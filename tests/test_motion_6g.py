@@ -358,7 +358,9 @@ class LiveMotionTests(UiTestCase):
         self.assertLess(orbit, min(packets))                     # fainter than every event packet
         self.assertLess(speed, 360 / 61)                         # slower than before K2
         self.assertIn("core.orbitPhase + core.idleOrbitSpeed", text)
-        self.assertIn("opacity: core.idleOrbitPeak *", text)
+        # DFCOREB: the orbit packet is drawn by the visual layer, from the same core values.
+        layer = (QML_DIR / "components/core/ReactorLayer.qml").read_text(encoding="utf-8")
+        self.assertIn("opacity: core.idleOrbitPeak *", layer)
 
 
 if __name__ == "__main__":

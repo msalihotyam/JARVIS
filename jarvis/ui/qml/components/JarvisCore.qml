@@ -1,30 +1,20 @@
 import QtQuick
-import QtQuick.Shapes
 import "../theme"
+import "core"
 
-// The JARVIS core: Reactor A. A machine with energy circulating inside it,
-// not a glowing sphere - dark material, selective light, and layers that
-// move at different speeds in different directions. The background plate
-// (L0) supplies the wide orbits and HUD linework around it; this component
-// covers the plate's own drawn globe with a dark bed and builds the living
-// reactor on top of it. No text anywhere in the core.
+// The JARVIS core: the state LOGIC of the core, with its look in a swappable
+// visual layer (components/core/<Design>Layer.qml). This file owns the real
+// state, the tuning, boot / power, the one 16 ms clock, the event language
+// and the bridge hooks; it animates only its OWN properties (angles, levels,
+// and the small event objects wave / ringWave / packet / rimPass / markerA /
+// markerB). A layer only READS them through its `core` property and draws;
+// it has no state logic and no clock of its own. The interface a layer may
+// read is documented at the top of core/ReactorLayer.qml. A second design is
+// one new layer file plus one line in the registry at the bottom.
 //
-// Layers, back to front (D = this item's width):
-//   L1 bed 0.56 D  ·  L2 optical chamber 0.36 D  ·  L3 six-sector mechanical
-//   structure 0.48-0.60 D  ·  L4 main ring 0.66 D (clockwise)  ·  L5 second
-//   ring 0.74 D (counter)  ·  L6 a 28 degree energy sweep  ·  L7 three energy
-//   points  ·  L8 fixed ticks and event light.
-// Every layer is a pre-rendered raster (dev/assets/reactor_core.py) that is
-// only rotated, faded or scaled. Semantic light (blue information, amber
-// attention, red failure, the brief green of a success) is emitting faces
-// INSET into the six sector housings - the same centre, radius, band,
-// angles and transform as the housing, read from the generated
-// ReactorGeometry. A response travels round the whole circumference,
-// housing by housing with a short overlap, so the machine answers as one;
-// the dark separators, the blue chassis and the blue nucleus always remain.
-// Confirmed OFF is dormant: nothing turns, sweeps, breathes or glows - the
-// dark hardware stays with faint static edges. No shaders, no per-frame
-// drawing, no offscreen effect chain.
+// Confirmed OFF is dormant: nothing turns, sweeps, breathes or glows, and
+// once the power-down has run the clock itself stops - the only fully
+// still state.
 //
 // Motion is one 16 ms clock advancing a handful of angles at constant
 // angular speed. State changes retune speed and light through eased
@@ -38,9 +28,22 @@ Item {
     // around the core only at wider layouts; environment light travels on
     // those lines and is absent when they are.
     property bool environment: true
+    // The look: a name from the registry at the bottom. Unknown or empty
+    // falls back to "reactor" - never a blank core.
+    property string design: "reactor"
     implicitWidth: 300; implicitHeight: 300
     readonly property real s: width
     readonly property real c: width / 2
+
+    // -- palette (Theme tokens where they exist) -------------------------------
+    readonly property color blue: Theme.materialBlue
+    readonly property color glint: Theme.materialGlint
+    readonly property color info: Theme.info
+    readonly property color brass: "#d2a860"
+    readonly property color warning: Theme.warning
+    readonly property color danger: Theme.danger
+    readonly property color success: Theme.success
+    readonly property color coldMetal: "#52606e"   // dormant hardware
 
     // -- the real state ------------------------------------------------------
     readonly property bool running: state_ === "running"
@@ -109,6 +112,7 @@ Item {
     property real ringEnergy: 1                 // ring / sector illumination
     property real nucleus: 1                    // the focus and the chamber's light
     property real residual: 1                   // halo, tick glow: the last emission
+    property real iris: 1                       // 1 = the chamber sealed (the shutter closed)
     readonly property real ringFloor: 0.16      // faint static edges of dormant hardware
     onDormantChanged: power(dormant)
     function power(off) {
@@ -125,7 +129,7 @@ Item {
         bootFocus = 0; bootRim = 0; bootGlow = 0; spin = 0; spin2 = 0; booted = false
         if (alive) awaken.start()
     }
-    function settleDormant() { booted = true; bootFocus = 1; bootRim = 1; bootGlow = 0; spin = 0; spin2 = 0; circulation = 0; ringEnergy = 0; nucleus = 0; residual = 0 }
+    function settleDormant() { booted = true; bootFocus = 1; bootRim = 1; bootGlow = 0; spin = 0; spin2 = 0; circulation = 0; ringEnergy = 0; nucleus = 0; residual = 0; iris = 1 }
     SequentialAnimation {
         id: shutdown
         // 0-180 ms: circulation decelerates and stops; the sweep and the moving points go out.
@@ -136,8 +140,11 @@ Item {
         }
         // 180-360: the segmented ring illumination drains.
         NumberAnimation { target: core; property: "ringEnergy"; to: 0; duration: Theme.dur(180); easing.type: Easing.InOutCubic }
-        // 360-540: the nucleus fades.
-        NumberAnimation { target: core; property: "nucleus"; to: 0; duration: Theme.dur(180); easing.type: Easing.InOutCubic }
+        // 360-540: the nucleus fades while the shutter closes over the chamber.
+        ParallelAnimation {
+            NumberAnimation { target: core; property: "nucleus"; to: 0; duration: Theme.dur(180); easing.type: Easing.InOutCubic }
+            NumberAnimation { target: core; property: "iris"; to: 1; duration: Theme.dur(360); easing.type: Easing.InOutCubic }
+        }
         // 540-720: the remaining emission disappears; the dark hardware stays.
         NumberAnimation { target: core; property: "residual"; to: 0; duration: Theme.dur(180); easing.type: Easing.InOutCubic }
         ScriptAction { script: core.booted = true }
@@ -147,6 +154,7 @@ Item {
         id: shutdownQuick
         PropertyAction { target: core; property: "spin"; value: 0 }
         PropertyAction { target: core; property: "spin2"; value: 0 }
+        PropertyAction { target: core; property: "iris"; value: 1 }
         ParallelAnimation {
             NumberAnimation { target: core; property: "circulation"; to: 0; duration: Theme.dur(250) }
             NumberAnimation { target: core; property: "ringEnergy"; to: 0; duration: Theme.dur(250) }
@@ -157,7 +165,7 @@ Item {
     }
     SequentialAnimation {
         id: wakeQuick
-        ScriptAction { script: { core.bootFocus = 1; core.bootRim = 1; core.bootGlow = 0; core.spin = 1; core.spin2 = 1; core.booted = true } }
+        ScriptAction { script: { core.bootFocus = 1; core.bootRim = 1; core.bootGlow = 0; core.spin = 1; core.spin2 = 1; core.iris = 0; core.booted = true } }
         ParallelAnimation {
             NumberAnimation { target: core; property: "circulation"; to: 1; duration: Theme.dur(250) }
             NumberAnimation { target: core; property: "ringEnergy"; to: 1; duration: Theme.dur(250) }
@@ -186,22 +194,32 @@ Item {
     property real rimPulse: 0.7                 // 11.3 s, not in step with the breath
     property real pointA: 0.9                   // the energy points are never all at peak together
     property real sweepAngle: 113
+    property real mainAngle: 0                  // the main ring, clockwise
+    property real secondAngle: 37               // the second ring, counter-clockwise
+    property real fieldAngle: 0                 // a slow counter field under the rings
+    property real flow: 0                       // energy along the inner paths, 0..1 per lap
     property real orbitPhase: 150
     property real clockT: 0
     property double lastTick: 0
+    // The two energy points' carriers (their angle in degrees).
+    readonly property QtObject markerA: QtObject { property real rotation: 250 }
+    readonly property QtObject markerB: QtObject { property real rotation: 95 }
     Timer {
         id: clock
-        interval: 16; repeat: true; running: core.alive
+        // Confirmed OFF stops the clock itself once the power-down has run.
+        interval: 16; repeat: true
+        running: core.alive && !(core.dormant && !shutdown.running && !shutdownQuick.running)
         onRunningChanged: if (running) core.lastTick = Date.now()
         onTriggered: {
             var now = Date.now()
             var dt = Math.min(Math.max(now - core.lastTick, 0) / 1000, 0.05)
             core.lastTick = now
             core.clockT += dt
-            mainRing.rotation = (mainRing.rotation + core.mainSpeed * core.spin * dt) % 360
-            secondRing.rotation = (secondRing.rotation + core.secondSpeed * core.spin2 * dt + 360) % 360
+            core.mainAngle = (core.mainAngle + core.mainSpeed * core.spin * dt) % 360
+            core.secondAngle = (core.secondAngle + core.secondSpeed * core.spin2 * dt + 360) % 360
+            core.fieldAngle = (core.fieldAngle + core.secondSpeed * 0.45 * core.spin2 * dt + 360) % 360
             core.sweepAngle = (core.sweepAngle + core.sweepSpeed * core.sweepGain * core.circulation * (1 + 0.1 * core.typeBoost) * dt) % 360
-            chamberLight.rotation = (chamberLight.rotation + 360 / 53 * core.circulation * dt) % 360
+            core.flow = (core.flow + (0.09 + 0.5 * (core.lvl - 0.22)) * core.markerGain * core.circulation * dt) % 1
             markerA.rotation = (markerA.rotation + 360 / 29 * core.markerGain * core.circulation * dt) % 360
             markerB.rotation = (markerB.rotation - 360 / 47 * core.markerGain * core.circulation * dt + 360) % 360
             core.orbitPhase = (core.orbitPhase + core.idleOrbitSpeed * core.markerGain * core.circulation * dt) % 360
@@ -228,12 +246,14 @@ Item {
     property real bootGlow: 0                   // the transient extra light
     property real spin: 0                       // main ring gains motion
     property real spin2: 0                      // the second ring, later
-    function settleBoot() { booted = true; bootFocus = 1; bootRim = 1; bootGlow = 0; spin = 1; spin2 = 1 }
+    function settleBoot() { booted = true; bootFocus = 1; bootRim = 1; bootGlow = 0; spin = 1; spin2 = 1; iris = 0 }
     SequentialAnimation {
         id: awaken
         // 0-180 ms: the bed and a dim mechanical silhouette are simply there.
         PauseAnimation { duration: Theme.dur(180) }
         ParallelAnimation {
+            // 180-600: the shutter opens over the chamber.
+            NumberAnimation { target: core; property: "iris"; to: 0; duration: Theme.dur(420); easing.type: Easing.InOutCubic }
             // 180-480: the small focus appears, light spreads into the chamber.
             NumberAnimation { target: core; property: "bootFocus"; to: 1; duration: Theme.dur(300); easing.type: Easing.OutCubic }
             NumberAnimation { target: core; property: "bootGlow"; to: 1; duration: Theme.dur(300); easing.type: Easing.OutCubic }
@@ -375,6 +395,13 @@ Item {
     property real okLevel: 0
     readonly property var eventAnims: [successAnim, majorAnim, errorAnim, blockedAnim, modelAnim, modelLocalAnim, sentAnim, activityAnim, focusAnim, ambientAnim, launchAnim]
     property real squeeze: 1                    // the nucleus's 1 % compression
+    // Event light the language drives: the radial wave and the retune ring
+    // (scale of the core's radius, opacity), the light packet (its CENTRE in
+    // this item's pixels), the rim highlight pass (angle in degrees, opacity).
+    readonly property QtObject wave: QtObject { property real scale: 1; property real opacity: 0 }
+    readonly property QtObject ringWave: QtObject { property real scale: 1; property real opacity: 0 }
+    readonly property QtObject packet: QtObject { property real x: 0; property real y: 0; property real opacity: 0 }
+    readonly property QtObject rimPass: QtObject { property real rotation: 0; property real opacity: 0 }
 
     // Hooks into what the application really did.
     Connections {
@@ -397,20 +424,20 @@ Item {
     // Light packets on the existing near lines only (never new lines).
     function packetOut(to, ms) {   // centre -> the right connector trace
         packetMove.stop()
-        packet.x = c - packet.width / 2; packet.y = c - packet.height / 2; packet.opacity = 0.9
-        packetMove.toX = c + s * to - packet.width / 2; packetMove.toY = packet.y; packetMove.ms = ms
+        packet.x = c; packet.y = c; packet.opacity = 0.9
+        packetMove.toX = c + s * to; packetMove.toY = packet.y; packetMove.ms = ms
         packetMove.start()
     }
     function packetDown(ms) {      // centre -> towards the lower connection, short
         packetMove.stop()
-        packet.x = c - packet.width / 2; packet.y = c + s * 0.17 - packet.height / 2; packet.opacity = 0.75
-        packetMove.toX = packet.x; packetMove.toY = c + s * 0.44 - packet.height / 2; packetMove.ms = ms
+        packet.x = c; packet.y = c + s * 0.17; packet.opacity = 0.75
+        packetMove.toX = packet.x; packetMove.toY = c + s * 0.44; packetMove.ms = ms
         packetMove.start()
     }
     function packetIn(fromX, fromY, ms) {   // from the environment into the centre
         packetMove.stop()
-        packet.x = c + s * fromX - packet.width / 2; packet.y = c + s * fromY - packet.height / 2; packet.opacity = 0.8
-        packetMove.toX = c - packet.width / 2; packetMove.toY = c - packet.height / 2; packetMove.ms = ms
+        packet.x = c + s * fromX; packet.y = c + s * fromY; packet.opacity = 0.8
+        packetMove.toX = c; packetMove.toY = c; packetMove.ms = ms
         packetMove.start()
     }
     SequentialAnimation {
@@ -646,146 +673,16 @@ Item {
         ScriptAction { script: if (core.environment) core.packetOut(0.56, 420) }
     }
 
-    // Housing geometry (generated with the rasters) and the one emitting face
-    // every semantic signal is made of: 7 degrees of an existing housing,
-    // inset by the bezel so dark material stays visible around it, with a
-    // narrow edge highlight and a bloom too short to bridge a separator.
-    // The face is a child of its housing, so centre, transform and rotation
-    // are the housing's own. Thin housings (the rings) carry the face at
-    // their full width and skip the bezel.
-    ReactorGeometry { id: geo }
-    component MicroFace: Shape {
-        property real radius: 0.27
-        property real band: 0.06
-        property real angle: 0
-        property real span: 7
-        property color tint: "#4fb8ff"
-        property real level: 0
+    // ======================= the visual layer ================================
+    // Everything drawn lives in a design layer (components/core/). The layer
+    // reads this item's values through its one `core` property; nothing here
+    // reaches into it. A new design = one layer file + one line below.
+    readonly property var designs: ({ "reactor": reactorDesign })
+    Component { id: reactorDesign; ReactorLayer { core: layerLoader.parent } }
+    Loader {
+        id: layerLoader
         anchors.fill: parent
-        opacity: level; visible: level > 0.01
-        preferredRendererType: Shape.CurveRenderer
-        readonly property real r: radius * core.s
-        readonly property real bezelPx: Math.max(1.5, geo.bezel * core.s)
-        readonly property bool thin: band * core.s < 4 * bezelPx
-        readonly property real face: thin ? Math.max(1.5, band * core.s) : band * core.s - 2 * bezelPx
-        // The same bezel angularly, so the face sits inside the housing's end walls too.
-        readonly property real inset: thin ? 0 : bezelPx / Math.max(1, r) * 180 / Math.PI
-        readonly property real a0: angle - span / 2 + inset
-        readonly property real sweep: span - 2 * inset
-        // Restrained local bloom: one bezel past the face, never further.
-        ShapePath { strokeColor: Theme.alpha(tint, 0.22); strokeWidth: face + 2 * bezelPx; fillColor: "transparent"; capStyle: ShapePath.FlatCap
-            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r; radiusY: r; startAngle: a0 - 0.5; sweepAngle: sweep + 1 } }
-        // The inset emissive body.
-        ShapePath { strokeColor: Theme.alpha(tint, 0.62); strokeWidth: face; fillColor: "transparent"; capStyle: ShapePath.FlatCap
-            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r; radiusY: r; startAngle: a0; sweepAngle: sweep } }
-        // Brighter internal energy through the middle of the body.
-        ShapePath { strokeColor: thin ? "transparent" : Theme.alpha(Qt.lighter(tint, 1.22), 0.72); strokeWidth: face * 0.46; fillColor: "transparent"; capStyle: ShapePath.FlatCap
-            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r; radiusY: r; startAngle: a0 + inset * 0.6; sweepAngle: sweep - inset * 1.2 } }
-        // Narrow edge highlights along the face's inner and outer contours.
-        ShapePath { strokeColor: thin ? "transparent" : Theme.alpha(Qt.lighter(tint, 1.35), 0.95); strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.FlatCap
-            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r - face / 2 + 0.5; radiusY: r - face / 2 + 0.5; startAngle: a0; sweepAngle: sweep } }
-        ShapePath { strokeColor: thin ? "transparent" : Theme.alpha(Qt.lighter(tint, 1.35), 0.85); strokeWidth: 1; fillColor: "transparent"; capStyle: ShapePath.FlatCap
-            PathAngleArc { centerX: core.c; centerY: core.c; radiusX: r + face / 2 - 0.5; radiusY: r + face / 2 - 0.5; startAngle: a0; sweepAngle: sweep } }
-    }
-
-    // ======================= the layer stack ==================================
-    // Restrained halo: the level lifts it a little; it never becomes a fog.
-    // The broad outer bloom sits ~18 % under its first tuning, so the dark
-    // structure and the lit faces read before the light around them.
-    Image { source: "../assets/core-halo.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            opacity: 0.82 * (0.45 + 0.6 * (core.lvl - 0.22) + 0.3 * core.bootGlow) * core.residual }
-    // L1: the dark bed. Present from the first frame: the plate's globe never shows.
-    Image { source: "../assets/core-bed.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true }
-    // L8 (static part): fixed tick groups.
-    Image { source: "../assets/core-ticks.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            opacity: (0.3 + 0.5 * core.bootRim) * (0.25 + 0.75 * core.residual) }
-    // L3: the six-sector mechanical structure (dark hardware, kept when
-    // dormant) and its light: the state rhythms (litA / litB) and the blue
-    // information faces share the same inset rasters, one per housing.
-    Image { source: "../assets/core-sectors.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            opacity: (0.4 + 0.6 * core.bootRim) * (0.55 + 0.45 * core.ringEnergy) }
-    Repeater {
-        model: 6
-        Image {
-            source: "../assets/core-sector-lit.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            rotation: index * 60
-            // Listening lights only the opposite pair (sectors 0 and 3).
-            readonly property real lit: (core.listening && index !== 0 && index !== 3) ? 0 : (index % 2 === 0 ? core.litA : core.litB)
-            opacity: lit * core.ringEnergy
-            visible: opacity > 0.01
-        }
-    }
-    // L5: the second ring - thinner, dimmer, counter-clockwise, its own segments.
-    Image { id: secondRing; source: "../assets/core-ring-secondary.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            rotation: 37; opacity: (0.3 + 0.7 * core.bootRim) * (0.72 + 0.4 * (core.lvl - 0.22)) * (core.ringFloor + (1 - core.ringFloor) * core.ringEnergy) }
-    // L4: the main ring - the most legible motion, clockwise. Its blue
-    // information faces and the green success face are its own children:
-    // same centre, same radius and band, angles in its frame, turning with it.
-    Image { id: mainRing; source: "../assets/core-ring-main.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            rotation: 0; opacity: (0.3 + 0.7 * core.bootRim) * Math.min(1, 0.86 + 0.5 * (core.lvl - 0.22)) * (core.ringFloor + (1 - core.ringFloor) * core.ringEnergy)
-        // The one small green success face rides on the ring's first arc.
-        MicroFace { radius: geo.mainRadius; band: geo.mainBand; tint: Theme.success
-                    angle: geo.mainArcs[0][0] + 12; level: core.okLevel }
-    }
-    // L6: the energy sweep, a 28 degree highlight travelling over the rings.
-    Image { id: sweep; source: "../assets/core-sweep.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true
-            rotation: core.sweepAngle + core.jolt
-            opacity: (0.5 + 1.0 * (core.lvl - 0.22)) * core.sweepGain * core.bootRim * core.circulation; visible: opacity > 0.01 }
-    // L7: two energy points on the ring tracks (their carriers turn), and
-    // one packet on the header's horizontal orbit.
-    Item { id: markerA; anchors.centerIn: parent; width: core.s; height: width; rotation: 250
-           Image { source: "../assets/core-dot.png"; width: core.s * 0.05; height: width; mipmap: true
-                   x: core.c + core.s * 0.33 - width / 2; y: core.c - height / 2; opacity: core.pointA * core.bootRim * core.circulation } }
-    Item { id: markerB; anchors.centerIn: parent; width: core.s; height: width; rotation: 95
-           Image { source: "../assets/core-dot.png"; width: core.s * 0.05; height: width; mipmap: true
-                   x: core.c + core.s * 0.37 - width / 2; y: core.c - height / 2; opacity: 0.55 * core.bootRim * core.circulation } }
-    Image {
-        id: orbitPacket
-        source: "../assets/core-dot.png"; width: core.s * 0.05; height: width; mipmap: true
-        visible: core.environment && opacity > 0.01
-        // The orbit ellipse the header draws: centre 0.292 D left of the core,
-        // rx 0.699 D, ry 0.123 D; only its left half is drawn, so the packet
-        // is seen from 78 to 282 degrees and passes behind the core otherwise.
-        readonly property real rad: core.orbitPhase * Math.PI / 180
-        x: core.c - core.s * 0.292 + core.s * 0.699 * Math.cos(rad) - width / 2
-        y: core.c + core.s * 0.123 * Math.sin(rad) - height / 2
-        opacity: core.idleOrbitPeak * core.bootRim * core.circulation * Math.max(0, Math.min(1, (core.orbitPhase - 78) / 14, (282 - core.orbitPhase) / 14))
-    }
-    // Attention / failure: one emitting face inset into each of the six
-    // sector housings (the same band, centres and span the housings were
-    // drawn with). Muted amber or controlled red per the real state; the
-    // dark separators between them and the blue nucleus always remain.
-    Repeater {
-        model: 6
-        MicroFace { radius: (geo.sectorInner + geo.sectorOuter) / 2; band: geo.sectorOuter - geo.sectorInner
-                    angle: geo.sectorCentres[index]; span: geo.sectorSpan; tint: core.sigTint
-                    level: Math.max([core.sig0, core.sig1, core.sig2, core.sig3, core.sig4, core.sig5][index], core.hold) * core.ringEnergy }
-    }
-    // Blue information: the same rich emitting faces, in the structural blue.
-    Repeater {
-        model: 6
-        MicroFace { radius: (geo.sectorInner + geo.sectorOuter) / 2; band: geo.sectorOuter - geo.sectorInner
-                    angle: geo.sectorCentres[index]; span: geo.sectorSpan; tint: "#4fb8ff"
-                    level: [core.blue0, core.blue1, core.blue2, core.blue3, core.blue4, core.blue5][index] * core.ringEnergy }
-    }
-    // Event light: the wave (scaled outward), the retune ring, the packet.
-    Image { id: wave; source: "../assets/core-wave.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true; opacity: 0; visible: opacity > 0.01 }
-    Image { id: ringWave; source: "../assets/core-wave.png"; anchors.centerIn: parent; width: core.s; height: width; mipmap: true; opacity: 0; visible: opacity > 0.01 }
-    Image { id: packet; source: "../assets/core-dot.png"; width: core.s * 0.05; height: width; mipmap: true; opacity: 0; visible: opacity > 0.01 }
-
-    // L2: the optical chamber and its nucleus, breathing in light, barely in size.
-    Item {
-        anchors.centerIn: parent; width: core.s * 0.5; height: width
-        scale: (1 + 0.16 * (core.breath - 1)) * core.squeeze
-        Image { source: "../assets/core-chamber.png"; anchors.fill: parent; mipmap: true; opacity: 0.45 + 0.55 * core.nucleus }
-        Image { id: chamberLight; source: "../assets/core-chamber-light.png"; anchors.fill: parent; mipmap: true; rotation: 40
-                opacity: 0.85 * core.bootFocus * core.nucleus }
-        Image { source: "../assets/core-rim-hi.png"; anchors.fill: parent; mipmap: true
-                opacity: (core.rimPulse * 0.8 + 0.2 * core.bootGlow) * core.bootRim * core.nucleus }
-        Image { id: rimPass; source: "../assets/core-rim-hi.png"; anchors.fill: parent; mipmap: true; opacity: 0; visible: opacity > 0.01 }
-        Image { source: "../assets/core-focus-glow.png"; anchors.centerIn: parent; width: core.s * 0.4; height: width; mipmap: true
-                opacity: Math.min(1, (0.34 + 1.1 * (core.lvl - 0.22) + core.focusBoost + 0.35 * core.bootGlow) * core.breath) * core.bootFocus * core.nucleus }
-        Image { source: "../assets/core-focus.png"; anchors.centerIn: parent; width: core.s * 0.2; height: width; mipmap: true
-                opacity: Math.min(1, (0.9 + 0.9 * core.focusBoost + 0.3 * (core.lvl - 0.22)) * core.breath) * core.bootFocus * core.nucleus }
+        // Fail closed: an unknown or empty design is the reactor, never a blank core.
+        sourceComponent: core.designs.hasOwnProperty(core.design) ? core.designs[core.design] : reactorDesign
     }
 }
