@@ -578,3 +578,12 @@ class Backend:
 
     def set_global_memory_toggle(self, conversation_id: str, enabled: bool) -> dict:
         return self._plain("global-memory", lambda app: app.set_global_memory_toggle(conversation_id, enabled))
+
+    def compact_conversation(self, conversation_id: str) -> dict:
+        return self._plain("compact", lambda app: app.compact_conversation(conversation_id))
+
+    def memory_doctor(self, project_id: str | None) -> dict:
+        return self._plain("memory-doctor", lambda app: app.memory_doctor_payload(project_id))
+
+    def apply_memory_repair(self, finding_id: str, confirm: str) -> dict:
+        return self._plain("memory-repair", lambda app: app.apply_memory_repair(finding_id, confirm=confirm))

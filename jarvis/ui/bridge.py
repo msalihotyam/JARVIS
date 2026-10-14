@@ -4944,6 +4944,46 @@ class Bridge(QObject):
             self._global_memory = enabled
             self.globalMemoryChanged.emit()
 
+    # -- V2.1a M4: "Oturumu sıkıştır" and the Memory Doctor (pass-through) -----
+    #
+    # Same contract as the record slots: the app runs on the worker, its answer
+    # arrives whole with the request's ids, a refusal (a reply still streaming,
+    # a stale finding) keeps "ok": False and is said in the feed. A compaction's
+    # answer is the conversation's new context usage, shown as such.
+
+    compactConversationDone = Signal("QVariantMap")
+    memoryDoctorDone = Signal("QVariantMap")
+    memoryRepairDone = Signal("QVariantMap")
+
+    @Slot(str)
+    def compactConversation(self, conversation_id: str) -> None:
+        request = {"conversation_id": str(conversation_id)}
+
+        def done(payload: Any) -> None:
+            self._memory_answer(self.compactConversationDone, request, payload)
+            if isinstance(payload, dict) and payload.get("ok") is True:
+                self._context_usage_answer(request["conversation_id"], payload)
+
+        self._run(f"memory-compact:{uuid4().hex}",
+                  lambda: self.backend.compact_conversation(request["conversation_id"]), done)
+
+    @Slot(str)
+    def memoryDoctor(self, project_id: str) -> None:
+        """One project's report, or the whole store's for "" (all projects)."""
+        request = {"project_id": str(project_id)}
+        self._run("memory-doctor", lambda: self.backend.memory_doctor(request["project_id"] or None),
+                  lambda payload: self._memory_answer(self.memoryDoctorDone, request, payload))
+
+    @Slot(str)
+    def applyMemoryRepair(self, finding_id: str) -> None:
+        """The window's 'Onar' click, made only after its own confirmation, IS
+        the confirmed command: the app re-diagnoses the whole store and repairs
+        exactly that finding, or refuses (I2/I3)."""
+        request = {"finding_id": str(finding_id)}
+        self._run(f"memory-repair:{uuid4().hex}",
+                  lambda: self.backend.apply_memory_repair(request["finding_id"], request["finding_id"]),
+                  lambda payload: self._memory_answer(self.memoryRepairDone, request, payload))
+
     # -- slots: configuration ------------------------------------------------
 
     def _apply_config(self, payload: dict) -> None:
