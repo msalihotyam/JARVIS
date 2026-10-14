@@ -412,7 +412,6 @@ class ImportSafetyTests(unittest.TestCase):
     # symlink/junction state and its resolved target, none of which sees a hard
     # link, so a hard link to a protected file is read. Remove the decorator
     # with the product fix (e.g. refuse st_nlink > 1 on the opened handle).
-    @unittest.expectedFailure
     def test_hard_link_into_a_protected_root_is_refused(self):
         target = Path(self.settings.memory_database).parent / "notes.md"
         target.write_text("User: protected text that must never be read", encoding="utf-8")

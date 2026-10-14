@@ -195,9 +195,17 @@ def _read_path(
         raise ProtectedPathError("refusing to read a protected path")
     if not resolved.is_file():
         raise MalformedExportError("export path is not a regular file")
-    if resolved.stat().st_size > max_bytes:
-        raise ImportTooLargeError(f"file is over {max_bytes} bytes")
+    # Open once and check the OPENED handle, then read from it: a hard link
+    # (st_nlink > 1) can be a second name for a protected file, and a swap
+    # after the checks above shows up as a different file than the path's.
     with open(resolved, "rb") as handle:
+        info = os.fstat(handle.fileno())
+        if info.st_nlink > 1:
+            raise ProtectedPathError("refusing to read a hard-linked file")
+        if not os.path.samestat(info, os.lstat(resolved)):
+            raise ProtectedPathError("export path changed while it was opened")
+        if info.st_size > max_bytes:
+            raise ImportTooLargeError(f"file is over {max_bytes} bytes")
         raw = handle.read(max_bytes + 1)
     if len(raw) > max_bytes:
         raise ImportTooLargeError(f"file is over {max_bytes} bytes")
