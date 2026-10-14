@@ -40,6 +40,7 @@ SecondaryPage {
         target: bridge
         function onMemoryRecordsDone(answer) { if (answer.ok && answer.project_id === page.scope) page.records = answer.records || [] }
         function onMemoryRecordActionDone(answer) { if (answer.project_id === page.scope) page.loadRecords() }
+        function onMemoryRepairDone(answer) { if (answer.ok) page.loadRecords() }
     }
 
     Column {
@@ -55,6 +56,8 @@ SecondaryPage {
                 ActionButton { objectName: "memoryProject"; label: modelData.name; primary: modelData.id === page.project || (page.project === "" && index === 0); onClicked: { page.project = modelData.id; bridge.refreshMemory(modelData.id, page.includeInactive) } }
             }
         }
+        // V2.1b: the Memory Doctor's findings for the shown project, with confirmed one-at-a-time repairs.
+        MemoryDoctorPanel { objectName: "memoryDoctor"; scope: page.scope }
         Column { objectName: "memoryPending"; width: parent.width; spacing: 8; visible: page.scope !== ""
             Text { text: qsTr("AWAITING YOUR APPROVAL"); color: Theme.textLabel; font: Theme.pageSection }
             Text { objectName: "memoryPendingEmpty"; visible: page.pending.length === 0; width: parent.width; wrapMode: Text.Wrap

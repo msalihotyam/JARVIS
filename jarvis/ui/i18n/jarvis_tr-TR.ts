@@ -2448,6 +2448,125 @@ yok</translation>
     </message>
 </context>
 <context>
+    <name>MemoryDoctorPanel</name>
+    <message>
+        <source>Error</source>
+        <translation>Hata</translation>
+    </message>
+    <message>
+        <source>Warning</source>
+        <translation>Uyarı</translation>
+    </message>
+    <message>
+        <source>Info</source>
+        <translation>Bilgi</translation>
+    </message>
+    <message>
+        <source>A record belongs to a project or conversation that no longer exists.</source>
+        <translation>Bir kayıt artık var olmayan bir projeye veya sohbete bağlı.</translation>
+    </message>
+    <message>
+        <source>A record is past its expiry date but still in use.</source>
+        <translation>Bir kaydın süresi dolmuş ama hâlâ kullanımda.</translation>
+    </message>
+    <message>
+        <source>A record has not been verified for a long time.</source>
+        <translation>Bir kayıt uzun süredir doğrulanmadı.</translation>
+    </message>
+    <message>
+        <source>Approved records on the same subject contradict each other.</source>
+        <translation>Aynı konudaki onaylı kayıtlar birbiriyle çelişiyor.</translation>
+    </message>
+    <message>
+        <source>Records replace each other in a loop.</source>
+        <translation>Kayıtlar bir döngü içinde birbirinin yerini alıyor.</translation>
+    </message>
+    <message>
+        <source>A record replaces a record that does not exist.</source>
+        <translation>Bir kayıt var olmayan bir kaydın yerini alıyor.</translation>
+    </message>
+    <message>
+        <source>The memory search index is out of step with the records.</source>
+        <translation>Hafıza arama dizini kayıtlarla uyumsuz.</translation>
+    </message>
+    <message>
+        <source>A record has been waiting for your approval for over two weeks.</source>
+        <translation>Bir kayıt iki haftadan uzun süredir onayınızı bekliyor.</translation>
+    </message>
+    <message>
+        <source>A record holds content that must never be stored.</source>
+        <translation>Bir kayıt asla saklanmaması gereken içerik taşıyor.</translation>
+    </message>
+    <message>
+        <source>An item from the old memory format has no new equivalent.</source>
+        <translation>Eski hafıza biçimindeki bir öğenin yeni karşılığı yok.</translation>
+    </message>
+    <message>
+        <source>A lesson has not been confirmed for over 90 days.</source>
+        <translation>Bir ders 90 günden uzun süredir doğrulanmadı.</translation>
+    </message>
+    <message>
+        <source>A newer record contradicts a lesson.</source>
+        <translation>Daha yeni bir kayıt bir dersle çelişiyor.</translation>
+    </message>
+    <message>
+        <source>Retract the record</source>
+        <translation>Kaydı geri çek</translation>
+    </message>
+    <message>
+        <source>Mark the record expired</source>
+        <translation>Kaydın süresini doldur</translation>
+    </message>
+    <message>
+        <source>Replace the older record with the newer one</source>
+        <translation>Eski kaydı yenisiyle değiştir</translation>
+    </message>
+    <message>
+        <source>Rebuild the search index</source>
+        <translation>Arama dizinini yeniden kur</translation>
+    </message>
+    <message>
+        <source>MEMORY HEALTH</source>
+        <translation>HAFIZA SAĞLIĞI</translation>
+    </message>
+    <message>
+        <source>Stale: %1 · Conflicts: %2 · Orphaned: %3</source>
+        <translation>Eskimiş: %1 · Çelişki: %2 · Sahipsiz: %3</translation>
+    </message>
+    <message>
+        <source>Memory is healthy: the Doctor found nothing to fix.</source>
+        <translation>Hafıza sağlıklı: Doktor onarılacak bir şey bulmadı.</translation>
+    </message>
+    <message>
+        <source>The health check could not run: %1</source>
+        <translation>Sağlık denetimi çalışamadı: %1</translation>
+    </message>
+    <message>
+        <source>Repairing…</source>
+        <translation>Onarılıyor…</translation>
+    </message>
+    <message>
+        <source>Repair</source>
+        <translation>Onar</translation>
+    </message>
+    <message>
+        <source>Memory repair</source>
+        <translation>Hafıza onarımı</translation>
+    </message>
+    <message>
+        <source>Apply this repair?</source>
+        <translation>Bu onarım uygulansın mı?</translation>
+    </message>
+    <message>
+        <source>Repair: %1. Nothing is deleted.</source>
+        <translation>Onarım: %1. Hiçbir şey silinmez.</translation>
+    </message>
+    <message>
+        <source>Cancel</source>
+        <translation>Vazgeç</translation>
+    </message>
+</context>
+<context>
     <name>MemoryPage</name>
     <message>
         <source>Memory</source>
