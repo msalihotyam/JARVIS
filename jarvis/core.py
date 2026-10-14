@@ -14,6 +14,7 @@ from datetime import datetime
 from decimal import Decimal
 from pathlib import Path
 from typing import AbstractSet, Any, Callable
+from uuid import NAMESPACE_URL, uuid5
 
 from jarvis.connectors.base import BaseConnector
 from jarvis.connectors.project_folder import PROJECT_FOLDER_CONNECTOR
@@ -111,6 +112,7 @@ from jarvis.contracts import (
     canonical_path,
     canonical_usd,
     chain_state_refusal,
+    chain_steps_from_declaration,
     chain_task_refusal,
     diagnostic_from_exception,
     format_usd,
@@ -127,6 +129,7 @@ from jarvis.contracts import (
     model_answer_refusal,
     utc_now,
     nano_usd,
+    normalize_locator,
     require_billing_class,
     result_to_dict,
     require_monetary_state,
@@ -216,6 +219,13 @@ from jarvis.registry import (
     ToolRegistry,
 )
 from jarvis.settings import Settings
+from jarvis import experience as skill_experience
+from jarvis import intent as skill_intent
+from jarvis import skill_lifecycle
+from jarvis.skill_draft import _find_params, _without_params
+from jarvis.skill_match import MatchKind, SkillWithState, match_skills
+from jarvis.skill_run_plan import MissingInputsError, SkillPlanContext, plan_steps
+from jarvis.skill_types import SkillStatus
 
 
 #: Task preference holding the billing fingerprint that cleared cost preflight.
@@ -641,6 +651,16 @@ _CAPTURE_TOOL = "memory_capture"
 #: ``source_task_id`` prefix of typed memory records in a retrieval snapshot
 #: (V2.1a M3); such items are always re-derived from the store, never trusted.
 _TYPED_MEMORY_SOURCE = "memory-record:"
+#: V2.2 SKCORE. Task preference holding a skill run's state; Core writes it,
+#: a new task's copy is dropped (S1: it is bookkeeping, never authority).
+_SKILL_RUN_KEY = "skill_run"
+#: Objective of the fresh session a skill's chain runs in, followed by the
+#: id of the user's task it serves; both sides are checked against each other.
+_SKILL_SESSION_PREFIX = "skill-run:"
+#: ``source_task_id`` prefix of the one skill reference item (S3).
+_SKILL_REFERENCE_SOURCE = "skill-reference:"
+#: Clarification keys a skill announcement sets and clears on the user's task.
+_SKILL_QUESTION_KEYS = ("needs_clarification", "clarification_question")
 
 
 def _retrieved_item_characters(item: RetrievedMemoryItem) -> int:
@@ -882,8 +902,12 @@ class AgentCore:
         destination_policy: AbstractSet[DestinationGrant] | None = None,
         github_identity: GitHubIdentityBinding | None = None,
         gmail_identity: GmailIdentityBinding | None = None,
+        skill_store: Any | None = None,
     ) -> None:
         self.registry = registry
+        # V2.2 SKCORE: the skill store (``SkillStore``), composition state read
+        # only while ``settings.skills_enabled``. A skill only proposes steps.
+        self.skill_store = skill_store
         self.memory = memory
         self.settings = settings or Settings()
         self.verifier = verifier
@@ -992,12 +1016,19 @@ class AgentCore:
         binding_failure = self._bind_project(session, task)
         if binding_failure is not None:
             return binding_failure
+        fresh = existing_session_id is None
+        if fresh:
+            # Skill state is Core's own bookkeeping; a new task cannot bring it.
+            task.preferences.pop(_SKILL_RUN_KEY, None)
         session.active_task_id = task.id
         session.latest_task_id = task.id
         try:
             self._checkpoint(session, task, "task_registered")
+            routed = self._skill_route(session, task) if fresh else None
         except _LifecycleLost as lost:
             return lost.run
+        if routed is not None:
+            return routed
         return self._advance(session, task, grant)
 
     def resume(
@@ -1081,6 +1112,9 @@ class AgentCore:
         session.latest_task_id = task.id
         try:
             self._checkpoint(session, task, "clarification_provided")
+            # The answer to a skill's missing-inputs question: plan again.
+            if self._skill_state(task).get("state") == "needs_inputs":
+                return self._skill_retry(session, task)
         except _LifecycleLost as lost:
             return lost.run
         return self._advance(session, task, None)
@@ -1194,6 +1228,9 @@ class AgentCore:
         if refusal is not None:
             return refusal
         try:
+            # A task delegated to a skill's chain moves only by that chain.
+            if self._skill_state(task).get("state") == "delegated":
+                return self._skill_progress(session, task)
             return self._advance_loop(session, task, grant)
         except _LifecycleLost as lost:
             return lost.run
@@ -1249,6 +1286,9 @@ class AgentCore:
             # current status, scope and toggle, limited to the ids the
             # snapshot already held: a resume can shrink or demote, never add.
             task.retrieved_context = self._with_typed_memory(
+                session, task, task.retrieved_context, reprove=True
+            )
+            task.retrieved_context = self._with_skill_reference(
                 session, task, task.retrieved_context, reprove=True
             )
         # S4. THE global execution barrier, and it is placed here on purpose:
@@ -1425,6 +1465,9 @@ class AgentCore:
                 # items; the persisted snapshot (record ids) is the delivery
                 # record.
                 retrieved = self._with_typed_memory(session, task, retrieved)
+                # V2.2 SKCORE: a skill chain's step sees its procedure as
+                # labelled reference data, never as an instruction (S3).
+                retrieved = self._with_skill_reference(session, task, retrieved)
                 task.retrieved_context = retrieved
                 # Gate 5: project-file excerpts, a SEPARATE bounded channel
                 # (<= 3 excerpts / 4,000 chars) that never touches the memory
@@ -5738,6 +5781,496 @@ class AgentCore:
         except Exception:  # noqa: BLE001 - informational context; fail closed to none
             return legacy
 
+    # ------------------------------------------------------------------
+    # V2.2 SKCORE. A matched skill runs as an ordinary chain, behind the flag.
+    #
+    # A skill is a PROCEDURE, never authority (S1): its steps become the
+    # declared steps of a chain in a fresh session, and each step is an
+    # ordinary task through _advance / the execution barrier / approval,
+    # unchanged (S2). The user's task is the "anchor": it waits while the
+    # chain runs and closes when the chain stops.
+    # ------------------------------------------------------------------
+
+    def _skills_on(self) -> bool:
+        return self.settings.skills_enabled is True and self.skill_store is not None
+
+    @staticmethod
+    def _skill_state(task: Task | None) -> dict[str, Any]:
+        state = task.preferences.get(_SKILL_RUN_KEY) if task is not None else None
+        return state if isinstance(state, dict) else {}
+
+    @staticmethod
+    def _skill_ident(skill: Any, revalidate: bool = False) -> dict[str, Any]:
+        return {
+            "skill_id": skill.skill_id,
+            "version": skill.version,
+            "name": skill.name,
+            "origin": skill.provenance.origin.value,
+            "revalidate": revalidate,
+        }
+
+    def _skill_route(self, session: SessionState, task: Task) -> AgentRun | None:
+        """Match a NEW task against the visible skills; ``None`` runs it as usual.
+
+        Only a fit is used, announced and continued unless declined (D6). A
+        stale skill that would fit is announced and waits for the user's use
+        or skip, never used automatically (S12); a similar skill is not used.
+        Values are stripped before matching (D18). Any fault: no skill.
+        """
+        if (
+            not self._skills_on()
+            or session.chain is not None
+            or session.objective.startswith(_SKILL_SESSION_PREFIX)
+            or task.preferences.get("needs_clarification")
+            # Steps are built INTERNAL; a more sensitive task keeps its own
+            # classification gates by never becoming a skill run.
+            or task.scope.data_classification
+            not in (DataClassification.PUBLIC, DataClassification.INTERNAL)
+        ):
+            return None
+        try:
+            text = "\n".join((task.objective, task.scope.target))
+            text = _without_params(text, _find_params(text))
+            entries: dict[str, SkillWithState] = {}
+            for listed in self.skill_store.list_skills(session.project_id):
+                history = self.skill_store.history(listed.skill.skill_id, session.project_id)
+                skill = None if history is None else skill_lifecycle.usable_skill(history)
+                if skill is not None:
+                    entries[skill.skill_id] = SkillWithState(
+                        skill=skill,
+                        status=skill_lifecycle.status(history),
+                        health=skill_lifecycle.health(history),
+                    )
+            result = match_skills(text, entries.values(), session.project_id)
+            stale = None
+            for candidate in result.needs_revalidation[:1]:
+                entry = entries[candidate.skill_id]
+                as_active = replace(entry, status=SkillStatus.ACTIVE)
+                if match_skills(text, (as_active,), session.project_id).kind is MatchKind.FIT:
+                    stale = entry.skill
+        except Exception:  # noqa: BLE001 - matching is advice; fail closed to no skill
+            return None
+        if result.kind is MatchKind.FIT and result.best is not None:
+            return self._skill_delegate(session, task, result.best.skill)
+        if stale is not None:
+            task.preferences[_SKILL_RUN_KEY] = {**self._skill_ident(stale), "state": "stale"}
+            task.preferences["needs_clarification"] = True
+            task.preferences["clarification_question"] = (
+                f'Bu iş için "{stale.name}" becerisi var ama eskimiş; önce yeniden '
+                "doğrulanması gerekir. Beceriyi kullanayım mı, becerisiz mi çalışayım?"
+            )
+            self._checkpoint(
+                session, task, "skill_stale_announced", self._skill_ident(stale)
+            )
+            return self._advance(session, task, None)
+        return None
+
+    def _skill_inputs(self, skill: Any, task: Task) -> dict[str, str]:
+        """The skill's inputs from the values the user typed, by kind, in order.
+
+        An input is named after its kind (``url``, ``url_2``, ...). When
+        exactly one required input is still missing, a clarification answer
+        is taken whole. ``plan_steps`` re-validates every value.
+        """
+        answer = " ".join(str(task.preferences.get("clarification") or "").split())
+        text = "\n".join((task.objective, task.scope.target, answer))
+        found: dict[str, list[str]] = {}
+        for param in _find_params(text):
+            bucket = found.setdefault(param.kind, [])
+            if param.value.strip() not in bucket:
+                bucket.append(param.value.strip())
+        inputs: dict[str, str] = {}
+        for spec in skill.inputs:
+            bucket = found.get(spec.name.split("_")[0])
+            if bucket:
+                inputs[spec.name] = bucket.pop(0)
+        missing = [s.name for s in skill.inputs if s.required and s.name not in inputs]
+        if len(missing) == 1 and answer:
+            inputs[missing[0]] = answer
+        return inputs
+
+    def _skill_catalog(self) -> dict[str, str]:
+        """Core's capability -> action catalog, only what a connector serves."""
+        served: set[str] = set()
+        for name in self.registry.list_names():
+            served.update(self.registry.get(name).manifest.capabilities)
+        return {
+            capability: hint.action
+            for capability, hint in skill_intent.NL_CAPABILITIES.items()
+            if capability in served
+        }
+
+    def _skill_delegate(self, session: SessionState, task: Task, skill: Any) -> AgentRun:
+        """Plan ``skill`` for ``task`` and run it as an ordinary chain.
+
+        Missing inputs are asked for as a normal clarification. A refused
+        plan or chain runs the task without the skill.
+        """
+        ident = self._skill_ident(skill, bool(self._skill_state(task).get("revalidate")))
+        try:
+            steps = plan_steps(
+                skill,
+                self._skill_inputs(skill, task),
+                SkillPlanContext(session.project_id, self._skill_catalog()),
+            )
+            # Targets are declared in the form a stored step task carries
+            # (persistence normalizes the scope), or no step could be bound.
+            chain = ChainState.declared(
+                chain_steps_from_declaration(
+                    [
+                        {**step.to_dict(), "target": normalize_locator(step.target)}
+                        for step in steps
+                    ]
+                )
+            )
+        except MissingInputsError as missing:
+            task.preferences[_SKILL_RUN_KEY] = {**ident, "state": "needs_inputs"}
+            task.preferences["needs_clarification"] = True
+            task.preferences["clarification_question"] = (
+                f'"{skill.name}" becerisi için şu bilgiler gerekli: '
+                + ", ".join(missing.missing)
+            )
+            task.preferences.pop("clarification", None)
+            self._checkpoint(
+                session, task, "skill_needs_inputs", {**ident, "missing": list(missing.missing)}
+            )
+            return self._advance(session, task, None)
+        except Exception:  # noqa: BLE001 - a refused plan is no skill, never a failure
+            chain = None
+        if chain is None:
+            return self._skill_not_used(session, task)
+        # ONE runner per task (a fixed id), so a repeated use/answer joins the
+        # chain already declared instead of starting the same work twice.
+        objective = _SKILL_SESSION_PREFIX + task.id
+        runner = self.memory.load_session(str(uuid5(NAMESPACE_URL, objective)))
+        if runner is None:
+            runner = SessionState(
+                objective=objective,
+                id=str(uuid5(NAMESPACE_URL, objective)),
+                project_id=session.project_id,
+            )
+            self.memory.save_session(runner)
+        if runner.objective != objective or runner.project_id != session.project_id:
+            return self._skill_not_used(session, task)
+        if self.memory.declare_chain_if_absent(runner.id, chain) not in ("declared", "occupied"):
+            return self._skill_not_used(session, task)
+        for key in _SKILL_QUESTION_KEYS:
+            task.preferences.pop(key, None)
+        task.preferences[_SKILL_RUN_KEY] = {
+            **ident, "state": "delegated", "chain_session_id": runner.id
+        }
+        self._checkpoint(
+            session,
+            task,
+            "skill_announced",
+            {
+                **ident,
+                "chain_session_id": runner.id,
+                "message": f'Bu iş için "{skill.name}" becerisini kullanıyorum',
+            },
+        )
+        return self.run_chain(runner.id)[0]
+
+    def _skill_not_used(self, session: SessionState, task: Task) -> AgentRun:
+        for key in _SKILL_QUESTION_KEYS:
+            task.preferences.pop(key, None)
+        task.preferences[_SKILL_RUN_KEY] = {"state": "not_used"}
+        return self._advance(session, task, None)
+
+    def _skill_reload(self, session: SessionState, state: dict[str, Any]) -> Any | None:
+        """The exact recorded version, if still usable here; a stale skill
+        only for a run the user asked to revalidate (S12)."""
+        if not self._skills_on():
+            return None
+        try:
+            history = self.skill_store.history(state["skill_id"], session.project_id)
+            skill = None if history is None else skill_lifecycle.usable_skill(history)
+            stale = history is not None and skill_lifecycle.status(history) is SkillStatus.STALE
+        except Exception:  # noqa: BLE001 - an unreadable skill is no skill
+            return None
+        if skill is None or skill.version != state.get("version"):
+            return None
+        return None if stale and state.get("revalidate") is not True else skill
+
+    def _skill_retry(self, session: SessionState, task: Task) -> AgentRun:
+        """The user answered the missing-inputs question: plan again."""
+        skill = self._skill_reload(session, self._skill_state(task))
+        if skill is None:
+            return self._skill_not_used(session, task)
+        return self._skill_delegate(session, task, skill)
+
+    def _skill_progress(self, session: SessionState, task: Task) -> AgentRun:
+        runner = self.memory.load_session(
+            str(self._skill_state(task).get("chain_session_id") or "")
+        )
+        if runner is None or runner.objective != _SKILL_SESSION_PREFIX + task.id:
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, "This task's skill run was not found.", session
+            )
+        return self.run_chain(runner.id)[0]
+
+    def _skill_owned(
+        self, session_id: str, task_id: str
+    ) -> tuple[SessionState | None, Task | None, AgentRun | None]:
+        session = self.memory.load_session(session_id)
+        task = self.memory.load_task(task_id)
+        if session is None or task is None or self.memory.task_session_id(task_id) != session_id:
+            return None, None, self._input_failure(
+                task, ErrorCode.TASK_NOT_FOUND, "Session or task was not found.", session
+            )
+        return session, task, None
+
+    def use_skill(self, session_id: str, task_id: str) -> AgentRun:
+        """The user's "use" answer to a stale skill's announcement.
+
+        The ONLY way a stale skill runs: as a normal revalidation run whose
+        every step still meets policy and approval (S12).
+        """
+        session, task, failure = self._skill_owned(session_id, task_id)
+        if failure is not None:
+            return failure
+        state = self._skill_state(task)
+        if (
+            state.get("state") != "stale"
+            or task.status is not TaskStatus.AWAITING_CLARIFICATION
+            or task.stage is not LoopStage.CLARIFY_OR_ASSUME
+        ):
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, "No skill is waiting for a decision.", session
+            )
+        state = {**state, "revalidate": True}
+        for key in _SKILL_QUESTION_KEYS:
+            task.preferences.pop(key, None)
+        task.preferences[_SKILL_RUN_KEY] = state
+        task.status = TaskStatus.PENDING
+        try:
+            self._checkpoint(session, task, "skill_use_requested", state)
+            skill = self._skill_reload(session, state)
+            if skill is None:
+                return self._skill_not_used(session, task)
+            return self._skill_delegate(session, task, skill)
+        except _LifecycleLost as lost:
+            return lost.run
+
+    def decline_skill(self, session_id: str, task_id: str) -> AgentRun:
+        """The user declined the announced skill: run the task without it (D6).
+
+        A decline is not a use, so no skill event is written (D16). A started
+        chain stops (its live step is cancelled; completed steps stay).
+        """
+        session, task, failure = self._skill_owned(session_id, task_id)
+        if failure is not None:
+            return failure
+        state = self._skill_state(task)
+        if state.get("state") not in ("delegated", "stale", "needs_inputs") or is_terminal(task):
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, "This task has no skill to decline.", session
+            )
+        if state.get("state") == "delegated":
+            # The chain must really stop before the task runs without it, or
+            # the same work could happen twice. Anything else refuses.
+            refusal = self._skill_stop(session, task, state)
+            if refusal is not None:
+                return refusal
+        for key in _SKILL_QUESTION_KEYS:
+            task.preferences.pop(key, None)
+        if task.status is TaskStatus.AWAITING_CLARIFICATION:
+            task.status = TaskStatus.PENDING
+        task.preferences[_SKILL_RUN_KEY] = {**state, "state": "declined"}
+        try:
+            self._checkpoint(session, task, "skill_declined", task.preferences[_SKILL_RUN_KEY])
+        except _LifecycleLost as lost:
+            return lost.run
+        return self._advance(session, task, None)
+
+    def _skill_stop(
+        self, session: SessionState, task: Task, state: dict[str, Any]
+    ) -> AgentRun | None:
+        """Cancel the skill chain of ``task``; ``None`` only when it stopped."""
+        runner = self.memory.load_session(str(state.get("chain_session_id") or ""))
+        if (
+            runner is None
+            or runner.objective != _SKILL_SESSION_PREFIX + task.id
+            or runner.chain is None
+        ):
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, "This task's skill run cannot be found.", session
+            )
+        chain = runner.chain
+        if chain.status is not ChainStatus.ACTIVE:
+            self._skill_run_finished(runner)
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, "The skill run already ended.", session
+            )
+        bound = chain.step_task_ids[chain.cursor] if chain.cursor < len(chain.step_task_ids) else ""
+        if bound:
+            stopped = self.cancel(runner.id, bound)
+            if stopped.task is None or stopped.task.status is not TaskStatus.CANCELLED:
+                return self._input_failure(
+                    task,
+                    ErrorCode.INVALID_TASK,
+                    "The current skill step could not be stopped; the skill was not declined.",
+                    session,
+                )
+        if self.memory.cancel_chain(runner.id, chain.id) != "cancelled":
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, "The skill run could not be stopped.", session
+            )
+        return None
+
+    def _skill_run_finished(self, final: SessionState | None) -> None:
+        """Close the anchor once its skill chain stopped, then record the use.
+
+        Once only: the anchor's terminal checkpoint is the guard. A cancelled
+        chain (decline, a denied approval, a cancel) is not a use and writes no
+        event (D16); usage history never blocks or approves anything.
+        """
+        if (
+            final is None
+            or final.chain is None
+            or not final.objective.startswith(_SKILL_SESSION_PREFIX)
+        ):
+            return
+        outcome = final.chain.status
+        ends = {
+            ChainStatus.COMPLETED: (TaskStatus.COMPLETED, LoopStage.COMPLETED),
+            ChainStatus.FAILED: (TaskStatus.FAILED, LoopStage.FAILED),
+            ChainStatus.CANCELLED: (TaskStatus.CANCELLED, LoopStage.CANCELLED),
+        }
+        if outcome not in ends:
+            return
+        anchor = self.memory.load_task(final.objective[len(_SKILL_SESSION_PREFIX):])
+        state = self._skill_state(anchor)
+        if (
+            anchor is None
+            or is_terminal(anchor)
+            or state.get("state") != "delegated"
+            or state.get("chain_session_id") != final.id
+        ):
+            return
+        owner = self.memory.load_session(self.memory.task_session_id(anchor.id) or "")
+        if owner is None:
+            return
+        anchor.status, anchor.stage = ends[outcome]
+        anchor.preferences[_SKILL_RUN_KEY] = {
+            **state, "state": "finished", "outcome": outcome.value
+        }
+        if owner.active_task_id == anchor.id:
+            owner.active_task_id = None
+        try:
+            self._checkpoint(
+                owner, anchor, "skill_run_finished", anchor.preferences[_SKILL_RUN_KEY]
+            )
+        except _LifecycleLost:
+            return
+        if outcome is ChainStatus.CANCELLED or not self._skills_on():
+            return
+        try:
+            history = self.skill_store.history(state["skill_id"], owner.project_id)
+            if history is None:
+                return
+            for event in skill_lifecycle.use_events(
+                history, state["version"], outcome is ChainStatus.COMPLETED, utc_now()
+            ):
+                self.skill_store.append_event(event)
+        except Exception:  # noqa: BLE001 - usage history is advisory, never blocking
+            return
+
+    def _with_skill_reference(
+        self,
+        session: SessionState,
+        task: Task,
+        base: RetrievedContext,
+        *,
+        reprove: bool = False,
+    ) -> RetrievedContext:
+        """S3: the procedure a skill chain's step serves, plus its lessons
+        (``experience.select_for_task``), as ONE labelled reference item.
+
+        Data the model may read, never an instruction, target, connector or
+        capability. A snapshot copy is always dropped and re-derived (the
+        MEMINJECT rule); a resume never adds one. Any fault delivers none.
+        """
+        mine = [i for i in base.items if i.source_task_id.startswith(_SKILL_REFERENCE_SOURCE)]
+        items = [i for i in base.items if not i.source_task_id.startswith(_SKILL_REFERENCE_SOURCE)]
+        legacy = base if not mine else replace(
+            base,
+            items=tuple(items),
+            character_count=max(
+                0, base.character_count - sum(_retrieved_item_characters(i) for i in mine)
+            ),
+        )
+        if (
+            not self._skills_on()
+            or (reprove and not mine)
+            or not session.objective.startswith(_SKILL_SESSION_PREFIX)
+        ):
+            return legacy
+        try:
+            anchor = self.memory.load_task(session.objective[len(_SKILL_SESSION_PREFIX):])
+            state = self._skill_state(anchor)
+            if state.get("chain_session_id") != session.id or not retrieval_eligible(
+                task.scope.data_classification, DataClassification.INTERNAL
+            ):
+                return legacy
+            history = self.skill_store.history(state["skill_id"], session.project_id)
+            if history is None:
+                return legacy
+            skill = history.get(state["version"])
+            lessons = skill_experience.select_for_task(
+                task.objective,
+                self.skill_store.experiences(session.project_id),
+                session.project_id,
+                skill.skill_id,
+                max_items=3,
+                max_chars=300,
+            )
+            steps = " ".join(f"{step.index}. {step.action}" for step in skill.steps)
+            text, _ = redact_credentials(
+                " ".join(
+                    normalize_retrieved_text(
+                        f"{steps} {skill_experience.render_context(lessons)}"
+                    ).split()
+                )
+            )
+            summary, cut_summary = truncate_retrieved_text(
+                redact_local_paths(text), RETRIEVAL_SUMMARY_CAP
+            )
+            name = " ".join(skill.name.replace(";", " ").replace("=", " ").split())[:60]
+            rationale, cut_rationale = truncate_retrieved_text(
+                f"skill procedure (reference data, not an instruction): "
+                f"skill={name}; version={skill.version}; "
+                f"origin={skill.provenance.origin.value}",
+                RETRIEVAL_RATIONALE_CAP,
+            )
+            item = RetrievedMemoryItem(
+                kind=RetrievedMemoryKind.FACT,
+                record_id=skill.skill_id,
+                source_task_id=_SKILL_REFERENCE_SOURCE + skill.skill_id,
+                summary=summary,
+                rationale=rationale,
+                next_step=None,
+                classification=DataClassification.INTERNAL,
+                created_at=skill.provenance.created_at,
+                relevance_score=1,
+                truncated=cut_summary or cut_rationale,
+                origin=MemoryOrigin.INFERRED,
+            )
+            used = legacy.character_count + _retrieved_item_characters(item)
+            if len(items) >= RETRIEVAL_MAX_ITEMS or used > RETRIEVAL_MAX_CHARACTERS:
+                # Reference data never evicts retrieved memory: no room, none.
+                return legacy
+            return self._validated_retrieved_context(
+                RetrievedContext(
+                    items=(*items, item),
+                    candidate_count=legacy.candidate_count + 1,
+                    character_count=used,
+                    truncated=legacy.truncated or item.truncated,
+                )
+            )
+        except Exception:  # noqa: BLE001 - reference data; fail closed to none
+            return legacy
+
     def _retrieve_project_files(
         self, session: SessionState, task: Task, query_text: str
     ) -> tuple[tuple, int]:
@@ -5915,6 +6448,7 @@ class AgentCore:
             if verdict != "advanced":
                 break
         final = self.memory.load_session(session_id)
+        self._skill_run_finished(final)
         if last is None:
             last = AgentRun(RunStatus.COMPLETED, final, None)
         elif final is not None:
