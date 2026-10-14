@@ -1,0 +1,556 @@
+{
+  "version": 1,
+  "about": "V2.2 b3 Turkish/English skill-matching corpus. Synthetic text only, no personal data. One reference skill per task family and language; families come from the capability catalog the V2.2 planner accepts (jarvis.intent.NL_CAPABILITIES). 'match' requests SHOULD fit the family's skill in that language; 'near' requests share its words but change the object, destination, scope or add a negation, and must never be a fit for any skill.",
+  "families": {
+    "file_summary": {
+      "en": {
+        "skill": {
+          "skill_id": "file-summary-en",
+          "name": "Summarize a project file",
+          "summary": "Read a project file and summarize it",
+          "inputs": ["path"],
+          "steps": [
+            {"action": "Read the file {path}", "capability": "file_read", "inputs": ["path"]},
+            {"action": "Summarize the file", "capability": "code_analysis", "inputs": ["path"]}
+          ]
+        },
+        "match": [
+          "Summarize the project file",
+          "summarize a project file for me",
+          "Read the project file and summarize it",
+          "Please read this project file and summarize it",
+          "summarize the project file docs/plan.md",
+          "Can you summarize that project file?",
+          "summarise the project file",
+          "read and summarize the file",
+          "SUMMARIZE THE PROJECT FILE"
+        ],
+        "near": [
+          "Delete the project file",
+          "Summarize the project emails",
+          "Do not summarize the project file",
+          "Summarize every file in the whole project",
+          "Write the project summary into the file report.md",
+          "Summarize the GitHub repository file README",
+          "Read the project file aloud",
+          "Rename the project file",
+          "Translate the project file into Turkish"
+        ]
+      },
+      "tr": {
+        "skill": {
+          "skill_id": "dosya-ozeti-tr",
+          "name": "Proje dosyasını özetle",
+          "summary": "Bir proje dosyasını okur ve özetler",
+          "inputs": ["yol"],
+          "steps": [
+            {"action": "{yol} dosyasını oku", "capability": "file_read", "inputs": ["yol"]},
+            {"action": "Dosyanın içeriğini özetle", "capability": "code_analysis", "inputs": ["yol"]}
+          ]
+        },
+        "match": [
+          "Proje dosyasını özetle",
+          "proje dosyasini ozetle",
+          "Proje dosyasını oku ve özetle",
+          "Lütfen proje dosyasını özetler misin?",
+          "Bu proje dosyasının özetini çıkar",
+          "PROJE DOSYASINI ÖZETLE",
+          "İzin verirsen proje dosyasını özetle",
+          "proje dosyasını okuyup özetle",
+          "dosyayı oku ve özetle",
+          "proje dosyasini okuyup ozetler misin"
+        ],
+        "near": [
+          "Proje dosyasını sil",
+          "Proje dosyasını özetleme, sadece aç",
+          "Proje e-postalarını özetle",
+          "Bütün proje dosyalarını özetle",
+          "Özeti proje dosyasına yaz",
+          "GitHub'daki proje dosyasını özetle",
+          "Proje dosyasını İngilizceye çevir",
+          "proje dosyasini ozetleyip e-postayla gonder",
+          "Proje dosyasının adını değiştir"
+        ]
+      }
+    },
+    "code_plan": {
+      "en": {
+        "skill": {
+          "skill_id": "code-plan-en",
+          "name": "Plan a code change",
+          "summary": "Propose a plan for a code change",
+          "inputs": ["change"],
+          "steps": [
+            {"action": "Propose a plan for {change}", "capability": "code_planning", "inputs": ["change"]}
+          ]
+        },
+        "match": [
+          "Plan a code change",
+          "plan the code change for the login bug",
+          "Propose a plan for this code change",
+          "Can you plan a code change?",
+          "propose a plan for the code change to the parser",
+          "I need a plan for a code change",
+          "plan out the change in the code",
+          "help me plan a code change",
+          "draft an approach for changing the code"
+        ],
+        "near": [
+          "Apply the code change",
+          "Do not plan a code change",
+          "Plan a vacation",
+          "Plan a code change and push it to main",
+          "Revert the code change",
+          "Plan the release schedule",
+          "Review the code change plan",
+          "Plan a code change for every repository",
+          "Merge the planned code change"
+        ]
+      },
+      "tr": {
+        "skill": {
+          "skill_id": "kod-plani-tr",
+          "name": "Kod değişikliği planla",
+          "summary": "Bir kod değişikliği için plan önerir",
+          "inputs": ["degisiklik"],
+          "steps": [
+            {"action": "{degisiklik} için bir plan öner", "capability": "code_planning", "inputs": ["degisiklik"]}
+          ]
+        },
+        "match": [
+          "Kod değişikliği planla",
+          "kod degisikligi planla",
+          "Giriş hatası için bir kod değişikliği planla",
+          "Bu kod değişikliği için plan öner",
+          "Kod değişikliği için bir plan önerir misin?",
+          "Ayrıştırıcıdaki kod değişikliğini planla",
+          "Kod değişikliğini planlar mısın",
+          "kod degisikligi icin plan oner",
+          "Kodu nasıl değiştireceğimizi planla"
+        ],
+        "near": [
+          "Kod değişikliğini uygula",
+          "Kod değişikliğini planlama, doğrudan uygula",
+          "Tatil planla",
+          "Kod değişikliği planla ve main dalına gönder",
+          "Kod değişikliğini geri al",
+          "Sürüm takvimini planla",
+          "Kod değişikliği planını incele",
+          "Tüm depolar için kod değişikliği planla",
+          "Planlanan kod değişikliğini birleştir"
+        ]
+      }
+    },
+    "mail_search": {
+      "en": {
+        "skill": {
+          "skill_id": "mail-search-en",
+          "name": "Search email",
+          "summary": "Search email with a query",
+          "inputs": ["query"],
+          "steps": [
+            {"action": "Search email for {query}", "capability": "gmail_search", "inputs": ["query"]}
+          ]
+        },
+        "match": [
+          "Search my email for invoices",
+          "search email for the contract from the supplier",
+          "Search my email for receipts",
+          "Search email with a query",
+          "search my e-mail for invoices",
+          "Please search the email for invoices",
+          "Run an email search for invoices",
+          "Search emails for invoices",
+          "Search email with this query"
+        ],
+        "near": [
+          "Search the web for invoices",
+          "Send an email about invoices",
+          "Delete emails about invoices",
+          "Do not search my email",
+          "Search Slack for invoices",
+          "Search email and forward the invoices to the team",
+          "Search every mailbox in the company email",
+          "Stop the email search",
+          "Search GitHub issues for email bugs"
+        ]
+      },
+      "tr": {
+        "skill": {
+          "skill_id": "posta-arama-tr",
+          "name": "E-postada ara",
+          "summary": "E-postada sorguyla ara",
+          "inputs": ["sorgu"],
+          "steps": [
+            {"action": "E-postada {sorgu} ara", "capability": "gmail_search", "inputs": ["sorgu"]}
+          ]
+        },
+        "match": [
+          "E-postada faturaları ara",
+          "e-postada faturalari ara",
+          "E-postamda faturaları ara",
+          "E-postada sözleşmeyi ara",
+          "Lütfen e-postada fatura ara",
+          "E-postada şu sorguyla ara",
+          "E-postalarda faturaları ara",
+          "E-postada faturaları arar mısın",
+          "E-POSTADA FATURALARI ARA",
+          "E-postada İstanbul faturalarını ara"
+        ],
+        "near": [
+          "Web'de faturaları ara",
+          "Faturaları e-postayla gönder",
+          "E-postada arama yapma",
+          "E-postada faturaları arama, sil",
+          "Slack'te faturaları ara",
+          "E-postada ara ve faturaları ekibe ilet",
+          "Tüm şirket e-postalarında ara",
+          "E-postada aramayı durdur",
+          "GitHub sorunlarında e-posta hatalarını ara"
+        ]
+      }
+    },
+    "mail_draft": {
+      "en": {
+        "skill": {
+          "skill_id": "mail-draft-en",
+          "name": "Draft an email reply",
+          "summary": "Draft an email reply without sending it",
+          "inputs": ["topic"],
+          "steps": [
+            {"action": "Draft an email reply about {topic}", "capability": "gmail_draft_create", "inputs": ["topic"]}
+          ]
+        },
+        "match": [
+          "Draft an email reply",
+          "draft an email reply about the meeting",
+          "Draft a reply email to the supplier",
+          "Please draft an email reply without sending it",
+          "Write a draft email reply",
+          "draft a reply to this email",
+          "Prepare an email reply draft",
+          "Draft me a quick email reply",
+          "Compose a reply to the email"
+        ],
+        "near": [
+          "Send the email reply",
+          "Do not draft an email reply",
+          "Draft a Slack reply",
+          "Draft an email reply and send it to everyone",
+          "Delete the email reply draft",
+          "Draft a contract",
+          "Read the email reply",
+          "Draft email replies to all 200 unread messages",
+          "Forward the email reply draft to the team"
+        ]
+      },
+      "tr": {
+        "skill": {
+          "skill_id": "taslak-yanit-tr",
+          "name": "Yanıt taslağı yaz",
+          "summary": "E-posta yanıt taslağı yazar",
+          "inputs": ["konu"],
+          "steps": [
+            {"action": "{konu} için e-posta yanıt taslağı yaz", "capability": "gmail_draft_create", "inputs": ["konu"]}
+          ]
+        },
+        "match": [
+          "Yanıt taslağı yaz",
+          "E-posta yanıt taslağı yaz",
+          "Toplantı için e-posta yanıt taslağı yaz",
+          "Tedarikçiye bir yanıt taslağı yazar mısın",
+          "e-posta yanit taslagi yaz",
+          "Müşteriye e-posta yanıtı için taslak yaz",
+          "Bu e-postaya yanıt taslağı hazırla",
+          "Yanıt taslağını yaz",
+          "Cevap taslağı yaz"
+        ],
+        "near": [
+          "E-posta yanıtını gönder",
+          "E-posta yanıt taslağı yazma",
+          "Slack yanıt taslağı yaz",
+          "Yanıt taslağı yaz ve herkese gönder",
+          "E-posta yanıt taslağını sil",
+          "Sözleşme taslağı yaz",
+          "E-posta yanıtını oku",
+          "Okunmamış 200 e-postanın hepsine yanıt taslağı yaz",
+          "Yanıt taslağını ekibe ilet"
+        ]
+      }
+    },
+    "github_pull_requests": {
+      "en": {
+        "skill": {
+          "skill_id": "pr-list-en",
+          "name": "List open pull requests",
+          "summary": "List the repository's pull requests",
+          "inputs": [],
+          "steps": [
+            {"action": "List the pull requests", "capability": "github_pull_request_list", "inputs": []}
+          ]
+        },
+        "match": [
+          "List open pull requests",
+          "list the open pull requests",
+          "Show me the open pull requests",
+          "What pull requests are open?",
+          "List the repository's pull requests",
+          "list pull requests",
+          "Can you list the open PRs?",
+          "List all open pull requests in the repository",
+          "which pull requests are still open"
+        ],
+        "near": [
+          "Merge the open pull requests",
+          "Close all open pull requests",
+          "List open issues",
+          "Do not list pull requests",
+          "List open pull requests in every repository of the organization",
+          "Open a pull request",
+          "List the pull requests and post them to Slack",
+          "List open GitLab merge requests",
+          "Review the open pull requests"
+        ]
+      },
+      "tr": {
+        "skill": {
+          "skill_id": "pr-listesi-tr",
+          "name": "Açık çekme isteklerini listele",
+          "summary": "Deponun çekme isteklerini listeler",
+          "inputs": [],
+          "steps": [
+            {"action": "Çekme isteklerini listele", "capability": "github_pull_request_list", "inputs": []}
+          ]
+        },
+        "match": [
+          "Açık çekme isteklerini listele",
+          "acik cekme isteklerini listele",
+          "Çekme isteklerini listele",
+          "Açık PR'ları listele",
+          "Depodaki açık çekme isteklerini listeler misin",
+          "Hangi çekme istekleri açık?",
+          "Açık çekme isteklerini göster",
+          "AÇIK ÇEKME İSTEKLERİNİ LİSTELE",
+          "Deponun açık çekme isteklerini listele"
+        ],
+        "near": [
+          "Açık çekme isteklerini birleştir",
+          "Açık çekme isteklerini kapat",
+          "Açık sorunları listele",
+          "Açık çekme isteklerini listeleme, birleştir",
+          "Tüm kuruluş depolarındaki açık çekme isteklerini listele",
+          "Bir çekme isteği aç",
+          "Çekme isteklerini listele ve Slack'e gönder",
+          "Açık çekme isteklerini incele",
+          "Açık GitLab birleştirme isteklerini listele"
+        ]
+      }
+    },
+    "github_commits": {
+      "en": {
+        "skill": {
+          "skill_id": "commit-list-en",
+          "name": "List recent commits",
+          "summary": "List the most recent commits in the repository",
+          "inputs": [],
+          "steps": [
+            {"action": "List the most recent commits", "capability": "github_commit_list", "inputs": []}
+          ]
+        },
+        "match": [
+          "List recent commits",
+          "list the most recent commits",
+          "Show the recent commits",
+          "List the latest commits",
+          "List the recent commits in the repository",
+          "What are the most recent commits?",
+          "List recent commits on the repository please",
+          "can you list the most recent commits",
+          "List the 10 most recent commits"
+        ],
+        "near": [
+          "Revert the most recent commits",
+          "List recent issues",
+          "Do not list recent commits",
+          "List recent commits in every repository",
+          "Squash the most recent commits",
+          "List recent emails",
+          "Push the recent commits to main",
+          "List the commits of the most recent release",
+          "List recent commits and email them to the team"
+        ]
+      },
+      "tr": {
+        "skill": {
+          "skill_id": "commit-listesi-tr",
+          "name": "Son commitleri listele",
+          "summary": "Depodaki en son commitleri listeler",
+          "inputs": [],
+          "steps": [
+            {"action": "En son commitleri listele", "capability": "github_commit_list", "inputs": []}
+          ]
+        },
+        "match": [
+          "Son commitleri listele",
+          "Son commit'leri listele",
+          "Depodaki son commitleri listeler misin",
+          "En son commitleri göster",
+          "Son on commiti listele",
+          "Depodaki son commitleri listele",
+          "Son commitlerin listesini çıkar",
+          "SON COMMİTLERİ LİSTELE",
+          "Lütfen son commitleri listele"
+        ],
+        "near": [
+          "Son commitleri geri al",
+          "Son sorunları listele",
+          "Son commitleri listeleme",
+          "Bütün depolardaki son commitleri listele",
+          "Son commitleri birleştir",
+          "Son e-postaları listele",
+          "Son commitleri main dalına gönder",
+          "Son sürümün commitlerini listele",
+          "Son commitleri listele ve ekibe e-postayla gönder"
+        ]
+      }
+    },
+    "web_page_read": {
+      "en": {
+        "skill": {
+          "skill_id": "web-read-en",
+          "name": "Read a web page",
+          "summary": "Open the site and read the page text",
+          "inputs": ["site"],
+          "steps": [
+            {"action": "Open {site} in a new tab", "capability": "browser_tab_open", "inputs": ["site"]},
+            {"action": "Read the page text", "capability": "browser_page_read", "inputs": []}
+          ]
+        },
+        "match": [
+          "Read a web page",
+          "Open the site and read the page",
+          "Open example.com and read the page text",
+          "read the web page at example.com",
+          "Open this site and read me the page text",
+          "Please read the page text of the site",
+          "open the website and read the page",
+          "Read the text on the web page",
+          "open the site, then read its page text"
+        ],
+        "near": [
+          "Open the site and print the page",
+          "Read the page text of the PDF file",
+          "Do not open the site or read the page",
+          "Open the site and fill in the login page",
+          "Open the site and read every page of the web archive",
+          "Read the web page text aloud",
+          "Close the site and the page",
+          "Read the page text and post it to the web forum",
+          "Read the printed page text from the scanner"
+        ]
+      },
+      "tr": {
+        "skill": {
+          "skill_id": "web-okuma-tr",
+          "name": "Web sayfasını oku",
+          "summary": "Siteyi açıp okur",
+          "inputs": ["site"],
+          "steps": [
+            {"action": "{site} sitesini yeni sekmede aç", "capability": "browser_tab_open", "inputs": ["site"]},
+            {"action": "Sayfanın metnini oku", "capability": "browser_page_read", "inputs": []}
+          ]
+        },
+        "match": [
+          "Web sayfasını oku",
+          "Siteyi açıp web sayfasını oku",
+          "Şu siteyi açıp sayfasını okur musun",
+          "example.com sitesini aç ve sayfayı oku",
+          "siteyi acip web sayfasini oku",
+          "Web sayfasını açıp okur musun",
+          "Siteyi aç, web sayfasını oku",
+          "SİTEYİ AÇIP WEB SAYFASINI OKU",
+          "Web sayfasının metnini oku"
+        ],
+        "near": [
+          "Siteyi açıp sayfayı yazdır",
+          "PDF dosyasının sayfasını oku",
+          "Siteyi açma, web sayfasını okuma",
+          "Siteyi açıp giriş sayfasını doldur",
+          "Siteyi açıp web arşivindeki her sayfayı oku",
+          "Web sayfasını sesli oku",
+          "Siteyi ve sayfayı kapat",
+          "Web sayfasını okuyup foruma gönder",
+          "Siteyi açıp web sayfasını okuma"
+        ]
+      }
+    },
+    "app_launch": {
+      "en": {
+        "skill": {
+          "skill_id": "app-launch-en",
+          "name": "Launch an application",
+          "summary": "Launch the named desktop application",
+          "inputs": ["app"],
+          "steps": [
+            {"action": "Launch {app}", "capability": "desktop_app_launch", "inputs": ["app"]}
+          ]
+        },
+        "match": [
+          "Launch an application",
+          "Launch the desktop application Notepad",
+          "launch the Spotify desktop application",
+          "Please launch the named desktop application",
+          "Start the desktop application",
+          "Launch the calculator application",
+          "Can you launch the desktop app?",
+          "launch desktop application Excel",
+          "Open and launch the desktop application"
+        ],
+        "near": [
+          "Close the desktop application",
+          "Do not launch the desktop application",
+          "Uninstall the desktop application",
+          "Launch the rocket",
+          "Launch every desktop application at startup",
+          "List the desktop application windows",
+          "Launch the web application in the browser",
+          "Install and launch the desktop application",
+          "Update the named desktop application"
+        ]
+      },
+      "tr": {
+        "skill": {
+          "skill_id": "uygulama-ac-tr",
+          "name": "Uygulamayı başlat",
+          "summary": "Masaüstü uygulamasını başlatır",
+          "inputs": ["uygulama"],
+          "steps": [
+            {"action": "{uygulama} uygulamasını başlat", "capability": "desktop_app_launch", "inputs": ["uygulama"]}
+          ]
+        },
+        "match": [
+          "Uygulamayı başlat",
+          "Masaüstü uygulamasını başlat",
+          "Not Defteri uygulamasını başlat",
+          "Spotify uygulamasını başlatır mısın",
+          "uygulamayi baslat",
+          "Hesap makinesi uygulamasını başlat",
+          "Masaüstündeki Excel uygulamasını başlat",
+          "Masaüstü uygulamasını başlatır mısın",
+          "UYGULAMAYI BAŞLAT"
+        ],
+        "near": [
+          "Masaüstü uygulamasını kapat",
+          "Uygulamayı başlatma",
+          "Masaüstü uygulamasını başlatma, kaldır",
+          "Masaüstü uygulamasını kaldır",
+          "Roketi başlat",
+          "Açılışta bütün masaüstü uygulamalarını başlat",
+          "Masaüstü uygulamasının pencerelerini listele",
+          "Web uygulamasını tarayıcıda başlat",
+          "Masaüstü uygulamasını kurup başlat"
+        ]
+      }
+    }
+  }
+}
