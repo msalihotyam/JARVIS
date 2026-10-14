@@ -6,7 +6,7 @@ temp database, never data/jarvis.db, no model or network call):
 
 - a repeatable run leaves a PENDING draft and an offer event, no skill (S5);
 - a trivial, failed or suppressed run is not offered;
-- a failed skill run proposes the next version of that skill, old kept;
+- a failed skill run proposes no new version (a5, SKLEARNSAFE), old kept;
 - a correction leaves an ``avoid`` lesson;
 - a secret in a step stores no draft (S7);
 - flag off: no offer, draft or lesson code runs (S4).
@@ -215,27 +215,19 @@ class SkillLearnTests(unittest.TestCase):
 
     # -- version after failure -------------------------------------------------
 
-    def test_a_failed_skill_run_proposes_the_next_version_of_that_skill(self) -> None:
+    def test_a_failed_skill_run_proposes_no_new_version_of_that_skill(self) -> None:
+        # a5 (SKLEARNSAFE): a failed run only records used_failure; a new
+        # version comes from a corrected, completed run (below).
         skill_id = self.save_skill()
         run = self.core(DummyConnector(outcome=OutcomeStatus.ERROR)).run(user_task())
         self.assertIs(run.session.chain.status, ChainStatus.FAILED)
         anchor_id = run.session.objective.removeprefix("skill-run:")
         self.assertIs(self.store.load_task(anchor_id).status, TaskStatus.FAILED)
-        [offer] = self.offers(self.store.task_session_id(anchor_id))
-        self.assertEqual(offer["message"], OFFER)
-        self.assertEqual(offer["run_id"], run.session.id)
-        [made] = self.store.pending_drafts(None)
-        self.assertEqual(offer["draft_ids"], [made.draft_id])
-        self.assertEqual(made.target_skill_id, skill_id)
-        self.assertIs(made.provenance.origin, SkillOrigin.VERSION_AFTER_FAILURE)
-        self.assertEqual(made.provenance.parent_skill_id, skill_id)
-        self.assertEqual(made.provenance.parent_version, 1)
-        self.assertEqual(len(made.checks), 1)
+        self.assertEqual(self.offers(self.store.task_session_id(anchor_id)), [])
+        self.assertEqual(self.store.pending_drafts(None), ())
         # The used version stays; nothing new is saved without approval.
         history = self.store.history(skill_id, None)
         self.assertEqual([v.version for v in history.versions], [1])
-        self.assertEqual(self.store.approve_draft(made.draft_id, project_id=None).version, 2)
-        self.assertEqual([v.version for v in self.store.history(skill_id, None).versions], [1, 2])
 
     # -- corrections -----------------------------------------------------------
 
@@ -264,6 +256,11 @@ class SkillLearnTests(unittest.TestCase):
         self.assertEqual(made.target_skill_id, skill_id)
         self.assertIn("Once yedek dosyayi kontrol et", made.checks[-1])
         self.assertEqual(len(self.store.history(skill_id, None).versions), 1)
+        self.assertIs(made.provenance.origin, SkillOrigin.VERSION_AFTER_FAILURE)
+        self.assertEqual(made.provenance.parent_skill_id, skill_id)
+        self.assertEqual(made.provenance.parent_version, 1)
+        self.assertEqual(self.store.approve_draft(made.draft_id, project_id=None).version, 2)
+        self.assertEqual([v.version for v in self.store.history(skill_id, None).versions], [1, 2])
 
     def test_a_global_skill_corrected_in_a_project_keeps_the_words_out_of_the_draft(self) -> None:
         skill_id = self.save_skill()

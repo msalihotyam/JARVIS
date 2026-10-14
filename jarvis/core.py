@@ -250,6 +250,7 @@ from jarvis.skill_types import (
     RunOutcome,
     RunStep,
     RunSummary,
+    Skill,
     SkillDraft,
     SkillOrigin,
     SkillRef,
@@ -725,6 +726,9 @@ def _memory_line_tokens(item: RetrievedMemoryItem) -> int:
 _MEMORY_BLOCK_HEADER_TOKENS = ESTIMATOR.tokens(
     json.dumps({"notice": RETRIEVED_MEMORY_NOTICE, "items": []}, ensure_ascii=False)
 )
+
+#: One sample value per draft input kind for the a6 plan dry run.
+_SKILL_SAMPLE_VALUES = {"url": "https://example.com/a", "email": "user@example.com", "path": "notes/a.md"}
 
 
 def _retrieved_item_characters(item: RetrievedMemoryItem) -> int:
@@ -6429,6 +6433,46 @@ class AgentCore:
             if capability in served
         }
 
+    def _skill_chain(
+        self, skill: Any, inputs: dict[str, str], project_id: str | None
+    ) -> ChainState | None:
+        """``skill`` planned and declared as one chain (the use path), or
+        ``None``; ``plan_steps`` raises its refusals."""
+        steps = plan_steps(skill, inputs, SkillPlanContext(project_id, self._skill_catalog()))
+        # Targets are declared in the form a stored step task carries
+        # (persistence normalizes the scope), or no step could be bound.
+        return ChainState.declared(
+            chain_steps_from_declaration(
+                [{**step.to_dict(), "target": normalize_locator(step.target)} for step in steps]
+            )
+        )
+
+    def _skill_plannable(self, draft: SkillDraft) -> bool:
+        """a6: the use path's plan, dry-run on ``draft`` with a sample value
+        per input kind. A draft Core could never run (more steps than one
+        chain, a capability outside the catalog, anything the chain grammar
+        refuses) is never offered. Any fault: not plannable."""
+        try:
+            parent = draft.provenance.parent_version
+            skill = Skill(
+                skill_id=draft.target_skill_id or "dry_run",
+                version=1 if parent is None else parent + 1,
+                name=draft.name,
+                summary=draft.summary,
+                scope=draft.scope,
+                inputs=draft.inputs,
+                steps=draft.steps,
+                checks=draft.checks,
+                provenance=draft.provenance,
+            )
+            inputs = {
+                spec.name: _SKILL_SAMPLE_VALUES.get(spec.name.split("_")[0], "a")
+                for spec in draft.inputs
+            }
+            return self._skill_chain(skill, inputs, draft.scope.project_id) is not None
+        except Exception:  # noqa: BLE001 - fail closed: an unplannable draft is not offered
+            return False
+
     def _skill_delegate(self, session: SessionState, task: Task, skill: Any) -> AgentRun:
         """Plan ``skill`` for ``task`` and run it as an ordinary chain.
 
@@ -6437,21 +6481,7 @@ class AgentCore:
         """
         ident = self._skill_ident(skill, bool(self._skill_state(task).get("revalidate")))
         try:
-            steps = plan_steps(
-                skill,
-                self._skill_inputs(skill, task),
-                SkillPlanContext(session.project_id, self._skill_catalog()),
-            )
-            # Targets are declared in the form a stored step task carries
-            # (persistence normalizes the scope), or no step could be bound.
-            chain = ChainState.declared(
-                chain_steps_from_declaration(
-                    [
-                        {**step.to_dict(), "target": normalize_locator(step.target)}
-                        for step in steps
-                    ]
-                )
-            )
+            chain = self._skill_chain(skill, self._skill_inputs(skill, task), session.project_id)
         except MissingInputsError as missing:
             task.preferences[_SKILL_RUN_KEY] = {**ident, "state": "needs_inputs"}
             task.preferences["needs_clarification"] = True
@@ -6913,20 +6943,15 @@ class AgentCore:
     @staticmethod
     def _skill_version_draft(run: RunSummary, skill: Any, history: Any, now: str) -> SkillDraft:
         """The next version of the EXACT version used, as a PENDING proposal
-        (``version_after_failure``); that version and every older one stay."""
-        if run.user_correction and skill.scope.project_id == run.project_id:
+        (``version_after_failure``) from a corrected, completed run; that
+        version and every older one stay."""
+        if skill.scope.project_id == run.project_id:
             # A correction's words stay in the scope they were said in (D15):
             # a global skill corrected inside a project gets the generic note;
             # the project-scoped avoid lesson keeps the words.
             note = "Kullanıcı düzeltmesi: «" + " ".join(run.user_correction.split())[:400] + "»"
-        elif run.user_correction:
-            note = "Kullanıcı son çalıştırmanın sonucunu düzeltti; önce sonucu doğrula."
         else:
-            failed = next(
-                (n for n, step in enumerate(run.steps, 1) if step.outcome is not RunOutcome.COMPLETED),
-                len(run.steps),
-            )
-            note = f"Adım {failed} son çalıştırmada başarısız oldu; önce girdilerini ve önkoşullarını doğrula."
+            note = "Kullanıcı son çalıştırmanın sonucunu düzeltti; önce sonucu doğrula."
         checks = skill.checks if note in skill.checks else (*skill.checks, note)[-MAX_CHECKS:]
         version = skill_lifecycle.next_version(
             skill,
@@ -6968,8 +6993,10 @@ class AgentCore:
     ) -> dict[str, Any]:
         """Pending drafts and advisory lessons from one finished run. Never raises.
 
-        A new-skill draft follows ``should_offer``; a skill run that failed,
-        or was corrected, proposes the next version of the version used.
+        A new-skill draft follows ``should_offer``; a skill run that completed
+        and was corrected proposes the next version of the version used (a5:
+        a failed run proposes none). A draft the use path could not plan is
+        never stored or offered (a6).
         Suppressed task kinds (or ``global``) get no draft. Only drafts newly
         stored are returned for the offer: deterministic draft ids make the
         drafts table the record of what was offered. ``health`` is the
@@ -7006,16 +7033,19 @@ class AgentCore:
                 offer
                 and skill is not None
                 and not suppressed
-                and (
-                    run.status is RunOutcome.FAILED
-                    or (run.user_correction and run.status is RunOutcome.COMPLETED)
-                )
+                # a5: only completed evidence that executed this version's
+                # steps; a failed run records used_failure and nothing more.
+                and run.user_correction
+                and run.status is RunOutcome.COMPLETED
+                and all(step.outcome is RunOutcome.COMPLETED for step in run.steps)
+                and [step.capability for step in run.steps]
+                == [step.capability for step in skill.steps]
             ):
                 drafts.append(self._skill_version_draft(run, skill, history, now))
         except Exception:  # noqa: BLE001 - no draft is never a failure of the run
             pass
         for draft in drafts:
-            if self._skill_keep(self.skill_store.add_draft, draft):
+            if self._skill_plannable(draft) and self._skill_keep(self.skill_store.add_draft, draft):
                 learned["draft_ids"].append(draft.draft_id)
         try:
             lessons = skill_experience.capture_candidates(
