@@ -193,6 +193,7 @@ from jarvis.memory_guard import (
     instruction_likeness,
     is_operational_preference,
 )
+from jarvis.memory_lifetime import Lifetime, decide_lifetime, expires_for
 from jarvis.schedules import ScheduleError, latest_occurrence, next_occurrence
 from jarvis.conversation import (
     CONVERSATION_ID,
@@ -870,6 +871,28 @@ CREATE TABLE IF NOT EXISTS memory_legacy_migration (
     migrated_at TEXT NOT NULL,
     CHECK ((record_id IS NULL) != (skip_reason IS NULL))
 );
+CREATE TABLE IF NOT EXISTS memory_record_lifetime (
+    record_id TEXT PRIMARY KEY REFERENCES memory_records(record_id) ON DELETE CASCADE,
+    lifetime TEXT NOT NULL CHECK (lifetime IN ('session', 'phase', 'permanent')),
+    at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS conversation_memory_off_toggles (
+    conversation_id TEXT NOT NULL,
+    off INTEGER NOT NULL CHECK (off IN (0, 1)),
+    actor TEXT NOT NULL,
+    at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_reply_sources (
+    conversation_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    outcome TEXT NOT NULL CHECK (outcome IN ('used', 'none')),
+    record_id TEXT NULL,
+    kind TEXT NULL,
+    revision INTEGER NULL,
+    at TEXT NOT NULL,
+    CHECK ((outcome = 'used') = (record_id IS NOT NULL AND kind IS NOT NULL AND revision IS NOT NULL)),
+    CHECK (outcome = 'used' OR (record_id IS NULL AND kind IS NULL AND revision IS NULL))
+);
 CREATE TABLE IF NOT EXISTS skills (
     skill_id TEXT NOT NULL,
     version INTEGER NOT NULL CHECK (version >= 1),
@@ -931,6 +954,13 @@ CREATE TABLE IF NOT EXISTS skill_experiences (
 # content (record_id NULL = a whole-DB backup). memory_legacy_migration is
 # the insert-only ledger of the one-time M1 migration: one row per legacy id,
 # its new record_id or a fixed skip reason (never text).
+# SEC2 (I19, I21, I22), insert-only; their rows hold ids and labels, never text.
+# memory_record_lifetime is written once with its record (no row = legacy
+# PERMANENT); its ON DELETE CASCADE lets the one I16 purge take it along
+# without a DELETE of its own. conversation_memory_off_toggles is append-only like the global
+# toggle (latest row wins, "ever off" stays answerable); memory_reply_sources
+# lists the records one reply used, or one 'none' row (no foreign key: a
+# legacy M1 id may be listed; a purged record's id may stay, without text).
 
 # V2.2 skills (above, jarvis/skill_store.py): every skill* table is insert- or
 # append-only - a skill's state is its skill_events rows in event_id order, a
@@ -1032,6 +1062,9 @@ MEMORY_V21_SCHEMA_OBJECTS = frozenset(
         "memory_purge_audit",
         "memory_owned_artifacts",
         "memory_legacy_migration",
+        "memory_record_lifetime",
+        "conversation_memory_off_toggles",
+        "memory_reply_sources",
     }
     | (
         {MEMORY_RECORDS_FTS}
@@ -6422,6 +6455,67 @@ class SQLiteMemoryStore:
             return False
         return row is not None and row[0] == 1
 
+    def set_conversation_memory_off(
+        self, conversation_id: str, off: bool, actor: MemoryRecordActor
+    ) -> None:
+        """Switch a conversation's memory off (temporary chat) or back on (I21).
+
+        Append-only like ``set_global_memory_toggle``: one row per call, so
+        "was it ever off" stays answerable. Only the user may flip it; unknown
+        or deleted conversations raise ValueError."""
+        self._require_conversation_id(conversation_id)
+        if type(off) is not bool:
+            raise ValueError("off must be a bool")
+        if actor is not MemoryRecordActor.USER:
+            raise ValueError("only the user may switch memory off or on")
+        with self._connection(write=True) as connection:
+            if connection.execute(
+                f"SELECT 1 FROM conversations WHERE id = ? AND {self._NOT_DELETED}",  # nosec B608 - constant SQL fragments only; values are bound
+                (conversation_id,),
+            ).fetchone() is None:
+                raise ValueError("unknown conversation")
+            connection.execute(
+                "INSERT INTO conversation_memory_off_toggles (conversation_id, off, actor, at) VALUES (?, ?, ?, ?)",
+                (conversation_id, int(off), actor.value, utc_now()),
+            )
+
+    def is_memory_off(self, conversation_id: str) -> bool:
+        """The latest toggle row; no row is on, an unreadable table is off."""
+        self._require_conversation_id(conversation_id)
+        with self._connection() as connection:
+            return self._memory_off_any(connection, (conversation_id,))
+
+    def was_ever_memory_off(self, conversation_id: str) -> bool:
+        """Any off row ever; an unreadable table reads as True (fail closed)."""
+        self._require_conversation_id(conversation_id)
+        with self._connection() as connection:
+            try:
+                return connection.execute(
+                    "SELECT 1 FROM conversation_memory_off_toggles WHERE conversation_id = ? AND off = 1 LIMIT 1",
+                    (conversation_id,),
+                ).fetchone() is not None
+            except sqlite3.Error:
+                return True
+
+    @staticmethod
+    def _memory_off_any(connection: sqlite3.Connection, conversation_ids: Iterable[str | None]) -> bool:
+        """Whether any named conversation is memory-off now (latest row);
+        ``None`` entries are skipped, an unreadable table reads as off."""
+        for conversation_id in conversation_ids:
+            if conversation_id is None:
+                continue
+            try:
+                row = connection.execute(
+                    "SELECT off FROM conversation_memory_off_toggles WHERE conversation_id = ? "
+                    "ORDER BY rowid DESC LIMIT 1",
+                    (conversation_id,),
+                ).fetchone()
+            except sqlite3.Error:
+                return True
+            if row is not None and row[0] != 0:
+                return True
+        return False
+
     def conversation_attach_preview(
         self, conversation_id: str, *, project_id: str | None = None, new_project_name: str | None = None
     ) -> dict[str, Any]:
@@ -6834,7 +6928,10 @@ class SQLiteMemoryStore:
     # UPDATE or DELETE against those tables.
 
     def insert_record(
-        self, record: MemoryRecord, guard: RecordGuard | None = None
+        self,
+        record: MemoryRecord,
+        guard: RecordGuard | None = None,
+        lifetime: Lifetime | str | None = None,
     ) -> MemoryRecordView:
         """Insert one model/tool/import record plus its initial status event.
 
@@ -6848,6 +6945,9 @@ class SQLiteMemoryStore:
         itself - kind and status come from Core, never the caller - refuses a
         live tombstone in this scope with ``MemoryTombstoned`` and writes the
         guard row in the same transaction. ``guard=None`` is today's path.
+
+        ``lifetime`` (I19) can only shorten what the text allows; see
+        ``_persist_record``.
         """
         if guard is not None and type(guard) is not RecordGuard:
             raise ValueError("guard must be a RecordGuard")
@@ -6862,7 +6962,7 @@ class SQLiteMemoryStore:
             )
         if record.actor is MemoryRecordActor.USER:
             raise ValueError("insert_record refuses the USER actor")
-        return self._persist_record(record, guard)
+        return self._persist_record(record, guard, lifetime=lifetime)
 
     def insert_explicit_user_record(
         self,
@@ -6873,6 +6973,7 @@ class SQLiteMemoryStore:
         subject_key: str,
         *,
         conversation_id: str | None = None,
+        source_conversation_id: str | None = None,
     ) -> MemoryRecordView:
         """THE trusted explicit-human write boundary for V2.1 records.
 
@@ -6883,6 +6984,8 @@ class SQLiteMemoryStore:
         only sanctioned caller. No model, connector or import path may call
         it. A DECISION/RULE/PREFERENCE still starts PENDING and needs
         ``approve_record``; FACT/LESSON start APPROVED.
+        ``source_conversation_id`` names the chat the command came from, so a
+        memory-off chat is refused (I21) and its rollback finds it (I23).
         """
         record = MemoryRecord(
             kind=MemoryRecordKind(kind),
@@ -6895,6 +6998,7 @@ class SQLiteMemoryStore:
             actor=MemoryRecordActor.USER,
             confidence=1.0,
             classification=DataClassification(classification),
+            source_conversation_id=source_conversation_id,
         )
         return self._persist_record(record)
 
@@ -6969,11 +7073,18 @@ class SQLiteMemoryStore:
         record: MemoryRecord,
         guard: RecordGuard | None = None,
         legacy_id: str | None = None,
+        *,
+        lifetime: Lifetime | str | None = None,
     ) -> MemoryRecordView:
         """The one INSERT-only record path; filter and hygiene re-run here.
 
         ``legacy_id`` (migration only) writes the ledger row in the same
         transaction: a legacy id already in the ledger fails the whole insert.
+
+        Every path writes a lifetime row (I19): the store re-decides it from
+        the raw and stored text, ``lifetime`` can only lower it, and a
+        SESSION/PHASE record's expires_at is capped at its TTL. A record
+        naming a conversation that is memory-off now is refused (I21).
         """
         if type(record) is not MemoryRecord:
             raise ValueError("record must be a MemoryRecord")
@@ -7050,8 +7161,21 @@ class SQLiteMemoryStore:
                 guard.proposed_kind.value,
                 content_hash(stored.text),
             )
+        # Defense in depth (I19): the text sets the ceiling, both forms count.
+        decided = decide_lifetime(
+            stored.text, requested=decide_lifetime(record.text, requested=lifetime)
+        )
+        cap = expires_for(decided, datetime.fromisoformat(stored.created_at))
+        if cap is not None and (
+            stored.expires_at is None or datetime.fromisoformat(stored.expires_at) > cap
+        ):
+            stored = replace(stored, expires_at=cap.isoformat())
         project_id = stored.scope.project_id
         with self._connection(write=True) as connection:
+            if self._memory_off_any(
+                connection, (stored.scope.conversation_id, stored.source_conversation_id)
+            ):
+                raise MemoryRecordRefused("memory_off")
             project_row = connection.execute(
                 "SELECT active FROM projects WHERE id = ?", (project_id,)
             ).fetchone()
@@ -7113,6 +7237,10 @@ class SQLiteMemoryStore:
                     "created",
                     utc_now(),
                 ),
+            )
+            connection.execute(
+                "INSERT INTO memory_record_lifetime (record_id, lifetime, at) VALUES (?, ?, ?)",
+                (stored.record_id, decided.value, utc_now()),
             )
             if guard_row is not None:
                 connection.execute(
@@ -7221,6 +7349,137 @@ class SQLiteMemoryStore:
         return self.record_event(
             record_id, MemoryRecordStatus.RETRACTED, actor, "undo"
         )
+
+    def record_lifetime(self, record_id: str) -> Lifetime:
+        """The record's lifetime row; no row (legacy) reads as PERMANENT."""
+        validate_memory_record_id(record_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT lifetime FROM memory_record_lifetime WHERE record_id = ?", (record_id,)
+            ).fetchone()
+        return Lifetime.PERMANENT if row is None else Lifetime(row[0])
+
+    def record_revision(self, record_id: str) -> int:
+        """Number of the record's status events: 1 = as created, 0 = not a
+        V2.1 record (unknown or legacy M1)."""
+        validate_memory_record_id(record_id)
+        with self._connection() as connection:
+            return connection.execute(
+                "SELECT COUNT(*) FROM memory_record_events WHERE record_id = ?", (record_id,)
+            ).fetchone()[0]
+
+    def record_reply_sources(
+        self,
+        conversation_id: str,
+        turn_id: str,
+        used: Sequence[tuple[str, MemoryRecordKind | str, int]],
+    ) -> None:
+        """Write which records one reply used (I22), once per turn: one
+        'used' row per (record_id, kind, revision), or one 'none' row for an
+        empty list. A second call for the same turn raises ValueError."""
+        validate_memory_record_id(conversation_id, "conversation_id")
+        validate_memory_record_id(turn_id, "turn_id")
+        rows = []
+        for entry in used:
+            record_id, kind, revision = entry
+            validate_memory_record_id(record_id)
+            if type(revision) is not int or revision < 0:
+                raise ValueError("revision must be a non-negative int")
+            rows.append(("used", record_id, MemoryRecordKind(kind).value, revision))
+        if len({row[1] for row in rows}) != len(rows):
+            raise ValueError("a record is listed twice")
+        at = utc_now()
+        with self._connection(write=True) as connection:
+            if connection.execute(
+                "SELECT 1 FROM memory_reply_sources WHERE conversation_id = ? AND turn_id = ? LIMIT 1",
+                (conversation_id, turn_id),
+            ).fetchone() is not None:
+                raise ValueError("reply sources already recorded for this turn")
+            connection.executemany(
+                "INSERT INTO memory_reply_sources (conversation_id, turn_id, outcome, "
+                "record_id, kind, revision, at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                [(conversation_id, turn_id, *row, at) for row in rows or [("none", None, None, None)]],
+            )
+
+    def sources_for_turn(
+        self, conversation_id: str, turn_id: str
+    ) -> list[tuple[str, MemoryRecordKind, int]] | None:
+        """The turn's used records in write order; ``[]`` = 'none' (no
+        relevant memory), ``None`` = nothing recorded for the turn."""
+        validate_memory_record_id(conversation_id, "conversation_id")
+        validate_memory_record_id(turn_id, "turn_id")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT outcome, record_id, kind, revision FROM memory_reply_sources "
+                "WHERE conversation_id = ? AND turn_id = ? ORDER BY rowid",
+                (conversation_id, turn_id),
+            ).fetchall()
+        if not rows:
+            return None
+        return [
+            (row["record_id"], MemoryRecordKind(row["kind"]), row["revision"])
+            for row in rows
+            if row["outcome"] == "used"
+        ]
+
+    def records_from_conversation(
+        self, conversation_id: str, project_id: str
+    ) -> list[MemoryRecordView]:
+        """Every V2.1 record of ``project_id`` whose source or scope
+        conversation is ``conversation_id``, with its current status (all
+        statuses), oldest first. Corrupt rows are skipped."""
+        validate_memory_record_id(conversation_id, "conversation_id")
+        validate_project_id(project_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                f"{_RECORD_CURRENT_SQL} WHERE r.project_id = ? AND "  # nosec B608 - constant SQL fragments only
+                "(r.source_conversation_id = ? OR r.conversation_id = ?) "
+                "ORDER BY r.created_at, r.record_id",
+                (project_id, conversation_id, conversation_id),
+            ).fetchall()
+        return [view for view in map(self._record_view_from_row, rows) if view is not None]
+
+    def retract_conversation_records(
+        self,
+        conversation_id: str,
+        project_id: str,
+        actor: MemoryRecordActor = MemoryRecordActor.USER,
+    ) -> tuple[int, int, int]:
+        """Roll back one conversation's records in one project (I23), events
+        and tombstones only: APPROVED -> RETRACTED (365d tombstone), PENDING
+        -> REJECTED (180d tombstone), terminal ones are skipped. Only the
+        user may do it; the project must exist. Idempotent: a second call
+        skips everything. Returns (retracted, rejected, skipped)."""
+        validate_memory_record_id(conversation_id, "conversation_id")
+        validate_project_id(project_id)
+        if actor is not MemoryRecordActor.USER:
+            raise ValueError("only the user may roll back a conversation's memory")
+        counts = {MemoryRecordStatus.RETRACTED: 0, MemoryRecordStatus.REJECTED: 0}
+        skipped = 0
+        with self._connection(write=True) as connection:
+            if connection.execute(
+                "SELECT 1 FROM projects WHERE id = ?", (project_id,)
+            ).fetchone() is None:
+                raise ValueError(f"Unknown project: {project_id}")
+            rows = connection.execute(
+                f"{_RECORD_CURRENT_SQL} WHERE r.project_id = ? AND "  # nosec B608 - constant SQL fragments only
+                "(r.source_conversation_id = ? OR r.conversation_id = ?) "
+                "ORDER BY r.created_at, r.record_id",
+                (project_id, conversation_id, conversation_id),
+            ).fetchall()
+            for row in rows:
+                target = {
+                    MemoryRecordStatus.APPROVED.value: MemoryRecordStatus.RETRACTED,
+                    MemoryRecordStatus.PENDING.value: MemoryRecordStatus.REJECTED,
+                }.get(row["current_status"])
+                if target is None:
+                    skipped += 1
+                    continue
+                self._append_record_event(
+                    connection, row["record_id"], target, actor, "conversation rollback"
+                )
+                counts[target] += 1
+        return counts[MemoryRecordStatus.RETRACTED], counts[MemoryRecordStatus.REJECTED], skipped
 
     @staticmethod
     def _append_record_event(
@@ -8006,6 +8265,7 @@ class SQLiteMemoryStore:
         statuses: Iterable[MemoryRecordStatus] | None = None,
         kinds: Iterable[MemoryRecordKind] | None = None,
         limit: int = 100,
+        for_conversation_id: str | None = None,
     ) -> list[MemoryRecordView]:
         """List one project's records (V2.1 + legacy M1) with current status.
 
@@ -8018,15 +8278,22 @@ class SQLiteMemoryStore:
         filter-refused rows never. Legacy M1 ``project_memory_items`` are adapted
         read-only as LEGACY_M1 records; nothing is migrated. Corrupt rows are
         skipped, never normalized.
+
+        A SESSION record (I19) is returned only when ``for_conversation_id``
+        is its source conversation; ``None`` returns none of them. A
+        memory-off conversation (scope or ``for_conversation_id``) reads
+        nothing (I21).
         """
         where, params, status_set, kind_set = self._record_filter_sql(
-            "list_records", scope, statuses, kinds, limit
+            "list_records", scope, statuses, kinds, limit, for_conversation_id
         )
         sql = f"{_RECORD_CURRENT_SQL} WHERE {where} ORDER BY r.created_at, r.record_id"
         with self._connection() as connection:
             connection.execute("BEGIN")  # toggle check and read: one snapshot
             try:
                 self._require_global_read(connection, scope)
+                if self._memory_off_any(connection, (scope.conversation_id, for_conversation_id)):
+                    return []
                 rows = connection.execute(sql, params).fetchall()
             finally:
                 connection.rollback()
@@ -8055,6 +8322,7 @@ class SQLiteMemoryStore:
         statuses: Iterable[MemoryRecordStatus] | None,
         kinds: Iterable[MemoryRecordKind] | None,
         limit: int,
+        for_conversation_id: str | None = None,
     ) -> tuple[
         str,
         list[object],
@@ -8104,6 +8372,18 @@ class SQLiteMemoryStore:
             params.append(scope.conversation_id)
         else:
             where += " AND r.conversation_id IS NULL"
+        if for_conversation_id is not None:
+            validate_memory_record_id(for_conversation_id, "for_conversation_id")
+            if scope.conversation_id not in (None, for_conversation_id):
+                raise ValueError("for_conversation_id must be the scope's conversation")
+        # I19: a SESSION record only for its own conversation; NULL (None)
+        # never equals, so None excludes every SESSION record.
+        where += (
+            " AND (NOT EXISTS (SELECT 1 FROM memory_record_lifetime l"
+            " WHERE l.record_id = r.record_id AND l.lifetime = 'session')"
+            " OR ? IN (r.source_conversation_id, r.conversation_id))"
+        )
+        params.append(for_conversation_id)
         if status_set is not None:
             where += f" AND e.status IN ({', '.join('?' * len(status_set))})"
             params.extend(sorted(s.value for s in status_set))
@@ -8119,6 +8399,7 @@ class SQLiteMemoryStore:
         kinds: Iterable[MemoryRecordKind] | None = None,
         statuses: Iterable[MemoryRecordStatus] | None = None,
         limit: int = 20,
+        for_conversation_id: str | None = None,
     ) -> list[tuple[MemoryRecordView, float]]:
         """Search one project's V2.1 records; returns (view, rank) pairs.
 
@@ -8128,12 +8409,13 @@ class SQLiteMemoryStore:
         Scope, status and kind filters are SQL predicates. FTS rank is bm25
         (lower is better). Without the FTS index the same filters run as a
         folded LIKE substring match with escaped wildcards and rank 0.0.
-        Legacy M1 items are not searched.
+        Legacy M1 items are not searched. SESSION and memory-off reads as in
+        ``list_records``.
         """
         if type(query_text) is not str:
             raise ValueError("query_text must be a string")
         where, params, _, _ = self._record_filter_sql(
-            "search_records", scope, statuses, kinds, limit
+            "search_records", scope, statuses, kinds, limit, for_conversation_id
         )
         tokens = re.findall(r"[^\W_]+", _fold_search_text(query_text))
         if not tokens:
@@ -8146,6 +8428,8 @@ class SQLiteMemoryStore:
             connection.execute("BEGIN")  # toggle check and read: one snapshot
             try:
                 rows, ranks = self._search_rows(connection, scope, tokens, where, params, limit)
+                if self._memory_off_any(connection, (scope.conversation_id, for_conversation_id)):
+                    rows, ranks = [], []
             finally:
                 connection.rollback()
         results = []

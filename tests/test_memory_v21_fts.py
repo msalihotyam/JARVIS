@@ -132,7 +132,8 @@ class RecordSearchTests(unittest.TestCase):
                 self.assertEqual(search("deploy", statuses=[S.APPROVED]),
                                  {fact, rule, lesson})
                 self.assertEqual(len(search("deploy", limit=1)), 1)
-                self.assertEqual(search("deploy", scope=self.scope(conversation="c-one")),
+                self.assertEqual(search("deploy", scope=self.scope(conversation="c-one"),
+                                        for_conversation_id="c-one"),
                                  {fact, rule, lesson, mine})
 
     def test_results_carry_status_and_rank(self) -> None:
