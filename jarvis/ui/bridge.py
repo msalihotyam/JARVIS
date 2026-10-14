@@ -5357,6 +5357,15 @@ class Bridge(QObject):
             self.prefs.save()
             self.prefsChanged.emit()
 
+    @Property(str, notify=prefsChanged)
+    def coreSkin(self) -> str:
+        return self.prefs.core_skin
+
+    @Slot(str)
+    def setCoreSkin(self, skin: str) -> None:
+        if self.prefs.set_core_skin(skin):
+            self.prefsChanged.emit()
+
     @Property(bool, notify=prefsChanged)
     def ambientEffects(self) -> bool:
         return self.prefs.data["ambient_effects"]

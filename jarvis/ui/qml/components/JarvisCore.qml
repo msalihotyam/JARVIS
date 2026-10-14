@@ -29,8 +29,8 @@ Item {
     // those lines and is absent when they are.
     property bool environment: true
     // The look: a name from the registry at the bottom. Unknown or empty
-    // falls back to "reactor" - never a blank core.
-    property string design: "reactor"
+    // falls back to "classic" (the familiar core) - never a blank core.
+    property string design: "classic"
     implicitWidth: 300; implicitHeight: 300
     readonly property real s: width
     readonly property real c: width / 2
@@ -677,12 +677,13 @@ Item {
     // Everything drawn lives in a design layer (components/core/). The layer
     // reads this item's values through its one `core` property; nothing here
     // reaches into it. A new design = one layer file + one line below.
-    readonly property var designs: ({ "reactor": reactorDesign })
+    readonly property var designs: ({ "classic": classicDesign, "reactor": reactorDesign })
+    Component { id: classicDesign; ClassicLayer { core: layerLoader.parent } }
     Component { id: reactorDesign; ReactorLayer { core: layerLoader.parent } }
     Loader {
         id: layerLoader
         anchors.fill: parent
-        // Fail closed: an unknown or empty design is the reactor, never a blank core.
-        sourceComponent: core.designs.hasOwnProperty(core.design) ? core.designs[core.design] : reactorDesign
+        // Fail closed: an unknown or empty design is the classic core, never a blank one.
+        sourceComponent: core.designs.hasOwnProperty(core.design) ? core.designs[core.design] : classicDesign
     }
 }

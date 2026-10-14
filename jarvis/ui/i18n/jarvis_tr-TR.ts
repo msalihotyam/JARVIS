@@ -4426,6 +4426,22 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Özel çok sütunlu komuta düzeni</translation>
     </message>
     <message>
+        <source>Core appearance</source>
+        <translation>Çekirdek görünümü</translation>
+    </message>
+    <message>
+        <source>The familiar JARVIS core</source>
+        <translation>Alışılmış JARVIS çekirdeği</translation>
+    </message>
+    <message>
+        <source>Reactor II</source>
+        <translation>Reactor II</translation>
+    </message>
+    <message>
+        <source>Arc reactor · brass frame and iris</source>
+        <translation>Ark reaktörü · pirinç çerçeve ve diyafram</translation>
+    </message>
+    <message>
         <source>Ambient effects</source>
         <translation>Ortam efektleri</translation>
     </message>

@@ -274,6 +274,8 @@ Item {
         state_: bridge.coreState
         active: Window.active
         environment: !bar.narrow && !Theme.command
+        // The person's core skin (settings); only the visual layer changes.
+        design: bridge.coreSkin
         Behavior on width { NumberAnimation { duration: Theme.reflow; easing.type: Easing.OutCubic } }
     }
     // The core's companion: ONE complete label, immediately right of the core

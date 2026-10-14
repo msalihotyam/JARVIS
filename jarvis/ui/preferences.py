@@ -28,6 +28,8 @@ from jarvis.settings import CLAUDE_MODEL_PATTERN
 
 PREFERENCES_VERSION = 5
 THEMES = ("space", "dark", "command")
+#: The core's look (DFCORESKIN): the first is the default and every fallback.
+CORE_SKINS = ("classic", "reactor")
 #: Execution-status lamp skins: the canonical glass orb, the HUD variant and
 #: the mechanical lamp (Gate 6G S1, the default; the others stay selectable).
 STATUS_INDICATORS = ("orb", "hud", "mechanical")
@@ -825,6 +827,39 @@ class UiPreferences:
         try:
             self.work_panel_path.parent.mkdir(parents=True, exist_ok=True)
             self.work_panel_path.write_text(json.dumps({"version": 1, "collapsed": self._work_panel}), encoding="utf-8")
+        except OSError:
+            pass
+        return True
+
+    # -- DFCORESKIN: the core's look, beside the theme (Salih 2026-10-14) -------
+    #
+    # A seventh sibling file (``<prefs>.core-skin.json``) for the same rollback
+    # reason; a missing or bad file reads as the classic core (the default).
+
+    @property
+    def core_skin_path(self) -> Path:
+        return self.path.with_suffix(".core-skin.json")
+
+    @property
+    def core_skin(self) -> str:
+        if not hasattr(self, "_core_skin"):
+            try:
+                raw = json.loads(self.core_skin_path.read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError, RecursionError):
+                raw = None
+            valid = isinstance(raw, dict) and set(raw) == {"version", "skin"} and raw["version"] == 1 \
+                and type(raw["skin"]) is str and raw["skin"] in CORE_SKINS
+            self._core_skin = raw["skin"] if valid else CORE_SKINS[0]
+        return self._core_skin
+
+    def set_core_skin(self, skin: str) -> bool:
+        """Keep a known skin when different; then save. ``False`` when nothing changed."""
+        if skin not in CORE_SKINS or skin == self.core_skin:
+            return False
+        self._core_skin = skin
+        try:
+            self.core_skin_path.parent.mkdir(parents=True, exist_ok=True)
+            self.core_skin_path.write_text(json.dumps({"version": 1, "skin": skin}), encoding="utf-8")
         except OSError:
             pass
         return True

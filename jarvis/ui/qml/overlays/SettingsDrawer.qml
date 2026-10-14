@@ -107,6 +107,41 @@ ContextPanel {
                 Pill { text: bridge.configRefused ? qsTr("config refused") : bridge.executionEnabled ? qsTr("running") : qsTr("frozen"); tint: bridge.executionEnabled ? Theme.success : Theme.danger }
             }
             Text { width: parent.width; wrapMode: Text.Wrap; text: qsTr("Permission mode: %1. The red control freezes JARVIS at once; resuming asks for confirmation.").arg(bridge.config.permission_mode || qsTr("unavailable")); color: Theme.textMuted; font: Theme.caption }
+            Rectangle { width: parent.width; height: 1; color: Theme.border }
+            // The core's look (DFCORESKIN): applied live, only the visual layer changes. Last, so
+            // every control above keeps its place in the panel.
+            Column { width: parent.width; spacing: 8
+                Text { text: qsTr("Core appearance"); color: Theme.textLabel; font: Theme.body }
+                Repeater {
+                    model: [
+                        {key: "classic", name: qsTr("Classic"), note: qsTr("The familiar JARVIS core"), tone: "#1bbdff"},
+                        {key: "reactor", name: qsTr("Reactor II"), note: qsTr("Arc reactor · brass frame and iris"), tone: "#d2a860"}
+                    ]
+                    Rectangle {
+                        id: skinChoice
+                        objectName: "coreSkin_" + modelData.key
+                        width: parent.width; height: 64; radius: 8
+                        readonly property bool selected: bridge.coreSkin === modelData.key
+                        color: selected ? Theme.alpha(Theme.materialBlue, 0.12) : Theme.glassNested
+                        border.width: 1; border.color: selected ? Theme.alpha(Theme.materialBlue, 0.6) : Theme.glassNestedEdge
+                        activeFocusOnTab: true
+                        Accessible.role: Accessible.Button; Accessible.name: modelData.name
+                        Keys.onSpacePressed: bridge.setCoreSkin(modelData.key)
+                        Keys.onReturnPressed: bridge.setCoreSkin(modelData.key)
+                        Rectangle { x: 12; y: 12; width: 42; height: 40; radius: 5; color: "#031019"; border.width: 1; border.color: modelData.tone
+                            Rectangle { anchors.centerIn: parent; width: 26; height: 26; radius: 13; color: "transparent"; border.width: 3; border.color: Theme.alpha(modelData.tone, 0.45) }
+                            Rectangle { anchors.centerIn: parent; width: 8; height: 8; radius: 4; color: Theme.alpha(modelData.tone, 0.7) }
+                        }
+                        Column { x: 68; anchors.verticalCenter: parent.verticalCenter; spacing: 3
+                            Text { text: modelData.name; color: Theme.text; font: Theme.bodyStrong }
+                            Text { text: modelData.note; color: Theme.textMuted; font: Theme.caption }
+                        }
+                        Icon { anchors.right: parent.right; anchors.rightMargin: 14; anchors.verticalCenter: parent.verticalCenter; visible: skinChoice.selected; name: "check"; size: 14; tint: Theme.materialBlue }
+                        Rectangle { anchors.fill: parent; anchors.margins: 1; radius: parent.radius - 1; color: "transparent"; border.width: 2; border.color: Theme.materialGlint; visible: skinChoice.activeFocus }
+                        MouseArea { anchors.fill: parent; cursorShape: Qt.PointingHandCursor; onClicked: bridge.setCoreSkin(modelData.key) }
+                    }
+                }
+            }
         }
     }
 }

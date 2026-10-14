@@ -3,7 +3,7 @@
 * JarvisCore.qml keeps the one logic block (state, tuning, power, the clock,
   the event language, the bridge hooks); the drawing is a design layer under
   components/core/, chosen by ONE `design` property through a small registry.
-* An unknown or empty design falls back to the reactor: never a blank core.
+* An unknown or empty design falls back to the classic core (DFCORESKIN): never a blank core.
 * The layer only reads `core`: no applyState / fire / stopEvent / Travel, no
   Timer, no animation; JarvisCore references no id inside a layer.
 * Frozen is the only fully still state: the clock stops, nothing runs.
@@ -128,12 +128,14 @@ JarvisCore {{ width: {size}; height: {size}; active: false; design: "{design}" }
         self.assertNotEqual([], self.running(core))
         self.assertEqual([], warnings)
 
-    def test_unknown_or_empty_design_falls_back_to_the_reactor(self) -> None:
+    def test_unknown_or_empty_design_falls_back_to_the_classic_core(self) -> None:
+        # DFCORESKIN: the fallback is the classic core (the default skin), no longer the reactor.
         for design in ("", "bogus"):
             with self.subTest(design=design):
                 core, _bridge, warnings = self.load(design, 324)
                 pump(50)
-                self.assertEqual(1, len(self.layer(core)))
+                self.assertEqual(1, len([o for o in core.findChildren(QObject)
+                                         if o.metaObject().className().startswith("ClassicLayer")]))
                 self.assertEqual([], warnings)
 
     def test_the_layer_only_draws(self) -> None:
