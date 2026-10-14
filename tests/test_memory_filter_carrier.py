@@ -139,7 +139,7 @@ class CarrierClassificationTests(unittest.TestCase):
 
     def test_short_base64_like_run_is_allowed(self):
         self.assertEqual(BASE64_MIN_RUN, 40)
-        self.assertTrue(classify_candidate_text(f"token {PAYLOAD[:BASE64_MIN_RUN - 1]}").allowed)
+        self.assertTrue(classify_candidate_text(f"note {PAYLOAD[:BASE64_MIN_RUN - 1]}").allowed)
 
     def test_plain_prose_stays_allowed(self):
         for text in ALLOWED:
