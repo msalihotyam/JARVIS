@@ -1473,8 +1473,9 @@ class ChatHeaderTests(SidebarNavCase):
                                 six = QFontMetricsF(text.property("font")).horizontalAdvance(text.property("text")[:6] + "…")
                                 self.assertGreaterEqual(text.width() + 0.5, six)
                         # V7 (Global) and F9 H2 (project, its name on the line above): the title has the whole
-                        # row up to "…" (was, for a project: cut beside the 32 % chip).
-                        room = self.box(root, "chatHeaderMenu").left() - 12 - header.left()
+                        # row up to "…" (was, for a project: cut beside the 32 % chip). V2.1a M4: up to the
+                        # all-projects memory switch, the actions' first item now (was: "…").
+                        room = self.box(root, "chatHeaderGlobalMemory").left() - 12 - header.left()
                         self.assertAlmostEqual(min(title.property("implicitWidth"), room), title.width(), delta=0.5)
                         self.assertEqual(title.property("implicitWidth") > room + 0.5, title.property("truncated"))
                         self.assertEqual(bridge.conversationTitle, self.item(root, "chatHeaderTitleTip").property("text"))

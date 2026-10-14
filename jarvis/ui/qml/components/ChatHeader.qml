@@ -143,6 +143,83 @@ Item {
         id: actions
         anchors.right: parent.right; anchors.verticalCenter: parent.verticalCenter
         spacing: 8
+        // V2.1a M4 (I6/I7): the open conversation's "all projects' memory" switch, off by default. It shows
+        // the app's confirmed answer (bridge.globalMemoryEnabled); a click only asks, and a refusal leaves it
+        // where it was. On, a warning says other projects' memory is read in, read-only, and that the
+        // conversation can no longer be moved into a project; the lines take only the room the title can
+        // spare (it keeps up to 35 %, never under its floor; the icon stays, the tip has them whole). Not in the Command preset
+        // (frozen) nor on a read-only (archived) conversation, which takes no turn to use memory in.
+        Item {
+            id: memoryWarning
+            objectName: "chatHeaderGlobalMemoryWarning"
+            visible: memorySwitch.visible && memorySwitch.on
+            anchors.verticalCenter: parent.verticalCenter
+            width: warningRow.implicitWidth; height: warningRow.implicitHeight
+            readonly property real room: Math.max(0, header.width - 12 - 22 - memorySwitch.width - menuButton.width - 3 * actions.spacing
+                - Math.min(title.implicitWidth, Math.max(header.titleFloor, Math.round(header.width * 0.35))))
+            Row {
+                id: warningRow
+                spacing: 6
+                Icon { anchors.verticalCenter: parent.verticalCenter; name: "warning"; size: 16; tint: Theme.warning }
+                Column {
+                    anchors.verticalCenter: parent.verticalCenter
+                    Text { id: warningLine; objectName: "chatHeaderGlobalMemoryWarningText"; anchors.right: parent.right
+                           width: Math.min(implicitWidth, memoryWarning.room); elide: Text.ElideRight; textFormat: Text.PlainText
+                           text: qsTr("Other projects' memory is in use, read-only"); color: Theme.warning; font: Theme.caption }
+                    Text { id: consequenceLine; objectName: "chatHeaderGlobalMemoryConsequence"; anchors.right: parent.right
+                           width: Math.min(implicitWidth, memoryWarning.room); elide: Text.ElideRight; textFormat: Text.PlainText
+                           text: qsTr("This conversation can no longer be moved into a project"); color: Theme.textMuted; font: Theme.caption }
+                }
+            }
+            HoverTip { active: warningLine.truncated || consequenceLine.truncated; text: warningLine.text + "\n" + consequenceLine.text }
+        }
+        Rectangle {
+            id: memorySwitch
+            objectName: "chatHeaderGlobalMemory"
+            readonly property bool on: bridge.globalMemoryEnabled
+            visible: bridge.conversationId !== "" && !header.scopeMenu && !bridge.conversationReadOnly
+            anchors.verticalCenter: parent.verticalCenter
+            width: switchRow.implicitWidth + 20; height: 34; radius: Theme.radiusSmall
+            color: memoryArea.containsMouse ? Theme.alpha(Theme.text, 0.07) : "transparent"
+            Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+            border.width: 1
+            border.color: on ? Theme.alpha(Theme.warning, 0.45) : memoryArea.containsMouse ? Theme.alpha(Theme.accent, 0.45) : "transparent"
+            activeFocusOnTab: true
+            Accessible.role: Accessible.CheckBox; Accessible.name: qsTr("All projects' memory"); Accessible.checked: on
+            Accessible.description: memoryTip.text
+            Accessible.onPressAction: header.toggleGlobalMemory()
+            Accessible.onToggleAction: header.toggleGlobalMemory()
+            Keys.onPressed: function (event) {
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
+                    event.accepted = true; header.toggleGlobalMemory()
+                }
+            }
+            Row {
+                id: switchRow
+                anchors.centerIn: parent; spacing: 8
+                Icon { anchors.verticalCenter: parent.verticalCenter; name: "memory"; size: 16
+                       tint: memorySwitch.on ? Theme.warning : Theme.textLabel }
+                Rectangle {
+                    id: track
+                    objectName: "chatHeaderGlobalMemoryTrack"
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 28; height: 16; radius: 8
+                    color: memorySwitch.on ? Theme.alpha(Theme.warning, 0.3) : Theme.alpha(Theme.text, 0.1)
+                    border.width: 1; border.color: memorySwitch.on ? Theme.warning : Theme.alpha(Theme.text, 0.25)
+                    Rectangle { y: 3; width: 10; height: 10; radius: 5; x: memorySwitch.on ? track.width - width - 3 : 3
+                                color: memorySwitch.on ? Theme.warning : Theme.textLabel
+                                Behavior on x { NumberAnimation { duration: Theme.dur(120); easing.type: Theme.ease } } }
+                }
+            }
+            Rectangle { visible: memorySwitch.activeFocus; anchors.fill: parent; anchors.margins: -3; radius: memorySwitch.radius + 3
+                        color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
+            MouseArea { id: memoryArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                        onClicked: header.toggleGlobalMemory() }
+            // Told before the click (K3): turning it on is one-way for attaching (I7).
+            HoverTip { id: memoryTip; objectName: "chatHeaderGlobalMemoryTip"
+                       text: qsTr("All projects' memory") + "\n" + (memorySwitch.on ? qsTr("Turn off to use only this conversation's own memory. It still cannot be moved into a project.")
+                                             : qsTr("Turn on to also read other projects' memory, read-only. The conversation can then never be moved into a project.")) }
+        }
         Rectangle {
             id: menuButton
             objectName: "chatHeaderMenu"
@@ -186,6 +263,8 @@ Item {
         conversationMenu.openFor("", "", menuButton, Qt.point(menuButton.width - 300, menuButton.height + 6),
                                  title, Qt.point(0, title.height + 10), undefined, undefined, menuButton)
     }
+
+    function toggleGlobalMemory() { bridge.setGlobalMemoryEnabled(!bridge.globalMemoryEnabled) }
 
     // H2: the link opens its project's page ("Genel" has no line here); the preset's chip its menu.
     function pickScope() {

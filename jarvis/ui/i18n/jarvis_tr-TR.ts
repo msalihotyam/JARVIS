@@ -1088,6 +1088,26 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Yeni Sohbet</translation>
     </message>
     <message>
+        <source>Other projects&apos; memory is in use, read-only</source>
+        <translation>Diğer projelerin hafızası salt okunur kullanılıyor</translation>
+    </message>
+    <message>
+        <source>This conversation can no longer be moved into a project</source>
+        <translation>Bu sohbet artık bir projeye taşınamaz</translation>
+    </message>
+    <message>
+        <source>All projects&apos; memory</source>
+        <translation>Tüm projelerin hafızası</translation>
+    </message>
+    <message>
+        <source>Turn off to use only this conversation&apos;s own memory. It still cannot be moved into a project.</source>
+        <translation>Kapatınca yalnız bu sohbetin kendi hafızası kullanılır. Sohbet yine de bir projeye taşınamaz.</translation>
+    </message>
+    <message>
+        <source>Turn on to also read other projects&apos; memory, read-only. The conversation can then never be moved into a project.</source>
+        <translation>Açınca diğer projelerin hafızası da salt okunur olarak kullanılır. Sohbet bundan sonra hiçbir zaman bir projeye taşınamaz.</translation>
+    </message>
+    <message>
         <source>Conversation actions</source>
         <translation>Sohbet işlemleri</translation>
     </message>
