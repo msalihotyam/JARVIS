@@ -114,7 +114,6 @@ from jarvis.contracts import (
     ProjectMemoryItem,
     ProjectRecord,
     ResultVerifier,
-    RetrievedContext,
     RunStatus,
     SessionState,
     SessionSummary,
@@ -4366,23 +4365,19 @@ class JarvisApp:
         """V2.1a M3b: the chat turn's typed memory, ``{}`` or
         ``{"retrieved_memory": block}`` for the understanding call's context.
 
-        Core decides everything (``AgentCore._with_typed_memory``: project
+        Core decides everything (``AgentCore.typed_memory_for``: project
         scope, the conversation's global toggle, approved records only,
         provenance labels); the block is the connector's re-validated egress
         view, labelled untrusted data. The app only names the scope: the
-        owner, and a session only while it belongs to THIS conversation - else
-        no conversation, so no global toggle (fail closed). Global and any
-        failure get nothing."""
+        owner and this conversation (a conversation-less CLI turn names its
+        session's linked one). Global and any failure get nothing."""
         if owner is None:
             return {}
         try:
-            view = SessionState(objective=text, project_id=owner)
-            if session is not None and (
-                conversation_id is None or self.memory.conversation_for_session(session.id) == conversation_id
-            ):
-                view.id = session.id
+            if conversation_id is None and session is not None:
+                conversation_id = self.memory.conversation_for_session(session.id)
             probe = Task(objective=text, capability=INTENT_CAPABILITY, scope=scope)
-            probe.retrieved_context = self.core._with_typed_memory(view, probe, RetrievedContext())
+            probe.retrieved_context = self.core.typed_memory_for(owner, conversation_id, probe)
             block, _ = ClaudeCodeConnector._retrieved_memory(probe)
         except Exception:  # noqa: BLE001 - informational context; deliver nothing
             return {}

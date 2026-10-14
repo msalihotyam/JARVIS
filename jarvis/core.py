@@ -693,6 +693,9 @@ _SKILL_OFFER_MESSAGE = "Bunu beceri olarak kaydedeyim mi?"
 #: A run is learned from only when everything in it was at most this sensitive.
 _SKILL_LEARN_CLASSES = (DataClassification.PUBLIC, DataClassification.INTERNAL)
 
+#: ``_with_typed_memory``'s default: the conversation is the session's link.
+_SESSION_CONVERSATION: Any = object()
+
 
 def _retrieved_item_characters(item: RetrievedMemoryItem) -> int:
     """The character contribution ``build_retrieved_context`` counts."""
@@ -5928,6 +5931,36 @@ class AgentCore:
             instruction, task.scope.data_classification
         )
 
+    def typed_memory_for(
+        self, project_id: str | None, conversation_id: str | None, task: Task
+    ) -> RetrievedContext:
+        """The typed memory Core delivers for ``task`` in this scope - the
+        same items ``_with_typed_memory`` adds to a run - for a caller with
+        no run, such as the chat turn's understanding call.
+
+        Core resolves the scope itself: the conversation's global toggle
+        applies only when ``conversation_id`` names a stored conversation of
+        ``project_id``. An unknown, foreign or malformed id is no
+        conversation (own-project memory only, no toggle); a project-less or
+        malformed ``project_id`` gets nothing. Read-only; every item is
+        labelled untrusted data and RULE delivery is Core's re-proof."""
+        if type(project_id) is not str or not project_id:
+            return RetrievedContext()
+        conversation = None
+        if type(conversation_id) is str and conversation_id:
+            try:
+                record = self.memory.load_conversation(conversation_id)
+            except Exception:  # noqa: BLE001 - storage boundary; no conversation
+                record = None
+            if record is not None and record.project_id == project_id:
+                conversation = conversation_id
+        return self._with_typed_memory(
+            SessionState(objective="typed memory", project_id=project_id),
+            task,
+            RetrievedContext(),
+            conversation_id=conversation,
+        )
+
     def _with_typed_memory(
         self,
         session: SessionState,
@@ -5935,6 +5968,7 @@ class AgentCore:
         base: RetrievedContext,
         *,
         reprove: bool = False,
+        conversation_id: str | None | object = _SESSION_CONVERSATION,
     ) -> RetrievedContext:
         """V2.1a M3: append task-targeted typed memory records to ``base``.
 
@@ -5967,7 +6001,8 @@ class AgentCore:
         if project_id is None or limit <= 0 or (reprove and not held):
             return legacy
         try:
-            conversation_id = self.memory.conversation_for_session(session.id)
+            if conversation_id is _SESSION_CONVERSATION:
+                conversation_id = self.memory.conversation_for_session(session.id)
             global_on = bool(conversation_id) and self.memory.global_memory_enabled(conversation_id)
             query_text = "\n".join(
                 (task.objective, task.capability, task.scope.action, task.scope.target)

@@ -136,8 +136,30 @@ class ChatMemoryInjectTests(unittest.TestCase):
         sibling = self.store.create_conversation(self.alpha).id
         self.assertEqual({"deploy uses uv"},
                          set(self.texts(self.chat(conversation=sibling, session_id=linked))))
-        # No session tied to this conversation: no toggle (fail closed).
-        self.assertEqual({"deploy uses uv"}, set(self.texts(self.chat())))
+        # No session tied to this conversation: Core still reads ITS toggle.
+        self.assertEqual({"deploy uses uv", "deploy needs a VPN"}, set(self.texts(self.chat())))
+
+    def test_a_conversation_less_turn_names_its_sessions_linked_conversation(self) -> None:
+        self.record(self.alpha, MemoryRecordKind.FACT, "deploy uses uv", approve=True)
+        self.record(self.beta, MemoryRecordKind.FACT, "deploy needs a VPN", approve=True)
+        sibling = self.store.create_conversation(self.alpha).id
+        self.store.set_global_memory_toggle(self.conversation, True, MemoryRecordActor.USER)
+
+        def cli_chat(linked_to):
+            session = SessionState(objective="cli session", project_id=self.alpha)
+            self.store.save_session(session)
+            self.store.link_session_conversation(session.id, linked_to)
+            model = ScriptedModel(chat_proposal("ok"))
+            app = create_app(settings=self.settings, memory=self.store, registry=ToolRegistry(),
+                             destination_policy=frozenset(), intent_model=model)
+            app.submit_text("deploy checklist", session.id)
+            (task,) = model.calls
+            return set(self.texts(task))
+
+        self.assertEqual({"deploy uses uv", "deploy needs a VPN"}, cli_chat(self.conversation))
+        # Linked to a sibling conversation (toggle off): only ITS toggle counts.
+        # (The store refuses a link to another project's conversation.)
+        self.assertEqual({"deploy uses uv"}, cli_chat(sibling))
 
     def test_memory_off_or_empty_leaves_the_request_unchanged(self) -> None:
         empty = self.chat()
@@ -170,6 +192,27 @@ class ChatMemoryInjectTests(unittest.TestCase):
             self.assertNotIn(CHAT_MEMORY_KEY, self.chat().context)
         with mock.patch.object(AgentCore, "_with_typed_memory", side_effect=RuntimeError("boom")):
             self.assertNotIn(CHAT_MEMORY_KEY, self.chat().context)
+
+    def test_the_chat_path_touches_no_private_core_member(self) -> None:
+        self.record(self.alpha, MemoryRecordKind.FACT, "deploy uses uv", approve=True)
+        model = ScriptedModel(chat_proposal("ok"))
+        app = create_app(settings=self.settings, memory=self.store, registry=ToolRegistry(),
+                         destination_policy=frozenset(), intent_model=model)
+        core, touched = app.core, []
+
+        class PublicCore:
+            def __getattr__(self, name):
+                touched.append(name)
+                if name.startswith("_"):
+                    raise AttributeError(f"private Core member on the chat path: {name}")
+                return getattr(core, name)
+
+        app.core = PublicCore()
+        app.submit_text("deploy checklist", conversation_id=self.conversation)
+        self.assertIn("typed_memory_for", touched)
+        self.assertEqual([], [name for name in touched if name.startswith("_")])
+        (task,) = model.calls
+        self.assertEqual({"deploy uses uv"}, set(self.texts(task)))
 
 
 if __name__ == "__main__":

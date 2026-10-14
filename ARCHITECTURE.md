@@ -3565,8 +3565,11 @@ açık bir kanaldır.
   hiçbir şey almaz. 5 öğe / 4.000 karakterlik getirilen hafıza kotası dışında
   kalır; RULE hafızası değişmez. Sağlayıcı/model değişimi hangi talimatın
   uygulandığını değiştirmez. Niyet yolunun "yalnız istek ve katalog" kuralı
-  yalnız bu açık-kullanıcı alanıyla genişler; getirilen hafıza, planlar ve
-  dosya alıntıları niyet yoluna yine asla girmez.
+  yalnız bu açık-kullanıcı alanıyla ve Core'un tipli hafızasıyla genişler:
+  `AgentCore.typed_memory_for(proje, konuşma, görev)` sonucu niyet yükünde
+  `context.retrieved_memory` altında güvenilmez veri olarak taşınır (V2.1a
+  M3b; kapsamı ve konuşmanın global anahtarını Core çözer). Planlar ve dosya
+  alıntıları niyet yoluna yine asla girmez.
 - **Yetki değildir (§4.22 ile aynı):** talimatın metni veya varlığı onay
   fingerprint'i hesaplamaları dışında hiçbir yetki kararı tarafından okunmaz:
   grant/hatırlanan grant, hedef politikası ve seçimi

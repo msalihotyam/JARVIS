@@ -1529,13 +1529,14 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         return super()._usage(task, payload, *args, **kwargs)
 
     def _sanitized_payload(self, task: Task) -> tuple[dict[str, Any], int]:
-        # The request, the catalog and - Gate 4 - the scoped project's
-        # explicit-user instruction, and nothing else. No plan, no
-        # preferences, no retrieved memory, no file excerpt: what the user
-        # typed, the one standing instruction the project owner wrote for
-        # this project (under its own key and notice, never inside
-        # ``request``), and what this installation can do, all
-        # credential-redacted.
+        # The request, the catalog, - Gate 4 - the scoped project's
+        # explicit-user instruction and - V2.1a M3b - Core's typed memory,
+        # and nothing else. No plan, no preferences, no file excerpt: what
+        # the user typed, the one standing instruction the project owner
+        # wrote for this project (under its own key and notice, never inside
+        # ``request``), the labelled records ``AgentCore.typed_memory_for``
+        # chose (under ``context.retrieved_memory``, as untrusted data), and
+        # what this installation can do, all credential-redacted.
         #
         # The catalog changes only when the installation does, so it travels
         # in the system prompt (see ``_command``): a stable prefix the provider
