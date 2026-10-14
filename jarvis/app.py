@@ -3759,8 +3759,42 @@ def _turn_timing(turn: Mapping[str, Any], now: float) -> dict[str, Any]:
     return timing
 
 
+#: Quiet time after a conversation's last chat turn before one idle capture
+#: runs (SECIDLE). A constant, not a setting.
+MEMORY_IDLE_TRIGGER_SECONDS = 20 * 60
+#: How often the idle watch looks; an idle capture starts at most this late.
+MEMORY_IDLE_POLL_SECONDS = 60.0
+#: The idle job's trigger in the worker queue (Core has no idle origin: it
+#: runs as a session-end capture of the turns not captured yet).
+_IDLE = "idle"
+
+
+def _quota_remaining_pct(model: Any) -> float | None:
+    """Percent left in the fullest window the adapter last REPORTED, or ``None``.
+
+    Claude Code reports ``utilization`` as a fraction, Codex ``used_percent``
+    (and ``limit_reached``). Nothing is estimated: no report means unknown.
+    """
+    try:
+        last = list(getattr(model, "observed", None).values())[-1]
+        limits, quota = last.get("rate_limits"), last.get("quota")
+    except Exception:  # noqa: BLE001 - no readable report is an unknown quota
+        return None
+    used: list[float] = []
+    windows = limits.get("windows") if isinstance(limits, dict) else None
+    for window in windows.values() if isinstance(windows, dict) else ():
+        if isinstance(window, dict) and type(window.get("utilization")) is float:
+            used.append(window["utilization"] * 100)
+    for window in quota.values() if isinstance(quota, dict) else ():
+        if isinstance(window, dict) and type(window.get("used_percent")) is float:
+            used.append(window["used_percent"])
+    if isinstance(quota, dict) and quota.get("limit_reached") is True:
+        used.append(100.0)
+    return 100.0 - max(used) if used else None
+
+
 class MemoryTriggers:
-    """Process-wide SessionEnd / PreCompact capture worker (V2.1a M2).
+    """Process-wide SessionEnd / PreCompact / idle capture worker (V2.1a M2).
 
     It only schedules: Core decides every record. Each conversation has at
     most one draining thread; jobs that arrive meanwhile queue behind it. A
@@ -3773,9 +3807,9 @@ class MemoryTriggers:
     next capture. Every capture write goes through one ``CaptureStop``.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
         self._lock = threading.Lock()
-        self._jobs: dict[str, list[tuple[Any, MemoryRecordOrigin, tuple[Any, ...] | None]]] = {}
+        self._jobs: dict[str, list[tuple[Any, Any, tuple[Any, ...] | None]]] = {}
         self._threads: dict[str, threading.Thread] = {}
         # ponytail: process-local high-water mark of seqs handed to capture;
         # a restart re-offers turns and Core's run-id ledger dedupes them.
@@ -3792,8 +3826,63 @@ class MemoryTriggers:
         #: batch is within it). Any other outcome drops it, so no turn is
         #: offered again after a run that could have written records.
         self._carry: dict[str, tuple[Any, ...]] = {}
+        #: conversation -> clock at its last chat turn; popped when idle fires.
+        self._active: dict[str, float] = {}
+        self._clock = clock
+        #: The idle watch's own stop; capture writes stay on ``_stop``.
+        self._watch_stop = threading.Event()
+        self._watcher: threading.Thread | None = None
+        #: What idle jobs run with: the watch's app or current-app resolver,
+        #: never the app of the chat turn that armed the conversation.
+        self._idle_target: Any = None
 
-    def schedule(self, app: Any, conversation_id: str, trigger: MemoryRecordOrigin,
+    def touch(self, conversation_id: str, *, temporary: bool = False) -> None:
+        """Chat activity: (re)arm the conversation's idle capture. A temporary
+        conversation (anything but ``False``) is never armed, so never captured."""
+        with self._lock:
+            if temporary is not False:
+                self._active.pop(conversation_id, None)
+            elif not self._closed and conversation_id:
+                self._active[conversation_id] = self._clock()
+
+    def start_idle_watch(self, target: Any, interval: float = MEMORY_IDLE_POLL_SECONDS) -> None:
+        """Start the one idle-watch thread (the UI's process); idle jobs run
+        with ``target`` (an app or a resolver, as ``schedule``; the latest call's
+        wins). Shutdown stops it."""
+        with self._lock:
+            if self._closed:
+                return
+            self._idle_target = target
+            if self._watcher is not None:
+                return
+            self._watcher = threading.Thread(target=self._watch, args=(interval,),
+                                             name="jarvis-capture-idle", daemon=True)
+            self._watcher.start()
+
+    def _watch(self, interval: float) -> None:
+        while not self._watch_stop.wait(interval):
+            try:
+                self.poll_idle()
+            except Exception:  # noqa: BLE001 - the watch never dies on one poll
+                pass
+
+    def poll_idle(self) -> int:
+        """Schedule one capture per conversation quiet for
+        ``MEMORY_IDLE_TRIGGER_SECONDS``; it re-arms only on new chat activity."""
+        now = self._clock()
+        with _REPLYING_LOCK:
+            replying = set(_REPLYING)  # a reply still streaming is not idle
+        with self._lock:
+            target = self._idle_target
+            if target is None:  # no watch: nothing to run idle jobs with
+                return 0
+            due = [cid for cid, seen in self._active.items()
+                   if now - seen >= MEMORY_IDLE_TRIGGER_SECONDS and cid not in replying]
+            for cid in due:
+                del self._active[cid]
+        return sum(self.schedule(target, cid, _IDLE) for cid in due)
+
+    def schedule(self, app: Any, conversation_id: str, trigger: MemoryRecordOrigin | str,
                  turns: Iterable[Any] | None = None) -> bool:
         with self._lock:
             if self._closed or not conversation_id:
@@ -3853,7 +3942,48 @@ class MemoryTriggers:
             else:
                 self._carry.pop(conversation_id, None)
 
-    def _run(self, app: Any, conversation_id: str, trigger: MemoryRecordOrigin,
+    def _run_idle(self, app: Any, conversation_id: str, model: Any, stop: CaptureStop) -> None:
+        # Core refuses these too, but only after a claim: no ledger row for a
+        # Global conversation or one that ever used all-projects memory.
+        if not capture_gate_open(app.memory, conversation_id):
+            return
+        raw = app.memory.load_conversation_state(conversation_id).turns
+        with self._lock:
+            mark = self._captured.get(conversation_id, 0)
+        fresh = tuple(turn for turn in raw if turn.seq > mark)
+        # Core's own skip rule, before any claim or call: a short session or
+        # a reported quota below the floor costs nothing. Temporary
+        # conversations are never armed (touch), so never reach this.
+        if not fresh or memory_capture.extraction_skip_reason(
+            fresh, temporary=False, quota_remaining_pct=_quota_remaining_pct(model)
+        ) is not None:
+            return
+        key = f"{conversation_id}|{_IDLE}|{fresh[0].id}|{fresh[-1].id}"
+        run_id = "idle-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        # The window's claim: a second idle over the same turns - after a
+        # restart, or from another process - makes no call. The table has no
+        # idle trigger (schema stays), and idle is a session-end capture.
+        # Claim and finish are capture writes: after halt they raise
+        # CaptureCancelled and shutdown's abort closes the open run.
+        with stop.write():
+            if not _claim_capture_run(app.memory, run_id, conversation_id, "session_end"):
+                return
+        outcome: Any = None
+        try:
+            if fresh == raw:
+                outcome = app.core.capture_memory(
+                    conversation_id, MemoryRecordOrigin.CAPTURE_SESSION_END, model, stop=stop)
+            else:
+                outcome = app.core.capture_memory(
+                    conversation_id, MemoryRecordOrigin.CAPTURE_SESSION_END, model, turns=fresh, stop=stop)
+            self._mark(conversation_id, fresh, outcome)
+        finally:
+            done = getattr(outcome, "outcome", None)
+            with stop.write():
+                _finish_capture_run(app.memory, MemoryCaptureOutcome(
+                    run_id=run_id, outcome=done if type(done) is str else "internal_error"))
+
+    def _run(self, app: Any, conversation_id: str, trigger: MemoryRecordOrigin | str,
              turns: tuple[Any, ...] | None) -> None:
         if self._stop.stopped:  # halted: not even a resolver's store opens
             return
@@ -3866,6 +3996,9 @@ class MemoryTriggers:
         if model is None:
             return
         stop = self._stop
+        if trigger == _IDLE:
+            self._run_idle(app, conversation_id, model, stop)
+            return
         if trigger is MemoryRecordOrigin.CAPTURE_PRECOMPACT:
             batch, new = self._with_carry(conversation_id, turns or ())
             if new:
@@ -3898,6 +4031,8 @@ class MemoryTriggers:
         model calls are cancelled."""
         with self._lock:
             self._closed = True
+            self._active.clear()
+        self._watch_stop.set()
         return self._stop.stop(timeout)
 
     def shutdown(self, app: Any, open_ids: Iterable[str] = (), timeout: float = 5.0) -> tuple[str, ...]:
@@ -3916,7 +4051,12 @@ class MemoryTriggers:
             self.schedule(app, conversation_id, MemoryRecordOrigin.CAPTURE_SESSION_END)
         with self._lock:
             self._closed = True
+            self._active.clear()
             threads = dict(self._threads)
+            watcher = self._watcher
+        self._watch_stop.set()
+        if watcher is not None:
+            watcher.join(max(0.0, deadline - reserve - time.monotonic()))
         for thread in threads.values():
             thread.join(max(0.0, deadline - reserve - time.monotonic()))
         self.halt(max(0.0, deadline - time.monotonic()))
@@ -4037,6 +4177,9 @@ class JarvisApp:
             if capture_gate_open(store, conversation_id):
                 triggers.schedule(target, conversation_id, MemoryRecordOrigin.CAPTURE_PRECOMPACT, turns)
         register_precompact_hook(store, hook)
+        # Idle capture watches only where conversations are watched (the UI),
+        # with the same current-app resolver.
+        triggers.start_idle_watch(target)
 
     def conversation_left(self, conversation_id: str) -> bool:
         """SessionEnd: switch, new conversation or archive. Delete never calls this."""
@@ -4051,8 +4194,13 @@ class JarvisApp:
 
     def submit_text(self, text: str, session_id: str | None = None, **kwargs: Any) -> CommandResult:
         """``_submit_text``, with its conversation marked as replying meanwhile."""
-        with _replying(kwargs.get("conversation_id")):
-            return self._submit_text(text, session_id, **kwargs)
+        conversation_id = kwargs.get("conversation_id")
+        try:
+            with _replying(conversation_id):
+                return self._submit_text(text, session_id, **kwargs)
+        finally:
+            if conversation_id:
+                self.memory_triggers.touch(conversation_id)
 
     def _submit_text(
         self,
