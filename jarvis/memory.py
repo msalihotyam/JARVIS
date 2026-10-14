@@ -6690,10 +6690,15 @@ class SQLiteMemoryStore:
         text, _ = redact_credentials(text)
         text = redact_local_paths(text)
         stored = replace(record, text=text)
-        # The stored text is what retrieval delivers, so it is checked too.
-        verdict = classify_candidate_text(stored.text)
-        if not verdict.allowed:
-            raise MemoryRecordRefused(verdict.category)
+        # The stored text is what retrieval delivers, so it is checked too;
+        # so is the subject key, which is stored and indexed as well.
+        # ponytail: the key arrives normalized (casefolded, punctuation to
+        # "-"), which hides case/punctuation-shaped secrets (ghp_, AKIA) from
+        # the filter; check the raw key at the writer if that matters.
+        for checked in (stored.text, stored.subject_key):
+            verdict = classify_candidate_text(checked)
+            if not verdict.allowed:
+                raise MemoryRecordRefused(verdict.category)
         status = (
             MemoryRecordStatus.APPROVED
             if not needs_user_approval(stored.kind)
@@ -7508,12 +7513,14 @@ class SQLiteMemoryStore:
     @staticmethod
     def _view_readable(view: MemoryRecordView, scope: MemoryRecordScope) -> bool:
         """Project reads trust the store; a global read re-applies the
-        never-stored filter and the SECRET ban to every row it returns."""
+        never-stored filter (text and subject key) and the SECRET ban to
+        every row it returns."""
         if scope.kind is not MemoryRecordScopeKind.GLOBAL_READONLY:
             return True
         return (
             view.record.classification is not DataClassification.SECRET
             and classify_candidate_text(view.record.text).allowed
+            and classify_candidate_text(view.record.subject_key).allowed
         )
 
     def _legacy_record_views(self, project_id: str) -> list[MemoryRecordView]:
