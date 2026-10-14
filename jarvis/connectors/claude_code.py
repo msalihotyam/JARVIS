@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from jarvis.connectors.base import BaseConnector, ConnectorManifest
+from jarvis.connectors.local_files import protected_paths
 from jarvis.contracts import (
     PROJECT_FILES_KEY,
     render_project_files_block,
@@ -327,12 +328,23 @@ class ClaudeCodeConnector(BaseConnector):
         auth_probe_timeout_seconds: int = 20,
         model: str | None = None,
         effort: str | None = None,
+        protected_roots: tuple[str | Path, ...] = (),
     ) -> None:
         default_root = Path(default_working_directory or Path.cwd()).resolve()
         roots = allowed_roots or (default_root,)
         self.allowed_roots = tuple(Path(root).resolve() for root in roots)
         if not self.allowed_roots:
             raise ValueError("At least one allowed root is required")
+        #: JARVIS's own folders (its data directory): never a working
+        #: directory or target, even inside an allowed root (V2.2 b6).
+        self.protected_roots = protected_paths(protected_roots)
+        self._protected_identity: set[tuple[int, int]] = set()
+        for protected in self.protected_roots:
+            try:
+                info = os.stat(protected)
+            except OSError:
+                continue
+            self._protected_identity.add((info.st_dev, info.st_ino))
         # The identity of each root AS AN OBJECT, captured here at
         # construction, so the no-follow working-directory scan is anchored to
         # the directory that was authorized rather than to its pathname. A root
@@ -1010,12 +1022,26 @@ class ClaudeCodeConnector(BaseConnector):
         info = self._reject_reparse_chain(root, path.relative_to(root).parts)
         if not stat.S_ISDIR(info.st_mode):
             raise ValueError("Working directory does not exist.")
+        # An 8.3 alias of a protected folder passes the lexical check, so the
+        # chain (proven link-free above) is matched by object identity too,
+        # with no-follow lstat only - nothing here resolves the caller's name.
+        probe = path
+        while self._protected_identity:
+            probe_info = os.lstat(probe)
+            if (probe_info.st_dev, probe_info.st_ino) in self._protected_identity:
+                raise ValueError(f"Working directory is outside allowed roots: {path}")
+            if probe == root:
+                break
+            probe = probe.parent
         return path
 
     def _within_allowed_roots(self, path: Path) -> bool:
         """Containment over resolved paths; ``Path`` equality is case-aware
-        per platform, so a Windows casing variant cannot escape."""
-        return any(path == root or root in path.parents for root in self.allowed_roots)
+        per platform, so a Windows casing variant cannot escape. A protected
+        folder is outside however it sits under a root."""
+        return any(path == root or root in path.parents for root in self.allowed_roots) and not any(
+            path == protected or protected in path.parents for protected in self.protected_roots
+        )
 
     def _command(self, prompt: str) -> list[str]:
         empty_mcp = json.dumps({"mcpServers": {}}, separators=(",", ":"))

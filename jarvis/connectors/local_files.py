@@ -1313,6 +1313,14 @@ def _preimage_binding_refusal(
     return None
 
 
+def protected_paths(roots: Iterable[str | Path]) -> tuple[Path, ...]:
+    """Each protected folder as spelled (lexically absolute) AND as resolved,
+    so an 8.3, SUBST or junction spelling of it cannot hide it."""
+    roots = tuple(roots)
+    spelled = tuple(Path(os.path.abspath(root)) for root in roots)
+    return spelled + tuple(Path(root).resolve() for root in roots)
+
+
 class LocalFileWriteConnector(_RootBoundLocalConnector):
     """Write exactly one in-root UTF-8 text file, once approved.
 
@@ -1339,6 +1347,20 @@ class LocalFileWriteConnector(_RootBoundLocalConnector):
     """
 
     _billing_evidence = "local_write:no_external_call"
+
+    def __init__(self, *args: Any, protected_roots: Iterable[str | Path] = (), **kwargs: Any) -> None:
+        """``protected_roots``: JARVIS's own folders (its data directory). No
+        write lands in or below one, even inside an allowed root (V2.2 b6)."""
+        super().__init__(*args, **kwargs)
+        self.protected_roots = protected_paths(protected_roots)
+
+    def _within_allowed_roots(self, path: Path) -> bool:
+        """Every containment check of this connector - the typed name and each
+        handle-proven path - routes through here, so the protected folders
+        are refused by all of them."""
+        return super()._within_allowed_roots(path) and not any(
+            path == protected or protected in path.parents for protected in self.protected_roots
+        )
 
     manifest = ConnectorManifest(
         name="local-file-write",
