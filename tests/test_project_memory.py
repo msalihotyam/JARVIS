@@ -36,7 +36,7 @@ from jarvis.destinations import (
     DestinationGrant,
 )
 from jarvis.core import AgentCore
-from jarvis.memory import SCHEMA_VERSION, SQLiteMemoryStore
+from jarvis.memory import SCHEMA_VERSION, MemoryRecordRefused, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
 from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_core, safe_cleanup
@@ -224,11 +224,18 @@ class MemoryWriteTests(ProjectMemoryTestCase):
 
     def test_hygiene_uses_canonical_helpers_without_mutilating_content(self) -> None:
         self.create_project()
-        stored = self.memory.save_memory_item(
-            self.item("Deploy notu: api_key=sk-abc123def456ghi789jkl her zaman gizli kalmali")
-        )
-        self.assertNotIn("sk-abc123def456ghi789jkl", stored.text)
-        self.assertIn("[REDACTED]", stored.text)
+        # Filtered secrets are never stored in any scope: refused before any INSERT.
+        with self.assertRaises(MemoryRecordRefused):
+            self.memory.save_memory_item(
+                self.item("Deploy notu: api_key=sk-abc123def456ghi789jkl her zaman gizli kalmali")
+            )
+        connection = sqlite3.connect(self.database)
+        try:
+            self.assertEqual(
+                0, connection.execute("SELECT COUNT(*) FROM project_memory_items").fetchone()[0]
+            )
+        finally:
+            connection.close()
         stored_path = self.memory.save_memory_item(
             self.item(r"Konfig dosyasi C:\Users\someone\jarvis\settings.toml icinde durur")
         )
@@ -240,7 +247,7 @@ class MemoryWriteTests(ProjectMemoryTestCase):
         self.assertEqual(prose, self.memory.save_memory_item(self.item(prose)).text)
         # What the store returns is exactly what a later read returns.
         listed = {item.id: item for item in self.memory.list_memory_items("proj-a")}
-        self.assertEqual(stored.text, listed[stored.id].text)
+        self.assertEqual(stored_path.text, listed[stored_path.id].text)
 
     def test_insert_only_with_supersede_keeps_old_content(self) -> None:
         self.create_project()

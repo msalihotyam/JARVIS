@@ -246,26 +246,27 @@ class CliTestCase(unittest.TestCase):
         self.assertEqual("proj-a", created["project"]["id"])
         self.assertEqual(1, len(self.memory.list_projects()))
 
-        code, output, _ = self.invoke(
-            [
-                "memory",
-                "add",
-                "--project",
-                "proj-a",
-                "--kind",
-                "fact",
-                "--classification",
-                "internal",
-                "--text",
-                "api_key=sk-abc123def456 goes through canonical hygiene",
-            ],
-            app_factory=_must_not_build,
-        )
+        def add(text):
+            return self.invoke(
+                [
+                    "memory", "add", "--project", "proj-a", "--kind", "fact",
+                    "--classification", "internal", "--text", text,
+                ],
+                app_factory=_must_not_build,
+            )
+
+        # Filtered secrets are never stored in any scope: refused, text not echoed.
+        code, output, errors = add("api_key=sk-abc123def456 goes through canonical hygiene")
+        self.assertEqual(cli.EXIT_INVALID_INPUT, code)
+        self.assertIn("memory record refused: env_secret", output + errors)
+        self.assertNotIn("sk-abc123def456", output + errors)
+
+        code, output, _ = add(r"Config lives in C:\Users\someone\jarvis\settings.toml via canonical hygiene")
         self.assertEqual(0, code)
         added = json.loads(output)
         self.assertEqual("memory-add", added["command"])
-        self.assertNotIn("sk-abc123def456", added["item"]["text"])
-        self.assertIn("[REDACTED]", added["item"]["text"])
+        self.assertNotIn("someone", added["item"]["text"])
+        self.assertIn("[PATH]", added["item"]["text"])
 
         code, output, _ = self.invoke(
             ["memory", "list", "--project", "proj-a"],

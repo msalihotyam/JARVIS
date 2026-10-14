@@ -267,7 +267,9 @@ class MemoryScopeLeakTests(unittest.TestCase):
         with mock.patch("jarvis.memory.classify_candidate_text", allow):
             leak = self.record(self.beta, MemoryRecordKind.FACT, "deploy credentials note", SECRET_KEY)
         own_read = self.store.search_records("deploy credentials", MemoryRecordScope(self.beta))
-        self.assertEqual([leak], [v.record.record_id for v, _ in own_read])  # positive control
+        # Filtered secrets are never delivered in any scope (I20); the row stays stored (I8).
+        self.assertEqual([], [v.record.record_id for v, _ in own_read])
+        self.assertIn(leak, self.state())
         self.toggle(True)
         self.assertTrue(
             self.foreign <= {v.record.record_id for v in self.store.list_records(self.global_scope())}

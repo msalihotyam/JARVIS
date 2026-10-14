@@ -6708,6 +6708,12 @@ class SQLiteMemoryStore:
             )
         text, _ = redact_credentials(text)
         text = redact_local_paths(text)
+        # The never-stored filter, as in _persist_record: the raw text and
+        # the stored (delivered) text; refused means nothing is written.
+        for checked in (item.text, text):
+            verdict = classify_candidate_text(checked)
+            if not verdict.allowed:
+                raise MemoryRecordRefused(verdict.category)
         # Defense in depth on the provenance detail: the record contract
         # already ran the one canonical hygiene pipeline, and the storage
         # boundary re-runs it rather than trusting the object it was handed.
@@ -6817,7 +6823,7 @@ class SQLiteMemoryStore:
             rows = connection.execute(sql, (project_id,)).fetchall()
         items: list[ProjectMemoryItem] = []
         for row in rows:
-            item = self._memory_item_from_row(row)
+            item = self._deliverable_memory_item(row)
             if item is not None:
                 items.append(item)
         return items
@@ -6919,6 +6925,16 @@ class SQLiteMemoryStore:
             )
         except (TypeError, KeyError, ValueError):
             return None
+
+    @classmethod
+    def _deliverable_memory_item(cls, row: sqlite3.Row) -> ProjectMemoryItem | None:
+        """The loader plus the never-stored filter (I20): an item the filter
+        refuses (stored before it, or past it) is never delivered. Retire
+        keeps the bare loader so such an item can still be retired."""
+        item = cls._memory_item_from_row(row)
+        if item is None or not classify_candidate_text(item.text).allowed:
+            return None
+        return item
 
     # --- V2.1 typed record store (insert-only, status events, undo) ---------
     #
@@ -8499,14 +8515,16 @@ class SQLiteMemoryStore:
 
     @staticmethod
     def _view_readable(view: MemoryRecordView, scope: MemoryRecordScope) -> bool:
-        """Project reads trust the store; a global read re-applies the
-        never-stored filter (text and subject key) and the SECRET ban to
-        every row it returns."""
-        if scope.kind is not MemoryRecordScopeKind.GLOBAL_READONLY:
-            return True
+        """Every read re-applies the never-stored filter (text and subject
+        key) to every row it returns (I20), so a row stored before a filter
+        change is never delivered; a global read also bans SECRET rows."""
+        if (
+            scope.kind is MemoryRecordScopeKind.GLOBAL_READONLY
+            and view.record.classification is DataClassification.SECRET
+        ):
+            return False
         return (
-            view.record.classification is not DataClassification.SECRET
-            and classify_candidate_text(view.record.text).allowed
+            classify_candidate_text(view.record.text).allowed
             and classify_candidate_text(view.record.subject_key).allowed
         )
 
@@ -8530,7 +8548,7 @@ class SQLiteMemoryStore:
             ).fetchall()
         views: list[MemoryRecordView] = []
         for row in rows:
-            item = self._memory_item_from_row(row)
+            item = self._deliverable_memory_item(row)
             if item is None or item.kind not in _LEGACY_RECORD_KINDS:
                 continue
             explicit = item.origin is MemoryOrigin.EXPLICIT_USER
@@ -8714,7 +8732,7 @@ class SQLiteMemoryStore:
             candidates.append((record, self._classification_from_state(row[1])))
         project_candidates: list[ProjectMemoryItem] = []
         for row in item_rows:
-            item = self._memory_item_from_row(row)
+            item = self._deliverable_memory_item(row)
             if item is not None:
                 project_candidates.append(item)
         return build_retrieved_context(
@@ -8858,7 +8876,7 @@ class SQLiteMemoryStore:
                 "FROM project_memory_items WHERE id = ?",
                 (item_id,),
             ).fetchone()
-        item = self._memory_item_from_row(row) if row is not None else None
+        item = self._deliverable_memory_item(row) if row is not None else None
         if item is None:
             return None
         if item.project_id != project_id:
