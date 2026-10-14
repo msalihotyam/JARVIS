@@ -18,12 +18,14 @@ import hashlib
 import json
 import math
 import re
+import sqlite3
 import threading
 import time
 from collections import Counter
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
+from functools import cached_property
 from pathlib import Path
 from typing import AbstractSet, Any, Callable, Iterable, Mapping
 from uuid import uuid4
@@ -248,6 +250,30 @@ from jarvis.settings import (
     ConfigError,
     ConfigStore,
     Settings,
+)
+from jarvis.skill_draft import GLOBAL_SUPPRESSION, parse_user_edited_draft
+from jarvis.skill_lifecycle import (
+    CHANGEABLE_FIELDS,
+    SkillEvent,
+    SkillHistory,
+    active_skill,
+    active_version,
+    health,
+    next_version,
+    rollback_event,
+    status,
+)
+from jarvis.skill_store import SkillStore, SkillStoreError
+from jarvis.skill_types import (
+    Skill,
+    SkillDraft,
+    SkillEventKind,
+    SkillHealth,
+    SkillOrigin,
+    SkillProvenance,
+    SkillScope,
+    SkillScopeKind,
+    SkillStatus,
 )
 
 #: Version of the non-status JSON envelope, independent of the SQLite schema.
@@ -3362,6 +3388,7 @@ def _config_payload(command: str, settings: Settings, result) -> dict[str, Any]:
         "paid_api_approval_id_present": settings.paid_api_approval_id is not None,
         "claude_call_budget_usd": settings.claude_call_budget_usd,
         "approval_ttl_minutes": settings.approval_ttl_minutes,
+        "skills_enabled": settings.skills_enabled,
         # Manual Claude selection. Both are validated, non-secret data in
         # their own bounded grammar, so the values themselves are shown;
         # null means the CLI's own default stands.
@@ -5199,6 +5226,236 @@ class JarvisApp:
         return self._present(
             "clarify", self.core.provide_clarification(session_id, task_id, text)
         )
+
+    # -- V2.2 S3 (SKAPPAPI): skill app API -------------------------------------
+    # Payload dicts like the memory API: ``{"ok": True, ...}`` or
+    # ``{"ok": False, "error": ...}``. Every method is a USER action: the
+    # writes record actor "user" and no method takes an actor, so a model, a
+    # skill or Core can never approve a draft through here (S5). A skill is a
+    # procedure, never an authority (S1): nothing here grants, implies or
+    # remembers an approval. Flag off (S4): list, get, disable, delete and
+    # decline still work so the user can always clean up; the rest refuse.
+
+    @cached_property
+    def skill_store(self) -> SkillStore | None:
+        """Over the app's own database; None (every call refused) otherwise."""
+        if isinstance(self.memory, SQLiteMemoryStore):
+            return SkillStore(self.memory.database_path)
+        return None
+
+    def _skill_call(
+        self, action: Callable[[SkillStore], dict[str, Any]], project_id: str | None, *, cleanup: bool = False
+    ) -> dict[str, Any]:
+        if not cleanup and self.settings.skills_enabled is not True:
+            return {"ok": False, "error": "skills disabled", "skills_disabled": True}
+        try:
+            store = self.skill_store
+            if store is None:
+                return {"ok": False, "error": "No skill store in this build."}
+            if project_id is not None:
+                validate_project_id(project_id)
+            return {"ok": True, **action(store)}
+        except (TypeError, ValueError) as exc:  # SkillRecordError is a ValueError
+            return {"ok": False, "error": _redact_text(str(exc))}
+        except sqlite3.Error:
+            return {"ok": False, "error": "The skill store could not be read or written."}
+
+    @staticmethod
+    def _skill_history(store: SkillStore, skill_id: Any, project_id: str | None) -> SkillHistory:
+        history = store.history(skill_id, project_id) if type(skill_id) is str else None
+        if history is None:  # unknown, deleted or another project's (S8)
+            raise SkillStoreError("no such skill")
+        return history
+
+    @staticmethod
+    def _skill_payload(skill: Skill, state: SkillStatus, counters: SkillHealth) -> dict[str, Any]:
+        return {**skill.to_dict(), "status": state.value, "health": counters.to_dict()}
+
+    @staticmethod
+    def _edit_draft(history: SkillHistory) -> SkillDraft:
+        """The active version as the draft the edit card sends back. Its id
+        names the latest version, so an edit made before another one lands is
+        refused (lineage mismatch) instead of silently overwriting it."""
+        base = active_skill(history)
+        seed = f"edit:{base.skill_id}:{base.version}:{history.latest_version}"
+        return SkillDraft(
+            draft_id="draft-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:32],
+            name=base.name,
+            summary=base.summary,
+            scope=base.scope,
+            inputs=base.inputs,
+            steps=base.steps,
+            checks=base.checks,
+            provenance=SkillProvenance(
+                origin=SkillOrigin.USER_EDIT,
+                source_run_id=None,
+                parent_skill_id=base.skill_id,
+                parent_version=base.version,
+                created_at=base.provenance.created_at,
+            ),
+            reason="user edit",
+            target_skill_id=base.skill_id,
+        )
+
+    def skills_list(self, project_id: str | None = None) -> dict[str, Any]:
+        def listed(store: SkillStore) -> dict[str, Any]:
+            return {"skills": [
+                self._skill_payload(item.skill, item.status, item.health)
+                for item in store.list_skills(project_id)
+            ]}
+        return self._skill_call(listed, project_id, cleanup=True)
+
+    def skill_get(self, skill_id: str, version: int | None = None, project_id: str | None = None) -> dict[str, Any]:
+        def get(store: SkillStore) -> dict[str, Any]:
+            if version is not None and type(version) is not int:
+                raise SkillStoreError("version must be an int")
+            history = self._skill_history(store, skill_id, project_id)
+            skill = active_skill(history) if version is None else history.get(version)
+            payload = self._skill_payload(skill, status(history), health(history))
+            payload["active_version"] = active_version(history)
+            payload["versions"] = [item.version for item in history.versions]
+            payload["edit_draft"] = self._edit_draft(history).to_dict()
+            return {"skill": payload}
+        return self._skill_call(get, project_id, cleanup=True)
+
+    def skill_edit(self, skill_id: str, payload: Any, project_id: str | None = None) -> dict[str, Any]:
+        """The user's edit of the active version, saved as the next version.
+        Saving it IS the user's approval; skill_filter re-runs on the save (S7)."""
+        def edit(store: SkillStore) -> dict[str, Any]:
+            history = self._skill_history(store, skill_id, project_id)
+            edited = parse_user_edited_draft(payload, original=self._edit_draft(history))
+            base = active_skill(history)
+            changes = {
+                name: getattr(edited, name)
+                for name in CHANGEABLE_FIELDS
+                if getattr(edited, name) != getattr(base, name)
+            }
+            skill = next_version(base, changes, SkillOrigin.USER_EDIT, utc_now(), history=history)
+            store.add_version(skill, actor="user")
+            return {"skill_id": skill.skill_id, "version": skill.version}
+        return self._skill_call(edit, project_id)
+
+    def _skill_event(
+        self,
+        skill_id: str,
+        project_id: str | None,
+        make: Callable[[SkillHistory], SkillEvent],
+        *,
+        cleanup: bool = False,
+    ) -> dict[str, Any]:
+        def append(store: SkillStore) -> dict[str, Any]:
+            event = make(self._skill_history(store, skill_id, project_id))
+            store.append_event(event, actor="user")
+            return {"skill_id": event.skill_id, "event": event.kind.value, "version": event.version}
+        return self._skill_call(append, project_id, cleanup=cleanup)
+
+    def skill_set_enabled(self, skill_id: str, on: bool, project_id: str | None = None) -> dict[str, Any]:
+        if type(on) is not bool:
+            return {"ok": False, "error": "on must be a bool."}
+        kind = SkillEventKind.ENABLED if on else SkillEventKind.DISABLED
+        return self._skill_event(
+            skill_id, project_id,
+            lambda history: SkillEvent(skill_id=skill_id, kind=kind, version=None, at=utc_now()),
+            cleanup=not on,
+        )
+
+    def skill_delete(self, skill_id: str, project_id: str | None = None) -> dict[str, Any]:
+        """A final tombstone event (D4); nothing is removed or rewritten (S9)."""
+        return self._skill_event(
+            skill_id, project_id,
+            lambda history: SkillEvent(
+                skill_id=skill_id, kind=SkillEventKind.DELETED, version=None, at=utc_now()
+            ),
+            cleanup=True,
+        )
+
+    def skill_rollback(self, skill_id: str, version: int, project_id: str | None = None) -> dict[str, Any]:
+        """Only the active pointer moves; every version stays (S6)."""
+        return self._skill_event(
+            skill_id, project_id, lambda history: rollback_event(history, version, utc_now())
+        )
+
+    def drafts_pending(self, project_id: str | None = None) -> dict[str, Any]:
+        return self._skill_call(
+            lambda store: {"drafts": [item.to_dict() for item in store.pending_drafts(project_id)]},
+            project_id,
+        )
+
+    def draft_approve(
+        self, draft_id: str, scope: str | None = None, edits: Any = None, project_id: str | None = None
+    ) -> dict[str, Any]:
+        """The user's explicit approval of one pending draft (S5). ``scope`` is
+        the card's choice: ``None``/"same" keeps the draft's, "global" makes a
+        project draft global (D15); ``edits`` is the edited draft payload."""
+        def approve(store: SkillStore) -> dict[str, Any]:
+            if type(draft_id) is not str:
+                raise SkillStoreError("no such draft")
+            if scope not in (None, "same", "global"):
+                raise SkillStoreError("scope is 'same' or 'global'")
+            chosen = SkillScope(kind=SkillScopeKind.GLOBAL, project_id=None) if scope == "global" else None
+            skill = store.approve_draft(draft_id, chosen, edits, "user", project_id=project_id)
+            return {"skill_id": skill.skill_id, "version": skill.version}
+        return self._skill_call(approve, project_id)
+
+    def draft_reject(self, draft_id: str, project_id: str | None = None) -> dict[str, Any]:
+        def reject(store: SkillStore) -> dict[str, Any]:
+            if type(draft_id) is not str:
+                raise SkillStoreError("no such draft")
+            store.reject_draft(draft_id, "user", project_id=project_id)
+            return {"draft_id": draft_id}
+        return self._skill_call(reject, project_id)
+
+    def _suppression(self, task_kind: str | None, scope: str, suppressed: bool) -> dict[str, Any]:
+        def write(store: SkillStore) -> dict[str, Any]:
+            if scope not in ("task", "global"):
+                raise SkillStoreError("scope is 'task' or 'global'")
+            key = GLOBAL_SUPPRESSION if scope == "global" else task_kind
+            store.set_suppression(key, suppressed, actor="user")
+            return {"key": key, "suppressed": suppressed}
+        return self._skill_call(write, None)
+
+    def suppress(self, task_kind: str | None, scope: str = "task") -> dict[str, Any]:
+        """Stop offering drafts for one task kind (``tk-...``) or at all."""
+        return self._suppression(task_kind, scope, True)
+
+    def unsuppress(self, task_kind: str | None, scope: str = "task") -> dict[str, Any]:
+        return self._suppression(task_kind, scope, False)
+
+    def skills_set_enabled(self, on: bool, store: ConfigStore | None = None) -> dict[str, Any]:
+        """The skills switch, through the same ConfigStore.mutate path as
+        every other configuration write. Takes effect for the next composed
+        app (Core reads its own settings), like a permission-mode change."""
+        if type(on) is not bool:
+            return {"ok": False, "error": "on must be a bool."}
+        try:
+            updated = (store or ConfigStore()).mutate(lambda current: replace(current, skills_enabled=on))
+        except ConfigError as exc:
+            return {"ok": False, "error": exc.message}
+        if updated.skills_enabled is not True:  # off is fail-closed at once here
+            self.settings = replace(self.settings, skills_enabled=False)
+        return {"ok": True, "skills_enabled": updated.skills_enabled}
+
+    def skill_decline(self, session_id: str, task_id: str) -> CommandResult:
+        """D6: run the anchor task without the announced skill. Works with
+        the flag off too (stopping a skill is clean-up); Core records no use
+        event (D16) and may refuse when the step can no longer be stopped."""
+        if not hasattr(self.core, "decline_skill"):
+            return self._failure("skill-decline", ErrorCode.INVALID_TASK, "skills are not wired into Core", EXIT_POLICY)
+        owned = self._ownership_failure("skill-decline", session_id, task_id)
+        if owned is not None:
+            return owned
+        return self._present("skill-decline", self.core.decline_skill(session_id, task_id))
+
+    def skill_use(self, session_id: str, task_id: str) -> CommandResult:
+        """The user's explicit 'use it' for a stale (revalidation) skill (S12)."""
+        if self.settings.skills_enabled is not True:
+            return self._failure("skill-use", ErrorCode.INVALID_TASK, "skills disabled", EXIT_POLICY)
+        if not hasattr(self.core, "use_skill"):
+            return self._failure("skill-use", ErrorCode.INVALID_TASK, "skills are not wired into Core", EXIT_POLICY)
+        owned = self._ownership_failure("skill-use", session_id, task_id)
+        if owned is not None:
+            return owned
+        return self._present("skill-use", self.core.use_skill(session_id, task_id))
 
     def approve(
         self,
