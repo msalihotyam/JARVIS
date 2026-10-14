@@ -2400,25 +2400,6 @@ yok</translation>
     </message>
 </context>
 <context>
-    <name>ModelSelector</name>
-    <message>
-        <source>Model and provider</source>
-        <translation>Model ve sağlayıcı</translation>
-    </message>
-    <message>
-        <source>5 h</source>
-        <translation>5 sa.</translation>
-    </message>
-    <message>
-        <source>Weekly</source>
-        <translation>Haftalık</translation>
-    </message>
-    <message>
-        <source>%1%</source>
-        <translation>%%1</translation>
-    </message>
-</context>
-<context>
     <name>NavMenu</name>
     <message>
         <source>NAVIGATE</source>
@@ -3675,13 +3656,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     </message>
 </context>
 <context>
-    <name>QuotaBar</name>
-    <message>
-        <source>%1% left</source>
-        <translation>%%1 kaldı</translation>
-    </message>
-</context>
-<context>
     <name>QuoteDetail</name>
     <message>
         <source>Edit</source>
@@ -4328,6 +4302,223 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>There are more results</source>
         <translation>Daha fazla sonuç var</translation>
+    </message>
+</context>
+<context>
+    <name>SkillAnnounceChip</name>
+    <message>
+        <source>The &quot;%1&quot; skill failed in recent runs - should I use it? (v%2)</source>
+        <translation>&quot;%1&quot; becerisi son denemelerde başarısız oldu - kullanayım mı? (v%2)</translation>
+    </message>
+    <message>
+        <source>Using the &quot;%1&quot; skill for this (v%2)</source>
+        <translation>Bu iş için &quot;%1&quot; becerisini kullanıyorum (v%2)</translation>
+    </message>
+    <message>
+        <source>Adapted from the &quot;%1&quot; skill, v%2</source>
+        <translation>&quot;%1&quot; becerisinden uyarlandı, v%2</translation>
+    </message>
+    <message>
+        <source>Don&apos;t use</source>
+        <translation>Kullanma</translation>
+    </message>
+    <message>
+        <source>Use it</source>
+        <translation>Kullan</translation>
+    </message>
+    <message>
+        <source>Skip</source>
+        <translation>Atla</translation>
+    </message>
+</context>
+<context>
+    <name>SkillDraftCard</name>
+    <message>
+        <source>Version %1 proposal for &quot;%2&quot;</source>
+        <translation>&quot;%2&quot; için v%1 önerisi</translation>
+    </message>
+    <message>
+        <source>Save this as a skill?</source>
+        <translation>Bunu beceri olarak kaydedeyim mi?</translation>
+    </message>
+    <message>
+        <source>Steps</source>
+        <translation>Adımlar</translation>
+    </message>
+    <message>
+        <source>Inputs</source>
+        <translation>Girdiler</translation>
+    </message>
+    <message>
+        <source>Checks</source>
+        <translation>Kontroller</translation>
+    </message>
+    <message>
+        <source>Scope</source>
+        <translation>Kapsam</translation>
+    </message>
+    <message>
+        <source>This project (%1)</source>
+        <translation>Bu proje (%1)</translation>
+    </message>
+    <message>
+        <source>General</source>
+        <translation>Genel</translation>
+    </message>
+    <message>
+        <source>Save</source>
+        <translation>Kaydet</translation>
+    </message>
+    <message>
+        <source>Edit</source>
+        <translation>Düzenle</translation>
+    </message>
+    <message>
+        <source>Dismiss</source>
+        <translation>Vazgeç</translation>
+    </message>
+    <message>
+        <source>Don&apos;t ask for tasks like this</source>
+        <translation>Bu tür işler için sorma</translation>
+    </message>
+</context>
+<context>
+    <name>SkillsPage</name>
+    <message>
+        <source>Skills</source>
+        <translation>Beceriler</translation>
+    </message>
+    <message>
+        <source>Project</source>
+        <translation>Proje</translation>
+    </message>
+    <message>
+        <source>Global</source>
+        <translation>Genel</translation>
+    </message>
+    <message>
+        <source>Off</source>
+        <translation>Kapalı</translation>
+    </message>
+    <message>
+        <source>Stale</source>
+        <translation>Bayat</translation>
+    </message>
+    <message>
+        <source>Active</source>
+        <translation>Etkin</translation>
+    </message>
+    <message>
+        <source>1 use</source>
+        <translation>1 kullanım</translation>
+    </message>
+    <message>
+        <source>%1 uses</source>
+        <translation>%1 kullanım</translation>
+    </message>
+    <message>
+        <source>last success %1</source>
+        <translation>son başarı %1</translation>
+    </message>
+    <message>
+        <source>1 failure</source>
+        <translation>1 başarısızlık</translation>
+    </message>
+    <message>
+        <source>%1 failures</source>
+        <translation>%1 başarısızlık</translation>
+    </message>
+    <message>
+        <source>Adapted from the &quot;%1&quot; skill, v%2</source>
+        <translation>&quot;%1&quot; becerisinden uyarlandı, v%2</translation>
+    </message>
+    <message>
+        <source>Saved from a finished task</source>
+        <translation>Biten bir işten kaydedildi</translation>
+    </message>
+    <message>
+        <source>Edited by you</source>
+        <translation>Sizin düzenlemeniz</translation>
+    </message>
+    <message>
+        <source>New version after a failed run</source>
+        <translation>Başarısız bir çalıştırmadan sonraki yeni sürüm</translation>
+    </message>
+    <message>
+        <source>Skills are off</source>
+        <translation>Beceriler kapalı</translation>
+    </message>
+    <message>
+        <source>While skills are off JARVIS does not match, announce or offer skills. Saved skills are kept.</source>
+        <translation>Beceriler kapalıyken JARVIS beceri eşlemez, duyurmaz ve önermez. Kayıtlı beceriler korunur.</translation>
+    </message>
+    <message>
+        <source>Turn skills on</source>
+        <translation>Becerileri aç</translation>
+    </message>
+    <message>
+        <source>No saved skills yet.</source>
+        <translation>Henüz kayıtlı beceri yok.</translation>
+    </message>
+    <message>
+        <source>When a task finishes, JARVIS can offer to save its steps as a skill. Nothing is saved without your approval.</source>
+        <translation>Bir iş bittiğinde JARVIS adımlarını beceri olarak kaydetmeyi önerebilir. Onayınız olmadan hiçbir şey kaydedilmez.</translation>
+    </message>
+    <message>
+        <source>This skill failed in recent runs. It is not used on its own until a run you approve succeeds with it again.</source>
+        <translation>Bu beceri son denemelerde başarısız oldu. Onayladığınız bir çalıştırma onunla yeniden başarılı olana kadar kendiliğinden kullanılmaz.</translation>
+    </message>
+    <message>
+        <source>Steps</source>
+        <translation>Adımlar</translation>
+    </message>
+    <message>
+        <source>Inputs</source>
+        <translation>Girdiler</translation>
+    </message>
+    <message>
+        <source>Checks</source>
+        <translation>Kontroller</translation>
+    </message>
+    <message>
+        <source>Edit</source>
+        <translation>Düzenle</translation>
+    </message>
+    <message>
+        <source>Turn on</source>
+        <translation>Aç</translation>
+    </message>
+    <message>
+        <source>Turn off</source>
+        <translation>Kapat</translation>
+    </message>
+    <message>
+        <source>Delete</source>
+        <translation>Sil</translation>
+    </message>
+    <message>
+        <source>Versions</source>
+        <translation>Sürümler</translation>
+    </message>
+    <message>
+        <source>Return to this version</source>
+        <translation>Bu sürüme dön</translation>
+    </message>
+    <message>
+        <source>Delete skill</source>
+        <translation>Beceriyi sil</translation>
+    </message>
+    <message>
+        <source>Delete the skill &quot;%1&quot;?</source>
+        <translation>&quot;%1&quot; becerisi silinsin mi?</translation>
+    </message>
+    <message>
+        <source>The skill is no longer shown or used, and it cannot be brought back. Its past runs stay in the history. To pause it instead, turn it off.</source>
+        <translation>Beceri artık gösterilmez ve kullanılmaz; geri getirilemez. Geçmiş çalıştırmaları geçmişte kalır. Yalnız duraklatmak için kapatın.</translation>
+    </message>
+    <message>
+        <source>Cancel</source>
+        <translation>Vazgeç</translation>
     </message>
 </context>
 <context>
