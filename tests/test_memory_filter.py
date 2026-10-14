@@ -46,7 +46,8 @@ CASES = {
         [
             "Reset your password from the settings page",
             "Şifre politikası en az 12 karakter",
-            "Open https://example.com:8080/path",
+            # The full URL is exfil_carrier now (test_memory_filter_carrier).
+            "Open example.com:8080/path",
         ],
     ),
     "payment_card": (

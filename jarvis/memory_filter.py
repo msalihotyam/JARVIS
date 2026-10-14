@@ -24,7 +24,9 @@ from .contracts import credential_bearing
 #: Memory candidates are short notes; anything longer is refused unread.
 MAX_CANDIDATE_CHARS = 8_000
 
-_INVISIBLE = dict.fromkeys(map(ord, "­​‌‍⁠﻿"))
+# Every format (Cf) character is dropped before the checks (soft hyphen,
+# zero-width, bidi, word joiners ...), plus these blank non-Cf fillers.
+_INVISIBLE_FILLERS = frozenset("͏ᅟᅠㅤﾠ")
 
 
 @dataclass(frozen=True)
@@ -127,6 +129,63 @@ _HEALTH_PATTERN = re.compile(
 )
 
 
+# --- exfiltration carriers (I20): text a renderer or model could turn into a fetch ---
+#: A base64 run this long (non-whitespace characters) is a carrier.
+BASE64_MIN_RUN = 40
+_CARRIER_PATTERNS = (
+    # http/https/ftp(s) scheme; browsers read backslashes as slashes.
+    re.compile(r"(?:https?|ftps?)\s{0,3}:\s{0,3}[/\\]\s{0,3}[/\\]", re.IGNORECASE),
+    re.compile(r"(?<![A-Za-z0-9])www\s{0,3}\.\s{0,3}[A-Za-z0-9]", re.IGNORECASE),
+    re.compile(r"data:(?:[a-z][\w.+-]{0,63}/[\w.+-]|[;,])", re.IGNORECASE),
+    # HTML: <tag after a non-word char (so `List<String>` and x<y stay prose), a
+    # fetching tag anywhere, </tag, <!-- and <!DOCTYPE / <![CDATA[. An unclosed tag
+    # still counts: the next text in a rendered feed can close it.
+    re.compile(
+        r"(?<!\w)<[A-Za-z][\w:-]{0,63}(?:[\s/>]|$)|</[A-Za-z]|<!(?:--|\[|[A-Za-z])"
+        r"|<(?:img|image|a|svg|iframe|frame|script|style|link|meta|object|embed|base|video"
+        r"|audio|source|picture|form|input|body|math|template|track)(?:[\s/>]|$)",
+        re.IGNORECASE,
+    ),
+    # autolink <scheme:...>, e.g. <mailto:...?body=...>, <javascript:...>
+    re.compile(r"<[A-Za-z][A-Za-z0-9+.-]{1,31}:"),
+)
+_MD_IMAGE_PATTERN = re.compile(r"!\[")  # any image: inline, reference or shortcut
+_MD_LINK_PATTERNS = (
+    re.compile(r"\]\("),  # inline [a](u); nested brackets in the label do not hide it
+    re.compile(r"\]\["),  # reference [a][r] and collapsed [a][]
+    # definition [r]: u - also inside list items / quotes and with escaped or
+    # line-split labels, so any "]:" counts
+    re.compile(r"\]:"),
+)
+# ponytail: segments of 16+ chars joined by single whitespace; base64 chopped
+# into shorter chunks reads like prose and passes. Upper, lower and a digit
+# are required so hex hashes, paths and long words stay allowed.
+_BASE64_RUN = re.compile(
+    r"(?<![A-Za-z0-9+/_-])[A-Za-z0-9+/_-]{16,}(?:\s[A-Za-z0-9+/_-]{16,})*"
+)
+
+
+def _has_base64_run(text: str) -> bool:
+    for match in _BASE64_RUN.finditer(text):
+        run = "".join(match.group().split())
+        if (
+            len(run) >= BASE64_MIN_RUN
+            and re.search(r"[A-Z]", run)
+            and re.search(r"[a-z]", run)
+            and re.search(r"\d", run)
+        ):
+            return True
+    return False
+
+
+def _has_exfil_carrier(text: str) -> bool:
+    return (
+        _MD_IMAGE_PATTERN.search(text) is not None
+        or any(p.search(text) for p in _CARRIER_PATTERNS + _MD_LINK_PATTERNS)
+        or _has_base64_run(text)
+    )
+
+
 def _luhn_valid(digits: str) -> bool:
     total = 0
     for index, char in enumerate(reversed(digits)):
@@ -206,6 +265,7 @@ _CHECKS = (
     ("protected_path", "quotes content from a protected path", _PROTECTED_PATH_PATTERN.search),
     ("env_secret", "contains a .env-style secret assignment", _has_env_secret),
     ("credential", "contains a credential, key, token or password", _has_credential),
+    ("exfil_carrier", "contains a URL, Markdown link/image, data: URI, base64 blob or HTML", _has_exfil_carrier),
     # IBAN first: its digit groups can pass Luhn by chance.
     ("iban", "contains an IBAN", _has_iban),
     ("payment_card", "contains a payment card number", _has_card),
@@ -217,7 +277,11 @@ _CHECKS = (
 
 
 def _scan(text: str) -> FilterVerdict:
-    text = unicodedata.normalize("NFKC", text).translate(_INVISIBLE)
+    text = "".join(
+        char
+        for char in unicodedata.normalize("NFKC", text)
+        if unicodedata.category(char) != "Cf" and char not in _INVISIBLE_FILLERS
+    )
     if len(text) > MAX_CANDIDATE_CHARS:  # NFKC can expand a short input
         return FilterVerdict(False, "too_long", f"longer than {MAX_CANDIDATE_CHARS} characters")
     for category, reason, check in _CHECKS:
