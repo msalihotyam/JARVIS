@@ -156,6 +156,7 @@ Item {
             anchors.verticalCenter: parent.verticalCenter
             width: warningRow.implicitWidth; height: warningRow.implicitHeight
             readonly property real room: Math.max(0, header.width - 12 - 22 - memorySwitch.width - menuButton.width - 3 * actions.spacing
+                - (temporarySwitch.visible ? temporarySwitch.width + actions.spacing : 0) - (memoryOffBadge.visible ? memoryOffBadge.width + actions.spacing : 0)
                 - Math.min(title.implicitWidth, Math.max(header.titleFloor, Math.round(header.width * 0.35))))
             Row {
                 id: warningRow
@@ -220,6 +221,59 @@ Item {
                        text: qsTr("All projects' memory") + "\n" + (memorySwitch.on ? qsTr("Turn off to use only this conversation's own memory. It still cannot be moved into a project.")
                                              : qsTr("Turn on to also read other projects' memory, read-only. The conversation can then never be moved into a project.")) }
         }
+        // SEC2UIQML (I21): the open conversation's temporary (memory-off) switch, the same pattern as the
+        // one above: it shows the bridge's confirmed answer and a click only asks. Hidden and inert until
+        // the bridge has conversationMemoryOff + setConversationMemoryOff (SEC2BRIDGE); while on, a badge.
+        Pill {
+            id: memoryOffBadge
+            objectName: "chatHeaderMemoryOffBadge"
+            visible: temporarySwitch.visible && temporarySwitch.on
+            anchors.verticalCenter: parent.verticalCenter
+            dot: false; implicitHeight: 18; text: qsTr("No memory"); tint: Theme.textLabel
+        }
+        Rectangle {
+            id: temporarySwitch
+            objectName: "chatHeaderTemporaryChat"
+            readonly property bool available: typeof bridge.setConversationMemoryOff === "function" && typeof bridge.conversationMemoryOff === "boolean"
+            readonly property bool on: available && bridge.conversationMemoryOff === true
+            visible: available && bridge.conversationId !== "" && !header.scopeMenu && !bridge.conversationReadOnly
+            anchors.verticalCenter: parent.verticalCenter
+            width: temporaryRow.implicitWidth + 20; height: 34; radius: Theme.radiusSmall
+            color: temporaryArea.containsMouse ? Theme.alpha(Theme.text, 0.07) : "transparent"
+            Behavior on color { ColorAnimation { duration: Theme.hoverMs } }
+            border.width: 1
+            border.color: on ? Theme.alpha(Theme.accent, 0.45) : temporaryArea.containsMouse ? Theme.alpha(Theme.accent, 0.45) : "transparent"
+            activeFocusOnTab: visible
+            Accessible.role: Accessible.CheckBox; Accessible.name: qsTr("Temporary chat (no memory)"); Accessible.checked: on
+            Accessible.onPressAction: header.toggleMemoryOff()
+            Accessible.onToggleAction: header.toggleMemoryOff()
+            Keys.onPressed: function (event) {
+                if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
+                    event.accepted = true; header.toggleMemoryOff()
+                }
+            }
+            Row {
+                id: temporaryRow
+                anchors.centerIn: parent; spacing: 8
+                Icon { anchors.verticalCenter: parent.verticalCenter; name: "memory"; size: 16; opacity: temporarySwitch.on ? 0.5 : 1
+                       tint: temporarySwitch.on ? Theme.accent : Theme.textLabel }
+                Rectangle {
+                    id: temporaryTrack
+                    anchors.verticalCenter: parent.verticalCenter
+                    width: 28; height: 16; radius: 8
+                    color: temporarySwitch.on ? Theme.alpha(Theme.accent, 0.3) : Theme.alpha(Theme.text, 0.1)
+                    border.width: 1; border.color: temporarySwitch.on ? Theme.accent : Theme.alpha(Theme.text, 0.25)
+                    Rectangle { y: 3; width: 10; height: 10; radius: 5; x: temporarySwitch.on ? temporaryTrack.width - width - 3 : 3
+                                color: temporarySwitch.on ? Theme.accent : Theme.textLabel
+                                Behavior on x { NumberAnimation { duration: Theme.dur(120); easing.type: Theme.ease } } }
+                }
+            }
+            Rectangle { visible: temporarySwitch.activeFocus; anchors.fill: parent; anchors.margins: -3; radius: temporarySwitch.radius + 3
+                        color: "transparent"; border.width: 2; border.color: Theme.alpha(Theme.materialGlint, 0.95) }
+            MouseArea { id: temporaryArea; anchors.fill: parent; enabled: temporarySwitch.available; hoverEnabled: true
+                        cursorShape: Qt.PointingHandCursor; onClicked: header.toggleMemoryOff() }
+            HoverTip { objectName: "chatHeaderTemporaryChatTip"; text: qsTr("Temporary chat (no memory)") }
+        }
         Rectangle {
             id: menuButton
             objectName: "chatHeaderMenu"
@@ -265,6 +319,7 @@ Item {
     }
 
     function toggleGlobalMemory() { bridge.setGlobalMemoryEnabled(!bridge.globalMemoryEnabled) }
+    function toggleMemoryOff() { if (temporarySwitch.available) bridge.setConversationMemoryOff(!temporarySwitch.on) }
 
     // H2: the link opens its project's page ("Genel" has no line here); the preset's chip its menu.
     function pickScope() {

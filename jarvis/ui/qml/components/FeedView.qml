@@ -415,7 +415,8 @@ Item {
                                    font: feed.referenceLayout ? Theme.tracked(Theme.messageIdentity, 0.72) : Theme.label }
                             Item {
                                 width: parent.width
-                                height: (sent.visible ? sent.y + sent.height : sources.visible ? sources.y + sources.height : message.y + message.height) + (row.isJarvis ? 4 : 0)
+                                height: (sent.visible ? sent.y + sent.height : usedMemory.visible ? usedMemory.y + usedMemory.height
+                                         : sources.visible ? sources.y + sources.height : message.y + message.height) + (row.isJarvis ? 4 : 0)
                                 // An ordinary JARVIS reply keeps its open shape; the only
                                 // addition is the reading veil: dark close to the text and
                                 // feathered outward (a nine-slice sheet, no effect), so the
@@ -432,7 +433,8 @@ Item {
                                     x: -10 - feather
                                     y: message.y - 8 - feather
                                     width: Math.min(parent.width + 10, message.width + 20) + 2 * feather
-                                    height: (sources.visible ? sources.y + sources.height : message.y + message.height) - message.y + 16 + 2 * feather
+                                    height: (usedMemory.visible ? usedMemory.y + usedMemory.height : sources.visible ? sources.y + sources.height
+                                             : message.y + message.height) - message.y + 16 + 2 * feather
                                     border { left: slice; top: slice; right: slice; bottom: slice }
                                     opacity: Theme.glassReadingVeil
                                     smooth: true
@@ -660,6 +662,72 @@ Item {
                                             font: Theme.chatSource
                                             MouseArea { id: linkArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
                                                         onClicked: if (/^https?:\/\//.test(modelData.url)) Qt.openUrlExternally(modelData.url) }
+                                        }
+                                    }
+                                }
+                                // SEC2UIQML (I22): the memory records Core says this reply used - kind, label,
+                                // revision - apart from the web sources above. Plain text only: a label is
+                                // stored text, never a link or Markdown. Collapsed to a count; a quiet line when
+                                // Core delivered no relevant memory. Absent fields show nothing.
+                                Column {
+                                    id: usedMemory
+                                    objectName: "feedUsedMemory"
+                                    // A QVariantList is a sequence, not a JS Array: copied by index, objects only.
+                                    readonly property var records: {
+                                        var given = modelData.usedMemory, out = []
+                                        if (given && typeof given === "object" && typeof given.length === "number")
+                                            for (var i = 0; i < given.length; i++) if (given[i] && typeof given[i] === "object") out.push(given[i])
+                                        return out
+                                    }
+                                    readonly property bool none: records.length === 0 && modelData.memoryNoneRelevant === true
+                                    property bool expanded: false
+                                    visible: !row.isUser && (records.length > 0 || none)
+                                    y: (sources.visible ? sources.y + sources.height : message.y + message.height) + 10
+                                    width: message.width
+                                    spacing: 4
+                                    Text { objectName: "feedUsedMemoryNone"; visible: usedMemory.none; width: usedMemory.width
+                                           textFormat: Text.PlainText; elide: Text.ElideRight
+                                           text: qsTr("No relevant memory"); renderType: Theme.textRender
+                                           color: Theme.textMuted; font: Theme.chatMeta }
+                                    Item {
+                                        id: usedMemoryToggle
+                                        objectName: "feedUsedMemoryToggle"
+                                        visible: usedMemory.records.length > 0
+                                        width: usedMemoryRow.implicitWidth; height: usedMemoryRow.implicitHeight
+                                        activeFocusOnTab: visible
+                                        Accessible.role: Accessible.Button; Accessible.name: usedMemoryCount.text
+                                        Accessible.onPressAction: usedMemory.expanded = !usedMemory.expanded
+                                        Keys.onPressed: function (event) {
+                                            if (event.key === Qt.Key_Return || event.key === Qt.Key_Enter || event.key === Qt.Key_Space) {
+                                                event.accepted = true; usedMemory.expanded = !usedMemory.expanded
+                                            }
+                                        }
+                                        Row {
+                                            id: usedMemoryRow
+                                            spacing: 4
+                                            Icon { anchors.verticalCenter: parent.verticalCenter; name: "chevron-down"; size: 12
+                                                   rotation: usedMemory.expanded ? 0 : -90; tint: Theme.textLabel }
+                                            Text { id: usedMemoryCount; objectName: "feedUsedMemoryCount"
+                                                   textFormat: Text.PlainText; renderType: Theme.textRender
+                                                   text: qsTr("Memory used (%1)").arg(usedMemory.records.length)
+                                                   color: usedMemoryArea.containsMouse || usedMemoryToggle.activeFocus ? Theme.accent : Theme.textLabel
+                                                   font: Theme.chatSourcesHeading }
+                                        }
+                                        MouseArea { id: usedMemoryArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor
+                                                    onClicked: usedMemory.expanded = !usedMemory.expanded }
+                                    }
+                                    Repeater {
+                                        model: usedMemory.expanded ? usedMemory.records : []
+                                        delegate: Text {
+                                            objectName: "feedUsedMemory_" + index
+                                            width: usedMemory.width
+                                            elide: Text.ElideRight
+                                            textFormat: Text.PlainText
+                                            text: String(modelData.kind || "") + "  ·  " + String(modelData.label || "")
+                                                  + "  ·  " + qsTr("rev %1").arg(Number(modelData.revision) || 0)
+                                            renderType: Theme.textRender
+                                            color: Theme.textMuted
+                                            font: Theme.chatSource
                                         }
                                     }
                                 }

@@ -1108,6 +1108,14 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Açınca diğer projelerin hafızası da salt okunur olarak kullanılır. Sohbet bundan sonra hiçbir zaman bir projeye taşınamaz.</translation>
     </message>
     <message>
+        <source>No memory</source>
+        <translation>Hafızasız</translation>
+    </message>
+    <message>
+        <source>Temporary chat (no memory)</source>
+        <translation>Geçici sohbet (hafızasız)</translation>
+    </message>
+    <message>
         <source>Conversation actions</source>
         <translation>Sohbet işlemleri</translation>
     </message>
@@ -1941,6 +1949,18 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Search results (the answer names no specific page)</source>
         <translation>Arama sonuçları (yanıt belirli bir sayfa belirtmiyor)</translation>
+    </message>
+    <message>
+        <source>No relevant memory</source>
+        <translation>Hafızada ilgili kayıt yok</translation>
+    </message>
+    <message>
+        <source>Memory used (%1)</source>
+        <translation>Kullanılan hafıza (%1)</translation>
+    </message>
+    <message>
+        <source>rev %1</source>
+        <translation>rev %1</translation>
     </message>
     <message>
         <source>Copy</source>
