@@ -11,6 +11,7 @@ SecondaryPage {
     property string project: ""
     property bool includeInactive: false
     headerRight: [
+        ActionButton { objectName: "memoryImportOpen"; label: qsTr("Import history"); onClicked: importDialog.openFrom(this) },
         ActionButton { label: page.includeInactive ? qsTr("Active only") : qsTr("Include superseded / retired"); onClicked: { page.includeInactive = !page.includeInactive; bridge.refreshMemory(page.project, page.includeInactive) } },
         ActionButton { label: qsTr("Load"); primary: true; onClicked: { bridge.refreshMemory(page.project, page.includeInactive); page.loadRecords() } }
     ]
@@ -41,7 +42,10 @@ SecondaryPage {
         function onMemoryRecordsDone(answer) { if (answer.ok && answer.project_id === page.scope) page.records = answer.records || [] }
         function onMemoryRecordActionDone(answer) { if (answer.project_id === page.scope) page.loadRecords() }
         function onMemoryRepairDone(answer) { if (answer.ok) page.loadRecords() }
+        // Imported memories land PENDING: the approval list below shows them.
+        function onImportRunDone(answer) { if (answer.ok) { bridge.refreshMemory(page.project, page.includeInactive); page.loadRecords() } }
     }
+    MemoryImportDialog { id: importDialog; objectName: "memoryImportDialog" }
 
     Column {
         anchors.fill: parent

@@ -666,3 +666,12 @@ class Backend:
 
     def apply_memory_repair(self, finding_id: str, confirm: str) -> dict:
         return self._plain("memory-repair", lambda app: app.apply_memory_repair(finding_id, confirm=confirm))
+
+    def import_history_preview(self, path: str) -> dict:
+        return self._plain("import-preview", lambda app: app.import_history_preview(path))
+
+    def import_history_run(self, plan_id: str, scopes: dict) -> dict:
+        return self._plain("import-run", lambda app: app.import_history_run(plan_id, scopes))
+
+    def import_history_cancel(self, plan_id: str) -> dict:
+        return self._plain("import-cancel", lambda app: app.import_history_cancel(plan_id))

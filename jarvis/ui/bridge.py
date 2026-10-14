@@ -5003,6 +5003,43 @@ class Bridge(QObject):
                   lambda: self.backend.apply_memory_repair(request["finding_id"], request["finding_id"]),
                   lambda payload: self._memory_answer(self.memoryRepairDone, request, payload))
 
+    # -- V2.1b (IMPUI): history import (pass-through) --------------------------
+    #
+    # Same contract as the record slots. The app parses, plans, checks every
+    # project and keeps each imported record PENDING; the bridge forwards only
+    # the groups the person confirmed (the dialog omits the rest) and decides
+    # nothing. Imported text is shown as redacted data, never executed.
+
+    importPreviewDone = Signal("QVariantMap")
+    importRunDone = Signal("QVariantMap")
+    importCancelDone = Signal("QVariantMap")
+
+    @Slot(str)
+    def importHistoryPreview(self, path: str) -> None:
+        local = QUrl(str(path)).toLocalFile() if str(path).startswith("file:") else str(path)
+
+        def done(payload: Any) -> None:
+            if isinstance(payload, dict) and isinstance(payload.get("groups"), list):
+                payload = {**payload, "groups": [{**g, "title": redact_text(str(g.get("title") or ""))}
+                                                 for g in payload["groups"] if isinstance(g, dict)]}
+            self._memory_answer(self.importPreviewDone, {}, payload)
+
+        self._run("import-preview", lambda: self.backend.import_history_preview(local), done)
+
+    @Slot(str, "QVariantMap")
+    def importHistoryRun(self, plan_id: str, scopes: Any) -> None:
+        """``scopes`` is {group_id: project_id} for the confirmed groups only."""
+        request = {"plan_id": str(plan_id)}
+        confirmed = {str(group): project for group, project in dict(scopes or {}).items()}
+        self._run("import-run", lambda: self.backend.import_history_run(request["plan_id"], confirmed),
+                  lambda payload: self._memory_answer(self.importRunDone, request, payload))
+
+    @Slot(str)
+    def cancelImport(self, plan_id: str) -> None:
+        """Answered here, not on the worker: the one worker is busy with the run it stops."""
+        request = {"plan_id": str(plan_id)}
+        self._memory_answer(self.importCancelDone, request, self.backend.import_history_cancel(request["plan_id"]))
+
     # -- slots: configuration ------------------------------------------------
 
     def _apply_config(self, payload: dict) -> None:

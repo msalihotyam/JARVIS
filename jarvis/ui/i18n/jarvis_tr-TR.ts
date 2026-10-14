@@ -2587,10 +2587,69 @@ yok</translation>
     </message>
 </context>
 <context>
+    <name>MemoryImportDialog</name>
+    <message>
+        <source>Import history</source>
+        <translation>Geçmişi içe aktar</translation>
+    </message>
+    <message>
+        <source>Import stopped. </source>
+        <translation>İçe aktarma durduruldu. </translation>
+    </message>
+    <message>
+        <source>Memory records waiting for your approval in the Memory list: %1</source>
+        <translation>Bellek listesinde onayınızı bekleyen kayıtlar: %1</translation>
+    </message>
+    <message>
+        <source>Imported conversations are read as data only. Nothing in them is ever executed or followed as an instruction, and every memory found waits for your approval.</source>
+        <translation>İçe aktarılan konuşmalar yalnızca veri olarak okunur. İçlerindeki hiçbir şey çalıştırılmaz ya da talimat olarak izlenmez; bulunan her bellek kaydı onayınızı bekler.</translation>
+    </message>
+    <message>
+        <source>Choose export file</source>
+        <translation>Dışa aktarma dosyası seç</translation>
+    </message>
+    <message>
+        <source>Confirm a project for each conversation you want imported. A conversation without a confirmed project is skipped.</source>
+        <translation>İçe aktarmak istediğiniz her konuşma için bir proje onaylayın. Onaylı projesi olmayan konuşma atlanır.</translation>
+    </message>
+    <message>
+        <source>Untitled conversation</source>
+        <translation>Başlıksız konuşma</translation>
+    </message>
+    <message>
+        <source>Messages: %1</source>
+        <translation>Mesaj: %1</translation>
+    </message>
+    <message>
+        <source>Suggested project: %1</source>
+        <translation>Önerilen proje: %1</translation>
+    </message>
+    <message>
+        <source>Close</source>
+        <translation>Kapat</translation>
+    </message>
+    <message>
+        <source>Stop import</source>
+        <translation>İçe aktarmayı durdur</translation>
+    </message>
+    <message>
+        <source>Import (%1)</source>
+        <translation>İçe aktar (%1)</translation>
+    </message>
+    <message>
+        <source>Chat exports (%1)</source>
+        <translation>Sohbet dışa aktarımları (%1)</translation>
+    </message>
+</context>
+<context>
     <name>MemoryPage</name>
     <message>
         <source>Memory</source>
         <translation>Hafıza</translation>
+    </message>
+    <message>
+        <source>Import history</source>
+        <translation>Geçmişi içe aktar</translation>
     </message>
     <message>
         <source>Active only</source>
