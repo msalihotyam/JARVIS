@@ -64,6 +64,7 @@ from jarvis.gmail import GmailExecutionUnavailable
 from jarvis.gmail_cli import gmail_controlled_login
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import (
+    CLAUDE_MODEL_PATTERN,
     ConfigError,
     ConfigStatus,
     ConfigStore,
@@ -771,6 +772,7 @@ CONFIG_SETTABLE_KEYS = (
     "gmail_principal",
     "browser_origins",
     "desktop_apps",
+    "memory_extract_model",
 )
 
 
@@ -868,6 +870,15 @@ def _config_change(key: str, raw: str):
     if key == "desktop_apps":
         apps = tuple(part.strip() for part in raw.split(",") if part.strip())
         return lambda current: replace(current, desktop_apps=apps)
+    # memory_extract_model: refused here, because Settings silently clears a
+    # malformed id instead of raising; '' clears the override.
+    if key == "memory_extract_model":
+        if raw and not CLAUDE_MODEL_PATTERN.match(raw):
+            raise ConfigError(
+                ErrorCode.CONFIG_INVALID,
+                "'memory_extract_model' must be empty or a Claude model id.",
+            )
+        return lambda current: replace(current, memory_extract_model=raw)
     if key == "approval_ttl_minutes":
         minutes = _config_int(key, raw)
         return lambda current: replace(current, approval_ttl_minutes=minutes)
