@@ -703,10 +703,14 @@ class Bridge(QObject):
                                 refs=refs or (), key=f"{self._store_run}:{entry['id']}")
             if first and turn is not None:
                 self._name_conversation(store, message)
+            if turn is not None:
+                entry["turn"] = turn.id     # the stored turn 'Hatırla' names (V2.1a M4)
         elif kind == "jarvis" and entry.get("chat") and isinstance(message, str):
             # DFREPLY: a reply cut short keeps why as its last line (an ordinary reply turn).
             text = cut_reply(message, entry["cut"]) if entry.get("cut") else plain_reply(message)
-            store.append(role="assistant", kind="reply", text=text, key=f"{self._store_run}:{entry['id']}")
+            turn = store.append(role="assistant", kind="reply", text=text, key=f"{self._store_run}:{entry['id']}")
+            if turn is not None:
+                entry["turn"] = turn.id
         elif kind == "result":
             shown = render(message)
             # A result's identity is its TASK and the OUTCOME Core reported for it -
@@ -852,10 +856,10 @@ class Bridge(QObject):
         for turn in state.turns:
             notice = None
             if turn.kind == "user":
-                entry: dict[str, Any] = {"kind": "user", "msg": self._redacted(turn.message or turn.text)}
+                entry: dict[str, Any] = {"kind": "user", "msg": self._redacted(turn.message or turn.text), "turn": turn.id}
             elif turn.kind == "reply":
                 shown, cut = split_cut(turn.text)
-                entry = {"kind": "jarvis", "msg": self._redacted(shown), "chat": True}
+                entry = {"kind": "jarvis", "msg": self._redacted(shown), "chat": True, "turn": turn.id}
                 if cut:                         # DFREPLY: cut short - and the notice under it again
                     reply, line = cut_entries(shown, cut)
                     entry.update(cut=cut, interrupted=reply["interrupted"])

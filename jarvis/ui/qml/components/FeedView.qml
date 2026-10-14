@@ -61,6 +61,40 @@ Item {
         }
     }
     Connections { target: bridge; function onInputAccepted() { feed.jumpToLatest() } }
+    // 'Hatırla' (V2.1a M4): the app's answer, by stored turn id - kept here
+    // because a feed change (a refusal's notice) rebuilds every row. The app
+    // decides what is stored and in which status; this only says what it said.
+    // ponytail: one shared fade for every note, a per-note timer if they ever overlap in use.
+    property var rememberNotes: ({})
+    Timer { id: rememberFade; interval: 5000; onTriggered: feed.rememberNotes = ({}) }
+    function rememberReason(answer) {
+        switch (answer.refused) {
+        case "protected_path": return qsTr("it quotes a protected file")
+        case "env_secret":
+        case "credential": return qsTr("it contains a secret, key or password")
+        case "iban":
+        case "payment_card": return qsTr("it contains bank or card details")
+        case "national_id": return qsTr("it contains an ID number")
+        case "phone": return qsTr("it contains a phone number")
+        case "address": return qsTr("it contains a home address")
+        case "health": return qsTr("it contains health data")
+        case "too_long": return qsTr("it is too long")
+        default: return answer.error || qsTr("refused")
+        }
+    }
+    Connections {
+        target: bridge
+        function onMemoryRecordActionDone(answer) {
+            if (answer.action !== "remember") return
+            var next = Object.assign({}, feed.rememberNotes)
+            next[answer.message_id] = answer.ok === true
+                ? {ok: true, text: answer.record && answer.record.status === "approved" ? qsTr("Remembered")
+                                                                                         : qsTr("Saved - awaiting your approval")}
+                : {ok: false, text: qsTr("Not remembered: %1").arg(feed.rememberReason(answer))}
+            feed.rememberNotes = next
+            rememberFade.restart()
+        }
+    }
     // Review: bring the card for an attention key into view and move focus to
     // its heading (never to a decision button). "decision" answers happen in
     // the choices / composer below the stream, so the end is shown.
@@ -663,7 +697,7 @@ Item {
                     Row {
                         objectName: "messageActions_" + index
                         visible: row.conversational
-                        opacity: rowHover.hovered || message.selectedText.length > 0 || copyAction.confirming ? 1 : 0
+                        opacity: rowHover.hovered || message.selectedText.length > 0 || copyAction.confirming || rememberNote.visible ? 1 : 0
                         Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
                         spacing: 14
                         y: stamp.y
@@ -674,6 +708,21 @@ Item {
                         // the message being composed, and it authorizes nothing. A selection
                         // is quoted from the ONE floating button at it (Q1), not from here.
                         MessageAction { objectName: "messageQuote_" + index; label: qsTr("Quote"); onActivated: bridge.quoteMessage(modelData.id) }
+                        // 'Hatırla': asks the app to store this STORED turn (what the person
+                        // wrote or a reply); the filter and the status are the app's (I4, I11).
+                        MessageAction { objectName: "messageRemember_" + index; visible: !!modelData.turn; label: qsTr("Remember")
+                                        onActivated: bridge.rememberMessage(bridge.conversationId, modelData.turn) }
+                        Text {
+                            id: rememberNote
+                            objectName: "messageRememberNote_" + index
+                            readonly property var note: feed.rememberNotes[modelData.turn || ""]
+                            visible: note !== undefined
+                            text: note ? note.text : ""
+                            width: Math.min(implicitWidth, 360); elide: Text.ElideRight
+                            color: note && note.ok ? Theme.success : Theme.danger
+                            renderType: Theme.textRender
+                            font: Theme.chatMeta
+                        }
                     }
                 }
             }

@@ -1808,6 +1808,54 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Siz</translation>
     </message>
     <message>
+        <source>it quotes a protected file</source>
+        <translation>korumalı bir dosyadan alıntı içeriyor</translation>
+    </message>
+    <message>
+        <source>it contains a secret, key or password</source>
+        <translation>gizli bilgi, anahtar veya parola içeriyor</translation>
+    </message>
+    <message>
+        <source>it contains bank or card details</source>
+        <translation>banka veya kart bilgisi içeriyor</translation>
+    </message>
+    <message>
+        <source>it contains an ID number</source>
+        <translation>kimlik numarası içeriyor</translation>
+    </message>
+    <message>
+        <source>it contains a phone number</source>
+        <translation>telefon numarası içeriyor</translation>
+    </message>
+    <message>
+        <source>it contains a home address</source>
+        <translation>ev adresi içeriyor</translation>
+    </message>
+    <message>
+        <source>it contains health data</source>
+        <translation>sağlık verisi içeriyor</translation>
+    </message>
+    <message>
+        <source>it is too long</source>
+        <translation>çok uzun</translation>
+    </message>
+    <message>
+        <source>refused</source>
+        <translation>reddedildi</translation>
+    </message>
+    <message>
+        <source>Remembered</source>
+        <translation>Hatırlandı</translation>
+    </message>
+    <message>
+        <source>Saved - awaiting your approval</source>
+        <translation>Kaydedildi - onayınızı bekliyor</translation>
+    </message>
+    <message>
+        <source>Not remembered: %1</source>
+        <translation>Hatırlanmadı: %1</translation>
+    </message>
+    <message>
         <source>TASK RESULT</source>
         <translation>GÖREV SONUCU</translation>
     </message>
@@ -1874,6 +1922,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Quote</source>
         <translation>Alıntıla</translation>
+    </message>
+    <message>
+        <source>Remember</source>
+        <translation>Hatırla</translation>
     </message>
     <message>
         <source>Queued (%1)</source>
