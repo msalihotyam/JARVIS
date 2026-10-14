@@ -852,6 +852,17 @@ CREATE TABLE IF NOT EXISTS memory_tombstones (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_tombstones_hash
     ON memory_tombstones(content_hash, project_id);
+CREATE TABLE IF NOT EXISTS memory_purge_audit (
+    purge_id TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    purged_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_owned_artifacts (
+    path TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    record_id TEXT NULL,
+    created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS skills (
     skill_id TEXT NOT NULL,
     version INTEGER NOT NULL CHECK (version >= 1),
@@ -907,7 +918,10 @@ CREATE TABLE IF NOT EXISTS skill_experiences (
 # V2.1 typed memory (above): every memory_record* table and the toggle table
 # are append-only - a record's status is its LATEST memory_record_events row
 # (highest event_id), a replacement is a memory_record_supersessions row -
-# and nothing here offers an UPDATE or DELETE of them.
+# and nothing here offers an UPDATE or DELETE of them, except the one hard
+# purge (I16, ``purge_records``). memory_purge_audit keeps only purge_id,
+# content hash and time; memory_owned_artifacts lists files that hold record
+# content (record_id NULL = a whole-DB backup).
 
 # V2.2 skills (above, jarvis/skill_store.py): every skill* table is insert- or
 # append-only - a skill's state is its skill_events rows in event_id order, a
@@ -1006,6 +1020,8 @@ MEMORY_V21_SCHEMA_OBJECTS = frozenset(
         "memory_record_guard",
         "memory_tombstones",
         "idx_memory_tombstones_hash",
+        "memory_purge_audit",
+        "memory_owned_artifacts",
     }
     | (
         {MEMORY_RECORDS_FTS}
@@ -1203,6 +1219,20 @@ class MemoryRecordApproval:
     project_id: str
     record_id: str
     detail: str = "user-approve"
+
+
+@dataclass(frozen=True, slots=True)
+class PurgeConfirmation:
+    """The human's confirmation of one hard purge (I16).
+
+    Minted ONLY by Core at the Core-drawn purge dialog (SECAPPUI), never
+    from model, tool, import or connector output. It names exactly the
+    record ids the human confirmed; ``purge_records`` refuses any other set.
+    """
+
+    record_ids: frozenset[str]
+    minted_at: str
+    nonce: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -7358,6 +7388,234 @@ class SQLiteMemoryStore:
                 ],
             )
         return len(rows)
+
+    @staticmethod
+    def _purge_collect(
+        connection: sqlite3.Connection, record_ids: frozenset[str]
+    ) -> dict[str, sqlite3.Row]:
+        """The purge set, to a fixed point: the named records, their
+        supersession chain in both directions (supersession rows and
+        ``supersedes`` links) and the consolidation-origin records whose
+        events name one of them as a whole token. An unknown named id
+        refuses the purge; a link to a non-record (legacy M1) is ignored."""
+        rows: dict[str, sqlite3.Row] = {}
+        frontier = sorted(record_ids)
+        while frontier:
+            record_id = frontier.pop()
+            if record_id in rows:
+                continue
+            row = connection.execute(
+                "SELECT record_id, text, project_id, supersedes FROM memory_records "
+                "WHERE record_id = ?",
+                (record_id,),
+            ).fetchone()
+            if row is None:
+                if record_id in record_ids:
+                    raise ValueError(f"Unknown memory record: {record_id}")
+                continue
+            rows[record_id] = row
+            if row["supersedes"]:
+                frontier.append(row["supersedes"])
+            frontier += [linked[0] for linked in connection.execute(
+                "SELECT old_record_id FROM memory_record_supersessions WHERE new_record_id = ? "
+                "UNION SELECT new_record_id FROM memory_record_supersessions WHERE old_record_id = ? "
+                "UNION SELECT record_id FROM memory_records WHERE supersedes = ?",
+                (record_id, record_id, record_id),
+            )]
+            frontier += [derived["record_id"] for derived in connection.execute(
+                "SELECT e.record_id, e.reason FROM memory_record_events e "
+                "JOIN memory_records r ON r.record_id = e.record_id "
+                "WHERE r.origin = ? AND instr(e.reason, ?) > 0",
+                (MemoryRecordOrigin.CONSOLIDATION.value, record_id),
+            ) if record_id in re.split(r"[^A-Za-z0-9._:-]+", derived["reason"])]
+        return rows
+
+    def _purge_paths(self, connection: sqlite3.Connection, ids: list[str]) -> tuple[list[str], list[str]]:
+        """(files linked to ``ids``, whole-DB backups) from memory_owned_artifacts."""
+        marks = ",".join("?" * len(ids))
+        linked, backups = [], []
+        for row in connection.execute(
+            "SELECT path, record_id FROM memory_owned_artifacts "  # nosec B608 - placeholders only
+            f"WHERE record_id IS NULL OR record_id IN ({marks}) ORDER BY path",
+            ids,
+        ):
+            (backups if row["record_id"] is None else linked).append(row["path"])
+        return linked, backups
+
+    def _delete_owned_file(self, path: str) -> bool:
+        """Delete one artifact file; True when it no longer exists.
+
+        Only a regular file under the database's own directory is deleted -
+        never a UNC path (refused before any resolve), a symlink, a path that
+        resolves elsewhere, the database itself or its WAL/SHM/pre-V2 copy.
+        """
+        target = Path(path)
+        if str(target).replace("/", "\\").startswith("\\\\") or not target.is_absolute():
+            return False
+        try:
+            if not os.path.lexists(target):
+                return True
+            if target.is_symlink():
+                return False
+            root = self.database_path.parent.resolve()
+            resolved = target.resolve(strict=True)
+            database = self.database_path.resolve()
+            protected = {
+                database,
+                database.with_name(database.name + "-wal"),
+                database.with_name(database.name + "-shm"),
+                pre_v2_backup_path(database),
+            }
+            if not resolved.is_relative_to(root) or resolved in protected or not resolved.is_file():
+                return False
+            resolved.unlink()
+        except (OSError, RuntimeError, ValueError):
+            return False
+        return True
+
+    def purge_preview(self, record_ids: Iterable[str]) -> dict[str, tuple[str, ...]]:
+        """Read-only: what ``purge_records`` would remove (``record_ids``,
+        chain and derived records included) and the files that would still
+        hold the content afterwards (``still_held_by``: whole-DB backups,
+        O1). For the Core-drawn purge dialog; it mints nothing."""
+        requested = self._purge_request(record_ids)
+        with self._connection() as connection:
+            ids = sorted(self._purge_collect(connection, requested))
+            _, backups = self._purge_paths(connection, ids)
+        return {"record_ids": tuple(ids), "still_held_by": tuple(backups)}
+
+    @staticmethod
+    def _purge_request(record_ids: Iterable[str]) -> frozenset[str]:
+        if isinstance(record_ids, (str, bytes)):
+            raise ValueError("record_ids must be a collection of record ids")
+        requested = frozenset(record_ids)
+        if not requested:
+            raise ValueError("purge needs at least one record id")
+        for record_id in requested:
+            validate_memory_record_id(record_id)
+        return requested
+
+    def purge_records(
+        self,
+        record_ids: Iterable[str],
+        *,
+        actor: MemoryRecordActor,
+        confirmation: PurgeConfirmation,
+    ) -> dict[str, Any]:
+        """THE hard purge (I16) - the only DELETE on memory_record* tables,
+        the documented exception to I8 (rebuild_fts's FTS-only delete aside).
+
+        Refused unless ``actor`` is USER and ``confirmation`` is a Core-minted
+        ``PurgeConfirmation`` naming exactly ``record_ids``, and refused when
+        the purge set (``_purge_collect``: chain and derived records) is
+        larger than that - the user confirms ``purge_preview``'s set, so no
+        record goes unseen. ONE transaction with ``secure_delete`` on: the
+        set is deleted from memory_records, its events, supersessions, guard
+        rows and FTS rows (then FTS 'optimize'). Each purged text leaves a
+        permanent tombstone (expires_at NULL) in the record's scope and one
+        memory_purge_audit row of purge_id, content hash and time - no text,
+        no ids. After commit: WAL checkpoint(TRUNCATE), then the files linked
+        to purged records are deleted (``_delete_owned_file``) and only then
+        their owned-artifact rows. Whole-DB backups are never touched (O1);
+        they, any linked file that could not be deleted (its row stays) and
+        a WAL a reader kept from truncation are returned in
+        ``still_held_by``. Conversation turns are out of scope;
+        the tombstone blocks re-capture from them. Best-effort defense in
+        depth: nothing here claims erasure from the file system or storage.
+        """
+        if actor is not MemoryRecordActor.USER:
+            raise ValueError("purge_records needs the USER actor")
+        requested = self._purge_request(record_ids)
+        if (
+            type(confirmation) is not PurgeConfirmation
+            or type(confirmation.record_ids) is not frozenset
+            or confirmation.record_ids != requested
+            or canonical_utc_timestamp(confirmation.minted_at) is None
+            or type(confirmation.nonce) is not str
+            or not confirmation.nonce
+        ):
+            raise ValueError("purge needs a Core-minted confirmation of exactly these records")
+        purge_id = str(uuid4())
+        connection = self._connect()
+        try:
+            connection.execute("PRAGMA secure_delete = ON")
+            _begin_immediate(connection)
+            try:
+                rows = self._purge_collect(connection, requested)
+                if frozenset(rows) != requested:
+                    # The user confirms every record that goes, chain and
+                    # derived ones included: confirm purge_preview's set.
+                    raise ValueError("purge set is larger than the confirmation; confirm purge_preview's record_ids")
+                fts = memory_records_fts_available(connection)
+                if not fts and connection.execute(
+                    "SELECT 1 FROM sqlite_master WHERE name = ?", (MEMORY_RECORDS_FTS,)
+                ).fetchone():
+                    raise ValueError("the FTS index holds record text but this SQLite cannot delete from it")
+                ids = sorted(rows)
+                marks = ",".join("?" * len(ids))
+                linked, backups = self._purge_paths(connection, ids)
+                # FK order: every row naming a record goes before the record.
+                connection.execute(
+                    "DELETE FROM memory_record_supersessions "  # nosec B608 - placeholders only
+                    f"WHERE old_record_id IN ({marks}) OR new_record_id IN ({marks})",
+                    ids + ids,
+                )
+                connection.execute(
+                    f"DELETE FROM memory_record_events WHERE record_id IN ({marks})", ids  # nosec B608 - placeholders only
+                )
+                connection.execute(
+                    f"DELETE FROM memory_record_guard WHERE record_id IN ({marks})", ids  # nosec B608 - placeholders only
+                )
+                if fts:
+                    connection.execute(
+                        f"DELETE FROM {MEMORY_RECORDS_FTS} WHERE record_id IN ({marks})", ids  # nosec B608 - constant table name, placeholders
+                    )
+                    connection.execute(
+                        f"INSERT INTO {MEMORY_RECORDS_FTS}({MEMORY_RECORDS_FTS}) VALUES ('optimize')"  # nosec B608 - constant table name
+                    )
+                connection.execute(
+                    f"DELETE FROM memory_records WHERE record_id IN ({marks})", ids  # nosec B608 - placeholders only
+                )
+                at = utc_now()
+                scoped = sorted({(content_hash(row["text"]), row["project_id"]) for row in rows.values()})
+                connection.executemany(
+                    "INSERT INTO memory_tombstones (content_hash, project_id, scope_kind, "
+                    "reason, created_at, expires_at) VALUES (?, ?, 'project', 'purged', ?, NULL)",
+                    [(digest, project_id, at) for digest, project_id in scoped],
+                )
+                connection.executemany(
+                    "INSERT INTO memory_purge_audit (purge_id, content_hash, purged_at) VALUES (?, ?, ?)",
+                    [(purge_id, digest, at) for digest in sorted({digest for digest, _ in scoped})],
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+            try:
+                busy = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()[0]
+            except sqlite3.OperationalError:
+                busy = 1
+            # Files go after commit; an artifact row goes only once its file
+            # is gone, so a crash or a refused path never loses the record.
+            undeleted = [path for path in linked if not self._delete_owned_file(path)]
+            deleted = sorted(set(linked) - set(undeleted))
+            if deleted:
+                with connection:
+                    connection.execute(
+                        "DELETE FROM memory_owned_artifacts "  # nosec B608 - placeholders only
+                        f"WHERE path IN ({','.join('?' * len(deleted))}) AND record_id IN ({marks})",
+                        deleted + ids,
+                    )
+        finally:
+            connection.close()
+        # A reader holding the WAL keeps the old pages there until a later checkpoint.
+        wal = [str(self.database_path) + "-wal"] if busy else []
+        still_held_by = backups + undeleted + wal
+        return {
+            "purge_id": purge_id,
+            "record_ids": tuple(ids),
+            "still_held_by": tuple(still_held_by),
+        }
 
     def apply_doctor_repair(
         self, proposal: RepairProposal, proof: MemoryRecordApproval

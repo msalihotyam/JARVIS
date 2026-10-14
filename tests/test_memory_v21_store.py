@@ -319,7 +319,14 @@ class RecordStoreTests(unittest.TestCase):
         source = (REPO / "jarvis" / "memory.py").read_text(encoding="utf-8")
         pattern = re.compile(r"(UPDATE|DELETE\s+FROM|REPLACE\s+INTO|INSERT\s+OR\s+REPLACE\s+INTO)\s+memory_record",
                              re.IGNORECASE)
-        self.assertEqual(pattern.findall(source), [])
+        # I16: purge_records is the one documented DELETE exception (SECPURGE).
+        start = source.index("    def purge_records(")
+        end = source.index("\n    def ", start + 1)
+        purge, rest = source[start:end], source[:start] + source[end:]
+        self.assertEqual(pattern.findall(rest), [])
+        self.assertEqual({match.upper() for match in pattern.findall(purge)}, {"DELETE FROM"})
+        self.assertEqual(set(re.findall(r"DELETE\s+FROM\s+(memory_record\w*)", purge)), {
+            "memory_records", "memory_record_events", "memory_record_supersessions", "memory_record_guard"})
 
 
 if __name__ == "__main__":
