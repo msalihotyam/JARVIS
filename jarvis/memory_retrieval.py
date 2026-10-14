@@ -25,10 +25,10 @@ from __future__ import annotations
 import re
 import sys
 import unicodedata
-from collections.abc import Set
+from collections.abc import Callable, Set
 from dataclasses import dataclass
 from datetime import datetime, timedelta
-from typing import AbstractSet, Iterable
+from typing import AbstractSet, Iterable, TypeVar
 
 from jarvis.contracts import (
     MemoryRecord,
@@ -44,6 +44,52 @@ FRESHNESS_HALF_LIFE = timedelta(days=90)
 STALE_AFTER = timedelta(days=180)
 
 _SUPERSEDING_KINDS = frozenset({MemoryRecordKind.DECISION, MemoryRecordKind.RULE})
+
+#: Token ceiling of the memory block in one prompt (I18, block header included).
+MEMORY_INJECT_TOKEN_BUDGET = 1500
+#: Injection fill order; a kind outside this tuple goes last.
+KIND_PRIORITY = (
+    MemoryRecordKind.RULE,
+    MemoryRecordKind.DECISION,
+    MemoryRecordKind.PREFERENCE,
+    MemoryRecordKind.FACT,
+    MemoryRecordKind.LESSON,
+)
+
+
+_T = TypeVar("_T")
+
+
+def pack_for_budget(
+    items: Iterable[_T],
+    *,
+    kind_of: Callable[[_T], object],
+    cost: Callable[[_T], int],
+    budget: int = MEMORY_INJECT_TOKEN_BUDGET,
+    reserved: int = 0,
+) -> tuple[tuple[_T, ...], tuple[_T, ...]]:
+    """Pack whole items into ``budget - reserved`` by kind priority, input (rank)
+    order within a kind. An item that does not fit is dropped whole and packing
+    goes on with the next; nothing is truncated. Returns ``(packed, dropped)``,
+    both in packing order. Bad input raises ValueError."""
+    if type(budget) is not int or type(reserved) is not int or not 0 <= reserved <= budget:
+        raise ValueError("budget and reserved must be ints with 0 <= reserved <= budget")
+    order = {kind: i for i, kind in enumerate(KIND_PRIORITY)}
+    # sorted() is stable, so the input (rank) order holds within a kind.
+    ranked = sorted(items, key=lambda item: order.get(kind_of(item), len(order)))
+    room = budget - reserved
+    packed: list[_T] = []
+    dropped: list[_T] = []
+    for item in ranked:
+        size = cost(item)
+        if type(size) is not int or size < 0:
+            raise ValueError("cost must return an int >= 0")
+        if size <= room:
+            packed.append(item)
+            room -= size
+        else:
+            dropped.append(item)
+    return tuple(packed), tuple(dropped)
 
 
 @dataclass(frozen=True, slots=True)
