@@ -245,6 +245,24 @@ gelecekteki parasal harcamayı yetkilendirmez. Ayrıntılı sözleşme
 - Claude Max aboneliği şirket tarafından karşılandığı için, resmi biçimde mümkünse Claude Code CLI üzerinden bundan yararlanmak önceliklidir; Anthropic API'ye otomatik geçiş yapılmaz.
 - ChatGPT Plus ve diğer aboneliklerin kapatılması bu geliştirme aşamasının parçası değildir; ancak JARVIS olgunlaştıktan ve gerçek kullanım/maliyet ölçüldükten sonra kullanıcı tarafından değerlendirilir.
 
+## V2.1a tipli hafıza durumu (2026-10-14)
+
+- V2.1a hafızası INT43-INT46 ile `main`'e entegre: tipli kayıtlar
+  (Fact/Decision/Rule/Lesson/Preference), append-only durum olayları,
+  SessionEnd/PreCompact capture (model önerir, Core doğrular ve yazar),
+  deterministik "hiç saklanmaz" filtresi, görev-hedefli getirme ve kaynak
+  etiketli teslim, sohbet başına varsayılan kapalı "tüm projelerin hafızası"
+  anahtarı, "Hatırla", onay/ret/geri al. Mimari: `ARCHITECTURE.md` §6.1.
+- Onay politikası: Fact/Lesson otomatik ve geri alınabilir; Decision/Rule ve
+  Q1 kararına kadar Preference onay bekler.
+- Açık: SessionEnd/PreCompact tetikleri ve sıkıştırma app'te kurulu ama
+  UI'dan henüz çağrılmıyor (MEMTRIGWIRE, backlog); dalga E (sıkıştır/doctor
+  köprüsü, bağlam kullanımı bloğu, Doctor paneli; INT47), MEMGATE uçtan uca
+  testi ve Salih'in elle kapısı
+  (`ARCHITECTURE.md` §6.2). `memory_extract_model` ayarı ve çıkarım atlama
+  politikası tanımlı, capture yoluna henüz bağlı değil. Açık sorular
+  Q1-Q7: `build/v21/SLICES_V21.md`.
+
 ## Proje hafızasını güncelleme kuralı
 
 - Yeni ve kalıcı teknik kararlar `ARCHITECTURE.md` içine eklenir.

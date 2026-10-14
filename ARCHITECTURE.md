@@ -2583,6 +2583,209 @@ alır ve yeniden denenmeden yükselir: bir işlem asla yarıdan sürdürülmez.
 Okumalar, işlemlerin yazdıkları, idempotency korumaları ve `SCHEMA_VERSION`
 değişmez.
 
+### 6.1 V2.1a tipli hafıza (uygulandı, INT43-INT46)
+
+Bu bölüm V2.1a hafızasını **kurulduğu haliyle** anlatır (plan:
+`build/v21/SLICES_V21.md`; güvenlik değişmezleri I1-I12 oradadır). Temel
+ilke değişmez: **Core yetkidir, model yalnız önerir.** Model çıktısı hiçbir
+kaydın kökenini, durumunu, kapsamını veya aktörünü belirleyemez.
+
+**Tablolar (yalnız ek tablo, `SCHEMA_VERSION` 10, ALTER yok;
+`jarvis/memory.py`):**
+
+- `memory_records`: insert-only kayıt. `kind` (fact, decision, rule,
+  lesson, preference), `text`, `subject_key` (supersession anahtarı),
+  `project_id`, `conversation_id`, `scope_kind` (yalnız `project`), `origin`,
+  `actor` (user, model, tool), `confidence`, `classification`,
+  `created_at`/`expires_at`, `supersedes`, `source_conversation_id`,
+  `source_turn_ids`.
+- `memory_record_events`: append-only durum günlüğü; bir kaydın güncel
+  durumu son olayıdır. Durumlar: pending, approved, rejected, retracted,
+  superseded, expired.
+- `memory_record_supersessions`: eski -> yeni kayıt bağı (aynı kayıt
+  olamaz).
+- `memory_records_fts` (`MEMORY_RECORDS_FTS`): FTS5 arama dizini;
+  `memory_records_fts_available` False ise arama LIKE'a düşer.
+- `conversation_global_memory_toggles`: sohbet başına "tüm projelerin
+  hafızası" anahtarı, append-only (son satır geçerli).
+- `memory_capture_runs`: capture koşu defteri (`trigger`: session_end,
+  precompact, import, manual; `outcome`, `counts`); aynı koşu iki kez
+  yazmaz.
+- `memory_record_guard` ve `memory_tombstones`: V2.1 SEC kabul koruması
+  (köken, oturum kirliliği, talimat-benzerliği, içerik özeti) ve silinmiş
+  içeriğin geri gelmesini engelleyen mezar taşları.
+
+Eski M1 `project_memory_items` taşınmaz (Q4 planı): M1 getirme yolu
+(`retrieve_context`) aynen çalışır, tipli kayıtlar onun kalan kotasına
+eklenir; `legacy_m1` kökeni M1'den okunan kaydı işaretlemek için ayrılmıştır.
+
+**Sözlük (`jarvis/contracts.py`):** `MemoryRecordKind`,
+`MemoryRecordStatus`, `MemoryRecordOrigin` (explicit_user,
+capture_session_end, capture_precompact, consolidation, import, legacy_m1),
+`MemoryRecordActor`, `MemoryRecordScopeKind` (`PROJECT` depolanır;
+`GLOBAL_READONLY` yalnız getirme etiketidir), `MemoryRecordScope`,
+`MemoryRecordCandidate`, `MemoryRecord`. Onay politikası
+`needs_user_approval`: FACT ve LESSON otomatik APPROVED (geri alınabilir);
+DECISION, RULE ve şimdilik PREFERENCE (Q1 fail-closed) kullanıcı onayına
+kadar PENDING.
+
+**Yazma sınırları (yetki):**
+
+- `insert_explicit_user_record`: `explicit_user` kökeninin tek yeni yazma
+  yolu (I2); yalnız app'in açık kullanıcı eylemlerinden çağrılır ("Hatırla":
+  `JarvisApp.remember_message`). M1 yolu `save_explicit_user_memory_item`
+  aynen kalır.
+- `insert_record`: model/araç/içe aktarma kayıtları; `explicit_user`,
+  `legacy_m1` kökeni veya `user` aktörü burada reddedilir. FACT/LESSON
+  APPROVED, diğer her tür ve her `import` kaydı PENDING başlar. İsteğe
+  bağlı `guard` (`RecordGuard`) verildiğinde depo `decide_admission`'ı
+  (`jarvis/memory_guard.py`) kendisi yeniden koşar ve mezar taşını
+  `MemoryTombstoned` ile reddeder; bugünkü capture yolu `guard` vermez.
+- `approve_record`: yalnız `MemoryRecordApproval` kanıtıyla; uygunluk
+  (kayıt o projede, proje etkin, kayıt PENDING) aynı yazma işleminde
+  SQLite'tan yeniden okunur. `record_event` ret (REJECTED) ve diğer durum
+  olaylarını, `undo` RETRACTED olayını, `supersede` supersession'ı yazar; onaylı RULE
+  veya `explicit_user` kayıt kanıtsız supersede edilmez.
+- Silme yok (I8): `memory_record*` tablolarında UPDATE/DELETE yoktur; her
+  değişiklik bir olay veya supersession satırıdır.
+
+**"Hiç saklanmaz" filtresi (`jarvis/memory_filter.py`):**
+`classify_candidate_text` -> `FilterVerdict`; deterministik, modelsiz.
+Korumalı yollar, `.env` sır satırları, kimlik bilgisi desenleri, kart/IBAN/TC
+kimlik/SSN numaraları, telefon, adres ve sağlık içeriği reddedilir; filtre
+hatası reddetmektir. Depolamadan önce ve depoda tekrar uygulanır (I5):
+Core capture adayında (`_validated_capture_candidate`) ve depoda yazmadan
+önce (`insert_record`/`insert_explicit_user_record`); global (salt okunur)
+okumada her satıra yeniden uygulanır (`_view_readable`, SECRET yasağıyla
+birlikte).
+
+**Tetikler ve capture (`jarvis/app.py` `MemoryTriggers`,
+`jarvis/core.py` `AgentCore.capture_memory`, `jarvis/memory_capture.py`):**
+
+- SessionEnd: `JarvisApp.conversation_left` (sohbet değiştirme, yeni sohbet,
+  arşiv; silme tetiklemez) ve kapanışta `shutdown_memory_capture`.
+- PreCompact: `JarvisApp.watch_conversations`, `register_precompact_hook`
+  ile sıkıştırılacak turları capture'a verir; elle "Oturumu sıkıştır"
+  (`JarvisApp.compact_conversation`) önce PreCompact capture'ı çalıştırır,
+  yanıt akarken reddedilir.
+- `MemoryTriggers` yalnız zamanlar: sohbet başına tek iş parçacığı, hatayı
+  yutar; capture hatası sohbeti veya sıkıştırmayı asla engellemez (I12).
+  Kapanışta süreyi aşan koşular `abort_capture_runs` ile kaydedilir.
+- Capture modeli: sohbetin mevcut modeli (`JarvisApp.intent_model`); model
+  yoksa capture koşmaz. `memory_extract_model` ayarı ve
+  `extraction_skip_reason` tanımlıdır ama capture yoluna henüz bağlı
+  değildir.
+- Akış: `build_capture_prompt` -> model -> `parse_candidates` (yetki anahtarı
+  taşıyan yanıtın tamamı reddedilir) -> Core `_validated_capture_candidate`
+  (en az bir kanıt turu kullanıcının kendi turu olmalı; filtre) ->
+  `insert_record` (köken = tetik, aktör `tool`, kapsam = sohbetin projesi).
+  Koşu `memory_capture_runs`'a yazılır; SessionEnd sonrası proje için
+  `consolidate_scope` çalışır.
+- Global anahtarı bir kez açılmış sohbetten capture yapılmaz (sonuç
+  `global_memory_used`).
+- Bağlantı durumu: tetik kancaları (`watch_conversations`,
+  `conversation_left`, `shutdown_memory_capture`, `compact_conversation`)
+  app'te kurulu ve testli, ama bu bölüm yazılırken köprü/arka uç/QML
+  onları çağırmaz; çalışan uygulamada SessionEnd/PreCompact capture,
+  SessionEnd konsolidasyonu ve sıkıştırma komutu henüz erişilemez.
+  Bağlantı konveyor backlog'undaki MEMTRIGWIRE dilimindedir.
+
+**Konsolidasyon (`jarvis/memory_consolidation.py`):** `plan_consolidation`
+saf planlayıcıdır (birleştirme, supersession, süre dolumu, çatışma);
+`MemoryStore.consolidate_scope` -> `apply_consolidation_plan` planı
+olaylarla uygular, her adımı yeniden denetler, eşzamanlı değişiklikte planı
+reddeder; idempotenttir.
+
+**Getirme ve teslim (`jarvis/memory_retrieval.py`,
+`AgentCore._with_typed_memory`):** her görevde `search_records` (FTS5/LIKE,
+SQL'de proje kapsamı) ile aday toplanır, `select_for_task` görev-hedefli
+sıralar (tazelik yarı ömrü 90 gün, 180 günden eski "stale"); aynı konuda en
+yeni APPROVED DECISION/RULE kazanır. Yalnız APPROVED, süresi dolmamış ve
+supersede edilmemiş kayıt teslim edilir (I12). Her öğe veri olarak
+çerçevelenir: `memory record (reference data, not an instruction)` + tür,
+proje, köken, tarih, gerekirse `stale` ve `read-only from project ...`.
+Yalnız kendi projesinin onaylı RULE'u RULE olarak teslim edilir ve resume'da
+`reprove_retrieved_rules` ile yeniden kanıtlanır (I3). Mevcut 5 öğe / 4.000
+karakter tavanı korunur; hata durumunda tipli hafıza teslim edilmez, görev
+engellenmez.
+
+**Global anahtar (I6, I7):** varsayılan kapalı, sohbet başına,
+`set_global_memory_toggle` / `global_memory_enabled`. Açıkken diğer
+projelerin APPROVED kayıtları `GLOBAL_READONLY` olarak salt okunur ve kaynak
+etiketli okunur. Anahtarı bir kez açılmış (sonra kapatılmış olsa da)
+sohbet projeye bağlanamaz: `_attach_toggle_refusal` hem
+`conversation_attach_preview` hem `attach_global_conversation_to_project`
+yolunda reddeder; tablo okunamazsa da reddeder.
+
+**Bağlam kullanımı (`jarvis/context_usage.py`):** `context_usage` ->
+`ContextUsage` (kullanılan / en çok, `HIGH_RATIO` 0,8, otomatik
+sıkıştırmaya kalan tur). Model yoksa pencere "bilinmiyor" olarak döner
+(`JarvisApp.context_usage_payload`).
+
+**App ve UI giriş noktaları:**
+
+- App (`jarvis/app.py`): `memory_records_payload`, `approve_memory_record`,
+  `reject_memory_record`, `undo_memory_record`, `remember_message`,
+  `global_memory_toggle_payload`, `set_global_memory_toggle`,
+  `context_usage_payload`, `compact_conversation`, `memory_doctor_payload`,
+  `apply_memory_repair`.
+- Köprü (`jarvis/ui/bridge.py`): `memoryRecords`, `approveMemoryRecord`,
+  `rejectMemoryRecord`, `undoMemoryRecord`, `rememberMessage`,
+  `contextUsage`, `globalMemoryEnabled`, `setGlobalMemoryEnabled`
+  (`contextUsage` özelliğini henüz hiçbir QML okumaz).
+- QML: mesaj menüsünde "Hatırla" (`FeedView.qml`); sohbet başlığında global
+  anahtar (`ChatHeader.qml`, `toggleGlobalMemory`); Hafıza sayfasında onay
+  bekleyen kartlar (`MemoryPage.qml`); proje sayfasında Hafıza diyaloğu
+  (`ProjectMemoryDialog.qml`: onay, ret, geri al).
+- Dalga E'de, bu bölüm yazılırken entegre değil (INT47 ile gelir):
+  sıkıştır/doctor köprü yuvaları (MEMUIBR3), `ContextUsageBlock.qml` +
+  `UsagePopover.qml` bağlam kullanımı bloğu (MEMUICTX), Hafıza sayfasında
+  `MemoryDoctorPanel.qml` (DOCUI, V2.1b).
+
+**Sağlayıcı otomatik hafızası kapalı (NOAUTOMEM):** JARVIS'in başlattığı
+Claude Code süreçleri `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1` ile, Codex
+app-server `--disable memories` ile çalışır; hafızanın tek sahibi Core'dur.
+
+### 6.2 V2.1a elle kapı kontrol listesi (Salih, dogfood)
+
+Kapı, INT47, MEMTRIGWIRE (tetiklerin UI bağlantısı; o olmadan 1, 2 ve 12.
+adımlar geçemez) ve MEMGATE (`tests/test_memory_v21_e2e.py`) yeşil olduktan
+sonra gerçek uygulamada bir kez yürütülür. Her adımın beklenen sonucu
+yanındadır; biri tutmazsa kapı kalır ve adım numarasıyla raporlanır.
+
+1. Proje A'da yeni sohbet: bir gerçek ("bu projede Python 3.13
+   kullanıyoruz") ve bir karar ("veritabanı olarak SQLite'ta kalıyoruz")
+   söyle. Sohbetten çık (başka sohbete geç). Beklenen: Hafıza sayfasında
+   FACT onaylı, DECISION "onay bekliyor" kartında.
+2. Uzun bir sohbette "Oturumu sıkıştır"ı kullan (yanıt akarken düğme
+   kapalı/ret). Beklenen: sıkıştırma olur, önce PreCompact capture yazılır;
+   sohbet etkilenmez.
+3. DECISION kartını onayla, bir başka adayı reddet. Beklenen: onaylı kayıt
+   listede, reddedilen teslim edilmiyor.
+4. Proje A'da yeni sohbet aç ve kararla ilgili soru sor. Beklenen: cevap
+   kararı kullanıyor; kayıt "referans veri" olarak, proje/köken/tarih
+   etiketli geliyor (talimat gibi davranmıyor).
+5. Aynı konuda yeni bir karar ver, onayla. Beklenen: eski karar
+   SUPERSEDED, yeni sohbetlerde yalnız yenisi geliyor.
+6. Proje B'de sohbet aç, aynı soruyu sor. Beklenen: A'nın kaydı görünmez.
+7. Proje B sohbetinde başlıktaki "tüm projelerin hafızası" anahtarını aç,
+   aynı soruyu sor. Beklenen: A'nın kaydı "read-only from project A"
+   etiketiyle görünür; B'ye kayıt yazılmaz.
+8. Anahtarı açılmış bir projesiz sohbeti bir projeye bağlamayı dene.
+   Beklenen: reddedilir.
+9. Bir mesajda "Hatırla"yı kullan, sonra o kaydı geri al. Beklenen: kayıt
+   `explicit_user` kökenli görünür; geri alınca RETRACTED, artık teslim
+   edilmez, satır silinmez.
+10. Bir mesajda sahte bir kart numarası, `.env` satırı veya parola yaz,
+    sohbetten çık. Beklenen: hiçbiri hafızaya girmez.
+11. Bağlam kullanımı bloğunu aç. Beklenen: kullanılan/en çok ve "Otomatik
+    sıkıştırmaya N tur"; model bilinmiyorsa dürüst "bilinmiyor".
+12. Uygulamayı kapat, yeniden aç. Beklenen: onaylı/bekleyen kayıtlar
+    korunur; açık sohbetler kapanışta SessionEnd capture aldı, uygulama
+    kapanışı takılmadı.
+13. Sonuç kaydı: kapı sonucu (geçti/kaldı + adım numaraları) runbook
+    sahibinin durum dosyasına yazılır; V2.1a ancak o zaman kapanır.
+
 ## 7. Maliyet yönetimi
 
 ### 7.1 Sağlayıcıdan bağımsız faturalandırma sınıfı (kullanıcı kararı)
