@@ -123,8 +123,11 @@ class MemoryTriggerWiringTests(UiTestCase):
         bridge.shutdown()
         shutdown = self.spies["shutdown_memory_capture"]
         self.assertEqual(1, shutdown.call_count)
-        self.assertEqual({"open_ids": (self.c1,), "timeout": backend_module.MEMORY_CAPTURE_SHUTDOWN_SECONDS},
-                         shutdown.call_args.kwargs)
+        kwargs = shutdown.call_args.kwargs                     # MEMTRIGFIX: the bound covers the whole quit path,
+        self.assertEqual({"open_ids", "timeout"}, set(kwargs))  # so the app gets what is left of it
+        self.assertEqual((self.c1,), kwargs["open_ids"])
+        self.assertGreater(kwargs["timeout"], 0)
+        self.assertLessEqual(kwargs["timeout"], backend_module.MEMORY_CAPTURE_SHUTDOWN_SECONDS)
         self.assertLessEqual(backend_module.MEMORY_CAPTURE_SHUTDOWN_SECONDS, 5.0)
 
     def test_a_raising_trigger_never_breaks_the_window(self) -> None:

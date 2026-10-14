@@ -150,7 +150,9 @@ from jarvis.context_items import (
 from jarvis.context_items import response_mode as items_response_mode
 from jarvis.core import (
     AgentCore,
+    CaptureStop,
     MemoryCaptureOutcome,
+    capture_gate_open,
     _capture_run_connection,
     _claim_capture_run,
     _finish_capture_run,
@@ -3764,6 +3766,10 @@ class MemoryTriggers:
     capture failure is swallowed here - it never reaches the chat or the
     compaction that triggered it (I12). Process-wide because the UI backend
     builds a fresh ``JarvisApp`` per call.
+
+    A job holds the app, or a zero-argument callable resolving it when the
+    job runs (``None``: skip), so a model or budget change applies to the
+    next capture. Every capture write goes through one ``CaptureStop``.
     """
 
     def __init__(self) -> None:
@@ -3774,6 +3780,10 @@ class MemoryTriggers:
         # a restart re-offers turns and Core's run-id ledger dedupes them.
         self._captured: dict[str, int] = {}
         self._closed = False
+        self._stop = CaptureStop()
+        #: The app each conversation's capture last ran with: shutdown aborts
+        #: through the store that run writes to, without reading config.
+        self._apps: dict[str, Any] = {}
 
     def schedule(self, app: Any, conversation_id: str, trigger: MemoryRecordOrigin,
                  turns: Iterable[Any] | None = None) -> bool:
@@ -3814,12 +3824,20 @@ class MemoryTriggers:
 
     def _run(self, app: Any, conversation_id: str, trigger: MemoryRecordOrigin,
              turns: tuple[Any, ...] | None) -> None:
+        if self._stop.stopped:  # halted: not even a resolver's store opens
+            return
+        app = app() if callable(app) else app
+        if app is None:
+            return
+        with self._lock:
+            self._apps[conversation_id] = app
         model = app.intent_model
         if model is None:
             return
+        stop = self._stop
         if trigger is MemoryRecordOrigin.CAPTURE_PRECOMPACT:
             if turns:
-                outcome = app.core.capture_memory(conversation_id, trigger, model, turns=turns)
+                outcome = app.core.capture_memory(conversation_id, trigger, model, turns=turns, stop=stop)
                 self._mark(conversation_id, turns, outcome)
             return
         raw = app.memory.load_conversation_state(conversation_id).turns
@@ -3828,35 +3846,53 @@ class MemoryTriggers:
         fresh = tuple(turn for turn in raw if turn.seq > mark)
         if fresh:
             if fresh == raw:
-                outcome = app.core.capture_memory(conversation_id, trigger, model)
+                outcome = app.core.capture_memory(conversation_id, trigger, model, stop=stop)
             else:
-                outcome = app.core.capture_memory(conversation_id, trigger, model, turns=fresh)
+                outcome = app.core.capture_memory(conversation_id, trigger, model, turns=fresh, stop=stop)
             self._mark(conversation_id, fresh, outcome)
         record = app.memory.load_conversation(conversation_id)
         if record is not None and record.project_id:
-            app.memory.consolidate_scope(record.project_id, utc_now())
+            with stop.write():
+                app.memory.consolidate_scope(record.project_id, utc_now())
+
+    def halt(self, timeout: float = 0.0) -> bool:
+        """Close for good: once this returns no capture write starts (one in
+        progress gets ``timeout``; ``False`` if it outlived that) and announced
+        model calls are cancelled."""
+        with self._lock:
+            self._closed = True
+        return self._stop.stop(timeout)
 
     def shutdown(self, app: Any, open_ids: Iterable[str] = (), timeout: float = 5.0) -> tuple[str, ...]:
-        """Session-end the open conversations, wait at most ``timeout`` seconds,
-        then have Core record every still-running conversation's run aborted.
-        Returns the conversations Core recorded as aborted."""
+        """Session-end the open conversations, wait for captures, halt, then
+        have Core record every run still open aborted - all within ``timeout``
+        seconds; no capture writes after this returns. ``app`` (or what it
+        resolves to; ``None`` is fine) only aborts a conversation whose
+        capture never resolved an app. Returns the conversations whose open
+        runs Core recorded aborted. Already halted (a quit that returned):
+        records nothing."""
+        if self._stop.stopped:
+            return ()
+        deadline = time.monotonic() + max(0.0, timeout)
+        reserve = min(0.5, max(0.0, timeout) / 5)  # for the halt: a write in progress finishes
         for conversation_id in open_ids:
             self.schedule(app, conversation_id, MemoryRecordOrigin.CAPTURE_SESSION_END)
         with self._lock:
             self._closed = True
             threads = dict(self._threads)
-        deadline = time.monotonic() + max(0.0, timeout)
         for thread in threads.values():
-            thread.join(max(0.0, deadline - time.monotonic()))
+            thread.join(max(0.0, deadline - reserve - time.monotonic()))
+        self.halt(max(0.0, deadline - time.monotonic()))
+        with self._lock:
+            apps = {cid: self._apps.get(cid) for cid in threads}
         aborted: list[str] = []
-        for conversation_id, thread in threads.items():
-            if not thread.is_alive():
-                continue
+        for conversation_id, ran_with in apps.items():
             try:
-                app.core.abort_capture_runs(conversation_id)
+                target = ran_with if ran_with is not None else (app() if callable(app) else app)
+                if target is not None and target.core.abort_capture_runs(conversation_id):
+                    aborted.append(conversation_id)
             except Exception:  # noqa: BLE001 - shutdown proceeds regardless
                 continue
-            aborted.append(conversation_id)
         return tuple(aborted)
 
 
@@ -3953,10 +3989,17 @@ class JarvisApp:
         self._cancelled_text: set[str] = set()
         self.memory_triggers = MEMORY_TRIGGERS
 
-    def watch_conversations(self, store: Any) -> None:
-        """PreCompact: capture exactly the turns ``store`` is about to compact."""
-        register_precompact_hook(store, lambda cid, turns: self.memory_triggers.schedule(
-            self, cid, MemoryRecordOrigin.CAPTURE_PRECOMPACT, turns))
+    def watch_conversations(self, store: Any, resolve: Callable[[], Any] | None = None) -> None:
+        """PreCompact: capture exactly the turns ``store`` is about to compact,
+        with the app ``resolve()`` returns when the capture runs (default this
+        one). Gated like Core: no capture thread for a conversation Core would
+        refuse (``capture_gate_open``)."""
+        triggers, target = self.memory_triggers, resolve or self
+
+        def hook(conversation_id: str, turns: tuple[Any, ...]) -> None:
+            if capture_gate_open(store, conversation_id):
+                triggers.schedule(target, conversation_id, MemoryRecordOrigin.CAPTURE_PRECOMPACT, turns)
+        register_precompact_hook(store, hook)
 
     def conversation_left(self, conversation_id: str) -> bool:
         """SessionEnd: switch, new conversation or archive. Delete never calls this."""

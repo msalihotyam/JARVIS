@@ -30,7 +30,7 @@ class StubCore:
         self.aborted: list[str] = []
         self.started = threading.Event()
 
-    def capture_memory(self, conversation_id, trigger, model, *, turns=None):
+    def capture_memory(self, conversation_id, trigger, model, *, turns=None, stop=None):
         # What is still raw in the store when the capture runs.
         raw = tuple(t.text for t in self.store.load_conversation_state(conversation_id).turns)
         self.calls.append((conversation_id, trigger,

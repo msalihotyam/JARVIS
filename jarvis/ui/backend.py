@@ -15,6 +15,8 @@ names a capability and never interprets destination grammar.
 from __future__ import annotations
 
 import logging
+import threading
+import time
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -55,6 +57,7 @@ from jarvis.app import (
     status_payload,
     tasks_result,
 )
+import jarvis.app as app_module
 from jarvis.cli import _config_change, _config_reset_change
 from jarvis.antigravity import antigravity_state
 from jarvis.codex import CodexIntentAdapter, codex_state, remember_codex_state
@@ -67,6 +70,7 @@ from jarvis.connectors.project_folder import (
 from jarvis.intent import INTENT_SYSTEM_PROMPT, claude_model_catalog
 from jarvis.model_retirement import codex_retirement
 from jarvis.contracts import BillingClass, ErrorCode
+from jarvis.core import capture_gate_open
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import ConfigError, ConfigStore, Settings
 
@@ -219,7 +223,7 @@ class Backend:
         store = self._conversations[1]
         if self._watched is not store:  # PreCompact: once per store instance (the window's own, not the app's)
             try:
-                self._app(loaded.settings).watch_conversations(store)
+                self._app(loaded.settings).watch_conversations(store, self._capture_app)
                 self._watched = store
             except Exception:  # noqa: BLE001 - capture never blocks the chat (I12); retried next call
                 _log.warning("memory capture: watching the conversation store failed", exc_info=True)
@@ -228,17 +232,19 @@ class Backend:
     # -- V2.1a M2c: memory capture triggers ----------------------------------
     #
     # Scheduling only: Core decides every record and re-checks every gate.
-    # Capture is off for a Global conversation and for one whose "all
-    # projects memory" toggle is on; then these are no-ops. They never raise
-    # into the window (I12): a failure is logged and dropped.
+    # Capture is off where Core's own gate is closed (``capture_gate_open``:
+    # a Global conversation, or one that ever used "all projects memory");
+    # then these are no-ops. They never raise into the window (I12): a
+    # failure is logged and dropped.
 
     def _capture_on(self, conversation_id: str) -> bool:
         store = self.conversations()
-        if store is None or not conversation_id:
-            return False
-        record = store.load_conversation(conversation_id)
-        return (record is not None and record.project_id is not None
-                and not store.global_memory_enabled(conversation_id))
+        return store is not None and bool(conversation_id) and capture_gate_open(store, conversation_id)
+
+    def _capture_app(self) -> JarvisApp | None:
+        """The app as configured when a capture runs (``None``: refused config)."""
+        loaded = self.store.load()
+        return self._app(loaded.settings) if loaded.usable else None
 
     def memory_capture_left(self, conversation_id: str) -> None:
         """SessionEnd: the window left ``conversation_id`` (switch, new, archive)."""
@@ -250,16 +256,35 @@ class Backend:
             _log.warning("memory capture: session end was not scheduled", exc_info=True)
 
     def memory_capture_shutdown(self, open_id: str) -> None:
-        """Quit: session-end the open conversation, wait at most
-        ``MEMORY_CAPTURE_SHUTDOWN_SECONDS``, abort what still runs."""
+        """Quit: session-end the open conversation and abort what still runs,
+        the whole path (config load, app build, joins, abort writes) within
+        ``MEMORY_CAPTURE_SHUTDOWN_SECONDS``. Whatever that path did - a
+        refused config, a hang - no capture writes once this returns."""
+        deadline = time.monotonic() + MEMORY_CAPTURE_SHUTDOWN_SECONDS
+        reserve = min(0.5, MEMORY_CAPTURE_SHUTDOWN_SECONDS / 5)  # for the final halt
+
+        def remaining() -> float:
+            return max(0.0, deadline - reserve - time.monotonic())
+
+        def quit_capture() -> None:
+            try:
+                loaded = self.store.load()
+                if loaded.usable:
+                    open_ids = (open_id,) if self._capture_on(open_id) else ()
+                    self._app(loaded.settings).shutdown_memory_capture(open_ids=open_ids, timeout=remaining())
+                else:  # no config: abort through the apps the runs resolved
+                    app_module.MEMORY_TRIGGERS.shutdown(None, (), remaining())
+            except Exception:  # noqa: BLE001 - quitting never waits on capture (I12)
+                _log.warning("memory capture: shutdown failed", exc_info=True)
+
+        worker = threading.Thread(target=quit_capture, name="jarvis-capture-quit", daemon=True)
+        worker.start()
+        worker.join(remaining())
         try:
-            loaded = self.store.load()
-            if loaded.usable:
-                open_ids = (open_id,) if self._capture_on(open_id) else ()
-                self._app(loaded.settings).shutdown_memory_capture(
-                    open_ids=open_ids, timeout=MEMORY_CAPTURE_SHUTDOWN_SECONDS)
+            if not app_module.MEMORY_TRIGGERS.halt(max(0.0, deadline - time.monotonic())):
+                _log.warning("memory capture: a write in progress outlived the quit bound")
         except Exception:  # noqa: BLE001 - quitting never waits on capture (I12)
-            _log.warning("memory capture: shutdown failed", exc_info=True)
+            _log.warning("memory capture: halt failed", exc_info=True)
 
     # -- configuration: the kill switch and the model selection --------------
 

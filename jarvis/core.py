@@ -8,6 +8,7 @@ import json
 import os
 import sqlite3
 import threading
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from collections import Counter
 from datetime import datetime
@@ -198,7 +199,7 @@ from jarvis.progress import (
 )
 from jarvis import memory_capture, memory_retrieval, project_files
 from collections.abc import Mapping, Sequence
-from jarvis.conversation import RAW_TURNS_MAX, REPLY_MAX_CHARS, TURN_MAX_CHARS, Turn
+from jarvis.conversation import RAW_TURNS_MAX, REPLY_MAX_CHARS, TURN_MAX_CHARS, Compacted, Turn
 from jarvis.conversation import digest as conversation_digest
 from jarvis.memory_doctor import LEGACY_M1_KIND_MAP
 from jarvis.memory_filter import classify_candidate_text
@@ -1009,6 +1010,94 @@ def _global_memory_ever_used(store: Any, conversation_id: str) -> bool:
         raise RuntimeError("the memory store cannot answer the all-projects toggle")
     with connection() as reader:
         return check(reader, conversation_id) is not None
+
+
+def capture_gate_open(store: Any, conversation_id: str) -> bool:
+    """Core's own pre-run capture refusals as one predicate, for a trigger
+    that must not start work Core would refuse: an unknown or Global
+    conversation, or one that ever used "all projects memory". Any read
+    error closes it. ``capture_memory`` still re-checks (Core decides)."""
+    try:
+        record = store.load_conversation(conversation_id)
+        return (record is not None and record.project_id is not None
+                and not _global_memory_ever_used(store, conversation_id))
+    except Exception:  # noqa: BLE001 - an unreadable gate is closed
+        return False
+
+
+class CaptureCancelled(Exception):
+    """A capture write or model call was refused: shutdown stopped capture."""
+
+
+class CaptureStop:
+    """Shutdown's stop for running captures.
+
+    Every capture write runs inside ``write()`` and every model call is
+    announced through ``calling()``; both refuse once ``stop()`` set the flag.
+    ``stop`` takes the same lock, so after it returns no write starts and
+    none is still in progress (unless one outlived ``timeout``), and it asks
+    each announced model call to terminate its process.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._stopped = False
+        self._calls: dict[str, Any] = {}
+
+    @property
+    def stopped(self) -> bool:
+        return self._stopped
+
+    @contextmanager
+    def write(self):
+        with self._lock:
+            if self._stopped:
+                raise CaptureCancelled
+            yield
+
+    def calling(self, model: Any, task_id: str) -> None:
+        with self._lock:
+            if self._stopped:
+                raise CaptureCancelled
+            self._calls[task_id] = model
+
+    def returned(self, task_id: str) -> None:
+        with self._lock:
+            self._calls.pop(task_id, None)
+
+    def stop(self, timeout: float = 0.0) -> bool:
+        """Set the flag; ``False`` if a write in progress outlived ``timeout``."""
+        held = self._lock.acquire(timeout=max(0.0, timeout))
+        try:
+            self._stopped = True
+            calls = list(self._calls.items())
+        finally:
+            if held:
+                self._lock.release()
+        # ponytail: a CLI spawned between this cancel and the adapter
+        # registering its process runs to the adapter timeout. Upgrade: an
+        # adapter-side cancel-before-spawn flag.
+        for task_id, model in calls:
+            try:
+                model.cancel(task_id)
+            except Exception:  # noqa: BLE001 - advisory; shutdown proceeds
+                pass
+        return held
+
+
+def _capture_writing(stop: CaptureStop | None):
+    return nullcontext() if stop is None else stop.write()
+
+
+def _session_user_turns(session_turns: tuple[Any, ...], batch: tuple[Any, ...]) -> list[Turn]:
+    """The session's user turns, once each (by seq: a turn id is ``t<seq>-``);
+    a raw or batch turn's own words win over its compacted digest."""
+    words = {e.seq: e.digest for e in session_turns if type(e) is Compacted and e.role == "user"}
+    words.update(
+        {t.seq: t.message for t in (*session_turns, *batch) if type(t) is Turn and t.role == "user"}
+    )
+    return [Turn(id=f"t{seq}", seq=seq, role="user", kind="user", text="", message=message)
+            for seq, message in words.items()]
 
 
 def _claim_capture_run(store: Any, run_id: str, conversation_id: str, trigger: str) -> bool:
@@ -5507,6 +5596,7 @@ class AgentCore:
         model: ModelAdapter,
         *,
         turns: Sequence[Turn] | None = None,
+        stop: CaptureStop | None = None,
     ) -> MemoryCaptureOutcome:
         """Capture memory from one conversation: the model proposes, Core decides.
 
@@ -5533,6 +5623,10 @@ class AgentCore:
         turns only if ``_validated_capture_turns`` proves each belongs to this
         conversation; otherwise ``invalid_turns`` and no run row. The run id
         comes from the same first/last ids, so a re-offer dedupes.
+
+        ``stop`` (shutdown): every write and the model call go through it;
+        once stopped the run ends ``aborted`` and writes nothing more, not
+        even its own finish (shutdown records the abort).
         """
         label = _CAPTURE_TRIGGERS.get(trigger) if type(trigger) is MemoryRecordOrigin else None
         if label is None:
@@ -5562,7 +5656,10 @@ class AgentCore:
         try:
             if _global_memory_ever_used(self.memory, conversation_id):
                 return MemoryCaptureOutcome(run_id=run_id, outcome="global_memory_used")
-            claimed = _claim_capture_run(self.memory, run_id, conversation_id, label)
+            with _capture_writing(stop):
+                claimed = _claim_capture_run(self.memory, run_id, conversation_id, label)
+        except CaptureCancelled:
+            return MemoryCaptureOutcome(run_id=run_id, outcome="aborted")
         except Exception:  # noqa: BLE001 - no run store means no model call
             return MemoryCaptureOutcome(run_id=run_id, outcome="run_store_error")
         if not claimed:
@@ -5570,13 +5667,16 @@ class AgentCore:
         try:
             result = self._run_capture(
                 run_id, conversation_id, conversation.project_id, trigger, turns, model,
-                (*state.turns, *state.compacted), state.omitted,
+                (*state.turns, *state.compacted), state.omitted, stop,
             )
+        except CaptureCancelled:
+            return MemoryCaptureOutcome(run_id=run_id, outcome="aborted")
         except Exception:  # noqa: BLE001 - capture never breaks the chat path
             result = MemoryCaptureOutcome(run_id=run_id, outcome="internal_error")
         try:
-            _finish_capture_run(self.memory, result)
-        except Exception:  # noqa: BLE001 - the run row stays unfinished
+            with _capture_writing(stop):
+                _finish_capture_run(self.memory, result)
+        except Exception:  # noqa: BLE001 - the row stays unfinished (stopped: shutdown aborts it)
             pass
         return result
 
@@ -5613,12 +5713,16 @@ class AgentCore:
         model: ModelAdapter,
         session_turns: tuple[Any, ...] = (),
         omitted: int = 0,
+        stop: CaptureStop | None = None,
     ) -> MemoryCaptureOutcome:
         # No temporary conversations and no quota reading exist in Core yet:
-        # temporary is False and an unknown quota never skips.
+        # temporary is False and an unknown quota never skips. The SESSION
+        # decides, not the batch: a PreCompact batch can be one turn.
         skip = memory_capture.extraction_skip_reason(
-            turns, temporary=False, quota_remaining_pct=None
+            _session_user_turns(session_turns, turns), temporary=False, quota_remaining_pct=None
         )
+        if skip is None and not any(type(t) is Turn and t.role == "user" for t in turns):
+            skip = "empty"  # a reply-only batch has no words of the person to quote
         if skip is not None:
             return MemoryCaptureOutcome(run_id=run_id, outcome=f"skipped:{skip}")
         # The whole session counts (raw, compacted and the batch), not only
@@ -5647,10 +5751,15 @@ class AgentCore:
             scope=ActionScope(action=_CAPTURE_TOOL),
             project_id=project_id,
         )
+        if stop is not None:
+            stop.calling(model, task.id)
         try:
             response = model.complete(task, SessionState(objective=prompt))
         except Exception:  # noqa: BLE001 - provider boundary
             return MemoryCaptureOutcome(run_id=run_id, outcome="provider_error")
+        finally:
+            if stop is not None:
+                stop.returned(task.id)
         if type(response) is not ToolResult or not response.ok or type(response.data) is not dict:
             return MemoryCaptureOutcome(run_id=run_id, outcome="provider_error")
         try:
@@ -5715,24 +5824,27 @@ class AgentCore:
                     proposed_kind=candidate.kind,
                     content_hash=digest,
                 )
-                view = self.memory.insert_record(
-                    MemoryRecord(
-                        kind=candidate.kind,
-                        text=candidate.text,
-                        subject_key=candidate.subject_key,
-                        scope=MemoryRecordScope(
-                            project_id=project_id, conversation_id=conversation_id
+                with _capture_writing(stop):
+                    view = self.memory.insert_record(
+                        MemoryRecord(
+                            kind=candidate.kind,
+                            text=candidate.text,
+                            subject_key=candidate.subject_key,
+                            scope=MemoryRecordScope(
+                                project_id=project_id, conversation_id=conversation_id
+                            ),
+                            origin=trigger,
+                            actor=MemoryRecordActor.TOOL,
+                            tool=_CAPTURE_TOOL,
+                            confidence=candidate.confidence,
+                            classification=DataClassification.INTERNAL,
+                            source_conversation_id=conversation_id,
+                            source_turn_ids=candidate.evidence_turn_ids,
                         ),
-                        origin=trigger,
-                        actor=MemoryRecordActor.TOOL,
-                        tool=_CAPTURE_TOOL,
-                        confidence=candidate.confidence,
-                        classification=DataClassification.INTERNAL,
-                        source_conversation_id=conversation_id,
-                        source_turn_ids=candidate.evidence_turn_ids,
-                    ),
-                    guard=guard,
-                )
+                        guard=guard,
+                    )
+            except CaptureCancelled:
+                raise
             except ValueError as exc:  # includes MemoryRecordRefused: the store said no
                 category = getattr(exc, "category", "store_refused")
                 if category == "tombstoned":
