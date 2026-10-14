@@ -33,6 +33,7 @@ PROJECT_CONTEXT_CAP = 2_000
 _TRIGGERS = {
     MemoryRecordOrigin.CAPTURE_SESSION_END: "the session ended",
     MemoryRecordOrigin.CAPTURE_PRECOMPACT: "the conversation is about to be compacted",
+    MemoryRecordOrigin.IMPORT: "the user imported an exported chat history",
 }
 _TOP_KEYS = frozenset({"candidates"})
 _CANDIDATE_KEYS = frozenset(

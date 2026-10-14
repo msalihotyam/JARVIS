@@ -14,6 +14,7 @@ outbound-payload decisions stay in ``jarvis.core`` and the connectors.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import re
@@ -87,6 +88,7 @@ from jarvis.contracts import (
     ChainStep,
     CostEstimate,
     DataClassification,
+    MemoryRecord,
     MemoryRecordActor,
     MemoryRecordKind,
     MemoryRecordScope,
@@ -143,7 +145,17 @@ from jarvis.context_items import (
     image_files,
 )
 from jarvis.context_items import response_mode as items_response_mode
-from jarvis.core import AgentCore
+from jarvis.core import (
+    AgentCore,
+    MemoryCaptureOutcome,
+    _capture_run_connection,
+    _claim_capture_run,
+    _finish_capture_run,
+    _validated_capture_candidate,
+)
+from jarvis import memory_capture, memory_import
+from jarvis.memory_guard import Provenance, RecordGuard, SessionTaint, content_hash
+from jarvis.memory_import_plan import ImportPlan, plan_import
 from jarvis.dispatch import DISPATCH_REFUSED, cancel_job_run
 from jarvis.destinations import (
     CONNECTOR_DESTINATION_POLICY,
@@ -3835,6 +3847,52 @@ def _replying(conversation_id: str | None):
                 del _REPLYING[conversation_id]
 
 
+#: V2.1b history import. Previewed plans and the cancel flag of each running
+#: import are process-wide: the UI backend builds a fresh ``JarvisApp`` per call.
+IMPORT_BATCH_MAX_ITEMS = 20
+IMPORT_BATCH_MAX_CHARS = 24_000
+_IMPORT_PLANS_MAX = 4
+#: Ledger rows one batch may claim: the first run plus retries of a failed one.
+_IMPORT_RUN_ATTEMPTS = 3
+#: The adapter-facing capability, the same one Core's capture uses.
+_IMPORT_CAPABILITY = "memory_capture"
+_IMPORT_TOOL = "memory_import"
+_IMPORT_PLANS: dict[str, ImportPlan] = {}
+_IMPORT_CANCEL: dict[str, threading.Event] = {}
+_IMPORT_LOCK = threading.Lock()
+
+
+@dataclass(frozen=True, slots=True)
+class _ImportTurn:
+    """One imported item shown to the capture model as DATA; never a stored turn."""
+
+    id: str
+    role: str
+    kind: str
+    text: str
+
+
+def _import_batches(items: Iterable[Any]) -> list[tuple[_ImportTurn, ...]]:
+    """Items in batches of at most ``IMPORT_BATCH_MAX_ITEMS`` items and
+    ``IMPORT_BATCH_MAX_CHARS`` characters, in order. Ids come from the content
+    hash, so the same export gives the same batches (the run ledger dedupes)."""
+    batches: list[tuple[_ImportTurn, ...]] = []
+    batch: list[_ImportTurn] = []
+    size = 0
+    for item in items:
+        # ponytail: an item over the batch cap is clipped, not split; split it
+        # into several turns if long imported messages lose memories.
+        text = item.text[:IMPORT_BATCH_MAX_CHARS]
+        if batch and (len(batch) >= IMPORT_BATCH_MAX_ITEMS or size + len(text) > IMPORT_BATCH_MAX_CHARS):
+            batches.append(tuple(batch))
+            batch, size = [], 0
+        batch.append(_ImportTurn(f"i{len(batch)}-{item.content_hash[:16]}", item.role, "imported", text))
+        size += len(text)
+    if batch:
+        batches.append(tuple(batch))
+    return batches
+
+
 class JarvisApp:
     """Thin command facade over ``AgentCore``; it holds no loop policy."""
 
@@ -4440,6 +4498,244 @@ class JarvisApp:
         except (TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
         return {"ok": True, "record": self._record_payload(view)}
+
+    # -- V2.1b (IMPEXTRACT): history import pipeline ----------------------------
+    # import -> dedup -> proposed scope (preview) -> the user confirms a project
+    # per group -> extraction -> every record PENDING until the user approves
+    # it. Imported text is untrusted DATA: never executed, never instructions.
+
+    def import_history_preview(self, path: Any) -> dict[str, Any]:
+        """Parse one export file and plan it. Writes nothing - no record, no
+        run row; the plan lives in this process under a fresh ``plan_id``.
+        Protected paths (operator data, secrets, the memory database's
+        folder), links and malformed or oversized exports are refused."""
+        if not isinstance(path, (str, Path)) or not str(path).strip():
+            return {"ok": False, "error": "path must be a file path."}
+        try:
+            batch = memory_import.parse_export(
+                path, protected_roots=(Path(self.settings.memory_database).parent,)
+            )
+            projects = {project.id: project.name for project in self.memory.list_projects() if project.active}
+            # ponytail: dedup is within the export; a re-import is deduped per
+            # batch by the run ledger. Pass stored item hashes if they get a home.
+            plan = plan_import(batch, (), projects)
+        except memory_import.ProtectedPathError:
+            return {"ok": False, "refused": "protected_path", "error": "This path is protected and is never read."}
+        except (memory_import.ImportRefused, OSError, TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        plan_id = uuid4().hex
+        with _IMPORT_LOCK:
+            _IMPORT_PLANS[plan_id] = plan
+            while len(_IMPORT_PLANS) > _IMPORT_PLANS_MAX:
+                _IMPORT_PLANS.pop(next(iter(_IMPORT_PLANS)))
+        return {
+            "ok": True,
+            "plan_id": plan_id,
+            "groups": [
+                {
+                    "group_id": str(index),
+                    "title": group.source_conversation_title,
+                    "source_format": group.source_format,
+                    "items": len(group.items),
+                    "proposed_project_id": group.proposed_project_id,
+                    "scope_status": group.scope_status,
+                    "estimated_chars": group.estimated_chars,
+                    "estimated_tokens": group.estimated_tokens,
+                }
+                for index, group in enumerate(plan.groups)
+            ],
+            "duplicates_dropped": plan.duplicates_dropped,
+            "estimated_chars": plan.estimated_chars,
+            "estimated_tokens": plan.estimated_tokens,
+            "warnings": list(batch.warnings),
+        }
+
+    def import_history_run(self, plan_id: str, confirmed_scopes: Mapping[str, str]) -> dict[str, Any]:
+        """Extract the groups the user confirmed (``group_id -> project_id``).
+
+        A group missing from ``confirmed_scopes`` is skipped; every confirmed
+        project must be active before any model call. Each batch is one run
+        in ``memory_capture_runs`` (trigger ``import``); a batch already run
+        is a ``duplicate`` and is not asked again. Every stored record has
+        origin IMPORT, so the store keeps it PENDING whatever its kind.
+        ``import_history_cancel`` stops before the next batch."""
+        with _IMPORT_LOCK:
+            plan = _IMPORT_PLANS.get(plan_id) if isinstance(plan_id, str) else None
+        if plan is None:
+            return {"ok": False, "error": "Unknown or expired import plan."}
+        if not isinstance(confirmed_scopes, Mapping):
+            return {"ok": False, "error": "confirmed_scopes must map group id -> project id."}
+        groups = {str(index): group for index, group in enumerate(plan.groups)}
+        if not set(confirmed_scopes) <= set(groups):
+            return {"ok": False, "error": "confirmed_scopes names an unknown group."}
+        for project_id in confirmed_scopes.values():
+            refusal = self._active_project_refusal(project_id)
+            if refusal:
+                return {"ok": False, "error": refusal}
+        model = self.intent_model
+        if model is None:
+            return {"ok": False, "error": "No model is available for import extraction."}
+        cancel = threading.Event()
+        with _IMPORT_LOCK:
+            if plan_id in _IMPORT_CANCEL:
+                return {"ok": False, "error": "This import is already running."}
+            _IMPORT_CANCEL[plan_id] = cancel
+        runs: list[dict[str, Any]] = []
+        try:
+            for group_id, group in groups.items():
+                if group_id not in confirmed_scopes:
+                    continue
+                for turns in _import_batches(group.items):
+                    if cancel.is_set():
+                        break
+                    outcome = self._import_batch(confirmed_scopes[group_id], plan_id, turns, model)
+                    runs.append({
+                        "group_id": group_id,
+                        "project_id": confirmed_scopes[group_id],
+                        "run_id": outcome.run_id,
+                        "outcome": outcome.outcome,
+                        "record_ids": list(outcome.record_ids),
+                        **outcome.counts(),
+                    })
+        finally:
+            with _IMPORT_LOCK:
+                if _IMPORT_CANCEL.get(plan_id) is cancel:
+                    del _IMPORT_CANCEL[plan_id]
+        return {
+            "ok": True,
+            "plan_id": plan_id,
+            "cancelled": cancel.is_set(),
+            "skipped_groups": [group_id for group_id in groups if group_id not in confirmed_scopes],
+            "runs": runs,
+            "pending": sum(run["pending"] for run in runs),
+            "approved": sum(run["approved"] for run in runs),
+        }
+
+    def import_history_cancel(self, plan_id: str) -> dict[str, Any]:
+        with _IMPORT_LOCK:
+            cancel = _IMPORT_CANCEL.get(plan_id) if isinstance(plan_id, str) else None
+        if cancel is None:
+            return {"ok": False, "error": "No import is running for this plan."}
+        cancel.set()
+        return {"ok": True, "plan_id": plan_id}
+
+    def _import_batch(
+        self, project_id: str, plan_id: str, turns: tuple[_ImportTurn, ...], model: ModelAdapter
+    ) -> MemoryCaptureOutcome:
+        """One ledgered extraction run; never raises (mirrors ``capture_memory``)."""
+        key = "|".join((project_id, "import", *(turn.id for turn in turns)))
+        base = "imp-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        for attempt in range(_IMPORT_RUN_ATTEMPTS):
+            run_id = f"{base}-{attempt}" if attempt else base
+            try:
+                if _claim_capture_run(self.memory, run_id, f"import-{plan_id}", "import"):
+                    break
+                with _capture_run_connection(self.memory) as connection:
+                    row = connection.execute(
+                        "SELECT outcome FROM memory_capture_runs WHERE run_id = ?", (run_id,)
+                    ).fetchone()
+            except Exception:  # noqa: BLE001 - no run store means no model call
+                return MemoryCaptureOutcome(run_id=run_id, outcome="run_store_error")
+            # Done, or unfinished (maybe still running): never asked twice.
+            # A finished failure is retried under the next attempt id.
+            if row is None or row[0] in (None, "ok"):
+                return MemoryCaptureOutcome(run_id=run_id, outcome="duplicate", duplicate=True)
+        else:
+            return MemoryCaptureOutcome(run_id=base, outcome="retries_exhausted")
+        try:
+            result = self._run_import_capture(run_id, project_id, turns, model)
+        except Exception:  # noqa: BLE001 - one batch never breaks the import
+            result = MemoryCaptureOutcome(run_id=run_id, outcome="internal_error")
+        try:
+            _finish_capture_run(self.memory, result)
+        except Exception:  # noqa: BLE001 - the run row stays unfinished
+            pass
+        return result
+
+    def _run_import_capture(
+        self, run_id: str, project_id: str, turns: tuple[_ImportTurn, ...], model: ModelAdapter
+    ) -> MemoryCaptureOutcome:
+        # ponytail: Core's capture path for imports, reusing Core's own
+        # validators; AgentCore.capture_memory is conversation-bound and
+        # jarvis/core.py belongs to another lane. Upgrade: AgentCore.capture_import.
+        prompt = memory_capture.build_capture_prompt(turns, MemoryRecordOrigin.IMPORT, "")
+        task = Task(
+            objective=prompt,
+            capability=_IMPORT_CAPABILITY,
+            scope=ActionScope(action=_IMPORT_CAPABILITY),
+            project_id=project_id,
+        )
+        try:
+            response = model.complete(task, SessionState(objective=prompt))
+        except Exception:  # noqa: BLE001 - provider boundary
+            return MemoryCaptureOutcome(run_id=run_id, outcome="provider_error")
+        if type(response) is not ToolResult or not response.ok or type(response.data) is not dict:
+            return MemoryCaptureOutcome(run_id=run_id, outcome="provider_error")
+        try:
+            answer = AgentCore._validated_model_answer(response.data.get(MODEL_ANSWER_RESULT_KEY))
+        except TypeError:
+            return MemoryCaptureOutcome(run_id=run_id, outcome="malformed_answer")
+        if not answer.present or answer.truncated:
+            return MemoryCaptureOutcome(run_id=run_id, outcome="malformed_answer")
+        parsed = memory_capture.parse_candidates(answer.content, turns)
+        if type(parsed) is not memory_capture.CaptureResult:
+            return MemoryCaptureOutcome(run_id=run_id, outcome="parse_error")
+        known = frozenset(turn.id for turn in turns)
+        # Evidence must be the person's side of the export (an "unknown" turn
+        # is a marker-less note); an assistant/system/tool line alone is not.
+        own = frozenset(turn.id for turn in turns if turn.role in ("user", "unknown"))
+        record_ids: list[str] = []
+        approved = pending = failed = 0
+        refused = parsed.refused
+        for value in parsed.candidates:
+            candidate = _validated_capture_candidate(value, known, own)
+            if candidate is None:
+                refused += 1
+                continue
+            try:
+                view = self.memory.insert_record(
+                    MemoryRecord(
+                        kind=candidate.kind,
+                        text=candidate.text,
+                        subject_key=candidate.subject_key,
+                        scope=MemoryRecordScope(project_id=project_id),
+                        origin=MemoryRecordOrigin.IMPORT,
+                        actor=MemoryRecordActor.TOOL,
+                        tool=_IMPORT_TOOL,
+                        confidence=candidate.confidence,
+                        classification=DataClassification.INTERNAL,
+                    ),
+                    # The store re-runs admission (import taint -> PENDING RULE,
+                    # proposed kind kept in the guard row) and the tombstone gate.
+                    guard=RecordGuard(
+                        Provenance.IMPORT,
+                        SessionTaint.IMPORT,
+                        (),
+                        candidate.kind,
+                        content_hash(candidate.text),
+                    ),
+                )
+            except ValueError:  # includes MemoryRecordRefused/MemoryTombstoned: the store said no
+                refused += 1
+                continue
+            except Exception:  # noqa: BLE001 - one bad write never stops the run
+                failed += 1
+                continue
+            record_ids.append(view.record.record_id)
+            if view.status is MemoryRecordStatus.PENDING:
+                pending += 1
+            else:
+                approved += 1
+        return MemoryCaptureOutcome(
+            run_id=run_id,
+            outcome="ok",
+            record_ids=tuple(record_ids),
+            approved=approved,
+            pending=pending,
+            refused=refused,
+            dropped=len(parsed.dropped),
+            failed=failed,
+        )
 
     def global_memory_toggle_payload(self, conversation_id: str) -> dict[str, Any]:
         try:
