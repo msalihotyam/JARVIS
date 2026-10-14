@@ -185,6 +185,9 @@ from jarvis.progress import (
     set_waiting_issue,
 )
 from jarvis import memory_capture, project_files
+from collections.abc import Sequence
+from jarvis.conversation import RAW_TURNS_MAX, REPLY_MAX_CHARS, TURN_MAX_CHARS, Turn
+from jarvis.conversation import digest as conversation_digest
 from jarvis.memory_filter import classify_candidate_text
 from jarvis.registry import (
     AmbiguousConnectorError,
@@ -721,6 +724,48 @@ def _claim_capture_run(store: Any, run_id: str, conversation_id: str, trigger: s
         except sqlite3.IntegrityError:
             return False
     return True
+
+
+def _validated_capture_turns(turns: Any, state: Any) -> tuple[Turn, ...] | None:
+    """The caller's turns if every one provably belongs to ``state``; else ``None``.
+
+    Fail-closed: a non-empty tuple of at most ``RAW_TURNS_MAX`` ``Turn``s
+    with consecutive seqs (so the first and last id name the range, as on the
+    stored path) and text within the store's own clip. A turn still raw must
+    equal the stored turn exactly; a compacted one (the PreCompact batch, once
+    the compaction committed) must match its checkpoint entry's seq, role,
+    kind, capability and digest. Text stays untrusted data.
+    """
+    # ponytail: a checkpoint keeps no turn id and only a 240-char digest, so
+    # a compacted turn's id hash and text past the digest are unverifiable.
+    # Upgrade: the id and a full-text hash in Compacted (jarvis/conversation.py).
+    if type(turns) is not tuple or not turns or len(turns) > RAW_TURNS_MAX:
+        return None
+    raw = {turn.seq: turn for turn in state.turns}
+    compacted = {entry.seq: entry for entry in state.compacted}
+    for index, turn in enumerate(turns):
+        if type(turn) is not Turn or type(turn.seq) is not int or type(turn.text) is not str:
+            return None
+        if index and turn.seq != turns[index - 1].seq + 1:
+            return None
+        limit = REPLY_MAX_CHARS + 64 if turn.kind == "reply" else TURN_MAX_CHARS
+        prefix = f"t{turn.seq}-"
+        if len(turn.text) > limit or type(turn.id) is not str or not turn.id.startswith(prefix):
+            return None
+        suffix = turn.id[len(prefix):]
+        if len(suffix) != 10 or not set(suffix) <= set("0123456789abcdef"):
+            return None
+        stored = raw.get(turn.seq)
+        if stored is not None:
+            if stored != turn:
+                return None
+            continue
+        entry = compacted.get(turn.seq)
+        if entry is None or (entry.role, entry.kind, entry.capability, entry.digest) != (
+            turn.role, turn.kind, turn.capability, conversation_digest(turn.text)
+        ):
+            return None
+    return turns
 
 
 def _finish_capture_run(store: Any, result: MemoryCaptureOutcome) -> None:
@@ -5119,6 +5164,8 @@ class AgentCore:
         conversation_id: str,
         trigger: MemoryRecordOrigin,
         model: ModelAdapter,
+        *,
+        turns: Sequence[Turn] | None = None,
     ) -> MemoryCaptureOutcome:
         """Capture memory from one conversation: the model proposes, Core decides.
 
@@ -5136,19 +5183,33 @@ class AgentCore:
         error, a malformed answer or an unparseable reply writes no record;
         once a run is claimed its outcome is recorded. The same conversation,
         trigger and turn range is captured at most once.
+
+        ``turns`` (PreCompact batch, SessionEnd remainder) replaces the stored
+        turns only if ``_validated_capture_turns`` proves each belongs to this
+        conversation; otherwise ``invalid_turns`` and no run row. The run id
+        comes from the same first/last ids, so a re-offer dedupes.
         """
         label = _CAPTURE_TRIGGERS.get(trigger) if type(trigger) is MemoryRecordOrigin else None
         if label is None:
             return MemoryCaptureOutcome(run_id="", outcome="invalid_trigger")
+        given = turns
         try:
             conversation = self.memory.load_conversation(conversation_id)
-            turns = tuple(self.memory.load_conversation_state(conversation_id).turns)
+            state = self.memory.load_conversation_state(conversation_id)
+            turns = tuple(state.turns)
         except Exception:  # noqa: BLE001 - unreadable conversation fails closed
             return MemoryCaptureOutcome(run_id="", outcome="unknown_conversation")
         if conversation is None:
             return MemoryCaptureOutcome(run_id="", outcome="unknown_conversation")
         if conversation.project_id is None:
             return MemoryCaptureOutcome(run_id="", outcome="no_project")
+        if given is not None:
+            try:
+                turns = _validated_capture_turns(given, state)
+            except Exception:  # noqa: BLE001 - a malformed turn fails closed
+                turns = None
+            if turns is None:
+                return MemoryCaptureOutcome(run_id="", outcome="invalid_turns")
         if not turns:
             return MemoryCaptureOutcome(run_id="", outcome="no_turns")
         key = f"{conversation_id}|{label}|{turns[0].id}|{turns[-1].id}"
@@ -5172,6 +5233,23 @@ class AgentCore:
         except Exception:  # noqa: BLE001 - the run row stays unfinished
             pass
         return result
+
+    def abort_capture_runs(self, conversation_id: str) -> int:
+        """Record every still-open capture run of one conversation as aborted.
+
+        Shutdown calls this for a capture it could not wait out. Only the run
+        ledger changes - never a memory_record* table (I8). Returns how many
+        runs it closed; raises when there is no ledger, so the caller does not
+        count the conversation as aborted.
+        """
+        if type(conversation_id) is not str or not conversation_id:
+            raise ValueError("conversation_id must be a non-empty string")
+        with _capture_run_connection(self.memory) as connection:
+            return connection.execute(
+                "UPDATE memory_capture_runs SET finished_at = ?, outcome = 'aborted' "
+                "WHERE conversation_id = ? AND finished_at IS NULL",
+                (utc_now(), conversation_id),
+            ).rowcount
 
     def _run_capture(
         self,
