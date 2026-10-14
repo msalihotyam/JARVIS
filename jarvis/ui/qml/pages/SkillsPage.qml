@@ -29,7 +29,7 @@ SecondaryPage {
         for (var i = 0; i < skills.length; ++i) if (skills[i].id === selectedId) return skills[i]
         return skills.length > 0 ? skills[0] : null
     }
-    function scopeWord(s) { return s.scope === "project" ? qsTr("Project") : qsTr("Global") }
+    function scopeWord(s) { return s.scope === "project" ? qsTr("Project") : qsTr("General") }
     function statusWord(status) {
         return status === "disabled" ? qsTr("Off") : status === "stale" ? qsTr("Stale") : qsTr("Active")
     }

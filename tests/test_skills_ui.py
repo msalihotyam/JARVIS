@@ -150,7 +150,7 @@ class SkillsViewTests(unittest.TestCase):
                                  [n.property("text") for n in sorted(names, key=lambda n: n.mapToScene(QPointF()).y())])
                 plain = next(n for n in names if n.property("text") == "Old flow")       # not selected, not off
                 self.assertEqual(QColor(self.window.property("ink")).name(), QColor(plain.property("color")).name())
-                self.assertEqual(["PROJECT", "GLOBAL", "GLOBAL"], sorted(
+                self.assertEqual(["PROJECT", "GENERAL", "GENERAL"], sorted(
                     [b.childItems()[0].childItems()[1].property("text") for b in self.all_shown("listRowBadge")], reverse=True))
                 statuses = {s.childItems()[0].childItems()[1].property("text") for s in self.all_shown("skillRowStatus")}
                 self.assertEqual({"ACTIVE", "OFF", "STALE"}, statuses)

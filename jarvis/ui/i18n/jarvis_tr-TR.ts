@@ -4393,7 +4393,7 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Proje</translation>
     </message>
     <message>
-        <source>Global</source>
+        <source>General</source>
         <translation>Genel</translation>
     </message>
     <message>
