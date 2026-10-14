@@ -1174,6 +1174,10 @@ class AgentCore:
         deferred to S2B. This is a deliberate capability gap, not an oversight,
         and the registry is not consulted below.
         """
+        # V2.2 SKCOREFIX: a task delegated to a skill stops its chain first.
+        pending = self._skill_cancel_run(session_id, task_id)
+        if pending is not None:
+            return pending
         outcome = self.memory.cancel_task(session_id, task_id)
         if outcome.verdict == "unknown_session":
             return self._input_failure(
@@ -6148,12 +6152,87 @@ class AgentCore:
             )
         return None
 
-    def _skill_run_finished(self, final: SessionState | None) -> None:
+    def _skill_cancel_run(self, session_id: str, task_id: str) -> AgentRun | None:
+        """The user cancels a delegated task: its skill chain stops first.
+
+        The chain is cancelled so storage refuses any later step, the live
+        step goes through its own ordinary cancel, and the task ends CANCELLED
+        with ``skill_run_finished`` (outcome cancelled). While that step is
+        still executing the task reports CANCELLING and is closed when the
+        step concludes. Not behind the flag: a stop control always stops.
+        ``None``: nothing proven here, the ordinary cancellation decides.
+        """
+        try:
+            if self.memory.task_session_id(task_id) != session_id:
+                return None
+            task = self.memory.load_task(task_id)
+            state = self._skill_state(task)
+            if task is None or is_terminal(task) or state.get("state") != "delegated":
+                return None
+            runner = self.memory.load_session(str(state.get("chain_session_id") or ""))
+        except Exception:  # noqa: BLE001 - an unreadable row proves nothing; cancel decides
+            return None
+        if (
+            runner is None
+            or runner.objective != _SKILL_SESSION_PREFIX + task_id
+            or runner.chain is None
+        ):
+            return None
+        # The chain first, so storage refuses any step materialized from now;
+        # then whatever step is bound at the cursor as storage holds it NOW.
+        if runner.chain.status is ChainStatus.ACTIVE:
+            self.memory.cancel_chain(runner.id, runner.chain.id)
+        runner = self.memory.load_session(runner.id)
+        chain = None if runner is None else runner.chain
+        if chain is not None and chain.status is ChainStatus.CANCELLED:
+            bound = chain.step_task_ids[chain.cursor] if chain.cursor < len(chain.step_task_ids) else ""
+            if bound:
+                stopped = self.cancel(runner.id, bound)
+                if stopped.task is None or not is_terminal(stopped.task):
+                    # In flight: its execution owner concludes it, and the
+                    # run_chain that drives it closes the task; CANCELLED now
+                    # would claim the work stopped (S2A).
+                    return AgentRun(RunStatus.CANCELLING, self.memory.load_session(session_id), task)
+        self._skill_run_finished(runner)
+        return None
+
+    def _skill_halt(self, session: SessionState, chain: ChainState) -> bool:
+        """True when a skill runner must not start its next step.
+
+        That is once its task was cancelled or ended, or skills were turned
+        off; the chain is then cancelled and the task closed (stopped when only
+        the flag went off). A step already bound is in flight and is not judged
+        here: it settles through its normal path (resume, approval, cancel).
+        """
+        if not session.objective.startswith(_SKILL_SESSION_PREFIX):
+            return False
+        if chain.cursor < len(chain.step_task_ids) and chain.step_task_ids[chain.cursor]:
+            return False
+        try:
+            anchor = self.memory.load_task(session.objective[len(_SKILL_SESSION_PREFIX):])
+        except Exception:  # noqa: BLE001 - an unreadable task is not a live run; halt
+            anchor = None
+        state = self._skill_state(anchor)
+        live = (
+            anchor is not None
+            and not is_terminal(anchor)
+            and state.get("state") == "delegated"
+            and state.get("chain_session_id") == session.id
+        )
+        if live and self._skills_on():
+            return False
+        self.memory.cancel_chain(session.id, chain.id)
+        if live:  # only the flag went off; an ended task has nothing to close
+            self._skill_run_finished(self.memory.load_session(session.id), stopped=True)
+        return True
+
+    def _skill_run_finished(self, final: SessionState | None, stopped: bool = False) -> None:
         """Close the anchor once its skill chain stopped, then record the use.
 
         Once only: the anchor's terminal checkpoint is the guard. A cancelled
-        chain (decline, a denied approval, a cancel) is not a use and writes no
-        event (D16); usage history never blocks or approves anything.
+        chain (decline, a denied approval, a cancel, skills turned off:
+        ``stopped``) is not a use and writes no event (D16); usage history
+        never blocks or approves anything.
         """
         if (
             final is None
@@ -6202,9 +6281,8 @@ class AgentCore:
                 except _LifecycleLost:
                     return
         anchor.status, anchor.stage = ends[outcome]
-        anchor.preferences[_SKILL_RUN_KEY] = {
-            **state, "state": "finished", "outcome": outcome.value
-        }
+        label = "stopped" if stopped and outcome is ChainStatus.CANCELLED else outcome.value
+        anchor.preferences[_SKILL_RUN_KEY] = {**state, "state": "finished", "outcome": label}
         if owner.active_task_id == anchor.id:
             owner.active_task_id = None
         try:
@@ -6808,6 +6886,9 @@ class AgentCore:
                 break
             if chain.status is not ChainStatus.ACTIVE:
                 verdict = chain.status.value
+                break
+            if self._skill_halt(session, chain):
+                verdict = ChainStatus.CANCELLED.value
                 break
             run, verdict = self._run_chain_step(session, chain, chain.cursor)
             if run is not None:
