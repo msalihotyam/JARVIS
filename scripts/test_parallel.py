@@ -40,6 +40,14 @@ The serial run stays the reference when a result is disputed.
   (``build/locks/suite.json``) of another session counts as holding it; a holder
   whose pid is gone is taken over. No lock under CI (the ``CI`` variable) or with
   ``--no-ui-lock``.
+* CONVAUTO: the default worker counts also shrink with free physical memory
+  (``WORKER_MEM_GB`` per process, never below 1; ``--workers`` / ``--ui-workers``
+  still win), and every run on this machine shares one budget of worker processes
+  (``POOL_TOKENS``, or ``test_pool_tokens`` in ``build/conveyor/pace.json``):
+  ``build/locks/pool.json`` holds each run's tokens by pid. A run takes up to what
+  it would start before its first worker (fewer when that is what is free, waiting
+  in the foreground while none is), gives them back at its end, and the tokens of a
+  pid that is gone are reclaimed. No pool under CI.
 
     python scripts/test_parallel.py [--workers N] [--ui-workers K] [--durations N] [--no-rerun]
                                     [--python PATH] [--shard I/N] [--report PATH] [--no-ui-lock]
@@ -433,6 +441,109 @@ def _cas(path: Path, change):
         os.close(fd)
 
 
+#: CONVAUTO goal C: free physical memory each test process (UI or not) plans on.
+WORKER_MEM_GB = 1.0
+#: CONVAUTO goal D: worker processes all runs on this machine hold at once (pace.json test_pool_tokens).
+POOL_TOKENS = 10
+
+
+def free_mem_gb() -> float | None:
+    """Free physical GB (GlobalMemoryStatusEx, as the conveyor's memory guard reads it); None when unreadable."""
+    if os.name != "nt":
+        return None
+
+    class MemStatus(ctypes.Structure):
+        _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + \
+                   [(n, ctypes.c_ulonglong) for n in ("ullTotalPhys", "ullAvailPhys", "ullTotalPageFile", "ullAvailPageFile",
+                                                       "ullTotalVirtual", "ullAvailVirtual", "ullAvailExtendedVirtual")]
+    try:
+        m = MemStatus(dwLength=ctypes.sizeof(MemStatus))
+        return m.ullAvailPhys / 1e9 if ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(m)) else None
+    except (AttributeError, OSError):
+        return None
+
+
+def worker_counts(cpus: int, free_gb: float | None, workers: int = 0, ui_workers: int = 0) -> tuple[int, int]:
+    """(non-UI workers, UI processes), each >= 1: explicit counts win; else the CPU defaults cut to
+    free_gb // WORKER_MEM_GB processes in all (UI share kept); the CPU defaults when memory is unknown."""
+    w, ui = min(cpus - 1, 6), min(4, cpus // 3)
+    if free_gb is not None:
+        slots = int(free_gb // WORKER_MEM_GB)
+        ui = min(ui, slots * ui // max(1, ui + w))
+        w = min(w, slots - ui)
+    return max(1, workers or w), max(1, ui_workers or ui)
+
+
+def pool_budget(folder: Path) -> int:
+    """POOL_TOKENS, or a positive int ``test_pool_tokens`` from build/conveyor/pace.json (only read)."""
+    try:
+        value = json.loads((folder.parent / "conveyor" / "pace.json").read_text(encoding="utf-8")).get("test_pool_tokens")
+    except (OSError, ValueError, AttributeError):
+        return POOL_TOKENS
+    return value if isinstance(value, int) and not isinstance(value, bool) and value >= 1 else POOL_TOKENS
+
+
+class TestPool:
+    """CONVAUTO goal D: the machine-wide budget of test worker processes, ``build/locks/pool.json`` = {pid: tokens}."""
+
+    poll = 2.0
+    notice = 30.0
+
+    def __init__(self, folder: Path, budget: int):
+        self.path, self.budget, self.key, self.held = folder / "pool.json", budget, str(os.getpid()), 0
+
+    def _held(self, text: str) -> dict[str, int]:
+        """The other live runs' tokens (garbage: none; a pid that is gone: reclaimed)."""
+        try:
+            items = json.loads(text or "{}").items()
+        except (ValueError, AttributeError):
+            return {}
+        # ponytail: a reused pid keeps a dead run's tokens until that process ends (as the UI lock)
+        return {k: v for k, v in items if k.isdigit() and k != self.key and isinstance(v, int) and v > 0
+                and pid_alive(int(k))}
+
+    def _take(self, want: int):
+        def change(text):
+            held = self._held(text)
+            got = min(want, self.budget - sum(held.values()))
+            if got >= 1:
+                held[self.key] = got
+            return max(got, 0), json.dumps(held)
+        return _cas(self.path, change)
+
+    def acquire(self, want: int) -> int:
+        """Up to `want` (>= 1) tokens; waits in the foreground while none is free."""
+        told = None
+        while True:
+            got = self._take(want)
+            if got:
+                self.held = got
+                return got
+            if told is None or time.monotonic() - told >= self.notice:
+                print(f"waiting for a free test worker token (machine budget {self.budget}, all held)", flush=True)
+                told = time.monotonic()
+            time.sleep(self.poll)
+
+    def release(self) -> None:
+        if self.held:
+            self.held = 0
+            _cas(self.path, lambda text: (None, json.dumps(self._held(text))))
+
+
+def pool_for(ui_workers: int, workers: int) -> tuple[TestPool | None, int, int]:
+    """Takes the run's tokens: (pool or None under CI, UI processes, non-UI workers) within what it got."""
+    if os.environ.get("CI"):
+        return None, ui_workers, workers
+    folder = lock_dir()
+    pool = TestPool(folder, pool_budget(folder))
+    want = ui_workers + workers
+    got = pool.acquire(want)
+    if got < want:  # fewer processes: the UI share kept, at least one UI process (it also takes plain units)
+        ui_workers = max(1, got * ui_workers // want)
+        workers = got - ui_workers
+    return pool, ui_workers, workers
+
+
 def _plain(text: object, limit: int = 40) -> str:
     return re.sub(r"[^A-Za-z0-9._:+-]", "_", str(text))[:limit]
 
@@ -571,8 +682,10 @@ def execute(args, units: list[Unit], ui_workers: int, workers: int,
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("modules", nargs="*", help="test modules (default: all of tests/)")
-    parser.add_argument("--workers", type=int, default=0, help="non-UI workers (default min(cpu_count - 1, 6))")
-    parser.add_argument("--ui-workers", type=int, default=0, help="UI processes at once (default min(4, cpu_count // 3), >= 1)")
+    parser.add_argument("--workers", type=int, default=0,
+                        help="non-UI workers (default min(cpu_count - 1, 6), cut by free memory, >= 1)")
+    parser.add_argument("--ui-workers", type=int, default=0,
+                        help="UI processes at once (default min(4, cpu_count // 3), cut by free memory, >= 1)")
     parser.add_argument("--durations", type=int, default=0, help="report the N slowest tests")
     parser.add_argument("--no-rerun", action="store_true", help="do not rerun load-sensitive failures alone")
     parser.add_argument("--python", default=sys.executable, help="interpreter for the workers")
@@ -608,9 +721,7 @@ def main(argv: list[str] | None = None) -> int:
             return 2
         shard = (int(match.group(1)), int(match.group(2)))
 
-    cpus = os.cpu_count() or 2
-    workers = max(1, args.workers or min(cpus - 1, 6))
-    ui_workers = max(1, args.ui_workers or min(4, cpus // 3))
+    workers, ui_workers = worker_counts(os.cpu_count() or 2, free_mem_gb(), args.workers, args.ui_workers)
     began = time.monotonic()
     discovery = discover_tests(args.python, names, serial=not args.modules)
     if discovery["errors"]:
@@ -629,14 +740,16 @@ def main(argv: list[str] | None = None) -> int:
         _print_set_difference("the dispatched ids", dispatched, expected)
         return 1
     ui_count = sum(1 for u in units if u.ui)
+    pool, ui_workers, workers = pool_for(ui_workers, workers)
     print(f"{len(names)} modules, {sum(expected.values())} tests discovered (serial set checked: "
           f"{'yes' if not args.modules else 'no, modules given'}) in {time.monotonic() - began:.0f}s"
           + (f"; shard {shard[0]}/{shard[1]}" if shard else ""), flush=True)
     print(f"{len(units)} units: {ui_count} UI over {ui_workers} processes, {len(units) - ui_count} other over {workers} workers;"
           f" {sum(dispatched.values())} tests dispatched", flush=True)
 
-    results, worker_wall, wall, bases = execute(args, units, ui_workers, workers, ui_lock_for(args, units))
+    bases: list[Path] = []
     try:
+        results, worker_wall, wall, bases = execute(args, units, ui_workers, workers, ui_lock_for(args, units))
         ran = sum(r.ran for r in results)
         skipped = sum(r.skipped for r in results)
         failures = sum(r.failures for r in results)
@@ -667,6 +780,8 @@ def main(argv: list[str] | None = None) -> int:
         print("OK" if green else "FAILED", flush=True)
         return 0 if green else 1
     finally:
+        if pool is not None:
+            pool.release()
         for base in bases:
             shutil.rmtree(base, ignore_errors=True)
 

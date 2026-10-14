@@ -1352,7 +1352,7 @@ class TestPaceGovernor(TestUsageGuard):
         return len(self.fake.bg_calls())
 
     def test_max_lanes_clamp(self):
-        for raw, want in ((0, 1), (-4, 1), (1, 1), (5, 5), (6, 6), (7, 6), (40, 6), (4.9, 4)):
+        for raw, want in ((0, 1), (-4, 1), (1, 1), (5, 5), (6, 6), (7, 7), (8, 8), (9, 8), (40, 8), (4.9, 4)):
             self.fresh()
             self.pace(max_lanes=raw)
             self.assertEqual(self.lanes_for_8(10), want, raw)
@@ -1444,7 +1444,7 @@ class TestPaceGovernor(TestUsageGuard):
 
     def test_min_lanes_clamped_like_the_other_lane_keys(self):
         self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400), min_lanes=40)
-        self.assertEqual(self.lanes_for_8(80), 6)  # clamped to MAX_LANES_CAP; no max_lanes set
+        self.assertEqual(self.lanes_for_8(80), 8)  # clamped to MAX_LANES_CAP; no max_lanes set
         self.assertIsNone(self.status()["pace"]["error"])
 
     def test_reset_keeps_min_and_max_lanes(self):
@@ -1615,7 +1615,7 @@ class TestPresence(Base):
         self.c.pass_once()
         self.assertEqual(self.status()["pace"]["max_lanes"], 2)
         self.go_away()
-        self.assertEqual(self.status()["pace"]["max_lanes"], 6)  # clamped to MAX_LANES_CAP
+        self.assertEqual(self.status()["pace"]["max_lanes"], 8)  # clamped to MAX_LANES_CAP
         self.pace(lanes_present=2, lanes_away=4, max_lanes=1)
         self.c.pass_once()
         self.assertEqual(self.status()["pace"]["max_lanes"], 1)  # a hand-set max_lanes wins
@@ -3276,7 +3276,7 @@ class TestCIHandoff(AutopilotBase):
         self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{SHA_A}:refs/heads/main"]])
         self.assertEqual(self.attn_ex_dry(), [])
 
-    def test_failure_or_cancelled_blocks_without_a_fix_chain(self):
+    def test_failure_or_cancelled_blocks_failure_alone_gets_a_fix_chain(self):
         for conclusion in ("failure", "cancelled"):
             with self.subTest(conclusion):
                 self.tearDown()
@@ -3288,10 +3288,89 @@ class TestCIHandoff(AutopilotBase):
                 self.assertEqual(self.lanes()["INT1"]["status"], "BLOCKED")
                 line = f"CI: https://github.com/x/y/actions/runs/10 {conclusion}"
                 self.assertTrue(self.text("INT1").endswith(f"\n{line}\n"))
-                self.assertEqual((self.approvals(), self.git.pushes(), self.ev("auto_fix")), ([], [], []))
+                self.assertEqual((self.approvals(), self.git.pushes()), ([], []))
+                self.assertEqual(len(self.ev("auto_fix")), conclusion == "failure")  # CONVAUTO
                 (item,) = [a for a in self.status()["attention"] if a["id"] == "INT1"]
                 self.assertIn(f"STATUS BLOCKED; {line}", item["reason"])
-                self.assertIn("auto-fix skipped: CI-handoff failure", item["reason"])
+                self.assertIn("auto-fix queued: INT1-AFX, then INT1-R" if conclusion == "failure" else
+                              "auto-fix skipped: CI-handoff lane without its own failed CI run", item["reason"])
+
+    def test_ci_failure_queues_one_fix_chain_and_the_rerun_goes_green(self):
+        self.int_lane("INT1", SHA_A)  # dispatched while local main is MAIN
+        self.pending("INT1", SHA_A)
+        self.git.ci(SHA_A, "failure")
+        self.c.pass_once()
+        (ev,) = self.ev("auto_fix")
+        self.assertEqual((ev["lane"], ev["fix"], ev["rerun"], ev["files"]),
+                         ("INT1", "INT1-AFX", "INT1-R", ["jarvis/core.py", "scripts/conveyor.py"]))
+        self.assertIn(["git", "diff", "--name-only", f"{MAIN}..{SHA_A}"], self.git.calls)  # start..its CI sha
+        tpl = self.base / "prompts" / "_autofix_ci_template.md"
+        self.assertEqual(tpl.read_text(encoding="utf-8"), conveyor.AUTOFIX_CI_TEMPLATE)
+        call = self.fake.bg_calls()[-1]
+        self.assertEqual(call[:7], ["--bg", "--name", "INT1-AFX", "--model", "opus", "--effort", "high"])
+        for part in ("@jarvis lane=INT1-AFX model=opus effort=high base=main\n",
+                     "CI run: https://github.com/x/y/actions/runs/10 (sha " + SHA_A + ", branch ci/int1)",
+                     "gh run view 10 --log-failed", "  jarvis/core.py\n  scripts/conveyor.py",
+                     f"CURRENT local main\n   ({SHA_A})", "FIX COMMIT: <40-hex sha> or none", "never push"):
+            self.assertIn(part, call[-1])
+        self.finish("INT1-AFX", "PASS", "FIX COMMIT: x\n")
+        call = self.fake.bg_calls()[-1]
+        self.assertEqual(call[:3], ["--bg", "--name", "INT1-R"])
+        for part in (f"Local main already holds INT1's picks ({SHA_A}; CI run 10 failed)",
+                     "CI BRANCH: ci/int1-r", "build/reports/INT1-R.md"):
+            self.assertIn(part, call[-1])
+        self.assertTrue(call[-1].endswith("INTEGRATE\n"))
+        self.git.main = SHA_B  # the fix commit on top of the failed sha
+        self.pending("INT1-R", SHA_B)
+        self.assertEqual(self.lanes()["INT1-R"]["status"], "CI_PENDING")  # not stacked on failed INT1
+        self.git.ci(SHA_B)
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT1-R"]["status"], "GREEN")
+        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{SHA_B}:refs/heads/main"]])
+        self.assertEqual(len(self.ev("auto_fix")), 1)
+        self.assertEqual(self.status()["breaker"], "closed")
+
+    def test_failed_rerun_ci_never_gets_a_second_chain(self):
+        self.int_lane("INT1", SHA_A)
+        self.pending("INT1", SHA_A)
+        self.git.ci(SHA_A, "failure")
+        self.c.pass_once()
+        self.finish("INT1-AFX", "PASS", "FIX COMMIT: none\n")
+        self.pending("INT1-R", SHA_A)  # a flake: no fix commit, the same sha on ci/int1-r
+        self.git.runs.insert(0, {"headSha": SHA_A, "status": "completed", "conclusion": "failure",
+                                 "workflowName": "tests", "url": "https://github.com/x/y/actions/runs/11"})
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT1-R"]["status"], "BLOCKED")
+        self.assertEqual(len(self.ev("auto_fix")), 1)
+        self.assertNotIn("INT1-R-AFX", self.fake.bg_names())
+        self.assertEqual(self.fake.bg_names().count("INT1-AFX"), 1)
+        self.assertEqual(self.status()["breaker"], "open")  # the chain failed
+        self.assertEqual(self.git.pushes(), [])
+
+    def test_dependents_of_a_blocked_int_wait_for_its_rerun(self):
+        lanes = {"INT1": {"status": "BLOCKED"}, "INT1-R": {"status": "CI_PENDING"}, "F": {"status": "BLOCKED"},
+                 "F-R": {"status": "GREEN"}}
+        self.assertFalse(self.c.slice_done("INT1", lanes))  # a product lane waits for CI success
+        self.assertTrue(self.c.slice_done("INT1", lanes, for_int=True))  # the next INT stacks on it
+        lanes["INT1-R"]["status"] = "GREEN"
+        self.assertTrue(self.c.slice_done("INT1", lanes))
+        lanes["INT1-R"]["status"] = "BLOCKED"
+        self.assertFalse(self.c.slice_done("INT1", lanes, for_int=True))
+        self.assertFalse(self.c.slice_done("F", lanes))  # not an integration lane: no re-run rule
+        self.backlog({"id": "INT1", "files": ["@main-checkout"]}, {"id": "G", "depends_on": ["INT1"]})
+        self.c.pass_once()
+        self.git.main = SHA_A
+        self.pending("INT1", SHA_A)
+        self.git.ci(SHA_A, "failure")
+        self.c.pass_once()
+        self.assertEqual(self.view()["G"], "waiting_deps")
+        self.finish("INT1-AFX", "PASS", "FIX COMMIT: x\n")
+        self.git.main = SHA_B
+        self.pending("INT1-R", SHA_B)
+        self.git.ci(SHA_B)
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT1-R"]["status"], "GREEN")
+        self.assertIn("G", self.fake.bg_names())
 
     def test_gh_unreadable_keeps_waiting_never_green(self):
         self.int_lane("INT1", SHA_A)
@@ -3380,12 +3459,36 @@ class TestCIHandoff(AutopilotBase):
         attn = {a["id"]: a["reason"] for a in self.status()["attention"]}
         self.assertIn(f"stacked on failed {SHA_A[:7]} (INT1)", attn["INT2"])
         self.assertIn("CI: https://github.com/x/y/actions/runs/10 failure", attn["INT1"])
+        self.assertEqual([e["lane"] for e in self.ev("auto_fix")], ["INT1"])  # CONVAUTO: one chain, not for INT2
+        self.assertIn("auto-fix skipped: CI-handoff lane without its own failed CI run", attn["INT2"])
         self.git.ci(SHA_B)  # its own CI green later: still BLOCKED, never pushed
         self.t += 60
         self.c.pass_once()
         self.assertEqual(self.lanes()["INT2"]["status"], "BLOCKED")
         self.assertEqual((self.approvals(), self.git.pushes()), ([], []))
         self.assertFalse([c for c in self.git.calls if "reset" in c])  # main is the orchestrator's
+
+    def test_the_rerun_is_not_blocked_by_an_int_stacked_on_the_failure(self):
+        sha_c = "c3" + "0" * 38  # INT1-R's fix commit on top of INT2's picks
+        self.git.line.append(sha_c)
+        self.git.memory[sha_c] = SCHEMA
+        self.int_lane("INT1", SHA_A)
+        self.pending("INT1", SHA_A)
+        self.int_lane("INT2", SHA_B)
+        self.pending("INT2", SHA_B)
+        self.git.ci(SHA_A, "failure")
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT2"]["ci"]["stacked_on"], "INT1")
+        self.finish("INT1-AFX", "PASS", "FIX COMMIT: x\n")
+        self.git.main = sha_c
+        self.pending("INT1-R", sha_c)
+        self.assertEqual(self.lanes()["INT1-R"]["status"], "CI_PENDING")  # neither INT1 nor INT2 blocks it
+        self.git.ci(sha_c)
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT1-R"]["status"], "GREEN")
+        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{sha_c}:refs/heads/main"]])
+        self.assertEqual(self.lanes()["INT2"]["status"], "BLOCKED")  # no chain of its own, its item stays
+        self.assertEqual([e["lane"] for e in self.ev("auto_fix")], ["INT1"])
 
     def test_failed_sha_holds_stacked_pushes_until_acked_not_for_a_day(self):
         self.int_lane("INT1", SHA_A)

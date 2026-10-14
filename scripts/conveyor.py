@@ -89,7 +89,7 @@ PACE_DEFAULTS = {"mode": "full_burn", "window_start": None, "days": 7,
                  "max_commit_pct": 90,
                  "lanes_present": MAX_LANES, "lanes_away": 5, "away_after_min": 10,
                  "power_switch": False, "power_switch_cmd": [], "blocked_nudge_min": 10}
-MAX_LANES_CAP = 6  # pace.json max_lanes / lanes_* are clamped to 1..MAX_LANES_CAP
+MAX_LANES_CAP = 8  # pace.json max_lanes / lanes_* are clamped to 1..MAX_LANES_CAP
 # Presence modes (CONV6, LaptopControl v1.3 plan Phase A): user idle time picks present/away.
 PRESENT_IDLE_S = 60  # idle under this: present (away: idle >= pace.json away_after_min)
 PRESENCE_HOLD_S = 120  # hysteresis: the new state must hold this long before it counts
@@ -175,6 +175,48 @@ Commit on {BRANCH}. Report build/reports/{AFX}.md: STATUS PASS or BLOCKED, FIX C
 <40-hex sha>, BRANCH: {BRANCH}, the tests run with real counts. The conveyor then
 dispatches {R}, which integrates FIX COMMIT onto main.
 """
+# CONVAUTO (Salih 2026-10-14): a GitHub CI failure of an integration lane queues the same chain;
+# the fix lane reads the failing tests from the CI run itself (build/conveyor/prompts/INT45-AFX.md).
+AUTOFIX_CI_TEMPLATE = """\
+@jarvis lane={AFX} model=opus effort=high base=main
+Automatic fix-forward lane, queued once by the conveyor (JARVIS_RUNBOOK.md "Konveyor",
+"Autopilot") because the GitHub CI of integration lane {INT} failed. Its report: {REPORT}
+CI run: {URL} (sha {SHA}, branch {CI_BRANCH}).
+LANE RULES: read build/conveyor/notes/LANE_RULES.md.
+UNATTENDED: never use AskUserQuestion, plan mode, background shells or background waits;
+decide fail-closed and report.
+
+1. Find what failed, read-only: gh run view {RUN} --log-failed (or gh run download {RUN}
+   --name ci-summary into a temp dir). Name every failing test id / step exactly.
+2. Work in a new worktree (EnterWorktree name={AFX}) branched from the CURRENT local main
+   ({MAIN}); branch {BRANCH}.
+3. Make the failing tests pass by fixing their cause. Never weaken, skip or remove a test or
+   an assert. Owned files (the files of the commits {INT} picked); touch nothing else:
+{FILES}
+A fix that needs another file, a test whose meaning must change, or any decision: stop with
+STATUS: BLOCKED and say why (fail closed).
+4. CI flake only: if EVERY failure is a test on the rule D load-sensitive list
+   (scripts/test_parallel.py load_sensitive()) and each passes when run alone locally 3
+   times, change no code and report STATUS: PASS with FIX COMMIT: none plus the evidence.
+   Anything else that is not a real fix -> BLOCKED.
+Proofs: the failing tests, then the test modules of the owned files (python
+scripts/test_parallel.py ...; rule D); ruff E4,E7,E9,F on changed Python; git diff --check.
+Hard rules: never push anything ({R} runs CI); gh only read-only (run view / run download);
+never touch uv.lock; stage explicit paths only; no reset/restore/stash/clean; never delete
+files. GREEN MEANS STOP.
+ONE commit on {BRANCH} (when there is a fix). Report build/reports/{AFX}.md (FINAL, never
+"(interim)"): STATUS PASS or BLOCKED, FIX COMMIT: <40-hex sha> or none, BRANCH: {BRANCH}, the
+CI failures found (test id + one line each), the tests run with real counts. Then
+ExitWorktree KEEP. The conveyor then dispatches {R}, which integrates FIX COMMIT onto main.
+"""
+RERUN_CI_PREFACE = (
+    "{R} re-runs integration lane {INT} after the automatic fix lane {AFX} (its report "
+    "build/reports/{AFX}.md names FIX COMMIT and BRANCH, or FIX COMMIT: none for a CI flake). "
+    "Local main already holds {INT}'s picks ({SHA}; CI run {RUN} failed): check git log first and "
+    "pick nothing of {INT} again. If FIX COMMIT is a sha, cherry-pick only it onto main; if it is "
+    "none, add no commit. Then do the local checks and the CI handoff exactly as below, with CI "
+    "BRANCH: ci/{RBRANCH} and NEW MAIN SHA = the main HEAD after your step. Your report is "
+    "build/reports/{R}.md (not {INT}'s). The rest of the prompt is {INT}'s.\n\n")
 RERUN_PREFACE = (
     "{R} re-runs integration lane {INT} after the automatic fix lane {AFX} (its report "
     "build/reports/{AFX}.md names FIX COMMIT and BRANCH). Local main may already hold {INT}'s "
@@ -1271,7 +1313,7 @@ class Conveyor:
         if u is not None:
             if isinstance(prev, (int, float)) and prev - u >= RESET_DROP:
                 p, err = {**p, "mode": "paced", "window_start": iso(self.now())}, None
-                keep = [*PACE_DEFAULTS, *(k for k in ("max_lanes", "min_lanes") if k in p)]
+                keep = [*PACE_DEFAULTS, *(k for k in ("max_lanes", "min_lanes", "test_pool_tokens") if k in p)]
                 (self.base / "pace.json").write_text(
                     json.dumps({k: p[k] for k in keep}, indent=2), encoding="utf-8")
                 self.event("quota_reset", before=prev, after=u, window_start=p["window_start"])
@@ -1509,13 +1551,18 @@ class Conveyor:
 
     def slice_done(self, sid, lanes, for_int=False):
         """A dependency is done at a good STATUS; for an integration lane also at CI_PENDING
-        (CONV12: the next integration lane stacks on the pending sha)."""
+        (CONV12: the next integration lane stacks on the pending sha); an integration lane also
+        when its re-run <INT>-R is."""
         done = GOOD | {CI_PENDING} if for_int else GOOD
-        ln = lanes.get(sid)
-        if ln and ln.get("status"):
-            return ln["status"] in done
-        found = self.find_report(sid)
-        return bool(found) and found[1] in done
+
+        def ok(name):
+            ln = lanes.get(name)
+            if ln and ln.get("status"):
+                return ln["status"] in done
+            found = self.find_report(name)
+            return bool(found) and found[1] in done
+        # CONVAUTO: a BLOCKED integration lane whose fix-forward re-run <INT>-R is done counts as done
+        return ok(sid) or bool(INT_RE.match(sid)) and ok(f"{sid}-R")
 
     def pick_slice(self, slices, lanes, busy):
         """First dispatchable slice (or None) and a {id: state} view of the backlog."""
@@ -1960,7 +2007,7 @@ class Conveyor:
         under = self.stacked(ci["sha"], lanes, CI_STACK_S)
         failed = next(((n, c) for n, c in under if c.get("state") == "failed"), None)
         if failed:
-            ci["state"] = "failed"
+            ci.update(state="failed", stacked_on=failed[0])  # CONVAUTO: its failure is that lane's
             return self.ci_done(name, ln, "BLOCKED", f"stacked on failed {failed[1]['sha'][:7]} ({failed[0]})")
         if under:
             n, c = under[0]
@@ -1976,7 +2023,7 @@ class Conveyor:
                 f.write("\n" + line + "\n")
         except OSError as e:
             return self.ci_slow(name, ln, f"report append: {e}", error=True)
-        ci.update(state="success" if state == "success" else "failed", url=url)
+        ci.update(state="success" if state == "success" else "failed", url=url, conclusion=state)
         self.event("ci_result", lane=name, sha=ci["sha"], result=state, url=url)
         if state == "success":
             return self.ci_done(name, ln, "GREEN", None)
@@ -2020,7 +2067,9 @@ class Conveyor:
         """[(lane, ci record)] of the handoff lanes whose sha is a strict ancestor of `sha` and not
         on origin/main (the local remote-tracking ref; once seen there it is cached as on_origin).
         A failed record counts until the orchestrator acks that lane's attention item (it decides
-        about main); any other record only while younger than `window`. RuntimeError on a git error."""
+        about main) or its re-run <lane>-R's sha (for a lane failed by stacking: the re-run of the
+        failed lane it stacked on) is at or under `sha`; any other record only while
+        younger than `window`. RuntimeError on a git error."""
         out = []
         for n, x in lanes.items():
             c = x.get("ci")
@@ -2030,6 +2079,15 @@ class Conveyor:
             if c.get("state") == "failed":
                 if self.acked(n, x.get("finished_ts") or 0):
                     continue
+                root = n  # CONVAUTO: a lane failed only by stacking is fixed by the root failure's re-run
+                for _ in lanes:
+                    up = ((lanes.get(root) or {}).get("ci") or {}).get("stacked_on")
+                    if not isinstance(up, str):
+                        break
+                    root = up
+                rc = (lanes.get(f"{root}-R") or {}).get("ci") or {}
+                if isinstance(rc.get("sha"), str) and self.is_ancestor(rc["sha"], sha):
+                    continue  # its re-run <root>-R (at or under sha) carries the fix; its own record counts
             elif self.now() - c.get("since", 0) > window:
                 continue
             if self.is_ancestor(c["sha"], sha):
@@ -2045,8 +2103,6 @@ class Conveyor:
         attention item for the orchestrator."""
         if name in chains:
             why, slices = "auto-fix already used for this integration lane", None
-        elif "ci" in ln:  # CONV12: GitHub CI failed (or stacked on a failure): no local test ids
-            why, slices = "CI-handoff failure, the orchestrator decides", None
         else:
             try:
                 why, slices = self.fix_chain(name, ln)
@@ -2067,31 +2123,45 @@ class Conveyor:
         """(None, [fix slice, re-run slice]) from the BLOCKED report's failing test ids and
         the files of the commits the lane picked (main at its start..main now), else
         (reason, None). The fix prompt comes from build/conveyor/prompts/_autofix_template.md
-        (written from AUTOFIX_TEMPLATE when missing; the orchestrator may edit it)."""
-        text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
-        tests = sorted(set(TEST_ID_RE.findall(text)))
-        if not tests:
-            return "the report names no failing test id", None
-        start, main = ln.get("main_at_start"), self.main_head()
+        (written from AUTOFIX_TEMPLATE when missing; the orchestrator may edit it).
+        CONVAUTO: a CI-handoff lane whose own CI run failed: the fix lane reads the failing tests
+        from that run, the picked files are main at its start..its CI sha, and the prompt comes
+        from _autofix_ci_template.md (AUTOFIX_CI_TEMPLATE; editable the same way)."""
+        afx, r = f"{name}-AFX", f"{name}-R"
+        main, ci = self.main_head(), ln.get("ci")
+        kw = {"INT": name, "AFX": afx, "R": r, "REPORT": ln["report"], "MAIN": main or "",
+              "BRANCH": afx.lower(), "RBRANCH": r.lower()}
+        if ci is None:
+            text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+            tests = sorted(set(TEST_ID_RE.findall(text)))
+            if not tests:
+                return "the report names no failing test id", None
+            end, tpl_name, default, preface = main, "_autofix_template.md", AUTOFIX_TEMPLATE, RERUN_PREFACE
+            kw["TESTS"] = "\n".join("  " + t for t in tests)
+        else:  # CONVAUTO: only its own completed CI run that failed; stacked or anything else: no chain
+            run = CI_RUN_RE.fullmatch(str(ci.get("url")))
+            if ci.get("conclusion") != "failure" or not run or not SHA_RE.fullmatch(str(ci.get("sha"))):
+                return "CI-handoff lane without its own failed CI run (stacked or unclear), the orchestrator decides", None
+            tests, end, tpl_name, default, preface = [], ci["sha"], "_autofix_ci_template.md", \
+                AUTOFIX_CI_TEMPLATE, RERUN_CI_PREFACE
+            kw.update(URL=ci["url"], RUN=run.group(1), SHA=ci["sha"], CI_BRANCH=str(ci.get("branch")))
+        start = ln.get("main_at_start")
         if not (isinstance(start, str) and SHA_RE.fullmatch(start) and main):
             return "main at the lane's start or now is unknown", None
-        rc, out = self.cmd(["git", "diff", "--name-only", f"{start}..{main}"])
+        rc, out = self.cmd(["git", "diff", "--name-only", f"{start}..{end}"])
         files = sorted({p.strip() for p in out.splitlines() if p.strip()}) if rc == 0 else []
         if not files:
-            return f"no picked files ({start[:7]}..{main[:7]}, rc={rc})", None
-        afx, r = f"{name}-AFX", f"{name}-R"
+            return f"no picked files ({start[:7]}..{end[:7]}, rc={rc})", None
+        kw["FILES"] = "\n".join("  " + f for f in files)
         prompts = self.base / "prompts"
-        tpl = prompts / "_autofix_template.md"
+        tpl = prompts / tpl_name
         if not tpl.exists():
             prompts.mkdir(parents=True, exist_ok=True)
-            tpl.write_text(AUTOFIX_TEMPLATE, encoding="utf-8")
-        kw = {"INT": name, "AFX": afx, "R": r, "REPORT": ln["report"], "MAIN": main,
-              "BRANCH": afx.lower(), "TESTS": "\n".join("  " + t for t in tests),
-              "FILES": "\n".join("  " + f for f in files)}
+            tpl.write_text(default, encoding="utf-8")
         rest = (self.base / ln["prompt"]).read_text(encoding="utf-8").partition("\n")[2]
         texts = {afx: fill(tpl.read_text(encoding="utf-8"), **kw),
                  r: f"@jarvis lane={r} model={ln.get('model')} effort={ln.get('effort')} base=main\n"
-                    + fill(RERUN_PREFACE, **kw) + rest}
+                    + fill(preface, **kw) + rest}
         rel = "build/conveyor/prompts/auto/{}.md"
         slices = [{"id": afx, "title": f"auto-fix {name}", "model": AUTOFIX_MODEL,
                    "effort": AUTOFIX_EFFORT, "tier": "T1", "files": files, "depends_on": [],
