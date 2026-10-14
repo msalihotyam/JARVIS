@@ -851,12 +851,69 @@ CREATE TABLE IF NOT EXISTS memory_tombstones (
 );
 CREATE INDEX IF NOT EXISTS idx_memory_tombstones_hash
     ON memory_tombstones(content_hash, project_id);
+CREATE TABLE IF NOT EXISTS skills (
+    skill_id TEXT NOT NULL,
+    version INTEGER NOT NULL CHECK (version >= 1),
+    body TEXT NOT NULL,
+    body_format INTEGER NOT NULL,
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('global', 'project')),
+    project_id TEXT NULL CHECK ((scope_kind = 'project') = (project_id IS NOT NULL)),
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (skill_id, version)
+);
+CREATE TABLE IF NOT EXISTS skill_events (
+    event_id INTEGER PRIMARY KEY,
+    skill_id TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    body TEXT NOT NULL,
+    body_format INTEGER NOT NULL,
+    draft_id TEXT NULL,
+    actor TEXT NOT NULL CHECK (actor IN ('user', 'core')),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_skill_events_skill
+    ON skill_events(skill_id, event_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_skill_events_draft
+    ON skill_events(draft_id) WHERE draft_id IS NOT NULL;
+CREATE TABLE IF NOT EXISTS skill_drafts (
+    draft_id TEXT PRIMARY KEY,
+    body TEXT NOT NULL,
+    body_format INTEGER NOT NULL,
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('global', 'project')),
+    project_id TEXT NULL CHECK ((scope_kind = 'project') = (project_id IS NOT NULL)),
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS skill_suppressions (
+    suppression_id INTEGER PRIMARY KEY,
+    suppression_key TEXT NOT NULL,
+    suppressed INTEGER NOT NULL CHECK (suppressed IN (0, 1)),
+    actor TEXT NOT NULL,
+    at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_skill_suppressions_key
+    ON skill_suppressions(suppression_key, suppression_id);
+CREATE TABLE IF NOT EXISTS skill_experiences (
+    experience_id TEXT PRIMARY KEY,
+    body TEXT NOT NULL,
+    body_format INTEGER NOT NULL,
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('global', 'project')),
+    project_id TEXT NULL CHECK ((scope_kind = 'project') = (project_id IS NOT NULL)),
+    skill_id TEXT NULL,
+    created_at TEXT NOT NULL
+);
 """
 
 # V2.1 typed memory (above): every memory_record* table and the toggle table
 # are append-only - a record's status is its LATEST memory_record_events row
 # (highest event_id), a replacement is a memory_record_supersessions row -
 # and nothing here offers an UPDATE or DELETE of them.
+
+# V2.2 skills (above, jarvis/skill_store.py): every skill* table is insert- or
+# append-only - a skill's state is its skill_events rows in event_id order, a
+# draft's decision is the one skill_events row carrying its draft_id - and
+# nothing offers an UPDATE or DELETE of them. ``body`` is the skill_types
+# to_dict JSON, ``body_format`` its layout version.
+# ponytail: no FTS5 index - the Python matcher scans rows; add FTS5 when a user has > 1k skills.
 
 #: The FTS5 index over record text + subject_key. Its rows are written by the
 #: record store in the same transaction as the record; retrieval falls back to
@@ -957,6 +1014,20 @@ MEMORY_V21_SCHEMA_OBJECTS = frozenset(
     )
 )
 
+#: The V2.2 skill objects of the compatibility layer.
+SKILL_SCHEMA_OBJECTS = frozenset(
+    {
+        "skills",
+        "skill_events",
+        "idx_skill_events_skill",
+        "idx_skill_events_draft",
+        "skill_drafts",
+        "skill_suppressions",
+        "idx_skill_suppressions_key",
+        "skill_experiences",
+    }
+)
+
 #: Every object the compatibility layer owns - kept apart from the numbered
 #: schema's objects so a migration test can still say exactly what ITS step
 #: added.
@@ -976,7 +1047,7 @@ COMPATIBILITY_SCHEMA_OBJECTS = frozenset(
         "project_folder_links",
         "idx_project_folder_links_current",
     }
-) | MEMORY_V21_SCHEMA_OBJECTS
+) | MEMORY_V21_SCHEMA_OBJECTS | SKILL_SCHEMA_OBJECTS
 
 #: The one pre-V2 copy, beside the database: ``<stem>.pre-v2<suffix>``.
 PRE_V2_BACKUP_TAG = ".pre-v2"

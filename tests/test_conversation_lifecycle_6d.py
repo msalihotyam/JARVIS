@@ -42,7 +42,7 @@ from jarvis.app import conversation_delete_result
 from jarvis.contracts import ChainState, ErrorCode, RunStatus, SessionState, TaskStatus, chain_steps_from_declaration
 from jarvis.conversation import ConversationState, ConversationStore, append_turn, encode_state
 from jarvis.intent import IntentStatus
-from jarvis.memory import COMPATIBILITY_SCHEMA_OBJECTS, MEMORY_V21_SCHEMA_OBJECTS, SCHEMA_VERSION, SQLiteMemoryStore
+from jarvis.memory import COMPATIBILITY_SCHEMA_OBJECTS, MEMORY_V21_SCHEMA_OBJECTS, SCHEMA_VERSION, SKILL_SCHEMA_OBJECTS, SQLiteMemoryStore
 from jarvis.settings import Settings
 from tests.helpers import make_task, safe_cleanup, settled, wait_until
 from tests.test_chain_cancel_cli import DECLARATION
@@ -404,7 +404,7 @@ class SchemaTests(StoreCase):
         self.assertEqual([(10,)], self.rows("SELECT version FROM schema_version"))
         self.assertEqual(list(range(1, 11)), [r[0] for r in self.rows("SELECT version FROM schema_migrations ORDER BY version")])
         self.assertEqual({"conversation_deletions", "project_folder_links", "idx_project_folder_links_current"},
-                         COMPATIBILITY_SCHEMA_OBJECTS - self.BEFORE_6DB - MEMORY_V21_SCHEMA_OBJECTS)
+                         COMPATIBILITY_SCHEMA_OBJECTS - self.BEFORE_6DB - MEMORY_V21_SCHEMA_OBJECTS - SKILL_SCHEMA_OBJECTS)
         self.assertLessEqual(self.BEFORE_6DB, COMPATIBILITY_SCHEMA_OBJECTS)
         self.assertEqual(["id", "project_id", "title", "state_json", "integrity", "origin", "created_at", "updated_at",
                           "archived_at"], [r[1] for r in self.rows("PRAGMA table_info(conversations)")])   # never ALTERed

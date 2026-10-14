@@ -46,7 +46,7 @@ from jarvis.contracts import (
     SessionState,
     Task,
 )
-from jarvis.memory import COMPATIBILITY_SCHEMA_OBJECTS, MEMORY_V21_SCHEMA_OBJECTS, PROJECT_FOLDER_LINK_UNREADABLE, SCHEMA_VERSION, SQLiteMemoryStore
+from jarvis.memory import COMPATIBILITY_SCHEMA_OBJECTS, MEMORY_V21_SCHEMA_OBJECTS, PROJECT_FOLDER_LINK_UNREADABLE, SCHEMA_VERSION, SKILL_SCHEMA_OBJECTS, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
 from tests.helpers import installed_cli, open_core, safe_cleanup
@@ -118,7 +118,7 @@ class SchemaTests(FolderCase):
         self.assertEqual(10, SCHEMA_VERSION)
         self.assertEqual([(10,)], self.rows("SELECT version FROM schema_version"))
         self.assertEqual(list(range(1, 11)), [r[0] for r in self.rows("SELECT version FROM schema_migrations ORDER BY version")])
-        self.assertEqual(NEW_6H, COMPATIBILITY_SCHEMA_OBJECTS - BEFORE_6H - MEMORY_V21_SCHEMA_OBJECTS)
+        self.assertEqual(NEW_6H, COMPATIBILITY_SCHEMA_OBJECTS - BEFORE_6H - MEMORY_V21_SCHEMA_OBJECTS - SKILL_SCHEMA_OBJECTS)
         self.assertLessEqual(BEFORE_6H, COMPATIBILITY_SCHEMA_OBJECTS)
         self.assertEqual(["id", "name", "active", "created_at"], [r[1] for r in self.rows("PRAGMA table_info(projects)")])
         self.assertEqual(["id", "project_id", "path", "origin", "linked_at", "unlinked_at"],
