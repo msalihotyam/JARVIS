@@ -7,12 +7,14 @@ append-only (no UPDATE, no DELETE): a skill's state is its events in
 event_id order, a draft's decision is the one event carrying its draft_id,
 a deletion is a final ``deleted`` tombstone event (PLAN D4).
 
-Every read goes through skill_types/skill_lifecycle ``from_dict``. A row that
-does not parse, has an unknown body format or disagrees with its own columns
-is skipped and counted in ``broken_rows`` - never shown, never a crash - and
-a skill with any such row, or a history skill_lifecycle refuses, is left out
-whole (a dropped event could be its tombstone). Every write re-runs
-skill_filter (S7) and the D15 scope-move rule.
+Every read dispatches on the row's ``body_format`` and then goes through
+skill_types/skill_lifecycle ``from_dict``. A row that does not parse, has an
+unknown (e.g. newer) body format or disagrees with its own columns is skipped
+and counted in ``broken_rows`` - never used, matched, offered or shown, never
+a crash - and listed by ``unreadable_rows``; a skill with any such row, or a
+history skill_lifecycle refuses, is left out whole (a dropped event could be
+its tombstone). Every write re-runs skill_filter (S7) and the D15 scope-move
+rule.
 """
 
 from __future__ import annotations
@@ -22,8 +24,10 @@ import json
 import logging
 import re
 import sqlite3
+import sys
+import unicodedata
 from dataclasses import replace
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 from jarvis.contracts import utc_now
 from jarvis.experience import visible_in
@@ -49,13 +53,20 @@ from jarvis.skill_types import (
     SkillRecordError,
     SkillScope,
     SkillStatus,
+    fold_token,
 )
 
 _log = logging.getLogger(__name__)
 
-#: Layout version of every ``body`` column; a row with another one is broken
-#: until a later build migrates it.
-BODY_FORMAT = 1
+#: Layout version of every new ``body``: an envelope {"body_format", "unicode",
+#: "python", "record"} around the record's to_dict, naming the Unicode database
+#: and the Python major.minor it was normalized and written with. Format 1 (the
+#: bare to_dict, written before the envelope) still reads; any other format is
+#: unreadable - a newer one "needs a newer JARVIS" - until a build knows it.
+BODY_FORMAT = 2
+_BARE_FORMAT = 1
+_ENVELOPE_KEYS = frozenset({"body_format", "unicode", "python", "record"})
+NEEDS_NEWER = "needs a newer JARVIS"
 
 _ACTORS = frozenset({"user", "core"})
 _SUPPRESSION_KEY = re.compile(re.escape(TASK_KIND_PREFIX) + "[0-9a-f]{32}")
@@ -124,6 +135,24 @@ class SkillStoreError(SkillRecordError):
     """A refused store write (callers catch ``SkillRecordError``)."""
 
 
+class UnreadableRow(NamedTuple):
+    """A stored row no read uses: its table, its key and why (never its text)."""
+
+    table: str
+    key: str
+    reason: str
+
+
+def _renormalized(data: Any) -> Any:
+    """An Experience body written under another Unicode database, its
+    task_signature re-folded with this one so it matches the words this build
+    folds - in memory only; the stored bytes stay as written (append-only)."""
+    if type(data) is dict and type(data.get("task_signature")) is list:
+        folded = dict.fromkeys(fold_token(token) for token in data["task_signature"])
+        return {**data, "task_signature": list(folded)}
+    return data
+
+
 def _text_fields(data: Any, name: str = "") -> list[tuple[str, str]]:
     """Every free-text value of a to_dict tree, named in skill_filter's grammar."""
     if isinstance(data, dict):
@@ -174,21 +203,77 @@ class SkillStore(SQLiteMemoryStore):
                 connection.execute(statement)
 
     def _body(self, record: Any) -> str:
-        return json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True)
+        return json.dumps(
+            {
+                "body_format": BODY_FORMAT,
+                "unicode": unicodedata.unidata_version,
+                "python": f"{sys.version_info.major}.{sys.version_info.minor}",
+                "record": record.to_dict(),
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+
+    def _parse_row(self, row: sqlite3.Row, parse: Callable[[Any], Any], columns: _Columns) -> Any:
+        """The strictly parsed record; raises for any row no read may use."""
+        body_format = row["body_format"]
+        if type(body_format) is not int or body_format not in (_BARE_FORMAT, BODY_FORMAT):
+            raise SkillRecordError(
+                NEEDS_NEWER if type(body_format) is int and body_format > BODY_FORMAT
+                else "unknown body format"
+            )
+        data = json.loads(row["body"])
+        unicode = unicodedata.unidata_version  # format 1 parses strictly, as before
+        if body_format == BODY_FORMAT:
+            if (
+                type(data) is not dict
+                or data.keys() != _ENVELOPE_KEYS
+                or type(data["body_format"]) is not int
+                or data["body_format"] != BODY_FORMAT
+                or type(data["unicode"]) is not str
+                or type(data["python"]) is not str
+            ):
+                raise SkillRecordError("the body envelope is malformed")
+            unicode, data = data["unicode"], data["record"]
+        if parse == Experience.from_dict and unicode != unicodedata.unidata_version:
+            data = _renormalized(data)
+        record = parse(data)
+        if any(row[column] != value(record) for column, value in columns):
+            raise SkillRecordError("the row's columns disagree with its body")
+        return record
 
     def _read(self, row: sqlite3.Row, parse: Callable[[Any], Any], columns: _Columns) -> Any:
         """The parsed record, or None (counted) for a broken row."""
         try:
-            if row["body_format"] != BODY_FORMAT:
-                raise SkillRecordError("unknown body format")
-            record = parse(json.loads(row["body"]))
-            if any(row[column] != value(record) for column, value in columns):
-                raise SkillRecordError("the row's columns disagree with its body")
-            return record
+            return self._parse_row(row, parse, columns)
         except (ValueError, TypeError, RecursionError):
             self.broken_rows += 1
             _log.warning("skill store: skipped a broken row")
             return None
+
+    def unreadable_rows(self) -> tuple[UnreadableRow, ...]:
+        """Every stored row no read uses (a newer format, a corrupted body,
+        columns that disagree), listed instead of silently hidden."""
+        tables = (
+            ("skills", "SELECT skill_id || ':' || version AS row_key, * FROM skills",
+             Skill.from_dict, _SKILL),
+            ("skill_events", "SELECT event_id AS row_key, * FROM skill_events",
+             SkillEvent.from_dict, _EVENT),
+            ("skill_drafts", "SELECT draft_id AS row_key, * FROM skill_drafts",
+             SkillDraft.from_dict, _DRAFT),
+            ("skill_experiences", "SELECT experience_id AS row_key, * FROM skill_experiences",
+             Experience.from_dict, _EXPERIENCE),
+        )
+        found = []
+        with self._connection() as connection:
+            for table, query, parse, columns in tables:
+                for row in connection.execute(query):
+                    try:
+                        self._parse_row(row, parse, columns)
+                    except (ValueError, TypeError, RecursionError) as error:
+                        reason = NEEDS_NEWER if str(error) == NEEDS_NEWER else "unreadable"
+                        found.append(UnreadableRow(table, str(row["row_key"]), reason))
+        return tuple(found)
 
     # -- skills and events ---------------------------------------------------
 

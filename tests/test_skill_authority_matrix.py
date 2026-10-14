@@ -16,7 +16,6 @@ isolated temp database, never data/jarvis.db, no model or network call):
 
 from __future__ import annotations
 
-import json
 import sqlite3
 import tempfile
 import unittest
@@ -316,7 +315,7 @@ class UnapprovedVersionTests(_Base):
                 "INSERT INTO skills (skill_id, version, body, body_format, scope_kind, project_id, "
                 "created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (skill.skill_id, skill.version,
-                 json.dumps(skill.to_dict(), ensure_ascii=False, sort_keys=True), BODY_FORMAT,
+                 self.store._body(skill), BODY_FORMAT,
                  skill.scope.kind.value, skill.scope.project_id, utc_now()),
             )
 
