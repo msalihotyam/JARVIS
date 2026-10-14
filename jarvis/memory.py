@@ -1308,6 +1308,13 @@ _RESERVED_EVENT_STATUSES = frozenset({
     MemoryRecordStatus.APPROVED,
     MemoryRecordStatus.SUPERSEDED,
 })
+#: A supersession written by the user's approval; undo of the newer record
+#: reverses only these.
+_APPROVAL_SUPERSEDE_REASON = "user-approved-newer"
+_APPROVAL_SUPERSEDE_KINDS = frozenset({
+    MemoryRecordKind.DECISION.value,
+    MemoryRecordKind.PREFERENCE.value,
+})
 _LEGACY_RECORD_KINDS = {
     ProjectMemoryKind.FACT: MemoryRecordKind.FACT,
     ProjectMemoryKind.DECISION: MemoryRecordKind.DECISION,
@@ -7332,7 +7339,75 @@ class SQLiteMemoryStore:
                 MemoryRecordActor.USER,
                 reason,
             )
+            self._supersede_on_approval(connection, record_id)
         return MemoryRecordStatus.APPROVED
+
+    @staticmethod
+    def _supersede_on_approval(connection: sqlite3.Connection, record_id: str) -> None:
+        """The user's approval of a DECISION/PREFERENCE supersedes the ONE
+        older APPROVED record of the same kind, project, conversation scope
+        and subject (Salih 2026-10-14; ARCHITECTURE manual gate step 5).
+
+        No match or several, an explicit-user older record (superseding it
+        needs proof naming it, see ``supersede``), an older record already
+        holding a supersession row, or a ``supersedes`` pointer at another
+        record: nothing is written and consolidation keeps proposing the
+        conflict. RULE is left out for the same proof reason.
+        """
+        new = connection.execute(
+            f"{_RECORD_CURRENT_SQL} WHERE r.record_id = ?", (record_id,)
+        ).fetchone()
+        if new["kind"] not in _APPROVAL_SUPERSEDE_KINDS:
+            return
+        new_at = datetime.fromisoformat(new["created_at"])
+        matches = [
+            row
+            for row in connection.execute(
+                f"{_RECORD_CURRENT_SQL} WHERE r.project_id = ? AND r.conversation_id IS ? "
+                "AND r.kind = ? AND r.subject_key = ? AND r.classification = ? "
+                "AND r.record_id <> ? AND e.status = ?",
+                (
+                    new["project_id"],
+                    new["conversation_id"],
+                    new["kind"],
+                    new["subject_key"],
+                    new["classification"],
+                    record_id,
+                    MemoryRecordStatus.APPROVED.value,
+                ),
+            ).fetchall()
+            if datetime.fromisoformat(row["created_at"]) < new_at
+        ]
+        if len(matches) != 1:
+            return
+        old_id = matches[0]["record_id"]
+        if (
+            matches[0]["origin"] == MemoryRecordOrigin.EXPLICIT_USER.value
+            or new["supersedes"] not in (None, old_id)
+            or connection.execute(
+                "SELECT 1 FROM memory_record_supersessions WHERE old_record_id = ?",
+                (old_id,),
+            ).fetchone()
+        ):
+            return
+        connection.execute(
+            "INSERT INTO memory_record_supersessions (old_record_id, "
+            "new_record_id, actor, reason, at) VALUES (?, ?, ?, ?, ?)",
+            (
+                old_id,
+                record_id,
+                MemoryRecordActor.USER.value,
+                _APPROVAL_SUPERSEDE_REASON,
+                utc_now(),
+            ),
+        )
+        SQLiteMemoryStore._append_record_event(
+            connection,
+            old_id,
+            MemoryRecordStatus.SUPERSEDED,
+            MemoryRecordActor.USER,
+            _APPROVAL_SUPERSEDE_REASON,
+        )
 
     def record_event(
         self,
@@ -7362,10 +7437,44 @@ class SQLiteMemoryStore:
     def undo(
         self, record_id: str, actor: MemoryRecordActor
     ) -> MemoryRecordStatus:
-        """Undo an APPROVED record by appending a RETRACTED event."""
-        return self.record_event(
-            record_id, MemoryRecordStatus.RETRACTED, actor, "undo"
-        )
+        """Undo an APPROVED record by appending a RETRACTED event.
+
+        If approving it superseded an older record (``_supersede_on_approval``)
+        that record is APPROVED again in the same transaction - the only
+        SUPERSEDED -> APPROVED move, reversing exactly that supersession.
+        """
+        validate_memory_record_id(record_id)
+        if type(actor) is not MemoryRecordActor:
+            raise ValueError("actor must be a MemoryRecordActor")
+        with self._connection(write=True) as connection:
+            self._append_record_event(
+                connection, record_id, MemoryRecordStatus.RETRACTED, actor, "undo"
+            )
+            if actor is not MemoryRecordActor.USER:
+                return MemoryRecordStatus.RETRACTED
+            for row in connection.execute(
+                "SELECT old_record_id FROM memory_record_supersessions "
+                "WHERE new_record_id = ? AND actor = ? AND reason = ?",
+                (record_id, MemoryRecordActor.USER.value, _APPROVAL_SUPERSEDE_REASON),
+            ).fetchall():
+                current = connection.execute(
+                    "SELECT status FROM memory_record_events WHERE record_id = ? "
+                    "ORDER BY event_id DESC LIMIT 1",
+                    (row["old_record_id"],),
+                ).fetchone()
+                if current["status"] == MemoryRecordStatus.SUPERSEDED.value:
+                    connection.execute(
+                        "INSERT INTO memory_record_events (record_id, status, "
+                        "actor, reason, at) VALUES (?, ?, ?, ?, ?)",
+                        (
+                            row["old_record_id"],
+                            MemoryRecordStatus.APPROVED.value,
+                            actor.value,
+                            "undo-restore",
+                            utc_now(),
+                        ),
+                    )
+        return MemoryRecordStatus.RETRACTED
 
     def record_lifetime(self, record_id: str) -> Lifetime:
         """The record's lifetime row; no row (legacy) reads as PERMANENT."""
@@ -7657,6 +7766,9 @@ class SQLiteMemoryStore:
         if type(actor) is not MemoryRecordActor:
             raise ValueError("actor must be a MemoryRecordActor")
         reason = sanitize_diagnostic_text(reason, MEMORY_ORIGIN_DETAIL_CAP)
+        if reason == _APPROVAL_SUPERSEDE_REASON:
+            # Reserved: undo restores only supersessions the approval wrote.
+            raise ValueError("supersede refuses the approval-supersede reason")
         with self._connection(write=True) as connection:
             rows = {
                 row["record_id"]: row

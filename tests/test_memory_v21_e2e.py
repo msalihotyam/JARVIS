@@ -265,6 +265,21 @@ class MemoryV21EndToEndTest(unittest.TestCase):
         self.assertIn("all projects memory", json.dumps(result.payload))
         self.assertIsNone(self.store.load_conversation(loose).project_id)
 
+    def test_approving_a_newer_decision_supersedes_the_older_and_undo_restores(self) -> None:
+        # Manual gate step 5 (Salih 2026-10-14): the Hafıza page shows the
+        # older DECISION superseded; undo of the newer brings it back.
+        self.capture_decision(FRIDAY)
+        thursday = self.capture_decision(THURSDAY)["record_id"]
+        listed = self.records(self.alpha)
+        self.assertEqual("superseded", listed[FRIDAY]["status"])
+        self.assertEqual("approved", listed[THURSDAY]["status"])
+        items = self.chat_memory(self.alpha)
+        self.assertIn(THURSDAY, items)
+        self.assertNotIn(FRIDAY, items)
+        self.assertTrue(self.app.undo_memory_record(self.alpha, thursday)["ok"])
+        self.assertEqual("approved", self.records(self.alpha)[FRIDAY]["status"])
+        self.assertIn(FRIDAY, self.chat_memory(self.alpha))
+
     def test_hatirla_then_undo(self) -> None:
         cid = self.store.create_conversation(self.alpha).id
         said, _ = self.converse(PersistedConversation(self.store, cid), "The release notes are written every Friday evening.")

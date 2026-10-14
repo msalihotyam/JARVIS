@@ -215,8 +215,10 @@ class MemoryInjectTests(unittest.TestCase):
             self.store.approve_record(record_id, MemoryRecordApproval(self.alpha, record_id))
             return record_id
 
-        old = decision("deploy only on Fridays", "2026-09-01T00:00:00+00:00")
+        # Newer approved first: approving the older one later supersedes
+        # nothing (MEMSUPERSEDE), so both stay APPROVED and retrieval decides.
         decision("ship on Tuesdays", "2026-09-02T00:00:00+00:00")
+        old = decision("deploy only on Fridays", "2026-09-01T00:00:00+00:00")
         delivered, _, _ = self.deliver()
         self.assertNotIn(old, delivered)
         # Mutation: without the full DECISION/RULE set the stale choice leaks.
