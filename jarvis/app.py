@@ -3395,6 +3395,7 @@ def _config_payload(command: str, settings: Settings, result) -> dict[str, Any]:
         # null means the CLI's own default stands.
         "claude_model": settings.claude_model,
         "claude_effort": settings.claude_effort,
+        "memory_extract_model": settings.memory_extract_model,
         "memory_database": _display_database(settings.memory_database),
         # Stated because it is the question this surface most invites, and
         # the answer is permanent: the monthly cap is not configuration.

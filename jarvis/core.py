@@ -955,6 +955,21 @@ def _file_input_taint(path: Any, roots: Sequence[Path]) -> SessionTaint:
     return SessionTaint.IMPORT
 
 
+def _proved_file_taint(relative: Any, roots: Sequence[Path]) -> SessionTaint:
+    """F7 for a file result turn: its connector-proved root-relative path,
+    joined to each trusted root. Empty, missing, absolute/anchored or a bare
+    name (the connector's no-root fallback) is ``import``.
+    """
+    if type(relative) is not str or not relative or Path(relative).anchor:
+        return SessionTaint.IMPORT
+    if "/" not in relative and "\\" not in relative:
+        return SessionTaint.IMPORT
+    for root in roots:
+        if _file_input_taint(os.path.join(root, relative), (root,)) is SessionTaint.LOCAL_TRUSTED_FILE:
+            return SessionTaint.LOCAL_TRUSTED_FILE
+    return SessionTaint.IMPORT
+
+
 def _capture_session_taint(
     turns: Sequence[Any], trigger: MemoryRecordOrigin, roots: Sequence[Path]
 ) -> SessionTaint:
@@ -962,7 +977,8 @@ def _capture_session_taint(
 
     The person's own words are ``user_typed`` and a reply is the model's
     own text; every other turn is a tool result tainted by its capability
-    (unknown -> ``web``), a file one by its path. What a user turn attached
+    (unknown -> ``web``), a file one by the path its connector proved
+    (never its destination, which is planner text). What a user turn attached
     is a file input (its snapshot path), what it quoted is ``import``: both
     reach the capture prompt through the turn's text. A compacted digest
     keeps its turn's refs; one stored before that (refs None) is ``import``.
@@ -983,10 +999,10 @@ def _capture_session_taint(
             continue
         taint = taint_for_capability(turn.capability)
         if taint is SessionTaint.LOCAL_TRUSTED_FILE:
-            # ponytail: a result turn keeps no resolved path (only its
-            # destination text, a compacted one nothing), so most file reads
-            # read as import. Upgrade: record the path on the result turn.
-            taint = _file_input_taint(getattr(turn, "destination", None), roots)
+            # ponytail: a top-level file (bare name) reads as import, since the
+            # connector's no-root fallback is a bare name too. Upgrade: the
+            # envelope names its root.
+            taint = _proved_file_taint(getattr(turn, "path", None), roots)
         taints.append(taint)
     return dirtiest(*taints)
 
@@ -1160,7 +1176,8 @@ def _validated_capture_turns(turns: Any, state: Any) -> tuple[Turn, ...] | None:
             turn.role, turn.kind, turn.capability, conversation_digest(turn.text)
         ):
             return None
-    return turns
+    # A compacted turn's path is bound to nothing stored: it reads as import (F7).
+    return tuple(turn if turn.seq in raw else replace(turn, path="") for turn in turns)
 
 
 def _finish_capture_run(store: Any, result: MemoryCaptureOutcome) -> None:

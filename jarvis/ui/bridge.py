@@ -178,6 +178,19 @@ def _parks(slots: dict) -> bool:
     return _waiting(slots) or task_outcome(slots["task"]).get("kind") == "paused"
 
 
+def _proved_path(run: Any) -> str:
+    """F7: the root-relative path a COMPLETED file run's connector proved from
+    its open handle (the envelope's local_read / local_write block), or "".
+    Never the destination: that is planner text."""
+    if not isinstance(run, dict) or run.get("run_status") != "completed":
+        return ""
+    for key in ("local_read", "local_write"):
+        block = run.get(key)
+        if isinstance(block, dict) and type(block.get("relative_path")) is str:
+            return block["relative_path"]
+    return ""
+
+
 def _run_facts(task: dict, payload: Any, intent: Any = None) -> dict[str, str]:
     """What a task envelope cannot say about its own task: the capability and the destination,
     from the resolved intent, else from the task block its OWN conversation already holds."""
@@ -723,7 +736,8 @@ class Bridge(QObject):
                    else f"{self._store_run}:{entry['id']}")
             store.append(role="assistant", kind="result", key=key,
                          text=result_history(shown, entry.get("capability"), entry.get("destination")),
-                         capability=str(entry.get("capability") or ""), destination=str(entry.get("destination") or ""))
+                         capability=str(entry.get("capability") or ""), destination=str(entry.get("destination") or ""),
+                         path=str(entry.get("path") or ""))
         if store.store is not None and store.diagnostic:
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "The conversation could not be saved: %1"),
                         (store.diagnostic,)), "error")
@@ -2509,7 +2523,7 @@ class Bridge(QObject):
             for entry in run_entries(run, facts):
                 if entry.get("kind") == "result":
                     self._say(entry.pop("kind"), entry.pop("text"), owner=owner, task_id=task_id,
-                              run_status=run_status, **entry)
+                              run_status=run_status, path=_proved_path(run), **entry)
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "A reply for another conversation was saved there"), ()), "system")
 
     # -- Gate 6G R2: parked waiting state, per conversation (bridge memory only) --
@@ -2733,6 +2747,8 @@ class Bridge(QObject):
                 measured = self._measured(*self._intent_reports(intent), result_usage)
                 if measured:
                     entry["telemetry"] = measured
+            if entry.get("kind") == "result":
+                entry["path"] = _proved_path(payload)
             self._say(entry.pop("kind"), entry.pop("text"), task_id=task_id, run_status=run_status, **entry)
         self._set_live(_project_run(prior, payload, intent))
         if self._task.get("task_id"):

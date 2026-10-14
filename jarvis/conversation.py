@@ -192,7 +192,9 @@ class Turn:
     ``message`` is the person's OWN words and nothing else - the only text a
     pin may come from. ``refs`` are the references the turn carried, by
     identity; a local ``path`` in them is a file handle that never leaves the
-    machine.
+    machine. ``path`` on a file result is the root-relative path the file
+    connector proved from its open handle, never planner text (F7); an older
+    build ignores the key.
     """
 
     id: str
@@ -205,11 +207,12 @@ class Turn:
     destination: str = ""
     refs: tuple = ()
     ts: int = 0
+    path: str = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {"id": self.id, "seq": self.seq, "role": self.role, "kind": self.kind, "text": self.text,
                 "message": self.message, "capability": self.capability, "destination": self.destination,
-                "refs": [dict(r) for r in self.refs], "ts": self.ts}
+                "refs": [dict(r) for r in self.refs], "ts": self.ts, **({"path": self.path} if self.path else {})}
 
 
 @dataclass(frozen=True)
@@ -326,7 +329,8 @@ def state_from_dict(data: Any) -> ConversationState:
                     text=_str(raw.get("text"), "text"), message=_str(raw.get("message"), "message"),
                     capability=_str(raw.get("capability"), "capability", 200),
                     destination=_str(raw.get("destination"), "destination", 400),
-                    refs=tuple(dict(r) for r in refs), ts=_int(raw.get("ts"), "ts"))
+                    refs=tuple(dict(r) for r in refs), ts=_int(raw.get("ts"), "ts"),
+                    path=_str(raw.get("path", ""), "path", 400))
         if turn.id in seen or (turns and turn.seq <= turns[-1].seq):
             raise CorruptConversation("turn ids repeat or turns are out of order")
         seen.add(turn.id)
@@ -420,7 +424,7 @@ def digest(text: str) -> str:
 
 def append_turn(state: ConversationState, *, role: str, kind: str, text: str, message: str = "",
                 capability: str = "", destination: str = "", refs: Iterable[Mapping[str, Any]] = (),
-                key: str = "", now: int | None = None, raw_turns_max: int = RAW_TURNS_MAX,
+                path: str = "", key: str = "", now: int | None = None, raw_turns_max: int = RAW_TURNS_MAX,
                 on_compact: Callable[[tuple[Turn, ...]], None] | None = None) -> tuple[ConversationState, Turn | None]:
     """The state with one more turn, or the same state when ``key`` was seen.
 
@@ -442,7 +446,8 @@ def append_turn(state: ConversationState, *, role: str, kind: str, text: str, me
     turn = Turn(id=f"t{seq}-{hashlib.sha256(f'{seq}:{key}:{text}'.encode()).hexdigest()[:10]}", seq=seq,
                 role=role, kind=kind, text=text, message=str(message)[:TURN_MAX_CHARS] if role == "user" else "",
                 capability=str(capability)[:200], destination=str(destination)[:400],
-                refs=tuple(dict(r) for r in refs), ts=int(now if now is not None else time.time()))
+                refs=tuple(dict(r) for r in refs), ts=int(now if now is not None else time.time()),
+                path=str(path)[:400])
     compacted = _compact(replace(state, turns=state.turns + (turn,)), raw_turns_max, on_compact)
     pins = update_pins(state.pins, turn) if role == "user" else state.pins
     keys = state.keys + ((key,) if key else ())

@@ -255,11 +255,12 @@ class FileTaintTests(unittest.TestCase):
         self.assertIs(self.taint(link / "secret.txt"), SessionTaint.IMPORT)
 
     def test_session_max_taint_follows(self) -> None:
-        def turn(kind, capability="", destination=""):
-            return mock.Mock(kind=kind, capability=capability, destination=destination)
+        def turn(kind, capability="", destination="", path=""):
+            return mock.Mock(kind=kind, capability=capability, destination=destination, path=path)
 
-        inside = turn("result", "file_read", str(self.root / "notes.txt"))
-        outside = turn("result", "file_read", str(self.outside / "secret.txt"))
+        # SECCAPWIRE2: F7 reads the connector-proved root-relative path, never the destination.
+        inside = turn("result", "file_read", str(self.root / "notes.txt"), "docs/notes.txt")
+        outside = turn("result", "file_read", str(self.outside / "secret.txt"), "../outside/secret.txt")
         user = turn("user", "web_search")
         user.refs = ()
         self.assertIs(_capture_session_taint((user,), SESSION_END, self.roots), SessionTaint.USER_TYPED)
