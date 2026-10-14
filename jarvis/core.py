@@ -199,7 +199,7 @@ from jarvis.progress import (
 )
 from jarvis import memory_capture, memory_retrieval, project_files
 from collections.abc import Mapping, Sequence
-from jarvis.conversation import RAW_TURNS_MAX, REPLY_MAX_CHARS, TURN_MAX_CHARS, Compacted, Turn
+from jarvis.conversation import CONVERSATION_ID, RAW_TURNS_MAX, REPLY_MAX_CHARS, TURN_MAX_CHARS, Compacted, Turn
 from jarvis.conversation import digest as conversation_digest
 from jarvis.memory_doctor import LEGACY_M1_KIND_MAP
 from jarvis.memory_filter import classify_candidate_text
@@ -5964,16 +5964,18 @@ class AgentCore:
         applies only when ``conversation_id`` names a stored conversation of
         ``project_id``. An unknown, foreign or malformed id is no
         conversation (own-project memory only, no toggle); a project-less or
-        malformed ``project_id`` gets nothing. Read-only; every item is
-        labelled untrusted data and RULE delivery is Core's re-proof."""
+        malformed ``project_id``, or a conversation lookup that fails (its
+        memory-off and SESSION checks cannot run), gets nothing. Read-only;
+        every item is labelled untrusted data and RULE delivery is Core's
+        re-proof."""
         if type(project_id) is not str or not project_id:
             return RetrievedContext()
         conversation = None
-        if type(conversation_id) is str and conversation_id:
+        if type(conversation_id) is str and CONVERSATION_ID.fullmatch(conversation_id):
             try:
                 record = self.memory.load_conversation(conversation_id)
-            except Exception:  # noqa: BLE001 - storage boundary; no conversation
-                record = None
+            except Exception:  # noqa: BLE001 - storage boundary; fail closed
+                return RetrievedContext()
             if record is not None and record.project_id == project_id:
                 conversation = conversation_id
         return self._with_typed_memory(

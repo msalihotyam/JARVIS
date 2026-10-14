@@ -121,6 +121,22 @@ class PrecompactCarryTests(unittest.TestCase):
         self.settle()
         self.assertEqual(3, len(self.runs()))
 
+    def test_a_duplicate_session_end_keeps_the_carry(self) -> None:
+        # B7: leave, return, leave with no new turn repeats the skipped
+        # SessionEnd ("duplicate"); the folded turn must keep riding.
+        said = self.say("user", "We use uv.")
+        self.say("assistant", "Noted.")
+        self.say("user", "Ok.")  # folds "We use uv.": too short
+        for _ in range(2):
+            self.app.conversation_left(self.cid)
+            self.settle()
+            self.assertEqual([said.id], [turn.id for turn in self.app.memory_triggers._carry[self.cid]])
+        self.say("user", "Now the long part." + PAD)  # folds "Noted.": enough now
+        self.assertEqual([("precompact", "skipped:too_short"), ("session_end", "skipped:too_short"),
+                          ("precompact", "ok")], self.runs())
+        self.assertEqual(1, len(self.model.prompts))
+        self.assertIn("We use uv.", self.model.prompts[0])
+
 
 def turns(first, last):
     return tuple(SimpleNamespace(seq=seq) for seq in range(first, last + 1))
@@ -152,6 +168,10 @@ class WithCarryTests(unittest.TestCase):
                               ("duplicate", False), ("aborted", False), ("internal_error", False)):
             self.triggers._carry_on("c", turns(1, 2), SimpleNamespace(outcome=outcome))
             self.assertEqual(kept, "c" in self.triggers._carry, outcome)
+        # B7: a duplicate keeps a live carry (it repeats a skipped run).
+        self.triggers._carry["c"] = turns(1, 2)
+        self.triggers._carry_on("c", turns(1, 2), SimpleNamespace(outcome="duplicate"))
+        self.assertEqual([1, 2], self.seqs(self.triggers._carry["c"]))
 
 
 if __name__ == "__main__":

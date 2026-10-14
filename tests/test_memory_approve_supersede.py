@@ -85,6 +85,22 @@ class ApproveSupersedeTests(unittest.TestCase):
         self.approved("other project", day=5, project=self.beta)
         self.assertIs(S.APPROVED, self.status(old))
 
+    def test_a_different_lifetime_never_supersedes(self) -> None:
+        # A1: a SESSION ("for now") approval must not hide the PERMANENT
+        # project record from other conversations, nor the reverse.
+        for kind in (K.DECISION, K.PREFERENCE):
+            permanent = self.approved(f"Deploy on Fridays {kind.value}", day=1, kind=kind, subject=kind.value)
+            session = self.approved(f"For now deploy on Thursdays {kind.value}", day=2, kind=kind,
+                                    subject=kind.value)
+            self.assertEqual(("permanent", "session"),
+                             (self.store.record_lifetime(permanent).value, self.store.record_lifetime(session).value))
+            self.assertIs(S.APPROVED, self.status(permanent), kind)
+            later = self.approved(f"Deploy on Mondays {kind.value}", day=3, kind=kind, subject=kind.value)
+            self.assertIs(S.APPROVED, self.status(session), kind)
+            # Same lifetime still supersedes (one PERMANENT match).
+            self.assertIs(S.SUPERSEDED, self.status(permanent), kind)
+            self.assertIs(S.APPROVED, self.status(later), kind)
+
     def test_rule_and_explicit_user_older_records_are_never_superseded(self) -> None:
         rule = self.approved("rule one", day=1, kind=K.RULE)
         self.approved("rule two", day=2, kind=K.RULE)

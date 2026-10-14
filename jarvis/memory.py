@@ -7345,8 +7345,10 @@ class SQLiteMemoryStore:
     @staticmethod
     def _supersede_on_approval(connection: sqlite3.Connection, record_id: str) -> None:
         """The user's approval of a DECISION/PREFERENCE supersedes the ONE
-        older APPROVED record of the same kind, project, conversation scope
-        and subject (Salih 2026-10-14; ARCHITECTURE manual gate step 5).
+        older APPROVED record of the same kind, project, conversation scope,
+        subject and lifetime (Salih 2026-10-14; ARCHITECTURE manual gate step
+        5). Lifetime: no row = PERMANENT; a SESSION "for now" must never hide
+        the PERMANENT record from other conversations, nor the reverse.
 
         No match or several, an explicit-user older record (superseding it
         needs proof naming it, see ``supersede``), an older record already
@@ -7359,7 +7361,15 @@ class SQLiteMemoryStore:
         ).fetchone()
         if new["kind"] not in _APPROVAL_SUPERSEDE_KINDS:
             return
+
+        def lifetime(rid: str) -> str:
+            row = connection.execute(
+                "SELECT lifetime FROM memory_record_lifetime WHERE record_id = ?", (rid,)
+            ).fetchone()
+            return Lifetime.PERMANENT.value if row is None else row[0]
+
         new_at = datetime.fromisoformat(new["created_at"])
+        new_lifetime = lifetime(record_id)
         matches = [
             row
             for row in connection.execute(
@@ -7377,6 +7387,7 @@ class SQLiteMemoryStore:
                 ),
             ).fetchall()
             if datetime.fromisoformat(row["created_at"]) < new_at
+            and lifetime(row["record_id"]) == new_lifetime
         ]
         if len(matches) != 1:
             return

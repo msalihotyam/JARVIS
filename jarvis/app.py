@@ -3934,9 +3934,12 @@ class MemoryTriggers:
     def _carry_on(self, conversation_id: str, batch: tuple[Any, ...], outcome: Any) -> None:
         with self._lock:
             # A provider or run-store failure wrote nothing either: the folded
-            # turns ride on rather than being lost.
-            if getattr(outcome, "outcome", None) in (
-                "skipped:too_short", "skipped:empty", "provider_error", "run_store_error"
+            # turns ride on rather than being lost. A duplicate with a live
+            # carry repeats a run that skipped (an ok run dropped the carry);
+            # without one it may repeat an ok run, whose turns never ride.
+            done = getattr(outcome, "outcome", None)
+            if done in ("skipped:too_short", "skipped:empty", "provider_error", "run_store_error") or (
+                done == "duplicate" and conversation_id in self._carry
             ):
                 self._carry[conversation_id] = batch
             else:
@@ -4016,10 +4019,14 @@ class MemoryTriggers:
                 outcome = app.core.capture_memory(conversation_id, trigger, model, stop=stop)
             else:
                 outcome = app.core.capture_memory(conversation_id, trigger, model, turns=batch, stop=stop)
-            self._mark(conversation_id, batch, outcome)
+            carried = batch[:len(batch) - len(new)]
+            # A duplicate with a live carry repeats a skip: its raw turns
+            # stay unmarked, so the carry still continues them.
+            if not (carried and getattr(outcome, "outcome", None) == "duplicate"):
+                self._mark(conversation_id, batch, outcome)
             # Skipped: the raw turns stay raw (the next leave re-reads them);
             # only the folded ones keep riding.
-            self._carry_on(conversation_id, batch[:len(batch) - len(new)], outcome)
+            self._carry_on(conversation_id, carried, outcome)
         record = app.memory.load_conversation(conversation_id)
         if record is not None and record.project_id:
             with stop.write():

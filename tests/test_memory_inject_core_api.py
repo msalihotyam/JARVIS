@@ -5,7 +5,9 @@ global toggle counts only for a stored conversation of that project. The
 store lives in each test's own TEMP database (never data\\jarvis.db).
 """
 
+import sqlite3
 import unittest
+from unittest import mock
 
 from jarvis.contracts import (
     DataClassification,
@@ -94,6 +96,15 @@ class TypedMemoryForTests(unittest.TestCase):
         for project_id in (None, "", 42, ["x"]):
             with self.subTest(project_id=project_id):
                 self.assertEqual({}, self.delivered(project_id, self.conversation))
+
+    def test_failed_conversation_lookup_delivers_nothing(self) -> None:
+        # B4: the memory-off (I21) and SESSION checks need the conversation;
+        # a lookup that raises must not fall back to project-wide delivery.
+        self.store.set_conversation_memory_off(self.conversation, True, MemoryRecordActor.USER)
+        with mock.patch.object(self.store, "load_conversation", side_effect=sqlite3.OperationalError("locked")):
+            self.assertEqual({}, self.delivered(self.alpha, self.conversation))
+        self.assertEqual({}, self.delivered(self.alpha, self.conversation))  # memory off
+        self.assertEqual({self.own}, set(self.delivered(self.alpha, None)))
 
     def test_linked_session_scope_matches_the_run_path(self) -> None:
         self.toggle(self.conversation)
