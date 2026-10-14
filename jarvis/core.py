@@ -222,10 +222,33 @@ from jarvis.settings import Settings
 from jarvis import experience as skill_experience
 from jarvis import intent as skill_intent
 from jarvis import skill_lifecycle
-from jarvis.skill_draft import _find_params, _without_params
+from jarvis.skill_draft import (
+    CHAT_CAPABILITIES,
+    GLOBAL_SUPPRESSION,
+    _find_params,
+    _visible,
+    _without_params,
+    build_drafts,
+    should_offer,
+    task_kind,
+)
+from jarvis.skill_filter import check_fields
 from jarvis.skill_match import MatchKind, SkillWithState, match_skills
 from jarvis.skill_run_plan import MissingInputsError, SkillPlanContext, plan_steps
-from jarvis.skill_types import SkillStatus
+from jarvis.skill_store import _text_fields
+from jarvis.skill_types import (
+    ID_PATTERN,
+    LONG_TEXT_MAX,
+    MAX_CHECKS,
+    TEXT_MAX,
+    RunOutcome,
+    RunStep,
+    RunSummary,
+    SkillDraft,
+    SkillOrigin,
+    SkillRef,
+    SkillStatus,
+)
 
 
 #: Task preference holding the billing fingerprint that cleared cost preflight.
@@ -661,6 +684,10 @@ _SKILL_SESSION_PREFIX = "skill-run:"
 _SKILL_REFERENCE_SOURCE = "skill-reference:"
 #: Clarification keys a skill announcement sets and clears on the user's task.
 _SKILL_QUESTION_KEYS = ("needs_clarification", "clarification_question")
+#: The offer a stored draft is announced with (SKLEARN); saving needs approval.
+_SKILL_OFFER_MESSAGE = "Bunu beceri olarak kaydedeyim mi?"
+#: A run is learned from only when everything in it was at most this sensitive.
+_SKILL_LEARN_CLASSES = (DataClassification.PUBLIC, DataClassification.INTERNAL)
 
 
 def _retrieved_item_characters(item: RetrievedMemoryItem) -> int:
@@ -2188,6 +2215,9 @@ class AgentCore:
                         task,
                         StructuredError(ErrorCode.CONNECTOR_FAILED, "Missing result"),
                     )
+                # SKLEARN: the offer rides on the task while it can still be
+                # written, before the terminal write below.
+                self._skill_learn_task(session, task)
                 # PERSIST succeeded; COMPLETED is the terminal state, not an
                 # executed work stage, and is never recorded as completed.
                 mark_stage_completed(task, LoopStage.PERSIST)
@@ -6151,6 +6181,26 @@ class AgentCore:
         owner = self.memory.load_session(self.memory.task_session_id(anchor.id) or "")
         if owner is None:
             return
+        if outcome is not ChainStatus.CANCELLED and self._skills_on():
+            # Before the anchor closes (it carries the offer) and before this
+            # run's use events (lessons need the health BEFORE the run).
+            try:
+                history = self.skill_store.history(state["skill_id"], owner.project_id)
+                skill = self._skill_version_of(history, state.get("version"))
+                health = None if skill is None else skill_lifecycle.health(history)
+            except Exception:  # noqa: BLE001 - an unreadable skill teaches nothing
+                history = skill = health = None
+            if skill is not None:
+                learned = self._skill_learn(
+                    self._skill_chain_summary(final, anchor.objective, state, anchor=anchor),
+                    skill=skill,
+                    history=history,
+                    health=health,
+                )
+                try:
+                    self._skill_offer(owner, anchor, learned)
+                except _LifecycleLost:
+                    return
         anchor.status, anchor.stage = ends[outcome]
         anchor.preferences[_SKILL_RUN_KEY] = {
             **state, "state": "finished", "outcome": outcome.value
@@ -6175,6 +6225,323 @@ class AgentCore:
                 self.skill_store.append_event(event)
         except Exception:  # noqa: BLE001 - usage history is advisory, never blocking
             return
+
+    # ------------------------------------------------------------------
+    # V2.2 SKLEARN. Learning from a finished run, behind the flag.
+    #
+    # Proposals and advice only (S5): a run may leave PENDING drafts and
+    # advisory, removable lessons. A draft becomes a skill solely through
+    # SkillStore.approve_draft from the user's action (the app API), never
+    # here. Every record passes skill_filter first (S7); nothing here raises
+    # into the loop except a lost checkpoint, like every other checkpoint.
+    # ------------------------------------------------------------------
+
+    def _skill_run_summary(
+        self,
+        run_id: str,
+        task_text: str,
+        project_id: str | None,
+        status: str,
+        steps: Sequence[tuple[Task, str]],
+        state: dict[str, Any],
+        correction: str | None = None,
+    ) -> RunSummary | None:
+        """THE one map from a finished Core run to ``skill_types.RunSummary``.
+
+        ``steps`` pairs each step task with its final status value; the run
+        and step outcomes are Core's own status values. D19: every character
+        skill_types refuses is stripped from copied text. A run that still
+        cannot be represented, or that touched anything more sensitive than
+        INTERNAL, is not learned from (``None``).
+        """
+        outcomes = {item.value for item in RunOutcome}
+
+        def fit(text: str, limit: int) -> str:
+            # Refused, not cut: a cut could leave a secret fragment the
+            # filter no longer recognises.
+            text = _visible(text)
+            if len(text) > limit:
+                raise ValueError("too long to learn from")
+            return text
+
+        try:
+            if any(t.scope.data_classification not in _SKILL_LEARN_CLASSES for t, _ in steps):
+                return None
+            return RunSummary(
+                run_id=run_id,
+                task_text=fit(task_text, LONG_TEXT_MAX),
+                project_id=project_id,
+                status=RunOutcome(status),
+                steps=tuple(
+                    RunStep(
+                        action=fit(t.objective, TEXT_MAX),
+                        capability=t.capability if ID_PATTERN.fullmatch(t.capability or "") else None,
+                        outcome=RunOutcome(value),
+                        error=None,
+                    )
+                    for t, value in steps
+                    if value in outcomes
+                ),
+                user_correction=(
+                    None if correction is None else fit(correction, LONG_TEXT_MAX)
+                ),
+                matched_skill=(
+                    SkillRef(skill_id=state["skill_id"], version=state["version"])
+                    if state.get("skill_id")
+                    else None
+                ),
+            )
+        except Exception:  # noqa: BLE001 - D19: not representable, not captured
+            return None
+
+    def _skill_chain_summary(
+        self,
+        final: SessionState,
+        task_text: str,
+        state: dict[str, Any],
+        correction: str | None = None,
+        anchor: Task | None = None,
+    ) -> RunSummary | None:
+        try:
+            tasks = [self.memory.load_task(item) for item in final.chain.step_task_ids if item]
+        except Exception:  # noqa: BLE001 - an unreadable step teaches nothing
+            return None
+        if (anchor is not None
+                and anchor.scope.data_classification not in _SKILL_LEARN_CLASSES):
+            # The user's own task text is learned from too: same ceiling.
+            return None
+        return self._skill_run_summary(
+            final.id,
+            task_text,
+            final.project_id,
+            final.chain.status.value,
+            [(t, t.status.value) for t in tasks if t is not None],
+            state,
+            correction,
+        )
+
+    @staticmethod
+    def _skill_version_of(history: Any, version: Any) -> Any | None:
+        if history is None:
+            return None
+        return next((skill for skill in history.versions if skill.version == version), None)
+
+    @staticmethod
+    def _skill_keep(add: Callable[[Any], bool], record: Any) -> bool | None:
+        """S7 first, then the store (which filters again). True stored, False
+        already there, ``None`` refused or failed: dropped, and counted."""
+        try:
+            if check_fields(_text_fields(record.to_dict())).allowed:
+                return add(record)
+        except Exception:  # noqa: BLE001 - a record that cannot be kept is dropped
+            pass
+        return None
+
+    @staticmethod
+    def _skill_version_draft(run: RunSummary, skill: Any, history: Any, now: str) -> SkillDraft:
+        """The next version of the EXACT version used, as a PENDING proposal
+        (``version_after_failure``); that version and every older one stay."""
+        if run.user_correction and skill.scope.project_id == run.project_id:
+            # A correction's words stay in the scope they were said in (D15):
+            # a global skill corrected inside a project gets the generic note;
+            # the project-scoped avoid lesson keeps the words.
+            note = "Kullanıcı düzeltmesi: «" + " ".join(run.user_correction.split())[:400] + "»"
+        elif run.user_correction:
+            note = "Kullanıcı son çalıştırmanın sonucunu düzeltti; önce sonucu doğrula."
+        else:
+            failed = next(
+                (n for n, step in enumerate(run.steps, 1) if step.outcome is not RunOutcome.COMPLETED),
+                len(run.steps),
+            )
+            note = f"Adım {failed} son çalıştırmada başarısız oldu; önce girdilerini ve önkoşullarını doğrula."
+        checks = skill.checks if note in skill.checks else (*skill.checks, note)[-MAX_CHECKS:]
+        version = skill_lifecycle.next_version(
+            skill,
+            {"checks": checks},
+            SkillOrigin.VERSION_AFTER_FAILURE,
+            now,
+            history=history,
+            source_run_id=run.run_id,
+        )
+        # The note is in the id, so a correction after a failure draft (or a
+        # second correction) is a new proposal, not silently ignored.
+        digest = hashlib.sha256(
+            f"{run.run_id}:version:{skill.skill_id}:{note}".encode("utf-8")
+        ).hexdigest()
+        return SkillDraft(
+            draft_id="draft-" + digest[:32],
+            name=version.name,
+            summary=version.summary,
+            scope=version.scope,
+            inputs=version.inputs,
+            steps=version.steps,
+            checks=version.checks,
+            provenance=version.provenance,
+            reason=(
+                f"Proposed after run {run.run_id} of version {skill.version}. "
+                "Saved only if you approve this draft."
+            ),
+            target_skill_id=skill.skill_id,
+        )
+
+    def _skill_learn(
+        self,
+        run: RunSummary | None,
+        *,
+        skill: Any = None,
+        history: Any = None,
+        health: Any = None,
+        offer: bool = True,
+    ) -> dict[str, Any]:
+        """Pending drafts and advisory lessons from one finished run. Never raises.
+
+        A new-skill draft follows ``should_offer``; a skill run that failed,
+        or was corrected, proposes the next version of the version used.
+        Suppressed task kinds (or ``global``) get no draft. Only drafts newly
+        stored are returned for the offer: deterministic draft ids make the
+        drafts table the record of what was offered. ``health`` is the
+        skill's health BEFORE the run. A lesson the filter refuses is dropped
+        and counted.
+        """
+        learned: dict[str, Any] = {
+            "run_id": None, "draft_ids": [], "experience_ids": [], "dropped": 0
+        }
+        if run is None or not self._skills_on():
+            return learned
+        learned["run_id"] = run.run_id
+        if (
+            # A project skill teaches nothing outside its project (S8, D15).
+            (skill is not None and skill.scope.project_id not in (None, run.project_id))
+            # A chat answer is not a procedure; its words are not kept.
+            or all(step.capability in (None, *CHAT_CAPABILITIES) for step in run.steps)
+            # S7 on the run itself: a run that carried a secret teaches
+            # nothing, even where a draft would template the value away.
+            or not check_fields(_text_fields(run.to_dict())).allowed
+        ):
+            return learned
+        now = utc_now()
+        drafts: list[SkillDraft] = []
+        try:
+            suppressed = {
+                key
+                for key in (GLOBAL_SUPPRESSION, task_kind(run))
+                if self.skill_store.is_suppressed(key)
+            }
+            if offer and should_offer(run, suppressed, ()).offer:
+                drafts.extend(build_drafts(run, created_at=now))
+            if (
+                offer
+                and skill is not None
+                and not suppressed
+                and (
+                    run.status is RunOutcome.FAILED
+                    or (run.user_correction and run.status is RunOutcome.COMPLETED)
+                )
+            ):
+                drafts.append(self._skill_version_draft(run, skill, history, now))
+        except Exception:  # noqa: BLE001 - no draft is never a failure of the run
+            pass
+        for draft in drafts:
+            if self._skill_keep(self.skill_store.add_draft, draft):
+                learned["draft_ids"].append(draft.draft_id)
+        try:
+            lessons = skill_experience.capture_candidates(
+                run, created_at=now, matched_skill_health=health
+            )
+        except Exception:  # noqa: BLE001 - lessons are advice; none on a fault
+            lessons = ()
+        for lesson in lessons:
+            kept = self._skill_keep(self.skill_store.add_experience, lesson)
+            if kept:
+                learned["experience_ids"].append(lesson.experience_id)
+            elif kept is None:
+                learned["dropped"] += 1
+        return learned
+
+    def _skill_offer(self, session: SessionState, task: Task, learned: dict[str, Any]) -> None:
+        """The offer event naming ONLY newly stored drafts; else the count of
+        kept and dropped lessons. A lost checkpoint raises as everywhere."""
+        if learned["draft_ids"]:
+            self._checkpoint(
+                session,
+                task,
+                "skill_draft_offered",
+                {**learned, "message": _SKILL_OFFER_MESSAGE},
+            )
+        elif learned["experience_ids"] or learned["dropped"]:
+            self._checkpoint(session, task, "skill_experience_captured", learned)
+
+    def _skill_learn_task(self, session: SessionState, task: Task) -> None:
+        """A standalone task about to complete: offer it, keep its lessons.
+
+        Not a chain step (the chain is the run) and not a task that met a
+        skill (a declined or stale one): only ``not_used`` or none.
+        """
+        if (
+            not self._skills_on()
+            or session.chain is not None
+            or self._skill_state(task).get("state") not in (None, "not_used")
+        ):
+            return
+        done = RunOutcome.COMPLETED.value
+        run = self._skill_run_summary(
+            task.id, task.objective, session.project_id, done, [(task, done)], {}
+        )
+        self._skill_offer(session, task, self._skill_learn(run))
+
+    def correct_run(self, session_id: str, task_id: str, correction: str) -> dict[str, Any]:
+        """The user corrected a FINISHED run's result.
+
+        An ``avoid`` lesson and, for a skill run, a PENDING next-version
+        draft of the version used (old versions stay). Proposals and advice
+        only: a finished task carries no further event, so the caller (the
+        app, from the user's action) shows the returned ``draft_ids`` as the
+        offer. Never raises; anything unclear learns nothing.
+        """
+        learned = self._skill_learn(None)
+        if not self._skills_on() or type(correction) is not str or not correction.strip():
+            return learned
+        try:
+            session = self.memory.load_session(session_id)
+            task = self.memory.load_task(task_id)
+            if (
+                session is None
+                or task is None
+                or self.memory.task_session_id(task_id) != session_id
+                or not is_terminal(task)
+            ):
+                return learned
+            state = self._skill_state(task)
+            if state.get("state") == "finished":
+                runner = self.memory.load_session(str(state.get("chain_session_id") or ""))
+                if (
+                    runner is None
+                    or runner.objective != _SKILL_SESSION_PREFIX + task.id
+                    or runner.chain is None
+                ):
+                    return learned
+                history = self.skill_store.history(state["skill_id"], session.project_id)
+                return self._skill_learn(
+                    self._skill_chain_summary(runner, task.objective, state, correction, task),
+                    skill=self._skill_version_of(history, state.get("version")),
+                    history=history,
+                )
+            if session.chain is not None or state.get("state") not in (None, "not_used"):
+                return learned
+            return self._skill_learn(
+                self._skill_run_summary(
+                    task.id,
+                    task.objective,
+                    session.project_id,
+                    task.status.value,
+                    [(task, task.status.value)],
+                    {},
+                    correction,
+                ),
+                offer=False,
+            )
+        except Exception:  # noqa: BLE001 - a correction is advice; fail closed to nothing
+            return learned
 
     def _with_skill_reference(
         self,
@@ -6449,6 +6816,16 @@ class AgentCore:
                 break
         final = self.memory.load_session(session_id)
         self._skill_run_finished(final)
+        if (
+            final is not None
+            and final.chain is not None
+            and not final.objective.startswith(_SKILL_SESSION_PREFIX)
+            and final.chain.status in (ChainStatus.COMPLETED, ChainStatus.FAILED)
+            and self._skills_on()
+        ):
+            # A plain chain has no live task left to carry an offer event:
+            # its lessons are kept, no draft is offered (reported for SKFEED).
+            self._skill_learn(self._skill_chain_summary(final, final.objective, {}), offer=False)
         if last is None:
             last = AgentRun(RunStatus.COMPLETED, final, None)
         elif final is not None:
