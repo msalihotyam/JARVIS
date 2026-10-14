@@ -20,6 +20,7 @@ from jarvis.contracts import (
     MemoryRecordStatus,
 )
 from jarvis.conversation import PersistedConversation
+from jarvis.memory import MemoryRecordApproval
 from tests.test_ui import UiTestCase
 
 TEXTS = tuple(f"mesaj {n}" for n in range(10))
@@ -52,7 +53,10 @@ class CompactAndDoctorBridgeTests(UiTestCase):
             scope=MemoryRecordScope(self.project, None), origin=MemoryRecordOrigin.CAPTURE_SESSION_END,
             actor=MemoryRecordActor.MODEL, confidence=0.8, classification=DataClassification.INTERNAL, **extra,
         )
-        return self.memory.insert_record(record).record.record_id
+        record_id = self.memory.insert_record(record).record.record_id
+        # A guard-less capture record starts PENDING (SECCAPTURE); the human approve makes it active.
+        self.memory.approve_record(record_id, MemoryRecordApproval(self.project, record_id))
+        return record_id
 
     def assertRefusedVisibly(self, answer: dict, feed_before: int) -> None:
         self.assertIs(answer["ok"], False)
