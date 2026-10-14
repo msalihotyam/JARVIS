@@ -36,7 +36,7 @@ S = MemoryRecordStatus
 K = MemoryRecordKind
 NOW = "2030-01-01T00:00:00+00:00"
 PAST = "2029-01-01T00:00:00+00:00"
-ZERO = {"expired": 0, "superseded": 0, "merged": 0, "conflicts": 0}
+ZERO = {"expired": 0, "superseded": 0, "merged": 0, "conflicts": 0, "skipped_tombstoned": 0}
 
 
 class ConsolidationStoreTests(unittest.TestCase):

@@ -221,10 +221,16 @@ class Compacted:
     kind: str
     digest: str
     capability: str = ""
+    # The replaced turn's refs, so its capture taint survives compaction.
+    # None marks a digest stored before refs were kept: its taint is unknown.
+    refs: tuple | None = None
 
     def to_dict(self) -> dict[str, Any]:
-        return {"seq": self.seq, "role": self.role, "kind": self.kind, "digest": self.digest,
+        data = {"seq": self.seq, "role": self.role, "kind": self.kind, "digest": self.digest,
                 "capability": self.capability}
+        if self.refs is not None:  # an unknown stays unknown when rewritten
+            data["refs"] = [dict(r) for r in self.refs]
+        return data
 
 
 @dataclass(frozen=True)
@@ -329,9 +335,13 @@ def state_from_dict(data: Any) -> ConversationState:
     for raw in data.get("compacted") if isinstance(data.get("compacted"), list) else _bad("compacted"):
         if not isinstance(raw, dict):
             raise CorruptConversation("a digest is not an object")
+        refs = raw.get("refs")
+        if refs is not None and (not isinstance(refs, list) or not all(isinstance(r, dict) for r in refs)):
+            raise CorruptConversation("a digest's references are not a list of objects")
         compacted.append(Compacted(seq=_int(raw.get("seq"), "seq"), role=_str(raw.get("role"), "role"),
                                    kind=_str(raw.get("kind"), "kind"), digest=_str(raw.get("digest"), "digest"),
-                                   capability=_str(raw.get("capability"), "capability", 200)))
+                                   capability=_str(raw.get("capability"), "capability", 200),
+                                   refs=None if refs is None else tuple(dict(r) for r in refs)))
     pins = []
     for raw in data.get("pins") if isinstance(data.get("pins"), list) else _bad("pins"):
         if not isinstance(raw, dict):
@@ -453,7 +463,8 @@ def _compact(state: ConversationState, keep: int,
         # Older history compacts into the checkpoint; it does not disappear.
         old, turns = turns[0], turns[1:]
         compacted = compacted + (Compacted(seq=old.seq, role=old.role, kind=old.kind,
-                                           digest=digest(old.text), capability=old.capability),)
+                                           digest=digest(old.text), capability=old.capability,
+                                           refs=old.refs),)
     if len(compacted) > COMPACTED_MAX:
         omitted += len(compacted) - COMPACTED_MAX
         compacted = compacted[-COMPACTED_MAX:]

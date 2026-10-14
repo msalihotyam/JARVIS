@@ -964,12 +964,16 @@ def _capture_session_taint(
     own text; every other turn is a tool result tainted by its capability
     (unknown -> ``web``), a file one by its path. What a user turn attached
     is a file input (its snapshot path), what it quoted is ``import``: both
-    reach the capture prompt through the turn's text.
+    reach the capture prompt through the turn's text. A compacted digest
+    keeps its turn's refs; one stored before that (refs None) is ``import``.
     """
     taints = [SessionTaint.USER_TYPED]
     if trigger is MemoryRecordOrigin.IMPORT:
         taints.append(SessionTaint.IMPORT)
     for turn in turns:
+        if getattr(turn, "refs", ()) is None:
+            taints.append(SessionTaint.IMPORT)
+            continue
         if turn.kind == "user":
             for ref in getattr(turn, "refs", ()):
                 is_file = isinstance(ref, Mapping) and ref.get("type") == "file"

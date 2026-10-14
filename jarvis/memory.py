@@ -171,6 +171,7 @@ from jarvis.contracts import (
 from jarvis.memory_consolidation import (
     ConsolidationEvent,
     ConsolidationPlan,
+    Merge,
     Supersession,
     plan_consolidation,
 )
@@ -8273,7 +8274,31 @@ class SQLiteMemoryStore:
         plan = plan_consolidation(
             ((view.record, view.status) for view in views), now=now
         )
-        return self.apply_consolidation_plan(plan)
+        # A supersession onto a tombstoned survivor is left out (and counted),
+        # so one tombstone never stalls the whole scope and its content never
+        # wins through consolidation (I15). Retiring a tombstoned loser stays
+        # (it only tightens). Apply still refuses a tombstoned survivor.
+        with self._connection() as connection:
+            tombstoned = {
+                step.superseded_by
+                for step in plan.supersessions
+                if (guard := self._read_record_guard(connection, step.superseded_by)) is None
+                or self._tombstoned(connection, guard.content_hash, project_id)
+            }
+        dropped = {
+            step.record_id for step in plan.supersessions if step.superseded_by in tombstoned
+        }
+        plan = ConsolidationPlan(
+            events=tuple(e for e in plan.events if e.record_id not in dropped),
+            supersessions=tuple(s for s in plan.supersessions if s.record_id not in dropped),
+            merges=tuple(
+                Merge(m.kept_record_id, kept)
+                for m in plan.merges
+                if (kept := tuple(i for i in m.merged_record_ids if i not in dropped))
+            ),
+            conflicts=plan.conflicts,
+        )
+        return {**self.apply_consolidation_plan(plan), "skipped_tombstoned": len(dropped)}
 
     def list_records(
         self,
