@@ -1133,10 +1133,13 @@ class Bridge(QObject):
         what waits for the person or Resume (``park``: not when it is left
         because it was deleted or archived), and ``opened`` gets back what it
         kept, once proven still its own."""
-        if park and opened.id != self._conversation_store.id:     # re-opening the same one (attach) starts fresh
-            self._park(self._conversation_store.id, self._live_slots())
+        left = self._conversation_store.id
+        if park and opened.id != left:                            # re-opening the same one (attach) starts fresh
+            self._park(left, self._live_slots())
+            if left:                                              # SessionEnd; archive fires from the backend, delete never
+                self._memory_hook("memory_capture_left", left)
         else:
-            self._parked.pop(self._conversation_store.id, None)
+            self._parked.pop(left, None)
         self._conversation_store = opened
         self._finished_unseen.discard(opened.id)                  # R3 (D1/D2): green clears on open
         record = self._run_record if self.openRunning else None
@@ -5592,6 +5595,16 @@ class Bridge(QObject):
         self._save_drafts()                    # DFDRAFT: the last keystrokes too (no-op after confirmQuit's)
         # A turn whose write met a busy file is written now, not lost with the process.
         self._conversation_store.flush()
+        self._memory_hook("memory_capture_shutdown", self._conversation_store.id or "")   # bounded (I12)
+
+    def _memory_hook(self, name: str, conversation_id: str) -> None:
+        """A backend memory-capture trigger; never raises into the window (I12)."""
+        hook = getattr(self.backend, name, None)
+        if callable(hook):
+            try:
+                hook(conversation_id)
+            except Exception:  # noqa: BLE001 - capture never blocks the chat
+                pass
 
     @Slot()
     def waitIdle(self) -> None:

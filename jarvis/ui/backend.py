@@ -14,6 +14,7 @@ names a capability and never interprets destination grammar.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass, replace
 from types import SimpleNamespace
 from typing import Any, Callable
@@ -70,6 +71,11 @@ from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import ConfigError, ConfigStore, Settings
 
 HISTORY_LIMIT = 20
+
+#: The longest quitting waits for a running memory capture (I12: bounded).
+MEMORY_CAPTURE_SHUTDOWN_SECONDS = 3.0
+
+_log = logging.getLogger(__name__)
 
 #: Presentation-only redaction, the backend's own rule, applied once more to
 #: every string the UI shows so no UI formatting path can re-expose a secret.
@@ -153,6 +159,8 @@ class Backend:
         #: The Core store the window's conversations live in, for the database
         #: the configuration names now: ``(path, store)``.
         self._conversations: tuple[Any, SQLiteMemoryStore] | None = None
+        #: The store the memory capture PreCompact hook is installed on.
+        self._watched: SQLiteMemoryStore | None = None
 
     # -- plumbing -------------------------------------------------------------
 
@@ -208,7 +216,50 @@ class Backend:
                 self._conversations = (path, SQLiteMemoryStore(path))
             except Exception:  # noqa: BLE001 - storage boundary
                 return None
-        return self._conversations[1]
+        store = self._conversations[1]
+        if self._watched is not store:  # PreCompact: once per store instance (the window's own, not the app's)
+            try:
+                self._app(loaded.settings).watch_conversations(store)
+                self._watched = store
+            except Exception:  # noqa: BLE001 - capture never blocks the chat (I12); retried next call
+                _log.warning("memory capture: watching the conversation store failed", exc_info=True)
+        return store
+
+    # -- V2.1a M2c: memory capture triggers ----------------------------------
+    #
+    # Scheduling only: Core decides every record and re-checks every gate.
+    # Capture is off for a Global conversation and for one whose "all
+    # projects memory" toggle is on; then these are no-ops. They never raise
+    # into the window (I12): a failure is logged and dropped.
+
+    def _capture_on(self, conversation_id: str) -> bool:
+        store = self.conversations()
+        if store is None or not conversation_id:
+            return False
+        record = store.load_conversation(conversation_id)
+        return (record is not None and record.project_id is not None
+                and not store.global_memory_enabled(conversation_id))
+
+    def memory_capture_left(self, conversation_id: str) -> None:
+        """SessionEnd: the window left ``conversation_id`` (switch, new, archive)."""
+        try:
+            loaded = self.store.load()
+            if loaded.usable and self._capture_on(conversation_id):
+                self._app(loaded.settings).conversation_left(conversation_id)
+        except Exception:  # noqa: BLE001 - capture never blocks the chat (I12)
+            _log.warning("memory capture: session end was not scheduled", exc_info=True)
+
+    def memory_capture_shutdown(self, open_id: str) -> None:
+        """Quit: session-end the open conversation, wait at most
+        ``MEMORY_CAPTURE_SHUTDOWN_SECONDS``, abort what still runs."""
+        try:
+            loaded = self.store.load()
+            if loaded.usable:
+                open_ids = (open_id,) if self._capture_on(open_id) else ()
+                self._app(loaded.settings).shutdown_memory_capture(
+                    open_ids=open_ids, timeout=MEMORY_CAPTURE_SHUTDOWN_SECONDS)
+        except Exception:  # noqa: BLE001 - quitting never waits on capture (I12)
+            _log.warning("memory capture: shutdown failed", exc_info=True)
 
     # -- configuration: the kill switch and the model selection --------------
 
@@ -520,9 +571,12 @@ class Backend:
 
     def conversation_archive(self, conversation_id: str) -> dict:
         """Gate 6D-b: archive (reversible), through the audited explicit-user app path."""
-        return self._call("conversation-archive", lambda s: conversation_archive_result(
+        payload = self._call("conversation-archive", lambda s: conversation_archive_result(
             self._memory(s), s, conversation_id
         ))
+        if payload.get("archived_at"):
+            self.memory_capture_left(conversation_id)
+        return payload
 
     def conversation_unarchive(self, conversation_id: str) -> dict:
         """Gate 6D-b: undo an archive, through the audited explicit-user app path."""

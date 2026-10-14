@@ -251,6 +251,16 @@ class UiTestCase(unittest.TestCase):
     ambient = False
 
     def setUp(self) -> None:
+        # MEMTRIGWIRE: the window fires memory capture now. UI tests get a closed
+        # per-test trigger set (first, so it outlives every bridge's shutdown):
+        # no capture thread on the scripted model, the process-wide one untouched.
+        import jarvis.app
+        from unittest.mock import patch
+        triggers = jarvis.app.MemoryTriggers()
+        triggers.shutdown(None)
+        closed = patch.object(jarvis.app, "MEMORY_TRIGGERS", triggers)
+        closed.start()
+        self.addCleanup(closed.stop)
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(safe_cleanup, self.temp)
         # TUICRASH: every Bridge this test makes - self.bridge() or a direct Bridge(...) - is
@@ -261,7 +271,6 @@ class UiTestCase(unittest.TestCase):
         # GUI thread cannot unregister its running timer ("Timers cannot be stopped from
         # another thread"): the next WM_TIMER goes to freed memory (0xC0000005 in
         # QCoreApplication::notifyInternal2).
-        from unittest.mock import patch
         made: list[Bridge] = []
         construct = Bridge.__init__
 
