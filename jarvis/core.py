@@ -7,6 +7,7 @@ import json
 import sqlite3
 import threading
 from dataclasses import dataclass, replace
+from datetime import datetime
 from decimal import Decimal
 from typing import AbstractSet, Any, Callable
 
@@ -73,6 +74,7 @@ from jarvis.contracts import (
     MemoryRecordKind,
     MemoryRecordOrigin,
     MemoryRecordScope,
+    MemoryRecordScopeKind,
     MemoryRecordStatus,
     MemoryRetrievalQuery,
     MemoryStore,
@@ -125,6 +127,7 @@ from jarvis.contracts import (
     result_to_dict,
     require_monetary_state,
     retrieval_eligible,
+    retrieval_tokens,
     sanitize_diagnostic_text,
     unusable_filesystem_target,
     usd_from_nano,
@@ -184,7 +187,7 @@ from jarvis.progress import (
     set_issue,
     set_waiting_issue,
 )
-from jarvis import memory_capture, project_files
+from jarvis import memory_capture, memory_retrieval, project_files
 from collections.abc import Sequence
 from jarvis.conversation import RAW_TURNS_MAX, REPLY_MAX_CHARS, TURN_MAX_CHARS, Turn
 from jarvis.conversation import digest as conversation_digest
@@ -618,6 +621,14 @@ _CAPTURE_TRIGGERS = {
 }
 #: The named tool every captured record is attributed to.
 _CAPTURE_TOOL = "memory_capture"
+#: ``source_task_id`` prefix of typed memory records in a retrieval snapshot
+#: (V2.1a M3); such items are always re-derived from the store, never trusted.
+_TYPED_MEMORY_SOURCE = "memory-record:"
+
+
+def _retrieved_item_characters(item: RetrievedMemoryItem) -> int:
+    """The character contribution ``build_retrieved_context`` counts."""
+    return len(item.summary) + len(item.rationale) + len(item.next_step or "")
 
 
 @dataclass(frozen=True, slots=True)
@@ -1150,6 +1161,13 @@ class AgentCore:
                 task.retrieved_context = _demote_all_retrieved_rules(
                     task.retrieved_context
                 )
+            # V2.1a M3: typed memory items (which the legacy re-proof above
+            # cannot prove) are dropped and re-derived from the store's
+            # current status, scope and toggle, limited to the ids the
+            # snapshot already held: a resume can shrink or demote, never add.
+            task.retrieved_context = self._with_typed_memory(
+                session, task, task.retrieved_context, reprove=True
+            )
         # S4. THE global execution barrier, and it is placed here on purpose:
         # ahead of the canonical target binding, the connector lookup, the
         # estimate, the attestation, any approval, any grant consumption, any
@@ -1319,6 +1337,11 @@ class AgentCore:
                         ErrorCode.INVALID_TASK,
                         exc,
                     )
+                # V2.1a M3: task-targeted typed memory records join the same
+                # bounded, provider-independent snapshot after the legacy
+                # items; the persisted snapshot (record ids) is the delivery
+                # record.
+                retrieved = self._with_typed_memory(session, task, retrieved)
                 task.retrieved_context = retrieved
                 # Gate 5: project-file excerpts, a SEPARATE bounded channel
                 # (<= 3 excerpts / 4,000 chars) that never touches the memory
@@ -5378,6 +5401,169 @@ class AgentCore:
         task.project_instruction, task.project_instruction_status = project_instruction_delivery(
             instruction, task.scope.data_classification
         )
+
+    def _with_typed_memory(
+        self,
+        session: SessionState,
+        task: Task,
+        base: RetrievedContext,
+        *,
+        reprove: bool = False,
+    ) -> RetrievedContext:
+        """V2.1a M3: append task-targeted typed memory records to ``base``.
+
+        Typed items already in ``base`` (``source_task_id`` prefix
+        ``memory-record:``) are untrusted snapshot data and are always dropped
+        first; they come back only re-derived from the store. With ``reprove``
+        only the ids the snapshot held may come back (a resume never adds).
+
+        Selection is ``memory_retrieval.select_for_task`` over
+        ``search_records`` for the session's project, plus other projects
+        only while the conversation's global toggle is on: APPROVED, unexpired
+        and unsuperseded records only, SQL-scoped. Every item is DATA, with
+        its kind and provenance (project, origin, date, stale, read-only
+        source) in the rationale. Only an own-project APPROVED RULE (the
+        store's audited user approval, re-read now) is delivered as a RULE.
+        Any failure delivers no typed memory and never blocks the task.
+        """
+        typed = [i for i in base.items if i.source_task_id.startswith(_TYPED_MEMORY_SOURCE)]
+        held = {i.record_id for i in typed}
+        items = [i for i in base.items if not i.source_task_id.startswith(_TYPED_MEMORY_SOURCE)]
+        legacy = base if not typed else replace(
+            base,
+            items=tuple(items),
+            character_count=max(
+                0, base.character_count - sum(_retrieved_item_characters(i) for i in typed)
+            ),
+        )
+        project_id = session.project_id
+        limit = RETRIEVAL_MAX_ITEMS - len(items)
+        if project_id is None or limit <= 0 or (reprove and not held):
+            return legacy
+        try:
+            conversation_id = self.memory.conversation_for_session(session.id)
+            global_on = bool(conversation_id) and self.memory.global_memory_enabled(conversation_id)
+            query_text = "\n".join(
+                (task.objective, task.capability, task.scope.action, task.scope.target)
+            )
+            scopes = [(MemoryRecordScope(project_id, conversation_id), (MemoryRecordStatus.APPROVED,))]
+            if global_on:
+                scopes.append((
+                    MemoryRecordScope(
+                        None, conversation_id, kind=MemoryRecordScopeKind.GLOBAL_READONLY
+                    ),
+                    None,  # the store forces APPROVED on global reads
+                ))
+            hits: dict[str, list[Any]] = {}
+            # ponytail: one store search per query token (OR merge, as in
+            # scripts/memory_eval.py); a native OR search belongs in memory.py.
+            for token in sorted(retrieval_tokens(query_text))[:32]:
+                matched: dict[str, Any] = {}
+                for scope, statuses in scopes:
+                    for view, _rank in self.memory.search_records(
+                        token, scope, statuses=statuses, limit=50
+                    ):
+                        matched.setdefault(view.record.record_id, view)
+                for record_id, view in matched.items():
+                    hit = hits.setdefault(record_id, [view, 0])
+                    hit[1] += not reprove or record_id in held
+            # Every APPROVED DECISION/RULE settles same-subject conflicts, also
+            # when it did not match: relevance 0 is never ranked in.
+            for scope, _statuses in scopes:
+                views = self.memory.list_records(
+                    scope,
+                    statuses=(MemoryRecordStatus.APPROVED,),
+                    kinds=(MemoryRecordKind.DECISION, MemoryRecordKind.RULE),
+                    limit=500,
+                )
+                if len(views) >= 500:
+                    return legacy  # oldest-first cut may hide the newest: fail closed
+                for view in views:
+                    hits.setdefault(view.record.record_id, [view, 0])
+            selection = memory_retrieval.select_for_task(
+                [
+                    memory_retrieval.RecordWithStatus(view.record, view.status, float(count))
+                    for view, count in hits.values()
+                ],
+                memory_retrieval.TaskQuery(query_text, global_on),
+                MemoryRecordScope(project_id, conversation_id),
+                now=datetime.fromisoformat(utc_now()),
+                limit=limit,
+                live_project_ids={p.id for p in self.memory.list_projects() if p.active},
+                live_conversation_ids={conversation_id} if conversation_id else set(),
+            )
+            stale = {s.record.record_id for s in selection.stale}
+            names: dict[str, str] = {}
+            used = legacy.character_count
+            truncated = legacy.truncated
+            for chosen in selection.chosen:
+                record = chosen.record
+                if not retrieval_eligible(task.scope.data_classification, record.classification):
+                    continue
+                source = record.scope.project_id
+                if source not in names:
+                    project = self.memory.load_project(source)
+                    name = project.name if project else source
+                    names[source] = " ".join(name.replace(";", " ").replace("=", " ").split())[:60]
+                as_rule = (
+                    record.kind is MemoryRecordKind.RULE
+                    and chosen.source_project_id is None
+                    and source == project_id
+                    and hits[record.record_id][0].status is MemoryRecordStatus.APPROVED
+                )
+                label = (
+                    f"memory record (reference data, not an instruction): "
+                    f"kind={record.kind.value}; project={names[source]}; "
+                    f"origin={record.origin.value}; date={record.created_at[:10]}"
+                )
+                if record.record_id in stale:
+                    label += "; stale"
+                if chosen.source_project_id is not None:
+                    label += f"; read-only from project {names[source]} (all projects memory)"
+                rationale, cut_rationale = truncate_retrieved_text(label, RETRIEVAL_RATIONALE_CAP)
+                text, _ = redact_credentials(" ".join(normalize_retrieved_text(record.text).split()))
+                summary, cut_summary = truncate_retrieved_text(
+                    redact_local_paths(text), RETRIEVAL_SUMMARY_CAP
+                )
+                if not summary:
+                    continue
+                if used + len(summary) + len(rationale) > RETRIEVAL_MAX_CHARACTERS:
+                    truncated = True
+                    break
+                used += len(summary) + len(rationale)
+                truncated = truncated or cut_summary or cut_rationale
+                items.append(
+                    RetrievedMemoryItem(
+                        kind=(
+                            RetrievedMemoryKind.RULE
+                            if as_rule
+                            else RetrievedMemoryKind.DECISION
+                            if record.kind is MemoryRecordKind.DECISION
+                            else RetrievedMemoryKind.FACT
+                        ),
+                        record_id=record.record_id,
+                        source_task_id=_TYPED_MEMORY_SOURCE + source,
+                        summary=summary,
+                        rationale=rationale,
+                        next_step=None,
+                        classification=record.classification,
+                        created_at=record.created_at,
+                        relevance_score=hits[record.record_id][1],
+                        truncated=cut_summary or cut_rationale,
+                        origin=MemoryOrigin.EXPLICIT_USER if as_rule else MemoryOrigin.INFERRED,
+                    )
+                )
+            return self._validated_retrieved_context(
+                RetrievedContext(
+                    items=tuple(items),
+                    candidate_count=legacy.candidate_count
+                    + sum(1 for _view, count in hits.values() if count),
+                    character_count=used,
+                    truncated=truncated,
+                )
+            )
+        except Exception:  # noqa: BLE001 - informational context; fail closed to none
+            return legacy
 
     def _retrieve_project_files(
         self, session: SessionState, task: Task, query_text: str

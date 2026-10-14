@@ -9504,6 +9504,26 @@ class MemoryStore(Protocol):
     #: conversation-linked session only to that conversation's owner.
     def conversation_for_session(self, session_id: str) -> str | None: ...
 
+    #: V2.1a M3: pure reads for task-targeted typed memory delivery.
+    def global_memory_enabled(self, conversation_id: str) -> bool: ...
+
+    def search_records(
+        self,
+        query_text: str,
+        scope: MemoryRecordScope,
+        kinds: Sequence[MemoryRecordKind] | None = None,
+        statuses: Sequence[MemoryRecordStatus] | None = None,
+        limit: int = 20,
+    ) -> list[tuple["MemoryRecordView", float]]: ...
+
+    def list_records(
+        self,
+        scope: MemoryRecordScope,
+        statuses: Sequence[MemoryRecordStatus] | None = None,
+        kinds: Sequence[MemoryRecordKind] | None = None,
+        limit: int = 100,
+    ) -> list["MemoryRecordView"]: ...
+
     def load_conversation(self, conversation_id: str) -> "ConversationRecord | None": ...
 
     #: V2.1 capture: a conversation's turns, and the one V2.1 record write
