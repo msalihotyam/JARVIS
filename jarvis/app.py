@@ -4277,6 +4277,7 @@ class JarvisApp:
             "created_at": record.created_at,
             "expires_at": record.expires_at,
             "supersedes": record.supersedes,
+            "source_conversation_id": record.source_conversation_id,
         }
 
     def _active_project_refusal(self, project_id: Any) -> str | None:

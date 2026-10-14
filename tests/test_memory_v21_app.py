@@ -4,10 +4,12 @@ called (the only "model" is a bare stub object)."""
 
 from __future__ import annotations
 
+import dataclasses
 import unittest
 from unittest import mock
 
 from jarvis.conversation import append_turn
+from jarvis.contracts import MemoryRecordScope
 from jarvis.memory import MemoryRecordApproval
 from tests.helpers import isolated_settings, open_app
 
@@ -87,6 +89,16 @@ class MemoryAppApiTests(unittest.TestCase):
         self.assertFalse(self.remember("Bad kind", kind="opinion")["ok"])
 
     # -- payloads --------------------------------------------------------------
+
+    def test_record_payload_carries_source_conversation_id(self) -> None:
+        self.remember("Deploys run on Fridays")
+        view = self.memory.list_records(MemoryRecordScope(self.project))[0]
+        for source in (None, "c-source"):
+            with self.subTest(source=source):
+                record = dataclasses.replace(view.record, source_conversation_id=source)
+                payload = self.app._record_payload(dataclasses.replace(view, record=record))
+                self.assertIn("source_conversation_id", payload)
+                self.assertEqual(payload["source_conversation_id"], source)
 
     def test_records_payload_filters_and_stays_in_its_project(self) -> None:
         fact = self.remember("Deploys run on Fridays")["record"]["record_id"]
