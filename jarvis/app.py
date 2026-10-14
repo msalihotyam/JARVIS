@@ -112,6 +112,7 @@ from jarvis.contracts import (
     ProjectMemoryItem,
     ProjectRecord,
     ResultVerifier,
+    RetrievedContext,
     RunStatus,
     SessionState,
     SessionSummary,
@@ -3592,6 +3593,15 @@ def _instruction_chars(instruction: str | None) -> int:
     return argv_chars(json_text({PROJECT_INSTRUCTION_KEY: project_instruction_block(instruction)}))
 
 
+#: The understanding call's context key for Core's typed memory (V2.1a M3b).
+CHAT_MEMORY_KEY = "retrieved_memory"
+
+
+def _memory_chars(memory: Mapping[str, Any]) -> int:
+    """What the typed memory block adds to one understanding call's payload."""
+    return argv_chars(json_text(memory)) if memory else 0
+
+
 def text_result(
     permission_mode: PermissionMode,
     status: IntentStatus,
@@ -4072,13 +4082,14 @@ class JarvisApp:
         # iff eligible for this call's own classification. Guidance only.
         intent_scope = ActionScope(action=INTENT_ACTION, destination=DEFAULT_TASK_DESTINATION)
         instruction = self._intent_instruction(owner, intent_scope, usage)
+        memory = self._chat_memory(owner, session, conversation_id, text, intent_scope)
         turn["model"] = model
         if items_response_mode(response_mode) == "separate" and len(items["groups"]) >= 2:
             # Strict isolation: one call per group, merged into one reply.
             return self._answer_groups_separately(
                 text, request_id, mode, previous_text, response_language, conversation,
                 groups, attachments, items, catalog, on_reply_preview, usage, respond, refused,
-                instruction,
+                instruction, memory,
             )
         # A file named again from an earlier turn comes back as data with its
         # provenance - never merged into this turn's groups.
@@ -4097,7 +4108,7 @@ class JarvisApp:
             turn_context["rehydrated_references"] = rehydrated
         plan = assemble_context(conversation, context_profile_of(model), text,
                                 extra_chars=argv_chars(json_text(turn_context)) + argv_chars(json_text(catalog.to_dict()))
-                                + _instruction_chars(instruction))
+                                + _instruction_chars(instruction) + _memory_chars(memory))
         intent_task = Task(
             objective=text,
             capability=INTENT_CAPABILITY,
@@ -4116,6 +4127,7 @@ class JarvisApp:
                 "attachment_files": image_files(groups, attachments),
                 "local_time": catalog.local_time,
                 "catalog": catalog.to_dict(),
+                **memory,
             },
             id=request_id,
             project_instruction=instruction,
@@ -4276,6 +4288,35 @@ class JarvisApp:
         if status:
             usage["project_instruction"] = status
         return text
+
+    def _chat_memory(
+        self, owner: str | None, session: SessionState | None, conversation_id: str | None,
+        text: str, scope: ActionScope,
+    ) -> dict[str, Any]:
+        """V2.1a M3b: the chat turn's typed memory, ``{}`` or
+        ``{"retrieved_memory": block}`` for the understanding call's context.
+
+        Core decides everything (``AgentCore._with_typed_memory``: project
+        scope, the conversation's global toggle, approved records only,
+        provenance labels); the block is the connector's re-validated egress
+        view, labelled untrusted data. The app only names the scope: the
+        owner, and a session only while it belongs to THIS conversation - else
+        no conversation, so no global toggle (fail closed). Global and any
+        failure get nothing."""
+        if owner is None:
+            return {}
+        try:
+            view = SessionState(objective=text, project_id=owner)
+            if session is not None and (
+                conversation_id is None or self.memory.conversation_for_session(session.id) == conversation_id
+            ):
+                view.id = session.id
+            probe = Task(objective=text, capability=INTENT_CAPABILITY, scope=scope)
+            probe.retrieved_context = self.core._with_typed_memory(view, probe, RetrievedContext())
+            block, _ = ClaudeCodeConnector._retrieved_memory(probe)
+        except Exception:  # noqa: BLE001 - informational context; deliver nothing
+            return {}
+        return {} if block is None else {CHAT_MEMORY_KEY: block}
 
     def _conversation_scope(
         self, conversation_id: str, session: SessionState | None
@@ -4946,6 +4987,7 @@ class JarvisApp:
         respond: Callable[..., CommandResult],
         refused: Callable[..., CommandResult],
         instruction: str | None = None,
+        memory: Mapping[str, Any] | None = None,
     ) -> CommandResult:
         """"Reply to each group separately": ONE understanding call PER GROUP.
 
@@ -4964,11 +5006,12 @@ class JarvisApp:
         group, in order.
         """
         model = self.intent_model
+        memory = memory or {}
         owned = {str(group.get("id")): group for group in groups if isinstance(group, Mapping)}
         largest = max((json_text(context_window([g], attachments)) for g in owned.values()), key=len, default="")
         plan = assemble_context(conversation, context_profile_of(model), text,
                                 extra_chars=argv_chars(largest) + argv_chars(json_text(catalog.to_dict()))
-                                + _instruction_chars(instruction))
+                                + _instruction_chars(instruction) + _memory_chars(memory))
         history = context_fields(plan)
         sections: list[dict[str, Any]] = []
         calls: list[dict[str, Any]] = []
@@ -5002,6 +5045,7 @@ class JarvisApp:
                         "attachment_files": image_files([source], attachments),
                         "local_time": catalog.local_time,
                         "catalog": catalog.to_dict(),
+                        **memory,
                     },
                     # The turn's request id for every call: they run one at a time,
                     # and cancel_text reaches whichever call is running.
