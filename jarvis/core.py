@@ -5854,9 +5854,10 @@ class AgentCore:
                             kind=candidate.kind,
                             text=candidate.text,
                             subject_key=candidate.subject_key,
-                            scope=MemoryRecordScope(
-                                project_id=project_id, conversation_id=conversation_id
-                            ),
+                            # Project-wide (the Hafıza page, approve/undo and the
+                            # project's other conversations see it);
+                            # source_conversation_id keeps where it came from.
+                            scope=MemoryRecordScope(project_id=project_id),
                             origin=trigger,
                             actor=MemoryRecordActor.TOOL,
                             tool=_CAPTURE_TOOL,

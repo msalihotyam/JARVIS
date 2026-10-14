@@ -228,6 +228,7 @@ from jarvis.intent import (
 from jarvis.context_usage import context_usage
 from jarvis.conversation import (
     COMPACT_KEEP_LAST,
+    RAW_TURNS_MAX,
     ConversationState,
     PersistedConversation,
     argv_chars,
@@ -3784,6 +3785,13 @@ class MemoryTriggers:
         #: The app each conversation's capture last ran with: shutdown aborts
         #: through the store that run writes to, without reading config.
         self._apps: dict[str, Any] = {}
+        #: The last PreCompact batch Core skipped as too short or reply-only
+        #: (or failed on before any write): those turns are folded, so
+        #: SessionEnd never re-reads them. It rides in front of the next
+        #: PreCompact or SessionEnd batch, up to Core's turn cap (a skipped
+        #: batch is within it). Any other outcome drops it, so no turn is
+        #: offered again after a run that could have written records.
+        self._carry: dict[str, tuple[Any, ...]] = {}
 
     def schedule(self, app: Any, conversation_id: str, trigger: MemoryRecordOrigin,
                  turns: Iterable[Any] | None = None) -> bool:
@@ -3822,6 +3830,29 @@ class MemoryTriggers:
         with self._lock:
             self._captured[conversation_id] = max(self._captured.get(conversation_id, 0), top)
 
+    def _with_carry(self, conversation_id: str, turns: tuple[Any, ...]) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+        """(the carried turns + the new ones, the new ones). A re-offered turn
+        is not new; a carry the new turns do not continue (seqs) is dropped;
+        the oldest carried turns give way to Core's cap, the new ones never."""
+        with self._lock:
+            carry = self._carry.get(conversation_id, ())
+        new = tuple(turn for turn in turns if not carry or turn.seq > carry[-1].seq)
+        if new and carry and new[0].seq != carry[-1].seq + 1:
+            carry = ()
+        room = RAW_TURNS_MAX - len(new)
+        return (carry[-room:] if room > 0 else ()) + new, new
+
+    def _carry_on(self, conversation_id: str, batch: tuple[Any, ...], outcome: Any) -> None:
+        with self._lock:
+            # A provider or run-store failure wrote nothing either: the folded
+            # turns ride on rather than being lost.
+            if getattr(outcome, "outcome", None) in (
+                "skipped:too_short", "skipped:empty", "provider_error", "run_store_error"
+            ):
+                self._carry[conversation_id] = batch
+            else:
+                self._carry.pop(conversation_id, None)
+
     def _run(self, app: Any, conversation_id: str, trigger: MemoryRecordOrigin,
              turns: tuple[Any, ...] | None) -> None:
         if self._stop.stopped:  # halted: not even a resolver's store opens
@@ -3836,20 +3867,26 @@ class MemoryTriggers:
             return
         stop = self._stop
         if trigger is MemoryRecordOrigin.CAPTURE_PRECOMPACT:
-            if turns:
-                outcome = app.core.capture_memory(conversation_id, trigger, model, turns=turns, stop=stop)
-                self._mark(conversation_id, turns, outcome)
+            batch, new = self._with_carry(conversation_id, turns or ())
+            if new:
+                outcome = app.core.capture_memory(conversation_id, trigger, model, turns=batch, stop=stop)
+                self._mark(conversation_id, batch, outcome)
+                self._carry_on(conversation_id, batch, outcome)
             return
         raw = app.memory.load_conversation_state(conversation_id).turns
         with self._lock:
             mark = self._captured.get(conversation_id, 0)
         fresh = tuple(turn for turn in raw if turn.seq > mark)
-        if fresh:
-            if fresh == raw:
+        batch, new = self._with_carry(conversation_id, fresh)
+        if batch:
+            if batch == raw:
                 outcome = app.core.capture_memory(conversation_id, trigger, model, stop=stop)
             else:
-                outcome = app.core.capture_memory(conversation_id, trigger, model, turns=fresh, stop=stop)
-            self._mark(conversation_id, fresh, outcome)
+                outcome = app.core.capture_memory(conversation_id, trigger, model, turns=batch, stop=stop)
+            self._mark(conversation_id, batch, outcome)
+            # Skipped: the raw turns stay raw (the next leave re-reads them);
+            # only the folded ones keep riding.
+            self._carry_on(conversation_id, batch[:len(batch) - len(new)], outcome)
         record = app.memory.load_conversation(conversation_id)
         if record is not None and record.project_id:
             with stop.write():

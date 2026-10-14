@@ -123,10 +123,11 @@ class CaptureCoreTests(unittest.TestCase):
         self.assertEqual((result.outcome, result.approved, result.pending, result.refused), ("ok", 1, 1, 0))
         self.assertEqual(len(result.record_ids), 2)
         self.assertEqual(model.calls[0].project_id, self.alpha)
+        # Project-wide (conversation_id NULL); the source conversation is kept.
         self.assertEqual(self.records(), [
-            ("decision", self.alpha, self.conversation, "capture_session_end", "tool", "memory_capture",
+            ("decision", self.alpha, None, "capture_session_end", "tool", "memory_capture",
              self.conversation, json.dumps([self.turn_ids[0]]), "pending"),
-            ("fact", self.alpha, self.conversation, "capture_session_end", "tool", "memory_capture",
+            ("fact", self.alpha, None, "capture_session_end", "tool", "memory_capture",
              self.conversation, json.dumps([self.turn_ids[1]]), "approved"),
         ])
         trigger, outcome, counts, finished = self.run_row(result.run_id)[0]
