@@ -2342,6 +2342,29 @@ yok</translation>
     </message>
 </context>
 <context>
+    <name>MemoryApprovalCard</name>
+    <message>
+        <source>Source: %1</source>
+        <translation>Kaynak: %1</translation>
+    </message>
+    <message>
+        <source>Replaces: %1</source>
+        <translation>Yerine geçtiği: %1</translation>
+    </message>
+    <message>
+        <source>Replaced by: %1</source>
+        <translation>Yerini alan: %1</translation>
+    </message>
+    <message>
+        <source>Approve</source>
+        <translation>Onayla</translation>
+    </message>
+    <message>
+        <source>Reject</source>
+        <translation>Reddet</translation>
+    </message>
+</context>
+<context>
     <name>MemoryPage</name>
     <message>
         <source>Memory</source>
@@ -2360,12 +2383,32 @@ yok</translation>
         <translation>Yükle</translation>
     </message>
     <message>
+        <source>No source conversation</source>
+        <translation>Kaynak sohbet yok</translation>
+    </message>
+    <message>
+        <source>A conversation in this project</source>
+        <translation>Bu projedeki bir sohbet</translation>
+    </message>
+    <message>
         <source>Project memory is explicit reference data written only by you. It is shown as data: nothing here is an instruction to JARVIS.</source>
         <translation>Proje hafızası yalnızca sizin yazdığınız açık başvuru verisidir. Veri olarak gösterilir: buradaki hiçbir şey JARVIS için bir talimat değildir.</translation>
     </message>
     <message>
         <source>PROJECT</source>
         <translation>PROJE</translation>
+    </message>
+    <message>
+        <source>AWAITING YOUR APPROVAL</source>
+        <translation>ONAYINIZI BEKLEYENLER</translation>
+    </message>
+    <message>
+        <source>No decision, rule or preference is waiting for your approval.</source>
+        <translation>Onayınızı bekleyen karar, kural veya tercih yok.</translation>
+    </message>
+    <message>
+        <source>REPLACED</source>
+        <translation>DEĞİŞTİRİLENLER</translation>
     </message>
     <message>
         <source>No project yet, so there is no project memory.</source>
@@ -5624,6 +5667,30 @@ DOĞRULANMADI</translation>
     <message>
         <source>Thread</source>
         <translation>Konu</translation>
+    </message>
+    <message>
+        <source>Lesson</source>
+        <translation>Ders</translation>
+    </message>
+    <message>
+        <source>Preference</source>
+        <translation>Tercih</translation>
+    </message>
+    <message>
+        <source>Approved</source>
+        <translation>Onaylandı</translation>
+    </message>
+    <message>
+        <source>Rejected</source>
+        <translation>Reddedildi</translation>
+    </message>
+    <message>
+        <source>Taken back</source>
+        <translation>Geri alındı</translation>
+    </message>
+    <message>
+        <source>Expired</source>
+        <translation>Süresi doldu</translation>
     </message>
     <message>
         <source>Pending</source>

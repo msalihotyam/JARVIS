@@ -12,9 +12,35 @@ SecondaryPage {
     property bool includeInactive: false
     headerRight: [
         ActionButton { label: page.includeInactive ? qsTr("Active only") : qsTr("Include superseded / retired"); onClicked: { page.includeInactive = !page.includeInactive; bridge.refreshMemory(page.project, page.includeInactive) } },
-        ActionButton { label: qsTr("Load"); primary: true; onClicked: bridge.refreshMemory(page.project, page.includeInactive) }
+        ActionButton { label: qsTr("Load"); primary: true; onClicked: { bridge.refreshMemory(page.project, page.includeInactive); page.loadRecords() } }
     ]
-    Component.onCompleted: bridge.refreshMemory(page.project, page.includeInactive)
+    Component.onCompleted: { bridge.refreshMemory(page.project, page.includeInactive); page.loadRecords() }
+
+    // V2.1a M4: the typed records of the shown project (bridge.memoryRecords). Pending
+    // Decisions/Rules/Preferences wait for the user's Approve / Reject; Core decides the move.
+    property var records: []
+    readonly property string scope: {
+        if (page.project !== "") return page.project
+        var active = bridge.projectRecords.filter(function(p) { return p.active })
+        return active.length ? active[0].id : ""
+    }
+    readonly property var pending: records.filter(function(r) { return r.status === "pending" && ["decision", "rule", "preference"].indexOf(r.kind) >= 0 })
+    readonly property var replaced: records.filter(function(r) { return r.status === "superseded" })
+    onScopeChanged: loadRecords()
+    function loadRecords() { if (page.scope !== "") bridge.memoryRecords(page.scope, {}) }
+    function textOf(id) { var r = page.records.find(function(x) { return x.record_id === id }); return r ? r.text : "" }
+    function newerOf(id) { var r = page.records.find(function(x) { return x.supersedes === id }); return r ? r.text : "" }
+    function sourceOf(record) {
+        var id = record.source_conversation_id || record.conversation_id || ""
+        if (id === "") return qsTr("No source conversation")
+        var c = bridge.conversations.find(function(x) { return x.id === id })
+        return c && c.title ? c.title : qsTr("A conversation in this project")
+    }
+    Connections {
+        target: bridge
+        function onMemoryRecordsDone(answer) { if (answer.ok && answer.project_id === page.scope) page.records = answer.records || [] }
+        function onMemoryRecordActionDone(answer) { if (answer.project_id === page.scope) page.loadRecords() }
+    }
 
     Column {
         anchors.fill: parent
@@ -29,6 +55,27 @@ SecondaryPage {
                 ActionButton { objectName: "memoryProject"; label: modelData.name; primary: modelData.id === page.project || (page.project === "" && index === 0); onClicked: { page.project = modelData.id; bridge.refreshMemory(modelData.id, page.includeInactive) } }
             }
         }
+        Column { objectName: "memoryPending"; width: parent.width; spacing: 8; visible: page.scope !== ""
+            Text { text: qsTr("AWAITING YOUR APPROVAL"); color: Theme.textLabel; font: Theme.pageSection }
+            Text { objectName: "memoryPendingEmpty"; visible: page.pending.length === 0; width: parent.width; wrapMode: Text.Wrap
+                   text: qsTr("No decision, rule or preference is waiting for your approval."); color: Theme.textMuted; font: Theme.pageMeta }
+            Repeater {
+                model: page.pending
+                MemoryApprovalCard { objectName: "memoryApprovalCard"; width: parent.width; record: modelData
+                    source: page.sourceOf(modelData); replaces: modelData.supersedes ? page.textOf(modelData.supersedes) : ""
+                    onApprove: bridge.approveMemoryRecord(page.scope, modelData.record_id)
+                    onReject: bridge.rejectMemoryRecord(page.scope, modelData.record_id) }
+            }
+        }
+        // Replaced records stay visible with their chain (I8: nothing is deleted).
+        Column { objectName: "memoryReplaced"; width: parent.width; spacing: 8; visible: page.replaced.length > 0
+            Text { text: qsTr("REPLACED"); color: Theme.textLabel; font: Theme.pageSection }
+            Repeater {
+                model: page.replaced
+                MemoryApprovalCard { objectName: "memoryChain"; width: parent.width; record: modelData
+                    source: page.sourceOf(modelData); replacedBy: page.newerOf(modelData.record_id) }
+            }
+        }
         // K6: the honest empty states - no project to hold memory, or a project with none yet.
         PageEmpty { objectName: "memoryEmpty"; width: parent.width; visible: bridge.memoryItems.length === 0
                     title: bridge.projects.length === 0 ? qsTr("No project yet, so there is no project memory.") : qsTr("No memory records to show for this project.")
@@ -38,7 +85,7 @@ SecondaryPage {
                     action: bridge.projects.length === 0 ? qsTr("Open Projects") : ""
                     onActed: bridge.setPage("projects") }
         ListView {
-            width: parent.width; height: parent.height - 104; clip: true; spacing: 8; visible: count > 0
+            width: parent.width; height: Math.max(0, parent.height - y); clip: true; spacing: 8; visible: count > 0
             model: bridge.memoryItems
             ScrollBar.vertical: ScrollBar {}
             delegate: Rectangle {

@@ -55,6 +55,23 @@ CODE_WORDS = {
         "rule": QT_TRANSLATE_NOOP("Wording", "Rule"),
         "thread": QT_TRANSLATE_NOOP("Wording", "Thread"),
     },
+    # V2.1a M4: a typed record's kind (contracts.MemoryRecordKind).
+    "memory_record_kind": {
+        "fact": QT_TRANSLATE_NOOP("Wording", "Fact"),
+        "decision": QT_TRANSLATE_NOOP("Wording", "Decision"),
+        "rule": QT_TRANSLATE_NOOP("Wording", "Rule"),
+        "lesson": QT_TRANSLATE_NOOP("Wording", "Lesson"),
+        "preference": QT_TRANSLATE_NOOP("Wording", "Preference"),
+    },
+    # V2.1a M4: a typed record's current status (contracts.MemoryRecordStatus).
+    "memory_record_status": {
+        "pending": QT_TRANSLATE_NOOP("Wording", "Awaiting your approval"),
+        "approved": QT_TRANSLATE_NOOP("Wording", "Approved"),
+        "rejected": QT_TRANSLATE_NOOP("Wording", "Rejected"),
+        "retracted": QT_TRANSLATE_NOOP("Wording", "Taken back"),
+        "superseded": QT_TRANSLATE_NOOP("Wording", "Replaced by a newer record"),
+        "expired": QT_TRANSLATE_NOOP("Wording", "Expired"),
+    },
     # K6: the pages' remaining codes (TaskStatus, DataClassification, MemoryLifecycle, MemoryOrigin).
     "task_status": {
         "pending": QT_TRANSLATE_NOOP("Wording", "Pending"),
