@@ -72,6 +72,7 @@ from jarvis.contracts import (
     LocalReadSnapshot,
     LocalWriteRecord,
     LoopStage,
+    MemoryLifecycle,
     MemoryOrigin,
     MemoryRecord,
     MemoryRecordActor,
@@ -139,6 +140,7 @@ from jarvis.contracts import (
     unusable_filesystem_target,
     usd_from_nano,
     validate_cost_estimate,
+    validate_project_id,
     validated_measured_cost,
     validated_metered_maximum,
 )
@@ -198,6 +200,7 @@ from jarvis import memory_capture, memory_retrieval, project_files
 from collections.abc import Mapping, Sequence
 from jarvis.conversation import RAW_TURNS_MAX, REPLY_MAX_CHARS, TURN_MAX_CHARS, Turn
 from jarvis.conversation import digest as conversation_digest
+from jarvis.memory_doctor import LEGACY_M1_KIND_MAP
 from jarvis.memory_filter import classify_candidate_text
 from jarvis.memory_guard import (
     REFUSE,
@@ -727,6 +730,161 @@ class MemoryCaptureOutcome:
             "failed": self.failed,
             "reasons": dict(Counter(self.reasons)),
         }
+
+
+#: The tool name a migrated legacy record is written under.
+_MIGRATE_TOOL = "memory_migrate"
+
+
+@dataclass(frozen=True, slots=True)
+class LegacyMigrationReport:
+    """What one ``migrate_legacy_memory`` call did (dry-run: would do).
+
+    ``outcome`` is ``ok`` or the fail-closed reason (``invalid_project``,
+    ``store_error``, ``backup_failed``); nothing else wrote anything.
+    ``skip_reasons`` pairs a legacy id with a fixed category, never text.
+    """
+
+    outcome: str
+    dry_run: bool
+    backup_path: str | None = None
+    migrated: int = 0
+    already_migrated: int = 0
+    skipped: int = 0
+    failed: int = 0
+    record_ids: tuple[str, ...] = ()
+    skip_reasons: tuple[tuple[str, str], ...] = ()
+
+    def counts(self) -> dict[str, Any]:
+        return {
+            "migrated": self.migrated,
+            "already_migrated": self.already_migrated,
+            "skipped": self.skipped,
+            "failed": self.failed,
+            "reasons": dict(Counter(reason for _, reason in self.skip_reasons)),
+        }
+
+
+def _legacy_skip_reason(item: Any) -> str | None:
+    """Why one M1 item is not migrated, or None. The never-store filter runs
+    first (I5); an error in it is a refusal."""
+    if item is None:
+        return "corrupt"
+    try:
+        verdict = classify_candidate_text(item.text)
+        allowed = verdict.allowed is True
+    except Exception:  # noqa: BLE001 - fail-closed (I5)
+        return "filtered:filter_error"
+    if not allowed:
+        return f"filtered:{verdict.category or 'filter_error'}"
+    if item.lifecycle is not MemoryLifecycle.ACTIVE:
+        return "inactive"  # superseded/retired history is not resurrected
+    if item.kind.value not in LEGACY_M1_KIND_MAP:
+        return "unmapped_kind"
+    if item.classification is DataClassification.SECRET:
+        return "secret"
+    return None
+
+
+def migrate_legacy_memory(
+    memory: Any, project_id: str | None = None, *, dry_run: bool = False
+) -> LegacyMigrationReport:
+    """One-time, idempotent migration of M1 ``project_memory_items`` (Q4).
+
+    A whole-DB backup comes first; if it fails nothing is written. Each
+    item not yet in the ledger is filtered (I5), then guarded with legacy
+    provenance and legacy taint (I13, I14): legacy is never clean, so every
+    migrated record is PENDING and nothing is approved here. A skip is
+    ledgered with its reason, a migration with its new record id, so a
+    re-run is a no-op; a failed write is not ledgered and retries next run.
+    The M1 rows are only read. ``dry_run`` reads only: no backup, no write.
+    """
+    if project_id is not None:
+        try:
+            validate_project_id(project_id)
+        except (TypeError, ValueError):
+            return LegacyMigrationReport("invalid_project", dry_run)
+    try:
+        candidates = memory.legacy_migration_candidates(project_id)
+        active = {project.id for project in memory.list_projects() if project.active}
+    except Exception:  # noqa: BLE001 - no readable store, no migration
+        return LegacyMigrationReport("store_error", dry_run)
+    todo = [(legacy_id, item) for legacy_id, item, ledgered in candidates if not ledgered]
+    already = len(candidates) - len(todo)
+    backup = None
+    if todo and not dry_run:
+        try:
+            backup = str(memory.backup_before_migration())
+        except Exception:  # noqa: BLE001 - fail-closed: no backup, no migration
+            return LegacyMigrationReport("backup_failed", dry_run, already_migrated=already)
+    migrated = failed = 0
+    record_ids: list[str] = []
+    skips: list[tuple[str, str]] = []
+    for legacy_id, item in todo:
+        reason = _legacy_skip_reason(item)
+        if reason is None and item.project_id not in active:
+            reason = "inactive_project"  # the store refuses it on every run
+        if reason is None:
+            kind = LEGACY_M1_KIND_MAP[item.kind.value]
+            hits = instruction_likeness(item.text)
+            admission = decide_admission(
+                kind, Provenance.LEGACY, SessionTaint.LEGACY, hits,
+                MemoryRecordScopeKind.PROJECT, item.classification,
+            )
+            if admission.status == REFUSE:
+                reason = admission.reason
+        if reason is None and dry_run:
+            migrated += 1
+            continue
+        if reason is None:
+            try:
+                # The store re-decides kind and status from the guard.
+                view = memory.insert_migrated_legacy_record(
+                    legacy_id,
+                    MemoryRecord(
+                        kind=kind,
+                        text=item.text,
+                        subject_key=f"legacy-{item.id}",
+                        scope=MemoryRecordScope(item.project_id),
+                        origin=MemoryRecordOrigin.LEGACY_M1,
+                        actor=MemoryRecordActor.TOOL,
+                        tool=_MIGRATE_TOOL,
+                        confidence=0.5,
+                        classification=item.classification,
+                    ),
+                    RecordGuard(
+                        provenance=Provenance.LEGACY,
+                        session_taint=SessionTaint.LEGACY,
+                        instruction_like=hits,
+                        proposed_kind=kind,
+                        content_hash=content_hash(item.text),
+                    ),
+                )
+            except ValueError as exc:
+                # MemoryRecordRefused (filter, guard, tombstone) is final and
+                # ledgered; any other refusal retries on the next run.
+                reason = getattr(exc, "category", None)
+                if reason is None:
+                    failed += 1
+                    continue
+            except Exception:  # noqa: BLE001 - one bad write never stops the run
+                failed += 1
+                continue
+            else:
+                record_ids.append(view.record.record_id)
+                migrated += 1
+                continue
+        if not dry_run:
+            try:
+                memory.record_legacy_migration_skip(legacy_id, reason)
+            except Exception:  # noqa: BLE001 - not ledgered: retried next run
+                failed += 1
+                continue
+        skips.append((legacy_id, reason))
+    return LegacyMigrationReport(
+        "ok", dry_run, backup, migrated, already, len(skips), failed,
+        tuple(record_ids), tuple(skips),
+    )
 
 
 def _validated_capture_candidate(
@@ -5438,6 +5596,12 @@ class AgentCore:
                 "WHERE conversation_id = ? AND finished_at IS NULL",
                 (utc_now(), conversation_id),
             ).rowcount
+
+    def migrate_legacy_memory(
+        self, project_id: str | None = None, *, dry_run: bool = False
+    ) -> LegacyMigrationReport:
+        """One-time M1 -> V2.1 memory migration; see ``migrate_legacy_memory``."""
+        return migrate_legacy_memory(self.memory, project_id, dry_run=dry_run)
 
     def _run_capture(
         self,

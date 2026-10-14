@@ -863,6 +863,13 @@ CREATE TABLE IF NOT EXISTS memory_owned_artifacts (
     record_id TEXT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS memory_legacy_migration (
+    legacy_id TEXT NOT NULL PRIMARY KEY,
+    record_id TEXT NULL,
+    skip_reason TEXT NULL,
+    migrated_at TEXT NOT NULL,
+    CHECK ((record_id IS NULL) != (skip_reason IS NULL))
+);
 CREATE TABLE IF NOT EXISTS skills (
     skill_id TEXT NOT NULL,
     version INTEGER NOT NULL CHECK (version >= 1),
@@ -921,7 +928,9 @@ CREATE TABLE IF NOT EXISTS skill_experiences (
 # and nothing here offers an UPDATE or DELETE of them, except the one hard
 # purge (I16, ``purge_records``). memory_purge_audit keeps only purge_id,
 # content hash and time; memory_owned_artifacts lists files that hold record
-# content (record_id NULL = a whole-DB backup).
+# content (record_id NULL = a whole-DB backup). memory_legacy_migration is
+# the insert-only ledger of the one-time M1 migration: one row per legacy id,
+# its new record_id or a fixed skip reason (never text).
 
 # V2.2 skills (above, jarvis/skill_store.py): every skill* table is insert- or
 # append-only - a skill's state is its skill_events rows in event_id order, a
@@ -1022,6 +1031,7 @@ MEMORY_V21_SCHEMA_OBJECTS = frozenset(
         "idx_memory_tombstones_hash",
         "memory_purge_audit",
         "memory_owned_artifacts",
+        "memory_legacy_migration",
     }
     | (
         {MEMORY_RECORDS_FTS}
@@ -1368,6 +1378,17 @@ class SQLiteMemoryStore:
         if "sessions" not in tables or "conversations" in tables or target.exists():
             return
         temporary = target.with_name(f"{target.name}.{os.getpid()}.{uuid4().hex[:8]}.tmp")
+        self._verified_backup(
+            temporary, "The pre-V2 database backup did not verify; nothing was changed."
+        )
+        try:
+            os.rename(temporary, target)
+        except FileExistsError:
+            temporary.unlink(missing_ok=True)
+
+    def _verified_backup(self, temporary: Path, failure: str) -> None:
+        """SQLite's online backup API into ``temporary``, verified with
+        ``integrity_check``; any failure removes the copy and raises."""
         source = self._connect()
         try:
             copy = sqlite3.connect(temporary)
@@ -1384,11 +1405,36 @@ class SQLiteMemoryStore:
             source.close()
         if verdict is None or verdict[0] != "ok":
             temporary.unlink(missing_ok=True)
-            raise RuntimeError("The pre-V2 database backup did not verify; nothing was changed.")
+            raise RuntimeError(failure)
+
+    def backup_before_migration(self) -> Path:
+        """A verified whole-DB copy next to the database (the settings data
+        dir), registered in memory_owned_artifacts with record_id NULL so a
+        purge knows it still holds content. Raises on any failure: the
+        legacy migration then writes nothing (fail-closed)."""
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S")
+        database = self.database_path.absolute()
+        target = database.with_name(
+            f"{database.stem}.pre-migrate-{stamp}-{uuid4().hex[:8]}{database.suffix}"
+        )
+        temporary = target.with_name(f"{target.name}.tmp")
+        self._verified_backup(temporary, "The migration backup did not verify; nothing was migrated.")
         try:
             os.rename(temporary, target)
-        except FileExistsError:
-            temporary.unlink(missing_ok=True)
+        except OSError:
+            temporary.unlink(missing_ok=True)  # an unregistered copy would escape purge
+            raise
+        try:
+            with self._connection(write=True) as connection:
+                connection.execute(
+                    "INSERT INTO memory_owned_artifacts (path, kind, record_id, created_at) "
+                    "VALUES (?, 'backup', NULL, ?)",
+                    (str(target), utc_now()),
+                )
+        except Exception:
+            target.unlink(missing_ok=True)  # an unregistered copy would escape purge
+            raise
+        return target
 
     def _initialize(self) -> None:
         wal_connection = self._connect()
@@ -6852,10 +6898,83 @@ class SQLiteMemoryStore:
         )
         return self._persist_record(record)
 
-    def _persist_record(
-        self, record: MemoryRecord, guard: RecordGuard | None = None
+    def legacy_migration_candidates(
+        self, project_id: str | None = None
+    ) -> list[tuple[str, ProjectMemoryItem | None, bool]]:
+        """Read-only: every M1 item of one project (or all) in created_at, id
+        order, as (legacy id, item or None when corrupt, already ledgered)."""
+        where, args = ("", ())
+        if project_id is not None:
+            where, args = " WHERE i.project_id = ?", (validate_project_id(project_id),)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT i.id, i.project_id, i.kind, i.text, i.classification, i.origin, "
+                "i.origin_detail, i.active, i.superseded_by, i.created_at, i.updated_at, "
+                "l.legacy_id IS NOT NULL AS ledgered FROM project_memory_items i "
+                "LEFT JOIN memory_legacy_migration l ON l.legacy_id = i.id"
+                f"{where} ORDER BY i.created_at, i.id",  # nosec B608 - constant fragment
+                args,
+            ).fetchall()
+        return [
+            (row["id"], self._memory_item_from_row(row), bool(row["ledgered"]))
+            for row in rows
+        ]
+
+    def insert_migrated_legacy_record(
+        self, legacy_id: str, record: MemoryRecord, guard: RecordGuard
     ) -> MemoryRecordView:
-        """The one INSERT-only record path; filter and hygiene re-run here."""
+        """Migration only (Core's ``migrate_legacy_memory``): one M1 item as a
+        new LEGACY_M1 record written by a tool, through the legacy guard, and
+        its ledger row - one transaction. Legacy taint is never clean, so the
+        store keeps it PENDING (I13); the M1 row itself is never touched."""
+        if type(legacy_id) is not str or not legacy_id:
+            raise ValueError("legacy_id must be a non-empty string")
+        if (
+            type(record) is not MemoryRecord
+            or record.origin is not MemoryRecordOrigin.LEGACY_M1
+            or record.actor is not MemoryRecordActor.TOOL
+        ):
+            raise ValueError("a migrated record is a LEGACY_M1 record written by a tool")
+        if (
+            type(guard) is not RecordGuard
+            or guard.provenance is not Provenance.LEGACY
+            or guard.session_taint is not SessionTaint.LEGACY
+        ):
+            raise ValueError("a migrated record needs the legacy guard")
+        return self._persist_record(record, guard, legacy_id)
+
+    def record_legacy_migration_skip(self, legacy_id: str, reason: str) -> None:
+        """Ledger one M1 item that is not migrated, with a fixed reason
+        category (never its text). A second row for the same id is refused."""
+        if type(legacy_id) is not str or not legacy_id:
+            raise ValueError("legacy_id must be a non-empty string")
+        if type(reason) is not str or not re.fullmatch(r"[a-z0-9_:]{1,64}", reason):
+            raise ValueError("skip reason must be a fixed category")
+        with self._connection(write=True) as connection:
+            if connection.execute(
+                "SELECT 1 FROM project_memory_items WHERE id = ?", (legacy_id,)
+            ).fetchone() is None:
+                raise ValueError("unknown legacy item")
+            try:
+                connection.execute(
+                    "INSERT INTO memory_legacy_migration (legacy_id, record_id, "
+                    "skip_reason, migrated_at) VALUES (?, NULL, ?, ?)",
+                    (legacy_id, reason, utc_now()),
+                )
+            except sqlite3.IntegrityError as exc:
+                raise ValueError(f"legacy item already migrated: {legacy_id}") from exc
+
+    def _persist_record(
+        self,
+        record: MemoryRecord,
+        guard: RecordGuard | None = None,
+        legacy_id: str | None = None,
+    ) -> MemoryRecordView:
+        """The one INSERT-only record path; filter and hygiene re-run here.
+
+        ``legacy_id`` (migration only) writes the ledger row in the same
+        transaction: a legacy id already in the ledger fails the whole insert.
+        """
         if type(record) is not MemoryRecord:
             raise ValueError("record must be a MemoryRecord")
         verdict = classify_candidate_text(record.text)
@@ -7002,6 +7121,20 @@ class SQLiteMemoryStore:
                     "content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (stored.record_id, *guard_row, utc_now()),
                 )
+            if legacy_id is not None:
+                legacy = connection.execute(
+                    "SELECT project_id FROM project_memory_items WHERE id = ?", (legacy_id,)
+                ).fetchone()
+                if legacy is None or legacy["project_id"] != project_id:
+                    raise ValueError("legacy item is unknown or in another project")
+                try:
+                    connection.execute(
+                        "INSERT INTO memory_legacy_migration (legacy_id, record_id, "
+                        "skip_reason, migrated_at) VALUES (?, ?, NULL, ?)",
+                        (legacy_id, stored.record_id, utc_now()),
+                    )
+                except sqlite3.IntegrityError as exc:
+                    raise ValueError(f"legacy item already migrated: {legacy_id}") from exc
             # Same transaction: a refused or failed insert leaves no index row.
             if memory_records_fts_available(connection):
                 connection.execute(
@@ -7329,10 +7462,12 @@ class SQLiteMemoryStore:
             conversations = connection.execute(
                 f"SELECT id FROM conversations WHERE {self._NOT_DELETED}"  # nosec B608 - constant fragment
             ).fetchall()
+            # A ledgered item (migrated, or skipped with a reason) is mapped:
+            # the LEGACY_M1_UNMAPPED exit gate counts only the rest.
             legacy = connection.execute(
-                "SELECT id, project_id, kind FROM project_memory_items "
-                "WHERE project_id = ? ORDER BY id" if scoped
-                else "SELECT id, project_id, kind FROM project_memory_items ORDER BY id",
+                "SELECT id, project_id, kind FROM project_memory_items "  # nosec B608 - constant fragments
+                "WHERE id NOT IN (SELECT legacy_id FROM memory_legacy_migration)"
+                + (" AND project_id = ?" if scoped else "") + " ORDER BY id",
                 args,
             ).fetchall()
             fts_ids = None

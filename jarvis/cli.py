@@ -59,6 +59,7 @@ from jarvis.contracts import (
     PermissionMode,
     ProjectMemoryKind,
 )
+from jarvis.core import migrate_legacy_memory
 from jarvis.gmail import GmailExecutionUnavailable
 from jarvis.gmail_cli import gmail_controlled_login
 from jarvis.memory import SQLiteMemoryStore
@@ -438,6 +439,12 @@ def _build_parser() -> _ArgumentParser:
                                help="Re-create the memory search index.")
     memory_doctor.add_argument("--confirm", metavar="FINDING",
                                help="Repeat the finding id to confirm --repair.")
+    memory_migrate = memory_actions.add_parser(
+        "migrate", help="One-time, idempotent move of legacy memory items into PENDING records."
+    )
+    memory_migrate.add_argument("--project", help="One project; omitted = every project.")
+    memory_migrate.add_argument("--dry-run", action="store_true",
+                                help="Only count what would happen; no backup, no write.")
 
     # Sequential task chain (M11 S2): local-only, like ``project`` and
     # ``memory``. Declaring a chain performs no action, so these commands
@@ -580,11 +587,25 @@ def _dispatch_memory_command(
         if args.json or args.repair is not None or args.rebuild_fts or result.exit_code != EXIT_OK:
             return result
         return _DoctorText(result.payload, result.exit_code)
+    if getattr(args, "memory_action", None) == "migrate":
+        report = migrate_legacy_memory(memory, args.project, dry_run=args.dry_run)
+        if report.outcome != "ok":
+            return failure_result(
+                "memory-migrate", settings.permission_mode, ErrorCode.INVALID_TASK,
+                f"memory migrate refused: {report.outcome}; nothing was migrated.",
+                EXIT_INVALID_INPUT,
+            )
+        return CommandResult({
+            "command": "memory-migrate",
+            "dry_run": report.dry_run,
+            "backup_path": report.backup_path,
+            "counts": report.counts(),
+        }, EXIT_OK)
     return failure_result(
         "memory",
         settings.permission_mode,
         ErrorCode.INVALID_TASK,
-        "'memory' requires the 'add', 'list', 'retire' or 'doctor' sub-command.",
+        "'memory' requires the 'add', 'list', 'retire', 'doctor' or 'migrate' sub-command.",
         EXIT_INVALID_INPUT,
     )
 
