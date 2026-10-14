@@ -2,8 +2,9 @@
 
 Loads the fixture into a fresh SQLite store in a temp directory (never
 data\\jarvis.db), runs every query through ``SQLiteMemoryStore.search_records``
-with the query's project scope and prints recall@5, MRR and the cross-project
-leak count per mode:
+with the query's project scope and prints recall@5, recall@10, MRR and the
+cross-project leak count per mode (an update query's hit counts only above
+its ``stale`` records):
 
 - fts / like: the store as shipped (all tokens ANDed), FTS5 or LIKE fallback;
 - fts_or / like_or: one search per query token, merged by matched-token count
@@ -12,10 +13,12 @@ leak count per mode:
 
 --extract scores recorded extraction model outputs (gold set) offline through
 memory_capture.parse_candidates: precision/recall per kind, false_fact and
-instruction_leak counts.  embeddings_gate() encodes the Q3 adoption rule.
+instruction_leak counts.  embeddings_gate() encodes the Q3 adoption rule;
+--gate BASELINE CANDIDATE feeds it two retrieval modes via gate_input().
 
 No network, no embeddings, stdlib only.  Usage:
     python scripts/memory_eval.py [--fixture PATH] [--json]
+    python scripts/memory_eval.py --gate BASELINE_MODE CANDIDATE_MODE
     python scripts/memory_eval.py --extract [--gold PATH] [--json]
 """
 
@@ -27,6 +30,7 @@ import re
 import sys
 import tempfile
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 
@@ -48,6 +52,10 @@ from jarvis.memory import SQLiteMemoryStore  # noqa: E402
 DEFAULT_FIXTURE = ROOT / "tests" / "fixtures" / "memory_eval_v21.json"
 DEFAULT_GOLD = ROOT / "tests" / "fixtures" / "memory_extract_gold_v21.json"
 K = 5
+K10 = 10
+# Fixed insertion clock: fixture order is age order (update pairs list the old
+# record first) and created_at ties cannot fall back to random record ids.
+_CLOCK = datetime(2026, 1, 1, tzinfo=timezone.utc)
 # Q3 (build/v21/SEC_PLAN.md): Recall@10 deltas in percentage points.
 GATE_OVERALL_GAIN = 5.0
 GATE_SUBSET_GAIN = 10.0
@@ -57,7 +65,7 @@ GATE_MAX_LOSS = 2.0
 def _load_store(store: SQLiteMemoryStore, fixture: dict) -> tuple[dict, dict]:
     projects = {label: store.create_project(label).id for label in fixture["projects"]}
     labels = {}
-    for item in fixture["records"]:
+    for index, item in enumerate(fixture["records"]):
         record = MemoryRecord(
             kind=MemoryRecordKind[item["kind"].upper()],
             text=item["text"],
@@ -67,15 +75,16 @@ def _load_store(store: SQLiteMemoryStore, fixture: dict) -> tuple[dict, dict]:
             actor=MemoryRecordActor.MODEL,
             confidence=0.8,
             classification=DataClassification.INTERNAL,
+            created_at=(_CLOCK + timedelta(seconds=index)).isoformat(),
         )
         labels[store.insert_record(record).record.record_id] = item["id"]
     return projects, labels
 
 
 def _search(store, text, scope, strategy, labels):
-    """Return [(record, rank)] best first, at most K; ties break by fixture label."""
+    """Return [(record, rank)] best first, at most K10; ties break by fixture label."""
     if strategy == "and":
-        return [(view.record, rank) for view, rank in store.search_records(text, scope, limit=K)]
+        return [(view.record, rank) for view, rank in store.search_records(text, scope, limit=K10)]
     # ponytail: OR merge in Python over the public API; a real OR mode belongs in memory.py if adopted.
     hits: dict[str, list] = {}
     for token in dict.fromkeys(re.findall(r"[^\W_]+", text.casefold())):
@@ -84,7 +93,7 @@ def _search(store, text, scope, strategy, labels):
             entry[1] += 1
             entry[2] += rank
     ordered = sorted(hits.values(), key=lambda e: (-e[1], e[2], labels.get(e[0].record_id, "?")))
-    return [(record, matched) for record, matched, _ in ordered[:K]]
+    return [(record, matched) for record, matched, _ in ordered[:K10]]
 
 
 def _run_mode(store, fixture, projects, labels, strategy) -> dict:
@@ -96,23 +105,34 @@ def _run_mode(store, fixture, projects, labels, strategy) -> dict:
         leaked = [r for r, _ in results if r.scope.project_id != project_id]
         leaks += len(leaked)
         got = [labels.get(r.record_id, "?") for r, _ in results]
+        stale = set(query.get("stale", ()))
+        # Only hits ranked above the first stale (superseded) record count.
+        ranked = got[:next((i for i, label in enumerate(got) if label in stale), len(got))]
         expected = set(query["expected"])
-        recall = len(expected & set(got)) / len(expected)
-        rr = next((1 / (i + 1) for i, label in enumerate(got) if label in expected), 0.0)
+        recall = len(expected & set(ranked[:K])) / len(expected)
+        rr = next((1 / (i + 1) for i, label in enumerate(ranked[:K]) if label in expected), 0.0)
         per_query.append({
             "id": query["id"], "type": query["type"], "lang": query["lang"],
-            "got": got, "recall": recall, "rr": rr, "leaks": len(leaked),
+            "got": got, "recall": recall,
+            "recall_at_10": len(expected & set(ranked)) / len(expected),
+            "rr": rr, "leaks": len(leaked),
         })
     n = len(per_query)
-    by_type: dict[str, list] = {}
-    for q in per_query:
-        by_type.setdefault(q["type"], []).append(q["recall"])
+
+    def by_type(key):
+        groups: dict[str, list] = {}
+        for q in per_query:
+            groups.setdefault(q["type"], []).append(q[key])
+        return {t: round(sum(v) / len(v), 4) for t, v in sorted(groups.items())}
+
     return {
         "recall_at_5": round(sum(q["recall"] for q in per_query) / n, 4),
+        "recall_at_10": round(sum(q["recall_at_10"] for q in per_query) / n, 4),
         "mrr": round(sum(q["rr"] for q in per_query) / n, 4),
         "leaks": leaks,
         "zero_hit_queries": [q["id"] for q in per_query if not q["got"]],
-        "recall_by_type": {t: round(sum(v) / len(v), 4) for t, v in sorted(by_type.items())},
+        "recall_by_type": by_type("recall"),
+        "recall_by_type_at_10": by_type("recall_at_10"),
         "queries": per_query,
     }
 
@@ -229,12 +249,24 @@ def embeddings_gate(baseline: dict, candidate: dict) -> tuple[str, list[str]]:
     return ("ADOPT" if gain and safe else "REJECT"), reasons
 
 
+def gate_input(mode_result: dict) -> dict:
+    """One run_eval mode as embeddings_gate input (Recall@10, 0..1).
+
+    Missing values stay missing so the gate fails closed (REJECT)."""
+    return {
+        "recall_at_10": mode_result.get("recall_at_10"),
+        "recall_by_type": dict(mode_result.get("recall_by_type_at_10") or {}),
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
     parser.add_argument("--extract", action="store_true", help="score the extraction gold set")
     parser.add_argument("--gold", type=Path, default=DEFAULT_GOLD)
     parser.add_argument("--json", action="store_true", help="print full JSON result")
+    parser.add_argument("--gate", nargs=2, metavar=("BASELINE_MODE", "CANDIDATE_MODE"),
+                        help="run embeddings_gate on two retrieval modes")
     args = parser.parse_args(argv)
     if args.extract:
         result = run_extract(args.gold)
@@ -251,12 +283,24 @@ def main(argv: list[str] | None = None) -> int:
                   f"emitted={row['emitted']} expected={row['expected']}")
         return 0
     result = run_eval(args.fixture)
+    if args.gate:
+        missing = [m for m in args.gate if m not in result["modes"]]
+        if missing:
+            print(f"unknown mode(s): {', '.join(missing)}; have: {', '.join(result['modes'])}")
+            return 2
+        baseline, candidate = (gate_input(result["modes"][m]) for m in args.gate)
+        verdict, reasons = embeddings_gate(baseline, candidate)
+        print(f"gate {args.gate[0]} -> {args.gate[1]}: {verdict}")
+        for reason in reasons:
+            print(f"  {reason}")
+        return 0
     if args.json:
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     print(f"records={result['records']} queries={result['queries']} fts5={result['fts5_available']}")
     for name, mode in result["modes"].items():
-        print(f"{name:8} recall@5={mode['recall_at_5']:.3f} mrr={mode['mrr']:.3f} "
+        print(f"{name:8} recall@5={mode['recall_at_5']:.3f} recall@10={mode['recall_at_10']:.3f} "
+              f"mrr={mode['mrr']:.3f} "
               f"leaks={mode['leaks']} zero_hit={len(mode['zero_hit_queries'])}")
         print("         by_type: " + " ".join(f"{t}={v:.2f}" for t, v in mode["recall_by_type"].items()))
     return 0

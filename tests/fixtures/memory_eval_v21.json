@@ -1,6 +1,6 @@
 {
-  "about": "V2.1b offline retrieval eval set (KARAR-2 embeddings decision). Records are fictional; every query term also appears in another project so a scope leak would show.",
-  "projects": ["alpha", "beta", "gamma"],
+  "about": "V2.1b offline retrieval eval set (KARAR-2 embeddings decision). Records are fictional; every query term also appears in another project so a scope leak would show. delta (JARVIS operator memory) holds the exact, update and tr_en queries: an update pair lists the old record first (older), and the query's stale record must rank below the expected one.",
+  "projects": ["alpha", "beta", "gamma", "delta"],
   "records": [
     {"id": "a01", "project": "alpha", "kind": "decision", "subject": "database", "text": "SQLite is the only database; no Postgres server for the desktop app."},
     {"id": "a02", "project": "alpha", "kind": "rule", "subject": "testing", "text": "Tests run with python -m unittest, never with uv run."},
@@ -43,7 +43,44 @@
     {"id": "c10", "project": "gamma", "kind": "lesson", "subject": "tokenizer", "text": "Turkish suffixes hurt keyword search; stemming improved recall."},
     {"id": "c11", "project": "gamma", "kind": "fact", "subject": "pipeline-tests", "text": "Unit tests for the data pipeline run with pytest."},
     {"id": "c12", "project": "gamma", "kind": "decision", "subject": "language", "text": "Tez İngilizce yazılacak, özet Türkçe de olacak."},
-    {"id": "c13", "project": "gamma", "kind": "fact", "subject": "meetings", "text": "Danışman toplantıları her salı saat 14:00'te yapılır."}
+    {"id": "c13", "project": "gamma", "kind": "fact", "subject": "meetings", "text": "Danışman toplantıları her salı saat 14:00'te yapılır."},
+
+    {"id": "d01", "project": "delta", "kind": "fact", "subject": "bridge-port", "text": "The local UI bridge listens on 127.0.0.1 port 8765."},
+    {"id": "d02", "project": "delta", "kind": "fact", "subject": "log-path", "text": "Runtime logs are written to %LOCALAPPDATA%\\Jarvis\\logs\\jarvis.log."},
+    {"id": "d03", "project": "delta", "kind": "fact", "subject": "hotkey", "text": "The push-to-talk hotkey is Ctrl+Alt+J."},
+    {"id": "d04", "project": "delta", "kind": "fact", "subject": "local-model", "text": "The default local model is qwen2.5-7b-instruct served by Ollama."},
+    {"id": "d05", "project": "delta", "kind": "decision", "subject": "retention", "text": "Konuşma kayıtları 90 gün saklanır, sonra silinir."},
+    {"id": "d06", "project": "delta", "kind": "fact", "subject": "error-codes", "text": "Error code E_BRIDGE_DOWN means the UI bridge process stopped."},
+    {"id": "d07", "project": "delta", "kind": "rule", "subject": "commit-trailer", "text": "Every commit message ends with the Co-Authored-By trailer."},
+    {"id": "d08", "project": "delta", "kind": "fact", "subject": "backup-job", "text": "The weekly backup job runs every Sunday at 03:30."},
+
+    {"id": "d11", "project": "delta", "kind": "fact", "subject": "briefing-time", "text": "The morning briefing runs at 08:00 on weekdays."},
+    {"id": "d13", "project": "delta", "kind": "preference", "subject": "browser", "text": "Browser tasks open in Microsoft Edge."},
+    {"id": "d15", "project": "delta", "kind": "fact", "subject": "python-version", "text": "The packaged app bundles Python 3.12."},
+    {"id": "d17", "project": "delta", "kind": "preference", "subject": "tts-voice", "text": "Text-to-speech uses the Filiz voice."},
+    {"id": "d19", "project": "delta", "kind": "fact", "subject": "gmail-poll", "text": "Gmail is checked every 30 minutes."},
+    {"id": "d21", "project": "delta", "kind": "preference", "subject": "theme", "text": "Pencere her zaman koyu temayı kullanır."},
+    {"id": "d23", "project": "delta", "kind": "fact", "subject": "project-folder", "text": "Proje dosyaları D:\\Projeler klasöründe duruyor."},
+    {"id": "d25", "project": "delta", "kind": "rule", "subject": "approval-timeout", "text": "Pending approvals expire after 10 minutes."},
+    {"id": "d12", "project": "delta", "kind": "fact", "subject": "briefing-time", "text": "Since October the morning briefing runs at 07:00 on weekdays."},
+    {"id": "d14", "project": "delta", "kind": "preference", "subject": "browser", "text": "Browser tasks now open in Chrome instead of Edge."},
+    {"id": "d16", "project": "delta", "kind": "fact", "subject": "python-version", "text": "The packaged app now bundles Python 3.13."},
+    {"id": "d18", "project": "delta", "kind": "preference", "subject": "tts-voice", "text": "Text-to-speech switched from Filiz to the Emel voice."},
+    {"id": "d20", "project": "delta", "kind": "fact", "subject": "gmail-poll", "text": "Gmail is now checked every 10 minutes."},
+    {"id": "d22", "project": "delta", "kind": "preference", "subject": "theme", "text": "Pencere artık koyu tema yerine sistem temasını izler."},
+    {"id": "d24", "project": "delta", "kind": "fact", "subject": "project-folder", "text": "Proje dosyaları artık C:\\Work\\Projeler klasöründe."},
+    {"id": "d26", "project": "delta", "kind": "rule", "subject": "approval-timeout", "text": "Pending approvals now expire after 30 minutes."},
+
+    {"id": "d31", "project": "delta", "kind": "fact", "subject": "calendar", "text": "Calendar events are read from the Outlook account only."},
+    {"id": "d32", "project": "delta", "kind": "rule", "subject": "file-delete", "text": "Deleting files always requires an explicit confirmation."},
+    {"id": "d33", "project": "delta", "kind": "preference", "subject": "notifications", "text": "Notifications are muted between 23:00 and 08:00."},
+    {"id": "d34", "project": "delta", "kind": "fact", "subject": "screenshots", "text": "Screenshots are saved to the Pictures folder."},
+    {"id": "d35", "project": "delta", "kind": "decision", "subject": "api-budget", "text": "Monthly API spending is capped at 20 dollars."},
+    {"id": "d36", "project": "delta", "kind": "fact", "subject": "hardware", "text": "Ofisteki yazıcı bir HP LaserJet."},
+    {"id": "d37", "project": "delta", "kind": "preference", "subject": "assistant-locale", "text": "Salih sesli yanıtların Türkçe olmasını istiyor."},
+    {"id": "d38", "project": "delta", "kind": "rule", "subject": "invites-policy", "text": "Toplantı davetleri onaysız kabul edilmez."},
+    {"id": "d39", "project": "delta", "kind": "fact", "subject": "vehicle", "text": "Araç muayenesi Mart ayında yapılacak."},
+    {"id": "d40", "project": "delta", "kind": "decision", "subject": "gallery-copies", "text": "Fotoğraflar her ay harici diske yedeklenir."}
   ],
   "queries": [
     {"id": "q01", "project": "alpha", "lang": "en", "type": "keyword", "text": "database", "expected": ["a01"]},
@@ -74,6 +111,35 @@
     {"id": "q26", "project": "gamma", "lang": "en", "type": "keyword", "text": "GPU memory", "expected": ["c05"]},
     {"id": "q27", "project": "gamma", "lang": "tr", "type": "cross-lingual", "text": "danışman", "expected": ["c13", "c06"]},
     {"id": "q28", "project": "gamma", "lang": "en", "type": "keyword", "text": "pytest", "expected": ["c11"]},
-    {"id": "q29", "project": "gamma", "lang": "en", "type": "keyword", "text": "SQLite", "expected": ["c02"]}
+    {"id": "q29", "project": "gamma", "lang": "en", "type": "keyword", "text": "SQLite", "expected": ["c02"]},
+
+    {"id": "q30", "project": "delta", "lang": "en", "type": "exact", "text": "port 8765", "expected": ["d01"]},
+    {"id": "q31", "project": "delta", "lang": "en", "type": "exact", "text": "jarvis.log", "expected": ["d02"]},
+    {"id": "q32", "project": "delta", "lang": "en", "type": "exact", "text": "Ctrl+Alt+J", "expected": ["d03"]},
+    {"id": "q33", "project": "delta", "lang": "en", "type": "exact", "text": "qwen2.5-7b-instruct", "expected": ["d04"]},
+    {"id": "q34", "project": "delta", "lang": "tr", "type": "exact", "text": "90 gün", "expected": ["d05"]},
+    {"id": "q35", "project": "delta", "lang": "en", "type": "exact", "text": "E_BRIDGE_DOWN", "expected": ["d06"]},
+    {"id": "q36", "project": "delta", "lang": "en", "type": "exact", "text": "Co-Authored-By trailer", "expected": ["d07"]},
+    {"id": "q37", "project": "delta", "lang": "en", "type": "exact", "text": "03:30", "expected": ["d08"]},
+
+    {"id": "q40", "project": "delta", "lang": "en", "type": "update", "text": "morning briefing weekdays", "expected": ["d12"], "stale": ["d11"]},
+    {"id": "q41", "project": "delta", "lang": "en", "type": "update", "text": "browser tasks open", "expected": ["d14"], "stale": ["d13"]},
+    {"id": "q42", "project": "delta", "lang": "en", "type": "update", "text": "packaged app python", "expected": ["d16"], "stale": ["d15"]},
+    {"id": "q43", "project": "delta", "lang": "en", "type": "update", "text": "text-to-speech voice", "expected": ["d18"], "stale": ["d17"]},
+    {"id": "q44", "project": "delta", "lang": "en", "type": "update", "text": "gmail checked every", "expected": ["d20"], "stale": ["d19"]},
+    {"id": "q45", "project": "delta", "lang": "tr", "type": "update", "text": "pencere teması", "expected": ["d22"], "stale": ["d21"]},
+    {"id": "q46", "project": "delta", "lang": "tr", "type": "update", "text": "proje dosyaları", "expected": ["d24"], "stale": ["d23"]},
+    {"id": "q47", "project": "delta", "lang": "en", "type": "update", "text": "pending approvals expire", "expected": ["d26"], "stale": ["d25"]},
+
+    {"id": "q50", "project": "delta", "lang": "tr", "type": "tr_en", "text": "takvim etkinlikleri", "expected": ["d31"]},
+    {"id": "q51", "project": "delta", "lang": "tr", "type": "tr_en", "text": "dosya silme onayı", "expected": ["d32"]},
+    {"id": "q52", "project": "delta", "lang": "tr", "type": "tr_en", "text": "bildirimler sessiz", "expected": ["d33"]},
+    {"id": "q53", "project": "delta", "lang": "tr", "type": "tr_en", "text": "ekran görüntüleri nereye kaydediliyor", "expected": ["d34"]},
+    {"id": "q54", "project": "delta", "lang": "tr", "type": "tr_en", "text": "aylık harcama limiti", "expected": ["d35"]},
+    {"id": "q55", "project": "delta", "lang": "en", "type": "tr_en", "text": "office printer", "expected": ["d36"]},
+    {"id": "q56", "project": "delta", "lang": "en", "type": "tr_en", "text": "voice reply language", "expected": ["d37"]},
+    {"id": "q57", "project": "delta", "lang": "en", "type": "tr_en", "text": "meeting invitations", "expected": ["d38"]},
+    {"id": "q58", "project": "delta", "lang": "en", "type": "tr_en", "text": "car inspection", "expected": ["d39"]},
+    {"id": "q59", "project": "delta", "lang": "en", "type": "tr_en", "text": "photo backup", "expected": ["d40"]}
   ]
 }
