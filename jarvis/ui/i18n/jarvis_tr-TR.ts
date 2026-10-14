@@ -1554,6 +1554,37 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     </message>
 </context>
 <context>
+    <name>ContextUsageBlock</name>
+    <message>
+        <source>%1 / %2 tokens</source>
+        <translation>%1 / %2 token</translation>
+    </message>
+    <message>
+        <source>%1 tokens / limit unknown</source>
+        <translation>%1 token / sınır bilinmiyor</translation>
+    </message>
+    <message>
+        <source>Unknown</source>
+        <translation>Bilinmiyor</translation>
+    </message>
+    <message>
+        <source>%1 turn until auto-compaction</source>
+        <translation>Otomatik sıkıştırmaya %1 tur</translation>
+    </message>
+    <message>
+        <source>%1 turns until auto-compaction</source>
+        <translation>Otomatik sıkıştırmaya %1 tur</translation>
+    </message>
+    <message>
+        <source>Context usage</source>
+        <translation>Bağlam kullanımı</translation>
+    </message>
+    <message>
+        <source>Compact session</source>
+        <translation>Oturumu sıkıştır</translation>
+    </message>
+</context>
+<context>
     <name>ConversationDeleteDialog</name>
     <message>
         <source>Delete this conversation permanently?</source>

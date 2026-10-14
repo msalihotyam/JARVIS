@@ -14,7 +14,9 @@ import "../theme"
 // Bridge-independent: `rows` are the quota rows as they are,
 // [{window: "five_hour" | "weekly" | "weekly_<model>", remaining: 0-100,
 //   resets_at: epoch s (0 = none), model: "Opus" (per-model weeks only)}];
-// `plan` and `details` are bridge.usageLimits' plan / map.
+// `plan` and `details` are bridge.usageLimits' plan / map. MEMUICTX: the
+// context usage block reads the window's bridge when there is one (`app`);
+// without it the block says unknown and its button stays off.
 MenuSurface {
     id: pop
     objectName: "usagePopover"
@@ -23,6 +25,7 @@ MenuSurface {
     property var rows: []
     property var details: ({})
     property real now: Date.now()               // the clock reset times read against
+    property var app: typeof bridge !== "undefined" ? bridge : null
     takesFocus: false
     width: 360; padding: 14
     onAboutToShow: now = Date.now()
@@ -125,6 +128,17 @@ MenuSurface {
         Text { objectName: "usageNone"; visible: pop.shown.length === 0; width: parent.width; wrapMode: Text.Wrap
                text: qsTr("This provider reported no usage limits.")
                color: Theme.textMuted; renderType: Theme.textRender; font: Theme.body }
+        Column {
+            width: parent.width; spacing: 10
+            Rectangle { width: parent.width; height: 1; color: Theme.border }
+            ContextUsageBlock {
+                width: parent.width
+                usage: pop.app ? pop.app.contextUsage : ({})
+                busy: pop.app ? pop.app.busy : false
+                canCompact: pop.app ? pop.app.conversationId !== "" : false
+                onCompact: pop.app.compactConversation(pop.app.conversationId)
+            }
+        }
         Column {
             objectName: "usageDetails"
             visible: pop.detailRows.length > 0
