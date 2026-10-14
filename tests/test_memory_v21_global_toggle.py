@@ -24,6 +24,7 @@ from jarvis.contracts import (
     MemoryRecordStatus,
 )
 from jarvis.memory import CONVERSATION_GLOBAL_MEMORY_TOGGLES, SQLiteMemoryStore
+from jarvis.memory_guard import Provenance, RecordGuard, SessionTaint, content_hash
 from tests.helpers import safe_cleanup
 
 USER = MemoryRecordActor.USER
@@ -60,7 +61,11 @@ class GlobalToggleTests(unittest.TestCase):
             actor=MemoryRecordActor.MODEL, confidence=0.8,
             classification=DataClassification.INTERNAL,
         )
-        return self.store.insert_record(record).record.record_id  # a FACT starts APPROVED
+        # A guard-less capture FACT/LESSON is now PENDING (SECCAPTURE): stand
+        # in for Core's clean user_stated guard.
+        guard = RecordGuard(Provenance.USER_STATED, SessionTaint.USER_TYPED, (), kind,
+                            content_hash(text)) if kind in (MemoryRecordKind.FACT, MemoryRecordKind.LESSON) else None
+        return self.store.insert_record(record, guard).record.record_id  # a FACT starts APPROVED
 
     def global_scope(self, cid: str | None = None) -> MemoryRecordScope:
         return MemoryRecordScope(None, cid or self.cid, MemoryRecordScopeKind.GLOBAL_READONLY)

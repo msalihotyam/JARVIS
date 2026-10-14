@@ -66,8 +66,9 @@ class GuardStoreTests(unittest.TestCase):
         )
 
     def test_web_tainted_fact_ends_pending_rule(self) -> None:
-        # Without a guard this FACT would auto-approve; the store re-decides.
-        self.assertIs(self.store.insert_record(self.record(text="other fact")).status, S.APPROVED)
+        # Without a guard a capture FACT is forced PENDING (SECCAPTURE flip);
+        # with one the store re-decides.
+        self.assertIs(self.store.insert_record(self.record(text="other fact")).status, S.PENDING)
         view = self.store.insert_record(self.record(), self.guard(taint=SessionTaint.WEB))
         self.assertIs(view.status, S.PENDING)
         self.assertIs(view.record.kind, K.RULE)

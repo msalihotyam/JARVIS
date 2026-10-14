@@ -189,6 +189,7 @@ from jarvis.memory_guard import (
     SessionTaint,
     content_hash,
     decide_admission,
+    dirtiest,
     instruction_likeness,
     is_operational_preference,
 )
@@ -1149,6 +1150,24 @@ _TOMBSTONE_DAYS = {
     MemoryRecordStatus.REJECTED: 180,
     MemoryRecordStatus.RETRACTED: 365,
 }
+
+
+#: Origins whose records must come through Core's guard (I13): a guard-less
+#: insert of one is forced to PENDING (fail-closed, SECCAPTURE).
+_GUARDED_ORIGINS = frozenset({
+    MemoryRecordOrigin.CAPTURE_SESSION_END,
+    MemoryRecordOrigin.CAPTURE_PRECOMPACT,
+    MemoryRecordOrigin.IMPORT,
+    MemoryRecordOrigin.CONSOLIDATION,
+})
+#: Session taints a supersession's inputs may carry. Legacy (no guard row:
+#: pre-guard records, explicit-user ones) keeps today's behaviour; an
+#: import, connector or web input never retires another record.
+_CONSOLIDATION_TAINTS = frozenset({
+    SessionTaint.USER_TYPED,
+    SessionTaint.LOCAL_TRUSTED_FILE,
+    SessionTaint.LEGACY,
+})
 
 
 #: The only actor a consolidation plan is applied as (stored as text).
@@ -6835,6 +6854,7 @@ class SQLiteMemoryStore:
             MemoryRecordStatus.APPROVED
             if not needs_user_approval(stored.kind)
             and stored.origin is not MemoryRecordOrigin.IMPORT
+            and (guard is not None or stored.origin not in _GUARDED_ORIGINS)
             else MemoryRecordStatus.PENDING
         )
         guard_row = None
@@ -7128,13 +7148,19 @@ class SQLiteMemoryStore:
         an unknown record as None."""
         validate_memory_record_id(record_id)
         with self._connection() as connection:
-            row = connection.execute(
-                "SELECT r.kind, r.text, g.provenance, g.session_taint, "
-                "g.instruction_like, g.proposed_kind, g.content_hash "
-                "FROM memory_records r LEFT JOIN memory_record_guard g "
-                "ON g.record_id = r.record_id WHERE r.record_id = ?",
-                (record_id,),
-            ).fetchone()
+            return self._read_record_guard(connection, record_id)
+
+    @staticmethod
+    def _read_record_guard(
+        connection: sqlite3.Connection, record_id: str
+    ) -> RecordGuard | None:
+        row = connection.execute(
+            "SELECT r.kind, r.text, g.provenance, g.session_taint, "
+            "g.instruction_like, g.proposed_kind, g.content_hash "
+            "FROM memory_records r LEFT JOIN memory_record_guard g "
+            "ON g.record_id = r.record_id WHERE r.record_id = ?",
+            (record_id,),
+        ).fetchone()
         if row is None:
             return None
         if row["provenance"] is None:
@@ -7407,7 +7433,9 @@ class SQLiteMemoryStore:
         classification, and the new side is APPROVED. An approved DECISION,
         RULE or PREFERENCE is never touched here, and a RULE or explicit-user
         record is never superseded here (that needs explicit-user proof, see
-        ``supersede``). Any invalid
+        ``supersede``). A supersession whose inputs' dirtiest guard is
+        tainted (import, connector, web), or whose survivor's content is
+        tombstoned, is refused. Any invalid
         step raises ConsolidationPlanRejected and rolls the whole plan back.
         Merges and conflicts are reported, never applied.
         """
@@ -7516,6 +7544,16 @@ class SQLiteMemoryStore:
                 ):
                     raise ConsolidationPlanRejected(
                         "supersession", old_id, "rule or explicit-user record needs the user"
+                    )
+                # The surviving record carries the dirtiest guard of its
+                # inputs (I13); a tainted input or a tombstoned survivor
+                # never retires another record (I15).
+                guards = [self._read_record_guard(connection, i) for i in (old_id, new_id)]
+                if dirtiest(*(g.session_taint for g in guards)) not in _CONSOLIDATION_TAINTS:
+                    raise ConsolidationPlanRejected("supersession", old_id, "tainted input")
+                if self._tombstoned(connection, guards[1].content_hash, new["project_id"]):
+                    raise ConsolidationPlanRejected(
+                        "supersession", old_id, "superseding record is tombstoned"
                     )
             at = utc_now()
             for step in plan.supersessions:

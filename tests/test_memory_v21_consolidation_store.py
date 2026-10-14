@@ -24,6 +24,7 @@ from jarvis.memory import (
     MemoryRecordApproval,
     SQLiteMemoryStore,
 )
+from jarvis.memory_guard import Provenance, RecordGuard, SessionTaint, content_hash
 from jarvis.memory_consolidation import (
     ConsolidationEvent,
     ConsolidationPlan,
@@ -58,7 +59,11 @@ class ConsolidationStoreTests(unittest.TestCase):
             classification=DataClassification.INTERNAL,
             created_at=f"2026-10-{day:02d}T00:00:00+00:00", **extra,
         )
-        record_id = self.store.insert_record(record).record.record_id
+        # A guard-less capture FACT/LESSON is now PENDING (SECCAPTURE): stand
+        # in for Core's clean user_stated guard.
+        guard = RecordGuard(Provenance.USER_STATED, SessionTaint.USER_TYPED, (), kind,
+                            content_hash(text)) if kind in (K.FACT, K.LESSON) else None
+        record_id = self.store.insert_record(record, guard).record.record_id
         if approve:
             self.store.approve_record(record_id, MemoryRecordApproval(project, record_id))
         return record_id

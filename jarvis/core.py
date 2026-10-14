@@ -2,13 +2,17 @@
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 from dataclasses import dataclass, replace
+from collections import Counter
 from datetime import datetime
 from decimal import Decimal
+from pathlib import Path
 from typing import AbstractSet, Any, Callable
 
 from jarvis.connectors.base import BaseConnector
@@ -188,10 +192,23 @@ from jarvis.progress import (
     set_waiting_issue,
 )
 from jarvis import memory_capture, memory_retrieval, project_files
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from jarvis.conversation import RAW_TURNS_MAX, REPLY_MAX_CHARS, TURN_MAX_CHARS, Turn
 from jarvis.conversation import digest as conversation_digest
 from jarvis.memory_filter import classify_candidate_text
+from jarvis.memory_guard import (
+    REFUSE,
+    Provenance,
+    RecordGuard,
+    SessionTaint,
+    content_hash,
+    decide_admission,
+    dirtiest,
+    instruction_likeness,
+    is_operational_preference,
+    taint_for_capability,
+    verify_user_stated,
+)
 from jarvis.registry import (
     AmbiguousConnectorError,
     ConnectorNotFoundError,
@@ -651,14 +668,17 @@ class MemoryCaptureOutcome:
     dropped: int = 0
     failed: int = 0
     duplicate: bool = False
+    #: One reason code per refused or dropped candidate (never text).
+    reasons: tuple[str, ...] = ()
 
-    def counts(self) -> dict[str, int]:
+    def counts(self) -> dict[str, Any]:
         return {
             "approved": self.approved,
             "pending": self.pending,
             "refused": self.refused,
             "dropped": self.dropped,
             "failed": self.failed,
+            "reasons": dict(Counter(self.reasons)),
         }
 
 
@@ -693,6 +713,69 @@ def _validated_capture_candidate(
         except Exception:  # noqa: BLE001 - a filter error refuses
             return None
     return value
+
+
+def _is_under(path: Path, root: Path) -> bool:
+    return path == root or root in path.parents
+
+
+def _file_input_taint(path: Any, roots: Sequence[Path]) -> SessionTaint:
+    """A file input is ``local_trusted_file`` only inside a trusted root (F7).
+
+    The path must be absolute and inside a root both lexically (``..``
+    collapsed) and resolved (links and junctions followed); a UNC/network
+    path, an escape, or anything unresolvable is ``import``.
+    """
+    def unc(value: str) -> bool:  # any mix of separators ("/\\host") is UNC too
+        return value.replace("/", "\\").startswith("\\\\")
+
+    try:
+        # Refused before resolve(): resolving a UNC path would open the share.
+        if type(path) is not str or unc(path) or not os.path.isabs(path):
+            return SessionTaint.IMPORT
+        lexical, resolved = Path(os.path.abspath(path)), Path(path).resolve()
+        if unc(str(resolved)):
+            return SessionTaint.IMPORT
+        for root in roots:
+            if _is_under(lexical, Path(os.path.abspath(root))) and _is_under(
+                resolved, Path(root).resolve()
+            ):
+                return SessionTaint.LOCAL_TRUSTED_FILE
+    except (OSError, ValueError, RuntimeError, TypeError):
+        pass
+    return SessionTaint.IMPORT
+
+
+def _capture_session_taint(
+    turns: Sequence[Any], trigger: MemoryRecordOrigin, roots: Sequence[Path]
+) -> SessionTaint:
+    """The dirtiest input the session saw (I13).
+
+    The person's own words are ``user_typed`` and a reply is the model's
+    own text; every other turn is a tool result tainted by its capability
+    (unknown -> ``web``), a file one by its path. What a user turn attached
+    is a file input (its snapshot path), what it quoted is ``import``: both
+    reach the capture prompt through the turn's text.
+    """
+    taints = [SessionTaint.USER_TYPED]
+    if trigger is MemoryRecordOrigin.IMPORT:
+        taints.append(SessionTaint.IMPORT)
+    for turn in turns:
+        if turn.kind == "user":
+            for ref in getattr(turn, "refs", ()):
+                is_file = isinstance(ref, Mapping) and ref.get("type") == "file"
+                taints.append(_file_input_taint(ref.get("path"), roots) if is_file else SessionTaint.IMPORT)
+            continue
+        if turn.kind == "reply":
+            continue
+        taint = taint_for_capability(turn.capability)
+        if taint is SessionTaint.LOCAL_TRUSTED_FILE:
+            # ponytail: a result turn keeps no resolved path (only its
+            # destination text, a compacted one nothing), so most file reads
+            # read as import. Upgrade: record the path on the result turn.
+            taint = _file_input_taint(getattr(turn, "destination", None), roots)
+        taints.append(taint)
+    return dirtiest(*taints)
 
 
 def _capture_run_connection(store: Any) -> Any:
@@ -5197,9 +5280,13 @@ class AgentCore:
         alone sets origin (``trigger``), scope (the conversation's project),
         actor/tool and provenance turn ids. The reply may only propose kind,
         text, subject key, confidence and evidence; an authority key in it
-        refuses the whole reply. Each candidate is re-validated and
-        re-filtered here, and the store filters again and sets the status
-        (FACT/LESSON approved and undoable, the rest pending).
+        refuses the whole reply. A short, empty or temporary session is
+        skipped before any model call (``skipped:<code>``). Each candidate is
+        re-validated and re-filtered here and goes through the guard (I13,
+        I14, I15, I17): session taint, provenance, instruction gate,
+        tombstones; the store re-decides kind and status from that guard.
+        ``settings.memory_extract_model``, when set, replaces the adapter's
+        model for this one call.
 
         Never raises. An unknown or Global conversation, one that ever used
         "all projects memory", no turns, a provider
@@ -5247,7 +5334,8 @@ class AgentCore:
             return MemoryCaptureOutcome(run_id=run_id, outcome="duplicate", duplicate=True)
         try:
             result = self._run_capture(
-                run_id, conversation_id, conversation.project_id, trigger, turns, model
+                run_id, conversation_id, conversation.project_id, trigger, turns, model,
+                (*state.turns, *state.compacted), state.omitted,
             )
         except Exception:  # noqa: BLE001 - capture never breaks the chat path
             result = MemoryCaptureOutcome(run_id=run_id, outcome="internal_error")
@@ -5282,7 +5370,35 @@ class AgentCore:
         trigger: MemoryRecordOrigin,
         turns: tuple[Any, ...],
         model: ModelAdapter,
+        session_turns: tuple[Any, ...] = (),
+        omitted: int = 0,
     ) -> MemoryCaptureOutcome:
+        # No temporary conversations and no quota reading exist in Core yet:
+        # temporary is False and an unknown quota never skips.
+        skip = memory_capture.extraction_skip_reason(
+            turns, temporary=False, quota_remaining_pct=None
+        )
+        if skip is not None:
+            return MemoryCaptureOutcome(run_id=run_id, outcome=f"skipped:{skip}")
+        # The whole session counts (raw, compacted and the batch), not only
+        # the batch: an earlier web read still shaped the later turns.
+        taint = _capture_session_taint(
+            (*session_turns, *turns), trigger, self._trusted_file_roots()
+        )
+        if omitted:
+            # Digests past the compacted cap keep only a count: their sources
+            # are unknown, so they count as import (fail closed).
+            taint = dirtiest(taint, SessionTaint.IMPORT)
+        # memory_extract_model is a Claude model id: never hand it to
+        # another provider's adapter.
+        if (
+            self.settings.memory_extract_model
+            and getattr(model, "provider", None) == "anthropic"
+            and hasattr(model, "model")
+        ):
+            # A copy, so the chat's adapter never changes under a running turn.
+            model = copy.copy(model)
+            model.model = self.settings.memory_extract_model
         prompt = memory_capture.build_capture_prompt(turns, trigger, "")
         task = Task(
             objective=prompt,
@@ -5309,15 +5425,55 @@ class AgentCore:
         user_turns = frozenset(
             turn.id for turn in turns if turn.role == "user" and turn.kind == "user"
         )
+        by_id = {turn.id: turn for turn in turns}
         record_ids: list[str] = []
-        approved = pending = failed = 0
+        reasons: list[str] = []
+        approved = pending = failed = dropped = 0
         refused = parsed.refused
         for value in parsed.candidates:
             candidate = _validated_capture_candidate(value, known, user_turns)
             if candidate is None:
                 refused += 1
+                reasons.append("invalid_candidate")
                 continue
+            # user_stated only when the person's own words in one evidence
+            # user turn carry it (I17); the model's say-so never does.
+            provenance = (
+                Provenance.USER_STATED
+                if any(
+                    verify_user_stated(candidate.text, by_id[turn_id].message)
+                    for turn_id in candidate.evidence_turn_ids
+                    if turn_id in user_turns
+                )
+                else Provenance.MODEL_INFERRED
+            )
+            hits = instruction_likeness(candidate.text)
+            digest = content_hash(candidate.text)
             try:
+                # A tombstoned text is refused by the store itself, in the
+                # same write transaction (MemoryTombstoned -> dropped below).
+                admission = decide_admission(
+                    candidate.kind,
+                    provenance,
+                    taint,
+                    hits,
+                    MemoryRecordScopeKind.PROJECT,
+                    DataClassification.INTERNAL,
+                    operational=is_operational_preference(candidate.text),
+                )
+                if admission.status == REFUSE:
+                    refused += 1
+                    reasons.append(admission.reason)
+                    continue
+                # The store re-decides from this guard: the record keeps the
+                # proposed kind, the store sets the final kind and status.
+                guard = RecordGuard(
+                    provenance=provenance,
+                    session_taint=taint,
+                    instruction_like=hits,
+                    proposed_kind=candidate.kind,
+                    content_hash=digest,
+                )
                 view = self.memory.insert_record(
                     MemoryRecord(
                         kind=candidate.kind,
@@ -5333,10 +5489,16 @@ class AgentCore:
                         classification=DataClassification.INTERNAL,
                         source_conversation_id=conversation_id,
                         source_turn_ids=candidate.evidence_turn_ids,
-                    )
+                    ),
+                    guard=guard,
                 )
-            except ValueError:  # includes MemoryRecordRefused: the store said no
-                refused += 1
+            except ValueError as exc:  # includes MemoryRecordRefused: the store said no
+                category = getattr(exc, "category", "store_refused")
+                if category == "tombstoned":
+                    dropped += 1
+                else:
+                    refused += 1
+                reasons.append(category)
                 continue
             except Exception:  # noqa: BLE001 - one bad write never stops the run
                 failed += 1
@@ -5353,9 +5515,20 @@ class AgentCore:
             approved=approved,
             pending=pending,
             refused=refused,
-            dropped=len(parsed.dropped),
+            dropped=len(parsed.dropped) + dropped,
             failed=failed,
+            reasons=tuple(reasons),
         )
+
+    def _trusted_file_roots(self) -> tuple[Path, ...]:
+        """The allowed roots of every registered local file connector: the
+        same boundary Core's file read and write run under."""
+        roots: list[Path] = []
+        for name in self.registry.list_names():
+            connector = self.registry.get(name)
+            if {LOCAL_READ_CAPABILITY, LOCAL_WRITE_CAPABILITY} & set(connector.manifest.capabilities):
+                roots.extend(getattr(connector, "allowed_roots", ()))
+        return tuple(roots)
 
     def _conversation_owner_refusal(
         self, session: SessionState, task: Task, requested: str | None

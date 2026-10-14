@@ -12,7 +12,9 @@ import time
 import unittest
 from contextlib import closing
 from dataclasses import replace
+from unittest import mock
 
+from jarvis import memory_capture
 from jarvis.app import MemoryTriggers
 from jarvis.contracts import (
     MODEL_ANSWER_RESULT_KEY,
@@ -34,6 +36,14 @@ from tests.helpers import isolated_settings, open_app, open_core
 
 PRECOMPACT = MemoryRecordOrigin.CAPTURE_PRECOMPACT
 SESSION_END = MemoryRecordOrigin.CAPTURE_SESSION_END
+
+
+def setUpModule() -> None:
+    # These short sessions test the trigger plumbing, not the skip policy
+    # (tests/test_memory_capture_guard.py covers the skip).
+    skip = mock.patch.object(memory_capture, "extraction_skip_reason", return_value=None)
+    skip.start()
+    unittest.addModuleCleanup(skip.stop)
 RECORD_TABLES = ("memory_records", "memory_record_events", "memory_record_supersessions")
 
 
@@ -53,10 +63,11 @@ class FakeModel:
         if self.gate is not None:
             self.gate.wait(5)
         transcript = task.objective.split("<transcript>\n", 1)[1].split("\n</transcript>", 1)[0]
-        first = json.loads(transcript)[0]["id"]
+        first = json.loads(transcript)[0]
+        # Quote the cited user turn so the fact is user_stated (SECCAPTURE).
         reply = json.dumps({"candidates": [{
-            "kind": "fact", "text": "The build uses uv.", "subject_key": "tooling",
-            "confidence": 0.9, "evidence_turn_ids": [first]}]})
+            "kind": "fact", "text": first["text"], "subject_key": "tooling",
+            "confidence": 0.9, "evidence_turn_ids": [first["id"]]}]})
         return ToolResult(outcome=OutcomeStatus.SUCCESS, summary="ok",
                           data={MODEL_ANSWER_RESULT_KEY: build_model_answer(reply)})
 

@@ -26,6 +26,7 @@ from jarvis.memory import (
     MemoryRecordRefused,
     SQLiteMemoryStore,
 )
+from jarvis.memory_guard import Provenance, RecordGuard, SessionTaint, content_hash
 from tests.helpers import safe_cleanup
 
 S = MemoryRecordStatus
@@ -42,6 +43,18 @@ class RecordStoreTests(unittest.TestCase):
         self.store = SQLiteMemoryStore(self.database)
         self.alpha = self.store.create_project("Alpha").id
         self.beta = self.store.create_project("Beta").id
+        # A guard-less capture FACT/LESSON is now PENDING (SECCAPTURE): these
+        # store tests stand in for Core's clean user_stated guard.
+        insert = self.store.insert_record
+
+        def guarded(record, guard=None):
+            if (guard is None and record.kind in (K.FACT, K.LESSON)
+                    and record.origin is MemoryRecordOrigin.CAPTURE_SESSION_END):
+                guard = RecordGuard(Provenance.USER_STATED, SessionTaint.USER_TYPED, (),
+                                    record.kind, content_hash(record.text))
+            return insert(record, guard)
+
+        self.store.insert_record = guarded
 
     def record(self, kind=K.FACT, text="the build uses uv", *, project=None,
                origin=MemoryRecordOrigin.CAPTURE_SESSION_END, actor=MODEL,
@@ -110,7 +123,9 @@ class RecordStoreTests(unittest.TestCase):
         ]
         for index, (kind, steps, outcome) in enumerate(table):
             with self.subTest(row=index, kind=kind, steps=steps):
-                view = self.store.insert_record(self.record(kind, subject=f"s{index}"))
+                # Own text per row: an undone row tombstones its text (SECGUARD).
+                view = self.store.insert_record(
+                    self.record(kind, text=f"the build uses uv {index}", subject=f"s{index}"))
                 record_id = view.record.record_id
                 before = self.store.current_status(record_id)
                 for position, step in enumerate(steps):

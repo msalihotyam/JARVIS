@@ -54,13 +54,20 @@ class FakeModel:
 
 class CaptureCoreTests(unittest.TestCase):
     def setUp(self) -> None:
+        # These short sessions test the reply path, not the skip policy
+        # (tests/test_memory_capture_guard.py covers the skip).
+        skip = mock.patch.object(memory_capture, "extraction_skip_reason", return_value=None)
+        skip.start()
+        self.addCleanup(skip.stop)
         self.settings = isolated_settings(self)
         self.database = self.settings.memory_database
         self.store = SQLiteMemoryStore(self.database)
         self.core = open_core(ToolRegistry(), self.store, self.settings, destination_policy=frozenset())
         self.alpha = self.store.create_project("Alpha").id
         self.conversation = self.store.create_conversation(self.alpha).id
-        self.turn_ids = self.say(self.conversation, "We deploy on Fridays only.", "Use uv for the build.")
+        # The default candidate quotes its cited turn, so its FACT is
+        # user_stated and the guard approves it (SECCAPTURE, I17).
+        self.turn_ids = self.say(self.conversation, "We deploy on Fridays only.", "The build uses uv.")
 
     def say(self, conversation_id, *texts):
         ids = []

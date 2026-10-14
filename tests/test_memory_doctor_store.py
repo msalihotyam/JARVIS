@@ -24,6 +24,7 @@ from jarvis.contracts import (
     MemoryRecordStatus,
 )
 from jarvis.memory import MemoryRecordApproval, SQLiteMemoryStore
+from jarvis.memory_guard import Provenance, RecordGuard, SessionTaint, content_hash
 from jarvis.memory_doctor import FindingCode, RepairAction, RepairProposal, diagnose
 from jarvis.memory_filter import classify_candidate_text
 from tests.helpers import safe_cleanup
@@ -58,7 +59,11 @@ class DoctorStoreTests(unittest.TestCase):
             actor=MemoryRecordActor.MODEL, confidence=0.8,
             classification=DataClassification.INTERNAL, **extra,
         )
-        return self.store.insert_record(record).record.record_id
+        # A guard-less capture FACT/LESSON is now PENDING (SECCAPTURE): stand
+        # in for Core's clean user_stated guard.
+        guard = RecordGuard(Provenance.USER_STATED, SessionTaint.USER_TYPED, (), kind,
+                            content_hash(text)) if kind in (MemoryRecordKind.FACT, MemoryRecordKind.LESSON) else None
+        return self.store.insert_record(record, guard).record.record_id
 
     def proof(self, record_id, project=None) -> MemoryRecordApproval:
         return MemoryRecordApproval(project or self.alpha, record_id, "doctor-repair")

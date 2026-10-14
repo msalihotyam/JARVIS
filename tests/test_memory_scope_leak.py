@@ -26,6 +26,7 @@ from jarvis.contracts import (
     RunStatus,
 )
 from jarvis.memory import MemoryRecordApproval, MemoryRecordRefused
+from jarvis.memory_guard import Provenance, RecordGuard, SessionTaint, content_hash
 from jarvis.registry import ToolRegistry
 from tests.helpers import DummyConnector, isolated_settings, make_task, open_app, open_core
 
@@ -100,6 +101,10 @@ class MemoryScopeLeakTests(unittest.TestCase):
         )
 
     def record(self, project, kind, text, subject_key, *, approve=False, conversation_id=None, **fields):
+        # A guard-less capture FACT/LESSON is now PENDING (SECCAPTURE): stand
+        # in for Core's clean user_stated guard.
+        guard = RecordGuard(Provenance.USER_STATED, SessionTaint.USER_TYPED, (), kind,
+                            content_hash(text)) if kind in (MemoryRecordKind.FACT, MemoryRecordKind.LESSON) else None
         view = self.store.insert_record(
             MemoryRecord(
                 kind=kind,
@@ -111,7 +116,8 @@ class MemoryScopeLeakTests(unittest.TestCase):
                 confidence=0.8,
                 classification=DataClassification.INTERNAL,
                 **fields,
-            )
+            ),
+            guard,
         )
         record_id = view.record.record_id
         if approve:
