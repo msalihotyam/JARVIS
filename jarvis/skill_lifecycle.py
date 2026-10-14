@@ -475,8 +475,9 @@ def _replay(events: tuple[SkillEvent, ...], latest: int | None) -> _Replay:
 
     The active version at each point is the one named by the last
     ``draft_approved``/``rolled_back`` event so far; before any such event it
-    is ``latest`` when a history without pointer events is given (as
-    ``active_version`` says), otherwise the highest version named so far.
+    is ``latest`` when a history without pointer events is given, otherwise
+    the highest version named so far. Health/stale bookkeeping only: which
+    version may RUN is ``usable_skill``'s (approved versions only).
     """
     has_pointer = any(event.kind in _POINTER_KINDS for event in events)
     fallback = latest if latest is not None and not has_pointer else 0
@@ -550,8 +551,9 @@ def status(events: Sequence[SkillEvent] | SkillHistory) -> SkillStatus:
     is ``disabled``. Stale per the module rules; only a success of the active
     version clears it. Before the first ``draft_approved``/``rolled_back``
     event the active version is the highest version named so far, or, for a
-    ``SkillHistory`` without any such event, its latest version (exactly as
-    ``active_version`` says), so pass the history when you have it. A declined
+    ``SkillHistory`` without any such event, its latest version (health
+    bookkeeping only; such a skill is never run, see ``usable_skill``), so
+    pass the history when you have it. A declined
     announcement or a denied approval is not a use and never a failure (D16);
     it records nothing.
 
@@ -568,17 +570,38 @@ def status(events: Sequence[SkillEvent] | SkillHistory) -> SkillStatus:
     return SkillStatus.ACTIVE
 
 
-def active_version(history: SkillHistory) -> int:
-    """The version in use: the one named by the last ``draft_approved`` or
-    ``rolled_back`` event, or the latest version when there is none.
+def approved_versions(history: SkillHistory) -> frozenset[int]:
+    """The versions that have their own ``draft_approved`` event.
     Raises ``SkillLifecycleError`` for a non-history."""
     if type(history) is not SkillHistory:
         raise SkillLifecycleError("history must be a SkillHistory")
+    return frozenset(
+        event.version for event in history.events if event.kind is SkillEventKind.DRAFT_APPROVED
+    )
+
+
+def _active(history: SkillHistory) -> int | None:
+    """The version named by the last ``draft_approved``/``rolled_back`` event
+    when it has its own ``draft_approved`` event; None otherwise (no pointer,
+    or a pointer at an unapproved row: fail closed, no fallback)."""
     pointer = None
     for event in history.events:
         if event.kind in _POINTER_KINDS:
             pointer = event.version
-    return history.latest_version if pointer is None else pointer
+    return pointer if pointer in approved_versions(history) else None
+
+
+def active_version(history: SkillHistory) -> int:
+    """The version in use: the one named by the last ``draft_approved`` or
+    ``rolled_back`` event, and only when it has its own ``draft_approved``
+    event. There is no "latest row" fallback: a history without such a
+    version raises ``SkillLifecycleError`` (as does a non-history)."""
+    if type(history) is not SkillHistory:
+        raise SkillLifecycleError("history must be a SkillHistory")
+    version = _active(history)
+    if version is None:
+        raise SkillLifecycleError(f"skill {history.skill_id} has no approved active version")
+    return version
 
 
 def active_skill(history: SkillHistory) -> Skill:
@@ -594,7 +617,8 @@ def active_skill(history: SkillHistory) -> Skill:
 
 def usable_skill(history: SkillHistory) -> Skill | None:
     """The record SKCORE/SKMATCH may run: the active version, or None for a
-    deleted or disabled skill.
+    deleted or disabled skill and for one without an approved active version
+    (a row with no ``draft_approved`` event of its own is never run).
 
     A stale skill is returned (S12: revalidation is a normal, approved run);
     the caller still reads ``status(history)`` and never uses a stale skill
@@ -605,7 +629,8 @@ def usable_skill(history: SkillHistory) -> Skill | None:
         raise SkillLifecycleError("history must be a SkillHistory")
     if status(history) in (SkillStatus.DELETED, SkillStatus.DISABLED):
         return None
-    return history.get(active_version(history))
+    version = _active(history)
+    return None if version is None else history.get(version)
 
 
 # -- events to append ------------------------------------------------------
@@ -616,7 +641,8 @@ def rollback_event(history: SkillHistory, target_version: int, now: str) -> Skil
 
     Only the pointer moves: no version is rewritten or removed. Refused
     (``SkillLifecycleError``) for a non-history, a deleted skill, an unknown
-    version and the version already active.
+    version, a version without its own ``draft_approved`` event and the
+    version already active.
     """
     if type(history) is not SkillHistory:
         raise SkillLifecycleError("history must be a SkillHistory")
@@ -624,7 +650,9 @@ def rollback_event(history: SkillHistory, target_version: int, now: str) -> Skil
         raise SkillLifecycleError("a deleted skill cannot be rolled back")
     _check_version(target_version, "target_version")
     history.get(target_version)
-    if target_version == active_version(history):
+    if target_version not in approved_versions(history):
+        raise SkillLifecycleError(f"version {target_version} was never approved")
+    if target_version == _active(history):
         raise SkillLifecycleError(f"version {target_version} is already the active version")
     return SkillEvent(
         skill_id=history.skill_id,

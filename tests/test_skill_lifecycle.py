@@ -505,9 +505,13 @@ class RollbackTests(unittest.TestCase):
         hist = history(events=(approved(1), approved(2), event(K.ROLLED_BACK, 1), approved(3)))
         self.assertEqual(active_version(hist), 3)
 
-    def test_without_pointer_events_the_latest_version_is_active(self):
-        self.assertEqual(active_version(history()), 3)
-        self.assertEqual(active_skill(history()).version, 3)
+    def test_without_pointer_events_no_version_is_active(self):
+        # No "latest row" fallback: a version is active only with its own draft_approved.
+        with self.assertRaises(SkillLifecycleError):
+            active_version(history())
+        with self.assertRaises(SkillLifecycleError):
+            active_skill(history())
+        self.assertIsNone(usable_skill(history()))
 
     def test_rollback_to_an_unknown_version_is_refused(self):
         hist = history(events=(approved(3),))
@@ -527,7 +531,9 @@ class RollbackTests(unittest.TestCase):
 
     def test_rollback_to_the_active_version_is_refused(self):
         with self.assertRaises(SkillLifecycleError):
-            rollback_event(history(events=(event(K.ROLLED_BACK, 2),)), 2, NOW)
+            rollback_event(
+                history(events=(approved(2), approved(3), event(K.ROLLED_BACK, 2))), 2, NOW
+            )
 
     def test_rollback_refuses_a_non_history(self):
         with self.assertRaises(SkillLifecycleError):
@@ -824,25 +830,29 @@ class ActiveVersionStaleTests(unittest.TestCase):
 
 class UsableSkillTests(unittest.TestCase):
     def test_usable_skill_is_the_active_version_of_an_active_or_stale_skill(self):
-        for events in ((), (approved(2),), (fail(3), fail(3), fail(3))):
+        for events in ((approved(3),), (approved(2),), (approved(3), fail(3), fail(3), fail(3))):
             hist = history(events=events)
             with self.subTest(events=events):
                 self.assertEqual(usable_skill(hist), active_skill(hist))
-        self.assertEqual(usable_skill(history(events=(event(K.ROLLED_BACK, 1),))).version, 1)
+        rolled = (approved(1), approved(3), event(K.ROLLED_BACK, 1))
+        self.assertEqual(usable_skill(history(events=rolled)).version, 1)
+        self.assertIsNone(usable_skill(history(events=(event(K.ROLLED_BACK, 1),))))
 
     def test_a_deleted_or_disabled_skill_is_not_usable(self):
         for events in (
-            (event(K.DELETED),),
-            (event(K.DELETED), event(K.ENABLED)),
-            (event(K.DISABLED),),
-            (event(K.ENABLED), event(K.DISABLED)),
+            (approved(3), event(K.DELETED)),
+            (approved(3), event(K.DELETED), event(K.ENABLED)),
+            (approved(3), event(K.DISABLED)),
+            (approved(3), event(K.ENABLED), event(K.DISABLED)),
         ):
             hist = history(events=events)
             with self.subTest(events=events):
                 self.assertIsNone(usable_skill(hist))
                 # active_skill stays a display lookup.
                 self.assertEqual(active_skill(hist).version, 3)
-        self.assertIsNotNone(usable_skill(history(events=(event(K.DISABLED), event(K.ENABLED)))))
+        self.assertIsNotNone(
+            usable_skill(history(events=(approved(3), event(K.DISABLED), event(K.ENABLED))))
+        )
 
     def test_usable_skill_refuses_a_non_history(self):
         for bad in (None, three_versions(), (), make_skill()):
@@ -999,12 +1009,14 @@ class SkillHistoryTests(unittest.TestCase):
     def test_a_version_may_stay_in_its_project_or_become_global(self):
         v1 = make_skill(scope=PROJECT)
         for scope in (PROJECT, GLOBAL):
-            hist = SkillHistory(versions=(v1, self.project_version(scope)), events=())
+            hist = SkillHistory(versions=(v1, self.project_version(scope)), events=(approved(2),))
             with self.subTest(scope=scope.kind):
                 self.assertEqual(active_skill(hist).scope, scope)
                 self.assertEqual(usable_skill(hist).scope, scope)
         # An unchanged global scope is read as it is.
-        hist = SkillHistory(versions=(make_skill(), self.project_version(GLOBAL)), events=())
+        hist = SkillHistory(
+            versions=(make_skill(), self.project_version(GLOBAL)), events=(approved(2),)
+        )
         self.assertEqual(usable_skill(hist).scope, GLOBAL)
 
     def test_a_global_version_may_not_move_into_a_project(self):

@@ -34,7 +34,9 @@ from jarvis.skill_lifecycle import (
     SkillEvent,
     SkillHistory,
     _check_scope_move,
+    _active,
     active_skill,
+    approved_versions,
     health,
     status,
 )
@@ -279,6 +281,11 @@ class SkillStore(SQLiteMemoryStore):
                 raise SkillStoreError("no such skill")
             if status(history) is SkillStatus.DELETED:
                 raise SkillStoreError("a deleted skill is final (D4)")
+            if (
+                event.kind is SkillEventKind.ROLLED_BACK
+                and event.version not in approved_versions(history)
+            ):
+                raise SkillStoreError("a rollback target needs its own draft_approved event")
             SkillHistory(versions=history.versions, events=history.events + (event,))
             self._insert_event(connection, event, actor)
 
@@ -292,6 +299,8 @@ class SkillStore(SQLiteMemoryStore):
         listed = []
         for history in histories.values():
             state = status(history)
+            if _active(history) is None:
+                continue  # no approved active version: nothing to show or run
             skill = active_skill(history)
             if state is not SkillStatus.DELETED and visible_in(skill.scope, project_id):
                 listed.append(SkillWithState(skill=skill, status=state, health=health(history)))
