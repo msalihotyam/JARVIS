@@ -42,6 +42,8 @@ V21_TABLES = {
     "memory_record_supersessions",
     CONVERSATION_GLOBAL_MEMORY_TOGGLES,
     "memory_capture_runs",
+    "memory_record_guard",
+    "memory_tombstones",
 }
 
 

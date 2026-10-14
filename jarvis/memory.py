@@ -182,6 +182,16 @@ from jarvis.memory_doctor import (
     RepairProposal,
 )
 from jarvis.memory_filter import classify_candidate_text
+from jarvis.memory_guard import (
+    REFUSE,
+    Provenance,
+    RecordGuard,
+    SessionTaint,
+    content_hash,
+    decide_admission,
+    instruction_likeness,
+    is_operational_preference,
+)
 from jarvis.schedules import ScheduleError, latest_occurrence, next_occurrence
 from jarvis.conversation import (
     CONVERSATION_ID,
@@ -821,6 +831,26 @@ CREATE TABLE IF NOT EXISTS memory_capture_runs (
     outcome TEXT NULL,
     counts TEXT NOT NULL DEFAULT '{}'
 );
+CREATE TABLE IF NOT EXISTS memory_record_guard (
+    record_id TEXT PRIMARY KEY REFERENCES memory_records(record_id),
+    provenance TEXT NOT NULL,
+    session_taint TEXT NOT NULL,
+    instruction_like TEXT NOT NULL DEFAULT '[]',
+    proposed_kind TEXT NOT NULL,
+    content_hash TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS memory_tombstones (
+    content_hash TEXT NOT NULL,
+    project_id TEXT NULL,
+    scope_kind TEXT NOT NULL CHECK (scope_kind IN ('project', 'global')),
+    reason TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    expires_at TEXT NULL,
+    CHECK ((scope_kind = 'project') = (project_id IS NOT NULL))
+);
+CREATE INDEX IF NOT EXISTS idx_memory_tombstones_hash
+    ON memory_tombstones(content_hash, project_id);
 """
 
 # V2.1 typed memory (above): every memory_record* table and the toggle table
@@ -915,6 +945,9 @@ MEMORY_V21_SCHEMA_OBJECTS = frozenset(
         "memory_record_supersessions",
         "conversation_global_memory_toggles",
         "memory_capture_runs",
+        "memory_record_guard",
+        "memory_tombstones",
+        "idx_memory_tombstones_hash",
     }
     | (
         {MEMORY_RECORDS_FTS}
@@ -1028,6 +1061,23 @@ class MemoryRecordRefused(ValueError):
     def __init__(self, category: str | None) -> None:
         self.category = category or "filter_error"
         super().__init__(f"memory record refused: {self.category}")
+
+
+class MemoryTombstoned(MemoryRecordRefused):
+    """A live tombstone in this scope blocks the guarded insert (I15).
+
+    Carries no text and no hash - only the fixed category.
+    """
+
+    def __init__(self) -> None:
+        super().__init__("tombstoned")
+
+
+#: Tombstone lifetimes by the event that writes them (I15); purge -> None.
+_TOMBSTONE_DAYS = {
+    MemoryRecordStatus.REJECTED: 180,
+    MemoryRecordStatus.RETRACTED: 365,
+}
 
 
 #: The only actor a consolidation plan is applied as (stored as text).
@@ -6617,7 +6667,9 @@ class SQLiteMemoryStore:
     # supersession in memory_record_supersessions. Nothing here issues an
     # UPDATE or DELETE against those tables.
 
-    def insert_record(self, record: MemoryRecord) -> MemoryRecordView:
+    def insert_record(
+        self, record: MemoryRecord, guard: RecordGuard | None = None
+    ) -> MemoryRecordView:
         """Insert one model/tool/import record plus its initial status event.
 
         Generic writers can never claim human provenance: an EXPLICIT_USER or
@@ -6625,7 +6677,14 @@ class SQLiteMemoryStore:
         records go through ``insert_explicit_user_record`` only. FACT/LESSON
         start APPROVED (automatic, undoable); every other kind and every
         IMPORT record starts PENDING until the user approves it.
+
+        With ``guard`` (I13-I15, I17) the store re-runs ``decide_admission``
+        itself - kind and status come from Core, never the caller - refuses a
+        live tombstone in this scope with ``MemoryTombstoned`` and writes the
+        guard row in the same transaction. ``guard=None`` is today's path.
         """
+        if guard is not None and type(guard) is not RecordGuard:
+            raise ValueError("guard must be a RecordGuard")
         if type(record) is not MemoryRecord:
             raise ValueError("record must be a MemoryRecord")
         if record.origin in (
@@ -6637,7 +6696,7 @@ class SQLiteMemoryStore:
             )
         if record.actor is MemoryRecordActor.USER:
             raise ValueError("insert_record refuses the USER actor")
-        return self._persist_record(record)
+        return self._persist_record(record, guard)
 
     def insert_explicit_user_record(
         self,
@@ -6673,7 +6732,9 @@ class SQLiteMemoryStore:
         )
         return self._persist_record(record)
 
-    def _persist_record(self, record: MemoryRecord) -> MemoryRecordView:
+    def _persist_record(
+        self, record: MemoryRecord, guard: RecordGuard | None = None
+    ) -> MemoryRecordView:
         """The one INSERT-only record path; filter and hygiene re-run here."""
         if type(record) is not MemoryRecord:
             raise ValueError("record must be a MemoryRecord")
@@ -6705,6 +6766,50 @@ class SQLiteMemoryStore:
             and stored.origin is not MemoryRecordOrigin.IMPORT
             else MemoryRecordStatus.PENDING
         )
+        guard_row = None
+        if guard is not None:
+            if guard.proposed_kind is not record.kind:
+                raise ValueError("guard proposed_kind must be the record's kind")
+            if (record.origin is MemoryRecordOrigin.IMPORT) != (
+                guard.provenance is Provenance.IMPORT
+            ):
+                raise ValueError("guard provenance import must match the import origin")
+            # Defense in depth: the store re-derives the instruction hits from
+            # the raw and stored text, hashes the stored text itself and
+            # decides kind and status - the caller's values only add hits.
+            hits = tuple(dict.fromkeys(
+                guard.instruction_like
+                + instruction_likeness(record.text)
+                + instruction_likeness(stored.text)
+            ))
+            admission = decide_admission(
+                stored.kind,
+                guard.provenance,
+                guard.session_taint,
+                hits,
+                stored.scope.kind,
+                stored.classification,
+                operational=is_operational_preference(stored.text),
+            )
+            if admission.status == REFUSE:
+                raise MemoryRecordRefused(admission.reason)
+            stored = replace(stored, kind=admission.final_kind)
+            if admission.expires_in_days is not None:
+                cap = datetime.fromisoformat(stored.created_at) + timedelta(
+                    days=admission.expires_in_days
+                )
+                if stored.expires_at is None or datetime.fromisoformat(stored.expires_at) > cap:
+                    stored = replace(stored, expires_at=cap.isoformat())
+            # The stricter of the admission and the guard-less default wins.
+            if admission.status is MemoryRecordStatus.PENDING:
+                status = MemoryRecordStatus.PENDING
+            guard_row = (
+                guard.provenance.value,
+                guard.session_taint.value,
+                json.dumps(list(hits)),
+                guard.proposed_kind.value,
+                content_hash(stored.text),
+            )
         project_id = stored.scope.project_id
         with self._connection(write=True) as connection:
             project_row = connection.execute(
@@ -6712,6 +6817,10 @@ class SQLiteMemoryStore:
             ).fetchone()
             if project_row is None or not project_row["active"]:
                 raise ValueError(f"Unknown or inactive project: {project_id}")
+            if guard_row is not None and self._tombstoned(
+                connection, guard_row[4], project_id
+            ):
+                raise MemoryTombstoned()
             # list_records shows legacy M1 items under their own id; one id, one item.
             if connection.execute(
                 "SELECT 1 FROM project_memory_items WHERE id = ?", (stored.record_id,)
@@ -6765,6 +6874,13 @@ class SQLiteMemoryStore:
                     utc_now(),
                 ),
             )
+            if guard_row is not None:
+                connection.execute(
+                    "INSERT INTO memory_record_guard (record_id, provenance, "
+                    "session_taint, instruction_like, proposed_kind, "
+                    "content_hash, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (stored.record_id, *guard_row, utc_now()),
+                )
             # Same transaction: a refused or failed insert leaves no index row.
             if memory_records_fts_available(connection):
                 connection.execute(
@@ -6879,6 +6995,91 @@ class SQLiteMemoryStore:
             "INSERT INTO memory_record_events (record_id, status, actor, "
             "reason, at) VALUES (?, ?, ?, ?, ?)",
             (record_id, status.value, actor.value, reason, utc_now()),
+        )
+        days = _TOMBSTONE_DAYS.get(status)
+        if days is not None:
+            # I15: hash only, in the record's own scope, same transaction.
+            # memory_records.scope_kind is always 'project' (schema CHECK).
+            record = connection.execute(
+                "SELECT text, project_id FROM memory_records WHERE record_id = ?",
+                (record_id,),
+            ).fetchone()
+            now = datetime.now(timezone.utc)
+            connection.execute(
+                "INSERT INTO memory_tombstones (content_hash, project_id, "
+                "scope_kind, reason, created_at, expires_at) "
+                "VALUES (?, ?, 'project', ?, ?, ?)",
+                (
+                    content_hash(record["text"]),
+                    record["project_id"],
+                    status.value,
+                    now.isoformat(),
+                    (now + timedelta(days=days)).isoformat(),
+                ),
+            )
+
+    @staticmethod
+    def _tombstoned(
+        connection: sqlite3.Connection, digest: str, project_id: str | None
+    ) -> bool:
+        """A live tombstone for ``digest`` in this project or global (I15).
+
+        Expired tombstones are ignored; an unreadable expiry counts as live.
+        """
+        now = datetime.now(timezone.utc)
+        for row in connection.execute(
+            "SELECT expires_at FROM memory_tombstones WHERE content_hash = ? "
+            "AND (project_id = ? OR project_id IS NULL)",
+            (digest, project_id),
+        ):
+            if row["expires_at"] is None:
+                return True
+            try:
+                if datetime.fromisoformat(row["expires_at"]) > now:
+                    return True
+            except (TypeError, ValueError):
+                return True
+        return False
+
+    def is_tombstoned(self, digest: str, project_id: str | None) -> bool:
+        """Read-only: whether a live tombstone blocks ``digest`` (a
+        ``memory_guard.content_hash``) in ``project_id``; global tombstones
+        apply to every project, ``None`` checks the global ones only."""
+        if type(digest) is not str:
+            raise ValueError("content hash must be a string")
+        if project_id is not None:
+            validate_project_id(project_id)
+        with self._connection() as connection:
+            return self._tombstoned(connection, digest, project_id)
+
+    def record_guard(self, record_id: str) -> RecordGuard | None:
+        """The record's guard row; a record without one reads as legacy,
+        an unknown record as None."""
+        validate_memory_record_id(record_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT r.kind, r.text, g.provenance, g.session_taint, "
+                "g.instruction_like, g.proposed_kind, g.content_hash "
+                "FROM memory_records r LEFT JOIN memory_record_guard g "
+                "ON g.record_id = r.record_id WHERE r.record_id = ?",
+                (record_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        if row["provenance"] is None:
+            return RecordGuard(
+                provenance=Provenance.LEGACY,
+                session_taint=SessionTaint.LEGACY,
+                instruction_like=(),
+                proposed_kind=MemoryRecordKind(row["kind"]),
+                content_hash=content_hash(row["text"]),
+            )
+        return RecordGuard(
+            provenance=Provenance(row["provenance"]),
+            session_taint=SessionTaint(row["session_taint"]),
+            instruction_like=tuple(json.loads(row["instruction_like"])),
+            proposed_kind=MemoryRecordKind(row["proposed_kind"]),
+            content_hash=row["content_hash"],
         )
 
     def current_status(self, record_id: str) -> MemoryRecordStatus | None:
