@@ -166,11 +166,18 @@ Item {
     // with single newlines turned into Markdown hard breaks, so a reply that
     // separates its lines with one newline still reads as separate lines. A
     // fenced code block is passed through untouched.
+    // SECEXFIL: an image is never fetched. Inline ![a](u) and reference ![a][r]
+    // become the inert text [image: a], so a reply cannot carry data out in an
+    // image URL; any other "![" left over (a shortcut ![a], a form the pattern
+    // does not take, an unfinished stream) loses its image opener.
     function displayMarkdown(raw) {
         var safe = String(raw).replace(/&/g, "&amp;").replace(/</g, "&lt;")
         var parts = safe.split(/(```[\s\S]*?```|```[\s\S]*$)/)
         for (var i = 0; i < parts.length; i++) {
             if (i % 2 === 1) continue
+            parts[i] = parts[i]
+                .replace(/!\[((?:[^\[\]]|\[[^\[\]]*\])*)\](?:\((?:[^()]|\([^()]*\))*\)|\[[^\[\]]*\])?/g, "[image: $1]")
+                .replace(/!\[/g, "!\\[")
             // A continuation line stays IN its paragraph: a line separator breaks
             // the line without opening a block, so it keeps the reading line
             // height instead of taking the gap that separates paragraphs.
