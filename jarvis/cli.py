@@ -7,7 +7,7 @@ from uuid import uuid4
 import json
 import math
 import sys
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -15,6 +15,7 @@ from jarvis.app import (
     EXIT_INTERNAL,
     EXIT_INVALID_INPUT,
     EXIT_NOT_FOUND,
+    EXIT_OK,
     EXIT_POLICY,
     MAX_TASK_JSON_BYTES,
     CommandResult,
@@ -36,6 +37,7 @@ from jarvis.app import (
     job_run_cancel_result,
     job_run_resolve_result,
     memory_add_result,
+    memory_doctor_result,
     memory_list_result,
     memory_retire_result,
     project_create_result,
@@ -425,6 +427,17 @@ def _build_parser() -> _ArgumentParser:
     )
     memory_retire.add_argument("--project", required=True)
     memory_retire.add_argument("--item", required=True)
+    memory_doctor = memory_actions.add_parser(
+        "doctor", help="Memory health report (read-only); --repair applies one confirmed fix."
+    )
+    memory_doctor.add_argument("--project", help="One project; omitted = the whole store.")
+    memory_doctor.add_argument("--json", action="store_true", help="Print the report as JSON.")
+    doctor_action = memory_doctor.add_mutually_exclusive_group()
+    doctor_action.add_argument("--repair", metavar="FINDING", help="Apply this finding's repair.")
+    doctor_action.add_argument("--rebuild-fts", action="store_true",
+                               help="Re-create the memory search index.")
+    memory_doctor.add_argument("--confirm", metavar="FINDING",
+                               help="Repeat the finding id to confirm --repair.")
 
     # Sequential task chain (M11 S2): local-only, like ``project`` and
     # ``memory``. Declaring a chain performs no action, so these commands
@@ -491,9 +504,26 @@ def _read_task_json(source: str, *, label: str = "Task JSON") -> bytes:
     return payload
 
 
+@dataclass(frozen=True, slots=True)
+class _DoctorText:
+    """The read-only doctor report as plain lines (``--json`` keeps JSON)."""
+
+    payload: dict[str, Any]
+    exit_code: int
+
+    def render(self) -> str:
+        findings = self.payload["findings"]
+        lines = [f"memory doctor: {self.payload['record_count']} records, {len(findings)} findings"]
+        for finding in findings:
+            repair = finding["repair"]
+            hint = f"  (repair: {repair['action']})" if repair else ""
+            lines.append(f"{finding['severity']:<8}{finding['finding_id']}  {finding['summary_key']}{hint}")
+        return "\n".join(lines)
+
+
 def _dispatch_memory_command(
     settings: Settings, command: str, args: argparse.Namespace
-) -> CommandResult:
+) -> CommandResult | _DoctorText:
     memory = SQLiteMemoryStore(settings.memory_database)
     if command == "project":
         if getattr(args, "project_action", None) == "create":
@@ -542,11 +572,19 @@ def _dispatch_memory_command(
         )
     if getattr(args, "memory_action", None) == "retire":
         return memory_retire_result(memory, settings, args.project, args.item)
+    if getattr(args, "memory_action", None) == "doctor":
+        result = memory_doctor_result(
+            memory, settings, args.project,
+            repair=args.repair, confirm=args.confirm, rebuild_fts=args.rebuild_fts,
+        )
+        if args.json or args.repair is not None or args.rebuild_fts or result.exit_code != EXIT_OK:
+            return result
+        return _DoctorText(result.payload, result.exit_code)
     return failure_result(
         "memory",
         settings.permission_mode,
         ErrorCode.INVALID_TASK,
-        "'memory' requires the 'add', 'list' or 'retire' sub-command.",
+        "'memory' requires the 'add', 'list', 'retire' or 'doctor' sub-command.",
         EXIT_INVALID_INPUT,
     )
 

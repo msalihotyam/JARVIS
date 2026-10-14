@@ -224,6 +224,8 @@ from jarvis.conversation import (
     rehydrate,
 )
 from jarvis.memory import _RECORD_CURRENT_SQL, MemoryRecordApproval, MemoryRecordRefused, SQLiteMemoryStore
+from jarvis.memory_doctor import Finding, RepairAction, RepairProposal, diagnose
+from jarvis.memory_filter import classify_candidate_text
 from jarvis.planning import build_task_plan
 from jarvis.registry import ToolRegistry
 from jarvis.scheduler_runner import SchedulerRunner
@@ -2096,6 +2098,138 @@ def memory_retire_result(
         },
         EXIT_OK,
     )
+
+
+# --------------------------------------------------------------------------
+# V2.1b Memory Doctor (DOCREPAIR). The report is read-only and carries ids
+# and summary keys, never record text (a FILTER_VIOLATION finding is about
+# text that must not be shown). A repair is the user's explicit, confirmed
+# command, one finding at a time; the store re-checks everything.
+# --------------------------------------------------------------------------
+
+
+def _doctor_findings(memory: SQLiteMemoryStore, project_id: str | None):
+    if project_id is not None:
+        validate_project_id(project_id)
+        if memory.load_project(project_id) is None:
+            raise ValueError(f"Unknown project: {project_id}")
+    snapshot = memory.doctor_snapshot(project_id)
+    return snapshot, diagnose(
+        snapshot, is_storable=lambda text: classify_candidate_text(text).allowed
+    )
+
+
+def _finding_payload(finding: Finding) -> dict[str, Any]:
+    repair = finding.repair
+    return {
+        "finding_id": finding.finding_id,
+        "code": finding.code.value,
+        "severity": finding.severity.value,
+        "record_ids": list(finding.record_ids),
+        "summary_key": finding.summary_key,
+        "repair": None if repair is None else {
+            "action": repair.action.value, "record_ids": list(repair.record_ids),
+        },
+    }
+
+
+def memory_doctor_payload(memory: SQLiteMemoryStore, project_id: str | None = None) -> dict[str, Any]:
+    """Read-only Memory Doctor report for one project, or the whole store."""
+    try:
+        snapshot, findings = _doctor_findings(memory, project_id)
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "project_id": project_id,
+        "taken_at": snapshot.taken_at,
+        "record_count": len(snapshot.records),
+        "findings": [_finding_payload(finding) for finding in findings],
+    }
+
+
+def apply_memory_repair(
+    memory: SQLiteMemoryStore,
+    finding_id: str,
+    *,
+    project_id: str | None = None,
+    confirm: str | None = None,
+) -> dict[str, Any]:
+    """Apply the repair of ONE current finding the user confirmed.
+
+    ``confirm`` must repeat ``finding_id`` (the purge confirmation style).
+    The finding is diagnosed again from current state, so a stale or made-up
+    id is refused. The explicit-user proof is built HERE, from the confirmed
+    command (I2/I3). A SUPERSEDE of a larger conflict applies one
+    supersession per confirmation; the rest stays a finding."""
+    if type(finding_id) is not str or not finding_id:
+        return {"ok": False, "error": "A repair names one finding id."}
+    if confirm != finding_id:
+        return {"ok": False, "error": "Repair not confirmed: repeat the finding id to confirm."}
+    try:
+        snapshot, findings = _doctor_findings(memory, project_id)
+        finding = next((f for f in findings if f.finding_id == finding_id), None)
+        if finding is None or finding.repair is None:
+            raise ValueError(f"No current repairable finding {finding_id}.")
+        action = finding.repair.action
+        if action is RepairAction.REBUILD_FTS:
+            return {"ok": True, "finding_id": finding_id, "action": action.value,
+                    "indexed": memory.rebuild_fts()}
+        records = {state.record.record_id: state.record for state in snapshot.records}
+        ids = finding.repair.record_ids
+        if action is RepairAction.SUPERSEDE:
+            # The store supersedes only a record its successor already names;
+            # oldest link first, so a chain A <- B <- C resolves step by step.
+            ids = next(
+                ((keep, old) for old in reversed(ids) for keep in ids if records[keep].supersedes == old),
+                ids[:2],
+            )
+        target = ids[-1]  # the record whose status changes
+        status = memory.apply_doctor_repair(
+            RepairProposal(action, ids),
+            MemoryRecordApproval(records[target].scope.project_id, target, "user-doctor-repair"),
+        )
+    except (TypeError, ValueError) as exc:
+        return {"ok": False, "error": str(exc)}
+    return {
+        "ok": True,
+        "finding_id": finding_id,
+        "action": action.value,
+        "record_id": target,
+        "status": status.value,
+        "remaining": len(finding.repair.record_ids) - len(ids),
+    }
+
+
+def memory_doctor_result(
+    memory: SQLiteMemoryStore,
+    settings: Settings,
+    project_id: str | None = None,
+    *,
+    repair: str | None = None,
+    confirm: str | None = None,
+    rebuild_fts: bool = False,
+) -> CommandResult:
+    """CLI ``memory doctor``: the report, one confirmed repair, or an FTS
+    rebuild (index only, idempotent, so the command itself is the consent)."""
+    command = "memory-doctor"
+    if (confirm is not None and repair is None) or (rebuild_fts and project_id is not None):
+        return failure_result(
+            command, settings.permission_mode, ErrorCode.INVALID_TASK,
+            "--confirm needs --repair; --rebuild-fts rebuilds the whole index and takes no --project.",
+            EXIT_INVALID_INPUT,
+        )
+    if rebuild_fts:
+        payload = {"ok": True, "action": RepairAction.REBUILD_FTS.value, "indexed": memory.rebuild_fts()}
+    elif repair is not None:
+        payload = apply_memory_repair(memory, repair, project_id=project_id, confirm=confirm)
+    else:
+        payload = memory_doctor_payload(memory, project_id)
+    if not payload.pop("ok"):
+        return failure_result(
+            command, settings.permission_mode, ErrorCode.INVALID_TASK, payload["error"], EXIT_INVALID_INPUT
+        )
+    return CommandResult({"command": command, **payload}, EXIT_OK)
 
 
 # --------------------------------------------------------------------------
@@ -4250,6 +4384,14 @@ class JarvisApp:
             MemoryRecordStatus.APPROVED,
             lambda: self.memory.undo(record_id, MemoryRecordActor.USER),
         )
+
+    def memory_doctor_payload(self, project_id: str | None = None) -> dict[str, Any]:
+        return memory_doctor_payload(self.memory, project_id)
+
+    def apply_memory_repair(
+        self, finding_id: str, *, project_id: str | None = None, confirm: str | None = None
+    ) -> dict[str, Any]:
+        return apply_memory_repair(self.memory, finding_id, project_id=project_id, confirm=confirm)
 
     def remember_message(self, conversation_id: str, message_id: str, kind: str = "fact") -> dict[str, Any]:
         """'Hatırla': the user's click stores one message as an EXPLICIT_USER
