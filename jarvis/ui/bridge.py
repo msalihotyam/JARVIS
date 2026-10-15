@@ -512,6 +512,8 @@ class Bridge(QObject):
         self._task_detail: list[dict] = []
         self._jobs: list[dict] = []
         self._memory: list[dict] = []
+        self._skills: list[dict] = []
+        self._pending_drafts: list[dict] = []
         self._projects: list[str] = []
         self._focus_mode = False
         self._edit_mode = False
@@ -4856,6 +4858,151 @@ class Bridge(QObject):
                 self._say(entry["kind"], entry["text"])
         self.dataChanged.emit()
 
+    # -- V2.2 S4: skills (pass-through) ------------------------------------------
+    #
+    # The page's rows and every user action run the app's skill API on the
+    # worker. The bridge decides nothing: the flag (S4), the filter (S7), the
+    # scope (S8) and every refusal are the app's. Each action is one user
+    # click, sent back with the project its row was read in; nothing here
+    # approves, trusts or remembers anything on its own (S1/S5). A refusal
+    # lands in the feed, then the rows are read again.
+
+    skillsChanged = Signal()
+
+    @Property("QVariantList", notify=skillsChanged)
+    def skills(self) -> list:
+        return list(self._skills)
+
+    @Property("QVariantList", notify=skillsChanged)
+    def pendingDrafts(self) -> list:
+        return list(self._pending_drafts)
+
+    @Property(bool, notify=stateChanged)
+    def skillsEnabled(self) -> bool:
+        return self._config.get("skills_enabled") is True and not self._config_refused()
+
+    @Slot()
+    def refreshSkills(self) -> None:
+        records = self.backend.project_records()
+        names = {str(p.get("id")): str(p.get("name") or "") for p in records}
+        active = [str(p.get("id")) for p in records if p.get("active")]
+        self._run("skills", lambda: self.backend.skills_overview(active),
+                  lambda payload: self._set_skills(payload, names))
+
+    @staticmethod
+    def _skill_text(record: dict) -> dict:
+        return {"steps": [str(step.get("action")) for step in record.get("steps") or []],
+                "inputs": [str(i.get("name")) + (": " + str(i["description"]) if i.get("description") else "")
+                           for i in record.get("inputs") or []],
+                "checks": [str(check) for check in record.get("checks") or []]}
+
+    def _set_skills(self, payload: Any, projects: dict[str, str]) -> None:
+        scopes = payload.get("scopes") if isinstance(payload, dict) else None
+        if not isinstance(scopes, list):
+            self._skill_refused(payload)
+            scopes = []
+        found: list[tuple[str, dict]] = []
+        drafts: list[dict] = []
+        refused: dict[str, dict] = {}     # one line per distinct refusal, not one per project
+        for scope in scopes:
+            pid = scope["project_id"] or ""
+            for answer in [scope["list"], *scope["skills"]]:
+                if answer.get("ok") is not True:
+                    refused.setdefault(str(answer.get("error")), answer)
+            found += [(pid, a["skill"]) for a in scope["skills"] if a.get("ok") is True]
+            seen = {d["id"] for d in drafts}
+            drafts += [{"id": d["draft_id"], "project_id": pid, "name": d["name"], "summary": d["summary"],
+                        "scope": d["scope"]["kind"], "project_name": projects.get(d["scope"]["project_id"] or "", ""),
+                        "reason": d["reason"], "origin": d["provenance"]["origin"],
+                        "parent_version": d["provenance"]["parent_version"] or 0, **self._skill_text(d)}
+                       for d in scope["drafts"].get("drafts", []) if d["draft_id"] not in seen]
+        names = {s["skill_id"]: s["name"] for _, s in found}
+        self._skills = [
+            {"id": s["skill_id"], "project_id": pid, "name": s["name"], "scope": s["scope"]["kind"],
+             "project_name": projects.get(s["scope"]["project_id"] or "", ""), "version": s["version"],
+             "versions": list(s["versions"]), "status": s["status"], "uses": s["health"]["use_count"],
+             "last_success": s["health"]["last_success_at"] or "", "failures": s["health"]["failure_count"],
+             "origin": s["provenance"]["origin"], "parent_name": names.get(s["provenance"]["parent_skill_id"] or "", ""),
+             "parent_version": s["provenance"]["parent_version"] or 0, **self._skill_text(s)}
+            for pid, s in found
+        ]
+        self._pending_drafts = drafts
+        for answer in refused.values():
+            self._skill_refused(answer)
+        self.skillsChanged.emit()
+
+    def _skill_refused(self, answer: Any) -> None:
+        """A refusal is said once in the feed; the flag being off is the page's own note, not an error."""
+        if not isinstance(answer, dict) or answer.get("skills_disabled") is True:
+            return
+        error = answer.get("error")
+        if not isinstance(error, dict):   # the app's own refusal words (its plain-dict answers)
+            error = {"code": "invalid_task", "message": str(error or "refused")}
+        for entry in error_entries(error):
+            self._say(entry["kind"], entry["text"])
+
+    def _skill_action(self, method: str, *args: Any) -> None:
+        # Its own kind per click (like the memory actions): no answer is dropped behind a later one.
+        self._run(f"skill-action:{uuid4().hex}", lambda: self.backend.skill_action(method, *args), self._skill_done)
+
+    def _skill_done(self, payload: Any) -> None:
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            self._skill_refused(payload)
+        self.refreshSkills()
+
+    @staticmethod
+    def _scope_of(rows: list[dict], row_id: str) -> str | None:
+        """The project a row was read in; an unknown id goes with none and the app refuses it."""
+        return next((row["project_id"] or None for row in rows if row["id"] == row_id), None)
+
+    @Slot(str, "QVariantMap")
+    def skillEdit(self, skill_id: str, payload: Any) -> None:
+        self._skill_action("skill_edit", str(skill_id), dict(payload or {}), self._scope_of(self._skills, str(skill_id)))
+
+    @Slot(str, bool)
+    def skillSetEnabled(self, skill_id: str, on: bool) -> None:
+        self._skill_action("skill_set_enabled", str(skill_id), bool(on), self._scope_of(self._skills, str(skill_id)))
+
+    @Slot(str)
+    def skillDelete(self, skill_id: str) -> None:
+        self._skill_action("skill_delete", str(skill_id), self._scope_of(self._skills, str(skill_id)))
+
+    @Slot(str, int)
+    def skillRollback(self, skill_id: str, version: int) -> None:
+        self._skill_action("skill_rollback", str(skill_id), int(version), self._scope_of(self._skills, str(skill_id)))
+
+    @Slot(str, str)
+    def draftApprove(self, draft_id: str, scope: str) -> None:
+        """The user's Save click on one draft card (S5); scope is the card's "same" or "global"."""
+        self._skill_action("draft_approve", str(draft_id), str(scope) or None, None,
+                           self._scope_of(self._pending_drafts, str(draft_id)))
+
+    @Slot(str)
+    def draftReject(self, draft_id: str) -> None:
+        self._skill_action("draft_reject", str(draft_id), self._scope_of(self._pending_drafts, str(draft_id)))
+
+    @Slot(str, str)
+    def suppressTaskKind(self, task_kind: str, scope: str) -> None:
+        self._skill_action("suppress", str(task_kind) or None, str(scope))
+
+    @Slot(bool)
+    def enableSkills(self, on: bool) -> None:
+        def done(payload: Any) -> None:
+            if not isinstance(payload, dict) or payload.get("ok") is not True:
+                self._skill_refused(payload)
+            self.refreshConfig()
+            self.refreshSkills()
+        self._run("skills-enable", lambda: self.backend.skills_set_enabled(bool(on)), done)
+
+    @Slot(str, str)
+    def declineSkill(self, session_id: str, task_id: str) -> None:
+        """D6: the announced skill's 'Kullanma' - the task runs on without it (Core may refuse)."""
+        if self._busy or not self._open_owner_of(str(session_id)):
+            return
+        self._session_id = str(session_id)
+        self._run("task", lambda: self.backend.skill_decline(str(session_id), str(task_id)),
+                  self._delivered(self._apply_run), executing=True)
+
     # -- V2.1a M4: memory records, approvals and 'Hatırla' (pass-through) -----
     #
     # Each slot runs the app's method on the worker and delivers its answer
@@ -5647,9 +5794,14 @@ class Bridge(QObject):
     def setPage(self, page: str) -> None:
         self._recheck_open()                    # N2 first; then the page asked for
         if page == "projects":
-            if not self._page_override:
+            if self._page_override != "projects":
                 self._page_override = "projects"
                 self.refreshProjects()
+            self.prefsChanged.emit()
+            return
+        if page == "skills":    # not persisted: an older build never reads a page it does not know
+            self._page_override = "skills"
+            self.refreshSkills()
             self.prefsChanged.emit()
             return
         if page in PAGES:

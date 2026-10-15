@@ -4792,6 +4792,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Yeni sohbet</translation>
     </message>
     <message>
+        <source>Skills</source>
+        <translation>Beceriler</translation>
+    </message>
+    <message>
         <source>1 conversation</source>
         <translation>1 sohbet</translation>
     </message>

@@ -703,3 +703,33 @@ class Backend:
 
     def import_history_cancel(self, plan_id: str) -> dict:
         return self._plain("import-cancel", lambda app: app.import_history_cancel(plan_id))
+
+    # -- V2.2 S4: skills, pass-through (the app decides the flag, scope and every refusal)
+
+    SKILL_ACTIONS = frozenset({"skill_edit", "skill_set_enabled", "skill_delete", "skill_rollback",
+                               "draft_approve", "draft_reject", "suppress"})
+
+    def skills_overview(self, project_ids: list[str]) -> dict:
+        """Each skill (as skill_get answers it) and pending draft visible globally or in one of
+        ``project_ids``, through one app; each keeps the project it was read in (S8)."""
+        def collect(app: JarvisApp) -> dict:
+            scopes, seen = [], set()
+            for pid in (None, *project_ids):
+                listed = app.skills_list(pid)
+                ids = [s["skill_id"] for s in listed.get("skills", []) if s["skill_id"] not in seen]
+                seen.update(ids)
+                scopes.append({"project_id": pid, "list": listed, "drafts": app.drafts_pending(pid),
+                               "skills": [app.skill_get(i, None, pid) for i in ids]})
+            return {"ok": True, "scopes": scopes}
+        return self._plain("skills", collect)
+
+    def skill_action(self, method: str, *args: Any) -> dict:
+        if method not in self.SKILL_ACTIONS:
+            raise ValueError(f"not a skill action: {method}")
+        return self._plain(f"skills-{method}", lambda app: getattr(app, method)(*args))
+
+    def skills_set_enabled(self, on: bool) -> dict:
+        return self._plain("skills-enable", lambda app: app.skills_set_enabled(on, self.store))
+
+    def skill_decline(self, session_id: str, task_id: str) -> dict:
+        return self._call("skill-decline", lambda s: self._app(s).skill_decline(session_id, task_id))

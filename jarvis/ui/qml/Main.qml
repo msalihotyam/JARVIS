@@ -314,7 +314,7 @@ Window {
                 id: pageLoader
                 anchors.fill: parent
                 property string current: bridge.page
-                sourceComponent: current === "tasks" ? tasksPage : current === "automations" ? automationsPage : current === "memory" ? memoryPage : current === "history" ? historyPage : current === "projects" ? projectsPage : homePage
+                sourceComponent: current === "tasks" ? tasksPage : current === "automations" ? automationsPage : current === "memory" ? memoryPage : current === "history" ? historyPage : current === "projects" ? projectsPage : current === "skills" ? skillsPage : homePage
                 onCurrentChanged: pageIn.restart()
                 opacity: 1
                 transform: Translate { id: pageSlide; y: 0 }
@@ -343,6 +343,13 @@ Window {
         Component { id: memoryPage; MemoryPage {} }
         Component { id: historyPage; HistoryPage {} }
         Component { id: projectsPage; ProjectsPage {} }
+        // V2.2 S4: the saved skills. The page is a pure view; every change is one bridge slot (the
+        // app decides). Edit has no editing surface yet, so editRequested is left unconnected.
+        Component { id: skillsPage; SkillsPage { skills: bridge.skills; skillsEnabled: bridge.skillsEnabled
+            onEnabledToggled: function(id, on) { bridge.skillSetEnabled(id, on) }
+            onDeleteRequested: function(id) { bridge.skillDelete(id) }
+            onRollbackRequested: function(id, version) { bridge.skillRollback(id, version) }
+            onEnableSkillsRequested: bridge.enableSkills(true) } }
 
         // E1': the right column's inner edge (Edit Mode): it only narrows, with a
         // live px label; the width is remembered on release.
