@@ -649,6 +649,21 @@ class Backend:
     def remember_message(self, conversation_id: str, message_id: str) -> dict:
         return self._plain("memory-remember", lambda app: app.remember_message(conversation_id, message_id))
 
+    # SECQMLUI: the approval batch and the two-step purge, pass-through (SECAPPUI decides).
+
+    def set_memory_batch_listener(self, listener: Callable[[str, dict], None]) -> None:
+        """The window's batch listener; capture jobs call it after each SessionEnd / PreCompact / idle run."""
+        app_module.MEMORY_TRIGGERS.batch_listener = listener
+
+    def memory_approval_batch(self, conversation_id: str) -> dict:
+        return self._plain("memory-batch", lambda app: app.memory_approval_batch(conversation_id))
+
+    def request_memory_purge(self, record_ids: list[str]) -> dict:
+        return self._plain("memory-purge", lambda app: app.request_memory_purge(record_ids))
+
+    def confirm_memory_purge(self, token: str) -> dict:
+        return self._plain("memory-purge", lambda app: app.confirm_memory_purge(token))
+
     def context_usage(self, conversation_id: str) -> dict:
         return self._plain("context-usage", lambda app: app.context_usage_payload(conversation_id))
 

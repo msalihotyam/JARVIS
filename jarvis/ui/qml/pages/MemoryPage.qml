@@ -25,7 +25,21 @@ SecondaryPage {
         var active = bridge.projectRecords.filter(function(p) { return p.active })
         return active.length ? active[0].id : ""
     }
-    readonly property var pending: records.filter(function(r) { return r.status === "pending" && ["decision", "rule", "preference"].indexOf(r.kind) >= 0 })
+    // SECQMLUI: the last session's approval batch (the app's, whole): its pending candidates with
+    // risk badges and its auto-saved records with Undo. Shown once, above the plain pending list.
+    readonly property var batch: bridge.memoryBatch
+    readonly property var batchItems: (batch.pending || []).concat(batch.auto_saved || [])
+    readonly property var batchIds: batchItems.map(function(r) { return r.record_id })
+    readonly property var pending: records.filter(function(r) { return r.status === "pending" && ["decision", "rule", "preference"].indexOf(r.kind) >= 0 && batchIds.indexOf(r.record_id) < 0 })
+    // Purge, step 1's answer (the app's set, still_held_by and its token) while the dialog is open.
+    property var purgeAsk: ({})
+    function askPurge(id) { bridge.requestMemoryPurge([id]) }
+    function purgeLine(id) {
+        var r = page.records.concat(page.batchItems).find(function(x) { return x.record_id === id })
+        if (!r) return qsTr("An older version or a record derived from it")
+        return i18n.word("memory_record_kind", r.kind || "") + ": " + (r.text_withheld || !r.text ? qsTr("a sensitive record, its text not shown") : r.text)
+    }
+    function reloadAll() { bridge.refreshMemory(page.project, page.includeInactive); page.loadRecords(); if (page.batch.conversation_id) bridge.refreshMemoryBatch(page.batch.conversation_id) }
     readonly property var replaced: records.filter(function(r) { return r.status === "superseded" })
     onScopeChanged: loadRecords()
     function loadRecords() { if (page.scope !== "") bridge.memoryRecords(page.scope, {}) }
@@ -40,12 +54,44 @@ SecondaryPage {
     Connections {
         target: bridge
         function onMemoryRecordsDone(answer) { if (answer.ok && answer.project_id === page.scope) page.records = answer.records || [] }
-        function onMemoryRecordActionDone(answer) { if (answer.project_id === page.scope) page.loadRecords() }
+        function onMemoryRecordActionDone(answer) {
+            if (answer.project_id === page.scope) page.loadRecords()
+            if (page.batch.conversation_id) bridge.refreshMemoryBatch(page.batch.conversation_id)
+        }
+        function onMemoryPurgeRequested(answer) { if (answer.ok) { page.purgeAsk = answer; purgeDialog.open() } }
+        function onMemoryPurgeDone(answer) { if (answer.ok) page.reloadAll() }
         function onMemoryRepairDone(answer) { if (answer.ok) page.loadRecords() }
         // Imported memories land PENDING: the approval list below shows them.
         function onImportRunDone(answer) { if (answer.ok) { bridge.refreshMemory(page.project, page.includeInactive); page.loadRecords() } }
     }
     MemoryImportDialog { id: importDialog; objectName: "memoryImportDialog" }
+    // Purge, step 2: names what goes and the backups that still hold it; the confirm click hands
+    // the app's token back unchanged. Cancel lets the token expire unused.
+    JarvisDialog {
+        id: purgeDialog
+        objectName: "memoryPurgeDialog"
+        danger: true
+        label: qsTr("Memory")
+        title: qsTr("Delete permanently?")
+        initialFocus: purgeCancel
+        confirmItem: purgeConfirm
+        onClosed: page.purgeAsk = ({})
+        Text { width: parent ? parent.width : 0; wrapMode: Text.Wrap; color: Theme.text; font: Theme.pageRow
+               text: qsTr("These records are deleted from memory for good, older versions and records derived from them included:") }
+        Repeater { model: page.purgeAsk.record_ids || []
+            Text { objectName: "memoryPurgeItem"; width: parent ? parent.width : 0; wrapMode: Text.Wrap; textFormat: Text.PlainText; text: "• " + page.purgeLine(modelData); color: Theme.text; font: Theme.pageRow } }
+        Text { objectName: "memoryPurgeBackupsNote"; width: parent ? parent.width : 0; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.pageMeta
+               text: (page.purgeAsk.still_held_by || []).length > 0
+                     ? qsTr("These backups still hold the record. They are not changed; delete them yourself if it must go everywhere:")
+                     : qsTr("No backup holds these records.") }
+        Repeater { model: page.purgeAsk.still_held_by || []
+            Text { objectName: "memoryPurgeBackup"; width: parent ? parent.width : 0; wrapMode: Text.WrapAnywhere; textFormat: Text.PlainText; text: "• " + modelData; color: Theme.textMuted; font: Theme.pageMeta } }
+        buttons: [
+            ActionButton { id: purgeCancel; objectName: "memoryPurgeCancel"; label: qsTr("Cancel"); height: 36; onClicked: purgeDialog.close() },
+            ActionButton { id: purgeConfirm; objectName: "memoryPurgeConfirm"; label: qsTr("Delete permanently"); danger: true; primary: true; height: 36
+                           onClicked: { bridge.confirmMemoryPurge(page.purgeAsk.token || ""); purgeDialog.close() } }
+        ]
+    }
 
     Column {
         anchors.fill: parent
@@ -62,6 +108,17 @@ SecondaryPage {
         }
         // V2.1b: the Memory Doctor's findings for the shown project, with confirmed one-at-a-time repairs.
         MemoryDoctorPanel { objectName: "memoryDoctor"; scope: page.scope }
+        Column { objectName: "memoryBatch"; width: parent.width; spacing: 8; visible: page.batchItems.length > 0
+            Text { text: qsTr("FROM YOUR LAST SESSION"); color: Theme.textLabel; font: Theme.pageSection }
+            Repeater {
+                model: page.batchItems
+                MemoryApprovalCard { objectName: "memoryBatchCard"; width: parent.width; record: modelData; source: page.sourceOf(modelData)
+                    onApprove: bridge.approveMemoryRecord(modelData.project_id || "", modelData.record_id)
+                    onReject: bridge.rejectMemoryRecord(modelData.project_id || "", modelData.record_id)
+                    onUndo: bridge.undoMemoryRecord(modelData.project_id || "", modelData.record_id)
+                    onPurge: page.askPurge(modelData.record_id) }
+            }
+        }
         Column { objectName: "memoryPending"; width: parent.width; spacing: 8; visible: page.scope !== ""
             Text { text: qsTr("AWAITING YOUR APPROVAL"); color: Theme.textLabel; font: Theme.pageSection }
             Text { objectName: "memoryPendingEmpty"; visible: page.pending.length === 0; width: parent.width; wrapMode: Text.Wrap
@@ -71,7 +128,8 @@ SecondaryPage {
                 MemoryApprovalCard { objectName: "memoryApprovalCard"; width: parent.width; record: modelData
                     source: page.sourceOf(modelData); replaces: modelData.supersedes ? page.textOf(modelData.supersedes) : ""
                     onApprove: bridge.approveMemoryRecord(page.scope, modelData.record_id)
-                    onReject: bridge.rejectMemoryRecord(page.scope, modelData.record_id) }
+                    onReject: bridge.rejectMemoryRecord(page.scope, modelData.record_id)
+                    onPurge: page.askPurge(modelData.record_id) }
             }
         }
         // Replaced records stay visible with their chain (I8: nothing is deleted).
@@ -80,7 +138,8 @@ SecondaryPage {
             Repeater {
                 model: page.replaced
                 MemoryApprovalCard { objectName: "memoryChain"; width: parent.width; record: modelData
-                    source: page.sourceOf(modelData); replacedBy: page.newerOf(modelData.record_id) }
+                    source: page.sourceOf(modelData); replacedBy: page.newerOf(modelData.record_id)
+                    onPurge: page.askPurge(modelData.record_id) }
             }
         }
         // K6: the honest empty states - no project to hold memory, or a project with none yet.

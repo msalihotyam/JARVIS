@@ -551,6 +551,13 @@ class Bridge(QObject):
         self._memory_read_id = ""
         self.conversationChanged.connect(self._refresh_conversation_memory)
         self._refresh_conversation_memory()
+        # SECQMLUI: the last session-end / compaction approval batch, as the app sent it
+        # (its capture thread calls the listener; the answer is queued to this thread).
+        self._memory_batch: dict[str, Any] = {}
+        self._memoryBatchArrived.connect(self._set_memory_batch, Qt.QueuedConnection)
+        listen = getattr(self.backend, "set_memory_batch_listener", None)
+        if callable(listen):
+            listen(self._memoryBatchArrived.emit)
         # DFDRAFT: every conversation's own unsent draft - the open one's live
         # (its text as the composer reports it, its context above), the others
         # parked here by key; written to the preferences' drafts file shortly
@@ -4875,6 +4882,50 @@ class Bridge(QObject):
                 self._say(entry["kind"], entry["text"])
             answer.update(ok=False, error=render(self._redacted(entries[0]["text"])))
         signal.emit(answer)
+
+    # -- SECQMLUI: the approval batch, Undo and the two-step purge (pass-through)
+    #
+    # The batch is the app's memory_approval_batch, whole (text redacted for
+    # display); its cards act through the record slots above (approve, reject,
+    # undo), so Core alone moves a status (I14). Purge: requestMemoryPurge
+    # answers the app's set, still_held_by and its Core token; the dialog's
+    # confirm click hands that token back to confirmMemoryPurge untouched.
+
+    _memoryBatchArrived = Signal(str, "QVariantMap")
+    memoryBatchChanged = Signal()
+    memoryPurgeRequested = Signal("QVariantMap")
+    memoryPurgeDone = Signal("QVariantMap")
+
+    @Property("QVariantMap", notify=memoryBatchChanged)
+    def memoryBatch(self) -> dict:
+        return dict(self._memory_batch)
+
+    @Slot(str)
+    def refreshMemoryBatch(self, conversation_id: str) -> None:
+        conversation_id = str(conversation_id)
+        self._run("memory-batch", lambda: self.backend.memory_approval_batch(conversation_id),
+                  lambda payload: self._set_memory_batch(conversation_id, payload))
+
+    def _set_memory_batch(self, conversation_id: str, payload: Any) -> None:
+        if not (isinstance(payload, dict) and payload.get("ok") is True):
+            return   # a batch that could not be read changes nothing; the records stay on the page
+        self._memory_batch = {**payload, "conversation_id": str(conversation_id), **{
+            key: [{**item, "text": redact_text(str(item.get("text") or ""))}
+                  for item in payload.get(key) or [] if isinstance(item, dict)]
+            for key in ("pending", "auto_saved")}}
+        self.memoryBatchChanged.emit()
+
+    @Slot("QVariantList")
+    def requestMemoryPurge(self, record_ids: Any) -> None:
+        request = {"requested": [str(record_id) for record_id in record_ids or []]}
+        self._run(f"memory-purge:{uuid4().hex}", lambda: self.backend.request_memory_purge(request["requested"]),
+                  lambda payload: self._memory_answer(self.memoryPurgeRequested, request, payload))
+
+    @Slot(str)
+    def confirmMemoryPurge(self, token: str) -> None:
+        token = str(token)
+        self._run(f"memory-purge:{uuid4().hex}", lambda: self.backend.confirm_memory_purge(token),
+                  lambda payload: self._memory_answer(self.memoryPurgeDone, {}, payload))
 
     # -- V2.1a M4: context usage and the all-projects memory toggle (pass-through)
     #

@@ -2447,6 +2447,34 @@ yok</translation>
 <context>
     <name>MemoryApprovalCard</name>
     <message>
+        <source>Tainted session</source>
+        <translation>Kirli oturum</translation>
+    </message>
+    <message>
+        <source>Instruction-like</source>
+        <translation>Talimat benzeri</translation>
+    </message>
+    <message>
+        <source>Model-inferred</source>
+        <translation>Model çıkarımı</translation>
+    </message>
+    <message>
+        <source>Global</source>
+        <translation>Genel kapsam</translation>
+    </message>
+    <message>
+        <source>Sensitive</source>
+        <translation>Hassas</translation>
+    </message>
+    <message>
+        <source>Legacy</source>
+        <translation>Eski kayıt</translation>
+    </message>
+    <message>
+        <source>The text of a sensitive record is not shown here.</source>
+        <translation>Hassas bir kaydın metni burada gösterilmez.</translation>
+    </message>
+    <message>
         <source>Source: %1</source>
         <translation>Kaynak: %1</translation>
     </message>
@@ -2465,6 +2493,14 @@ yok</translation>
     <message>
         <source>Reject</source>
         <translation>Reddet</translation>
+    </message>
+    <message>
+        <source>Undo</source>
+        <translation>Geri Al</translation>
+    </message>
+    <message>
+        <source>Delete permanently…</source>
+        <translation>Kalıcı sil…</translation>
     </message>
 </context>
 <context>
@@ -2664,6 +2700,14 @@ yok</translation>
         <translation>Yükle</translation>
     </message>
     <message>
+        <source>An older version or a record derived from it</source>
+        <translation>Eski bir sürüm ya da ondan türetilmiş bir kayıt</translation>
+    </message>
+    <message>
+        <source>a sensitive record, its text not shown</source>
+        <translation>hassas bir kayıt, metni gösterilmiyor</translation>
+    </message>
+    <message>
         <source>No source conversation</source>
         <translation>Kaynak sohbet yok</translation>
     </message>
@@ -2672,12 +2716,40 @@ yok</translation>
         <translation>Bu projedeki bir sohbet</translation>
     </message>
     <message>
+        <source>Delete permanently?</source>
+        <translation>Kalıcı olarak silinsin mi?</translation>
+    </message>
+    <message>
+        <source>These records are deleted from memory for good, older versions and records derived from them included:</source>
+        <translation>Bu kayıtlar, eski sürümleri ve onlardan türetilen kayıtlar dahil, hafızadan kalıcı olarak silinir:</translation>
+    </message>
+    <message>
+        <source>These backups still hold the record. They are not changed; delete them yourself if it must go everywhere:</source>
+        <translation>Bu yedekler kaydı hâlâ içeriyor. Bunlar değiştirilmez; kaydın her yerden gitmesi gerekiyorsa onları kendiniz silin:</translation>
+    </message>
+    <message>
+        <source>No backup holds these records.</source>
+        <translation>Bu kayıtları tutan bir yedek yok.</translation>
+    </message>
+    <message>
+        <source>Cancel</source>
+        <translation>Vazgeç</translation>
+    </message>
+    <message>
+        <source>Delete permanently</source>
+        <translation>Kalıcı sil</translation>
+    </message>
+    <message>
         <source>Project memory is explicit reference data written only by you. It is shown as data: nothing here is an instruction to JARVIS.</source>
         <translation>Proje hafızası yalnızca sizin yazdığınız açık başvuru verisidir. Veri olarak gösterilir: buradaki hiçbir şey JARVIS için bir talimat değildir.</translation>
     </message>
     <message>
         <source>PROJECT</source>
         <translation>PROJE</translation>
+    </message>
+    <message>
+        <source>FROM YOUR LAST SESSION</source>
+        <translation>SON OTURUMUNUZDAN</translation>
     </message>
     <message>
         <source>AWAITING YOUR APPROVAL</source>
