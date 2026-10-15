@@ -2648,6 +2648,20 @@ kadar PENDING.
   veya `explicit_user` kayıt kanıtsız supersede edilmez.
 - Silme yok (I8): `memory_record*` tablolarında UPDATE/DELETE yoktur; her
   değişiklik bir olay veya supersession satırıdır.
+- Kalıcı silme istisnası (I16): `SQLiteMemoryStore.purge_records`
+  `memory_record*` tablolarındaki TEK DELETE'tir ve I8'in belgelenmiş
+  istisnasıdır (`rebuild_fts`'in yalnız-FTS silmesi ayrıca kalır). Yalnız
+  actor=USER ve Core'un ürettiği `PurgeConfirmation` ile çalışır; denetim
+  satırı yalnız purge_id, content_hash ve zamanı tutar, kalıcı mezar taşı
+  (expires_at NULL) yazılır. Purge supersession değildir: supersession geçmişi
+  korur, purge siler. Onay tam olarak önizlenen kümeyi onaylar: onay
+  `purge_preview(ids)["record_ids"]`'ten (zincir ve türetilmiş kayıtlar dahil)
+  üretilir; `purge_records` istenen ya da topladığı küme onaylanan kümeye
+  birebir eşit değilse (eksik ya da fazla) reddeder ve hiçbir şey silmez.
+  Onayın üretim yeri Core'un çizdiği purge diyaloğudur (SECAPPUI; henüz
+  bağlı değil, ürün kodunda `purge_records` çağıranı yok). "Core üretir"
+  kuralını tip kendisi zorlamaz: `purge_records` yalnız tip ve alan biçimini
+  denetler; kural bu tip denetimi ve inceleme ile korunur.
 
 **"Hiç saklanmaz" filtresi (`jarvis/memory_filter.py`):**
 `classify_candidate_text` -> `FilterVerdict`; deterministik, modelsiz.
