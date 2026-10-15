@@ -692,7 +692,6 @@ _SKILL_QUESTION_KEYS = ("needs_clarification", "clarification_question")
 _SKILL_OFFER_MESSAGE = "Bunu beceri olarak kaydedeyim mi?"
 #: A run is learned from only when everything in it was at most this sensitive.
 _SKILL_LEARN_CLASSES = (DataClassification.PUBLIC, DataClassification.INTERNAL)
-
 #: ``_with_typed_memory``'s default: the conversation is the session's link.
 _SESSION_CONVERSATION: Any = object()
 
