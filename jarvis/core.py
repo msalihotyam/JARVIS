@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+import difflib
 import hashlib
 import json
 import os
@@ -255,6 +256,7 @@ from jarvis.skill_types import (
     SkillOrigin,
     SkillRef,
     SkillStatus,
+    fold_token,
 )
 
 
@@ -729,6 +731,19 @@ _MEMORY_BLOCK_HEADER_TOKENS = ESTIMATOR.tokens(
 
 #: One sample value per draft input kind for the a6 plan dry run.
 _SKILL_SAMPLE_VALUES = {"url": "https://example.com/a", "email": "user@example.com", "path": "notes/a.md"}
+#: V2.2 SKEXPLICIT. The fixed reasons an explicit skill use is refused with;
+#: a refused use creates no session, no task and runs nothing.
+SKILL_REFUSED_OFF = "Beceriler kapalı; hiçbir şey çalıştırılmadı."
+SKILL_REFUSED_UNKNOWN = "Bu adla bir beceri yok; hiçbir şey çalıştırılmadı."
+SKILL_REFUSED_AMBIGUOUS = "Bu ad birden fazla beceriye uyuyor; hiçbir şey çalıştırılmadı."
+SKILL_REFUSED_SCOPE = "Bu beceri bu kapsamda kullanılamaz; hiçbir şey çalıştırılmadı."
+SKILL_REFUSED_STALE = (
+    "Bu beceri eskimiş; önce yeniden doğrulanması gerekir. Hiçbir şey çalıştırılmadı."
+)
+SKILL_REFUSED_UNAPPROVED = "Bu becerinin onaylı bir sürümü yok; hiçbir şey çalıştırılmadı."
+SKILL_REFUSED_DISABLED = "Bu beceri kapalı; hiçbir şey çalıştırılmadı."
+SKILL_REFUSED_UNPLANNABLE = "Bu beceri şu an çalıştırılamaz; hiçbir şey çalıştırılmadı."
+SKILL_REFUSED_SESSION = "Bu oturumda beceri başlatılamaz; hiçbir şey çalıştırılmadı."
 
 
 def _retrieved_item_characters(item: RetrievedMemoryItem) -> int:
@@ -6406,7 +6421,9 @@ class AgentCore:
         is taken whole. ``plan_steps`` re-validates every value.
         """
         answer = " ".join(str(task.preferences.get("clarification") or "").split())
-        text = "\n".join((task.objective, task.scope.target, answer))
+        # An explicit use's message is the command, never a value (SKEXPLICIT).
+        explicit = self._skill_state(task).get("explicit") is True
+        text = answer if explicit else "\n".join((task.objective, task.scope.target, answer))
         found: dict[str, list[str]] = {}
         for param in _find_params(text):
             bucket = found.setdefault(param.kind, [])
@@ -6479,7 +6496,10 @@ class AgentCore:
         Missing inputs are asked for as a normal clarification. A refused
         plan or chain runs the task without the skill.
         """
-        ident = self._skill_ident(skill, bool(self._skill_state(task).get("revalidate")))
+        prior = self._skill_state(task)
+        ident = self._skill_ident(skill, bool(prior.get("revalidate")))
+        if prior.get("explicit") is True:
+            ident["explicit"] = True
         try:
             chain = self._skill_chain(skill, self._skill_inputs(skill, task), session.project_id)
         except MissingInputsError as missing:
@@ -6533,8 +6553,34 @@ class AgentCore:
     def _skill_not_used(self, session: SessionState, task: Task) -> AgentRun:
         for key in _SKILL_QUESTION_KEYS:
             task.preferences.pop(key, None)
+        if self._skill_state(task).get("explicit") is True:
+            # An explicit use has no work of its own to fall back to: the
+            # anchor fails and nothing runs. Not a use: no skill event (D16).
+            task.preferences[_SKILL_RUN_KEY] = {"state": "not_used", "explicit": True}
+            return self._skill_explicit_end(
+                session, task, TaskStatus.FAILED, LoopStage.FAILED, "skill_not_used"
+            )
         task.preferences[_SKILL_RUN_KEY] = {"state": "not_used"}
         return self._advance(session, task, None)
+
+    def _skill_explicit_end(
+        self,
+        session: SessionState,
+        task: Task,
+        status: TaskStatus,
+        stage: LoopStage,
+        event_type: str,
+    ) -> AgentRun:
+        """Close an explicit use's anchor without running anything."""
+        task.status, task.stage = status, stage
+        if session.active_task_id == task.id:
+            session.active_task_id = None
+        self._checkpoint(session, task, event_type, task.preferences[_SKILL_RUN_KEY])
+        if status is TaskStatus.FAILED:
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, SKILL_REFUSED_UNPLANNABLE, session
+            )
+        return AgentRun(terminal_run_status(task), session, task)
 
     def _skill_reload(self, session: SessionState, state: dict[str, Any]) -> Any | None:
         """The exact recorded version, if still usable here; a stale skill
@@ -6578,6 +6624,118 @@ class AgentCore:
                 task, ErrorCode.TASK_NOT_FOUND, "Session or task was not found.", session
             )
         return session, task, None
+
+    def _skill_resolve(self, ref: Any, project_id: str | None) -> tuple[Any | None, str]:
+        """``(skill, "")`` for the skill ``ref`` names in ``project_id`` (its
+        id, or its name compared folded: case, Turkish i, diacritics), else
+        ``(None, reason)``. Only what an implicit FIT may use is returned: the
+        active approved version of an enabled, in-scope, not stale skill."""
+        if not self._skills_on():
+            return None, SKILL_REFUSED_OFF
+        if type(ref) is not str or not ref.split():
+            return None, SKILL_REFUSED_UNKNOWN
+        ref = " ".join(ref.split())
+        wanted = fold_token(ref)
+
+        def named(listed: Any) -> list[Any]:
+            return [
+                item.skill for item in listed
+                if item.skill.skill_id == ref or fold_token(item.skill.name) == wanted
+            ]
+
+        try:
+            listed = self.skill_store.list_skills(project_id)
+            found = named(listed)
+            if len(found) > 1:
+                both = ", ".join(skill.name for skill in found[:3])
+                return None, f"{SKILL_REFUSED_AMBIGUOUS} Adaylar: {both}"
+            if not found:
+                # In scope but never listed: no approved active version.
+                if ID_PATTERN.fullmatch(ref) and self.skill_store.history(ref, project_id):
+                    return None, SKILL_REFUSED_UNAPPROVED
+                others = [p.id for p in self.memory.list_projects() if p.id != project_id]
+                if any(named(self.skill_store.list_skills(other)) for other in others):
+                    return None, SKILL_REFUSED_SCOPE
+                names = {fold_token(item.skill.name): item.skill.name for item in listed}
+                close = [names[n] for n in names if wanted in n]
+                close += [names[n] for n in difflib.get_close_matches(wanted, names, n=3, cutoff=0.6)]
+                close = list(dict.fromkeys(close))[:3]
+                return None, SKILL_REFUSED_UNKNOWN + (
+                    f" Yakın adlar: {', '.join(close)}" if close else ""
+                )
+            history = self.skill_store.history(found[0].skill_id, project_id)
+            skill = None if history is None else skill_lifecycle.usable_skill(history)
+            state = None if history is None else skill_lifecycle.status(history)
+        except Exception:  # noqa: BLE001 - an unreadable skill is no skill
+            return None, SKILL_REFUSED_UNKNOWN
+        if state is SkillStatus.DISABLED:
+            return None, SKILL_REFUSED_DISABLED
+        if state is SkillStatus.STALE:
+            return None, SKILL_REFUSED_STALE
+        if skill is None or state is not SkillStatus.ACTIVE:
+            return None, SKILL_REFUSED_UNAPPROVED
+        return skill, ""
+
+    def run_skill(
+        self,
+        ref: str,
+        project_id: str | None = None,
+        session_id: str | None = None,
+        text: str = "",
+    ) -> AgentRun:
+        """V2.2 SKEXPLICIT. The user names one skill to run ("/beceri <ad>").
+
+        Resolved first: a refusal creates no session or task and runs
+        nothing. Then exactly the implicit FIT path (``_skill_delegate``): the
+        same announcement, missing-inputs question and fresh session, every
+        step an ordinary task through policy and approval. Naming a skill is
+        never an approval: no grant is passed, made or pre-filled here.
+        """
+        session = None
+        if session_id is not None:
+            session = self.memory.load_session(session_id)
+            if session is None:
+                return self._input_failure(
+                    None, ErrorCode.UNKNOWN_SESSION, f"Unknown session: {session_id}"
+                )
+            # A skill run inside a chain or another skill run: like _skill_route, never.
+            if session.chain is not None or session.objective.startswith(_SKILL_SESSION_PREFIX):
+                return self._input_failure(
+                    None, ErrorCode.INVALID_TASK, SKILL_REFUSED_SESSION, session
+                )
+            if project_id is None:
+                project_id = session.project_id
+        skill, reason = self._skill_resolve(ref, project_id)
+        if skill is None:
+            return self._input_failure(None, ErrorCode.INVALID_TASK, reason, session)
+        # The anchor stands for the skill's first step; it never runs itself.
+        action = self._skill_catalog().get(skill.steps[0].capability) if skill.steps else None
+        if action is None:
+            return self._input_failure(
+                None, ErrorCode.INVALID_TASK, SKILL_REFUSED_UNPLANNABLE, session
+            )
+        task = Task(
+            objective=" ".join(str(text).split()) or f"/beceri {skill.name}",
+            capability=skill.steps[0].capability,
+            scope=ActionScope(action=action),
+            project_id=project_id,
+        )
+        if session is None:
+            session = self.start_session(task.objective)
+        barrier = self._execution_barrier(session, task)
+        if barrier is not None:
+            return barrier
+        binding_failure = self._bind_project(session, task)
+        if binding_failure is not None:
+            return binding_failure
+        session.active_task_id = task.id
+        session.latest_task_id = task.id
+        task.preferences[_SKILL_RUN_KEY] = {"explicit": True}
+        try:
+            self._checkpoint(session, task, "task_registered")
+            return self._skill_delegate(session, task, skill)
+        except _LifecycleLost as lost:
+            return lost.run
 
     def use_skill(self, session_id: str, task_id: str) -> AgentRun:
         """The user's "use" answer to a stale skill's announcement.
@@ -6637,6 +6795,12 @@ class AgentCore:
             task.status = TaskStatus.PENDING
         task.preferences[_SKILL_RUN_KEY] = {**state, "state": "declined"}
         try:
+            if state.get("explicit") is True:
+                # SKEXPLICIT: nothing to run without the skill; a decline
+                # ends the use as cancelled, never as a failure (D16).
+                return self._skill_explicit_end(
+                    session, task, TaskStatus.CANCELLED, LoopStage.CANCELLED, "skill_declined"
+                )
             self._checkpoint(session, task, "skill_declined", task.preferences[_SKILL_RUN_KEY])
         except _LifecycleLost as lost:
             return lost.run

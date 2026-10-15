@@ -150,6 +150,7 @@ from jarvis.context_items import (
 )
 from jarvis.context_items import response_mode as items_response_mode
 from jarvis.core import (
+    SKILL_REFUSED_OFF,
     AgentCore,
     CaptureStop,
     MemoryCaptureOutcome,
@@ -3638,6 +3639,11 @@ def _memory_chars(memory: Mapping[str, Any]) -> int:
     return argv_chars(json_text(memory)) if memory else 0
 
 
+#: V2.2 SKEXPLICIT. "/beceri <ad>" (alias "/skill <name>") as the WHOLE
+#: message names a skill to run; inside a longer message it is plain text.
+_SKILL_COMMAND = re.compile(r"/(?:beceri|skill)[ \t]+([^\r\n]+)", re.IGNORECASE)
+
+
 def text_result(
     permission_mode: PermissionMode,
     status: IntentStatus,
@@ -4366,6 +4372,22 @@ class JarvisApp:
             owner, reason = self._conversation_scope(conversation_id, session)
             if reason is not None:
                 return refused(IntentStatus.INVALID_INPUT, f"{reason} Nothing was executed.")
+        command = _SKILL_COMMAND.fullmatch(text.strip())
+        if command is not None:
+            # SKEXPLICIT: no model is asked. Core resolves the name and runs
+            # the skill exactly like an implicit fit; nothing here approves.
+            if self.settings.skills_enabled is not True or not hasattr(self.core, "run_skill"):
+                return refused(IntentStatus.INVALID_INPUT, SKILL_REFUSED_OFF)
+            run = self.core.run_skill(command.group(1), owner, session_id, text)
+            if run.task is None:
+                return refused(IntentStatus.INVALID_INPUT, run.error.message if run.error else SKILL_REFUSED_OFF)
+            return respond(
+                mode, IntentStatus.STRUCTURED, request_id,
+                capability=run.task.capability,
+                objective=run.task.objective,
+                run=build_envelope("run", mode, run),
+                exit_code=self._exit_code(run),
+            )
         model = self.intent_model
         if model is None:
             return refused(
@@ -6023,6 +6045,21 @@ class JarvisApp:
         if owned is not None:
             return owned
         return self._present("skill-use", self.core.use_skill(session_id, task_id))
+
+    def run_skill(self, skill_id: str, project_id: str | None = None) -> CommandResult:
+        """SKEXPLICIT: the user's "run this skill" (the Skills page). Core runs
+        it like "/beceri" and an implicit fit: announced, inputs asked, every
+        step through policy and approval. Never a grant."""
+        if self.settings.skills_enabled is not True:
+            return self._failure("skill-run", ErrorCode.INVALID_TASK, SKILL_REFUSED_OFF, EXIT_POLICY)
+        if not hasattr(self.core, "run_skill"):
+            return self._failure("skill-run", ErrorCode.INVALID_TASK, "skills are not wired into Core", EXIT_POLICY)
+        try:
+            if project_id is not None:
+                validate_project_id(project_id)
+        except (TypeError, ValueError):
+            return self._failure("skill-run", ErrorCode.INVALID_TASK, "invalid project id", EXIT_POLICY)
+        return self._present("skill-run", self.core.run_skill(skill_id, project_id))
 
     def approve(
         self,
