@@ -68,10 +68,14 @@ _FS_MUTATORS = (
     (os, "link", 2), (os, "symlink", 2), (shutil, "rmtree", 1), (shutil, "move", 2),
     (shutil, "copyfile", 2),
 )
-#: The only tables an import may change: typed records, their events and
-#: guard rows, the FTS index and the run ledger (never supersessions).
+#: The only tables an import may change: typed records, their events, guard
+#: and lifetime rows, the FTS index and the run ledger (never supersessions).
+#: memory_record_lifetime is the record's own row, written once in the same
+#: transaction as the record (SEC2); run_import pins it to exactly one
+#: PERMANENT row per new record.
 IMPORT_TABLES = frozenset({
     "memory_records", "memory_record_events", "memory_record_guard", "memory_capture_runs",
+    "memory_record_lifetime",
     "memory_records_fts", "memory_records_fts_data", "memory_records_fts_idx",
     "memory_records_fts_content", "memory_records_fts_docsize", "memory_records_fts_config",
 })
@@ -272,9 +276,17 @@ class ImportSafetyTests(unittest.TestCase):
             }
         return {record_id: rows[record_id] for record_id in record_ids}
 
+    def lifetimes(self):
+        """(record ids, {record_id: lifetime}) as stored now."""
+        with closing(sqlite3.connect(self.settings.memory_database)) as db:
+            records = {row[0] for row in db.execute("SELECT record_id FROM memory_records")}
+            lifetimes = dict(db.execute("SELECT record_id, lifetime FROM memory_record_lifetime"))
+        return records, lifetimes
+
     def run_import(self, content, name="conversations.json"):
         """Preview and run one export with every door shut; returns the run result."""
         before = self.table_counts()
+        records_before, lifetimes_before = self.lifetimes()
         with self.doors_shut():
             plan = self.app.import_history_preview(self.export(content, name))
             self.assertTrue(plan["ok"], plan)
@@ -285,6 +297,18 @@ class ImportSafetyTests(unittest.TestCase):
         # Only the typed record store and its run ledger move: no legacy
         # explicit-user memory, no global toggle, no task, no conversation.
         self.assertLessEqual(changed, IMPORT_TABLES)
+        # The lifetime table moves only with its records: one PERMANENT row
+        # per record this import created, none for any other record.
+        records_after, lifetimes_after = self.lifetimes()
+        new_records = records_after - records_before
+        self.assertEqual(new_records, {rid for run in result["runs"] for rid in run["record_ids"]})
+        self.assertEqual(
+            {rid: lifetime for rid, lifetime in lifetimes_after.items() if rid not in lifetimes_before},
+            dict.fromkeys(new_records, "permanent"),
+        )
+        self.assertEqual(
+            {rid: lifetimes_after.get(rid) for rid in lifetimes_before}, lifetimes_before
+        )
         return result
 
     def assert_pending_import_data(self, result):

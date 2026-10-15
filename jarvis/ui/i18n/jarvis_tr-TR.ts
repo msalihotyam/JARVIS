@@ -2602,7 +2602,7 @@ yok</translation>
     </message>
     <message>
         <source>Imported conversations are read as data only. Nothing in them is ever executed or followed as an instruction, and every memory found waits for your approval.</source>
-        <translation>İçe aktarılan konuşmalar yalnızca veri olarak okunur. İçlerindeki hiçbir şey çalıştırılmaz ya da talimat olarak izlenmez; bulunan her bellek kaydı onayınızı bekler.</translation>
+        <translation>İçe aktarılan sohbetler yalnızca veri olarak okunur. İçlerindeki hiçbir şey çalıştırılmaz ya da talimat olarak izlenmez; bulunan her bellek kaydı onayınızı bekler.</translation>
     </message>
     <message>
         <source>Choose export file</source>
@@ -2610,11 +2610,11 @@ yok</translation>
     </message>
     <message>
         <source>Confirm a project for each conversation you want imported. A conversation without a confirmed project is skipped.</source>
-        <translation>İçe aktarmak istediğiniz her konuşma için bir proje onaylayın. Onaylı projesi olmayan konuşma atlanır.</translation>
+        <translation>İçe aktarmak istediğiniz her sohbet için bir proje onaylayın. Onaylı projesi olmayan sohbet atlanır.</translation>
     </message>
     <message>
         <source>Untitled conversation</source>
-        <translation>Başlıksız konuşma</translation>
+        <translation>Başlıksız sohbet</translation>
     </message>
     <message>
         <source>Messages: %1</source>
