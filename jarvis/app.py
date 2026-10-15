@@ -3935,8 +3935,9 @@ class MemoryTriggers:
         with self._lock:
             # A provider or run-store failure wrote nothing either: the folded
             # turns ride on rather than being lost. A duplicate with a live
-            # carry repeats a run that skipped (an ok run dropped the carry);
-            # without one it may repeat an ok run, whose turns never ride.
+            # carry repeats a run the ledger did not record ok (``_settled``
+            # turns that one into ok); without one it may repeat an ok run,
+            # whose turns never ride.
             done = getattr(outcome, "outcome", None)
             if done in ("skipped:too_short", "skipped:empty", "provider_error", "run_store_error") or (
                 done == "duplicate" and conversation_id in self._carry
@@ -3944,6 +3945,35 @@ class MemoryTriggers:
                 self._carry[conversation_id] = batch
             else:
                 self._carry.pop(conversation_id, None)
+
+    def _settled(self, memory: Any, outcome: Any, stop: CaptureStop) -> Any:
+        """Core's outcome; a duplicate of a run the ledger recorded ``ok``
+        reads as ``ok`` (an earlier process may have run it), so its turns are
+        marked and no carry rides again. Any other duplicate stays one."""
+        if getattr(outcome, "outcome", None) != "duplicate":
+            return outcome
+        try:
+            # A read, but on the ledger's write connection: refused after halt.
+            with stop.write(), _capture_run_connection(memory) as connection:
+                row = connection.execute(
+                    "SELECT outcome FROM memory_capture_runs WHERE run_id = ?", (outcome.run_id,)
+                ).fetchone()
+        except Exception:  # noqa: BLE001 - unreadable: no proof the run wrote
+            return outcome
+        if row is None or row[0] != "ok":
+            return outcome
+        return MemoryCaptureOutcome(run_id=outcome.run_id, outcome="ok")
+
+    def _after_capture(self, conversation_id: str, batch: tuple[Any, ...], new: tuple[Any, ...],
+                       outcome: Any) -> None:
+        carried = batch[:len(batch) - len(new)]
+        # A duplicate with a live carry repeats a skip: its raw turns
+        # stay unmarked, so the carry still continues them.
+        if not (carried and getattr(outcome, "outcome", None) == "duplicate"):
+            self._mark(conversation_id, batch, outcome)
+        # Skipped: the raw turns stay raw (the next leave re-reads them);
+        # only the folded ones keep riding.
+        self._carry_on(conversation_id, carried, outcome)
 
     def _run_idle(self, app: Any, conversation_id: str, model: Any, stop: CaptureStop) -> None:
         # Core refuses these too, but only after a claim: no ledger row for a
@@ -3954,14 +3984,16 @@ class MemoryTriggers:
         with self._lock:
             mark = self._captured.get(conversation_id, 0)
         fresh = tuple(turn for turn in raw if turn.seq > mark)
+        # Folded turns a PreCompact skip left ride in front, as at SessionEnd.
+        batch, new = self._with_carry(conversation_id, fresh)
         # Core's own skip rule, before any claim or call: a short session or
         # a reported quota below the floor costs nothing. Temporary
         # conversations are never armed (touch), so never reach this.
-        if not fresh or memory_capture.extraction_skip_reason(
-            fresh, temporary=False, quota_remaining_pct=_quota_remaining_pct(model)
+        if not new or memory_capture.extraction_skip_reason(
+            batch, temporary=False, quota_remaining_pct=_quota_remaining_pct(model)
         ) is not None:
             return
-        key = f"{conversation_id}|{_IDLE}|{fresh[0].id}|{fresh[-1].id}"
+        key = f"{conversation_id}|{_IDLE}|{batch[0].id}|{batch[-1].id}"
         run_id = "idle-" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
         # The window's claim: a second idle over the same turns - after a
         # restart, or from another process - makes no call. The table has no
@@ -3973,13 +4005,13 @@ class MemoryTriggers:
                 return
         outcome: Any = None
         try:
-            if fresh == raw:
+            if batch == raw:
                 outcome = app.core.capture_memory(
                     conversation_id, MemoryRecordOrigin.CAPTURE_SESSION_END, model, stop=stop)
             else:
                 outcome = app.core.capture_memory(
-                    conversation_id, MemoryRecordOrigin.CAPTURE_SESSION_END, model, turns=fresh, stop=stop)
-            self._mark(conversation_id, fresh, outcome)
+                    conversation_id, MemoryRecordOrigin.CAPTURE_SESSION_END, model, turns=batch, stop=stop)
+            self._after_capture(conversation_id, batch, new, self._settled(app.memory, outcome, stop))
         finally:
             done = getattr(outcome, "outcome", None)
             with stop.write():
@@ -4005,7 +4037,8 @@ class MemoryTriggers:
         if trigger is MemoryRecordOrigin.CAPTURE_PRECOMPACT:
             batch, new = self._with_carry(conversation_id, turns or ())
             if new:
-                outcome = app.core.capture_memory(conversation_id, trigger, model, turns=batch, stop=stop)
+                outcome = self._settled(app.memory, app.core.capture_memory(
+                    conversation_id, trigger, model, turns=batch, stop=stop), stop)
                 self._mark(conversation_id, batch, outcome)
                 self._carry_on(conversation_id, batch, outcome)
             return
@@ -4019,14 +4052,7 @@ class MemoryTriggers:
                 outcome = app.core.capture_memory(conversation_id, trigger, model, stop=stop)
             else:
                 outcome = app.core.capture_memory(conversation_id, trigger, model, turns=batch, stop=stop)
-            carried = batch[:len(batch) - len(new)]
-            # A duplicate with a live carry repeats a skip: its raw turns
-            # stay unmarked, so the carry still continues them.
-            if not (carried and getattr(outcome, "outcome", None) == "duplicate"):
-                self._mark(conversation_id, batch, outcome)
-            # Skipped: the raw turns stay raw (the next leave re-reads them);
-            # only the folded ones keep riding.
-            self._carry_on(conversation_id, carried, outcome)
+            self._after_capture(conversation_id, batch, new, self._settled(app.memory, outcome, stop))
         record = app.memory.load_conversation(conversation_id)
         if record is not None and record.project_id:
             with stop.write():

@@ -137,6 +137,38 @@ class PrecompactCarryTests(unittest.TestCase):
         self.assertEqual(1, len(self.model.prompts))
         self.assertIn("We use uv.", self.model.prompts[0])
 
+    def test_after_a_restart_a_duplicate_of_an_ok_run_drops_the_carry(self) -> None:
+        # B7 (CDXINT48B): process 1 captured turns 1..3 ok at SessionEnd.
+        # After a restart a PreCompact skip (reply-only: skipped:empty) folds
+        # turn 1 and SessionEnd rebuilds batch 1..3: the ledger says ok, so the
+        # carry drops and the mark moves - the captured turns never go to the
+        # model again.
+        whole = PersistedConversation(self.store, self.cid)  # no fold in process 1
+        for role, text in (("assistant", "REPLY-ZERO"), ("user", "We use uv."), ("user", "The long part." + PAD)):
+            self.assertIsNotNone(whole.append(role=role, kind="user" if role == "user" else "reply",
+                                              text=text, message=text))
+        self.app.conversation_left(self.cid)
+        self.settle()
+        self.assertEqual([("session_end", "ok")], self.runs())
+        self.app.memory_triggers = MemoryTriggers()  # restart: no mark, no carry
+        self.addCleanup(self.app.memory_triggers.shutdown, self.app, (), 5.0)
+        first = self.store.load_conversation_state(self.cid).turns[0]
+        self.app.memory_triggers.schedule(self.app, self.cid, PRECOMPACT, (first,))
+        self.settle()
+        self.assertEqual([first.id], [turn.id for turn in self.app.memory_triggers._carry[self.cid]])
+        self.app.conversation_left(self.cid)  # batch 1..3: the run process 1 recorded ok
+        self.settle()
+        self.assertNotIn(self.cid, self.app.memory_triggers._carry)
+        self.assertEqual(3, self.app.memory_triggers._captured[self.cid])
+        self.assertIsNotNone(whole.append(role="user", kind="user", text="Next." + PAD, message="Next." + PAD))
+        self.app.conversation_left(self.cid)
+        self.settle()
+        self.assertEqual([("session_end", "ok"), ("precompact", "skipped:empty"), ("session_end", "ok")],
+                         self.runs())
+        self.assertEqual(2, len(self.model.prompts))
+        self.assertNotIn("REPLY-ZERO", self.model.prompts[-1])
+        self.assertNotIn("We use uv.", self.model.prompts[-1])
+
 
 def turns(first, last):
     return tuple(SimpleNamespace(seq=seq) for seq in range(first, last + 1))

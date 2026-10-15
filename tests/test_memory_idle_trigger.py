@@ -48,10 +48,12 @@ class StubCore:
         self.calls: list[tuple[str, MemoryRecordOrigin, bool]] = []
         self.models: list[object] = []
         self.stops: list[object] = []
+        self.turns: list[tuple | None] = []
         self.during = lambda: None
 
     def capture_memory(self, conversation_id, trigger, model, *, turns=None, stop=None):
         self.calls.append((conversation_id, trigger, turns is None))
+        self.turns.append(turns)
         self.models.append(model)
         self.stops.append(stop)
         self.during()
@@ -137,6 +139,36 @@ class IdleTriggerTest(unittest.TestCase):
         app.memory_triggers.touch(self.cid)
         self.idle(app)
         self.assertEqual(2, len(core.calls))
+
+    def test_idle_captures_a_folded_turn_once(self) -> None:
+        # NEW-A1 (CDXINT48B): a turn a PreCompact skip folded rides in front
+        # of the idle batch, is offered once, and is never dropped.
+        app, core = self.make(outcome="skipped:too_short")
+        first = self.store.load_conversation_state(self.cid).turns[0]
+        folding = PersistedConversation(self.store, self.cid, raw_turns_max=2)
+        self.assertIsNotNone(folding.append(role="user", kind="user", text=LONG, message=LONG))
+        self.assertEqual([2, 3], [turn.seq for turn in self.store.load_conversation_state(self.cid).turns])
+        app.memory_triggers.schedule(app, self.cid, MemoryRecordOrigin.CAPTURE_PRECOMPACT, (first,))
+        self.wait(app)
+        self.assertEqual([first.id], [turn.id for turn in app.memory_triggers._carry[self.cid]])
+        core.outcome = "ok"
+        app.memory_triggers.touch(self.cid)
+        self.assertEqual(1, self.idle(app))
+        self.assertEqual([1, 2, 3], [turn.seq for turn in core.turns[-1]])
+        self.assertNotIn(self.cid, app.memory_triggers._carry)
+        for text in (LONG, LONG):
+            PersistedConversation(self.store, self.cid).append(role="user", kind="user", text=text, message=text)
+        app.memory_triggers.touch(self.cid)
+        self.assertEqual(1, self.idle(app))
+        self.assertEqual([4, 5], [turn.seq for turn in core.turns[-1]])
+        self.assertEqual(3, len(core.calls))
+
+    def wait(self, app: JarvisApp) -> None:
+        with app.memory_triggers._lock:
+            threads = list(app.memory_triggers._threads.values())
+        for thread in threads:
+            thread.join(5)
+            self.assertFalse(thread.is_alive())
 
     def test_temporary_conversation_makes_no_call(self) -> None:
         app, core = self.make()
