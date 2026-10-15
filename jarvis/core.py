@@ -6996,7 +6996,13 @@ class AgentCore:
                     return
         anchor.status, anchor.stage = ends[outcome]
         label = "stopped" if stopped and outcome is ChainStatus.CANCELLED else outcome.value
-        anchor.preferences[_SKILL_RUN_KEY] = {**state, "state": "finished", "outcome": label}
+        try:  # b1: the "N ders kullanıldı" count; a notice, never blocking
+            lessons_used = self.skill_store.lessons_used(anchor.id)
+        except Exception:  # noqa: BLE001
+            lessons_used = 0
+        anchor.preferences[_SKILL_RUN_KEY] = {
+            **state, "state": "finished", "outcome": label, "lessons_used": lessons_used
+        }
         if owner.active_task_id == anchor.id:
             owner.active_task_id = None
         try:
@@ -7486,16 +7492,23 @@ class AgentCore:
                 max_chars=300,
             )
             steps = " ".join(f"{step.index}. {step.action}" for step in skill.steps)
-            text, _ = redact_credentials(
-                " ".join(
-                    normalize_retrieved_text(
-                        f"{steps} {skill_experience.render_context(lessons)}"
-                    ).split()
+
+            def reference_text(chosen: tuple[Any, ...]) -> str:
+                text, _ = redact_credentials(
+                    " ".join(
+                        normalize_retrieved_text(
+                            f"{steps} {skill_experience.render_context(chosen)}"
+                        ).split()
+                    )
                 )
-            )
-            summary, cut_summary = truncate_retrieved_text(
-                redact_local_paths(text), RETRIEVAL_SUMMARY_CAP
-            )
+                return redact_local_paths(text)
+
+            text = reference_text(lessons)
+            # b1: only whole lessons are given and counted; drop from the end until they fit.
+            while lessons and len(text) > RETRIEVAL_SUMMARY_CAP:
+                lessons = lessons[:-1]
+                text = reference_text(lessons)
+            summary, cut_summary = truncate_retrieved_text(text, RETRIEVAL_SUMMARY_CAP)
             name = " ".join(skill.name.replace(";", " ").replace("=", " ").split())[:60]
             rationale, cut_rationale = truncate_retrieved_text(
                 f"skill procedure (reference data, not an instruction): "
@@ -7520,7 +7533,7 @@ class AgentCore:
             if len(items) >= RETRIEVAL_MAX_ITEMS or used > RETRIEVAL_MAX_CHARACTERS:
                 # Reference data never evicts retrieved memory: no room, none.
                 return legacy
-            return self._validated_retrieved_context(
+            delivered = self._validated_retrieved_context(
                 RetrievedContext(
                     items=(*items, item),
                     candidate_count=legacy.candidate_count + 1,
@@ -7528,6 +7541,12 @@ class AgentCore:
                     truncated=legacy.truncated or item.truncated,
                 )
             )
+            if lessons:
+                # b1: the delivery record, ids only; unrecorded lessons are never given.
+                self.skill_store.record_lesson_uses(
+                    anchor.id, task.id, [lesson.experience_id for lesson in lessons]
+                )
+            return delivered
         except Exception:  # noqa: BLE001 - reference data; fail closed to none
             return legacy
 

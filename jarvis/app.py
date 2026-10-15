@@ -5965,6 +5965,41 @@ class JarvisApp:
             skill_id, project_id, lambda history: rollback_event(history, version, utc_now())
         )
 
+    # b1 (SKLESSONS): lessons are advice, never an authority. Same scope rule
+    # as skills; an unknown, deleted or other project's id is "no such lesson".
+    # Disable and delete are append-only rows; a deleted lesson's text is never
+    # returned again. All four work with the flag off (cleanup).
+
+    def list_lessons(self, project_id: str | None = None) -> dict[str, Any]:
+        return self._skill_call(
+            lambda store: {"lessons": [
+                {**item.to_dict(), "state": state} for item, state in store.lessons(project_id)
+            ]},
+            project_id,
+            cleanup=True,
+        )
+
+    def lesson(self, experience_id: str, project_id: str | None = None) -> dict[str, Any]:
+        def get(store: SkillStore) -> dict[str, Any]:
+            for item, state in store.lessons(project_id):
+                if item.experience_id == experience_id:
+                    return {"lesson": {**item.to_dict(), "state": state}}
+            raise SkillStoreError("no such lesson")
+        return self._skill_call(get, project_id, cleanup=True)
+
+    def _lesson_state(self, experience_id: str, kind: str, project_id: str | None) -> dict[str, Any]:
+        def write(store: SkillStore) -> dict[str, Any]:
+            store.set_lesson_state(experience_id, kind, project_id, actor="user")
+            return {"experience_id": experience_id, "event": kind}
+        return self._skill_call(write, project_id, cleanup=True)
+
+    def disable_lesson(self, experience_id: str, project_id: str | None = None) -> dict[str, Any]:
+        return self._lesson_state(experience_id, "disabled", project_id)
+
+    def delete_lesson(self, experience_id: str, project_id: str | None = None) -> dict[str, Any]:
+        """A final tombstone row; nothing is removed or rewritten (S9)."""
+        return self._lesson_state(experience_id, "deleted", project_id)
+
     def drafts_pending(self, project_id: str | None = None) -> dict[str, Any]:
         return self._skill_call(
             lambda store: {"drafts": [item.to_dict() for item in store.pending_drafts(project_id)]},

@@ -83,6 +83,43 @@ _EXPERIENCE: _Columns = (
 ) + _SCOPE
 
 
+#: b1 lesson control (SKLESSONS): two more append-only tables, created on
+#: every SkillStore open (no ALTER; SCHEMA_VERSION unchanged). A lesson's
+#: state is its latest skill_experience_events row, ``deleted`` final (a
+#: tombstone); a use row holds ids only, never lesson text.
+LESSON_SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS skill_experience_events (
+    event_id INTEGER PRIMARY KEY,
+    experience_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK (kind IN ('enabled', 'disabled', 'deleted')),
+    actor TEXT NOT NULL CHECK (actor IN ('user', 'core')),
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_skill_experience_events_experience
+    ON skill_experience_events(experience_id, event_id);
+CREATE TABLE IF NOT EXISTS skill_experience_uses (
+    use_id INTEGER PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    experience_id TEXT NOT NULL,
+    created_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_skill_experience_uses_run
+    ON skill_experience_uses(run_id, use_id)
+"""
+LESSON_SCHEMA_OBJECTS = frozenset(
+    {
+        "skill_experience_events",
+        "idx_skill_experience_events_experience",
+        "skill_experience_uses",
+        "idx_skill_experience_uses_run",
+    }
+)
+LESSON_ACTIVE = "active"
+LESSON_DISABLED = "disabled"
+_LESSON_KINDS = frozenset({"enabled", LESSON_DISABLED, "deleted"})
+
+
 class SkillStoreError(SkillRecordError):
     """A refused store write (callers catch ``SkillRecordError``)."""
 
@@ -132,6 +169,9 @@ class SkillStore(SQLiteMemoryStore):
     def __init__(self, database_path: Any) -> None:
         self.broken_rows = 0
         super().__init__(database_path)
+        with self._connection(write=True) as connection:
+            for statement in LESSON_SCHEMA_SQL.split(";"):
+                connection.execute(statement)
 
     def _body(self, record: Any) -> str:
         return json.dumps(record.to_dict(), ensure_ascii=False, sort_keys=True)
@@ -543,12 +583,74 @@ class SkillStore(SQLiteMemoryStore):
             return cursor.rowcount == 1
 
     def experiences(self, project_id: str | None) -> tuple[Experience, ...]:
-        """Every lesson visible in ``project_id``."""
-        with self._connection() as connection:
-            rows = connection.execute(
-                "SELECT * FROM skill_experiences ORDER BY created_at, experience_id"
-            ).fetchall()
+        """Every ACTIVE lesson visible in ``project_id`` - the only lessons a
+        task may be given (disabled and deleted ones never are)."""
+        return tuple(item for item, state in self.lessons(project_id) if state == LESSON_ACTIVE)
+
+    def _lessons(
+        self, connection: sqlite3.Connection, project_id: str | None
+    ) -> tuple[tuple[Experience, str], ...]:
+        states: dict[str, str] = {}
+        for experience_id, kind in connection.execute(
+            "SELECT experience_id, kind FROM skill_experience_events ORDER BY event_id"
+        ):
+            if states.get(experience_id) != "deleted":  # a tombstone is final
+                states[experience_id] = kind
+        rows = connection.execute(
+            "SELECT * FROM skill_experiences ORDER BY created_at, experience_id"
+        ).fetchall()
         found = (self._read(row, Experience.from_dict, _EXPERIENCE) for row in rows)
         return tuple(
-            item for item in found if item is not None and visible_in(item.scope, project_id)
+            (item, LESSON_DISABLED if states.get(item.experience_id) == LESSON_DISABLED else LESSON_ACTIVE)
+            for item in found
+            if item is not None
+            and visible_in(item.scope, project_id)
+            and states.get(item.experience_id) != "deleted"
         )
+
+    def lessons(self, project_id: str | None) -> tuple[tuple[Experience, str], ...]:
+        """Every non-deleted lesson visible in ``project_id`` with its state
+        (``active`` or ``disabled``); a deleted lesson is never returned."""
+        with self._connection() as connection:
+            connection.execute("BEGIN")  # one snapshot: lessons and their states agree
+            return self._lessons(connection, project_id)
+
+    def set_lesson_state(
+        self, experience_id: str, kind: str, project_id: str | None, *, actor: str = "user"
+    ) -> None:
+        """Append an ``enabled`` / ``disabled`` / ``deleted`` row for a lesson
+        visible in ``project_id``; an unknown, deleted or other project's
+        lesson is refused, the same answer for each."""
+        _check_actor(actor)
+        if kind not in _LESSON_KINDS:
+            raise SkillStoreError("a lesson state is 'enabled', 'disabled' or 'deleted'")
+        with self._connection(write=True) as connection:
+            if not any(item.experience_id == experience_id for item, _ in self._lessons(connection, project_id)):
+                raise SkillStoreError("no such lesson")
+            connection.execute(
+                "INSERT INTO skill_experience_events (experience_id, kind, actor, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                (experience_id, kind, actor, utc_now()),
+            )
+
+    def record_lesson_uses(self, run_id: str, task_id: str, experience_ids: Any) -> None:
+        """Append which lessons a run's task was given: ids only, never text."""
+        ids = tuple(experience_ids)
+        if not all(type(value) is str and value for value in (run_id, task_id, *ids)):
+            raise SkillStoreError("lesson uses are non-empty string ids")
+        at = utc_now()
+        with self._connection(write=True) as connection:
+            connection.executemany(
+                "INSERT INTO skill_experience_uses (run_id, task_id, experience_id, created_at) "
+                "VALUES (?, ?, ?, ?)",
+                [(run_id, task_id, experience_id, at) for experience_id in ids],
+            )
+
+    def lessons_used(self, run_id: str) -> int:
+        """How many distinct lessons the run's tasks were given."""
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT COUNT(DISTINCT experience_id) FROM skill_experience_uses WHERE run_id = ?",
+                (run_id,),
+            ).fetchone()
+        return int(row[0])
