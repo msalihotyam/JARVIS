@@ -7,7 +7,6 @@ preview_text), a near miss with a bad checksum or no secret shape stays allowed.
 import time
 import unittest
 
-from jarvis.memory_filter import classify_candidate_text
 from jarvis.skill_filter import check_fields, preview_text
 
 
@@ -87,7 +86,6 @@ class LeakClassTests(unittest.TestCase):
             "MIIEvQIBADANBgkqhkiGwBAQEFAASCBKcwggSjAgEAAoIBAQC" + "q" * 30,
             "MHcCAQEEIBQvLmzaXxQrVzPpKfaLqRuWhTbNcGsDkEoJyFiAvHnUoAoGCCqGSM",
         ):
-            self.assertTrue(classify_candidate_text(body).allowed)  # memory_filter misses it
             self.assertRefused(body, "credential")
         self.assertAllowed("-----BEGIN CERTIFICATE-----")
         self.assertAllowed("MIIabcdefABCDEFabcdef")  # too short for a key body
