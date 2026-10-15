@@ -6009,7 +6009,22 @@ class JarvisApp:
         return self._suppression(task_kind, scope, True)
 
     def unsuppress(self, task_kind: str | None, scope: str = "task") -> dict[str, Any]:
-        return self._suppression(task_kind, scope, False)
+        """b7: undo one suppression with an append-only off row. A key never
+        suppressed is refused; undoing twice is a no-op (``changed`` False)."""
+        def undo(store: SkillStore) -> dict[str, Any]:
+            if scope not in ("task", "global"):
+                raise SkillStoreError("scope is 'task' or 'global'")
+            key = GLOBAL_SUPPRESSION if scope == "global" else task_kind
+            changed = store.undo_suppression(key, actor="user")
+            return {"key": key, "suppressed": False, "changed": changed}
+        return self._skill_call(undo, None)
+
+    def suppressions(self, scope: str | None = None) -> dict[str, Any]:
+        """The active suppressions (latest row on), ``scope`` "task"/"global"
+        filters. A read, so it works with the flag off too (like skills_list)."""
+        def listed(store: SkillStore) -> dict[str, Any]:
+            return {"suppressions": list(store.active_suppressions(scope))}
+        return self._skill_call(listed, None, cleanup=True)
 
     def skills_set_enabled(self, on: bool, store: ConfigStore | None = None) -> dict[str, Any]:
         """The skills switch, through the same ConfigStore.mutate path as

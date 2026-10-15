@@ -484,6 +484,46 @@ class SkillStore(SQLiteMemoryStore):
             ).fetchone()
         return row is not None and row[0] != 0
 
+    def active_suppressions(self, scope: str | None = None) -> tuple[dict[str, str], ...]:
+        """Keys whose latest row is on, oldest first; ``scope`` "global" or
+        "task" filters (b7)."""
+        if scope not in (None, "global", "task"):
+            raise SkillStoreError("scope is 'task' or 'global'")
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT s.suppression_key, s.actor, s.at FROM skill_suppressions s "
+                "WHERE s.suppressed = 1 AND s.suppression_id = (SELECT MAX(suppression_id) "
+                "FROM skill_suppressions WHERE suppression_key = s.suppression_key) "
+                "ORDER BY s.suppression_id"
+            ).fetchall()
+        listed = (
+            {"key": key, "scope": "global" if key == GLOBAL_SUPPRESSION else "task", "actor": actor, "at": at}
+            for key, actor, at in rows
+        )
+        return tuple(item for item in listed if scope in (None, item["scope"]))
+
+    def undo_suppression(self, key: str, *, actor: str = "user", now: str | None = None) -> bool:
+        """b7: append an off row for a key that has ever been suppressed
+        (True); already off appends nothing (False). A key with no row is
+        refused (fail closed). Never UPDATE/DELETE: latest row wins."""
+        _check_actor(actor)
+        with self._connection(write=True) as connection:
+            row = connection.execute(
+                "SELECT suppressed FROM skill_suppressions WHERE suppression_key = ? "
+                "ORDER BY suppression_id DESC LIMIT 1",
+                (key,),
+            ).fetchone()
+            if row is None:
+                raise SkillStoreError("no such suppression")
+            if row[0] == 0:
+                return False
+            connection.execute(
+                "INSERT INTO skill_suppressions (suppression_key, suppressed, actor, at) "
+                "VALUES (?, 0, ?, ?)",
+                (key, actor, now or utc_now()),
+            )
+        return True
+
     # -- experiences -----------------------------------------------------------
 
     def add_experience(self, experience: Experience) -> bool:
