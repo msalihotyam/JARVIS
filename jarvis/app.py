@@ -5802,6 +5802,8 @@ class JarvisApp:
     @cached_property
     def skill_store(self) -> SkillStore | None:
         """Over the app's own database; None (every call refused) otherwise."""
+        if isinstance(getattr(self.core, "skill_store", None), SkillStore):
+            return self.core.skill_store  # the one create_app gave Core
         if isinstance(self.memory, SQLiteMemoryStore):
             return SkillStore(self.memory.database_path)
         return None
@@ -5996,6 +5998,8 @@ class JarvisApp:
             return {"ok": False, "error": exc.message}
         if updated.skills_enabled is not True:  # off is fail-closed at once here
             self.settings = replace(self.settings, skills_enabled=False)
+            # and in Core, which now holds the factory's skill store (S4)
+            self.core.settings = replace(self.core.settings, skills_enabled=False)
         return {"ok": True, "skills_enabled": updated.skills_enabled}
 
     def skill_decline(self, session_id: str, task_id: str) -> CommandResult:
@@ -6285,6 +6289,9 @@ def create_app(
     registry = registry if registry is not None else ToolRegistry()
     for connector in connectors:
         registry.register(connector)
+    # V2.2: one skill store over the app's database, shared by Core and the
+    # app API. Core reads it only while settings.skills_enabled (S4).
+    skill_store = SkillStore(memory.database_path) if isinstance(memory, SQLiteMemoryStore) else None
     return JarvisApp(
         AgentCore(
             registry,
@@ -6294,6 +6301,7 @@ def create_app(
             destination_policy=destination_policy,
             github_identity=github_identity,
             gmail_identity=gmail_identity,
+            skill_store=skill_store,
         ),
         memory,
         settings,

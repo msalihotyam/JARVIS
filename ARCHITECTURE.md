@@ -2800,6 +2800,47 @@ yanındadır; biri tutmazsa kapı kalır ve adım numarasıyla raporlanır.
 13. Sonuç kaydı: kapı sonucu (geçti/kaldı + adım numaraları) runbook
     sahibinin durum dosyasına yazılır; V2.1a ancak o zaman kapanır.
 
+### 6.3 Beceriler (V2.2, uygulandı; SKGATE kapısı)
+
+Beceri (skill) bir prosedürdür, yetki değildir: Core otoritedir, model yalnız
+önerir; beceride hiçbir şey onay vermez, ima etmez veya hatırlamaz. Karar
+kaynağı `build/v22/PLAN_V22.md` (D1-D11 orkestratörce 2026-10-14 01:00 Salih
+yetkisiyle kabul, INT45-R, D12-D19). Değişmezler S1-S13: kayıtta onay/güven/
+risk/izin alanı yok (S1); her adım normal zincir adımı olarak politika + onay
+kapısından geçer, tier düşmez, ön-onay yok (S2); beceri/deneyim metni modele
+etiketli güvenilmez veri olarak gider (S3); `settings.skills_enabled`
+varsayılan ve fail-closed False, kapalıyken eşleme/duyuru/teklif/yakalama yok
+(S4); kayıt yalnız taslak başına açık kullanıcı onayıyla (S5); uyarlama parent
+kökenli yeni beceridir, sürümler değişmez, geri alma olaydır (S6); her yazımda
+deterministik `skill_filter` (S7); kapsam global veya tek proje (S8); bayat
+beceri otomatik kullanılmaz (S12); kayıt motoru yok, V2.6'ya kalır (S13).
+
+- Tablolar (`memory.py` uyumlu şema, S9): `skills` (insert-only, PK
+  skill_id+version), `skill_events` (append-only), `skill_drafts`,
+  `skill_suppressions`, `skill_experiences`. SCHEMA_VERSION 10, ALTER yok,
+  skill tablolarında UPDATE/DELETE yok; silme tombstone olayıdır.
+- Composition root: `create_app` SQLite hafızası varsa tek bir `SkillStore`
+  kurar, Core'a ve app API'sine (`JarvisApp.skill_store`) aynı örneği verir.
+  Core onu yalnız `skills_enabled` açıkken okur.
+- Karar a2 (Salih, 2026-10-15 01:42): dersler ders başına onay istemez; Core'un
+  dış içerik okumadığını olumlu bildiği adımlar dışında tek adım bile içeren
+  çalıştırma ders bırakmaz (bilinmeyen = dış). İzin listesi şu an boştur.
+- Kapı: `tests/test_skill_e2e.py` (fabrika yolu, sahte bağlayıcı, izole TEMP).
+
+Bilinen sınırlamalar (SKCORE açık konular 3-8 ve sonrası):
+1. Zaten netleştirme bekleyen bir görev beceri eşlemesini atlar.
+2. Bayat beceri sorusuna `provide_clarification` ile cevap görevi becerisiz
+   çalıştırır; beceriyle kullanım yolu `use_skill`'dir.
+3. Yetenek kataloğu yalnız kayıtlı bağlayıcıları kapsar.
+4. FAILED biten bir adım used_failure sayılır.
+5. Bir retten önce tamamlanmış adımlar geri alınmaz.
+6. Küçük yarış: iki ilk kez devretme, ikisi de bildirmeden runner'ı
+   kaydedebilir.
+7. `skills_set_enabled(False)` app ve Core'da hemen kapatır (fail-closed);
+   açmak ise yalnız yeniden kuruluşta (uygulama yeniden açılışı) etkili olur.
+8. `skill_experience_captured` olayı boş id listesiyle de yazılabilir
+   (V22RESAPPLY açık konusu).
+
 ## 7. Maliyet yönetimi
 
 ### 7.1 Sağlayıcıdan bağımsız faturalandırma sınıfı (kullanıcı kararı)

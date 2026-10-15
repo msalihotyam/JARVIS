@@ -263,6 +263,20 @@ gelecekteki parasal harcamayı yetkilendirmez. Ayrıntılı sözleşme
   politikası tanımlı, capture yoluna henüz bağlı değil. Açık sorular
   Q1-Q7: `build/v21/SLICES_V21.md`.
 
+## Beceriler (V2.2) durumu (2026-10-15)
+
+- Beceri bir prosedürdür, yetki değildir; Core otoritedir. Öğretme = biten
+  bir çalıştırmadan teklif, kayıt yalnız kullanıcı onayıyla; benzer işte
+  duyuru, her zorunlu yan-etkili adım yine onay ister. Uyarlama, sürüm,
+  geri alma, tombstone silme, bayatlama (3 hata), proje kapsamı. Mimari ve
+  bilinen sınırlamalar: `ARCHITECTURE.md` §6.3.
+- `settings.skills_enabled` varsayılan False; kapatma hemen, açma uygulama
+  yeniden açılışında etkili. `create_app` tek `SkillStore`'u Core'a bağlar.
+- Kararlar: `build/v22/PLAN_V22.md` kanoniktir (D1-D19, INT45-R). Karar a2
+  (Salih, 2026-10-15): dersler ders başına onaysız; dış içerik okuyabilecek
+  adımlı çalıştırma ders bırakmaz (izin listesi boş).
+- Kapı testi `tests/test_skill_e2e.py`; kayıt motoru V2.6'ya kalır.
+
 ## Proje hafızasını güncelleme kuralı
 
 - Yeni ve kalıcı teknik kararlar `ARCHITECTURE.md` içine eklenir.
