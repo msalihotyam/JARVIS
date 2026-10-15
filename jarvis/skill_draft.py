@@ -389,6 +389,36 @@ def task_kind(run: RunSummary) -> str:
     return TASK_KIND_PREFIX + digest[:32]
 
 
+#: A draft names a second input of a kind ``kind_2``; the kind is the name
+#: without that suffix.
+_INPUT_SUFFIX = re.compile(r"_\d+$")
+
+
+def step_signature(steps: tuple[SkillStep, ...]) -> tuple[tuple[str, tuple[str, ...]], ...]:
+    """b8 (AWM): the abstract shape of a procedure - each step's capability and
+    the kinds of the targets it takes, in order. Words never count: the same
+    work on the same kinds of things has one signature. Deterministic and
+    text-free; only compared, never stored or shown."""
+    return tuple(
+        (
+            step.capability or "-",
+            tuple(sorted(_INPUT_SUFFIX.sub("", name) for name in step.inputs)),
+        )
+        for step in steps
+    )
+
+
+def step_family(steps: tuple[SkillStep, ...]) -> tuple[str, ...]:
+    """b8: the coarser family of a procedure - its capabilities in order, a
+    repeated capability counted once, target kinds ignored."""
+    family: list[str] = []
+    for step in steps:
+        capability = step.capability or "-"
+        if not family or family[-1] != capability:
+            family.append(capability)
+    return tuple(family)
+
+
 # -- segments ----------------------------------------------------------------------
 
 

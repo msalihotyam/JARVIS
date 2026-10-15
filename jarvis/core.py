@@ -237,6 +237,8 @@ from jarvis.skill_draft import (
     _without_params,
     build_drafts,
     should_offer,
+    step_family,
+    step_signature,
     task_kind,
 )
 from jarvis.skill_filter import check_fields
@@ -254,6 +256,7 @@ from jarvis.skill_types import (
     Skill,
     SkillDraft,
     SkillOrigin,
+    SkillRecordError,
     SkillRef,
     SkillStatus,
     fold_token,
@@ -6473,7 +6476,8 @@ class AgentCore:
             parent = draft.provenance.parent_version
             skill = Skill(
                 skill_id=draft.target_skill_id or "dry_run",
-                version=1 if parent is None else parent + 1,
+                # A new skill (taught or adapted) starts at 1; a version follows its parent.
+                version=1 if draft.target_skill_id is None else parent + 1,
                 name=draft.name,
                 summary=draft.summary,
                 scope=draft.scope,
@@ -7167,6 +7171,98 @@ class AgentCore:
             target_skill_id=skill.skill_id,
         )
 
+    def _skill_dedup(
+        self, run: RunSummary, drafts: Sequence[SkillDraft], now: str
+    ) -> list[SkillDraft]:
+        """b8: check new-skill drafts against the skills in scope before offering.
+
+        Same abstract step signature as skill X (``step_signature``; words never
+        count) -> a PENDING next-version draft of X's active version; same
+        family (``step_family``) but another signature -> an adaptation, a new
+        skill naming X as parent. Lineage only: the user decides on the card
+        and nothing approves. A declined, stale, disabled or failing X is a
+        parent like any other. A brand-new draft is never offered for a
+        signature a skill in scope already has: one that cannot become X's
+        version (the procedure is unchanged, or a global X would take a
+        project run's words, D15) is dropped. A store fault raises (the
+        caller then offers nothing).
+        """
+        skills = sorted(
+            (listed.skill for listed in self.skill_store.list_skills(run.project_id)),
+            # A skill of the run's own scope first; then a stable order.
+            key=lambda skill: (skill.scope.project_id != run.project_id, skill.skill_id),
+        )
+        kept: list[SkillDraft] = []
+        for draft in drafts:
+            signature = step_signature(draft.steps)
+            parent = next((s for s in skills if step_signature(s.steps) == signature), None)
+            same = parent is not None
+            if not same:
+                family = step_family(draft.steps)
+                parent = next((s for s in skills if step_family(s.steps) == family), None)
+            if parent is None or parent.scope.project_id != run.project_id:
+                if not same:
+                    kept.append(draft)
+                continue
+            changes = {
+                "inputs": draft.inputs,
+                "steps": draft.steps,
+                "checks": tuple(dict.fromkeys((*parent.checks, *draft.checks)))[:MAX_CHECKS],
+            }
+            history = self.skill_store.history(parent.skill_id, run.project_id)
+            try:
+                if history is None:
+                    raise SkillRecordError("the parent's history is not readable here")
+                if same:
+                    made = skill_lifecycle.next_version(
+                        parent,
+                        changes,
+                        SkillOrigin.VERSION_AFTER_FAILURE,
+                        now,
+                        history=history,
+                        source_run_id=run.run_id,
+                    )
+                else:
+                    made = skill_lifecycle.adapt(
+                        parent,
+                        {**changes, "name": draft.name, "summary": draft.summary},
+                        now,
+                        history=history,
+                        source_run_id=run.run_id,
+                    )
+            except SkillRecordError:
+                # No version or adaptation: an identical signature offers
+                # nothing; another one stays a plain new-skill draft.
+                if not same:
+                    kept.append(draft)
+                continue
+            how = "version" if same else "adaptation"
+            digest = hashlib.sha256(
+                f"{run.run_id}:b8-{how}:{parent.skill_id}:{draft.draft_id}".encode("utf-8")
+            ).hexdigest()
+            kept.append(
+                SkillDraft(
+                    draft_id="draft-" + digest[:32],
+                    name=made.name,
+                    summary=made.summary,
+                    scope=made.scope,
+                    inputs=made.inputs,
+                    steps=made.steps,
+                    checks=made.checks,
+                    provenance=made.provenance,
+                    reason=(
+                        f"Same steps as skill version {parent.version}; proposed as its "
+                        f"next version from run {run.run_id}. "
+                        if same
+                        else f"Adapted from skill version {parent.version} (same kind of "
+                        f"work, other steps) from run {run.run_id}. "
+                    )
+                    + "Saved only if you approve this draft.",
+                    target_skill_id=parent.skill_id if same else None,
+                )
+            )
+        return kept
+
     def _skill_learn(
         self,
         run: RunSummary | None,
@@ -7213,7 +7309,7 @@ class AgentCore:
                 if self.skill_store.is_suppressed(key)
             }
             if offer and should_offer(run, suppressed, ()).offer:
-                drafts.extend(build_drafts(run, created_at=now))
+                drafts.extend(self._skill_dedup(run, build_drafts(run, created_at=now), now))
             if (
                 offer
                 and skill is not None
@@ -7269,13 +7365,15 @@ class AgentCore:
     def _skill_learn_task(self, session: SessionState, task: Task) -> None:
         """A standalone task about to complete: offer it, keep its lessons.
 
-        Not a chain step (the chain is the run) and not a task that met a
-        skill (a declined or stale one): only ``not_used`` or none.
+        Not a chain step (the chain is the run). A task whose skill the user
+        declined ran without it, so it is offered too (b8: as that skill's
+        next version when the steps match); ``needs_inputs``/``stale`` are
+        still undecided and ``delegated``/``finished`` were skill runs.
         """
         if (
             not self._skills_on()
             or session.chain is not None
-            or self._skill_state(task).get("state") not in (None, "not_used")
+            or self._skill_state(task).get("state") not in (None, "not_used", "declined")
         ):
             return
         done = RunOutcome.COMPLETED.value
