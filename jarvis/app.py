@@ -6314,9 +6314,14 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     """Production composition. Constructing a connector starts no process."""
     settings = settings or Settings()
     startup_directory = Path.cwd().resolve()
+    # V2.2 b6: JARVIS's own data directory is never a write target or a CLI
+    # working directory, even inside the startup root. A tuple: a bare Path
+    # would be iterated as its parts.
+    protected_roots = (settings.memory_database.parent,)
     connector = ClaudeCodeConnector(
         allowed_roots=(startup_directory,),
         default_working_directory=startup_directory,
+        protected_roots=protected_roots,
         max_budget_usd=settings.claude_call_budget_usd,
         model=settings.claude_model,
         effort=settings.claude_effort,
@@ -6327,6 +6332,7 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     intent_model = ClaudeIntentAdapter(
         allowed_roots=(startup_directory,),
         default_working_directory=startup_directory,
+        protected_roots=protected_roots,
         max_budget_usd=settings.claude_call_budget_usd,
         model=settings.claude_model,
         effort=settings.claude_effort,
@@ -6336,6 +6342,7 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     research_model = ClaudeResearchAdapter(
         allowed_roots=(startup_directory,),
         default_working_directory=startup_directory,
+        protected_roots=protected_roots,
         max_budget_usd=settings.claude_call_budget_usd,
         model=settings.claude_model,
         effort=settings.claude_effort,
@@ -6352,6 +6359,7 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     local_writer = LocalFileWriteConnector(
         allowed_roots=(startup_directory,),
         default_working_directory=startup_directory,
+        protected_roots=protected_roots,
     )
     # GitHub v1. The authority is CONFIGURATION, resolved here and nowhere
     # else: an operator's stated login becomes the Core-owned identity

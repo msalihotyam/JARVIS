@@ -117,7 +117,8 @@ class DataDirectoryCase(unittest.TestCase):
         self.assertFalse(resolved == data or data in resolved.parents, f"{resolved} is in the data directory")
 
 
-#: The file_write spellings that reach the data directory today (BLOCKED).
+#: The file_write spellings only protected_roots refuses (the open cases
+#: before SKSINGLEWIRE wired it).
 FILE_WRITE_OPEN_SPELLINGS = ("direct", "dotdot", "case")
 
 
@@ -192,12 +193,8 @@ class DataDirectoryWriteRefusalTests(DataDirectoryCase):
     def test_file_write_under_the_data_directory_is_refused_through_a_junction_short_name_and_prefixes(self) -> None:
         self.file_write_refused(open_case=False)
 
-    # BLOCKED (SKSINGLEWRITER): LocalFileWriteConnector has the guard
-    # (protected_roots, proven wired below) but build_default_app does not pass
-    # it, so with data\ under the startup folder these spellings are written
-    # (NEEDS FILES: jarvis/app.py). The asserts are the real ones: once wired
-    # this is an unexpected success - drop the decorator.
-    @unittest.expectedFailure
+    # Held by build_default_app passing protected_roots (the data directory)
+    # to LocalFileWriteConnector (SKSINGLEWIRE).
     def test_file_write_under_the_data_directory_is_refused_direct_dotdot_and_case(self) -> None:
         self.file_write_refused(open_case=True)
 
@@ -237,7 +234,7 @@ class DataDirectoryWriteRefusalTests(DataDirectoryCase):
 class WiredDataDirectoryWriteRefusalTests(DataDirectoryWriteRefusalTests):
     """The connector guard, wired as build_default_app must wire it
     (``protected_roots`` = the data directory): every spelling is refused.
-    The unwired composition above stays pinned until jarvis/app.py passes it."""
+    The shipped composition above passes it itself."""
 
     def build_app(self):
         wired = functools.partial(LocalFileWriteConnector, protected_roots=(self.data,))
@@ -275,9 +272,11 @@ class CliWorkingDirectoryTests(DataDirectoryCase):
             context=context or {},
         )
 
-    def claude_launch(self, kind: type[ClaudeCodeConnector], context: dict | None = None, **wiring):
-        """``build_default_app``'s construction; returns (popen mock, result)."""
-        connector = kind(allowed_roots=(self.root,), default_working_directory=self.root, max_budget_usd=0.15, **wiring)
+    def claude_launch(self, kind: type[ClaudeCodeConnector], context: dict | None = None, connector=None, **wiring):
+        """``build_default_app``'s construction (or ``connector``, a shipped
+        instance); returns (popen mock, result)."""
+        if connector is None:
+            connector = kind(allowed_roots=(self.root,), default_working_directory=self.root, max_budget_usd=0.15, **wiring)
         with mock.patch.object(kind, "_auth_status", return_value=OAUTH_MAX_AUTH_STATUS), \
                 mock.patch.object(kind, "_argv0", return_value="claude.exe"), \
                 mock.patch("jarvis.connectors.claude_code.subprocess.Popen", side_effect=OSError("mocked")) as popen:
@@ -293,16 +292,17 @@ class CliWorkingDirectoryTests(DataDirectoryCase):
                 self.assertTrue(popen.called)
                 self.assertOutsideData(launched_cwd(popen))
 
-    # BLOCKED (SKSINGLEWRITER): unwired (build_default_app's construction, no
-    # protected_roots), _working_directory accepts a caller's
-    # context["working_directory"] anywhere under its allowed root, data\
-    # included (NEEDS FILES: jarvis/app.py). Real asserts: an unexpected
-    # success once wired - drop the decorator then.
-    @unittest.expectedFailure
     def test_a_caller_named_working_directory_in_the_data_directory_never_starts_there(self) -> None:
-        self.caller_named_data_directory_refused()
+        """The shipped composition: build_default_app's own Claude connector,
+        intent model and research model (SKSINGLEWIRE)."""
+        app = build_default_app(self.settings)
+        self.caller_named_data_directory_refused(shipped={
+            ClaudeCodeConnector: app.core.registry.get("claude-code-plan"),
+            ClaudeIntentAdapter: app.intent_model,
+            ClaudeResearchAdapter: app.research_model,
+        })
 
-    def caller_named_data_directory_refused(self, **wiring) -> None:
+    def caller_named_data_directory_refused(self, shipped: dict | None = None, **wiring) -> None:
         requests = [str(self.data), os.path.join(str(self.root), "x", "..", self.data.name),
                     os.path.join(str(self.root), self.data.name.upper()), os.path.join(str(self.data), "sub")]
         (self.data / "sub").mkdir(exist_ok=True)
@@ -313,7 +313,10 @@ class CliWorkingDirectoryTests(DataDirectoryCase):
         for requested in requests:
             for kind in (ClaudeCodeConnector, ClaudeIntentAdapter, ClaudeResearchAdapter):
                 with self.subTest(requested=requested, kind=kind.__name__):
-                    popen, result = self.claude_launch(kind, {"working_directory": requested}, **wiring)
+                    connector = None if shipped is None else shipped[kind]
+                    if connector is not None:
+                        self.assertIs(kind, type(connector))
+                    popen, result = self.claude_launch(kind, {"working_directory": requested}, connector, **wiring)
                     if popen.called:
                         self.assertOutsideData(launched_cwd(popen))
                     else:
@@ -322,8 +325,8 @@ class CliWorkingDirectoryTests(DataDirectoryCase):
 
     def test_wired_a_caller_named_working_directory_in_the_data_directory_is_refused(self) -> None:
         """The connector guard, wired as build_default_app must wire it
-        (``protected_roots`` = the data directory); the unwired construction
-        above stays pinned until jarvis/app.py passes it."""
+        (``protected_roots`` = the data directory); the shipped composition
+        above is checked through build_default_app itself."""
         self.caller_named_data_directory_refused(protected_roots=(self.data,))
         popen, _ = self.claude_launch(ClaudeCodeConnector, protected_roots=(self.data,))
         self.assertTrue(popen.called)  # control: the default root still launches
