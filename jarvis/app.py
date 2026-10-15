@@ -18,6 +18,7 @@ import hashlib
 import json
 import math
 import re
+import secrets
 import sqlite3
 import threading
 import time
@@ -94,6 +95,7 @@ from jarvis.contracts import (
     MemoryRecordActor,
     MemoryRecordKind,
     MemoryRecordScope,
+    MemoryRecordScopeKind,
     MemoryRecordStatus,
     normalize_memory_subject_key,
     redact_credentials,
@@ -158,7 +160,9 @@ from jarvis.core import (
     _validated_capture_candidate,
 )
 from jarvis import memory_capture, memory_import
-from jarvis.memory_guard import Provenance, RecordGuard, SessionTaint, content_hash
+from jarvis.memory_guard import (
+    Provenance, RecordGuard, SessionTaint, content_hash, instruction_likeness, is_clean,
+)
 from jarvis.memory_import_plan import ImportPlan, plan_import
 from jarvis.dispatch import DISPATCH_REFUSED, cancel_job_run
 from jarvis.destinations import (
@@ -240,7 +244,9 @@ from jarvis.conversation import (
     register_precompact_hook,
     rehydrate,
 )
-from jarvis.memory import _RECORD_CURRENT_SQL, MemoryRecordApproval, MemoryRecordRefused, SQLiteMemoryStore
+from jarvis.memory import (
+    _RECORD_CURRENT_SQL, MemoryRecordApproval, MemoryRecordRefused, PurgeConfirmation, SQLiteMemoryStore,
+)
 from jarvis.memory_doctor import Finding, RepairAction, RepairProposal, diagnose
 from jarvis.memory_filter import classify_candidate_text
 from jarvis.planning import build_task_plan
@@ -3835,6 +3841,10 @@ class MemoryTriggers:
         #: What idle jobs run with: the watch's app or current-app resolver,
         #: never the app of the chat turn that armed the conversation.
         self._idle_target: Any = None
+        #: SECAPPUI: called (conversation id, ``memory_approval_batch``) after
+        #: each SessionEnd / PreCompact / idle job; the Core-drawn batch card
+        #: listens. A listener failure is swallowed like a capture failure (I12).
+        self.batch_listener: Callable[[str, dict[str, Any]], None] | None = None
 
     def touch(self, conversation_id: str, *, temporary: bool = False) -> None:
         """Chat activity: (re)arm the conversation's idle capture. A temporary
@@ -3909,6 +3919,20 @@ class MemoryTriggers:
                     self._run(app, conversation_id, trigger, turns)
                 except Exception:  # noqa: BLE001 - capture never blocks the chat (I12)
                     pass
+                self._emit_batch(conversation_id)
+
+    def _emit_batch(self, conversation_id: str) -> None:
+        listener = self.batch_listener
+        if listener is None or self._stop.stopped:
+            return
+        with self._lock:
+            app = self._apps.get(conversation_id)
+        if app is None:
+            return
+        try:
+            listener(conversation_id, app.memory_approval_batch(conversation_id))
+        except Exception:  # noqa: BLE001 - the batch never blocks the chat (I12)
+            pass
 
     def _mark(self, conversation_id: str, turns: Iterable[Any], outcome: Any) -> None:
         # Only a run Core finished (or already had) moves the mark; a
@@ -4143,6 +4167,14 @@ _IMPORT_TOOL = "memory_import"
 _IMPORT_PLANS: dict[str, ImportPlan] = {}
 _IMPORT_CANCEL: dict[str, threading.Event] = {}
 _IMPORT_LOCK = threading.Lock()
+
+#: SECAPPUI two-step purge (I16): token -> (database, the confirmed purge set,
+#: monotonic deadline). In memory only and process-wide like the import plans;
+#: a token is single use and dies with the process.
+PURGE_TOKEN_SECONDS = 120
+_PURGE_TOKENS_MAX = 16
+_PURGE_TOKENS: dict[str, tuple[str, frozenset[str], float]] = {}
+_PURGE_LOCK = threading.Lock()
 
 
 @dataclass(frozen=True, slots=True)
@@ -4769,6 +4801,134 @@ class JarvisApp:
             lambda: self.memory.undo(record_id, MemoryRecordActor.USER),
         )
 
+    # -- SECAPPUI: batched approvals, Undo and the two-step purge -------------
+    # Payloads only. Approving still goes through ``approve_memory_record``
+    # (the Core-drawn card), undo through ``undo_memory_record``; nothing here
+    # approves, and no chat turn reaches these methods (I14).
+
+    @staticmethod
+    def _batch_reasons(view: Any, guard: RecordGuard | None) -> list[str]:
+        record = view.record
+        provenance = guard.provenance if guard is not None else Provenance.LEGACY
+        reasons = []
+        if provenance in (Provenance.EXTERNAL, Provenance.IMPORT) or (
+            guard is not None and not is_clean(guard.session_taint) and provenance is not Provenance.LEGACY
+        ):
+            reasons.append("tainted")
+        if guard is not None and guard.instruction_like:
+            reasons.append("instruction_like")
+        if provenance is Provenance.MODEL_INFERRED:
+            reasons.append("model_inferred")
+        if record.scope.kind is not MemoryRecordScopeKind.PROJECT:
+            reasons.append("global")
+        if record.classification not in (DataClassification.PUBLIC, DataClassification.INTERNAL):
+            reasons.append("sensitive")
+        if provenance is Provenance.LEGACY:
+            reasons.append("legacy")
+        return reasons
+
+    def memory_approval_batch(self, conversation_id: str) -> dict[str, Any]:
+        """The session-end / compaction batch of one conversation: its PENDING
+        candidates with their risk labels and its auto-saved records (an
+        ``auto_saved`` event, SECPREFAUTO) for Undo. A sensitive record's text
+        stays out of the batch; the Hafıza page shows it on request."""
+        try:
+            conversation = self.memory.load_conversation(conversation_id)
+        except (TypeError, ValueError):
+            conversation = None
+        if conversation is None:
+            return {"ok": False, "error": f"Unknown conversation: {conversation_id}."}
+        pending: list[dict[str, Any]] = []
+        auto_saved: list[dict[str, Any]] = []
+        with self.memory._connection() as connection:
+            rows = connection.execute(
+                f"{_RECORD_CURRENT_SQL} WHERE r.source_conversation_id = ? ORDER BY r.created_at, r.record_id",
+                (conversation_id,),
+            ).fetchall()
+            saved = {row[0] for row in connection.execute(
+                "SELECT DISTINCT e.record_id FROM memory_record_events e JOIN memory_records r "
+                "ON r.record_id = e.record_id WHERE r.source_conversation_id = ? AND e.reason = 'auto_saved'",
+                (conversation_id,),
+            )}
+            for row in rows:
+                view = self.memory._record_view_from_row(row)
+                if view is None:
+                    continue
+                if view.status is not MemoryRecordStatus.PENDING and (
+                    view.status is not MemoryRecordStatus.APPROVED or view.record.record_id not in saved
+                ):
+                    continue
+                try:
+                    guard = self.memory._read_record_guard(connection, view.record.record_id)
+                except (TypeError, ValueError):  # a corrupt guard row reads as legacy
+                    guard = None
+                reasons = self._batch_reasons(view, guard)
+                item = self._record_payload(view)
+                if "sensitive" in reasons:
+                    item.update(text="", subject_key="", text_withheld=True)
+                if view.status is MemoryRecordStatus.PENDING:
+                    pending.append({**item, "reasons": reasons})
+                else:
+                    auto_saved.append({**item, "undo": True})
+        return {"ok": True, "conversation_id": conversation_id, "pending": pending, "auto_saved": auto_saved}
+
+    def request_memory_purge(self, record_ids: Iterable[str]) -> dict[str, Any]:
+        """Purge step 1: the set that would go (chain and derived records
+        included) and ``still_held_by``, plus a single-use token bound to
+        exactly that set, valid ``PURGE_TOKEN_SECONDS``. Deletes nothing."""
+        try:
+            preview = self.memory.purge_preview(record_ids)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        except (sqlite3.Error, OSError):
+            return {"ok": False, "error": "The memory database is busy; try the purge again."}
+        token = secrets.token_urlsafe(32)
+        now = time.monotonic()
+        with _PURGE_LOCK:
+            for stale in [key for key, entry in _PURGE_TOKENS.items() if entry[2] <= now]:
+                del _PURGE_TOKENS[stale]
+            _PURGE_TOKENS[token] = (
+                str(self.memory.database_path), frozenset(preview["record_ids"]), now + PURGE_TOKEN_SECONDS)
+            while len(_PURGE_TOKENS) > _PURGE_TOKENS_MAX:
+                _PURGE_TOKENS.pop(next(iter(_PURGE_TOKENS)))
+        return {
+            "ok": True,
+            "token": token,
+            "record_ids": list(preview["record_ids"]),
+            "still_held_by": list(preview["still_held_by"]),
+            "expires_in_seconds": PURGE_TOKEN_SECONDS,
+        }
+
+    def confirm_memory_purge(self, token: str) -> dict[str, Any]:
+        """Purge step 2, the human's confirm click: the token is spent here
+        whatever happens next; an unknown, used, expired or other-database
+        token is refused. Core mints the ``PurgeConfirmation`` (I16)."""
+        entry = None
+        if type(token) is str:
+            with _PURGE_LOCK:
+                entry = _PURGE_TOKENS.pop(token, None)
+        if (
+            entry is None
+            or time.monotonic() >= entry[2]
+            or entry[0] != str(self.memory.database_path)
+        ):
+            return {"ok": False, "error": "This purge confirmation is unknown, used or expired."}
+        record_ids = entry[1]
+        confirmation = PurgeConfirmation(record_ids=record_ids, minted_at=utc_now(), nonce=secrets.token_hex(16))
+        try:
+            result = self.memory.purge_records(
+                record_ids, actor=MemoryRecordActor.USER, confirmation=confirmation)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        except (sqlite3.Error, OSError):
+            return {"ok": False, "error": "The purge did not finish (database busy); request it again."}
+        return {
+            "ok": True,
+            "purge_id": result["purge_id"],
+            "record_ids": list(result["record_ids"]),
+            "still_held_by": list(result["still_held_by"]),
+        }
+
     def memory_doctor_payload(self, project_id: str | None = None) -> dict[str, Any]:
         return memory_doctor_payload(self.memory, project_id)
 
@@ -4815,6 +4975,12 @@ class JarvisApp:
             # from the redacted text: the store redacts only ``text``.
             redacted = redact_local_paths(redact_credentials(text)[0])
             subject_key = normalize_memory_subject_key(redacted.strip()[:60])
+            MemoryRecordKind(kind)
+            # I14: an instruction-like message is stored as a PENDING RULE;
+            # only the Core-drawn card (approve_memory_record) approves it.
+            hits = tuple(dict.fromkeys(instruction_likeness(text) + instruction_likeness(redacted)))
+            if hits:
+                kind = MemoryRecordKind.RULE.value
             view = self.memory.insert_explicit_user_record(
                 record.project_id, kind, DataClassification.INTERNAL.value, text, subject_key
             )
@@ -4822,6 +4988,8 @@ class JarvisApp:
             return {"ok": False, "refused": exc.category, "error": "This message cannot be stored in memory."}
         except (TypeError, ValueError) as exc:
             return {"ok": False, "error": str(exc)}
+        if hits:
+            return {"ok": True, "record": self._record_payload(view), "instruction_like": list(hits)}
         return {"ok": True, "record": self._record_payload(view)}
 
     # -- V2.1b (IMPEXTRACT): history import pipeline ----------------------------
