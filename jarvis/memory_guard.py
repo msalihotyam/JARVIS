@@ -228,7 +228,11 @@ _MEANING_TOKENS = frozenset({
 
 def verify_user_stated(candidate_text: str, user_turn_text: str) -> bool:
     """True when >= 80% of the candidate's folded tokens are in this ONE user
-    turn and every negation or number token of the candidate is too."""
+    turn and every negation or number token of the candidate is too.
+
+    A negation in the turn must be in the candidate as well: dropping the
+    user's 'don't' flips the meaning (an unrelated negation in the turn only
+    costs user_stated, so the row stays PENDING)."""
     if type(candidate_text) is not str or type(user_turn_text) is not str:
         return False
     candidate, turn = _tokens(candidate_text), _tokens(user_turn_text)
@@ -238,6 +242,8 @@ def verify_user_stated(candidate_text: str, user_turn_text: str) -> bool:
         (tok in _MEANING_TOKENS or any(ch.isdigit() for ch in tok)) and tok not in turn
         for tok in candidate
     ):
+        return False
+    if (turn & _MEANING_TOKENS) - candidate:
         return False
     return len(candidate & turn) >= 0.8 * len(candidate)
 

@@ -5833,6 +5833,9 @@ class AgentCore:
                     MemoryRecordScopeKind.PROJECT,
                     DataClassification.INTERNAL,
                     operational=is_operational_preference(candidate.text),
+                    # Q1: only the clean user-stated project row auto-saves;
+                    # decide_admission keeps every other row PENDING or refused.
+                    preference_autosave=True,
                 )
                 if admission.status == REFUSE:
                     refused += 1
@@ -5866,6 +5869,7 @@ class AgentCore:
                             source_turn_ids=candidate.evidence_turn_ids,
                         ),
                         guard=guard,
+                        preference_autosave=True,
                     )
             except CaptureCancelled:
                 raise

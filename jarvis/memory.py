@@ -6956,6 +6956,8 @@ class SQLiteMemoryStore:
         record: MemoryRecord,
         guard: RecordGuard | None = None,
         lifetime: Lifetime | str | None = None,
+        *,
+        preference_autosave: bool = False,
     ) -> MemoryRecordView:
         """Insert one model/tool/import record plus its initial status event.
 
@@ -6972,6 +6974,11 @@ class SQLiteMemoryStore:
 
         ``lifetime`` (I19) can only shorten what the text allows; see
         ``_persist_record``.
+
+        ``preference_autosave`` (Q1, Core's capture path only) is passed to
+        ``decide_admission``; only its ``operational_preference_autosave``
+        verdict starts a PREFERENCE APPROVED, with the event reason
+        ``auto_saved``. Without ``guard`` it has no effect.
         """
         if guard is not None and type(guard) is not RecordGuard:
             raise ValueError("guard must be a RecordGuard")
@@ -6986,7 +6993,9 @@ class SQLiteMemoryStore:
             )
         if record.actor is MemoryRecordActor.USER:
             raise ValueError("insert_record refuses the USER actor")
-        return self._persist_record(record, guard, lifetime=lifetime)
+        return self._persist_record(
+            record, guard, lifetime=lifetime, preference_autosave=preference_autosave
+        )
 
     def insert_explicit_user_record(
         self,
@@ -7099,6 +7108,7 @@ class SQLiteMemoryStore:
         legacy_id: str | None = None,
         *,
         lifetime: Lifetime | str | None = None,
+        preference_autosave: bool = False,
     ) -> MemoryRecordView:
         """The one INSERT-only record path; filter and hygiene re-run here.
 
@@ -7142,6 +7152,7 @@ class SQLiteMemoryStore:
             else MemoryRecordStatus.PENDING
         )
         guard_row = None
+        autosaved = False
         if guard is not None:
             if guard.proposed_kind is not record.kind:
                 raise ValueError("guard proposed_kind must be the record's kind")
@@ -7165,6 +7176,7 @@ class SQLiteMemoryStore:
                 stored.scope.kind,
                 stored.classification,
                 operational=is_operational_preference(stored.text),
+                preference_autosave=preference_autosave is True,
             )
             if admission.status == REFUSE:
                 raise MemoryRecordRefused(admission.reason)
@@ -7178,6 +7190,13 @@ class SQLiteMemoryStore:
             # The stricter of the admission and the guard-less default wins.
             if admission.status is MemoryRecordStatus.PENDING:
                 status = MemoryRecordStatus.PENDING
+            # Q1: only Core's operational-preference rule lifts a PREFERENCE.
+            autosaved = (
+                admission.status is MemoryRecordStatus.APPROVED
+                and admission.reason == "operational_preference_autosave"
+            )
+            if autosaved:
+                status = MemoryRecordStatus.APPROVED
             guard_row = (
                 guard.provenance.value,
                 guard.session_taint.value,
@@ -7258,7 +7277,7 @@ class SQLiteMemoryStore:
                     stored.record_id,
                     status.value,
                     stored.actor.value,
-                    "created",
+                    "auto_saved" if autosaved else "created",
                     utc_now(),
                 ),
             )
