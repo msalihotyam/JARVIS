@@ -236,11 +236,13 @@ class SkillLearnTests(unittest.TestCase):
         run = core.run(user_task())
         self.assertEqual(run.status, RunStatus.COMPLETED, run.error)
         learned = core.correct_run(run.session.id, run.task.id, "Once yedek dosyayi kontrol et")
-        self.assertTrue(learned["experience_ids"])
+        # a2 (V22RESAPPLY): the dummy "echo" step is not on the no-external-read
+        # allow-list, so the run leaves no lesson; the same asserts with echo
+        # allow-listed live in test_skill_experience_origin.
+        self.assertEqual(learned["experience_ids"], [])
+        self.assertEqual(learned["experience_skipped"], "external_content")
         avoid = [e for e in self.store.experiences(None) if e.kind is ExperienceKind.AVOID]
-        self.assertEqual(len(avoid), 1)
-        self.assertIn("Once yedek dosyayi kontrol et", avoid[0].text)
-        self.assertEqual(avoid[0].source_run_id, run.task.id)
+        self.assertEqual(len(avoid), 0)
         self.assertEqual(learned["draft_ids"], [])
 
     def test_a_corrected_skill_run_proposes_a_version_with_the_correction(self) -> None:

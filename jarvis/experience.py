@@ -87,6 +87,22 @@ FRAGMENT_MAX = 120
 PATH_STEPS_MAX = 8
 PATH_STEP_MAX = 60
 
+#: V2.2 a2 (Salih 2026-10-15): the ONLY step capabilities Core knows read no
+#: external content (a web, file, folder, connector or mail read, tool or
+#: CLI output, or model text written after such a read). An allow-list, never
+#: a deny-list: a run with any other executed step capability - unknown,
+#: unclassified or none at all - leaves no lesson (the cost accepted:
+#: "deneyim daha az ders üretir"). EMPTY, so lessons are off: every
+#: capability in the catalog reads external content or carries text Core
+#: cannot vouch for. Even the two local writes that read nothing
+#: (``file_write``, ``project_folder_create``) take their objective - the
+#: lesson's task text and step action - from the intent model, which is
+#: prompted with the recent conversation and attachments (earlier web, mail
+#: or file content). A member needs proof its run text is user-typed first.
+NO_EXTERNAL_READ_CAPABILITIES: frozenset[str] = frozenset()
+#: The fixed checkpoint label when a run's lessons are withheld for that reason.
+EXTERNAL_CONTENT = "external_content"
+
 _OPEN_QUOTE = chr(0xAB)
 _CLOSE_QUOTE = chr(0xBB)
 _ELLIPSIS = chr(0x2026)
@@ -482,6 +498,18 @@ def capture_candidates(
     return tuple(out)
 
 
+def reads_no_external_content(run: RunSummary) -> bool:
+    """True only when the run has steps and every one carries an allow-listed
+    capability (``NO_EXTERNAL_READ_CAPABILITIES``); anything else, a missing
+    capability or a bad record included, is external (fail closed)."""
+    try:
+        return bool(run.steps) and all(
+            step.capability in NO_EXTERNAL_READ_CAPABILITIES for step in run.steps
+        )
+    except Exception:  # noqa: BLE001 - unreadable means external
+        return False
+
+
 def _check_optional_id(value: object, name: str) -> None:
     if value is not None and (type(value) is not str or ID_PATTERN.fullmatch(value) is None):
         raise ValueError(f"{name} must be None or an id of a-z, 0-9, _ or -")
@@ -602,10 +630,13 @@ __all__ = [
     "CONTEXT_NOTE",
     "DEFAULT_MAX_CHARS",
     "DEFAULT_MAX_ITEMS",
+    "EXTERNAL_CONTENT",
     "MAX_SELECT_CHARS",
     "MAX_SELECT_ITEMS",
+    "NO_EXTERNAL_READ_CAPABILITIES",
     "RENDER_MAX_CHARS",
     "capture_candidates",
+    "reads_no_external_content",
     "render_context",
     "select_for_task",
     "task_tokens",

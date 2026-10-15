@@ -7047,12 +7047,18 @@ class AgentCore:
         for draft in drafts:
             if self._skill_plannable(draft) and self._skill_keep(self.skill_store.add_draft, draft):
                 learned["draft_ids"].append(draft.draft_id)
-        try:
-            lessons = skill_experience.capture_candidates(
-                run, created_at=now, matched_skill_health=health
-            )
-        except Exception:  # noqa: BLE001 - lessons are advice; none on a fault
-            lessons = ()
+        # a2: no per-lesson approval, so no external content may reach one: a
+        # run with any step outside the allow-list captures no lesson at all.
+        lessons: tuple[Any, ...] = ()
+        if not skill_experience.reads_no_external_content(run):
+            learned["experience_skipped"] = skill_experience.EXTERNAL_CONTENT
+        else:
+            try:
+                lessons = skill_experience.capture_candidates(
+                    run, created_at=now, matched_skill_health=health
+                )
+            except Exception:  # noqa: BLE001 - lessons are advice; none on a fault
+                lessons = ()
         for lesson in lessons:
             kept = self._skill_keep(self.skill_store.add_experience, lesson)
             if kept:
@@ -7063,7 +7069,8 @@ class AgentCore:
 
     def _skill_offer(self, session: SessionState, task: Task, learned: dict[str, Any]) -> None:
         """The offer event naming ONLY newly stored drafts; else the count of
-        kept and dropped lessons. A lost checkpoint raises as everywhere."""
+        kept and dropped lessons, or the fixed label of why none was kept. A
+        lost checkpoint raises as everywhere."""
         if learned["draft_ids"]:
             self._checkpoint(
                 session,
@@ -7071,7 +7078,7 @@ class AgentCore:
                 "skill_draft_offered",
                 {**learned, "message": _SKILL_OFFER_MESSAGE},
             )
-        elif learned["experience_ids"] or learned["dropped"]:
+        elif learned["experience_ids"] or learned["dropped"] or learned.get("experience_skipped"):
             self._checkpoint(session, task, "skill_experience_captured", learned)
 
     def _skill_learn_task(self, session: SessionState, task: Task) -> None:
