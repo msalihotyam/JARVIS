@@ -11,7 +11,7 @@ from dataclasses import replace
 from unittest import mock
 
 from jarvis.app import JarvisApp
-from jarvis.skill_types import SkillOrigin, SkillScope, SkillScopeKind
+from jarvis.skill_types import SkillInput, SkillOrigin, SkillScope, SkillScopeKind
 from tests.helpers import wait_until
 from tests.test_intent import task_proposal
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
@@ -124,6 +124,32 @@ class SkillsFeedTests(test_ui.UiTestCase):
         self.assertEqual(DRAFT(2), self.calls["draft_reject"].call_args.args[1])
         self.assertTrue(wait_until(lambda: not self.cards(root), 2000))
         self.assertFalse(self.calls["approve"].called)
+
+    def test_the_card_shows_every_field_that_is_saved(self) -> None:
+        # a4: seen = saved. Each saved field gets its own distinct text, shown whole.
+        scope = SkillScope(kind=SkillScopeKind.PROJECT, project_id=self.project)
+        base = draft(7, scope)
+        summary = "Haftalik raporu okur, toplamlari cikarir ve ozeti dosyaya yazar; " * 3
+        self.skills.add_draft(replace(
+            base, name="Rapor ozeti", summary=summary,
+            inputs=(SkillInput(name="path", description="Rapor dosyasi", required=True),),
+            steps=(base.steps[0], replace(base.steps[0], index=2, action="Ozeti yaz: {path}.ozet")),
+            checks=("Ozet dosyasi bos degil",)))
+        ui, root = self.open()
+        self.offer(ui, DRAFT(7))
+        card = next(c for c in self.cards(root) if c.objectName() == "feedSkillDraft_" + DRAFT(7))
+        shown, todo = [], [card]
+        while todo:
+            node = todo.pop()
+            if node.isVisible() and isinstance(node.property("text"), str):
+                shown.append(node.property("text"))
+            todo += node.childItems()
+        for saved in ("Rapor ozeti", summary, "1. Haftalik rapor dosyasini oku: {path}", "2. Ozeti yaz: {path}.ozet",
+                      "· path: Rapor dosyasi", "· Ozet dosyasi bos degil", "This project (Alpha)"):
+            with self.subTest(saved):
+                self.assertIn(saved, shown)
+        self.assertEqual("project", card.property("chosenScope"))
+        self.assertIn("run-1", self.item(root, "feedSkillDraftSource").property("text"))
 
     def test_a_version_proposal_shows_its_number_and_diff_to_the_active_skill(self) -> None:
         self.skills.add_draft(draft(5))

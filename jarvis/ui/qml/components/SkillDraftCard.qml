@@ -9,6 +9,7 @@ import "../theme"
 Rectangle {
     id: card
     property string draftName: ""
+    property string summary: ""                // saved and used for matching, so shown in full
     property var steps: []
     property var inputs: []
     property var checks: []
@@ -55,6 +56,7 @@ Rectangle {
                                    : qsTr("Save this as a skill?") }
         Text { objectName: "skillDraftName"; width: parent.width; wrapMode: Text.Wrap; textFormat: Text.PlainText
                text: card.draftName; color: Theme.text; font: Theme.pageRowStrong }
+        Line { objectName: "skillDraftSummary"; visible: text !== ""; text: card.summary }
         Section { heading: qsTr("Steps"); items: card.steps; numbered: true; itemName: "skillDraftStep" }
         Section { heading: qsTr("Inputs"); items: card.inputs; itemName: "skillDraftInput" }
         Section { heading: qsTr("Checks"); items: card.checks; itemName: "skillDraftCheck" }

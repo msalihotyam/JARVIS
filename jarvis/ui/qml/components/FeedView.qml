@@ -799,6 +799,7 @@ Item {
                                                 objectName: "feedSkillDraft_" + draftItem.draft.id
                                                 width: parent.width
                                                 draftName: draftItem.draft.name
+                                                summary: draftItem.draft.summary || ""
                                                 steps: draftItem.draft.steps
                                                 inputs: draftItem.draft.inputs
                                                 checks: draftItem.draft.checks
