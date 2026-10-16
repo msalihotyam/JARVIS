@@ -183,8 +183,9 @@ class MemoryInjectTests(unittest.TestCase):
         search = self.store.search_records
         select = memory_retrieval.select_for_task
 
-        def any_status(text, scope, kinds=None, statuses=None, limit=20):
-            return search(text, scope, kinds=kinds, statuses=None, limit=limit)
+        def any_status(text, scope, kinds=None, statuses=None, limit=20, for_conversation_id=None):
+            return search(text, scope, kinds=kinds, statuses=None, limit=limit,
+                          for_conversation_id=for_conversation_id)
 
         def all_approved(records, *args, **kwargs):
             records = [replace(r, status=MemoryRecordStatus.APPROVED) for r in records]

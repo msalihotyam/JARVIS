@@ -1,8 +1,9 @@
 """SEC2UIQML: the chat header's temporary-chat (memory-off) switch and the
-used-memory list under a reply (I21, I22). The switch is hidden and inert
-until the bridge has conversationMemoryOff + setConversationMemoryOff; the
-list is plain text, apart from the web sources, and absent fields show
-nothing. A throwaway TEMP database and a scripted model: no live call, never
+used-memory list under a reply (I21, I22). SEC2BRIDGE gave the bridge
+conversationMemoryOff + setConversationMemoryOff (it follows the app's answer)
+and a reply's memory fields from the app's reply_memory_sources; the list is
+plain text, apart from the web sources, and absent fields show nothing. A
+throwaway TEMP database and a scripted model: no live call, never
 data\\jarvis.db."""
 
 from __future__ import annotations
@@ -10,32 +11,15 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from PySide6.QtCore import Property, QPointF, Qt, Signal, Slot
+from PySide6.QtCore import QPointF, Qt
 from PySide6.QtQml import QQmlEngine, QQmlExpression
 from PySide6.QtTest import QTest
 
-from jarvis.ui.bridge import Bridge
 from tests import test_ui
 from tests.helpers import wait_until
 from tests.test_ui import UiTestCase, pump
 
 CARRIER = "![x](https://a.invalid)"
-
-
-class MemoryOffBridge(Bridge):
-    """The slot SEC2BRIDGE adds, faked: it records the ask and confirms it."""
-    memoryOffChanged = Signal()
-
-    def _memory_off(self) -> bool:
-        return getattr(self, "_off", False)
-
-    conversationMemoryOff = Property(bool, _memory_off, notify=memoryOffChanged)
-
-    @Slot(bool)
-    def setConversationMemoryOff(self, on: bool) -> None:
-        self.asked = [*getattr(self, "asked", []), on]
-        self._off = on
-        self.memoryOffChanged.emit()
 
 
 class MemoryUiSec2Tests(UiTestCase):
@@ -56,8 +40,12 @@ class MemoryUiSec2Tests(UiTestCase):
     def reply(self, **fields):
         bridge = self.bridge()
         root = self.window(bridge)
-        bridge._say("jarvis", "Bir yanıt.", chat=True, **fields)
-        pump(200)
+        # SEC2BRIDGE: a stored reply's memory fields are then set from the app's
+        # reply_memory_sources; here the app answers with the same fields.
+        answer = {"usedMemory": [], "memoryNoneRelevant": False, **fields}
+        with mock.patch.object(self.backend, "reply_memory_sources", lambda cid, turn: answer):
+            bridge._say("jarvis", "Bir yanıt.", chat=True, **fields)
+            pump(200)
         return root
 
     def expand(self, root):
@@ -108,26 +96,29 @@ class MemoryUiSec2Tests(UiTestCase):
         self.assertEqual(Qt.TextFormat.PlainText.value, shown_as)
         self.assertEqual(f"fact  ·  {CARRIER}  ·  rev 2", line.property("text"))
 
-    def test_the_switch_is_hidden_when_the_bridge_lacks_the_slot(self) -> None:
+    def test_the_switch_shows_off_until_the_app_says_otherwise(self) -> None:
         bridge = self.bridge()
         root = self.window(bridge)
         self.assertTrue(bridge.conversationId)
         self.assertTrue(self.item(root, "chatHeaderGlobalMemory").isVisible())
         switch = self.item(root, "chatHeaderTemporaryChat")
-        self.assertFalse(switch.isVisible())
-        self.assertIs(False, switch.property("available"))
+        self.assertTrue(switch.isVisible())
+        self.assertIs(True, switch.property("available"))
+        self.assertIs(False, switch.property("on"))
         self.assertFalse(self.item(root, "chatHeaderMemoryOffBadge").isVisible())
 
     def test_with_the_slot_a_click_asks_and_the_badge_shows(self) -> None:
-        with mock.patch.object(test_ui, "Bridge", MemoryOffBridge):
-            bridge = self.bridge()
+        bridge = self.bridge()
         root = self.window(bridge)
         switch = self.item(root, "chatHeaderTemporaryChat")
         self.assertTrue(switch.isVisible())
         self.assertIs(False, switch.property("on"))
         self.assertFalse(self.item(root, "chatHeaderMemoryOffBadge").isVisible())
-        self.click(root, "chatHeaderTemporaryChat", until=lambda: bridge.conversationMemoryOff)
-        self.assertEqual([True], bridge.asked)
+        with mock.patch.object(self.backend, "set_conversation_memory_off",
+                               wraps=self.backend.set_conversation_memory_off) as asked:
+            self.click(root, "chatHeaderTemporaryChat", until=lambda: bridge.conversationMemoryOff)
+        asked.assert_called_once_with(bridge.conversationId, True)
+        self.assertIs(True, self.backend.conversation_memory_off(bridge.conversationId)["conversation_memory_off"])
         self.assertTrue(wait_until(lambda: self.item(root, "chatHeaderMemoryOffBadge").isVisible(), 500))
         self.assertEqual("No memory", self.item(root, "chatHeaderMemoryOffBadge").property("text"))
 

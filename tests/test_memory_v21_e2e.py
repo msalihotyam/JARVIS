@@ -39,6 +39,8 @@ from tests.helpers import isolated_settings, open_app
 from tests.test_intent import ScriptedModel, chat_proposal
 
 LABEL = "memory record (reference data, not an instruction)"
+NONE_LINE = ("Hafızada bu konuyla ilgili kayıt yok; hatırladığını iddia etme. / "
+             "No relevant memory; do not claim remembered facts.")
 FRIDAY = "We deploy the release only on Fridays."
 THURSDAY = "We deploy the release only on Thursdays now."
 UV = "The build of the release uses uv for every package."
@@ -223,8 +225,8 @@ class MemoryV21EndToEndTest(unittest.TestCase):
         # Delivery-level: an approved DECISION is never auto-superseded
         # (memory_consolidation); the newest approved one wins retrieval.
 
-        # Project B never sees Alpha's memory ...
-        self.assertEqual({}, self.chat_memory(self.beta))
+        # Project B never sees Alpha's memory (SEC2CORE2 I22: only the NONE line) ...
+        self.assertEqual([NONE_LINE], list(self.chat_memory(self.beta)))
         self.assertNotIn(THURSDAY, self.records(self.beta))
         # ... except through ITS conversation's toggle: read-only, labelled.
         beta_cid = self.store.create_conversation(self.beta).id

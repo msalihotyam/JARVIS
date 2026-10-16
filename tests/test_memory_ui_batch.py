@@ -100,7 +100,7 @@ class MemoryBatchPageTests(K6Case):
             "auto_saved": [item("m3", "preference", "Dark mode please", status="approved", undo=True)]})
         settled(800, lambda: self.assertEqual(3, len(self.cards(root))))
         self.assertEqual("c1", self.ui.memoryBatch["conversation_id"])
-        english = ["Tainted session", "Instruction-like", "Model-inferred", "Global", "Sensitive", "Legacy"]
+        english = ["Tainted session", "Instruction-like", "Model-inferred", "All projects", "Sensitive", "Legacy"]
 
         def badges():
             return sorted(b.property("text") for b in self.named(root, "memoryReasonBadge"))
@@ -110,7 +110,7 @@ class MemoryBatchPageTests(K6Case):
         self.assertEqual(2, len(self.named(root, "memoryApprove")))        # only the pending ones
         localization(_APP).apply("tr-TR")
         self.addCleanup(localization(_APP).apply, "en-US")
-        turkish = ["Kirli oturum", "Talimat benzeri", "Model çıkarımı", "Genel kapsam", "Hassas", "Eski kayıt"]
+        turkish = ["Kirli oturum", "Talimat benzeri", "Model çıkarımı", "Tüm projeler", "Hassas", "Eski kayıt"]
         settled(500, lambda: self.assertEqual(sorted(turkish + ["Hassas"]), badges()))
 
     def test_approve_reject_and_undo_go_through_the_bridge_slots(self) -> None:

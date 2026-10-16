@@ -2487,8 +2487,8 @@ yok</translation>
         <translation>Model çıkarımı</translation>
     </message>
     <message>
-        <source>Global</source>
-        <translation>Genel kapsam</translation>
+        <source>All projects</source>
+        <translation>Tüm projeler</translation>
     </message>
     <message>
         <source>Sensitive</source>

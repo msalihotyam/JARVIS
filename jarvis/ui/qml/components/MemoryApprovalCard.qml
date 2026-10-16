@@ -20,7 +20,7 @@ Rectangle {
     readonly property var reasons: record.reasons || []
     readonly property var reasonWords: ({
         "tainted": qsTr("Tainted session"), "instruction_like": qsTr("Instruction-like"),
-        "model_inferred": qsTr("Model-inferred"), "global": qsTr("Global"),
+        "model_inferred": qsTr("Model-inferred"), "global": qsTr("All projects"),
         "sensitive": qsTr("Sensitive"), "legacy": qsTr("Legacy") })
     signal approve()
     signal reject()
