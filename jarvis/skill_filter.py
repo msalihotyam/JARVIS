@@ -137,12 +137,16 @@ _SEPARATED_IBAN = re.compile(
 )
 _IBAN_SEPARATORS = re.compile(r"[\W_]")
 _LABEL_SEPARATOR = r"(?:[ \t]*[:=>\-‐-―→]{1,3}[ \t]*|[ \t]+)"
-# A password label, then any value of four or more characters: refused unless
-# the whole value is exactly one of the UI words below ("password field",
-# "parola alanını"); "Parolam fieldmouse" and "şifre - alan9921" are refused.
+# A password label (Turkish suffixes up to 12 letters: "Şifreleriniz"), any
+# run of non-word characters (blanks, newlines, , / | ~ ; . : dashes, marks),
+# then any value of four or more characters: refused unless the raw value is
+# exactly one of the UI words below, optionally followed by one sentence-final
+# mark ("password field.",
+# "parola alanını"); "Parolam fieldmouse", "Parolam field!!!" and
+# "şifre - alan9921" are refused.
 _PASSWORD_LABEL = re.compile(
-    r"(?<!\w)(?:şifre\w{0,6}|sifre\w{0,6}|parola\w{0,6}|password|passwd|passcode"
-    r"|passphrase|pw)(?!\w)" + _LABEL_SEPARATOR + r"(?P<value>\S{4,64})",
+    r"(?<!\w)(?:şifre\w{0,12}|sifre\w{0,12}|parola\w{0,12}|pass[\W_]{0,3}word|passwd"
+    r"|passcode|passphrase|pw)(?!\w)[\W_]+(?P<value>\S{4,64})",
     re.IGNORECASE,
 )
 _PASSWORD_UI_WORDS = frozenset((
@@ -252,8 +256,11 @@ def _has_grouped_national_id(text: str) -> bool:
     return False
 
 
+_TRAILING_PUNCTUATION = ".,;:!?)]}\"'"
+
+
 def _values(pattern: re.Pattern[str], text: str) -> list[str]:
-    values = (match.group("value").rstrip(".,;:!?)]}\"'") for match in pattern.finditer(text))
+    values = (match.group("value").rstrip(_TRAILING_PUNCTUATION) for match in pattern.finditer(text))
     return [value for value in values if len(value) >= 4]
 
 
@@ -261,12 +268,29 @@ def _secret_looking(value: str) -> bool:
     return any(p.search(value) for p in _SECRET_LOOKING)
 
 
+def _is_password_ui_word(raw_value: str) -> bool:
+    value = raw_value.lower()
+    if value[-1] in ".!?":
+        value = value[:-1]
+    return value in _PASSWORD_UI_WORDS
+
+
+def _has_password_value(text: str) -> bool:
+    # Also on the text without combining marks: a mark right after the label
+    # ("Parolam̶ x") would otherwise end the label and stop the match.
+    # The 4-character minimum is measured without trailing punctuation.
+    marks_dropped = "".join(c for c in text if not unicodedata.category(c).startswith("M"))
+    return any(
+        len(match.group("value").rstrip(_TRAILING_PUNCTUATION)) >= 4
+        and not _is_password_ui_word(match.group("value"))
+        for form in (text, marks_dropped)
+        for match in _PASSWORD_LABEL.finditer(form)
+    )
+
+
 def _has_labelled_secret(text: str) -> bool:
     return (
-        any(
-            value.lower() not in _PASSWORD_UI_WORDS
-            for value in _values(_PASSWORD_LABEL, text)
-        )
+        _has_password_value(text)
         or any(_secret_looking(value) for value in _values(_KEY_LABEL, text))
         or any(_secret_looking(value) for value in _values(_PASSWORD_IS, text))
     )

@@ -76,6 +76,36 @@ class LeakClassTests(unittest.TestCase):
         self.assertAllowed("Şifre alanına yaz.")
         self.assertAllowed("Open the password dialog.")
 
+    def test_password_label_separator_suffix_and_mark_variants(self):
+        for text in (
+            "Parolam\nkeditopu",
+            "Parolam, keditopu",
+            "Parolam / keditopu",
+            "Şifreleriniz: keditopu",
+            "Parolalarınız keditopu",
+            "pass word keditopu",
+            "Parolam̶ keditopu",
+            "Parolam | keditopu",
+            "Parolam ~ keditopu",
+            "Parolam field!!!",
+            "Parolam; keditopu",
+            "Parolam + keditopu",
+            "Parolam • keditopu",
+            "pass.word keditopu",
+        ):
+            with self.subTest(text=text):
+                self.assertRefused(text, "credential")
+        for text in (
+            "Parola alanını doldur.",
+            "Enter the password field.",
+            "The password field is required.",
+            "Şifre alanına yaz.",
+            "Open the password dialog.",
+            "Kimlik 123.456.789.51",
+        ):
+            with self.subTest(text=text):
+                self.assertAllowed(text)
+
     def test_short_unquoted_secret_or_key(self):
         for text in (
             "password hunter2",
