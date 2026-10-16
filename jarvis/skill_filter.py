@@ -24,8 +24,8 @@ A field is refused when any of these hold:
   never-stored category (``field_name``; the name is never echoed);
 * it hits a leak class memory_filter misses (SKFILTERLEAK, S1 notes 4):
   card or TC kimlik digit groups joined by any short non-word separator,
-  separated IBANs, a password label followed by any value that is not a UI
-  word ("Parolam KediTopu"), a key/token label followed by a secret-looking
+  separated IBANs, a password label followed by any value that is not exactly
+  a known UI word ("Parolam KediTopu", "Parolam fieldmouse"), a key/token label followed by a secret-looking
   value ("key sk-AbC123"), short vendor-prefixed keys, any-case PEM private
   key headers and bare base64 DER (``M...``) key bodies. Over-blocking is
   accepted (fail closed);
@@ -128,7 +128,8 @@ _EMAIL_PATTERN = re.compile(r"[\w.+%-]@(?:[\w-]|\[[^\]\s])")
 # check below sees "123.456.789.50"; a valid checksum still decides.
 _DIGIT_SEPARATOR = re.compile(r"(?<=\d)[\W_]{1,4}(?=\d)")
 _DIGIT_GROUPS = re.compile(r"\d+(?: \d+)*")
-_ID_MAX_GROUPS = 6
+# Eleven one-digit groups are the most a TC number can be split into.
+_ID_MAX_GROUPS = 11
 # An IBAN whose groups are joined the same way; memory_filter's mod-97 check
 # decides on the compacted form.
 _SEPARATED_IBAN = re.compile(
@@ -137,19 +138,24 @@ _SEPARATED_IBAN = re.compile(
 _IBAN_SEPARATORS = re.compile(r"[\W_]")
 _LABEL_SEPARATOR = r"(?:[ \t]*[:=>\-‐-―→]{1,3}[ \t]*|[ \t]+)"
 # A password label, then any value of four or more characters: refused unless
-# the value starts like a UI word ("password field", "parola alanını").
+# the whole value is exactly one of the UI words below ("password field",
+# "parola alanını"); "Parolam fieldmouse" and "şifre - alan9921" are refused.
 _PASSWORD_LABEL = re.compile(
     r"(?<!\w)(?:şifre\w{0,6}|sifre\w{0,6}|parola\w{0,6}|password|passwd|passcode"
     r"|passphrase|pw)(?!\w)" + _LABEL_SEPARATOR + r"(?P<value>\S{4,64})",
     re.IGNORECASE,
 )
-_PASSWORD_UI_WORDS = (
-    "field", "box", "input", "prompt", "manager", "reset", "change", "policy", "rule",
-    "requirement", "dialog", "screen", "page", "form", "protect", "length", "strength",
-    "hint", "recover", "expir", "must", "should", "when", "that", "with", "from", "into",
-    "alan", "kutu", "yönetici", "sıfırla", "değiş", "kural", "giriş", "gir", "iste",
-    "ekran", "sayfa", "pencere",
-)
+_PASSWORD_UI_WORDS = frozenset((
+    "field", "fields", "input", "prompt", "manager", "reset", "change", "changes", "changed",
+    "policy", "rule", "rules", "requirement", "requirements", "dialog", "screen", "page",
+    "form", "protected", "protection", "length", "strength", "hint", "recovery", "expires",
+    "expired", "expiry", "must", "should", "when", "that", "with", "from", "into",
+    "alanı", "alanını", "alanına", "alanında", "alanda", "kutusu", "kutusuna", "kutusunu",
+    "yöneticisi", "sıfırla", "sıfırlama", "sıfırlayın", "değiştir", "değiştirin",
+    "değiştirme", "kuralı", "kuralları", "giriş", "girişi", "girin", "iste", "ister",
+    "istenir", "ekranı", "ekranında", "ekranına", "sayfası", "sayfasında", "sayfasına",
+    "penceresi", "penceresinde", "penceresine",
+))
 # A key/token/secret label (or a word that is also a common verb: pass, pin,
 # pwd), then a value that looks like a secret: a digit, an inner lower-to-upper
 # case change or an inner symbol ("key sk-AbC123").
@@ -258,7 +264,7 @@ def _secret_looking(value: str) -> bool:
 def _has_labelled_secret(text: str) -> bool:
     return (
         any(
-            not value.lower().startswith(_PASSWORD_UI_WORDS)
+            value.lower() not in _PASSWORD_UI_WORDS
             for value in _values(_PASSWORD_LABEL, text)
         )
         or any(_secret_looking(value) for value in _values(_KEY_LABEL, text))

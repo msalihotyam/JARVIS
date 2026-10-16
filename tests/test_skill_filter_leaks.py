@@ -46,6 +46,17 @@ class LeakClassTests(unittest.TestCase):
             self.assertRefused(text, "national_id")
         self.assertAllowed("Kimlik 123.456.789.51")  # checksum fails
 
+    def test_tc_kimlik_split_into_up_to_eleven_groups(self):
+        for text in (
+            "Kimlik 10-00-00-00-1-4-6",
+            "Kimlik 1.0.0.0.0.0.0.0.1.4.6",
+            "Kimlik 1 0 0 0 0 0 0 0 1 4 6",
+            "Kimlik 1.2.3.4.5.6.7.8.9.5.0",
+        ):
+            self.assertRefused(text, "national_id")
+        self.assertAllowed("Kimlik 10-00-00-00-1-4-7")  # checksum fails
+        self.assertAllowed("Kimlik 1.0.0.0.0.0.0.0.1.4.7")  # checksum fails
+
     def test_separated_iban(self):
         self.assertRefused("IBAN TR33-0006-1005-1978-6457-8413-26", "iban")
         self.assertRefused("IBAN TR33.0006.1005.1978.6457.8413.26", "iban")
@@ -58,6 +69,12 @@ class LeakClassTests(unittest.TestCase):
         self.assertRefused("my password kedicik", "credential")
         self.assertAllowed("Parola alanını doldur.")
         self.assertAllowed("Enter the password field.")
+
+    def test_password_label_exempt_only_for_an_exact_ui_word(self):
+        self.assertRefused("Parolam fieldmouse", "credential")
+        self.assertRefused("şifre - alan9921", "credential")
+        self.assertAllowed("Şifre alanına yaz.")
+        self.assertAllowed("Open the password dialog.")
 
     def test_short_unquoted_secret_or_key(self):
         for text in (
