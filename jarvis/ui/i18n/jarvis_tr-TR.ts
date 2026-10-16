@@ -454,6 +454,26 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
 <context>
     <name>Bridge</name>
     <message>
+        <source>uses %1</source>
+        <translation>%1 kullanır</translation>
+    </message>
+    <message>
+        <source>inputs: %1</source>
+        <translation>girdiler: %1</translation>
+    </message>
+    <message>
+        <source>check: %1</source>
+        <translation>kontrol: %1</translation>
+    </message>
+    <message>
+        <source>%1 (required)</source>
+        <translation>%1 (zorunlu)</translation>
+    </message>
+    <message>
+        <source>%1 (optional)</source>
+        <translation>%1 (isteğe bağlı)</translation>
+    </message>
+    <message>
         <source>JARVIS frozen</source>
         <translation>JARVIS donduruldu</translation>
     </message>

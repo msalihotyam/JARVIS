@@ -61,6 +61,7 @@ from jarvis.ui.backend import ATTACHMENT_SUPPORT, ApprovalTicket, Backend, appro
 from jarvis.ui.i18n import LANGUAGES, QT_TRANSLATE_NOOP, render, tx
 from jarvis.ui import weather
 from jarvis.ui.telemetry import Sampler
+from jarvis.ui.wording import code_word
 from jarvis.ui.preferences import (
     CHAT_PROVIDERS,
     CONTEXTUAL_PANELS,
@@ -4891,8 +4892,22 @@ class Bridge(QObject):
 
     @staticmethod
     def _skill_text(record: dict) -> dict:
-        return {"steps": [str(step.get("action")) for step in record.get("steps") or []],
-                "inputs": [str(i.get("name")) + (": " + str(i["description"]) if i.get("description") else "")
+        # Every field a save keeps reads on the card: a step's capability, inputs and check, an input's required.
+        def step(s: dict) -> str:
+            extra = [tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "uses %1"), code_word("capability", s["capability"]))
+                     if s.get("capability") else "",
+                     tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "inputs: %1"), ", ".join(map(str, s["inputs"])))
+                     if s.get("inputs") else "",
+                     tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "check: %1"), str(s["check"])) if s.get("check") else ""]
+            extra = [part for part in extra if part]
+            return str(s.get("action")) + (" (" + "; ".join(extra) + ")" if extra else "")
+
+        def need(i: dict) -> str:
+            return tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "%1 (required)") if i.get("required") is True
+                      else QT_TRANSLATE_NOOP("Bridge", "%1 (optional)"), str(i.get("name")))
+
+        return {"steps": [step(s) for s in record.get("steps") or []],
+                "inputs": [need(i) + (": " + str(i["description"]) if i.get("description") else "")
                            for i in record.get("inputs") or []],
                 "checks": [str(check) for check in record.get("checks") or []]}
 
@@ -4914,7 +4929,8 @@ class Bridge(QObject):
             drafts += [{"id": d["draft_id"], "project_id": pid, "name": d["name"], "summary": d["summary"],
                         "scope": d["scope"]["kind"], "project_name": projects.get(d["scope"]["project_id"] or "", ""),
                         "reason": d["reason"], "origin": d["provenance"]["origin"],
-                        "parent_version": d["provenance"]["parent_version"] or 0, **self._skill_text(d)}
+                        "parent_version": d["provenance"]["parent_version"] or 0,
+                        "target_skill_id": d.get("target_skill_id") or "", **self._skill_text(d)}
                        for d in scope["drafts"].get("drafts", []) if d["draft_id"] not in seen]
         names = {s["skill_id"]: s["name"] for _, s in found}
         self._skills = [

@@ -61,8 +61,8 @@ class SkillsBridgeTests(test_ui.UiTestCase):
         shown = self.row(ui, general)
         self.assertEqual((1, [1], "active", 0, "taught_from_run"),
                          (shown["version"], shown["versions"], shown["status"], shown["uses"], shown["origin"]))
-        self.assertEqual(["Haftalik rapor dosyasini oku: {path}"], shown["steps"])
-        self.assertEqual(["path"], shown["inputs"])
+        self.assertEqual(["Haftalik rapor dosyasini oku: {path} (uses File reading; inputs: path)"], shown["steps"])
+        self.assertEqual(["path (required)"], shown["inputs"])
         self.assertEqual([(DRAFT(3), self.project, "Alpha")],
                          [(d["id"], d["project_id"], d["project_name"]) for d in ui.pendingDrafts])
         self.assertEqual([], self.errors(ui))

@@ -12,6 +12,7 @@ from unittest import mock
 
 from jarvis.app import JarvisApp
 from jarvis.skill_types import SkillInput, SkillOrigin, SkillScope, SkillScopeKind
+from jarvis.ui.wording import code_word
 from tests.helpers import wait_until
 from tests.test_intent import task_proposal
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
@@ -21,6 +22,18 @@ from tests.test_ui import pump, tap
 
 DRAFT = "draft-{:032x}".format
 SPIED = ("draft_approve", "draft_reject", "suppress", "skill_decline", "skill_use", "approve")
+
+
+def _leaves(value, path="", parent=None):
+    """(dotted path, value, the record holding it) for each leaf; list items share their list's path."""
+    if isinstance(value, dict):
+        for key, item in value.items():
+            yield from _leaves(item, f"{path}.{key}".lstrip("."), value)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _leaves(item, path, parent)
+    else:
+        yield path, value, parent
 
 
 class SkillsFeedTests(test_ui.UiTestCase):
@@ -138,18 +151,68 @@ class SkillsFeedTests(test_ui.UiTestCase):
         ui, root = self.open()
         self.offer(ui, DRAFT(7))
         card = next(c for c in self.cards(root) if c.objectName() == "feedSkillDraft_" + DRAFT(7))
+        shown = self.texts(card)
+        for saved in ("Rapor ozeti", summary, "1. Haftalik rapor dosyasini oku: {path} (uses File reading; inputs: path)",
+                      "2. Ozeti yaz: {path}.ozet (uses File reading; inputs: path)",
+                      "· path (required): Rapor dosyasi", "· Ozet dosyasi bos degil", "This project (Alpha)"):
+            with self.subTest(saved):
+                self.assertIn(saved, shown)
+        self.assertEqual("project", card.property("chosenScope"))
+        self.assertIn("run-1", self.item(root, "feedSkillDraftSource").property("text"))
+
+    def test_every_field_of_the_draft_record_reaches_the_card_text(self) -> None:
+        # CDXINT53B C-B1: walk the record a save keeps, so a field added later and left off the card fails here.
+        # Every list holds an item and every optional field a value, so each path is walked and shown.
+        base = draft(8, SkillScope(kind=SkillScopeKind.PROJECT, project_id=self.project))
+        full = replace(
+            base, name="Rapor ozeti", summary="Raporu okur ve ozeti yazar", reason="Ayni rapor uc kez okundu",
+            inputs=(SkillInput(name="path", description="Rapor dosyasi", required=True),
+                    SkillInput(name="limit", description="Satir sayisi", required=False)),
+            steps=(replace(base.steps[0], inputs=("path", "limit"), check="Dosya okundu"),),
+            checks=("Ozet dosyasi bos degil",), provenance=replace(base.provenance, source_run_id="run-1"))
+        self.skills.add_draft(full)
+        ui, root = self.open()
+        self.offer(ui, DRAFT(8))
+        card = next(c for c in self.cards(root) if c.objectName() == "feedSkillDraft_" + DRAFT(8))
+        text = "\n".join(self.texts(card) + self.texts(self.item(root, "feedSkillDraftSource")))
+
+        def need(i):
+            return f"{i['name']} ({'required' if i['required'] else 'optional'})"
+
+        shown_as = {
+            "name": lambda v, p: v, "summary": lambda v, p: v, "reason": lambda v, p: v,
+            "scope.kind": lambda v, p: {"project": "This project"}[v], "scope.project_id": lambda v, p: "(Alpha)",
+            "inputs.name": lambda v, p: "· " + need(p), "inputs.required": lambda v, p: "· " + need(p),
+            "inputs.description": lambda v, p: f"· {need(p)}: {v}",
+            "steps.index": lambda v, p: f"{v}. {p['action']} (", "steps.action": lambda v, p: v,
+            "steps.capability": lambda v, p: "uses " + code_word("capability", v),
+            "steps.inputs": lambda v, p: "inputs: " + ", ".join(p["inputs"]), "steps.check": lambda v, p: "check: " + v,
+            "checks": lambda v, p: "· " + v, "provenance.source_run_id": lambda v, p: "From run " + v,
+        }
+        not_on_card = {
+            "draft_id",                     # the card's own objectName
+            "target_skill_id",              # the row carries it for the version label and diff (asserted below)
+            "provenance.origin",            # picks the question: a new skill or a version proposal (version test)
+            "provenance.parent_skill_id",   # lineage the version label reads (version test)
+            "provenance.parent_version",
+            "provenance.created_at",        # Core's timestamp, not part of the procedure
+        }
+        walked = list(_leaves(full.to_dict()))
+        self.assertEqual(set(), {path for path, _, _ in walked} - set(shown_as) - not_on_card)
+        for path, value, parent in walked:
+            if path in shown_as:
+                with self.subTest(path, value=value):
+                    self.assertIn(shown_as[path](value, parent), text)
+        self.assertEqual([""], [row["target_skill_id"] for row in ui.pendingDrafts])
+
+    def texts(self, card) -> list[str]:
         shown, todo = [], [card]
         while todo:
             node = todo.pop()
             if node.isVisible() and isinstance(node.property("text"), str):
                 shown.append(node.property("text"))
             todo += node.childItems()
-        for saved in ("Rapor ozeti", summary, "1. Haftalik rapor dosyasini oku: {path}", "2. Ozeti yaz: {path}.ozet",
-                      "· path: Rapor dosyasi", "· Ozet dosyasi bos degil", "This project (Alpha)"):
-            with self.subTest(saved):
-                self.assertIn(saved, shown)
-        self.assertEqual("project", card.property("chosenScope"))
-        self.assertIn("run-1", self.item(root, "feedSkillDraftSource").property("text"))
+        return shown
 
     def test_a_version_proposal_shows_its_number_and_diff_to_the_active_skill(self) -> None:
         self.skills.add_draft(draft(5))
@@ -163,9 +226,8 @@ class SkillsFeedTests(test_ui.UiTestCase):
         ui, root = self.open()
         ui.refreshSkills()
         self.assertTrue(wait_until(lambda: ui.skills and ui.pendingDrafts, 2000))
-        # The bridge row does not carry the draft's target yet (integration lane).
-        ui._pending_drafts = [{**row, "target_skill_id": skill.skill_id} for row in ui._pending_drafts]
-        ui.skillsChanged.emit()
+        # CDXINT53B C-M1: the bridge row carries the draft's target, so the label and diff read the active skill.
+        self.assertEqual([skill.skill_id], [row["target_skill_id"] for row in ui.pendingDrafts])
         ui._say("skill", "Beceri olarak kaydedilsin mi?", event="skill_draft_offered", run_id="run-6",
                 task_kind=TK, draft_ids=[DRAFT(6)])
         pump(300)
