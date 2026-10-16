@@ -6496,6 +6496,27 @@ class AgentCore:
         Missing inputs are asked for as a normal clarification. A refused
         plan or chain runs the task without the skill.
         """
+        try:
+            return self._skill_delegate_unguarded(session, task, skill)
+        except _LifecycleLost:
+            raise
+        except Exception:
+            # SKEXPLICITFIX2: an explicit anchor not yet stored as "delegated"
+            # is ended, never left for resume() to advance as an ordinary task.
+            stored = self.memory.load_task(task.id)
+            if (
+                self._skill_state(task).get("explicit") is True
+                and stored is not None
+                and not is_terminal(stored)
+                and self._skill_state(stored).get("state") != "delegated"
+            ):
+                task.preferences[_SKILL_RUN_KEY] = {"state": "not_used", "explicit": True}
+                self._skill_explicit_end(
+                    session, task, TaskStatus.FAILED, LoopStage.FAILED, "skill_not_used"
+                )
+            raise
+
+    def _skill_delegate_unguarded(self, session: SessionState, task: Task, skill: Any) -> AgentRun:
         prior = self._skill_state(task)
         ident = self._skill_ident(skill, bool(prior.get("revalidate")))
         if prior.get("explicit") is True:

@@ -4378,6 +4378,9 @@ class JarvisApp:
             # the skill exactly like an implicit fit; nothing here approves.
             if self.settings.skills_enabled is not True or not hasattr(self.core, "run_skill"):
                 return refused(IntentStatus.INVALID_INPUT, SKILL_REFUSED_OFF)
+            if not self.core.execution_allowed():
+                # SKEXPLICITFIX2: frozen - refused before Core makes a session.
+                return refused(IntentStatus.EXECUTION_DISABLED, _FROZEN_UNDERSTOOD_MESSAGE)
             run = self.core.run_skill(command.group(1), owner, session_id, text)
             if run.task is None:
                 return refused(IntentStatus.INVALID_INPUT, run.error.message if run.error else SKILL_REFUSED_OFF)

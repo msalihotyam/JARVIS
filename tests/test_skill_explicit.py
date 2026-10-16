@@ -23,6 +23,8 @@ import unittest
 from dataclasses import replace
 from unittest import mock
 
+from jarvis import intent
+from jarvis.app import _FROZEN_UNDERSTOOD_MESSAGE
 from jarvis.contracts import (
     ChainStatus,
     ErrorCode,
@@ -43,9 +45,10 @@ from jarvis.core import (
     SKILL_REFUSED_UNAPPROVED,
     SKILL_REFUSED_UNKNOWN,
 )
+from jarvis.intent import IntentStatus
 from jarvis.skill_lifecycle import SkillEvent, health
 from jarvis.skill_types import SkillEventKind, SkillScope, SkillScopeKind
-from tests.helpers import DummyConnector, isolated_settings, open_app
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, isolated_settings, open_app
 from tests.test_skill_authority_matrix import (
     AT,
     MODES,
@@ -322,6 +325,65 @@ class ExplicitResolutionTests(_Explicit):
         self.assertIsNone(unknown.task)
         self.assertIs(unknown.error.code, ErrorCode.UNKNOWN_SESSION)
 
+    def test_session_bound_to_another_project_is_refused(self) -> None:
+        # SKEXPLICITFIX2: a session_id whose project conflicts with the given one.
+        alpha = self.store.create_project("Alpha").id
+        beta = self.store.create_project("Beta").id
+        self.save()
+        session = self.core(DummyConnector(), PermissionMode.STRICT).start_session("bound")
+        session.project_id = alpha
+        self.store.save_session(session)
+        before = self.counts()
+        connector = DummyConnector()
+        run = self.core(connector, PermissionMode.SMART_AUTO).run_skill(
+            NAME, project_id=beta, session_id=session.id
+        )
+        self.assertIs(run.status, RunStatus.FAILED)
+        self.assertTrue(
+            run.error.message.startswith("Task project does not match"), run.error.message
+        )
+        self.assertEqual(self.counts(), before)
+        self.assertEqual(self.store.load_session(session.id).project_id, alpha)
+        self.assertEqual(connector.execute_calls, 0)
+
+
+class ExplicitFailClosedTests(_Explicit):
+    """SKEXPLICITFIX2: an explicit run never leaves a resumable anchor behind."""
+
+    def test_frozen_installation_runs_nothing(self) -> None:
+        self.save()
+        connector = DummyConnector()
+        core = self.core(connector, PermissionMode.SMART_AUTO)
+        core.settings = replace(core.settings, execution_enabled=False)
+        tasks_before = self.counts()[1]
+        run = core.run_skill(NAME)
+        self.assertIs(run.status, RunStatus.FAILED)
+        self.assertIs(run.error.code, ErrorCode.EXECUTION_DISABLED)
+        self.assertEqual(self.counts()[1], tasks_before)
+        self.assertEqual(connector.execute_calls, 0)
+
+    def test_exception_after_task_registered_ends_the_anchor(self) -> None:
+        self.save()
+        seen = []
+
+        def boom(session, task, skill):
+            seen.append((session.id, task.id))
+            raise RuntimeError("injected")
+
+        core = self.core(DummyConnector(), PermissionMode.SMART_AUTO)
+        with mock.patch.object(core, "_skill_delegate_unguarded", side_effect=boom):
+            with self.assertRaises(RuntimeError):
+                core.run_skill(NAME)
+        (session_id, anchor_id), = seen
+        self.assertIs(self.store.load_task(anchor_id).status, TaskStatus.FAILED)
+        sessions, tasks = self.counts()
+        connector = DummyConnector()
+        resumed = self.core(connector, PermissionMode.SMART_AUTO).resume(session_id, anchor_id)
+        self.assertIs(resumed.status, RunStatus.FAILED)
+        self.assertIs(self.store.load_task(anchor_id).status, TaskStatus.FAILED)
+        self.assertEqual(self.counts(), (sessions, tasks))  # no step, no chain session
+        self.assertEqual(connector.execute_calls, 0)
+
 
 class ExplicitUnapprovedTests(_Explicit):
     """A version without its own draft_approved event is never run by name."""
@@ -401,6 +463,48 @@ class ExplicitAppTests(unittest.TestCase):
         self.assertTrue(result.payload["error"]["message"].startswith(SKILL_REFUSED_UNKNOWN))
         bad = self.app.run_skill("sk-" + "a" * 32, project_id="../x")
         self.assertNotEqual(bad.exit_code, 0)
+
+    def sessions(self) -> int:
+        with sqlite3.connect(self.settings.memory_database) as connection:
+            return connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0]
+
+    def test_frozen_command_is_refused_before_any_session(self) -> None:
+        # SKEXPLICITFIX2: the refused call creates no session.
+        before = self.sessions()
+        with (
+            mock.patch.object(self.app.core, "execution_allowed", return_value=False),
+            mock.patch.object(self.app.core, "run_skill") as run,
+        ):
+            result = self.app.submit_text(f"/beceri {NAME}")
+        understood = result.payload["intent"]
+        self.assertEqual(understood["status"], IntentStatus.EXECUTION_DISABLED.value)
+        self.assertEqual(understood["message"], _FROZEN_UNDERSTOOD_MESSAGE)
+        self.assertIsNone(result.payload["run"])
+        run.assert_not_called()
+        self.assertEqual(self.sessions(), before)
+
+    def test_command_returns_the_run_envelope(self) -> None:
+        # The skill's step must be plannable: a fake connector serves it.
+        patcher = mock.patch.dict(
+            intent.NL_CAPABILITIES,
+            {DUMMY_CAPABILITY: intent.CapabilityHint(None, "read", "echo")},
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        connector = DummyConnector()
+        self.app.core.registry.register(connector)
+        made = named_draft(NAME)
+        self.app.skill_store.add_draft(made)
+        self.app.skill_store.approve_draft(made.draft_id, project_id=None)
+        result = self.app.submit_text(f"/beceri {NAME}")
+        understood = result.payload["intent"]
+        self.assertEqual(understood["status"], IntentStatus.STRUCTURED.value, result.payload)
+        self.assertEqual(understood["objective"], f"/beceri {NAME}")
+        self.assertIsNotNone(understood["capability"])
+        self.assertEqual(
+            result.payload["run"]["run_status"], RunStatus.AWAITING_CLARIFICATION.value
+        )
+        self.assertEqual(connector.execute_calls, 0)
 
 
 if __name__ == "__main__":
