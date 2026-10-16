@@ -18,6 +18,7 @@ from typing import AbstractSet, Any, Callable
 from uuid import NAMESPACE_URL, uuid5
 
 from jarvis.connectors.base import BaseConnector
+from jarvis.connectors.claude_code import RETRIEVED_MEMORY_NOTICE
 from jarvis.connectors.project_folder import PROJECT_FOLDER_CONNECTOR
 from jarvis.contracts import (
     project_instruction_delivery,
@@ -198,8 +199,9 @@ from jarvis.progress import (
     set_waiting_issue,
 )
 from jarvis import memory_capture, memory_retrieval, project_files
+from jarvis.memory_lifetime import decide_lifetime
 from collections.abc import Mapping, Sequence
-from jarvis.conversation import CONVERSATION_ID, RAW_TURNS_MAX, REPLY_MAX_CHARS, TURN_MAX_CHARS, Compacted, Turn
+from jarvis.conversation import CONVERSATION_ID, ESTIMATOR, RAW_TURNS_MAX, REPLY_MAX_CHARS, TURN_MAX_CHARS, Compacted, Turn
 from jarvis.conversation import digest as conversation_digest
 from jarvis.memory_doctor import LEGACY_M1_KIND_MAP
 from jarvis.memory_filter import classify_candidate_text
@@ -694,6 +696,35 @@ _SKILL_OFFER_MESSAGE = "Bunu beceri olarak kaydedeyim mi?"
 _SKILL_LEARN_CLASSES = (DataClassification.PUBLIC, DataClassification.INTERNAL)
 #: ``_with_typed_memory``'s default: the conversation is the session's link.
 _SESSION_CONVERSATION: Any = object()
+#: I22: the Core line a memory-on reply gets when no record was delivered.
+_MEMORY_NONE_LINE = (
+    "Hafızada bu konuyla ilgili kayıt yok; hatırladığını iddia etme. / "
+    "No relevant memory; do not claim remembered facts."
+)
+#: ``source_task_id`` of that line; it names no record.
+_MEMORY_NONE_SOURCE = "memory-status:none"
+_MEMORY_UNKNOWN = ""  # ``delivered`` key: retrieval failed, so "none" is unknown
+#: Undelivered reply-source entries kept at most (oldest go first).
+_REPLY_SOURCES_MAX = 64
+
+
+def _memory_line_tokens(item: RetrievedMemoryItem) -> int:
+    """I18 cost of one memory line: the token estimate of the item as it
+    leaves the machine (the egress fields), plus its separator."""
+    line = {
+        "kind": item.kind.value,
+        "summary": item.summary,
+        "rationale": item.rationale,
+        "next_step": item.next_step,
+        "classification": item.classification.value,
+    }
+    return ESTIMATOR.tokens(json.dumps(line, ensure_ascii=False)) + 1
+
+
+#: I18 reserve: the block header (notice and keys) every memory block carries.
+_MEMORY_BLOCK_HEADER_TOKENS = ESTIMATOR.tokens(
+    json.dumps({"notice": RETRIEVED_MEMORY_NOTICE, "items": []}, ensure_ascii=False)
+)
 
 
 def _retrieved_item_characters(item: RetrievedMemoryItem) -> int:
@@ -1208,6 +1239,10 @@ class AgentCore:
         self.memory = memory
         self.settings = settings or Settings()
         self.verifier = verifier
+        # I22: what typed_memory_for delivered per memory-call task id, until
+        # record_reply_sources writes it against the reply turn.
+        self._reply_sources: dict[str, tuple[str, tuple[tuple[str, MemoryRecordKind, int], ...]]] = {}
+        self._reply_sources_lock = threading.Lock()
         # FREEZE: an optional LIVE execution gate a composer may install (the
         # desktop app reads the persisted switch through it). It is consulted
         # together with the settings snapshot, so it can only narrow what the
@@ -5738,12 +5773,20 @@ class AgentCore:
         omitted: int = 0,
         stop: CaptureStop | None = None,
     ) -> MemoryCaptureOutcome:
-        # No temporary conversations and no quota reading exist in Core yet:
-        # temporary is False and an unknown quota never skips. The SESSION
-        # decides, not the batch: a PreCompact batch can be one turn.
+        # I21: a conversation that is or ever was memory-off is never
+        # captured, decided before any model call; an unreadable flag reads as
+        # off. No quota reading exists in Core yet: an unknown quota never
+        # skips. The SESSION decides, not the batch: a PreCompact batch can be
+        # one turn.
+        try:
+            memory_off = self.memory.was_ever_memory_off(conversation_id) is not False
+        except Exception:  # noqa: BLE001 - storage boundary; fail closed
+            memory_off = True
         skip = memory_capture.extraction_skip_reason(
-            _session_user_turns(session_turns, turns), temporary=False, quota_remaining_pct=None
+            _session_user_turns(session_turns, turns), temporary=memory_off, quota_remaining_pct=None
         )
+        if skip == "temporary" and memory_off:
+            skip = "memory_off"
         if skip is None and not any(type(t) is Turn and t.role == "user" for t in turns):
             skip = "empty"  # a reply-only batch has no words of the person to quote
         if skip is not None:
@@ -5869,6 +5912,8 @@ class AgentCore:
                             source_turn_ids=candidate.evidence_turn_ids,
                         ),
                         guard=guard,
+                        # I19: the text decides; a transient one stays SESSION.
+                        lifetime=decide_lifetime(candidate.text),
                         preference_autosave=True,
                     )
             except CaptureCancelled:
@@ -5970,23 +6015,97 @@ class AgentCore:
         malformed ``project_id``, or a conversation lookup that fails (its
         memory-off and SESSION checks cannot run), gets nothing. Read-only;
         every item is labelled untrusted data and RULE delivery is Core's
-        re-proof."""
+        re-proof.
+
+        For a stored conversation with memory on, the delivered records are
+        kept under ``task.id`` for ``record_reply_sources`` (I22); when none
+        was delivered the context carries the one "no relevant memory" Core
+        line instead. A memory-off conversation gets nothing and keeps
+        nothing (I21)."""
         if type(project_id) is not str or not project_id:
             return RetrievedContext()
         conversation = None
         if type(conversation_id) is str and CONVERSATION_ID.fullmatch(conversation_id):
             try:
                 record = self.memory.load_conversation(conversation_id)
+                # I21: a memory-off conversation reads nothing, whatever project.
+                if self.memory.is_memory_off(conversation_id):
+                    return RetrievedContext()
             except Exception:  # noqa: BLE001 - storage boundary; fail closed
                 return RetrievedContext()
             if record is not None and record.project_id == project_id:
                 conversation = conversation_id
-        return self._with_typed_memory(
+        delivered: dict[str, MemoryRecordKind | None] = {}
+        context = self._with_typed_memory(
             SessionState(objective="typed memory", project_id=project_id),
             task,
             RetrievedContext(),
             conversation_id=conversation,
+            delivered=delivered,
         )
+        if conversation is None or _MEMORY_UNKNOWN in delivered:
+            return context  # a failed retrieval is unknown: no none line, nothing kept
+        try:
+            if self.memory.is_memory_off(conversation):
+                return RetrievedContext()
+            used = tuple(
+                (record_id, kind, self.memory.record_revision(record_id))
+                for record_id, kind in delivered.items()
+            )
+            if not used:
+                # Nothing typed came back (also the fail-closed none):
+                # base was empty, so the line is the whole context.
+                rationale = "memory status (JARVIS Core)"
+                context = self._validated_retrieved_context(
+                    RetrievedContext(
+                        items=(
+                            RetrievedMemoryItem(
+                                kind=RetrievedMemoryKind.FACT,
+                                record_id="memory-none",
+                                source_task_id=_MEMORY_NONE_SOURCE,
+                                summary=_MEMORY_NONE_LINE,
+                                rationale=rationale,
+                                next_step=None,
+                                classification=DataClassification.PUBLIC,
+                                created_at=utc_now(),
+                                relevance_score=0,
+                                truncated=False,
+                            ),
+                        ),
+                        character_count=len(_MEMORY_NONE_LINE) + len(rationale),
+                    )
+                )
+        except Exception:  # noqa: BLE001 - storage boundary; nothing delivered, nothing kept
+            return RetrievedContext()
+        with self._reply_sources_lock:
+            self._reply_sources.pop(task.id, None)
+            self._reply_sources[task.id] = (conversation, used)
+            while len(self._reply_sources) > _REPLY_SOURCES_MAX:
+                self._reply_sources.pop(next(iter(self._reply_sources)))
+        return context
+
+    def record_reply_sources(self, conversation_id: str, turn_id: str, task_id: str) -> str:
+        """I22: write which typed records ``typed_memory_for`` delivered for
+        the memory-call task ``task_id`` against the reply turn ``turn_id`` of
+        ``conversation_id``: one 'used' row per record (kind, revision at
+        delivery) or one 'none' row. Core's own delivery entry is the only
+        source, never a caller's list; it is used once.
+
+        Nothing is written for an unknown or already-used task id, another
+        conversation's entry, a conversation that is memory-off now, or a
+        store refusal. Never raises; returns 'used', 'none', 'unknown',
+        'memory_off' or 'error'."""
+        with self._reply_sources_lock:
+            entry = self._reply_sources.pop(task_id, None) if type(task_id) is str else None
+        if entry is None or entry[0] != conversation_id:
+            return "unknown"
+        try:
+            if self.memory.is_memory_off(conversation_id):
+                return "memory_off"
+            self.memory.record_reply_sources(conversation_id, turn_id, entry[1])
+        except Exception:  # noqa: BLE001 - storage boundary; nothing more is written
+            return "error"
+        return "used" if entry[1] else "none"
 
     def _with_typed_memory(
         self,
@@ -5996,6 +6115,7 @@ class AgentCore:
         *,
         reprove: bool = False,
         conversation_id: str | None | object = _SESSION_CONVERSATION,
+        delivered: dict[str, MemoryRecordKind | None] | None = None,
     ) -> RetrievedContext:
         """V2.1a M3: append task-targeted typed memory records to ``base``.
 
@@ -6012,6 +6132,14 @@ class AgentCore:
         source) in the rationale. Only an own-project APPROVED RULE (the
         store's audited user approval, re-read now) is delivered as a RULE.
         Any failure delivers no typed memory and never blocks the task.
+
+        I18: the selected records are packed whole into
+        ``MEMORY_INJECT_TOKEN_BUDGET`` by kind priority, the block header and
+        the legacy items already in ``base`` reserved first. I19: a SESSION
+        record only reaches its own conversation. I21: a memory-off
+        conversation (or one whose flag cannot be read) gets no memory at
+        all - no retrieval call, no block, legacy items included.
+        ``delivered``, when given, receives each delivered record's kind.
         """
         typed = [i for i in base.items if i.source_task_id.startswith(_TYPED_MEMORY_SOURCE)]
         held = {i.record_id for i in typed}
@@ -6025,11 +6153,17 @@ class AgentCore:
         )
         project_id = session.project_id
         limit = RETRIEVAL_MAX_ITEMS - len(items)
-        if project_id is None or limit <= 0 or (reprove and not held):
-            return legacy
         try:
             if conversation_id is _SESSION_CONVERSATION:
                 conversation_id = self.memory.conversation_for_session(session.id)
+            memory_off = bool(conversation_id) and self.memory.is_memory_off(conversation_id)
+        except Exception:  # noqa: BLE001 - the memory-off check cannot run: fail closed
+            memory_off = True
+        if memory_off:
+            return RetrievedContext()
+        if project_id is None or limit <= 0 or (reprove and not held):
+            return legacy
+        try:
             global_on = bool(conversation_id) and self.memory.global_memory_enabled(conversation_id)
             query_text = "\n".join(
                 (task.objective, task.capability, task.scope.action, task.scope.target)
@@ -6049,7 +6183,8 @@ class AgentCore:
                 matched: dict[str, Any] = {}
                 for scope, statuses in scopes:
                     for view, _rank in self.memory.search_records(
-                        token, scope, statuses=statuses, limit=50
+                        token, scope, statuses=statuses, limit=50,
+                        for_conversation_id=conversation_id,
                     ):
                         matched.setdefault(view.record.record_id, view)
                 for record_id, view in matched.items():
@@ -6063,9 +6198,11 @@ class AgentCore:
                     statuses=(MemoryRecordStatus.APPROVED,),
                     kinds=(MemoryRecordKind.DECISION, MemoryRecordKind.RULE),
                     limit=500,
+                    for_conversation_id=conversation_id,
                 )
                 if len(views) >= 500:
-                    return legacy  # oldest-first cut may hide the newest: fail closed
+                    # oldest-first cut may hide the newest: fail closed (unknown, not none)
+                    raise LookupError("typed memory scan cut")
                 for view in views:
                     hits.setdefault(view.record.record_id, [view, 0])
             selection = memory_retrieval.select_for_task(
@@ -6081,6 +6218,7 @@ class AgentCore:
                 live_conversation_ids={conversation_id} if conversation_id else set(),
             )
             stale = {s.record.record_id for s in selection.stale}
+            candidates: list[tuple[MemoryRecordKind, RetrievedMemoryItem]] = []
             names: dict[str, str] = {}
             used = legacy.character_count
             truncated = legacy.truncated
@@ -6115,13 +6253,7 @@ class AgentCore:
                 )
                 if not summary:
                     continue
-                if used + len(summary) + len(rationale) > RETRIEVAL_MAX_CHARACTERS:
-                    truncated = True
-                    break
-                used += len(summary) + len(rationale)
-                truncated = truncated or cut_summary or cut_rationale
-                items.append(
-                    RetrievedMemoryItem(
+                candidates.append((record.kind, RetrievedMemoryItem(
                         kind=(
                             RetrievedMemoryKind.RULE
                             if as_rule
@@ -6139,9 +6271,29 @@ class AgentCore:
                         relevance_score=hits[record.record_id][1],
                         truncated=cut_summary or cut_rationale,
                         origin=MemoryOrigin.EXPLICIT_USER if as_rule else MemoryOrigin.INFERRED,
-                    )
-                )
-            return self._validated_retrieved_context(
+                )))
+            # I18: whole lines by kind priority, rank order within a kind;
+            # the header and the legacy lines already in the prompt go first.
+            # A reserve past the budget raises: no typed memory (fail closed).
+            packed, dropped = memory_retrieval.pack_for_budget(
+                candidates,
+                kind_of=lambda candidate: candidate[0],
+                cost=lambda candidate: _memory_line_tokens(candidate[1]),
+                reserved=_MEMORY_BLOCK_HEADER_TOKENS + sum(map(_memory_line_tokens, items)),
+            )
+            # No detail field exists on the snapshot (no ALTER): a dropped
+            # record shows only as the truncated flag.
+            truncated = truncated or bool(dropped)
+            typed_items: list[tuple[MemoryRecordKind, RetrievedMemoryItem]] = []
+            for kind, item in packed:
+                if used + len(item.summary) + len(item.rationale) > RETRIEVAL_MAX_CHARACTERS:
+                    truncated = True
+                    break
+                used += len(item.summary) + len(item.rationale)
+                truncated = truncated or item.truncated
+                typed_items.append((kind, item))
+            items.extend(item for _kind, item in typed_items)
+            result = self._validated_retrieved_context(
                 RetrievedContext(
                     items=tuple(items),
                     candidate_count=legacy.candidate_count
@@ -6151,7 +6303,12 @@ class AgentCore:
                 )
             )
         except Exception:  # noqa: BLE001 - informational context; fail closed to none
+            if delivered is not None:
+                delivered[_MEMORY_UNKNOWN] = None  # I22: unknown is not "no memory"
             return legacy
+        if delivered is not None:
+            delivered.update((item.record_id, kind) for kind, item in typed_items)
+        return result
 
     # ------------------------------------------------------------------
     # V2.2 SKCORE. A matched skill runs as an ordinary chain, behind the flag.

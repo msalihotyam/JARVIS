@@ -9532,6 +9532,20 @@ class MemoryStore(Protocol):
 
     def insert_record(self, record: MemoryRecord) -> "MemoryRecordView": ...
 
+    #: SEC2: memory-off conversations (I21) and sourced replies (I22).
+    def is_memory_off(self, conversation_id: str) -> bool: ...
+
+    def was_ever_memory_off(self, conversation_id: str) -> bool: ...
+
+    def record_revision(self, record_id: str) -> int: ...
+
+    def record_reply_sources(
+        self,
+        conversation_id: str,
+        turn_id: str,
+        used: Sequence[tuple[str, MemoryRecordKind | str, int]],
+    ) -> None: ...
+
     #: Gate 5. Pure reads: the deterministic excerpt selection for a task, and
     #: one chunk with its file's current state for re-proof.
     def retrieve_project_file_refs(
