@@ -564,17 +564,6 @@ Rectangle {
                 onActivated: bridge.startNewChat()
             }
 
-            // V2.2 S4: "Beceriler" - the Skills page, shown whether skills are on or off
-            // (off, the page says so and keeps the saved ones listed).
-            NavRow {
-                objectName: "sidebarSkills"
-                visible: !searchBox.active
-                titleName: "sidebarSkillsName"
-                lead: "spark"; title: qsTr("Skills"); muted: true
-                current: bridge.page === "skills"
-                onActivated: bridge.setPage("skills")
-            }
-
             // L2: the word PROJELER links to the Projects page; the rest of the row
             // collapses / opens the tree (the chevron at the right, the count while collapsed).
             Item {

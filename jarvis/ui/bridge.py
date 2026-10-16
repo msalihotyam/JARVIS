@@ -515,6 +515,7 @@ class Bridge(QObject):
         self._memory: list[dict] = []
         self._skills: list[dict] = []
         self._pending_drafts: list[dict] = []
+        self._skills_read = False   # the rail's Skills tile says "—" until a listing answered
         self._projects: list[str] = []
         self._focus_mode = False
         self._edit_mode = False
@@ -4878,6 +4879,11 @@ class Bridge(QObject):
     def pendingDrafts(self) -> list:
         return list(self._pending_drafts)
 
+    @Property(bool, notify=skillsChanged)
+    def skillsRead(self) -> bool:
+        """True once a skills listing answered; before it the counts are unknown, not zero."""
+        return self._skills_read
+
     @Property(bool, notify=stateChanged)
     def skillsEnabled(self) -> bool:
         return self._config.get("skills_enabled") is True and not self._config_refused()
@@ -4913,6 +4919,7 @@ class Bridge(QObject):
 
     def _set_skills(self, payload: Any, projects: dict[str, str]) -> None:
         scopes = payload.get("scopes") if isinstance(payload, dict) else None
+        self._skills_read = isinstance(scopes, list)
         if not isinstance(scopes, list):
             self._skill_refused(payload)
             scopes = []
@@ -5892,16 +5899,19 @@ class Bridge(QObject):
             self._layout_save = "failed"
         self.prefsChanged.emit()
 
-    @Slot(str, str, bool)
-    def setCardVisible(self, region: str, card: str, visible: bool) -> None:
-        """Hide a card from the layout or add it back. Presentation only."""
+    @Slot(str, str, bool, result=bool)
+    def setCardVisible(self, region: str, card: str, visible: bool) -> bool:
+        """Hide a card from the layout or add it back. Presentation only.
+        False: refused (a fifth rail tile) - nothing changed or saved."""
         if region == "rail":
-            self.prefs.set_rail_visible(str(card), bool(visible))
+            if not self.prefs.set_rail_visible(str(card), bool(visible)):
+                return False
         elif region == "stack":
             self.prefs.set_visible(str(card), bool(visible))
         else:
-            return
+            return False
         self._layout_changed()
+        return True
 
     @Slot(str, str, int)
     def moveCard(self, region: str, card: str, step: int) -> None:

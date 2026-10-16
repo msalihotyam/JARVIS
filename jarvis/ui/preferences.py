@@ -47,7 +47,8 @@ PANEL_IDS = ("system", "workflow", "activity", "automations")
 #: Panels that appear only when they have something to show, unless pinned.
 CONTEXTUAL_PANELS = frozenset({"workflow"})
 #: The left rail's summary cards, in canonical order.
-RAIL_IDS = ("tasks", "updates", "focus", "plan", "memory")
+RAIL_IDS = ("tasks", "updates", "focus", "plan", "skills", "memory")
+RAIL_MAX_SHOWN = 4   # the 2x2 tile grid; "updates" has no tile and does not count
 #: Interface languages, as stable locale ids (never the visible option name).
 LANGUAGES = ("en-US", "tr-TR")
 #: The chat / understanding providers a person can choose.
@@ -125,8 +126,9 @@ def _valid_chat(candidate: Any) -> bool:
 def canonical_rail() -> dict[str, Any]:
     """Every card in canonical order. Updates starts hidden: it lists the same
     activity notes the Live intelligence feed already shows, so on the default
-    workspace it only repeated them; it stays in the Cards inventory."""
-    return {"order": list(RAIL_IDS), "visible": {name: name != "updates" for name in RAIL_IDS}}
+    workspace it only repeated them; it stays in the Cards inventory. Skills
+    starts hidden too: the grid holds four tiles and Salih picks them."""
+    return {"order": list(RAIL_IDS), "visible": {name: name not in ("updates", "skills") for name in RAIL_IDS}}
 
 
 def legacy_rail() -> dict[str, Any]:
@@ -272,6 +274,12 @@ def validate_preferences(candidate: Any) -> dict[str, Any]:
     if candidate["language"] not in LANGUAGES or not _valid_chat(candidate["chat"]):
         return defaults
     rail = candidate["rail"]
+    # A rail saved before the Skills tile keeps its order and flags; Skills joins hidden at the end.
+    older = set(RAIL_IDS) - {"skills"}
+    if (isinstance(rail, dict) and isinstance(rail.get("order"), list) and isinstance(rail.get("visible"), dict)
+            and sorted(rail["order"]) == sorted(older) and set(rail["visible"]) == older):
+        rail = {**rail, "order": [*rail["order"], "skills"], "visible": {**rail["visible"], "skills": False}}
+        candidate = {**candidate, "rail": rail}
     if (not isinstance(rail, dict) or set(rail) != {"order", "visible"}
             or not isinstance(rail["order"], list) or sorted(rail["order"]) != sorted(RAIL_IDS)
             or not isinstance(rail["visible"], dict) or set(rail["visible"]) != set(RAIL_IDS)
@@ -567,9 +575,16 @@ class UiPreferences:
     def set_column_width(self, width: float) -> None:
         self.layout()["column_width"] = clamp(snap(float(width)), MIN_COLUMN_WIDTH, MAX_COLUMN_WIDTH)
 
-    def set_rail_visible(self, card: str, visible: bool) -> None:
-        if card in RAIL_IDS:
-            self.data["rail"]["visible"][card] = bool(visible)
+    def set_rail_visible(self, card: str, visible: bool) -> bool:
+        """False, nothing changed: an unknown card, or a fifth tile while four show (hide one first)."""
+        if card not in RAIL_IDS:
+            return False
+        flags = self.data["rail"]["visible"]
+        if visible and card != "updates" and not flags[card]:
+            if sum(on for name, on in flags.items() if name != "updates") >= RAIL_MAX_SHOWN:
+                return False
+        flags[card] = bool(visible)
+        return True
 
     def move_card(self, region: str, card: str, step: int) -> None:
         """Swap a card with its nearest VISIBLE neighbour in one direction,

@@ -22,8 +22,9 @@ Item {
     readonly property bool open: mode !== ""
     visible: open
 
-    // The sidebar's four tiles (Gate 6F); Updates has no tile (Q4), so it is not offered.
-    readonly property var railNames: ({ tasks: qsTr("Tasks"), focus: qsTr("Focus"), plan: qsTr("Plan"), memory: qsTr("Memory") })
+    // The sidebar's tiles (Gate 6F), four shown at most; Updates has no tile (Q4), so it is not offered.
+    readonly property var railNames: ({ tasks: qsTr("Tasks"), focus: qsTr("Focus"), plan: qsTr("Plan"), memory: qsTr("Memory"), skills: qsTr("Skills") })
+    property bool capRefused: false     // a fifth tile was refused; the inventory says why
     readonly property var stackNames: commandMode
         ? ({ system: qsTr("Model & execution"), workflow: qsTr("Active task"), activity: qsTr("Recent actions"), automations: qsTr("Memory context") })
         : ({ system: qsTr("System status"), workflow: qsTr("Active workflow"), activity: qsTr("Live intelligence feed"), automations: qsTr("Automations") })
@@ -50,7 +51,7 @@ Item {
         if (mode === which) { close(); return }
         place(anchor); mode = which
     }
-    function close() { mode = "" }
+    function close() { mode = ""; capRefused = false }
     // It opens once its content (the Loader) is in, so focus can enter its first row.
     onModeChanged: if (!open) surface.close()
     Connections { target: bridge; function onPrefsChanged() { if (!bridge.editMode) menus.close() } }
@@ -108,6 +109,8 @@ Item {
                        text: qsTr("%1 visible · %2 hidden").arg(menus.railVisible + menus.stackVisible).arg(menus.railHidden.length + menus.stackHidden.length)
                        color: Theme.textMuted; font: Theme.metadata }
             }
+            Text { objectName: "railCapNote"; visible: menus.capRefused; x: 8; width: parent.width - 16; wrapMode: Text.Wrap
+                   text: qsTr("Four tiles at most - hide one first."); color: Theme.warning; font: Theme.metadata }
             Text { visible: menus.railHidden.length + menus.stackHidden.length === 0; x: 8; height: 36; verticalAlignment: Text.AlignVCenter
                    text: qsTr("All cards are visible"); color: Theme.textLabel; font: Theme.uiLabel }
             Repeater {
@@ -127,7 +130,7 @@ Item {
                             readonly property bool rail: modelData.id in menus.railNames
                             Rectangle { id: sock; visible: parent.rail; x: 8; anchors.verticalCenter: parent.verticalCenter; width: 30; height: 30; radius: 8
                                 color: "#0a1f36"; border.width: 1; border.color: Theme.alpha("#299ddf", 0.42)
-                                SummaryIcon { anchors.centerIn: parent; icon: modelData.id; tint: "#b8e7ff" } }
+                                SummaryIcon { anchors.centerIn: parent; icon: modelData.id === "skills" ? "spark" : modelData.id; tint: "#b8e7ff" } }
                             Column { x: parent.rail ? 48 : 8; anchors.verticalCenter: parent.verticalCenter; width: addButton.x - x - 8
                                 Text { width: parent.width; elide: Text.ElideRight; color: Theme.text; font: Theme.uiLabel
                                        text: parent.parent.rail ? menus.railNames[modelData.id] : menus.stackNames[modelData.id] }
@@ -135,7 +138,7 @@ Item {
                             }
                             ActionButton { id: addButton; objectName: "addToLayout_" + modelData.id; compact: true; label: qsTr("Add to layout")
                                 anchors.right: parent.right; anchors.rightMargin: 4; anchors.verticalCenter: parent.verticalCenter; height: 32
-                                onClicked: bridge.setCardVisible(parent.rail ? "rail" : "stack", modelData.id, true) }
+                                onClicked: menus.capRefused = !bridge.setCardVisible(parent.rail ? "rail" : "stack", modelData.id, true) }
                         }
                     }
                 }

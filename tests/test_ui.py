@@ -3106,7 +3106,7 @@ class LayoutEditorTests(UiTestCase):
 
     def test_hide_restore_and_move_in_both_regions_persist(self):
         bridge = self.bridge()
-        self.assertEqual([("tasks", True), ("updates", False), ("focus", True), ("plan", True), ("memory", True)], self.rail(bridge))
+        self.assertEqual([("tasks", True), ("updates", False), ("focus", True), ("plan", True), ("skills", False), ("memory", True)], self.rail(bridge))
         bridge.setCardVisible("rail", "memory", False)
         bridge.setCardVisible("stack", "activity", False)
         self.assertEqual("saved", bridge.layoutSaveState)
@@ -3116,10 +3116,10 @@ class LayoutEditorTests(UiTestCase):
         # Moves swap with the nearest VISIBLE neighbour; hidden cards keep their place.
         bridge.setCardVisible("rail", "updates", False)
         bridge.moveCard("rail", "focus", -1)
-        self.assertEqual(["focus", "updates", "tasks", "plan", "memory"], [c for c, _ in self.rail(bridge)])
+        self.assertEqual(["focus", "updates", "tasks", "plan", "skills", "memory"], [c for c, _ in self.rail(bridge)])
         bridge.moveCard("rail", "focus", -1)                 # already the first visible card
         bridge.moveCard("rail", "plan", 1)                   # already the last visible card
-        self.assertEqual(["focus", "updates", "tasks", "plan", "memory"], [c for c, _ in self.rail(bridge)])
+        self.assertEqual(["focus", "updates", "tasks", "plan", "skills", "memory"], [c for c, _ in self.rail(bridge)])
         bridge.moveCard("rail", "updates", 1)                # a hidden card does not move
         bridge.moveCard("stack", "workflow", -1)
         self.assertEqual(["workflow", "system", "activity", "automations"], bridge.prefs.layout()["order"])
@@ -3173,7 +3173,7 @@ class LayoutEditorTests(UiTestCase):
         self.assertEqual(5, prefs.data["version"])
         self.assertEqual(v3["profiles"], prefs.data["profiles"])
         # Memory waits in Cards as before; Updates now does too (v4 -> v5).
-        self.assertEqual({"tasks": True, "updates": False, "focus": True, "plan": True, "memory": False}, prefs.data["rail"]["visible"])
+        self.assertEqual({"tasks": True, "updates": False, "focus": True, "plan": True, "skills": False, "memory": False}, prefs.data["rail"]["visible"])
         broken = canonical_preferences()
         broken["rail"]["order"] = ["tasks"]
         self.assertEqual(canonical_preferences(), validate_preferences(broken))
@@ -3213,7 +3213,7 @@ class LayoutEditorTests(UiTestCase):
                 ))
                 self.click(root, "layoutCards")
                 popover = self.item(root, "layoutPopover")
-                self.assertEqual("6 visible · 2 hidden", self.item(root, "inventoryCount").property("text"))   # Gate 6F Q4: no Updates tile
+                self.assertEqual("6 visible · 3 hidden", self.item(root, "inventoryCount").property("text"))   # Gate 6F Q4: no Updates tile
                 top_left = popover.mapToScene(popover.boundingRect().topLeft())
                 self.assertGreaterEqual(top_left.x(), 0)
                 self.assertGreaterEqual(top_left.y(), 0)

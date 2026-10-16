@@ -19,6 +19,8 @@ import "../theme"
 //   Plan   - the next scheduled job: when, then its name and day.
 //   Memory - the store's status, then this scope's records (a project) or
 //            the last record written (Genel).
+//   Skills - hidden by default (four tiles at most, Salih picks): the active
+//            skills, then the drafts waiting; its click opens the Skills page.
 //
 // Every figure comes from a bridge listing; nothing is invented. Order and
 // visibility are the persisted layout (bridge.railCards); in Edit Mode the
@@ -155,12 +157,29 @@ Item {
                  dot: bridge.memoryStatus === "Available" ? Theme.success : Theme.warning, value: word, lines: lines, tip: word + " · " + lines[0] }
     }
 
+    // -- Skills: the active skills and the drafts waiting (hidden by default) --
+    readonly property var skillsTile: {
+        var tile = { id: "skills", key: "Skills", title: qsTr("Skills"), icon: "spark", tone: "#ffb84f", action: "skills" }
+        if (!bridge.skillsRead)
+            return Object.assign(tile, { value: "—", lines: [qsTr("not read yet")], tip: qsTr("Skills not read yet") })
+        var active = bridge.skills.filter(function(s) { return s.status === "active" }).length
+        var drafts = bridge.pendingDrafts.length
+        var lines = !bridge.skillsEnabled ? [qsTr("skills are off"), qsTr("off")]
+                  : drafts ? [drafts === 1 ? qsTr("1 draft waiting") : qsTr("%1 drafts waiting").arg(drafts), qsTr("%1 drafts").arg(drafts)]
+                  : [qsTr("no drafts waiting"), qsTr("no drafts")]
+        return Object.assign(tile, { value: String(active), lines: lines, tip: qsTr("%1 active").arg(active) + " · " + lines[0] })
+    }
+    // Skills load with their page; a shown tile reads them once itself (a local listing).
+    readonly property bool skillsShown: bridge.railCards.some(function(c) { return c.id === "skills" && c.visible })
+    onSkillsShownChanged: if (skillsShown && !bridge.skillsRead) bridge.refreshSkills()
+    Component.onCompleted: if (skillsShown && !bridge.skillsRead) bridge.refreshSkills()
+
     // A tile: its title, then `value` - a big number, or with `word` a word
     // after its `dot` - then `lines`, its one short line, longest variant
     // first; `tip` is the whole sentence (its tip and accessible name).
     // `quiet`: read, not pressed; `alert` + `action`: the amber approval tile.
     // `key` is the stable id (object names, the peek); `title` is what is shown.
-    readonly property var modules: [rail.tasksTile, rail.focusTile, rail.planTile, rail.memoryTile]
+    readonly property var modules: [rail.tasksTile, rail.focusTile, rail.planTile, rail.memoryTile, rail.skillsTile]
     readonly property var shownModules: {
         var byId = {}
         rail.modules.forEach(function(m) { byId[m.id] = m })
@@ -210,6 +229,7 @@ Item {
             function activate() {
                 if (!card.navigable) return
                 if (modelData.action === "approval") rail.approvalRequested()
+                else if (modelData.action === "skills") bridge.setPage("skills")
                 else rail.picked(modelData.key, card.y, card.height)
             }
             Keys.onReturnPressed: card.activate()

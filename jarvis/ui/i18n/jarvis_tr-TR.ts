@@ -2136,6 +2136,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Hafıza</translation>
     </message>
     <message>
+        <source>Skills</source>
+        <translation>Beceriler</translation>
+    </message>
+    <message>
         <source>Model &amp; execution</source>
         <translation>Model ve yürütme</translation>
     </message>
@@ -2186,6 +2190,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>%1 visible · %2 hidden</source>
         <translation>%1 görünür · %2 gizli</translation>
+    </message>
+    <message>
+        <source>Four tiles at most - hide one first.</source>
+        <translation>En fazla dört kart - önce birini gizleyin.</translation>
     </message>
     <message>
         <source>All cards are visible</source>
@@ -4820,10 +4828,6 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Yeni sohbet</translation>
     </message>
     <message>
-        <source>Skills</source>
-        <translation>Beceriler</translation>
-    </message>
-    <message>
         <source>1 conversation</source>
         <translation>1 sohbet</translation>
     </message>
@@ -5439,6 +5443,50 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>%1 records</source>
         <translation>%1 kayıt</translation>
+    </message>
+    <message>
+        <source>Skills</source>
+        <translation>Beceriler</translation>
+    </message>
+    <message>
+        <source>not read yet</source>
+        <translation>henüz okunmadı</translation>
+    </message>
+    <message>
+        <source>Skills not read yet</source>
+        <translation>Beceriler henüz okunmadı</translation>
+    </message>
+    <message>
+        <source>skills are off</source>
+        <translation>beceriler kapalı</translation>
+    </message>
+    <message>
+        <source>off</source>
+        <translation>kapalı</translation>
+    </message>
+    <message>
+        <source>1 draft waiting</source>
+        <translation>1 taslak bekliyor</translation>
+    </message>
+    <message>
+        <source>%1 drafts waiting</source>
+        <translation>%1 taslak bekliyor</translation>
+    </message>
+    <message>
+        <source>%1 drafts</source>
+        <translation>%1 taslak</translation>
+    </message>
+    <message>
+        <source>no drafts waiting</source>
+        <translation>bekleyen taslak yok</translation>
+    </message>
+    <message>
+        <source>no drafts</source>
+        <translation>taslak yok</translation>
+    </message>
+    <message>
+        <source>%1 active</source>
+        <translation>%1 etkin</translation>
     </message>
     <message>
         <source>%1 layout options</source>
