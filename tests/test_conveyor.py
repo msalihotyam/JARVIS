@@ -96,6 +96,10 @@ class FakeProcs:
 MAIN = "1234567" + "a" * 33  # local main (the approved sha)
 ORIGIN = "b" * 40  # origin/main, its parent
 SCHEMA = "X = 1\nSCHEMA_VERSION = 10\n"
+# powercfg /getactivescheme answers (GUIDs from LaptopControl PowerProfileApplyService.cs)
+BAG_ACTIVE = "Power Scheme GUID: 9b1e4f52-2c7d-4a8e-b6f3-1d0a7c55b205  (LaptopControl - Çanta)"
+OWN_ACTIVE = "Power Scheme GUID: 4a7c2e19-5b3d-4f81-9e26-0c8d1f3ab206  (LaptopControl - JARVIS İzleme)"
+DEFAULT_ACTIVE = "Power Scheme GUID: 381b4222-f694-41f0-9685-ff5bb260df2e  (Balanced)"
 
 
 class FakeGit:
@@ -1717,6 +1721,7 @@ class TestPresence(Base):
     def test_power_switch_once_per_change(self):
         self.pace(power_switch=True, power_switch_cmd=["LC.exe", "--activate", "{plan}"])
         self.git.fail[("LC.exe",)] = (0, "ok")
+        self.git.fail[("powercfg",)] = (0, OWN_ACTIVE)
         self.passes(3)
         self.assertEqual(self.lc_calls(), [])  # starting present is not a change
         self.go_away()
@@ -1729,6 +1734,7 @@ class TestPresence(Base):
     def test_power_switch_failure_attention_no_retry(self):
         self.pace(power_switch=True, power_switch_cmd=["LC.exe", "--activate", "{plan}"])
         self.git.fail[("LC.exe",)] = (3, "refused")
+        self.git.fail[("powercfg",)] = (0, OWN_ACTIVE)
         self.go_away()
         self.passes(5)
         self.assertEqual(len(self.lc_calls()), 1)
@@ -1742,6 +1748,7 @@ class TestPresence(Base):
 
     def test_power_switch_missing_exe(self):
         self.pace(power_switch=True, power_switch_cmd=["missing.exe", "{plan}"])
+        self.git.fail[("powercfg",)] = (0, OWN_ACTIVE)
         calls = []
 
         def cmd(args, timeout=120):
@@ -1756,9 +1763,60 @@ class TestPresence(Base):
         (item,) = [a for a in self.status()["attention"] if a["id"] == conveyor.POWER_SWITCH_ID]
         self.assertIn("FileNotFoundError", item["reason"])
 
+    def bag_pace(self, active):
+        self.pace(power_switch=True, power_switch_cmd=["LC.exe", "--activate", "{plan}"],
+                  power_switch_query_cmd=["LCQ.exe", "--status"])
+        self.git.fail[("LC.exe",)] = (0, "ok")
+        self.git.fail[("LCQ.exe",)] = active
+
+    def skips(self):
+        return [e["reason"] for e in self.events() if e["event"] == "power_switch_skip"]
+
+    def test_power_switch_skipped_while_bag_profile_active(self):
+        self.bag_pace((0, BAG_ACTIVE))
+        self.go_away()
+        self.passes(3)
+        self.assertEqual(self.lc_calls(), [])
+        self.assertEqual(self.skips(), ["bag profile active"])
+        self.assertEqual([c for c in self.git.calls if c[0] == "LCQ.exe"], [["LCQ.exe", "--status"]])
+        self.assertNotIn(conveyor.POWER_SWITCH_ID, [a["id"] for a in self.status()["attention"]])
+
+    def test_power_switch_skipped_when_profile_unreadable_or_unknown(self):
+        for active in ((1, "error"), (0, ""), (0, "Power Scheme GUID: 1234 (Someone Else)")):
+            self.git.calls.clear()
+            self.bag_pace(active)
+            self.idle = 600 if self.c.presence == "present" else 0
+            self.passes(3)
+            self.assertEqual(self.lc_calls(), [], active)
+        reasons = self.skips()
+        self.assertEqual(len(reasons), 3)
+        self.assertTrue(reasons[0].startswith("active profile unreadable"), reasons)
+        self.assertTrue(reasons[1].startswith("active profile unreadable"), reasons)
+        self.assertTrue(reasons[2].startswith("unknown active profile"), reasons)
+
+    def test_power_switch_query_timeout_no_switch(self):
+        self.bag_pace((0, OWN_ACTIVE))
+        self.git.raise_on = ("LCQ.exe",)
+        self.go_away()
+        self.passes(3)
+        self.assertEqual(self.lc_calls(), [])
+        self.assertEqual(self.skips(), ["active profile unreadable: TimeoutError"])
+
+    def test_power_switch_from_own_or_default_plan_as_today(self):
+        self.bag_pace((0, OWN_ACTIVE))
+        self.go_away()
+        self.assertEqual(self.lc_calls(), [["LC.exe", "--activate", "JarvisFocus"]])
+        self.git.fail[("LCQ.exe",)] = (0, DEFAULT_ACTIVE)
+        self.idle = 0
+        self.passes(3)
+        self.assertEqual(self.lc_calls()[1:], [["LC.exe", "--activate", "JarvisWatch"]])
+        self.assertEqual(self.skips(), [])
+
     def test_power_switch_without_cmd_is_invalid(self):
         for cfg in ({"power_switch": True}, {"power_switch": "yes"},
-                    {"power_switch_cmd": "LC.exe"}, {"lanes_away": "5"}, {"away_after_min": 0}):
+                    {"power_switch_cmd": "LC.exe"}, {"lanes_away": "5"}, {"away_after_min": 0},
+                    {"power_switch_query_cmd": "LCQ.exe"}, {"power_switch_query_cmd": []},
+                    {"power_switch_skip_plans": "Bag"}, {"power_switch_skip_plans": [""]}):
             self.pace(**cfg)
             self.c.pass_once()
             self.assertIn(conveyor.PACE_BAD_ID, [a["id"] for a in self.status()["attention"]], cfg)

@@ -88,7 +88,10 @@ PACE_DEFAULTS = {"mode": "full_burn", "window_start": None, "days": 7,
                  "reset_alert_pct": 95, "full_burn_limit_pct": 98, "min_free_mem_gb": 3.0,
                  "max_commit_pct": 90,
                  "lanes_present": MAX_LANES, "lanes_away": 5, "away_after_min": 10,
-                 "power_switch": False, "power_switch_cmd": [], "blocked_nudge_min": 10}
+                 "power_switch": False, "power_switch_cmd": [], "blocked_nudge_min": 10,
+                 "power_switch_query_cmd": ["powercfg", "/getactivescheme"],  # read-only (CONVBAG)
+                 "power_switch_skip_plans": ["9b1e4f52-2c7d-4a8e-b6f3-1d0a7c55b205",
+                                             "LaptopControl - Çanta"]}  # LaptopControl bag profile
 MAX_LANES_CAP = 8  # pace.json max_lanes / lanes_* are clamped to 1..MAX_LANES_CAP
 # Presence modes (CONV6, LaptopControl v1.3 plan Phase A): user idle time picks present/away.
 PRESENT_IDLE_S = 60  # idle under this: present (away: idle >= pace.json away_after_min)
@@ -97,6 +100,13 @@ BELOW_NORMAL, NORMAL = 0x4000, 0x20  # Windows priority classes of the conveyor'
 PRIORITY = {"present": BELOW_NORMAL, "away": NORMAL}
 POWER_PLANS = {"present": "JarvisWatch", "away": "JarvisFocus"}  # "{plan}" in power_switch_cmd
 POWER_SWITCH_ID = "power-switch"  # attention id (and ack file) of a failed power switch
+POWER_QUERY_TIMEOUT_S = 15  # power_switch_query_cmd; a timeout means "unreadable": no switch
+# Active plans the switch may override, by GUID (powercfg names are localized/codepage-mangled):
+# LaptopControl JarvisWatch / JarvisFocus (PowerProfileApplyService.cs ProfileSchemeGuids) and the
+# Windows defaults Balanced / High performance / Power saver. Anything else: no switch (fail closed).
+POWER_OWN_PLANS = ("4a7c2e19-5b3d-4f81-9e26-0c8d1f3ab206", "e5d81c47-2a96-4b0f-8c13-7f4e9b62d207",
+                   "381b4222-f694-41f0-9685-ff5bb260df2e", "8c5e7fda-e8bf-4a96-9a85-a6e23a8c635c",
+                   "a1841308-3d13-4a3e-89ab-cb1d8a2d0e9c")
 SESSION_EXE = "claude.exe"  # a lane's session pid is touched only when it is this image
 COMMIT_PCT_RANGE = (80, 97)  # pace.json max_commit_pct (memory guard: no new lane above it) clamp
 PACED_LIMIT = 97  # paced mode: no new lanes at or above this % of the weekly plan
@@ -1297,6 +1307,11 @@ class Conveyor:
             if not isinstance(p["power_switch"], bool) or not isinstance(cmd, list) or \
                     not all(isinstance(a, str) and a for a in cmd) or (p["power_switch"] and not cmd):
                 raise ValueError(f"power_switch {p['power_switch']!r} / power_switch_cmd {cmd!r}")
+            q, skip = p["power_switch_query_cmd"], p["power_switch_skip_plans"]
+            if not isinstance(q, list) or not q or not all(isinstance(a, str) and a for a in q):
+                raise ValueError(f"power_switch_query_cmd {q!r}")
+            if not isinstance(skip, list) or not all(isinstance(s, str) and s for s in skip):
+                raise ValueError(f"power_switch_skip_plans {skip!r}")
             if p["mode"] == "paced":
                 datetime.fromisoformat(p["window_start"]).timestamp()  # TypeError when null
             return p, None
@@ -1402,6 +1417,10 @@ class Conveyor:
         JarvisWatch / JarvisFocus) once; a failure is an event and attention item, no retry."""
         if not p["power_switch"]:
             return
+        skip = self.power_skip_reason(p)
+        if skip:
+            self.event("power_switch_skip", presence=self.presence, reason=skip)
+            return
         args = [a.replace("{plan}", POWER_PLANS[self.presence]) for a in p["power_switch_cmd"]]
         try:
             rc, out = self.cmd(args, timeout=60)
@@ -1413,6 +1432,23 @@ class Conveyor:
             self.pager_flag("power_switch_fail", [f"{self.presence}: rc={rc}", self.now()])
         elif self.pager_flag("power_switch_fail"):
             self.pager_flag("power_switch_fail", False)
+
+    def power_skip_reason(self, p):
+        """None when the active power plan (power_switch_query_cmd output) is one the switch may
+        override: JarvisWatch / JarvisFocus or a Windows default. Fail closed: a skip plan (the
+        bag profile), an unreadable answer or an unknown plan is a reason not to switch."""
+        try:
+            rc, out = self.cmd(p["power_switch_query_cmd"], timeout=POWER_QUERY_TIMEOUT_S)
+        except Exception as e:  # missing exe, timeout
+            return f"active profile unreadable: {type(e).__name__}"
+        text = (out or "").casefold()
+        if rc != 0 or not text.strip():
+            return f"active profile unreadable: rc={rc}"
+        if any(s.casefold() in text for s in p["power_switch_skip_plans"]):
+            return "bag profile active"
+        if not any(s.casefold() in text for s in POWER_OWN_PLANS):
+            return f"unknown active profile: {out.strip()[-120:]}"
+        return None
 
     def own_tree(self, root, snap):
         """root (a lane session pid that is SESSION_EXE) and its descendants, each created
