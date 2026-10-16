@@ -28,7 +28,11 @@ summarize", "hiçbir", "değil", a Turkish verb of the skill with a negative
 ending such as "özetleme"), and each cue word naming another action (delete,
 send, merge...), object, destination or scope (repository, main, mailbox,
 recipient, file, site, app, every/all...; ``_CUE_GROUPS``), and each stem a
-Turkish suffix names after an apostrophe ("GitHub'daki"). A task that misses
+Turkish suffix names after an apostrophe ("GitHub'daki"). Negative
+contractions (can't, won't, cannot, any apostrophe) read as "not"; a Turkish
+negative ending counts on any word of the skill. The task must also bind its
+objects and places as the skill does: "copy beta to alpha" is not "copy
+alpha to beta", nor "from" for "to" (``_misordered``). A task that misses
 one is SIMILAR at best: a lost fit is only a hint, a false fit would propose
 the wrong procedure.
 
@@ -162,21 +166,30 @@ KEPT_CONTENT_WORDS = frozenset({"is", "su", "sunu", "can"})
 _NEGATION_BEFORE_TEXT = (
     "not no never without dont don doesn didn isn aren wasn weren cannot cant "
     "won wouldn shouldn couldn haven hasn hadn mustn needn shan "
+    "doesnt didnt isnt arent wasnt werent wont wouldnt shouldnt couldnt "
+    "havent hasnt hadnt mustnt neednt shant aint "
     "nothing none neither hiçbir asla"
 )
-_NEGATION_AFTER_TEXT = "değil değildir"
+_NEGATION_AFTER_TEXT = (
+    "değil değildir değilim değilsin değiliz değilsiniz değiller yok yerine gerekmez bırak"
+)
 # A verb plus one of these endings is the negated verb ("özetle" + "me"). The
-# verb is one of the skill's own verbs (the last word of its name, summary or
-# a step) or one of the general verbs below. The second list also matches
-# every longer ending it starts ("özetle" + "miyorum").
+# verb is any content word of the skill's name, summary or a step (a word of
+# its own text is never negated by accident) or one of the general verbs
+# below. The second list also matches every longer ending it starts
+# ("özetle" + "miyorum", "özetle" + "yemem").
 _NEGATIVE_ENDINGS_TEXT = (
     "ma me mayın meyin mayınız meyiniz masın mesin masınlar mesinler "
     "madan meden mayalım meyelim"
 )
 _NEGATIVE_ENDING_STARTS_TEXT = (
-    "mıyor miyor muyor müyor madı medi mamış memiş mayacak meyecek maz mez"
+    "mıyor miyor muyor müyor madı medi mamış memiş mayacak meyecek mayacağ "
+    "meyeceğ maz mez mam mem mayız meyiz yama yeme ama eme meksizin maksızın mesene masana"
 )
-_NEGATED_VERBS_TEXT = "yap et"
+# A passive ("silin" + "mesin", "özetlen" + "me") is the verb plus one of these
+# and a negative ending starting with "m".
+_PASSIVE = ("il", "in", "ul", "un", "l", "n")  # folded: "ıl", "ün" are "il", "un"
+_NEGATED_VERBS_TEXT = "yap et ed"
 # A cue only when it opens a clause ("Open a pull request") or an object
 # pronoun follows it ("(open it first)"), never as an adjective ("List open
 # pull requests", "which are open"); a clause opens at the start, after a
@@ -349,6 +362,30 @@ _CUE_PREFIX_SIZES = tuple(sorted({len(prefix) for prefix in _CUE_PREFIX}))
 _TOKEN = re.compile(_WORD_RUN.pattern + "|[,.;:!?]")
 # A stem and the suffix written after an apostrophe (ASCII or U+2019).
 _NAMED = re.compile("(" + _WORD_RUN.pattern + ")['" + chr(0x2019) + "](" + _WORD_RUN.pattern + ")")
+# "n't" after any apostrophe (ASCII, U+2018, U+2019, U+02BC, a backtick, or
+# the space an acute accent folds to): read as "not" before tokenizing.
+_APOSTROPHES = "'`" + chr(0x2018) + chr(0x2019) + chr(0x2BC)
+# Apostrophes that are letters (U+02BB, U+02BC) or a prime split words as "'".
+_LETTER_APOSTROPHES = {0x2BB: "'", 0x2BC: "'", 0x2032: "'"}
+_NEGATIVE_CONTRACTION = re.compile(
+    "(?<![^" + chr(0x5C) + "W_])[^" + chr(0x5C) + "W_]*n[" + _APOSTROPHES + " ]t(?![^"
+    + chr(0x5C) + "W_])"
+)
+# Slot words and Turkish case suffixes after an apostrophe, read as slot marks
+# in a text's word order ("@" is never part of a word).
+_SLOT_WORDS = {"to": "@to", "into": "@to", "onto": "@to", "toward": "@to",
+               "towards": "@to", "unto": "@to", "from": "@from"}
+_SLOT_SUFFIXES = {"a": "@to", "e": "@to", "ya": "@to", "ye": "@to", "na": "@to",
+                  "ne": "@to", "i": "@obj", "u": "@obj", "yi": "@obj", "yu": "@obj",
+                  "ni": "@obj", "nu": "@obj"}
+
+
+def _suffix_slot(suffix: str) -> str | None:
+    if suffix.startswith(("dan", "den", "tan", "ten", "ndan", "nden")):
+        return "@from"
+    if suffix.startswith(("da", "de", "ta", "te", "nda", "nde")):
+        return "@at"
+    return _SLOT_SUFFIXES.get(suffix)
 
 
 def _cue_group(word: str) -> str | None:
@@ -381,17 +418,30 @@ class _CueText:
     there is none); ``endings`` maps a stem to the positions of words that are
     the stem plus a negative ending, a negated verb only when the stem is a
     verb (``_cues``); ``cues`` are the positions and groups of cue words;
-    ``named`` the stems written before an apostrophe suffix.
+    ``named`` the stems written before an apostrophe suffix; ``order`` the
+    content words and slot marks (``_SLOT_WORDS``, ``_suffix_slot``) in text
+    order. A negative contraction ("can't") is read as "not".
     """
 
     particles: tuple[tuple[int, str], ...]
     endings: dict[str, tuple[int, ...]]
     cues: tuple[tuple[int, str], ...]
     named: tuple[str, ...]
+    order: tuple[str, ...]
 
     @classmethod
     def read(cls, folded: str) -> _CueText:
-        tokens = [token[:WORD_MAX] for token in _TOKEN.findall(folded)]
+        folded = re.sub(r"\bout of\b", "from", folded.translate(_LETTER_APOSTROPHES))
+        folded = _NEGATIVE_CONTRACTION.sub(" not ", folded)
+        found = list(_TOKEN.finditer(folded))
+        tokens = [match.group()[:WORD_MAX] for match in found]
+        order: list[str] = []
+        for match, word in zip(found, tokens):
+            start = match.start()
+            after = start >= 2 and folded[start - 1] in _APOSTROPHES and folded[start - 2].isalnum()
+            slot = _suffix_slot(word) if after else _SLOT_WORDS.get(word)
+            if slot is not None or (not after and _is_content(word)):
+                order.append(slot or word)
         flags = [_is_content(word) for word in tokens]
         objects = [word in _OBJECT_PRONOUNS for word in tokens[1:]] + [False]
         content: list[str] = []
@@ -429,7 +479,10 @@ class _CueText:
                 particles.append((target if inside else -2, content[target] if inside else ""))
             for cut in range(1, len(word)):
                 ending = word[cut:]
-                if ending in _NEGATIVE_ENDINGS or ending.startswith(_NEGATIVE_ENDING_STARTS):
+                passive = [ending[len(p):] for p in _PASSIVE if ending[len(p):len(p) + 1] == "m"
+                           and ending.startswith(p)]
+                if any(e in _NEGATIVE_ENDINGS or e.startswith(_NEGATIVE_ENDING_STARTS)
+                       for e in (ending, *passive)):
                     endings.setdefault(word[:cut], []).append(at)
         named = tuple(
             dict.fromkeys(
@@ -443,6 +496,7 @@ class _CueText:
             {stem: tuple(at) for stem, at in endings.items()},
             tuple(cues),
             named,
+            tuple(order),
         )
 
 
@@ -519,11 +573,14 @@ def _skill_words(skill: Skill) -> _SkillWords:
 
 
 @lru_cache(maxsize=CACHE_MAX)
-def _skill_cues(skill: Skill) -> tuple[frozenset[str], frozenset[str], tuple[str, ...]]:
-    """A skill's verbs, cue groups and negated words, read like its words.
+def _skill_cues(
+    skill: Skill,
+) -> tuple[frozenset[str], frozenset[str], tuple[str, ...], tuple[tuple[str, ...], ...]]:
+    """A skill's verbs, cue groups, negated words and field word orders.
 
-    Its verbs are the last content word of its name, summary and each step
-    action (a Turkish verb ends its clause). Each field opens a clause.
+    Its verbs are every content word of its name, summary and each step
+    action: a Turkish verb need not end its clause ("özetle ve göster"). Each
+    field opens a clause.
     """
     fields = (
         [_without_placeholders(skill.name), _without_placeholders(skill.summary)]
@@ -531,6 +588,7 @@ def _skill_cues(skill: Skill) -> tuple[frozenset[str], frozenset[str], tuple[str
         + [_without_placeholders(step.action) for step in skill.steps]
     )
     folded: list[str] = []
+    orders: list[tuple[str, ...]] = []
     verbs: set[str] = set()
     budget = SKILL_TEXT_MAX
     for position, field in enumerate(fields):
@@ -539,17 +597,92 @@ def _skill_cues(skill: Skill) -> tuple[frozenset[str], frozenset[str], tuple[str
         text = _fold_capped(field, min(FIELD_TEXT_MAX, budget))
         budget -= len(text)
         folded.append(text)
-        last = [word for word in _WORD_RUN.findall(text) if _is_content(word)][-1:]
+        orders.append(_CueText.read(text).order)
         if position < 2 or position >= 2 + len(skill.inputs):
-            verbs.update(word[:WORD_MAX] for word in last)
+            verbs.update(word[:WORD_MAX] for word in _WORD_RUN.findall(text) if _is_content(word))
     verbs_set = frozenset(verbs)
     groups, negated = _cues(_CueText.read(" . ".join(folded)), verbs_set)
-    return verbs_set, groups, negated
+    return verbs_set, groups, negated, tuple(orders)
+
+
+def _misordered(fields: tuple[tuple[str, ...], ...], order: tuple[str, ...]) -> bool:
+    """Whether ``order`` binds its words or slots unlike every skill field.
+
+    True when the request has a slot mark no field has ("from" for "to")
+    while the skill binds some slot, or two words of the skill swap their
+    neighbours (the word or slot mark just before, or just after; a clause
+    edge only where the skill has nothing else there), or a shared stem with
+    another case ending ("dosyasından" for "dosyasını"): "copy file beta to folder alpha" is not "copy
+    file alpha to folder beta", "beta dosyasını alpha klasörüne" is not
+    "alpha dosyasını beta klasörüne". Free reordering that keeps each word's
+    own neighbours ("faturayı müşteriye" for "müşteriye faturayı") is not a
+    swap. More shared words than ``MAX_TASK_WORDS`` cannot be checked (fail
+    closed).
+    """
+    def same(a: str, b: str) -> bool:
+        return a == b or (a[0] not in "@^$" and _same_word(a, b))
+
+    own = {word for field in fields for word in field}
+    if any(word[0] == "@" for word in own) and any(word[0] == "@" and word not in own for word in order):
+        return True
+    shared = [
+        word
+        for word in dict.fromkeys(order)
+        if word[0] != "@" and any(same(word, other) for other in own)
+    ]
+    if len(shared) > MAX_TASK_WORDS:
+        return True
+
+    def neighbours(text: tuple[str, ...], word: str) -> list[tuple[str, str]]:
+        padded = ("^", *text, "$")
+        return [(padded[k - 1], padded[k + 1]) for k in range(1, len(padded) - 1) if same(word, padded[k])]
+
+    def case(text: tuple[str, ...], k: int, size: int) -> str | None:
+        if len(text[k]) > size:
+            return _suffix_slot(text[k][size:])
+        return text[k + 1] if k + 1 < len(text) and text[k + 1][0] == "@" else None
+
+    # A shared stem with another case ending: "dosyasından" for "dosyasını",
+    # "betaya" for "beta'yı".
+    for k, word in enumerate(order):
+        cases = [
+            (case(order, k, size), case(field, m, size))
+            for field in fields
+            for m, other in enumerate(field)
+            if word[0] != "@" and other[0] != "@"
+            and (size := next((n for n, (x, y) in enumerate(zip(word, other)) if x != y),
+                              min(len(word), len(other)))) >= PREFIX_MIN
+        ]
+        if any(a and b and a != b for a, b in cases) and not any(a == b for a, b in cases):
+            return True
+
+    asked = [neighbours(order, word) for word in shared]
+    known = [[pair for field in fields for pair in neighbours(field, word)] for word in shared]
+    for side in (0, 1):
+        moved = [
+            (i, pair[side])
+            for i in range(len(shared))
+            for pair in asked[i]
+            if not any(same(pair[side], own[side]) for own in known[i])
+        ]
+        for i, near in moved:
+            for j, other in moved:
+                if (
+                    i != j
+                    and not same(shared[i], shared[j])
+                    and (near not in "^$" or other not in "^$")
+                    and (near not in "^$" or all(pair[side] in "^$" for pair in known[j]))
+                    and (other not in "^$" or all(pair[side] in "^$" for pair in known[i]))
+                    and any(same(near, pair[side]) for pair in known[j])
+                    and any(same(other, pair[side]) for pair in known[i])
+                ):
+                    return True
+    return False
 
 
 def _conflicts(skill: Skill, body: _WordIndex, request: _CueText) -> list[str]:
     """Why ``request`` carries a cue the skill's own text does not (fit rule)."""
-    verbs, own_groups, own_negated = _skill_cues(skill)
+    verbs, own_groups, own_negated, orders = _skill_cues(skill)
     groups, negated = _cues(request, verbs)
     found: list[str] = []
     negations = sorted(
@@ -565,6 +698,8 @@ def _conflicts(skill: Skill, body: _WordIndex, request: _CueText) -> list[str]:
     places = [stem for stem in request.named if not _TaskWords.build((stem,)).hits(body)]
     if places:
         found.append(_named("not a fit: names a place the skill does not", places))
+    if _misordered(orders, request.order):
+        found.append("not a fit: binds objects or places unlike the skill")
     return found
 
 

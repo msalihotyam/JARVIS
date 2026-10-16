@@ -156,5 +156,103 @@ class CorpusMatchTest(unittest.TestCase):
         self.assertEqual(zero_recall, [])
 
 
+def probe_kind(skill_text: str, request: str) -> MatchKind:
+    raw = {
+        "skill_id": "probe",
+        "name": skill_text,
+        "summary": skill_text,
+        "inputs": [],
+        "steps": [{"action": skill_text, "capability": "file_read", "inputs": []}],
+    }
+    entry = SkillWithState(skill=build_skill(raw), status=SkillStatus.ACTIVE, health=NO_HEALTH)
+    return match_skills(request, (entry,), None).kind
+
+
+class ReviewProbeTest(unittest.TestCase):
+    """INT54 review probes: a negated or object-swapped request is never a fit."""
+
+    NOT_FIT = (
+        # B1: swapped or rebound objects and places.
+        ("Copy file alpha to folder beta", "Copy file beta to folder alpha"),
+        ("Copy file alpha into folder beta", "Copy file beta into folder alpha"),
+        ("Move file alpha from folder beta", "Move file beta from folder alpha"),
+        ("Copy file alpha to folder beta", "Copy file alpha from folder beta"),
+        ("Copy file alpha to folder beta", "File beta is copied to folder alpha"),
+        ("alpha dosyasını beta klasörüne kopyala", "beta dosyasını alpha klasörüne kopyala"),
+        ("alpha klasöründen beta klasörüne taşı", "beta klasöründen alpha klasörüne taşı"),
+        ("alpha'yı beta'ya kopyala", "beta'yı alpha'ya kopyala"),
+        ("alpha'yı beta'ya kopyala", "alpha'yı beta'dan kopyala"),
+        # B2: a negated skill verb anywhere in the clause.
+        ("Dosyayı özetle ve göster", "Dosyayı özetleme ve göster"),
+        ("Dosyayı özetle ve göster", "Dosyayı özetlemiyorum ve göster"),
+        ("Dosyayı özetle ve göster", "Dosyayı özetlemeden göster"),
+        ("Dosyayı özetle ve göster", "Dosyayı özetlemeyeceğim ve göster"),
+        ("Dosyayı özetle ve göster", "Dosyayı özetleyemem ve göster"),
+        # B3: negative contractions, any apostrophe.
+        ("Delete the report file", "I can't delete the report file"),
+        ("Delete the report file", "I won't delete the report file"),
+        ("Delete the report file", "I can" + chr(0x2019) + "t delete the report file"),
+        ("Delete the report file", "I can" + chr(0x2BC) + "t delete the report file"),
+        ("Delete the report file", "I can`t delete the report file"),
+        ("Delete the report file", "I can" + chr(0xB4) + "t delete the report file"),
+        ("Delete the report file", "I didn't delete the report file"),
+        ("Delete the report file", "The report file isn't to delete"),
+        ("Delete the report file", "It doesnt delete the report file"),
+        ("Delete the report file", "I cannot delete the report file"),
+        # SKMATCHFIX2 review bypasses: rebinding across clauses, case endings
+        # without an apostrophe, other apostrophes, other Turkish negations.
+        ("Copy file alpha to folder beta and file gamma to folder delta",
+         "Copy file alpha to folder delta and file gamma to folder beta"),
+        ("Copy file alpha to folder beta", "Copy file alpha to folder beta and file beta to folder alpha"),
+        ("alpha dosyasını beta klasörüne kopyala", "beta dosyasından alpha klasörüne kopyala"),
+        ("alpha dosyasını beta klasörüne kopyala", "alpha dosyasını beta klasöründen kopyala"),
+        ("alpha dosyasını beta klasörüne kopyala", "alpha klasörünü beta dosyasına kopyala"),
+        ("alpha dosyasını beta klasörüne kopyala", "alpha dosyasını beta klasöründe kopyala"),
+        ("Faturayı müşteriye gönder", "Faturayı müşteriden gönder"),
+        ("Raporu müdüre gönder", "Raporu müdürden gönder"),
+        ("alpha'yı beta'ya kopyala", "betayı alphaya kopyala"),
+        ("alpha'yı beta'ya kopyala", "alpha" + chr(0x2BC) + "yı beta" + chr(0x2BC) + "dan kopyala"),
+        ("Copy file alpha to folder beta", "Copy file alpha out of folder beta"),
+        ("Copy file alpha to folder beta", "Copy file alpha unto folder beta from folder gamma"),
+        ("Delete the report file", "Don" + chr(0x2BB) + "t delete the report file"),
+        ("Delete the report file", "Don" + chr(0x2032) + "t delete the report file"),
+        ("Dosyayı özetle ve göster", "Dosyayı özetlemeksizin göster"),
+        ("Dosyayı özetle ve göster", "Dosyayı özetlemesene ve göster"),
+        ("Dosyayı özetle ve göster", "Dosyayı özetlemek yok, göster"),
+        ("Dosyayı özetle ve göster", "Dosyayı özetlemek yerine göster"),
+        ("Dosyayı özetle ve göster", "Dosyayı özetlemen gerekmez, göster"),
+        ("Dosyayı özetle ve göster", "Dosyayı özetlenmesin ve göster"),
+        ("Dosyayı sil", "Dosya silinmesin"),
+        ("Dosyayı sil", "Dosya silinmemeli"),
+        ("Dosyayı sil", "Dosya silinmeyecek"),
+        ("Dosyayı sil", "Dosya silinmez"),
+        ("Dosyayı kontrol et", "Dosya kontrol edilmesin"),
+        ("Dosyayı kontrol et", "Dosyayı kontrol edemem"),
+        ("Dosyayı kontrol et", "Dosyayı kontrol etmesene"),
+        ("Testleri çalıştır", "Testler çalıştırılmasın"),
+    )
+    SAME = (
+        ("Faturayı müşteriye gönder", "Müşteriye faturayı gönder"),
+        ("alpha dosyasını beta klasörüne kopyala", "beta klasörüne alpha dosyasını kopyala"),
+        ("alpha'yı beta'ya kopyala", "beta'ya alpha'yı kopyala"),
+        ("alpha'yı beta'ya kopyala", "alphayı betaya kopyala"),
+        ("Send the invoice to the customer", "Send the customer the invoice"),
+    )
+
+    def test_review_probes_are_never_a_fit(self) -> None:
+        fits = [pair for pair in self.NOT_FIT if probe_kind(*pair) is MatchKind.FIT]
+        self.assertEqual(fits, [])
+
+    def test_a_reordered_same_request_still_fits(self) -> None:
+        lost = [pair for pair in self.SAME if probe_kind(*pair) is not MatchKind.FIT]
+        self.assertEqual(lost, [])
+
+    def test_the_same_request_still_fits(self) -> None:
+        for text in ("Copy file alpha to folder beta", "alpha dosyasını beta klasörüne kopyala",
+                     "Dosyayı özetle ve göster", "Delete the report file"):
+            with self.subTest(text=text):
+                self.assertIs(probe_kind(text, text), MatchKind.FIT)
+
+
 if __name__ == "__main__":
     unittest.main()
