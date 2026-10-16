@@ -516,6 +516,12 @@ class Bridge(QObject):
         self._skills: list[dict] = []
         self._pending_drafts: list[dict] = []
         self._skills_read = False   # the rail's Skills tile says "—" until a listing answered
+        # SKUIB (b1, b5, b7): the Skills page's lessons, suppressions, unreadable count and own notice
+        self._lessons: list[dict] = []
+        self._lesson_detail: dict = {}
+        self._suppressions: list[dict] = []
+        self._skills_unreadable = 0
+        self._skill_notice = ""
         self._projects: list[str] = []
         self._focus_mode = False
         self._edit_mode = False
@@ -4895,6 +4901,8 @@ class Bridge(QObject):
         active = [str(p.get("id")) for p in records if p.get("active")]
         self._run("skills", lambda: self.backend.skills_overview(active),
                   lambda payload: self._set_skills(payload, names))
+        self.refreshLessons()          # SKUIB b1/b7: the page's other two lists
+        self.refreshSuppressions()
 
     @staticmethod
     def _skill_text(record: dict) -> dict:
@@ -4937,9 +4945,13 @@ class Bridge(QObject):
                         "scope": d["scope"]["kind"], "project_name": projects.get(d["scope"]["project_id"] or "", ""),
                         "reason": d["reason"], "origin": d["provenance"]["origin"],
                         "parent_version": d["provenance"]["parent_version"] or 0,
-                        "target_skill_id": d.get("target_skill_id") or "", **self._skill_text(d)}
+                        "target_skill_id": d.get("target_skill_id") or "",
+                        "parent_id": d["provenance"].get("parent_skill_id") or "", **self._skill_text(d)}
                        for d in scope["drafts"].get("drafts", []) if d["draft_id"] not in seen]
         names = {s["skill_id"]: s["name"] for _, s in found}
+        for d in drafts:   # SKUIB b8: the adapted draft's source, by name
+            d["parent_name"] = names.get(d["parent_id"], "")
+        self._skills_unreadable = max((int(s["list"].get("unreadable") or 0) for s in scopes), default=0)
         self._skills = [
             {"id": s["skill_id"], "project_id": pid, "name": s["name"], "scope": s["scope"]["kind"],
              "project_name": projects.get(s["scope"]["project_id"] or "", ""), "version": s["version"],
@@ -5025,6 +5037,114 @@ class Bridge(QObject):
         self._session_id = str(session_id)
         self._run("task", lambda: self.backend.skill_decline(str(session_id), str(task_id)),
                   self._delivered(self._apply_run), executing=True)
+
+    # -- SKUIB: run, lessons and suppressions from the Skills page (b4, b1, b7) --
+    #
+    # Pass-through like the rest: "Run" is a request to Core (announce, inputs,
+    # every step through policy and approval), never an approval. Lesson and
+    # suppression refusals are the app's words, shown verbatim on the page.
+
+    skillNoticeChanged = Signal()
+
+    @Property("QVariantList", notify=skillsChanged)
+    def lessons(self) -> list:
+        return list(self._lessons)
+
+    @Property("QVariantMap", notify=skillsChanged)
+    def lessonDetail(self) -> dict:
+        return dict(self._lesson_detail)
+
+    @Property("QVariantList", notify=skillsChanged)
+    def suppressions(self) -> list:
+        return list(self._suppressions)
+
+    @Property(int, notify=skillsChanged)
+    def skillsUnreadable(self) -> int:
+        return self._skills_unreadable
+
+    @Property(str, notify=skillNoticeChanged)
+    def skillNotice(self) -> str:
+        return self._skill_notice
+
+    def _set_skill_notice(self, answer: Any) -> None:
+        """The answer's own error, verbatim (also when the flag is off); "" on success."""
+        ok = isinstance(answer, dict) and answer.get("ok") is True
+        error = answer.get("error") if isinstance(answer, dict) else answer
+        if isinstance(error, dict):
+            error = error.get("message")
+        self._skill_notice = "" if ok else str(error or "refused")
+        self.skillNoticeChanged.emit()
+
+    @Slot(str)
+    def runSkill(self, skill_id: str) -> None:
+        if self._busy or self._ticket is not None:
+            return
+        self._task = {}
+        project_id = self._scope_of(self._skills, str(skill_id))
+        self._run("task", lambda: self.backend.run_skill(str(skill_id), project_id),
+                  self._delivered(self._apply_run), executing=True)
+
+    @Slot()
+    def refreshLessons(self) -> None:
+        scopes = (None, *[str(p.get("id")) for p in self.backend.project_records() if p.get("active")])
+
+        def fetch() -> list[dict]:
+            return [{**self.backend.skill_action("list_lessons", pid), "project_id": pid or ""} for pid in scopes]
+
+        def done(answers: Any) -> None:
+            rows: dict[str, dict] = {}
+            for answer in answers if isinstance(answers, list) else []:
+                for item in answer.get("lessons", []) if answer.get("ok") is True else []:
+                    rows.setdefault(str(item["experience_id"]), {**item, "project_id": answer["project_id"]})
+            self._lessons = list(rows.values())
+            self.skillsChanged.emit()
+        self._run("skill-lessons", fetch, done)
+
+    @Slot()
+    def refreshSuppressions(self) -> None:
+        def done(answer: Any) -> None:
+            ok = isinstance(answer, dict) and answer.get("ok") is True
+            self._suppressions = list(answer.get("suppressions") or []) if ok else []
+            self.skillsChanged.emit()
+        self._run("skill-suppressions", lambda: self.backend.skill_action("suppressions", None), done)
+
+    def _lesson_call(self, method: str, experience_id: str, then: Callable[[Any], None]) -> None:
+        pid = self._scope_of([{"id": r["experience_id"], "project_id": r["project_id"]} for r in self._lessons],
+                             str(experience_id))
+        self._run(f"skill-action:{uuid4().hex}",
+                  lambda: self.backend.skill_action(method, str(experience_id), pid), then)
+
+    @Slot(str)
+    def viewLesson(self, experience_id: str) -> None:
+        def done(answer: Any) -> None:
+            self._set_skill_notice(answer)
+            ok = isinstance(answer, dict) and answer.get("ok") is True
+            self._lesson_detail = dict(answer.get("lesson") or {}) if ok else {}
+            self.skillsChanged.emit()
+        self._lesson_call("lesson", experience_id, done)
+
+    def _lesson_changed(self, answer: Any) -> None:
+        self._set_skill_notice(answer)
+        self._lesson_detail = {}
+        self.refreshLessons()
+
+    @Slot(str)
+    def disableLesson(self, experience_id: str) -> None:
+        self._lesson_call("disable_lesson", experience_id, self._lesson_changed)
+
+    @Slot(str)
+    def deleteLesson(self, experience_id: str) -> None:
+        self._lesson_call("delete_lesson", experience_id, self._lesson_changed)
+
+    @Slot(str, str)
+    def unsuppress(self, key: str, scope: str) -> None:
+        """b7 'Geri al': a task row by its key, the global row by its scope alone."""
+        def done(answer: Any) -> None:
+            self._set_skill_notice(answer)
+            self.refreshSuppressions()
+        task_kind = None if scope == "global" else str(key)
+        self._run(f"skill-action:{uuid4().hex}",
+                  lambda: self.backend.skill_action("unsuppress", task_kind, str(scope)), done)
 
     # -- V2.1a M4: memory records, approvals and 'Hatırla' (pass-through) -----
     #

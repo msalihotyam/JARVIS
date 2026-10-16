@@ -707,7 +707,10 @@ class Backend:
     # -- V2.2 S4: skills, pass-through (the app decides the flag, scope and every refusal)
 
     SKILL_ACTIONS = frozenset({"skill_edit", "skill_set_enabled", "skill_delete", "skill_rollback",
-                               "draft_approve", "draft_reject", "suppress"})
+                               "draft_approve", "draft_reject", "suppress",
+                               # SKUIB: lesson control and suppression undo (b1, b7)
+                               "list_lessons", "lesson", "disable_lesson", "delete_lesson",
+                               "suppressions", "unsuppress"})
 
     def skills_overview(self, project_ids: list[str]) -> dict:
         """Each skill (as skill_get answers it) and pending draft visible globally or in one of
@@ -733,3 +736,7 @@ class Backend:
 
     def skill_decline(self, session_id: str, task_id: str) -> dict:
         return self._call("skill-decline", lambda s: self._app(s).skill_decline(session_id, task_id))
+
+    def run_skill(self, skill_id: str, project_id: str | None) -> dict:
+        """SKUIB b4: the Skills page's "Run" - a request to Core, never an approval."""
+        return self._call("skill-run", lambda s: self._app(s).run_skill(skill_id, project_id))

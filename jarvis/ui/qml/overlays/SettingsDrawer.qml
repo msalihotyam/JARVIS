@@ -80,6 +80,16 @@ ContextPanel {
                 Text { text: qsTr("Ambient effects"); width: 190; anchors.verticalCenter: parent.verticalCenter; color: Theme.textLabel; font: Theme.body }
                 Segmented { accent: Theme.materialBlue; value: bridge.ambientEffects ? "on" : "off"; options: [{value:"on",label:qsTr("On")},{value:"off",label:qsTr("Off")}]; onPicked: function(v) { bridge.setAmbientEffects(v === "on") } }
             }
+            // SKUIB (SKBRIDGE a): the skills switch, with the rollback rule beside it.
+            Column { width: parent.width; spacing: 6
+                Row { width: parent.width; spacing: 18
+                    Text { text: qsTr("Skills"); width: 190; anchors.verticalCenter: parent.verticalCenter; color: Theme.textLabel; font: Theme.body }
+                    Segmented { accent: Theme.materialBlue; objectName: "skillsSwitch"; segmentPrefix: "skillsSwitch_"; value: bridge.skillsEnabled ? "on" : "off"
+                        options: [{value:"on",label:qsTr("On")},{value:"off",label:qsTr("Off")}]; onPicked: function(v) { bridge.enableSkills(v === "on") } }
+                }
+                Text { objectName: "skillsSwitchHint"; width: parent.width; wrapMode: Text.Wrap; color: Theme.textMuted; font: Theme.caption
+                       text: qsTr("Turn skills off before going back to a version older than V2.2") }
+            }
             // Three skins (6G S1 adds the mechanical lamp): the choice sits under the label, like the freeze key.
             Column { width: parent.width; spacing: 8
                 Text { text: qsTr("Status indicator"); color: Theme.textLabel; font: Theme.body }

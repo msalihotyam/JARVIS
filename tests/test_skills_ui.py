@@ -174,13 +174,13 @@ class SkillsViewTests(unittest.TestCase):
         self.assertEqual("New version after a failed run", self.shown("skillProvenance").property("text"))
 
     def test_actions_emit_their_signals_with_the_right_args(self) -> None:
-        self.tap(self.shown("skillEdit"))
+        self.assertEqual([], self.all_shown("skillEdit"))         # SKUIB: no editor yet, so no edit control
         self.tap(self.shown("skillToggle"))
         rollbacks = sorted(self.all_shown("skillRollback"), key=lambda b: b.mapToScene(QPointF()).y())
         self.assertEqual(2, len(rollbacks))                       # v1 and v2; the active v3 has none
         self.tap(rollbacks[0])
         self.tap(rollbacks[1])
-        self.assertEqual([["edit", "sk-report"], ["toggle", "sk-report", False],
+        self.assertEqual([["toggle", "sk-report", False],
                           ["rollback", "sk-report", 1], ["rollback", "sk-report", 2]], self.log())
         self.tap(next(r for r in self.all_shown("skillRow") if r.property("title") == "Sort mail"))
         self.assertEqual("Turn on", self.shown("skillToggle").property("label"))

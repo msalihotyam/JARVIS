@@ -19,11 +19,26 @@ SecondaryPage {
     property var skills: []
     property bool skillsEnabled: false
     property string selectedId: ""
+    // SKUIB: lessons { experience_id, kind, text, state: "active" | "disabled" }, the
+    // open lesson, active suppressions { key, scope: "task" | "global" }, the count of
+    // unreadable records, and the last lesson/undo refusal - shown verbatim.
+    property var lessons: []
+    property var lessonDetail: ({})
+    property var suppressions: []
+    property int unreadable: 0
+    property string notice: ""
+    // SKBRIDGE: declared for the caller, but no editor exists, so no control sends it.
     signal editRequested(string id)
     signal enabledToggled(string id, bool on)
     signal deleteRequested(string id)
     signal rollbackRequested(string id, int version)
     signal enableSkillsRequested()
+    // b4: a request to Core to run the skill - every step still goes through policy and approval.
+    signal runRequested(string id)
+    signal lessonViewRequested(string id)
+    signal lessonDisableRequested(string id)
+    signal lessonDeleteRequested(string id)
+    signal unsuppressRequested(string key, string scope)
 
     readonly property var selected: {
         for (var i = 0; i < skills.length; ++i) if (skills[i].id === selectedId) return skills[i]
@@ -81,9 +96,12 @@ SecondaryPage {
         PageEmpty { objectName: "skillsEmpty"; width: parent.width; visible: page.skills.length === 0
                     title: qsTr("No saved skills yet.")
                     note: qsTr("When a task finishes, JARVIS can offer to save its steps as a skill. Nothing is saved without your approval.") }
+        Line { objectName: "skillsUnreadable"; visible: page.unreadable > 0; color: Theme.warning
+               text: qsTr("%1 records could not be read").arg(page.unreadable) }
+        Line { objectName: "skillsNotice"; visible: page.notice !== ""; color: Theme.warning; text: page.notice }
         Row {
             id: split
-            width: parent.width; height: parent.height - y; spacing: 16
+            width: parent.width; height: parent.height - y - extras.height - parent.spacing; spacing: 16
             visible: page.skills.length > 0
             ListView {
                 id: list
@@ -132,7 +150,9 @@ SecondaryPage {
                     Section { heading: qsTr("Checks"); items: pane.s.checks || []; itemName: "skillCheck" }
                     Row {
                         spacing: 8
-                        ActionButton { objectName: "skillEdit"; label: qsTr("Edit"); onClicked: page.editRequested(pane.s.id) }
+                        ActionButton { objectName: "skillRun"; primary: true; label: qsTr("Run")
+                                       visible: page.skillsEnabled && pane.s.status === "active"
+                                       onClicked: page.runRequested(pane.s.id) }
                         ActionButton { objectName: "skillToggle"; label: pane.s.status === "disabled" ? qsTr("Turn on") : qsTr("Turn off")
                                        onClicked: page.enabledToggled(pane.s.id, pane.s.status === "disabled") }
                         ActionButton { id: deleteButton; objectName: "skillDelete"; danger: true; label: qsTr("Delete")
@@ -157,6 +177,102 @@ SecondaryPage {
                 }
             }
         }
+        // b1/b7: lessons and suppressions; their own scroll area under the split.
+        Flickable {
+            id: extras
+            objectName: "skillsExtras"
+            width: parent.width
+            height: page.skills.length > 0 ? Math.min(extrasColumn.height, Math.round(parent.height * 0.4))
+                                           : Math.max(0, parent.height - split.y)
+            contentHeight: extrasColumn.height; clip: true; boundsBehavior: Flickable.StopAtBounds
+            ScrollBar.vertical: ScrollBar {}
+            Column {
+                id: extrasColumn
+                width: extras.width; spacing: 8
+                Text { text: i18n.upper(qsTr("Lessons")); color: Theme.textLabel; font: Theme.pageSection }
+                Line { objectName: "lessonsEmpty"; visible: page.lessons.length === 0; color: Theme.textLabel; text: qsTr("No lessons yet.") }
+                Repeater {
+                    model: page.lessons
+                    Row {
+                        objectName: "lessonRow"
+                        width: extrasColumn.width; spacing: 8
+                        Pill { objectName: "lessonState"; anchors.verticalCenter: parent.verticalCenter
+                               text: modelData.state === "disabled" ? qsTr("Off") : qsTr("Active")
+                               tint: modelData.state === "disabled" ? Theme.textMuted : Theme.success
+                               font: Theme.pageSection; implicitHeight: 24 }
+                        Text { objectName: "lessonText"; anchors.verticalCenter: parent.verticalCenter
+                               width: Math.max(0, parent.width - x - lessonButtons.width - parent.spacing)
+                               elide: Text.ElideRight; textFormat: Text.PlainText; color: Theme.text; font: Theme.pageMeta
+                               text: modelData.text || "" }
+                        Row {
+                            id: lessonButtons
+                            spacing: 6
+                            ActionButton { objectName: "lessonView"; compact: true; label: qsTr("View")
+                                           onClicked: page.lessonViewRequested(modelData.experience_id) }
+                            ActionButton { id: lessonDisableButton; objectName: "lessonDisable"; compact: true; label: qsTr("Turn off")
+                                           visible: modelData.state !== "disabled"
+                                           onClicked: { lessonDisableDialog.targetId = modelData.experience_id; lessonDisableDialog.openFrom(lessonDisableButton) } }
+                            ActionButton { id: lessonDeleteButton; objectName: "lessonDelete"; compact: true; danger: true; label: qsTr("Delete")
+                                           onClicked: { lessonDeleteDialog.targetId = modelData.experience_id; lessonDeleteDialog.openFrom(lessonDeleteButton) } }
+                        }
+                    }
+                }
+                // The lesson asked for with "View": its text and when it was learned, as plain data.
+                Line { objectName: "lessonDetail"; visible: !!page.lessonDetail.experience_id
+                       text: (page.lessonDetail.text || "") + (page.lessonDetail.created_at ? " · " + page.when(page.lessonDetail.created_at) : "") }
+                Text { text: i18n.upper(qsTr("Not offered")); color: Theme.textLabel; font: Theme.pageSection }
+                Line { objectName: "suppressionsEmpty"; visible: page.suppressions.length === 0; color: Theme.textLabel
+                       text: qsTr("Nothing is held back from offers.") }
+                Repeater {
+                    model: page.suppressions
+                    Row {
+                        objectName: "suppressionRow"
+                        spacing: 10
+                        Text { objectName: "suppressionKey"; anchors.verticalCenter: parent.verticalCenter
+                               textFormat: Text.PlainText; color: Theme.text; font: Theme.pageMeta
+                               text: modelData.scope === "global" ? qsTr("All skill offers") : (modelData.key || "") }
+                        ActionButton { objectName: "suppressionUndo"; compact: true; label: qsTr("Undo")
+                                       onClicked: page.unsuppressRequested(modelData.key || "", modelData.scope || "task") }
+                    }
+                }
+            }
+        }
+    }
+
+    // b1: no "turn back on" in this version - said before the click.
+    JarvisDialog {
+        id: lessonDisableDialog
+        objectName: "lessonDisableDialog"
+        label: qsTr("Turn off lesson")
+        title: qsTr("Turn this lesson off?")
+        titleName: "lessonDisableTitle"
+        initialFocus: lessonDisableCancel
+        confirmItem: lessonDisableConfirm
+        property string targetId: ""
+        Line { text: qsTr("JARVIS stops using this lesson. This cannot be undone in this version.") }
+        buttons: [
+            ActionButton { id: lessonDisableCancel; objectName: "lessonDisableCancel"; label: qsTr("Cancel"); onClicked: lessonDisableDialog.close() },
+            ActionButton { id: lessonDisableConfirm; objectName: "lessonDisableConfirm"; primary: true; label: qsTr("Turn off")
+                           onClicked: { page.lessonDisableRequested(lessonDisableDialog.targetId); lessonDisableDialog.close() } }
+        ]
+    }
+    // b1: a delete is final.
+    JarvisDialog {
+        id: lessonDeleteDialog
+        objectName: "lessonDeleteDialog"
+        danger: true
+        label: qsTr("Delete lesson")
+        title: qsTr("Delete this lesson?")
+        titleName: "lessonDeleteTitle"
+        initialFocus: lessonDeleteCancel
+        confirmItem: lessonDeleteConfirm
+        property string targetId: ""
+        Line { text: qsTr("The lesson is deleted for good and cannot be brought back.") }
+        buttons: [
+            ActionButton { id: lessonDeleteCancel; objectName: "lessonDeleteCancel"; label: qsTr("Cancel"); onClicked: lessonDeleteDialog.close() },
+            ActionButton { id: lessonDeleteConfirm; objectName: "lessonDeleteConfirm"; danger: true; primary: true; label: qsTr("Delete")
+                           onClicked: { page.lessonDeleteRequested(lessonDeleteDialog.targetId); lessonDeleteDialog.close() } }
+        ]
     }
 
     // D4: delete is a tombstone - asked first, focus on the safe button.

@@ -32,7 +32,7 @@ Item {
     readonly property int vpad: 8
     readonly property int barHeight: Math.max(minHeight, Math.min(maxHeight, Math.ceil(input.implicitHeight) + 2 * vpad))
     readonly property int rowGap: 6
-    implicitHeight: readOnlyBanner.height + (readOnlyBanner.visible ? 6 : 0) + strip.height + barHeight + rowGap + underRow.height
+    implicitHeight: readOnlyBanner.height + (readOnlyBanner.visible ? 6 : 0) + strip.height + skillHint.height + barHeight + rowGap + underRow.height
     // An archived project's conversation is read-only (V2.0 Gate 6A). Presentation
     // only: Core refuses the work anyway (ARCHITECTURE 4.22).
     property bool readOnly: bridge.conversationReadOnly
@@ -168,6 +168,17 @@ Item {
         anchors { left: parent.left; right: parent.right; top: readOnlyBanner.bottom; topMargin: readOnlyBanner.visible ? 6 : 0 }
         onPickRequested: function(kind, groupId) { composer.pick(kind, groupId) }
         onUnpasteRequested: function(file) { composer.unpaste(file) }
+    }
+
+    // b4: an explicit skill run is the whole message; one line says so while it is typed.
+    Text {
+        id: skillHint
+        objectName: "composerSkillHint"
+        anchors { left: parent.left; right: parent.right; top: strip.bottom }
+        visible: input.text.startsWith("/beceri") || input.text.startsWith("/skill")
+        height: visible ? implicitHeight + 4 : 0
+        textFormat: Text.PlainText; elide: Text.ElideRight; color: Theme.textLabel; font: Theme.caption
+        text: qsTr("To run a skill, the whole message must be \"/beceri <name>\".")
     }
 
     Rectangle {

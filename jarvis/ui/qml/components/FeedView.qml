@@ -777,6 +777,13 @@ Item {
                                     onUse: if (typeof bridge.useSkill === "function") bridge.useSkill(modelData.session_id, modelData.task_id)
                                 }
                             }
+                            // b1: how many lessons the finished skill run used - only when any.
+                            Text {
+                                objectName: "feedSkillLessonsUsed"
+                                visible: row.kind === "skill" && modelData.event === "skill_run_finished" && Number(modelData.lessons_used) > 0
+                                textFormat: Text.PlainText; color: Theme.textMuted; font: Theme.caption
+                                text: qsTr("%1 lessons used").arg(Number(modelData.lessons_used) || 0)
+                            }
                             // One card per still-pending draft of the offer (several drafts,
                             // several cards; a decided one leaves the bridge's list). The card
                             // shows the whole draft that would be saved, never a summary.
@@ -805,6 +812,9 @@ Item {
                                                 checks: draftItem.draft.checks
                                                 projectName: draftItem.draft.project_name || ""
                                                 proposal: draftItem.draft.origin === "user_edit" || draftItem.draft.origin === "version_after_failure"
+                                                // b8: which skill the Save writes to, by name.
+                                                targetName: draftItem.draft.target_skill_id ? String((draftItem.current || {}).name || draftItem.draft.parent_name || "") : ""
+                                                adaptedFrom: draftItem.draft.origin === "adapted" ? String(draftItem.draft.parent_name || "") : ""
                                                 // One past the replaced skill's latest version (a rolled-back one too).
                                                 version: (draftItem.current ? Math.max.apply(null, [Number(draftItem.current.version) || 0].concat(draftItem.current.versions || []))
                                                                             : Number(draftItem.draft.parent_version) || 0) + 1

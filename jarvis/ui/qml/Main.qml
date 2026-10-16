@@ -349,7 +349,15 @@ Window {
             onEnabledToggled: function(id, on) { bridge.skillSetEnabled(id, on) }
             onDeleteRequested: function(id) { bridge.skillDelete(id) }
             onRollbackRequested: function(id, version) { bridge.skillRollback(id, version) }
-            onEnableSkillsRequested: bridge.enableSkills(true) } }
+            onEnableSkillsRequested: bridge.enableSkills(true)
+            // SKUIB: run, lessons and suppressions (b4, b1, b7)
+            lessons: bridge.lessons; lessonDetail: bridge.lessonDetail; suppressions: bridge.suppressions
+            unreadable: bridge.skillsUnreadable; notice: bridge.skillNotice
+            onRunRequested: function(id) { bridge.runSkill(id) }
+            onLessonViewRequested: function(id) { bridge.viewLesson(id) }
+            onLessonDisableRequested: function(id) { bridge.disableLesson(id) }
+            onLessonDeleteRequested: function(id) { bridge.deleteLesson(id) }
+            onUnsuppressRequested: function(key, scope) { bridge.unsuppress(key, scope) } } }
 
         // E1': the right column's inner edge (Edit Mode): it only narrows, with a
         // live px label; the width is remembered on release.

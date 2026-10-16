@@ -1440,6 +1440,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Salt okunur: bu sohbet arşivlenmiş %1 projesine ait. Devam etmek için projeyi arşivden çıkarın.</translation>
     </message>
     <message>
+        <source>To run a skill, the whole message must be &quot;/beceri &lt;name&gt;&quot;.</source>
+        <translation>Beceri çalıştırmak için mesajın tamamı &quot;/beceri &lt;ad&gt;&quot; olmalı.</translation>
+    </message>
+    <message>
         <source>Permission mode: %1</source>
         <translation>İzin modu: %1</translation>
     </message>
@@ -1985,6 +1989,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>rev %1</source>
         <translation>rev %1</translation>
+    </message>
+    <message>
+        <source>%1 lessons used</source>
+        <translation>%1 ders kullanıldı</translation>
     </message>
     <message>
         <source>From run %1</source>
@@ -4653,6 +4661,14 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Kapalı</translation>
     </message>
     <message>
+        <source>Skills</source>
+        <translation>Beceriler</translation>
+    </message>
+    <message>
+        <source>Turn skills off before going back to a version older than V2.2</source>
+        <translation>V2.2 öncesi bir sürüme dönmeden önce becerileri kapatın</translation>
+    </message>
+    <message>
         <source>Status indicator</source>
         <translation>Durum göstergesi</translation>
     </message>
@@ -4957,8 +4973,16 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Genel</translation>
     </message>
     <message>
+        <source>Save as a new version of %1</source>
+        <translation>%1 için yeni sürüm olarak kaydet</translation>
+    </message>
+    <message>
         <source>Save</source>
         <translation>Kaydet</translation>
+    </message>
+    <message>
+        <source>Save as an adaptation of %1</source>
+        <translation>%1 uyarlaması olarak kaydet</translation>
     </message>
     <message>
         <source>Edit</source>
@@ -5056,6 +5080,10 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Bir iş bittiğinde JARVIS adımlarını beceri olarak kaydetmeyi önerebilir. Onayınız olmadan hiçbir şey kaydedilmez.</translation>
     </message>
     <message>
+        <source>%1 records could not be read</source>
+        <translation>%1 kayıt okunamadı</translation>
+    </message>
+    <message>
         <source>This skill failed in recent runs. It is not used on its own until a run you approve succeeds with it again.</source>
         <translation>Bu beceri son denemelerde başarısız oldu. Onayladığınız bir çalıştırma onunla yeniden başarılı olana kadar kendiliğinden kullanılmaz.</translation>
     </message>
@@ -5072,8 +5100,8 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Kontroller</translation>
     </message>
     <message>
-        <source>Edit</source>
-        <translation>Düzenle</translation>
+        <source>Run</source>
+        <translation>Çalıştır</translation>
     </message>
     <message>
         <source>Turn on</source>
@@ -5094,6 +5122,58 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
     <message>
         <source>Return to this version</source>
         <translation>Bu sürüme dön</translation>
+    </message>
+    <message>
+        <source>Lessons</source>
+        <translation>Dersler</translation>
+    </message>
+    <message>
+        <source>No lessons yet.</source>
+        <translation>Henüz ders yok.</translation>
+    </message>
+    <message>
+        <source>View</source>
+        <translation>Görüntüle</translation>
+    </message>
+    <message>
+        <source>Not offered</source>
+        <translation>Önerilmeyecekler</translation>
+    </message>
+    <message>
+        <source>Nothing is held back from offers.</source>
+        <translation>Önerilerden geri tutulan bir şey yok.</translation>
+    </message>
+    <message>
+        <source>All skill offers</source>
+        <translation>Tüm beceri önerileri</translation>
+    </message>
+    <message>
+        <source>Undo</source>
+        <translation>Geri al</translation>
+    </message>
+    <message>
+        <source>Turn off lesson</source>
+        <translation>Dersi kapat</translation>
+    </message>
+    <message>
+        <source>Turn this lesson off?</source>
+        <translation>Bu ders kapatılsın mı?</translation>
+    </message>
+    <message>
+        <source>JARVIS stops using this lesson. This cannot be undone in this version.</source>
+        <translation>JARVIS bu dersi artık kullanmaz. Bu sürümde geri alınamaz.</translation>
+    </message>
+    <message>
+        <source>Delete lesson</source>
+        <translation>Dersi sil</translation>
+    </message>
+    <message>
+        <source>Delete this lesson?</source>
+        <translation>Bu ders silinsin mi?</translation>
+    </message>
+    <message>
+        <source>The lesson is deleted for good and cannot be brought back.</source>
+        <translation>Ders kalıcı olarak silinir ve geri getirilemez.</translation>
     </message>
     <message>
         <source>Delete skill</source>

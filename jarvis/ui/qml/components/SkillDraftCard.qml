@@ -17,6 +17,8 @@ Rectangle {
     property string scope: projectName !== "" ? "project" : "global"
     property bool proposal: false              // a new version of an existing skill
     property int version: 0                    // the proposed version (N+1)
+    property string targetName: ""             // b8: the skill a new version replaces, by name
+    property string adaptedFrom: ""            // b8: the skill an adaptation came from, by name
     readonly property string chosenScope: projectName !== "" && scope === "project" ? "project" : "global"
     signal approve(string scope)
     signal edit()
@@ -73,7 +75,9 @@ Rectangle {
         }
         Flow {
             width: parent.width; spacing: 8
-            ActionButton { objectName: "skillDraftSave"; primary: true; compact: true; label: qsTr("Save"); onClicked: card.approve(card.chosenScope) }
+            ActionButton { objectName: "skillDraftSave"; primary: true; compact: true; onClicked: card.approve(card.chosenScope)
+                           label: card.targetName !== "" ? qsTr("Save as a new version of %1").arg(card.targetName)
+                                  : card.adaptedFrom !== "" ? qsTr("Save as an adaptation of %1").arg(card.adaptedFrom) : qsTr("Save") }
             ActionButton { objectName: "skillDraftEdit"; compact: true; label: qsTr("Edit"); onClicked: card.edit() }
             ActionButton { objectName: "skillDraftReject"; compact: true; label: qsTr("Dismiss"); onClicked: card.reject() }
             ActionButton { objectName: "skillDraftSuppress"; compact: true; label: qsTr("Don't ask for tasks like this"); onClicked: card.suppress() }

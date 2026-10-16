@@ -5892,7 +5892,7 @@ class JarvisApp:
             return {"skills": [
                 self._skill_payload(item.skill, item.status, item.health)
                 for item in store.list_skills(project_id)
-            ]}
+            ], "unreadable": len(store.unreadable_rows())}  # b5: a count only, read-only
         return self._skill_call(listed, project_id, cleanup=True)
 
     def skill_get(self, skill_id: str, version: int | None = None, project_id: str | None = None) -> dict[str, Any]:
