@@ -4172,6 +4172,7 @@ _IMPORT_LOCK = threading.Lock()
 #: monotonic deadline). In memory only and process-wide like the import plans;
 #: a token is single use and dies with the process.
 PURGE_TOKEN_SECONDS = 120
+REPLY_SOURCE_LABEL_CHARS = 60  # a used-memory line under a reply (SEC2APP)
 _PURGE_TOKENS_MAX = 16
 _PURGE_TOKENS: dict[str, tuple[str, frozenset[str], float]] = {}
 _PURGE_LOCK = threading.Lock()
@@ -4956,6 +4957,14 @@ class JarvisApp:
         refusal = self._active_project_refusal(record.project_id)
         if refusal:
             return {"ok": False, "error": refusal}
+        # I21: a temporary (memory-off) chat writes nothing; the store refuses
+        # it too, through source_conversation_id below.
+        try:
+            memory_off = self.memory.is_memory_off(conversation_id)
+        except (TypeError, ValueError, sqlite3.Error, OSError):
+            return {"ok": False, "error": "The memory database is busy; try again."}
+        if memory_off:
+            return {"ok": False, "refused": "memory_off", "error": "Memory is off for this conversation."}
         try:
             state = self.memory.load_conversation_state(conversation_id)
         except (KeyError, ValueError):
@@ -4982,7 +4991,8 @@ class JarvisApp:
             if hits:
                 kind = MemoryRecordKind.RULE.value
             view = self.memory.insert_explicit_user_record(
-                record.project_id, kind, DataClassification.INTERNAL.value, text, subject_key
+                record.project_id, kind, DataClassification.INTERNAL.value, text, subject_key,
+                source_conversation_id=conversation_id,
             )
         except MemoryRecordRefused as exc:
             return {"ok": False, "refused": exc.category, "error": "This message cannot be stored in memory."}
@@ -4991,6 +5001,134 @@ class JarvisApp:
         if hits:
             return {"ok": True, "record": self._record_payload(view), "instruction_like": list(hits)}
         return {"ok": True, "record": self._record_payload(view)}
+
+    # -- SEC2APP: per-conversation rollback (I23), memory-off (I21) and the
+    # records a reply used (I22). USER actions from the window only; hard
+    # purge stays the separate two-step confirmation above (I16).
+
+    def _conversation_project_refusal(self, conversation_id: Any, project_id: Any) -> tuple[str | None, str | None]:
+        """(project, None) when ``conversation_id`` is a conversation of an
+        active project and, if ``project_id`` is given (the page's project),
+        of exactly that one; else (None, refusal). Unknown, Global and
+        other-project conversations read alike on purpose."""
+        try:
+            record = self.memory.load_conversation(conversation_id)
+        except (TypeError, ValueError, sqlite3.Error, OSError):
+            record = None
+        if record is None or record.project_id is None or (
+            project_id is not None and record.project_id != project_id
+        ):
+            return None, "No conversation of this project to undo."
+        refusal = self._active_project_refusal(record.project_id)
+        return (None, refusal) if refusal else (record.project_id, None)
+
+    def undo_conversation_records(
+        self, conversation_id: str, *, project_id: str | None = None, confirm: bool = False
+    ) -> dict[str, Any]:
+        """"Undo all from this conversation": ``confirm=False`` previews how
+        many APPROVED (-> RETRACTED) and PENDING (-> REJECTED) records of the
+        conversation's project would go; ``confirm=True`` (the dialog's
+        click) rolls them back - events and tombstones only, nothing is
+        deleted (I23) - and returns the same counts."""
+        owner, refusal = self._conversation_project_refusal(conversation_id, project_id)
+        if refusal:
+            return {"ok": False, "error": refusal}
+        try:
+            if confirm is True:
+                retracted, rejected, skipped = self.memory.retract_conversation_records(
+                    conversation_id, owner, actor=MemoryRecordActor.USER)
+            else:
+                # The rollback's own row set (not records_from_conversation, which
+                # drops unreadable rows), so the preview counts what confirm rolls back.
+                with self.memory._connection() as connection:
+                    statuses = [row["current_status"] for row in connection.execute(
+                        f"{_RECORD_CURRENT_SQL} WHERE r.project_id = ? AND "
+                        "(r.source_conversation_id = ? OR r.conversation_id = ?)",
+                        (owner, conversation_id, conversation_id),
+                    )]
+                retracted = statuses.count(MemoryRecordStatus.APPROVED.value)
+                rejected = statuses.count(MemoryRecordStatus.PENDING.value)
+                skipped = len(statuses) - retracted - rejected
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        except (sqlite3.Error, OSError):
+            return {"ok": False, "error": "The memory database is busy; try again."}
+        return {
+            "ok": True,
+            "conversation_id": conversation_id,
+            "project_id": owner,
+            "confirmed": confirm is True,
+            "count": retracted + rejected,
+            "approved": retracted,
+            "pending": rejected,
+            "skipped": skipped,
+        }
+
+    def conversation_memory_off_payload(self, conversation_id: str) -> dict[str, Any]:
+        try:
+            off = self.memory.is_memory_off(conversation_id)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        except (sqlite3.Error, OSError):
+            return {"ok": False, "error": "The memory database is busy; try again."}
+        return {"ok": True, "conversation_id": conversation_id, "conversation_memory_off": off}
+
+    def set_conversation_memory_off(self, conversation_id: str, off: bool) -> dict[str, Any]:
+        """The temporary-chat switch (I21). Switching back on does not make
+        the conversation capturable again: Core reads ``was_ever_memory_off``."""
+        try:
+            self.memory.set_conversation_memory_off(conversation_id, off, MemoryRecordActor.USER)
+        except (TypeError, ValueError) as exc:
+            return {"ok": False, "error": str(exc)}
+        except (sqlite3.Error, OSError):
+            return {"ok": False, "error": "The memory database is busy; try again."}
+        return self.conversation_memory_off_payload(conversation_id)
+
+    def reply_memory_sources(self, conversation_id: str, turn_id: str) -> dict[str, Any]:
+        """The feed fields of one reply (I22): ``usedMemory`` - each record it
+        used, ``{record_id, kind, label, revision}`` - and
+        ``memoryNoneRelevant`` when Core recorded that none was relevant.
+        Nothing recorded (memory off, an older reply) gives neither. A label
+        is a short plain-text line of the record; one the never-store filter
+        refuses (a link, Markdown, a secret ...), a sensitive, a no longer
+        approved or a missing record shows its kind only."""
+        try:
+            used = self.memory.sources_for_turn(conversation_id, turn_id)
+        except (TypeError, ValueError, sqlite3.Error, OSError):
+            used = None
+        if used is None:
+            return {"usedMemory": [], "memoryNoneRelevant": False}
+        try:
+            conversation = self.memory.load_conversation(conversation_id)
+        except (TypeError, ValueError, sqlite3.Error, OSError):
+            conversation = None
+        project_id = None if conversation is None else conversation.project_id
+        items = []
+        for record_id, kind, revision in used:
+            label = kind.value
+            # Only a record this conversation may see gives its text: its own
+            # project (any, for a Global one) and project-wide or its own chat.
+            try:
+                with self.memory._connection() as connection:
+                    row = None if conversation is None else connection.execute(
+                        f"{_RECORD_CURRENT_SQL} WHERE r.record_id = ? AND (? IS NULL OR r.project_id = ?) "
+                        "AND (r.conversation_id IS NULL OR r.conversation_id = ?)",
+                        (record_id, project_id, project_id, conversation_id),
+                    ).fetchone()
+                view = None if row is None else self.memory._record_view_from_row(row)
+            except (TypeError, ValueError, sqlite3.Error, OSError):
+                view = None
+            # A record undone, rejected or rolled back since (I23) is not re-shown.
+            if view is not None and view.status is MemoryRecordStatus.APPROVED and view.record.classification in (
+                DataClassification.PUBLIC, DataClassification.INTERNAL
+            ):
+                line = " ".join(view.record.text.split())
+                line = line if len(line) <= REPLY_SOURCE_LABEL_CHARS else line[:REPLY_SOURCE_LABEL_CHARS - 1] + "…"
+                # Both: a cut can split a carrier (a base64 run) below the filter's threshold.
+                if line and classify_candidate_text(view.record.text).allowed and classify_candidate_text(line).allowed:
+                    label = line
+            items.append({"record_id": record_id, "kind": kind.value, "label": label, "revision": revision})
+        return {"usedMemory": items, "memoryNoneRelevant": not items}
 
     # -- V2.1b (IMPEXTRACT): history import pipeline ----------------------------
     # import -> dedup -> proposed scope (preview) -> the user confirms a project
