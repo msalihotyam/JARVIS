@@ -673,6 +673,19 @@ class Backend:
     def set_global_memory_toggle(self, conversation_id: str, enabled: bool) -> dict:
         return self._plain("global-memory", lambda app: app.set_global_memory_toggle(conversation_id, enabled))
 
+    # SEC2: undo this conversation's records (confirm=False previews), memory-off, a reply's sources.
+    def undo_conversation_records(self, conversation_id: str, confirm: bool = False) -> dict:
+        return self._plain("memory-undo-conversation", lambda app: app.undo_conversation_records(conversation_id, confirm=confirm))
+
+    def conversation_memory_off(self, conversation_id: str) -> dict:
+        return self._plain("memory-off", lambda app: app.conversation_memory_off_payload(conversation_id))
+
+    def set_conversation_memory_off(self, conversation_id: str, off: bool) -> dict:
+        return self._plain("memory-off", lambda app: app.set_conversation_memory_off(conversation_id, off))
+
+    def reply_memory_sources(self, conversation_id: str, turn_id: str) -> dict:
+        return self._plain("reply-sources", lambda app: app.reply_memory_sources(conversation_id, turn_id))
+
     def compact_conversation(self, conversation_id: str) -> dict:
         return self._plain("compact", lambda app: app.compact_conversation(conversation_id))
 

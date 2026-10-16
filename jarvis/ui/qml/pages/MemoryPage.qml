@@ -60,6 +60,8 @@ SecondaryPage {
         }
         function onMemoryPurgeRequested(answer) { if (answer.ok) { page.purgeAsk = answer; purgeDialog.open() } }
         function onMemoryPurgeDone(answer) { if (answer.ok) page.reloadAll() }
+        function onUndoConversationPreviewed(answer) { if (answer.ok) { page.undoAsk = answer; undoDialog.open() } }
+        function onUndoConversationDone(answer) { if (answer.ok) page.reloadAll() }
         function onMemoryRepairDone(answer) { if (answer.ok) page.loadRecords() }
         // Imported memories land PENDING: the approval list below shows them.
         function onImportRunDone(answer) { if (answer.ok) { bridge.refreshMemory(page.project, page.includeInactive); page.loadRecords() } }
@@ -92,6 +94,25 @@ SecondaryPage {
                            onClicked: { bridge.confirmMemoryPurge(page.purgeAsk.token || ""); purgeDialog.close() } }
         ]
     }
+    // SEC2 undo-this-conversation: the preview's count (nothing changed yet); only Confirm undoes, Cancel calls nothing.
+    property var undoAsk: ({})
+    JarvisDialog {
+        id: undoDialog
+        objectName: "memoryUndoConversationDialog"
+        danger: true
+        label: qsTr("Memory")
+        title: qsTr("Undo all from this conversation?")
+        initialFocus: undoCancel
+        confirmItem: undoConfirm
+        onClosed: page.undoAsk = ({})
+        Text { objectName: "memoryUndoConversationCount"; width: parent ? parent.width : 0; wrapMode: Text.Wrap; color: Theme.text; font: Theme.pageRow
+               text: qsTr("%1 records from this conversation are undone. Nothing is deleted; they stay in the history.").arg(page.undoAsk.count || 0) }
+        buttons: [
+            ActionButton { id: undoCancel; objectName: "memoryUndoConversationCancel"; label: qsTr("Cancel"); height: 36; onClicked: undoDialog.close() },
+            ActionButton { id: undoConfirm; objectName: "memoryUndoConversationConfirm"; label: qsTr("Undo all from this conversation"); danger: true; primary: true; height: 36
+                           onClicked: { bridge.undoConversationRecords(page.undoAsk.conversation_id || ""); undoDialog.close() } }
+        ]
+    }
 
     Column {
         anchors.fill: parent
@@ -118,6 +139,9 @@ SecondaryPage {
                     onUndo: bridge.undoMemoryRecord(modelData.project_id || "", modelData.record_id)
                     onPurge: page.askPurge(modelData.record_id) }
             }
+            // SEC2: undo every record this conversation brought, after the app's preview names the count.
+            ActionButton { objectName: "memoryUndoConversation"; label: qsTr("Undo all from this conversation"); visible: !!page.batch.conversation_id
+                           onClicked: bridge.undoConversationRecordsPreview(page.batch.conversation_id) }
         }
         Column { objectName: "memoryPending"; width: parent.width; spacing: 8; visible: page.scope !== ""
             Text { text: qsTr("AWAITING YOUR APPROVAL"); color: Theme.textLabel; font: Theme.pageSection }

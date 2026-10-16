@@ -548,9 +548,11 @@ class Bridge(QObject):
         # toggle, re-read on every switch (and after each turn, ``_remember``).
         self._context_usage: dict[str, Any] = dict(_UNKNOWN_USAGE)
         self._global_memory = False
+        self._conversation_memory_off = False   # SEC2: the open conversation's memory-off switch
         self._memory_read_id = ""
         self.conversationChanged.connect(self._refresh_conversation_memory)
         self._refresh_conversation_memory()
+        self._read_feed_sources()               # SEC2: the restored replies' sources
         # SECQMLUI: the last session-end / compaction approval batch, as the app sent it
         # (its capture thread calls the listener; the answer is queued to this thread).
         self._memory_batch: dict[str, Any] = {}
@@ -731,6 +733,8 @@ class Bridge(QObject):
             turn = store.append(role="assistant", kind="reply", text=text, key=f"{self._store_run}:{entry['id']}")
             if turn is not None:
                 entry["turn"] = turn.id
+                if store.id:
+                    self._read_reply_sources(store.id, [turn.id])
         elif kind == "result":
             shown = render(message)
             # A result's identity is its TASK and the OUTCOME Core reported for it -
@@ -895,6 +899,33 @@ class Bridge(QObject):
                 feed.append(item)
         self._feed = feed[-FEED_LIMIT:]
         self.feedChanged.emit()
+
+    def _read_feed_sources(self) -> None:
+        """The restored replies' sources; called once the opened conversation is set."""
+        replies = [entry["turn"] for entry in self._feed if entry.get("kind") == "jarvis" and entry.get("turn")]
+        if replies and self._conversation_store.id:
+            self._read_reply_sources(self._conversation_store.id, replies)
+
+    def _read_reply_sources(self, conversation_id: str, turn_ids: list[str]) -> None:
+        """SEC2 (I22): each reply's usedMemory / memoryNoneRelevant, as the app
+        answers them, set on its feed entry unchanged; the bridge picks nothing."""
+        if self._shutting_down:
+            return
+        self._run(f"reply-sources:{uuid4().hex}",
+                  lambda: {turn: self.backend.reply_memory_sources(conversation_id, turn) for turn in turn_ids},
+                  lambda answers: self._reply_sources_answer(conversation_id, answers))
+
+    def _reply_sources_answer(self, conversation_id: str, answers: Any) -> None:
+        if not isinstance(answers, dict) or conversation_id != (self._conversation_store.id or ""):
+            return   # it landed for a conversation no longer open
+        changed = False
+        for entry in self._feed:
+            sources = answers.get(entry.get("turn")) if entry.get("kind") == "jarvis" else None
+            if isinstance(sources, dict) and isinstance(sources.get("usedMemory"), list):
+                entry.update(usedMemory=sources["usedMemory"], memoryNoneRelevant=sources.get("memoryNoneRelevant") is True)
+                changed = True
+        if changed:
+            self.feedChanged.emit()
 
     def _name_conversation(self, conversation: PersistedConversation, message: str) -> None:
         """A conversation is named from its first message, once. DFNEW: named
@@ -1176,6 +1207,7 @@ class Bridge(QObject):
             self._stream_text, self._stream_ts = record["preview"], record["stream_ts"]
             self.streamChanged.emit()
         self._restore_feed(opened.state)
+        self._read_feed_sources()
         self._refresh_conversations()
         self.approvalChanged.emit()
         self._refresh_core_state()
@@ -4927,6 +4959,29 @@ class Bridge(QObject):
         self._run(f"memory-purge:{uuid4().hex}", lambda: self.backend.confirm_memory_purge(token),
                   lambda payload: self._memory_answer(self.memoryPurgeDone, {}, payload))
 
+    # -- SEC2: undo everything one conversation brought (pass-through) ---------
+    #
+    # The preview asks the app with confirm=False (nothing changes) and answers
+    # its count; only the dialog's confirm click calls with confirm=True. Core
+    # retracts through events and tombstones as USER (I23); purge stays apart.
+
+    undoConversationPreviewed = Signal("QVariantMap")
+    undoConversationDone = Signal("QVariantMap")
+
+    @Slot(str)
+    def undoConversationRecordsPreview(self, conversation_id: str) -> None:
+        request = {"conversation_id": str(conversation_id)}
+        self._run(f"memory-undo-conversation:{uuid4().hex}",
+                  lambda: self.backend.undo_conversation_records(request["conversation_id"], confirm=False),
+                  lambda payload: self._memory_answer(self.undoConversationPreviewed, request, payload))
+
+    @Slot(str)
+    def undoConversationRecords(self, conversation_id: str) -> None:
+        request = {"conversation_id": str(conversation_id)}
+        self._run(f"memory-undo-conversation:{uuid4().hex}",
+                  lambda: self.backend.undo_conversation_records(request["conversation_id"], confirm=True),
+                  lambda payload: self._memory_answer(self.undoConversationDone, request, payload))
+
     # -- V2.1a M4: context usage and the all-projects memory toggle (pass-through)
     #
     # Both are the app's answers for the open conversation, read on the worker.
@@ -4953,6 +5008,37 @@ class Bridge(QObject):
                   lambda: self.backend.set_global_memory_toggle(conversation_id, enabled),
                   lambda payload: self._global_memory_answer(conversation_id, payload, says=True))
 
+    # SEC2 (I21): the open conversation's memory-off switch, the app's value only.
+    conversationMemoryOffChanged = Signal()
+
+    @Property(bool, notify=conversationMemoryOffChanged)
+    def conversationMemoryOff(self) -> bool:
+        return self._conversation_memory_off
+
+    @Slot(bool)
+    def setConversationMemoryOff(self, off: bool) -> None:
+        conversation_id, off = self._conversation_store.id or "", bool(off)
+        self._run(f"memory-off-set:{uuid4().hex}",
+                  lambda: self.backend.set_conversation_memory_off(conversation_id, off),
+                  lambda payload: self._memory_off_answer(conversation_id, payload, says=True))
+
+    def _memory_off_answer(self, conversation_id: str, payload: Any, says: bool = False) -> None:
+        if says and not (isinstance(payload, dict) and payload.get("ok") is True):
+            error = payload.get("error") if isinstance(payload, dict) else None
+            if not isinstance(error, dict):
+                error = {"code": "invalid_task", "message": str(error or "refused")}
+            if conversation_id == (self._conversation_store.id or ""):
+                for entry in error_entries(error):
+                    self._say(entry["kind"], entry["text"])
+            self.conversationMemoryOffChanged.emit()   # a switch that moved on its own snaps back
+            return
+        if says and not self._current(conversation_id, payload):
+            return
+        off = self._current(conversation_id, payload) and payload.get("conversation_memory_off") is True
+        if off != self._conversation_memory_off:
+            self._conversation_memory_off = off
+            self.conversationMemoryOffChanged.emit()
+
     def _refresh_conversation_memory(self) -> None:
         if self._shutting_down:
             return
@@ -4961,12 +5047,16 @@ class Bridge(QObject):
             self._memory_read_id = conversation_id
             self._context_usage_answer("", None)
             self._global_memory_answer("", None)
+            self._memory_off_answer("", None)
         self._refresh_context_usage()
         if not conversation_id:
             self._global_memory_answer("", None)
+            self._memory_off_answer("", None)
             return
         self._run("global-memory", lambda: self.backend.global_memory_toggle(conversation_id),
                   lambda payload: self._global_memory_answer(conversation_id, payload))
+        self._run("memory-off", lambda: self.backend.conversation_memory_off(conversation_id),
+                  lambda payload: self._memory_off_answer(conversation_id, payload))
 
     def _refresh_context_usage(self) -> None:
         if self._shutting_down:

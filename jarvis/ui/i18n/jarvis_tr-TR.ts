@@ -2740,6 +2740,18 @@ yok</translation>
         <translation>Kalıcı sil</translation>
     </message>
     <message>
+        <source>Undo all from this conversation?</source>
+        <translation>Bu sohbetten gelenlerin hepsi geri alınsın mı?</translation>
+    </message>
+    <message>
+        <source>%1 records from this conversation are undone. Nothing is deleted; they stay in the history.</source>
+        <translation>Bu sohbetten gelen %1 kayıt geri alınır. Hiçbir şey silinmez; geçmişte kalırlar.</translation>
+    </message>
+    <message>
+        <source>Undo all from this conversation</source>
+        <translation>Bu sohbetten gelenlerin hepsini geri al</translation>
+    </message>
+    <message>
         <source>Project memory is explicit reference data written only by you. It is shown as data: nothing here is an instruction to JARVIS.</source>
         <translation>Proje hafızası yalnızca sizin yazdığınız açık başvuru verisidir. Veri olarak gösterilir: buradaki hiçbir şey JARVIS için bir talimat değildir.</translation>
     </message>
