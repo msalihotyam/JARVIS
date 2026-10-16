@@ -1927,6 +1927,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>NOT</translation>
     </message>
     <message>
+        <source>SKILL</source>
+        <translation>BECERİ</translation>
+    </message>
+    <message>
         <source>SYSTEM</source>
         <translation>SİSTEM</translation>
     </message>
@@ -1961,6 +1965,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>rev %1</source>
         <translation>rev %1</translation>
+    </message>
+    <message>
+        <source>From run %1</source>
+        <translation>%1 çalışmasından</translation>
     </message>
     <message>
         <source>Copy</source>

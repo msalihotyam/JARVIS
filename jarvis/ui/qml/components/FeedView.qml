@@ -231,6 +231,7 @@ Item {
         case "scheduled": return Theme.success
         case "data": return Theme.textMuted
         case "notice": return Theme.accentSoft
+        case "skill": return Theme.accent
         default: return Theme.textDim
         }
     }
@@ -247,8 +248,28 @@ Item {
         case "scheduled": return qsTr("SCHEDULED")
         case "data": return qsTr("UNTRUSTED DATA")
         case "notice": return qsTr("NOTE")
+        case "skill": return qsTr("SKILL")
         default: return qsTr("SYSTEM")
         }
+    }
+    // V2.2 S4: a saved skill by id (the one announced, or the one a version
+    // proposal replaces), and the step / input / check lines a proposal changes
+    // against it ("- " dropped, "+ " added); no known skill, no diff.
+    function skillById(id) {
+        if (!id) return null
+        const all = bridge.skills
+        for (let i = 0; i < all.length; ++i) if (all[i].id === id) return all[i]
+        return null
+    }
+    function draftDiff(before, after) {
+        if (!before) return []
+        let lines = []
+        ;["steps", "inputs", "checks"].forEach(function (field) {
+            const was = before[field] || [], now = after[field] || []
+            lines = lines.concat(was.filter(function (s) { return now.indexOf(s) < 0 }).map(function (s) { return "- " + s }),
+                                 now.filter(function (s) { return was.indexOf(s) < 0 }).map(function (s) { return "+ " + s }))
+        })
+        return lines
     }
     // K3: a result's capability as a word, never the raw id (unknown reads "Other
     // capability"); a feed without the localization context names none.
@@ -406,7 +427,7 @@ Item {
                             spacing: row.isJarvis ? 0 : (feed.referenceLayout ? 7 : 9)
                             // The label line: JARVIS carries its name inside its surface;
                             // the operator's bubble needs none; the rest are labelled.
-                            Text { visible: row.loud || row.isResult || row.kind === "system" || row.kind === "scheduled" || row.kind === "data"
+                            Text { visible: row.loud || row.isResult || row.kind === "system" || row.kind === "scheduled" || row.kind === "data" || row.kind === "skill"
                                    text: feed.kindLabel(row.kind)
                                          + (row.isResult ? feed.capabilityPart(modelData.capability) : "")
                                          + (row.isResult && modelData.destination ? "  ·  " + modelData.destination : "")
@@ -728,6 +749,80 @@ Item {
                                             renderType: Theme.textRender
                                             color: Theme.textMuted
                                             font: Theme.chatSource
+                                        }
+                                    }
+                                }
+                            }
+                            // V2.2 S4: which saved skill this task follows (D6); a stale one
+                            // asks first (S12). Declining or skipping runs the task without it.
+                            // Neither the chip nor a draft card approves anything: every step
+                            // still meets the normal ApprovalCard (S1). The entries carry Core's
+                            // event name and payload as they are; any other skill event (needs
+                            // inputs, declined, use requested, run finished) is its message row.
+                            Loader {
+                                active: row.kind === "skill" && bridge.skillsEnabled
+                                        && (modelData.event === "skill_announced" || modelData.event === "skill_stale_announced")
+                                visible: active
+                                width: Math.min(parent.width, 560)
+                                sourceComponent: SkillAnnounceChip {
+                                    objectName: "feedSkillChip"
+                                    readonly property var known: feed.skillById(modelData.skill_id) || ({})
+                                    skillName: String(modelData.name || "")
+                                    version: Number(modelData.version) || 0
+                                    stale: modelData.event === "skill_stale_announced"
+                                    parentName: String(known.parent_name || "")
+                                    parentVersion: Number(known.parent_version) || 0
+                                    onDeclined: bridge.declineSkill(modelData.session_id, modelData.task_id)
+                                    onSkip: bridge.declineSkill(modelData.session_id, modelData.task_id)
+                                    onUse: if (typeof bridge.useSkill === "function") bridge.useSkill(modelData.session_id, modelData.task_id)
+                                }
+                            }
+                            // One card per still-pending draft of the offer (several drafts,
+                            // several cards; a decided one leaves the bridge's list). The card
+                            // shows the whole draft that would be saved, never a summary.
+                            Loader {
+                                active: row.kind === "skill" && bridge.skillsEnabled && modelData.event === "skill_draft_offered"
+                                visible: active
+                                width: Math.min(parent.width, 560)
+                                sourceComponent: Column {
+                                    id: offer
+                                    readonly property var entry: modelData
+                                    spacing: 12
+                                    Repeater {
+                                        model: bridge.pendingDrafts.filter(function (d) { return (offer.entry.draft_ids || []).indexOf(d.id) >= 0 })
+                                        delegate: Column {
+                                            id: draftItem
+                                            readonly property var draft: modelData
+                                            readonly property var current: feed.skillById(draft.target_skill_id)
+                                            width: offer.width; spacing: 4
+                                            SkillDraftCard {
+                                                objectName: "feedSkillDraft_" + draftItem.draft.id
+                                                width: parent.width
+                                                draftName: draftItem.draft.name
+                                                steps: draftItem.draft.steps
+                                                inputs: draftItem.draft.inputs
+                                                checks: draftItem.draft.checks
+                                                projectName: draftItem.draft.project_name || ""
+                                                proposal: draftItem.draft.origin === "user_edit" || draftItem.draft.origin === "version_after_failure"
+                                                // One past the replaced skill's latest version (a rolled-back one too).
+                                                version: (draftItem.current ? Math.max.apply(null, [Number(draftItem.current.version) || 0].concat(draftItem.current.versions || []))
+                                                                            : Number(draftItem.draft.parent_version) || 0) + 1
+                                                onApprove: function (scope) { bridge.draftApprove(draftItem.draft.id, scope === "project" ? "same" : "global") }
+                                                onEdit: bridge.setPage("skills")
+                                                onReject: bridge.draftReject(draftItem.draft.id)
+                                                onSuppress: bridge.suppressTaskKind(offer.entry.task_kind || "", "task")
+                                            }
+                                            Text { objectName: "feedSkillDraftSource"; width: parent.width; wrapMode: Text.Wrap; textFormat: Text.PlainText
+                                                   visible: text !== ""; color: Theme.textMuted; font: Theme.caption
+                                                   text: [draftItem.draft.reason || "", offer.entry.run_id ? qsTr("From run %1").arg(offer.entry.run_id) : ""]
+                                                         .filter(function (part) { return part !== "" }).join("  ·  ") }
+                                            // A new version: what changes against the active one.
+                                            Repeater {
+                                                model: feed.draftDiff(draftItem.current, draftItem.draft)
+                                                Text { objectName: "feedSkillDraftDiff"; width: draftItem.width; wrapMode: Text.Wrap; textFormat: Text.PlainText
+                                                       text: modelData; font: Theme.caption
+                                                       color: modelData.charAt(0) === "+" ? Theme.success : Theme.warning }
+                                            }
                                         }
                                     }
                                 }
