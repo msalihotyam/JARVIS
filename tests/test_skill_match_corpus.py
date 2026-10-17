@@ -437,6 +437,65 @@ class ReviewProbeTest(unittest.TestCase):
         ("Delete file Straße", "Delete file Strasse"),
     )
 
+    # SKSIMASK3 (CDXINT54D M1-M5): any token difference names another literal.
+    LITERAL = (
+        ("Delete file .env", "Delete file env"),
+        ("Delete file alpha+beta", "Delete file alpha=beta"),
+        ("Delete file alpha+beta", "Delete file alpha beta"),
+        ("Set amount .5", "Set amount 5"),
+        ("Set range -5 to +5", "Set range +5 to -5"),
+        ("Copy file alpha/beta to alpha@beta", "Copy file alpha@beta to alpha/beta"),
+        ("Read file aq" + chr(0x301), "Read file aq"),
+        ("Read file report", "Read file report{the}"),
+        ('Set label "alpha beta"', 'Set label "alpha  beta"'),
+        ("Set amount 5", "Set amount -5"),
+        ("Set amount -5", "Set amount +5"),
+        ("Set amount 5.0", "Set amount 5,0"),
+        ("Delete file a/b", "Delete file a" + chr(0x5C) + "b"),
+        ("Delete file a:b", "Delete file ab"),
+        ("Delete file report", "Delete file report."),
+        ("Delete file report", "Delete file report?"),
+        ("Copy file alpha to beta", "Copy file beta to alpha"),
+        ("Copy file 1 to 2", "Copy file 2 to 1"),
+        ('Set label "alpha beta"', "Set label alpha beta"),
+        ('Set label "alpha beta"', 'Set label "alpha" "beta"'),
+        ('Set label ""', "Set label"),
+        ("Delete file alpha", "Delete file " + chr(0xFF41) + "lpha"),
+        ("Delete file alpha", "Delete file alpha alpha"),
+        ("Read file report{name}", "Read file report"),
+        ("Read file report", "Read file report: other"),
+        ("Read file report", "Read file report:other"),
+        ("Read file {name}", "Read file {name}"),
+    )
+
+    def test_a_different_literal_is_never_a_fit(self) -> None:
+        for skill_text, request in self.LITERAL:
+            for pair in ((skill_text, request), (request, skill_text)):
+                with self.subTest(pair=pair):
+                    self.assertIsNot(probe_kind(*pair), MatchKind.FIT)
+
+    def test_a_placeholder_inside_a_word_is_never_said(self) -> None:
+        # A stored "file{name}" has no identity a request can spell, even U+FFFF.
+        for skill_text, request in (
+            ("Copy file{name} to folder backup", "Copy file" + chr(0xFFFF) + " to folder backup"),
+            ("Copy file{a} to folder{b}", "Copy file" + chr(0xFFFF) + " to folder" + chr(0xFFFF)),
+            ("Copy file{a} to folder{b}", "Copy file{a} to folder{b}"),
+        ):
+            with self.subTest(request=request):
+                self.assertIsNot(probe_kind(skill_text, request), MatchKind.FIT)
+
+    def test_whitespace_runs_and_unicode_forms_still_fit(self) -> None:
+        for skill_text, request in (
+            ("Delete file .env", "Delete  file\t.env"),
+            ("Set range -5 to +5", "Set range -5 to +5"),
+            ("Read file report", "Read file report:  \n "),
+            ('Set label "alpha  beta"', 'Set label "alpha  beta"'),
+            ("Read file aq" + chr(0x301), "Read file aq" + chr(0x301)),
+            ("Read file " + chr(0xE9), "Read file e" + chr(0x301)),
+        ):
+            with self.subTest(request=request):
+                self.assertIs(probe_kind(skill_text, request), MatchKind.FIT)
+
     def test_residual_probes_are_similar(self) -> None:
         for pair in self.RESIDUAL:
             with self.subTest(request=pair[1]):

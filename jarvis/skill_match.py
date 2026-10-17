@@ -685,23 +685,35 @@ def _without_placeholders(text: str) -> str:
     return _PLACEHOLDER.sub(" ", text)
 
 
-# Identity keeps what names an object: an in-word "-", "_" or "." and every
-# accent except a Turkish letter's own mark (c/s cedilla, g breve, o/u
-# diaeresis, a/i/u circumflex), which folds away as in ``fold_token``.
-_SAID_RUN = re.compile(_WORD_RUN.pattern + "(?:[-_.]" + _WORD_RUN.pattern + ")*")
+# Identity keeps what names an object: the text split on whitespace runs, a
+# quoted span one token with its inner whitespace as typed, every non-space
+# symbol and every accent kept except a Turkish letter's own mark (c/s
+# cedilla, g breve, o/u diaeresis, a/i/u circumflex), which folds away as in
+# ``fold_token``. Literals are tokens, so their order is compared too.
+_SAID_TOKEN = re.compile("(?:" + _QUOTED.pattern + "|" + chr(0x5C) + "S)+")
+_LONE_PLACEHOLDER = re.compile("(?<!" + chr(0x5C) + "S)" + _PLACEHOLDER.pattern + "(?!" + chr(0x5C) + "S)")
+# A colon ending a line labels a value the caller already stripped
+# ("oku: notes/week.md" -> "oku:"); it names nothing, so it is not said.
+_BARE_LABEL = re.compile(":(?=[ \t]*(?:\n|" + chr(0x5C) + "Z))")
 
 
-def _said(text: str) -> tuple[str, ...]:
-    """A text's identity-folded words in order, stop words kept, an in-word
-    "-", "_" or "." kept, then one "?" per question mark."""
-    folded = fold_token(_without_placeholders(text), identity=True)
-    return tuple(_SAID_RUN.findall(folded)) + ("?",) * folded.count("?")
+def _said(text: str, *, stored: bool = False) -> tuple[str, ...] | None:
+    """A text's identity-folded whitespace tokens in order; placeholders are
+    removed from a stored skill text only, never from a request. A stored text
+    with a placeholder inside a word has no identity (None): no request equals it."""
+    if stored:
+        text = _LONE_PLACEHOLDER.sub(" ", text)
+        if _PLACEHOLDER.search(text):
+            return None
+    text = _BARE_LABEL.sub("", text)
+    return tuple(m.group(0) for m in _SAID_TOKEN.finditer(fold_token(text, identity=True)))
 
 
 @lru_cache(maxsize=CACHE_MAX)
 def _skill_said(skill: Skill) -> frozenset[tuple[str, ...]]:
     """The skill's own texts a near-identical request must equal: name and summary."""
-    return frozenset({_said(skill.name), _said(skill.summary)})
+    said = {_said(skill.name, stored=True), _said(skill.summary, stored=True)}
+    return frozenset(said - {None})
 
 
 @lru_cache(maxsize=CACHE_MAX)
