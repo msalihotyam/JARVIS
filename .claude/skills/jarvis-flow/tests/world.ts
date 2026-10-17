@@ -65,6 +65,8 @@ export type World = {
   // plan percentages the usage noun reports
   five: number
   seven: number
+  // the usage noun is not available on this surface
+  breakUsage: boolean
   // hold the simulated shell tool / a Start-Sleep until the test lets go
   toolHold: Promise<void> | null
   toolThrow: boolean
@@ -111,6 +113,7 @@ export function world(on: any, opts: WorldOptions = {}): World {
     curlExit: 0,
     five: 31,
     seven: 10,
+    breakUsage: false,
     toolHold: null,
     toolThrow: false,
     sleepHold: null,
@@ -139,7 +142,7 @@ export function world(on: any, opts: WorldOptions = {}): World {
 
   reg('session.cwd', () => ({ value: cwd }))
   reg('session.model', () => (w.breakModel ? { deny: 'model unavailable' } : { value: w.model }))
-  reg('session.usage', () => ({
+  reg('session.usage', () => (w.breakUsage ? { deny: 'usage unavailable' } : {
     value: {
       startedAt: 0,
       context: { window: 1000000, tokens: 1000, percent: opts.usagePercent ?? 12 },

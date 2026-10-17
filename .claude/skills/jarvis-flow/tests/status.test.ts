@@ -45,7 +45,7 @@ test('the status file is written at start with every field', { timeoutMs: 60000 
   await startSession($)
   const status = statusOf(w, 'sonnet')
   expect(Object.keys(status).sort()).toEqual(
-    ['base', 'branch', 'busy', 'context_pct', 'cwd', 'effort', 'family', 'head', 'lane', 'last_auto', 'model', 'paused', 'power', 'state', 'updated_at', 'worktree'].sort(),
+    ['base', 'branch', 'busy', 'context_pct', 'cwd', 'effort', 'family', 'head', 'lane', 'last_auto', 'model', 'paused', 'plan_pct', 'power', 'seven_pct', 'state', 'updated_at', 'worktree'].sort(),
   )
   expect(status).toMatchObject({
     family: 'sonnet',
@@ -56,6 +56,8 @@ test('the status file is written at start with every field', { timeoutMs: 60000 
     branch: 'worktree-demo',
     head: 'aaaaaaaaaaaa',
     context_pct: 12,
+    plan_pct: 31,
+    seven_pct: 10,
     power: { ac: true, pct: null },
     lane: null,
   })
@@ -174,4 +176,57 @@ test('a fallback model on a request never moves the queue family', { timeoutMs: 
   expect(w.files.has('/repo/build/lanes/opus.json')).toBe(false)
   const list = await $.command.run({ command: 'kuyruk', args: '' })
   expect(list.text).toContain('SB1 · sb1.md')
+})
+
+const usageReads = (w: any) => w.calls.filter((c: string) => c === 'session.usage').length
+
+test('the tick re-reads plan usage at most once every 5 minutes', { timeoutMs: 60000 }, async ($, on) => {
+  const w = world(on)
+  await startSession($)
+  const first = usageReads(w)
+  expect(first).toBeGreaterThan(0)
+  for (let i = 0; i < 10; i++) await w.clock.advance(5000)
+  expect(usageReads(w)).toBe(first)
+  await w.clock.advance(250000)
+  expect(usageReads(w)).toBe(first + 1)
+  for (let i = 0; i < 10; i++) await w.clock.advance(5000)
+  expect(usageReads(w)).toBe(first + 1)
+})
+
+test('a changed plan_pct or seven_pct is written even when nothing else changed', { timeoutMs: 60000 }, async ($, on) => {
+  const w = world(on)
+  await startSession($)
+  const first = written(w, LANES)
+  expect(statusOf(w, 'sonnet')).toMatchObject({ plan_pct: 31, seven_pct: 10 })
+  w.five = 47.6
+  await w.clock.advance(300000)
+  expect(written(w, LANES)).toBe(first + 1)
+  expect(statusOf(w, 'sonnet')).toMatchObject({ plan_pct: 48, seven_pct: 10 })
+  w.seven = 12.2
+  await w.clock.advance(300000)
+  expect(written(w, LANES)).toBe(first + 2)
+  expect(statusOf(w, 'sonnet')).toMatchObject({ plan_pct: 48, seven_pct: 12 })
+  // same numbers next time: no rewrite
+  await w.clock.advance(300000)
+  expect(written(w, LANES)).toBe(first + 2)
+})
+
+test('usage unavailable on this surface keeps the last known values', { timeoutMs: 60000 }, async ($, on) => {
+  const w = world(on)
+  await startSession($)
+  const first = written(w, LANES)
+  w.breakUsage = true
+  w.five = 90
+  await w.clock.advance(300000)
+  expect(statusOf(w, 'sonnet')).toMatchObject({ plan_pct: 31, seven_pct: 10 })
+  expect(written(w, LANES)).toBe(first)
+  expect(w.toasts.some((t) => t.includes('hatası'))).toBe(false)
+})
+
+test('usage never available leaves plan_pct and seven_pct null', { timeoutMs: 60000 }, async ($, on) => {
+  const w = world(on)
+  w.breakUsage = true
+  await startSession($)
+  await w.clock.advance(300000)
+  expect(statusOf(w, 'sonnet')).toMatchObject({ plan_pct: null, seven_pct: null })
 })

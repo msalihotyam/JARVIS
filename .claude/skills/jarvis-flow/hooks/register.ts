@@ -64,6 +64,8 @@ const TICK_MS = 5000
 const POWER_MS = 120000
 const START_GUARD_MS = 60000
 const CONVEYOR_MS = 60000
+// the tick re-reads plan usage at most this often, so the conveyor never paces on a stale number
+const USAGE_MS = 300000
 
 type Item = { dir: string; kind: 'manual' | 'auto'; name: string; abs: string; text: string; sha: string; header: Header }
 type Rejection = { kind: 'manual' | 'auto'; name: string; reason: string }
@@ -107,6 +109,7 @@ let turnStartMs: number | null = null
 // wave 2
 let sessionId = ''
 let sevenPct: number | null = null
+let usageReadAt: number | null = null
 let waitingSince: number | null = null
 let lastWaitPush: number | null = null
 let lastPush: number | null = null
@@ -157,10 +160,13 @@ async function refreshUsage($: any): Promise<void> {
   try {
     const usage = await $.session.usage()
     contextPct = typeof usage.context.percent === 'number' ? usage.context.percent : null
-    const five = usage.rateLimits.find((row: any) => row.kind === 'five_hour')
-    planPct = five ? Math.round(five.percentUsed) : null
-    const seven = usage.rateLimits.find((row: any) => row.kind === 'seven_day')
-    sevenPct = seven ? Math.round(seven.percentUsed) : null
+    const pct = (kind: string): number | null => {
+      const row = usage.rateLimits.find((r: any) => r.kind === kind)
+      return row && typeof row.percentUsed === 'number' ? Math.round(row.percentUsed) : null
+    }
+    // a missing row keeps the last known value
+    planPct = pct('five_hour') ?? planPct
+    sevenPct = pct('seven_day') ?? sevenPct
   } catch {
     // not available on this surface: leave what was known
   }
@@ -210,9 +216,16 @@ async function refreshConveyor($: any, now: number): Promise<void> {
   }
 }
 
+// From the tick, at most once per USAGE_MS.
+async function tickUsage($: any, now: number): Promise<void> {
+  if (usageReadAt !== null && now - usageReadAt < USAGE_MS) return
+  usageReadAt = now
+  await refreshUsage($)
+}
+
 async function writeStatus($: any): Promise<void> {
   if (!active) return
-  const status: Status = {
+  const status: Status & { plan_pct: number | null; seven_pct: number | null } = {
     family: famName,
     model: modelId,
     effort: lastEffort,
@@ -229,6 +242,8 @@ async function writeStatus($: any): Promise<void> {
     power,
     paused,
     last_auto: lastAuto,
+    plan_pct: planPct,
+    seven_pct: sevenPct,
   }
   const print = fingerprint(status)
   if (print === lastWritten) return
@@ -412,6 +427,7 @@ async function tick($: any): Promise<void> {
   try {
     // first, so a failing queue scan cannot freeze it (it never throws)
     await refreshConveyor($, await $.clock.now())
+    await tickUsage($, await $.clock.now())
     const g = await currentGate($)
     await scanQueue($)
     for (const item of [...manual, ...auto]) {
