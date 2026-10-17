@@ -52,6 +52,9 @@ PASS_S = 60
 USAGE_S = 1800  # usage ledger cadence (scripts/usage_ledger.py, else the build/conveyor copy)
 CLEANUP_S = 3600  # a finished lane's session is removed this long after its report was collected
 CLEANUP_PER_PASS = 5  # stop/rm calls are slow; keep one pass well under the stale-lock time
+# CONVIDLE: `claude agents` lists a finished idle background session as state "working"; early
+# stop takes it only when its status is "idle" and the report was collected this long ago
+STOP_WORKING_S = 600
 CLEAN_STATES = {"done", "blocked", "failed"}  # session states cleanup acts on; anything else: leave
 FINISHED = {"done", "idle"}
 IDLE_REDISPATCH_S = 600  # respawned lane with no activity this long -> re-dispatch
@@ -2769,36 +2772,43 @@ class Conveyor:
             return False
         return gen >= after and all(s in known for s in sids)
 
-    def lane_sessions(self, name, ids, agents, stopped=()):
+    def lane_sessions(self, name, ids, agents, stopped=(), idle_working=False):
         """(listed sessions of these lane ids, doubt or None). A doubt is any row that is not
         this lane's finished background session: other kind or name, unknown state, busy,
         or no session id of its own. State "stopped" is fine only for ids in `stopped`
-        (sessions this conveyor's early stop stopped itself)."""
+        (sessions this conveyor's early stop stopped itself); state "working" only with
+        `idle_working` and status exactly "idle" (early stop's aged finished lanes)."""
         by_id = {a.get("id"): a for a in agents}
         sess = [by_id[i] for i in ids if i in by_id]
         doubt = next((f"{a.get('id')}: kind/name/state/session not as expected" for a in sess
                       if a.get("kind") != "background" or a.get("name") != name
                       or (a.get("state") not in CLEAN_STATES
-                          and not (a.get("state") == "stopped" and a.get("id") in stopped))
+                          and not (a.get("state") == "stopped" and a.get("id") in stopped)
+                          and not (idle_working and a.get("state") == "working"
+                                   and a.get("status") == "idle"))
                       or a.get("status") == "busy"
                       or not str(a.get("sessionId") or "").startswith(a["id"])), None)
         return sess, doubt
 
     def stop_finished(self, lanes, agents, attention_ids):
         """`claude stop` (never rm) the live sessions of lanes this conveyor started whose
-        report was collected and that are not in attention: an idle finished session holds
-        memory until cleanup's rm. Once per lane (ln["stopped"]); a doubt (busy, foreign,
-        unknown state) leaves it; a stop failure is an event, never fatal."""
+        report was collected: an idle finished session holds memory until cleanup's rm. Lanes
+        in attention too (stop keeps the session and its transcript; nudge resumes a stopped
+        one; finished lanes get no session action; only cleanup's rm skips attention). State
+        "working" + status "idle" counts once the report is STOP_WORKING_S old. Once per lane
+        (ln["stopped"]); a doubt (busy, foreign, unknown state) leaves it; a stop failure is
+        an event, never fatal."""
         done, fresh = 0, False
         for name, ln in lanes.items():
             if done >= CLEANUP_PER_PASS:
                 return
+            t = self.collected_ts(ln)
             if (not ln.get("finished") or "stopped" in ln or "cleanup" in ln
-                    or name in attention_ids or ln.get("status") == "STUCK"
-                    or self.collected_ts(ln) is None):
+                    or ln.get("status") == "STUCK" or t is None):
                 continue
             ids = ln.get("prev_ids", []) + [ln["id"]]
-            sess, doubt = self.lane_sessions(name, ids, agents)
+            aged = self.now() - t >= STOP_WORKING_S
+            sess, doubt = self.lane_sessions(name, ids, agents, idle_working=aged)
             if doubt or not any("pid" in a for a in sess):
                 continue  # rm cleanup still judges it later
             if not fresh:  # the pass may be minutes old: act only on a fresh listing
@@ -2807,7 +2817,7 @@ class Conveyor:
                 except Exception as e:
                     self.event("early_stop_skip", reason=f"agents: {type(e).__name__}")
                     return
-                sess, doubt = self.lane_sessions(name, ids, agents)
+                sess, doubt = self.lane_sessions(name, ids, agents, idle_working=aged)
             live = [a for a in sess if "pid" in a]
             if doubt or not live:
                 continue

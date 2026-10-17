@@ -2624,13 +2624,12 @@ class TestEarlyStop(Base):
         fn(d)
         (self.base / "lanes.json").write_text(json.dumps(d))
 
-    def test_busy_attention_foreign_never_stopped(self):
+    def test_busy_foreign_young_working_never_stopped(self):
         self.fake.agents.append(  # not started by the conveyor: same lane name, alive, idle
             {"id": "ffff0001", "name": "A", "kind": "background", "state": "done", "status": "idle",
              "pid": 1, "sessionId": "ffff0001-x"})
         self.finished(agent={"status": "busy"})
-        self.finished("B", "BLOCKED")  # in attention
-        self.finished("C", agent={"state": "working"})
+        self.finished("C", agent={"state": "working"})  # idle, report under STOP_WORKING_S old
         for _ in range(3):
             self.c.pass_once()
         self.assertEqual(self.cli("stop", "rm"), [])
@@ -2639,6 +2638,46 @@ class TestEarlyStop(Base):
         self.c.pass_once()
         self.assertEqual(self.cli("stop"), [["stop", self.lanes()["A"]["id"]]])
         self.assertIn("pid", next(a for a in self.fake.agents if a["id"] == "ffff0001"))
+
+    def test_attention_lane_stopped_never_removed(self):
+        b = self.finished("B", "BLOCKED")  # in attention until acked
+        self.assertEqual(self.cli("stop", "rm"), [["stop", b]])
+        self.assertEqual(self.lanes()["B"]["early_stopped"], [b])
+        self.fake.agent("B").update(state="stopped")
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [["stop", b]])
+
+    def test_idle_working_stopped_once_after_stop_working_s(self):  # CONVIDLE
+        sid = self.finished(agent={"state": "working"})
+        self.t += conveyor.STOP_WORKING_S - 1
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [])
+        self.t += 1
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [["stop", sid]])
+        for _ in range(3):
+            self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [["stop", sid]])
+        self.assertEqual(self.lanes()["A"]["early_stopped"], [sid])
+
+    def test_busy_or_unknown_status_working_left(self):
+        self.finished(agent={"state": "working", "status": "busy"})
+        self.finished("B", agent={"state": "working"})
+        self.fake.agent("B").pop("status")
+        self.t += conveyor.STOP_WORKING_S
+        for _ in range(2):
+            self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [])
+        self.assertNotIn("stopped", self.lanes()["A"])
+
+    def test_working_without_collected_report_left(self):
+        self.finished(agent={"state": "working"})
+        self.lanes_edit(lambda d: d["A"].pop("report"))
+        self.t += conveyor.STOP_WORKING_S
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [])
+        self.assertNotIn("stopped", self.lanes()["A"])
 
     def test_fresh_listing_busy_not_stopped(self):
         run = self.c.run
