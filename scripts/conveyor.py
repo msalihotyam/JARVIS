@@ -40,6 +40,9 @@ PROTECTED_FILES = {"scripts/test_parallel.py", "scripts/ci.ps1", "scripts/qualit
 SKIPLIST_RE = re.compile(r"(skip|allow)[_-]?list|load[_-]?sensitive", re.I)
 STATE_DOC = "JARVIS_ACTIVE_STATE.md"  # its "- Load-sensitive list" item (scripts/test_parallel.py)
 LOAD_SENSITIVE_RE = re.compile(r"^- Load-sensitive list.*?(?=^- |^#|\Z)", re.M | re.S)
+# every git call of the branch proof: user/repo config cannot change its answer (CONVMERGE2)
+GIT_PIN = ["git", "-c", "log.diffMerges=separate", "-c", "diff.ignoreSubmodules=none", "-c", "diff.relative=false",
+           "-c", "status.showUntrackedFiles=all", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"]
 CLEANUP_RETRY_S = 86400  # a refused rm / worktree removal is retried the next day
 BEAT_S = 60  # the lock heartbeat inside a long pass, at most this often
 API_PAGE_WINDOW_S = 600  # 2+ lanes on API errors this close together: an account/network page
@@ -3124,9 +3127,13 @@ class Conveyor:
         wt = self.worktree_of({"cwd": ln.get("worktree")})
         try:
             if wt is not None and wt.exists():
-                rc, out = self.cmd(["git", "-C", str(wt), "status", "--porcelain"])
+                rc, out = self.cmd([*GIT_PIN, "-C", str(wt), "status", "--porcelain", "--untracked-files=all",
+                                    "--ignore-submodules=none"])
                 if rc != 0 or out.strip():
                     return f"worktree {wt.name} not clean (git status rc={rc})"
+                rc, out = self.cmd([*GIT_PIN, "-C", str(wt), "ls-files", "-v"])  # status hides skip/assume edits
+                if rc != 0 or any(not ln_.startswith("H ") for ln_ in out.splitlines()):
+                    return f"worktree {wt.name} kept: skip-worktree/assume-unchanged entries (rc={rc})"
                 kept = self.unintegrated({"cwd": str(wt)})
                 if kept:
                     return kept[0]
@@ -3134,19 +3141,27 @@ class Conveyor:
                 if rc != 0 or not branch or branch == "main" or branch.startswith("ci/"):
                     return f"worktree branch {branch} not removable (rc={rc})"
                 c["branch"] = branch  # a retry after the worktree is gone still knows it
-                rc, out = self.cmd(["git", "worktree", "remove", str(wt)])  # never --force
+                rc, out = self.cmd([*GIT_PIN, "worktree", "remove", str(wt)])  # never --force
                 if rc != 0:
                     return f"git worktree remove rc={rc}: {out[-150:]}"
                 self.event("worktree_removed", lane=name, path=str(wt), branch=branch)
             branch = c.get("branch")
             if not branch:
                 return None
-            off = self.off_main(branch)
+            ref = f"refs/heads/{branch}"
+            rc, tip = self.cmd([*GIT_PIN, "rev-parse", "--verify", "--quiet", ref])
+            tip = tip.strip()
+            if rc != 0 or not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", tip):
+                return f"branch {branch} kept: git rev-parse rc={rc}"
+            rc, _ = self.cmd([*GIT_PIN, "symbolic-ref", "-q", ref])  # 1 = a plain ref; a symref may point at main
+            if rc != 1:
+                return f"branch {branch} kept: symbolic ref or git symbolic-ref rc={rc}"
+            off = self.off_main(branch, tip)
             if off:
                 return f"branch {branch} kept: not provably on main ({off[0]})"
-            rc, out = self.cmd(["git", "branch", "-D", branch])
+            rc, out = self.cmd(["git", "update-ref", "--no-deref", "-d", ref, tip])  # only if still the proven tip
             if rc != 0:
-                return f"git branch -D {branch} rc={rc}: {out[-150:]}"
+                return f"git update-ref -d {branch} rc={rc}: {out[-150:]}"
             c.pop("branch")
             self.event("branch_deleted", lane=name, branch=branch)
         except Exception as e:  # a timeout etc.
@@ -3181,7 +3196,7 @@ class Conveyor:
             return f"git failed: {type(e).__name__}", None, None
         return (off[0], branch, off[1]) if off else None
 
-    def off_main(self, branch):
+    def off_main(self, branch, tip=None):
         """None when nothing reachable from `branch` is missing on local main, else (reason,
         first unintegrated sha or None). Every non-merge commit of main..branch needs an
         equivalent on main (`git cherry`, which skips merges and ignores whitespace), and the tip
@@ -3189,9 +3204,11 @@ class Conveyor:
         parent), so a merge's own content, a whitespace-only difference or a revert on main is
         caught too. Full refs: a tag named like the branch or main cannot stand in for it. Fail
         closed: any git error or unparsable output is a reason; this over-keeps a branch whose
-        paths main edited later, or that merged main in after main picked its work."""
-        main, ref = "refs/heads/main", f"refs/heads/{branch}"
-        rc, out = self.cmd(["git", "cherry", main, ref])
+        paths main edited later. Any merge commit in main..branch is a reason too (CONVMERGE2:
+        a merge pair can add and drop work, so no content check proves a merge). `tip`: prove
+        this sha instead of the branch ref, so a caller deletes exactly what was proven."""
+        main, ref = "refs/heads/main", tip or f"refs/heads/{branch}"
+        rc, out = self.cmd([*GIT_PIN, "cherry", main, ref])
         if rc != 0:
             return f"git cherry main {branch} rc={rc}", None
         for line in out.splitlines():
@@ -3200,22 +3217,29 @@ class Conveyor:
                 return f"git cherry main {branch}: unparsable {line[:40]!r}", None
             if line[0] == "+":
                 return f"{branch} has commits not on main (first {sha[:7]})", sha
-        rc, out = self.cmd(["git", "rev-list", f"{main}..{ref}"])
+        rc, out = self.cmd([*GIT_PIN, "rev-list", f"{main}..{ref}"])
         if rc != 0:
             return f"git rev-list main..{branch} rc={rc}", None
         if not out.split():
             return None
         sha = out.split()[0]  # the tip
-        rc, out = self.cmd(["git", "log", "-m", "--no-renames", "--name-only", "--format=", "-z", f"{main}..{ref}"])
+        rc, out = self.cmd([*GIT_PIN, "log", "-m", "--diff-merges=separate", "--ignore-submodules=none",
+                            "--no-renames", "--name-only", "--format=", "-z", f"{main}..{ref}"])
         if rc != 0:
             return f"git log main..{branch} rc={rc}", sha
         changed = set(filter(None, out.split("\0")))
-        rc, out = self.cmd(["git", "diff", "--name-only", "--no-renames", "-z", main, ref])
+        rc, out = self.cmd([*GIT_PIN, "diff", "--name-only", "--ignore-submodules=none", "--no-renames", "-z",
+                            main, ref])
         if rc != 0:
             return f"git diff main {branch} rc={rc}", sha
         missing = changed & set(filter(None, out.split("\0")))
         if missing:
             return f"{branch} content not on main ({min(missing)})", sha
+        rc, out = self.cmd([*GIT_PIN, "rev-list", "--merges", f"{main}..{ref}"])
+        if rc != 0:
+            return f"git rev-list --merges main..{branch} rc={rc}", sha
+        if out.split():
+            return f"{branch} has merge commits (first {out.split()[0][:7]})", out.split()[0]
         return None
 
     def branch_of(self, wt):

@@ -2529,11 +2529,13 @@ class TestPreserved(Base):
         return p.stdout.strip()
 
     def run_git(self, args, timeout=120):
-        if args[:2] not in (["git", "worktree"], ["git", "cherry"], ["git", "-C"], ["git", "rev-list"]) \
-                and args[:3] not in (["git", "branch", "-D"], ["git", "log", "-m"],
-                                     ["git", "diff", "--name-only"]) or args[-1].endswith("..main"):
+        pinned = args[:len(conveyor.GIT_PIN)] == conveyor.GIT_PIN  # every proof call is pinned
+        a = ["git", *args[len(conveyor.GIT_PIN):]] if pinned else args
+        if not (pinned or a[:2] in (["git", "worktree"], ["git", "cherry"], ["git", "-C"], ["git", "rev-list"],
+                                    ["git", "update-ref"])
+                or a[:3] in (["git", "log", "-m"], ["git", "diff", "--name-only"])) or a[-1].endswith("..main"):
             return self.git(args, timeout)  # the fake main/origin of every other test
-        if self.git_fail and args[:len(self.git_fail_on)] == self.git_fail_on:
+        if self.git_fail and a[:len(self.git_fail_on)] == self.git_fail_on:
             return self.git_fail
         p = conveyor.subprocess.run(args, cwd=self.root, capture_output=True, text=True)
         return p.returncode, p.stdout
@@ -2604,12 +2606,93 @@ class TestPreserved(Base):
         self.assertTrue(self.wt.exists())
         self.assertEqual(self.g("branch", "--list", "lane-a"), "+ lane-a")  # "+": checked out in the kept worktree
 
-    def test_merge_with_all_content_on_main_is_removed(self):
-        self.merge_side(extra=False)
+    def test_merge_with_all_content_on_main_is_kept(self):
+        sha = self.merge_side(extra=False)  # CONVMERGE2: no content check proves a merge
         self.run_cleanup()
-        self.assertNotIn("preserved", self.lanes()["A"])
-        self.assertFalse(self.wt.exists())
-        self.assertEqual(self.g("branch", "--list", "lane-a"), "")
+        pv = self.assert_preserved_once()
+        self.assertEqual((pv["branch"], pv["first_unintegrated_sha"]), ("lane-a", sha))
+        self.assertIn("merge commits", pv["reason"])
+        self.assertTrue(self.wt.exists())
+        self.assertEqual(self.g("branch", "--list", "lane-a"), "+ lane-a")
+
+    def test_add_then_drop_merges_are_kept(self):
+        """main A-B-C; lane M1(A,B) adds c.txt, M2(M1,C) drops it: tip tree == main, work lost if removed."""
+        for n in ("b", "c"):  # the lane worktree stays at A
+            (self.root / f"{n}.txt").write_text(f"{n}\n")
+            self.g("add", f"{n}.txt")
+            self.g("commit", "-q", "-m", n)
+        b, c = self.g("rev-parse", "main~1"), self.g("rev-parse", "main")
+        self.g("merge", "-q", "--no-ff", "--no-commit", b, cwd=self.wt)
+        (self.wt / "c.txt").write_text("lane work\n")
+        self.g("add", "c.txt", cwd=self.wt)
+        self.g("commit", "-q", "-m", "m1", cwd=self.wt)
+        self.g("merge", "-q", "--no-ff", "--no-commit", "-X", "theirs", c, cwd=self.wt)
+        (self.wt / "c.txt").write_text("c\n")
+        self.g("add", "c.txt", cwd=self.wt)
+        self.g("commit", "-q", "-m", "m2", cwd=self.wt)
+        self.assertEqual(self.g("diff", "--name-only", "main", "lane-a"), "")
+        self.run_cleanup()
+        self.assertIn("merge commits", self.assert_preserved_once()["reason"])
+        self.assertTrue(self.wt.exists())
+        self.assertEqual(self.g("branch", "--list", "lane-a"), "+ lane-a")
+
+    def test_hostile_config_gives_same_answers(self):
+        for k, v in (("log.diffMerges", "first-parent"), ("diff.ignoreSubmodules", "all"),
+                     ("status.showUntrackedFiles", "no"), ("diff.relative", "true")):
+            self.g("config", k, v)
+        sha = self.merge_side(extra=True)
+        self.assertEqual(self.c.off_main("lane-a"), ("lane-a content not on main (h.txt)", sha))
+        self.g("config", "log.diffMerges", "off")
+        self.assertEqual(self.c.off_main("lane-a"), ("lane-a content not on main (h.txt)", sha))
+        self.g("checkout", "-q", "-b", "lane-b", "main")
+        base = self.g("rev-parse", "main")
+        self.g("update-index", "--add", "--cacheinfo", f"160000,{base},sub")  # a gitlink: ignoreSubmodules hides it
+        self.g("commit", "-q", "-m", "gitlink")
+        gl = self.g("rev-parse", "HEAD")
+        self.g("checkout", "-q", "main")
+        self.assertEqual(self.c.off_main("lane-b")[1], gl)
+        self.g("-c", "diff.ignoreSubmodules=none", "cherry-pick", gl)
+        self.assertIsNone(self.c.off_main("lane-b"))  # linear and picked: still removable
+        (self.wt / "u.txt").write_text("untracked\n")  # showUntrackedFiles=no would hide it
+        self.assertIn("not clean", self.c.remove_worktree("A", {"cleanup": {}, "worktree": str(self.wt)}))
+        self.assertTrue(self.wt.exists())
+
+    def test_branch_moved_after_proof_is_not_deleted(self):
+        self.g("cherry-pick", self.lane_commit())
+        self.g("worktree", "remove", str(self.wt))
+        other = self.g("commit-tree", "-p", "main", "-m", "late", self.g("rev-parse", "main^{tree}"))
+        proof = self.c.off_main
+
+        def off_then_move(branch, tip=None):
+            r = proof(branch, tip)
+            self.g("update-ref", "refs/heads/lane-a", other)  # a lane commits between proof and delete
+            return r
+        self.c.off_main = off_then_move
+        self.assertIn("update-ref -d lane-a rc=", self.c.remove_worktree("A", {"cleanup": {"branch": "lane-a"}}))
+        self.assertEqual(self.g("rev-parse", "refs/heads/lane-a"), other)
+
+    def test_branch_symref_to_main_never_deletes_main(self):
+        self.g("worktree", "remove", str(self.wt))
+        main = self.g("rev-parse", "main")
+        self.g("symbolic-ref", "refs/heads/lane-a", "refs/heads/main")  # resolves to main's tip: "on main"
+        self.assertIn("symbolic ref", self.c.remove_worktree("A", {"cleanup": {"branch": "lane-a"}}))
+        self.assertEqual(self.g("rev-parse", "refs/heads/main"), main)
+        self.assertEqual(self.g("symbolic-ref", "refs/heads/lane-a"), "refs/heads/main")
+
+    def test_skip_worktree_or_assume_unchanged_edit_keeps_worktree(self):
+        for flag in ("--skip-worktree", "--assume-unchanged"):
+            self.g("update-index", flag, "f.txt", cwd=self.wt)
+            (self.wt / "f.txt").write_text("hidden edit\n")  # git status shows nothing
+            self.assertIn("skip-worktree", self.c.remove_worktree("A", {"cleanup": {}, "worktree": str(self.wt)}))
+            self.assertEqual((self.wt / "f.txt").read_text(), "hidden edit\n")
+            self.g("update-index", flag.replace("--", "--no-"), "f.txt", cwd=self.wt)
+            (self.wt / "f.txt").write_text("base\n")
+
+    def test_fsmonitor_config_cannot_hide_dirty_files(self):
+        self.g("config", "core.fsmonitor", "true", cwd=self.wt)  # a hook that would report nothing
+        (self.wt / "f.txt").write_text("edit\n")
+        self.assertIn("not clean", self.c.remove_worktree("A", {"cleanup": {}, "worktree": str(self.wt)}))
+        self.assertTrue(self.wt.exists())
 
     def test_merge_that_drops_picked_work_is_preserved(self):
         self.merge_side(extra=False)
@@ -2644,9 +2727,10 @@ class TestPreserved(Base):
     def test_missing_ref_or_git_error_mid_proof_is_not_integrated(self):
         self.assertIn("rc=", self.c.off_main("no-such-branch")[0])
         sha = self.merge_side(extra=False)
-        self.assertIsNone(self.c.off_main("lane-a"))
+        self.assertEqual(self.c.off_main("lane-a"), (f"lane-a has merge commits (first {sha[:7]})", sha))
         self.git_fail = (128, "fatal: boom")
-        for step in (["git", "rev-list"], ["git", "log", "-m"], ["git", "diff", "--name-only"]):
+        for step in (["git", "rev-list"], ["git", "log", "-m"], ["git", "diff", "--name-only"],
+                     ["git", "rev-list", "--merges"]):
             self.git_fail_on = step
             reason, first = self.c.off_main("lane-a")
             self.assertIn("rc=128", reason)
