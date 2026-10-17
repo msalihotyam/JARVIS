@@ -685,10 +685,17 @@ def _without_placeholders(text: str) -> str:
     return _PLACEHOLDER.sub(" ", text)
 
 
+# Identity keeps what names an object: an in-word "-", "_" or "." and every
+# accent except a Turkish letter's own mark (c/s cedilla, g breve, o/u
+# diaeresis, a/i/u circumflex), which folds away as in ``fold_token``.
+_SAID_RUN = re.compile(_WORD_RUN.pattern + "(?:[-_.]" + _WORD_RUN.pattern + ")*")
+
+
 def _said(text: str) -> tuple[str, ...]:
-    """A text's folded words in order, stop words kept, then one "?" per question mark."""
-    folded = fold_token(_without_placeholders(text))
-    return tuple(_WORD_RUN.findall(folded)) + ("?",) * folded.count("?")
+    """A text's identity-folded words in order, stop words kept, an in-word
+    "-", "_" or "." kept, then one "?" per question mark."""
+    folded = fold_token(_without_placeholders(text), identity=True)
+    return tuple(_SAID_RUN.findall(folded)) + ("?",) * folded.count("?")
 
 
 @lru_cache(maxsize=CACHE_MAX)

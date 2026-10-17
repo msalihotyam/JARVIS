@@ -404,6 +404,37 @@ class ReviewProbeTest(unittest.TestCase):
         ("Delete the report file", "Delete the report file before"),
         ("Delete the report file", "Delete the report file after"),
         ("Delete old files", "Delete old filesystems"),
+        # SKSIMASK2 (CDXINT54C A1): an in-word "-", "_" or "." and a
+        # non-Turkish accent name a different object.
+        ("Delete file alpha-beta", "Delete file alpha_beta"),
+        ("Read file résumé.txt", "Read file resume.txt"),
+        ("Delete file alpha-beta", "Delete file alpha beta"),
+        ("Read file résumé", "Read file resume"),
+        ("Delete file alpha_beta", "Delete file alpha-beta"),
+        ("Delete file alpha.beta", "Delete file alpha_beta"),
+        ("Delete file alpha.beta", "Delete file alpha beta"),
+        ("Delete file alpha-beta", "Delete file alphabeta"),
+        ("Delete file alpha-beta", "Delete file alpha" + chr(0x2013) + "beta"),
+        ("Delete file alpha-beta", "Delete file alpha--beta"),
+        ("Delete file alpha-beta", "Delete file alpha-beta-gamma"),
+        ("Delete file alpha-beta", "Delete file alpha"),
+        ("Delete file notes-v2.txt", "Delete file notes_v2.txt"),
+        ("Read file resume", "Read file résumé"),
+        ("Read file naïve", "Read file naive"),
+        ("Read file café", "Read file cafe"),
+        ("Read file Zoë", "Read file Zoe"),
+        ("Read file señor", "Read file senor"),
+        ("Delete file alpha_beta", "Delete file " + chr(0x430) + "lpha_beta"),
+        ("Delete file Ölçek", "Delete file Ölçek" + chr(0x301)),
+        # SKSIMASK2 F2: a compatibility form names a different object.
+        ("Delete file alpha_beta", "Delete file " + chr(0xFF41) + "lpha_beta"),
+        ("Delete file report_1", "Delete file report_" + chr(0x2081)),
+        ("Delete file report1", "Delete file report" + chr(0xB9)),
+        ("rapor_v2.pdf dosyasını aç", "rapor_v" + chr(0x2461) + ".pdf dosyasını aç"),
+        ("Delete file " + chr(0xFB01) + "le1", "Delete file file1"),
+        ("Delete file version" + chr(0x2163), "Delete file versioniv"),
+        ("Delete file " + chr(0x2460), "Delete file 1"),
+        ("Delete file Straße", "Delete file Strasse"),
     )
 
     def test_residual_probes_are_similar(self) -> None:
@@ -429,6 +460,19 @@ class ReviewProbeTest(unittest.TestCase):
                      "Archive the logs from 2024-01-05", "Draft the reply without sending it"):
             with self.subTest(text=text):
                 self.assertIs(probe_kind(text, text), MatchKind.FIT)
+
+    def test_case_and_turkish_letters_still_fit(self) -> None:
+        # SKSIMASK2: identity keeps case folding and Turkish letter folding.
+        for skill_text, request in (
+            ("Delete file alpha-beta", "Delete file alpha-beta"),
+            ("Delete file alpha_beta", "DELETE FILE alpha_beta"),
+            ("Read file résumé.txt", "Read file RÉSUMÉ.TXT"),
+            ("Read file résumé", "Read file re" + chr(0x301) + "sume" + chr(0x301)),
+            ("Şirket raporunu sil", "Sirket raporunu sil"),
+            ("İstanbul raporunu sil", "istanbul raporunu sil"),
+        ):
+            with self.subTest(request=request):
+                self.assertIs(probe_kind(skill_text, request), MatchKind.FIT)
 
 
 if __name__ == "__main__":

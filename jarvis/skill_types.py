@@ -146,7 +146,12 @@ class AuthorityKeyError(SkillRecordError):
     """The data carried an approval, trust, permission, risk-like key."""
 
 
-def fold_token(token: str) -> str:
+# The marks a Turkish letter carries, by the base letters that carry them:
+# cedilla (c, s), breve (g), diaeresis (o, u), circumflex (a, i, u).
+_TURKISH_MARKS = {chr(0x327): "cs", chr(0x306): "g", chr(0x308): "ou", chr(0x302): "aiu"}
+
+
+def fold_token(token: str, *, identity: bool = False) -> str:
     """The one canonical form of a task word (``Experience.task_signature``).
 
     NFKC; dotted capital I (U+0130) and dotless i (U+0131) become ``i``;
@@ -156,16 +161,28 @@ def fold_token(token: str) -> str:
     deterministic and idempotent. Every consumer that stores or matches task
     words calls this, so a lesson is found under the same word it was stored
     under. Raises ``SkillRecordError`` for a non-string.
+
+    ``identity=True`` (a skill's exact identity) drops only a Turkish letter's
+    own mark, so an accented "resume" stays apart from the plain one while a
+    cedilla s still folds to a plain s. It also skips the compatibility forms
+    (NFC, lower, NFD), so a superscript, circled, ligature, roman-numeral or
+    fullwidth character names a different object than its plain spelling.
     """
     if type(token) is not str:
         raise SkillRecordError("a task word must be a string")
-    text = unicodedata.normalize("NFKC", token).translate(_TURKISH_I).casefold()
-    text = "".join(
-        char
-        for char in unicodedata.normalize("NFKD", text)
-        if unicodedata.category(char) != "Mn"
-    )
-    return unicodedata.normalize("NFC", text)
+    if identity:
+        text = unicodedata.normalize("NFC", token).translate(_TURKISH_I).lower()
+    else:
+        text = unicodedata.normalize("NFKC", token).translate(_TURKISH_I).casefold()
+    kept: list[str] = []
+    base = ""
+    for char in unicodedata.normalize("NFD" if identity else "NFKD", text):
+        if unicodedata.category(char) != "Mn":
+            base = char
+        elif not identity or (base and base in _TURKISH_MARKS.get(char, "")):
+            continue
+        kept.append(char)
+    return unicodedata.normalize("NFC", "".join(kept))
 
 
 class SkillScopeKind(str, Enum):
