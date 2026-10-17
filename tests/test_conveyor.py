@@ -3356,6 +3356,126 @@ class StackGit(FakeGit):
                              "workflowName": "tests", "url": f"https://github.com/x/y/actions/runs/{self.line.index(sha)}0"})
 
 
+SHA_C = "c3" + "0" * 38  # a sibling candidate: a child of ORIGIN off the line
+
+
+class CandGit(StackGit):
+    """StackGit with the main checkout (clean, on main), `git merge --ff-only`, a failed-run log,
+    the candidate's picks, and SHA_C forked from ORIGIN."""
+
+    def __init__(self):
+        super().__init__([ORIGIN, SHA_A, SHA_B])
+        self.memory[SHA_C] = SCHEMA
+        self.dirty, self.failed_log, self.picks_log = "", "", ""
+
+    def __call__(self, args, timeout=120):
+        a = tuple(args)
+        if a[:3] == ("git", "merge-base", "--is-ancestor"):
+            refs = {"HEAD": self.main, "refs/heads/main": self.main, "refs/remotes/origin/main": self.origin}
+            x, y = (refs.get(v, v) for v in a[3:5])
+            if SHA_C in (x, y):
+                self.calls.append(args)
+                return (0 if x == y or (x, y) == (ORIGIN, SHA_C) else 1), ""
+            args = [*a[:3], x, y]
+        answers = {("git", "symbolic-ref"): (0, "refs/heads/main\n"), ("git", "status"): (0, self.dirty),
+                   ("gh", "run", "view"): (0, self.failed_log), ("git", "log", "--reverse"): (0, self.picks_log)}
+        for k, v in answers.items():
+            if a[:len(k)] == k:
+                self.calls.append(args)
+                return v
+        if a[:3] == ("git", "merge", "--ff-only"):
+            self.calls.append(args)
+            self.main = a[3]
+            return 0, ""
+        return super().__call__(args, timeout)
+
+    def ci(self, sha, conclusion="success"):
+        self.runs.insert(0, {"headSha": sha, "status": "completed", "conclusion": conclusion, "workflowName": "tests",
+                             "url": f"https://github.com/x/y/actions/runs/{(self.line + [SHA_C]).index(sha)}0"})
+
+
+class TestCandidate(AutopilotBase):
+    """CONVINT: an INT lane reports a CANDIDATE SHA on top of local main; only CI green moves main."""
+
+    def setUp(self):
+        super().setUp()
+        self.git = self.c.cmd = CandGit()
+
+    def cand(self, name, sha, main=ORIGIN):
+        self.drop(f"{name}.md", INT_HDR.format(name) + "INTEGRATE\n")
+        self.c.pass_once()
+        self.git.main = main
+        self.t += 60
+        self.finish(name, "CI_PENDING", f"CANDIDATE SHA: {sha}\nCI: pushed ci/{name.lower()}, run in progress\n")
+
+    def reason(self, name):
+        (item,) = [a for a in self.status()["attention"] if a["id"] == name]
+        return item["reason"]
+
+    def test_green_candidate_fast_forwards_main_then_pushes(self):
+        self.cand("INT1", SHA_B)
+        ln = self.lanes()["INT1"]
+        self.assertEqual((ln["status"], ln["ci"]["sha"], ln["ci"]["cand"]), ("CI_PENDING", SHA_B, True))
+        self.assertEqual((self.git.main, self.git.pushes()), (ORIGIN, []))  # main never holds a pending candidate
+        self.git.ci(SHA_B)
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT1"]["status"], "GREEN")
+        self.assertIn(["git", "merge", "--ff-only", SHA_B], self.git.calls)
+        self.assertEqual([e["sha"] for e in self.ev("fast_forward")], [SHA_B])
+        self.assertEqual((self.git.main, self.git.pushes()), (SHA_B, [["git", "push", "origin", f"{SHA_B}:refs/heads/main"]]))
+
+    def test_dirty_main_checkout_blocks_the_fast_forward_and_the_push(self):
+        self.git.dirty = " M jarvis/core.py\n"
+        self.cand("INT1", SHA_B)
+        self.git.ci(SHA_B)
+        self.c.pass_once()
+        self.assertEqual((self.git.main, self.git.pushes(), self.ev("fast_forward")), (ORIGIN, [], []))
+        self.assertIn("main checkout has local changes", self.ev("push_blocked")[-1]["reason"])
+
+    def test_sibling_candidate_built_on_the_old_main_is_refused(self):
+        self.cand("INT1", SHA_A)
+        self.cand("INT2", SHA_C)
+        self.git.ci(SHA_A)
+        self.git.ci(SHA_C)
+        self.c.pass_once()
+        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{SHA_A}:refs/heads/main"]])
+        self.assertEqual(self.git.main, SHA_A)
+        self.assertNotIn(["git", "merge", "--ff-only", SHA_C], self.git.calls)
+        self.assertIn(f"is not {SHA_C}", self.ev("push_blocked")[-1]["reason"])
+
+    def test_candidate_not_on_top_of_local_main_blocks(self):
+        self.cand("INT1", SHA_A, main=SHA_B)
+        self.assertEqual(self.lanes()["INT1"]["status"], "BLOCKED")
+        self.assertIn(f"CANDIDATE SHA {SHA_A[:7]} is not on top of local main", self.reason("INT1"))
+
+    def test_red_candidate_splits_and_names_every_pick(self):
+        self.git.failed_log = "FAIL: test_x (tests.test_core.TestCore.test_x)\n"
+        self.git.picks_log = f"@@{SHA_A} feat: core\njarvis/core.py\n\n@@{SHA_B} feat: ui\njarvis/ui.py\n"
+        self.cand("INT1", SHA_B)
+        self.git.ci(SHA_B, "failure")
+        self.c.pass_once()
+        self.assertEqual((self.git.main, self.git.pushes()), (ORIGIN, []))
+        (ev,) = self.ev("auto_split")
+        self.assertEqual((ev["lane"], ev["fixes"]), ("INT1", ["INT1-1-AFX"]))
+        listing = f"INT1-S takes {SHA_B[:7]}; INT1-1-AFX fixes {SHA_A[:7]}"
+        self.assertIn(listing, self.reason("INT1"))
+        self.assertIn(f"CONVEYOR AUTO-SPLIT: {listing}", (self.root / self.lanes()["INT1"]["report"]).read_text(encoding="utf-8"))
+        s = (self.base / "prompts" / "auto" / "INT1-S.md").read_text(encoding="utf-8")
+        self.assertIn(f"  {SHA_B} feat: ui", s)
+        afx = (self.base / "prompts" / "auto" / "INT1-1-AFX.md").read_text(encoding="utf-8")
+        self.assertIn(SHA_A, afx)
+        self.assertIn("tests.test_core.TestCore.test_x", afx)
+
+    def test_unmapped_red_candidate_falls_back_to_one_fix_chain(self):
+        self.git.failed_log = "ERROR: test_y (tests.test_other.T.test_y)\n"
+        self.git.picks_log = f"@@{SHA_A} feat: core\njarvis/core.py\n@@{SHA_B} feat: ui\njarvis/ui.py\n"
+        self.cand("INT1", SHA_B)
+        self.git.ci(SHA_B, "failure")
+        self.c.pass_once()
+        self.assertEqual((self.ev("auto_split"), self.git.main), ([], ORIGIN))
+        self.assertIn("auto-fix queued: INT1-AFX, then INT1-R", self.reason("INT1"))
+
+
 class TestCIHandoff(AutopilotBase):
     """CONV12: an integration lane finishes CI_PENDING; the conveyor waits for its GitHub CI."""
 

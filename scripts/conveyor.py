@@ -89,6 +89,10 @@ GRANT_DENY = ("policy", "approv", "authori", "auth", "credential", "secret", "re
               "data/")
 # CONV12: an integration lane may finish 'STATUS: CI_PENDING' + 'NEW MAIN SHA' + ci/<name>; the
 # conveyor then waits for that sha's CI (push_checks' query) and turns it GREEN or BLOCKED.
+# CONVINT (Salih 2026-10-17): the integration lane leaves local main alone. It builds branch
+# cand/<int> at local main in its own worktree, cherry-picks there, pushes ci/<int>-<n> from it and
+# reports 'CANDIDATE SHA: <40 hex>'. On CI green the push gate (keys unchanged) fast-forwards local
+# main to it, then pushes; a red candidate never reaches local main ('NEW MAIN SHA' still works).
 CI_PENDING = "CI_PENDING"
 CI_ERROR_GAP_S = 3600  # gh unreadable during a CI wait: one error line per hour
 CI_PAGE_S = 7200  # a CI wait unresolved this long pages once
@@ -183,6 +187,7 @@ NIGHT_HOURS = range(2, 8)  # 02:00-08:00 local: the 30 min escalation page waits
 AUTO_LINE_S = 3600  # the band shows "auto-approved <sha7>" this long
 AUTOFIX_MODEL, AUTOFIX_EFFORT = "opus", "high"  # routing table: auto-fix lanes
 NEW_MAIN_RE = re.compile(r"(?m)^[ \t]*NEW MAIN SHA\b(.*)$")
+CANDIDATE_RE = re.compile(r"(?m)^[ \t]*CANDIDATE SHA\b(.*)$")
 CI_RUN_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/(\d+)")
 # a name that goes on with "/" (ci/a/b) or more name characters is not taken at all
 CI_BRANCH_RE = re.compile(r"(?<![\w.-])ci/([A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*)(?![/\w-]|\.[\w-])")
@@ -250,6 +255,28 @@ RERUN_CI_PREFACE = (
     "none, add no commit. Then do the local checks and the CI handoff exactly as below, with CI "
     "BRANCH: ci/{RBRANCH} and NEW MAIN SHA = the main HEAD after your step. Your report is "
     "build/reports/{R}.md (not {INT}'s). The rest of the prompt is {INT}'s.\n\n")
+RERUN_CAND_PREFACE = (
+    "{R} re-runs integration lane {INT} after the automatic fix lane {AFX} (its report "
+    "build/reports/{AFX}.md names FIX COMMIT and BRANCH, or FIX COMMIT: none for a CI flake). "
+    "{INT}'s candidate {SHA} failed CI run {RUN} and never reached local main. Build a new "
+    "candidate: in your worktree make branch cand/{RLOW} at the CURRENT local main (never move "
+    "local main), cherry-pick {INT}'s picks (git log refs/heads/main..{SHA}) in order, then FIX "
+    "COMMIT if it is a sha. Then do the local checks and the CI handoff exactly as below, pushing "
+    "CI BRANCH: ci/{RBRANCH} from the candidate, with CANDIDATE SHA = the candidate HEAD. Your "
+    "report is build/reports/{R}.md (not {INT}'s). The rest of the prompt is {INT}'s.\n\n")
+SPLIT_PREFACE = (
+    "{S} re-tries integration lane {INT} without its failing picks: candidate {SHA} failed CI "
+    "run {RUN}. In your worktree make branch cand/{SLOW} at the CURRENT local main (never move "
+    "local main) and cherry-pick ONLY these picks, in this order:\n{TAKE}\nHeld back (each has "
+    "its own fix lane; never pick them):\n{HOLD}\nThen do the local checks and the CI handoff "
+    "exactly as below, pushing CI BRANCH: ci/{SLOW} from the candidate, with CANDIDATE SHA = the "
+    "candidate HEAD. Your report is build/reports/{S}.md (not {INT}'s). The rest of the prompt "
+    "is {INT}'s.\n\n")
+SPLIT_AFX_NOTE = (
+    "\nCONVINT split: {INT}'s candidate never reached local main. Fix ONLY pick {PICK} ({SUBJ}); "
+    "its failing tests: {PTESTS}. Branch from the CURRENT local main, cherry-pick {PICK} first, "
+    "then the fix. Report PICK COMMIT (the cherry-picked pick) and FIX COMMIT. No automatic "
+    "re-run follows: the orchestrator integrates pick + fix.\n")
 RERUN_PREFACE = (
     "{R} re-runs integration lane {INT} after the automatic fix lane {AFX} (its report "
     "build/reports/{AFX}.md names FIX COMMIT and BRANCH). Local main may already hold {INT}'s "
@@ -2246,7 +2273,8 @@ class Conveyor:
             st = ln.get("status")
             if st == CI_PENDING:
                 continue  # not terminal: ci_wait sets GREEN/BLOCKED with a new finished_ts
-            role = next((r for c in chains.values() for r in ("afx", "r") if c.get(r) == name), None)
+            role = next((r for c in chains.values() for r in ("afx", "r", "s")
+                         if c.get(r) == name or r == "afx" and name in c.get("afxs", ())), None)
             if st in BAD and not (st == "BLOCKED" and CDX_DRY_RE.match(name)):
                 ap.setdefault("bad", []).append([name, fin])  # an audit lane's BLOCKED: attention only
             if role and st not in GOOD:
@@ -2393,12 +2421,12 @@ class Conveyor:
         return None
 
     def main_and_ci(self, text):
-        """(None, sha40, ci name) from a report's single 'NEW MAIN SHA: <40 hex>' line and single
-        ci/<name> branch, else (reason, None, None)."""
-        mains = NEW_MAIN_RE.findall(text)
+        """(None, sha40, ci name) from a report's single 'NEW MAIN SHA: <40 hex>' or (CONVINT)
+        'CANDIDATE SHA: <40 hex>' line and single ci/<name> branch, else (reason, None, None)."""
+        mains = NEW_MAIN_RE.findall(text) + CANDIDATE_RE.findall(text)
         m = len(mains) == 1 and re.match(r"\s*:\s*([0-9a-f]{40})(?![0-9A-Za-z])", mains[0])
         if not m:
-            return "the report has no single 'NEW MAIN SHA: <40 hex>' line", None, None
+            return "the report has no single 'NEW MAIN SHA: <40 hex>' or 'CANDIDATE SHA: <40 hex>' line", None, None
         cis = set(CI_BRANCH_RE.findall(text))
         if len(cis) != 1:
             return f"the report names {len(cis)} ci/* branches, not one", None, None
@@ -2426,15 +2454,20 @@ class Conveyor:
             text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
             st = [x for x in text.splitlines() if re.match(r"\s*STATUS:", x)]
             why, sha, branch = self.main_and_ci(text)
+            cand = bool(CANDIDATE_RE.search(text))
             if len(st) != 1 or not re.fullmatch(rf"\s*STATUS:\s*{CI_PENDING}\s*", st[0]):
                 why = f"the report has no single 'STATUS: {CI_PENDING}' line"
             if not INT_RE.match(name):
                 why = "CI_PENDING from a lane that is not an integration lane"
-            elif not why and not self.is_ancestor(sha, "refs/heads/main"):  # an unknown sha raises: waits
+            elif not why and cand and not self.is_ancestor("refs/heads/main", sha):  # unknown: raises
+                why = f"CANDIDATE SHA {sha[:7]} is not on top of local main"
+            elif not why and not cand and not self.is_ancestor(sha, "refs/heads/main"):
                 why = f"NEW MAIN SHA {sha[:7]} is not on local main"
             if why:
                 return self.ci_done(name, ln, "BLOCKED", why)
             ln["ci"] = {"since": self.now(), **(ln.get("ci") or {}), "sha": sha, "branch": f"ci/{branch}"}
+            if cand:
+                ln["ci"]["cand"] = True
             self.event("ci_pending", lane=name, sha=sha, branch=f"ci/{branch}")
         ci = ln["ci"]
         under = self.stacked(ci["sha"], lanes, CI_STACK_S)
@@ -2547,6 +2580,24 @@ class Conveyor:
         if name in chains:
             why, slices = "auto-fix already used for this integration lane", None
         else:
+            try:  # CONVINT: a red candidate first tries to split its picks
+                split = self.split_chain(name, ln)
+            except Exception as e:  # gh/git timeout, unreadable prompt: the plain chain below
+                split = None
+                self.error(f"auto-split {name}: {type(e).__name__}")
+            if split:
+                slices, listing = split
+                afxs = [s["id"] for s in slices[1:]]
+                chains[name] = {"s": slices[0]["id"], "afx": afxs[0], "afxs": afxs, "at": self.now()}
+                ap["slices"] = ap.get("slices", []) + slices
+                ln["auto_fix"] = f"auto-fix split: {listing}"
+                try:  # every pick named in the report too, never dropped silently
+                    with open(ln["report"], "a", encoding="utf-8") as fh:
+                        fh.write(f"\nCONVEYOR AUTO-SPLIT: {listing}\n")
+                except OSError as e:
+                    self.error(f"auto-split {name}: report: {e}")
+                self.event("auto_split", lane=name, split=slices[0]["id"], fixes=afxs)
+                return
             try:
                 why, slices = self.fix_chain(name, ln)
             except Exception as e:  # unreadable report or prompt, a git timeout
@@ -2587,7 +2638,10 @@ class Conveyor:
                 return "CI-handoff lane without its own failed CI run (stacked or unclear), the orchestrator decides", None
             tests, end, tpl_name, default, preface = [], ci["sha"], "_autofix_ci_template.md", \
                 AUTOFIX_CI_TEMPLATE, RERUN_CI_PREFACE
-            kw.update(URL=ci["url"], RUN=run.group(1), SHA=ci["sha"], CI_BRANCH=str(ci.get("branch")))
+            kw.update(URL=ci["url"], RUN=run.group(1), SHA=ci["sha"], CI_BRANCH=str(ci.get("branch")),
+                      RLOW=r.lower())
+            if ci.get("cand"):  # CONVINT: the picks live only on the red candidate
+                preface = RERUN_CAND_PREFACE
         start = ln.get("main_at_start")
         if not (isinstance(start, str) and SHA_RE.fullmatch(start) and main):
             return "main at the lane's start or now is unknown", None
@@ -2602,7 +2656,10 @@ class Conveyor:
             prompts.mkdir(parents=True, exist_ok=True)
             tpl.write_text(default, encoding="utf-8")
         rest = (self.base / ln["prompt"]).read_text(encoding="utf-8").partition("\n")[2]
-        texts = {afx: fill(tpl.read_text(encoding="utf-8"), **kw),
+        note = "" if not (ci or {}).get("cand") else fill(
+            "\nCONVINT: {INT}'s picks are not on local main: branch {BRANCH} from the candidate {SHA}, "
+            "not from local main; {R} cherry-picks FIX COMMIT onto a new candidate.\n", **kw)
+        texts = {afx: fill(tpl.read_text(encoding="utf-8"), **kw) + note,
                  r: f"@jarvis lane={r} model={ln.get('model')} effort={ln.get('effort')} base=main\n"
                     + fill(preface, **kw) + rest}
         rel = "build/conveyor/prompts/auto/{}.md"
@@ -2619,6 +2676,82 @@ class Conveyor:
         for s in slices:
             (self.root / s["prompt"]).write_text(texts[s["id"]], encoding="utf-8")
         return None, slices
+
+    def split_chain(self, name, ln):
+        """CONVINT: ([<INT>-S, <INT>-<i>-AFX...], listing) for a red candidate whose failing CI
+        tests (gh run view --log-failed) each map to the picks touching that test's module or
+        its source stem, or a report 'SUSPECT COMMIT: <sha>' line; <INT>-S re-tries the other
+        picks on a new candidate, each affected pick gets its own fix lane. Any unmapped test, no
+        test, or no unaffected pick: None (the plain fix_chain)."""
+        ci = ln.get("ci") or {}
+        run = CI_RUN_RE.fullmatch(str(ci.get("url")))
+        sha = str(ci.get("sha"))
+        if not (ci.get("cand") and ci.get("conclusion") == "failure" and run and SHA_RE.fullmatch(sha)):
+            return None
+        rc, out = self.cmd(["gh", "run", "view", run.group(1), "--log-failed"])
+        tests = sorted({t for x in out.splitlines() if "FAIL:" in x or "ERROR:" in x
+                        for t in TEST_ID_RE.findall(x)}) if rc == 0 else []
+        rc, log = self.cmd(["git", "log", "--reverse", "--no-renames", "--name-only",
+                            "--format=@@%H %s", f"refs/heads/main..{sha}"])
+        picks = []  # [sha, subject, files]
+        for x in log.splitlines() if rc == 0 else ():
+            if x.startswith("@@"):
+                p, _, subj = x[2:].partition(" ")
+                picks.append([p, subj, set()])
+            elif x.strip() and picks:
+                picks[-1][2].add(x.strip())
+        if not tests or len(picks) < 2 or any(not SHA_RE.fullmatch(p[0]) for p in picks):
+            return None
+        text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+        sus = {p[0] for p in picks for s in re.findall(r"(?m)^[ \t]*SUSPECT COMMIT:\s*([0-9a-f]{7,40})\b", text)
+               if p[0].startswith(s)}
+        hits = {}  # pick sha -> its failing tests
+        for t in tests:
+            parts = t.split(".")
+            mods = {"/".join(parts[:i]) + ".py" for i in range(2, len(parts))}
+            stems = {m.rsplit("/", 1)[-1][:-3].removeprefix("test_") for m in mods}
+            by = [p[0] for p in picks if any(f in mods or Path(f).stem in stems for f in p[2])] or sorted(sus)
+            if not by:
+                return None
+            for p in by:
+                hits.setdefault(p, []).append(t)
+        keep = [p for p in picks if p[0] not in hits]
+        bad = [p for p in picks if p[0] in hits]
+        if not keep:
+            return None
+        s_id, main = f"{name}-S", self.main_head() or ""
+        prompts, rel = self.base / "prompts", "build/conveyor/prompts/auto/{}.md"
+        tpl = prompts / "_autofix_ci_template.md"
+        if not tpl.exists():
+            prompts.mkdir(parents=True, exist_ok=True)
+            tpl.write_text(AUTOFIX_CI_TEMPLATE, encoding="utf-8")
+        rest = (self.base / ln["prompt"]).read_text(encoding="utf-8").partition("\n")[2]
+        kw = {"INT": name, "S": s_id, "SLOW": s_id.lower(), "SHA": sha, "RUN": run.group(1),
+              "TAKE": "\n".join(f"  {p[0]} {p[1]}" for p in keep),
+              "HOLD": "\n".join(f"  {p[0]} {p[1]}" for p in bad)}
+        texts = {s_id: f"@jarvis lane={s_id} model={ln.get('model')} effort={ln.get('effort')} base=main\n"
+                       + fill(SPLIT_PREFACE, **kw) + rest}
+        slices = [{"id": s_id, "title": f"split re-run {name}", "model": ln.get("model"),
+                   "effort": ln.get("effort"), "tier": "T1", "files": ln.get("files", []),
+                   "depends_on": [], "prompt": rel.format(s_id)}]
+        for i, p in enumerate(bad, 1):
+            afx = f"{name}-{i}-AFX"
+            fkw = {"INT": name, "AFX": afx, "R": "the orchestrator", "REPORT": ln["report"], "MAIN": main,
+                   "BRANCH": afx.lower(), "URL": ci["url"], "RUN": run.group(1), "SHA": sha,
+                   "CI_BRANCH": str(ci.get("branch")), "FILES": "\n".join("  " + f for f in sorted(p[2])),
+                   "PICK": p[0], "SUBJ": p[1], "PTESTS": ", ".join(hits[p[0]])}
+            texts[afx] = fill(tpl.read_text(encoding="utf-8"), **fkw) + fill(SPLIT_AFX_NOTE, **fkw)
+            slices.append({"id": afx, "title": f"auto-fix {name} pick {p[0][:7]}", "model": AUTOFIX_MODEL,
+                           "effort": AUTOFIX_EFFORT, "tier": "T1", "files": sorted(p[2]), "depends_on": [],
+                           "prompt": rel.format(afx), "tests": hits[p[0]]})
+        if any(validate_slice(s) for s in slices):
+            return None
+        (prompts / "auto").mkdir(parents=True, exist_ok=True)
+        for s in slices:
+            (self.root / s["prompt"]).write_text(texts[s["id"]], encoding="utf-8")
+        listing = (f"{s_id} takes {', '.join(p[0][:7] for p in keep)}; "
+                   + "; ".join(f"{s['id']} fixes {p[0][:7]}" for s, p in zip(slices[1:], bad)))
+        return slices, listing
 
     # ---- push gate: verified main to GitHub under two keys ---------------
     def push_gate(self, lanes=None):
@@ -2637,6 +2770,8 @@ class Conveyor:
             sha = url = None
             try:
                 why, sha, url = self.push_checks(f.name, lanes)
+                if why is None:
+                    why = self.fast_forward(sha)
                 if why is None:
                     rc, out = self.cmd(["git", "push", "origin", f"{sha}:refs/heads/main"])
                     if rc != 0:
@@ -2667,11 +2802,40 @@ class Conveyor:
         if state or self.push_file.exists():
             self.push_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
 
+    def fast_forward(self, sha):
+        """CONVINT: None when local main holds `sha` (already, or after `git merge --ff-only` in
+        the main checkout), else the reason. Only a clean checkout on main whose HEAD is an
+        ancestor of sha moves; never a merge commit, never a reset."""
+        rc, main = self.cmd(["git", "rev-parse", "--verify", "refs/heads/main"])
+        main = main.strip()
+        if rc != 0 or not SHA_RE.fullmatch(main):
+            return "local main unknown"
+        if main == sha or self.is_ancestor(sha, main):
+            return None
+        rc, ref = self.cmd(["git", "symbolic-ref", "-q", "HEAD"])
+        if rc != 0 or ref.strip() != "refs/heads/main":
+            return "main checkout is not on main: no fast-forward"
+        rc, out = self.cmd(["git", "status", "--porcelain", "--untracked-files=no"])
+        if rc != 0 or out.strip():
+            return "main checkout has local changes: no fast-forward"
+        if not self.is_ancestor("HEAD", sha):
+            return f"HEAD is not an ancestor of {sha[:7]}: no fast-forward"
+        rc, out = self.cmd(["git", "merge", "--ff-only", sha])
+        if rc != 0:
+            return f"git merge --ff-only rc={rc}: {out.strip()[-200:]}"
+        rc, main = self.cmd(["git", "rev-parse", "--verify", "refs/heads/main"])
+        if rc != 0 or main.strip() != sha:
+            return f"local main is not {sha[:7]} after the fast-forward"
+        self.event("fast_forward", sha=sha)
+        return None
+
     def push_checks(self, name, lanes=None):
         """(None, full sha, CI run url) when every check passes, else (reason, sha, None).
         CONV12: a CI-handoff lane's exact 40-hex sha may sit under newer local main commits (the
         next integration lane stacked on it); a sha stacked on a handoff sha that is not on
-        origin/main and not CI success is refused (strict push order)."""
+        origin/main and not CI success is refused (strict push order). CONVINT: a candidate's
+        sha sits on top of local main (push_gate fast-forwards main to it after these checks); a
+        sibling candidate built on an older main is not, and is refused."""
         lanes = self.load_lanes() if lanes is None else lanes
         m = APPROVAL_RE.fullmatch(name)
         if not m:
@@ -2679,9 +2843,13 @@ class Conveyor:
         want, ci = m.groups()
         rc, sha = self.cmd(["git", "rev-parse", "--verify", "refs/heads/main"])
         head = sha = sha.strip()
+        cis = [x.get("ci") or {} for x in lanes.values()]
         if rc == 0 and SHA_RE.fullmatch(head) and not head.startswith(want) and any(
-                (x.get("ci") or {}).get("sha") == want for x in lanes.values()):
-            sha = want if self.is_ancestor(want, head) else head
+                c.get("sha") == want for c in cis):
+            if self.is_ancestor(want, head):
+                sha = want
+            elif any(c.get("sha") == want and c.get("cand") for c in cis) and self.is_ancestor(head, want):
+                sha = want
         if rc != 0 or not SHA_RE.fullmatch(sha) or not sha.startswith(want):
             return f"local main {head[:12]} is not {want}", want, None
         rc, _ = self.cmd(["git", "fetch", "origin", "main"])
