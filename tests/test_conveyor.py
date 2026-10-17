@@ -4,6 +4,7 @@ import importlib.util
 import json
 import os
 import re
+import subprocess
 import sys
 import tempfile
 import time
@@ -3828,6 +3829,134 @@ class TestLock(Base):
         self.assertTrue(self.c.acquire_lock())
         (self.base / "conveyor.lock").write_text("garbage")
         self.assertTrue(self.c.acquire_lock())
+
+
+class VersionClaude(FakeClaude):
+    """FakeClaude that also answers `--version` (a tuple, or an exception to raise)."""
+
+    def __init__(self):
+        super().__init__()
+        self.version = (0, "2.1.123 (Claude Code)\n")
+
+    def __call__(self, args, timeout=120, cwd=None):
+        if args == ["--version"]:
+            self.calls.append(args)
+            self.version_timeout = timeout
+            if isinstance(self.version, Exception):
+                raise self.version
+            return self.version
+        return super().__call__(args, timeout, cwd)
+
+
+class TestVersionPin(Base):
+    """pace.json claude_version (CONVPIN): dispatch only on an equal `claude --version`."""
+
+    WANT = "2.1.123"
+
+    def setUp(self):
+        super().setUp()
+        self.fake = self.c.run = VersionClaude()
+
+    def pin(self, want=WANT):
+        (self.base / "pace.json").write_text(
+            json.dumps({**conveyor.PACE_DEFAULTS, "claude_version": want}), encoding="utf-8")
+
+    def version_calls(self):
+        return [c for c in self.fake.calls if c == ["--version"]]
+
+    def assert_held(self, have):
+        self.assertEqual(self.fake.bg_calls(), [])
+        self.assertEqual(len(list((self.base / "inbox").glob("*.md"))), 1)  # the prompt waits
+        attn = [(a["id"], a["reason"]) for a in self.status()["attention"]]
+        self.assertEqual([a for a in attn if a[0] == conveyor.CC_VERSION_ID],
+                         [(conveyor.CC_VERSION_ID, f"cc-version: have {have}, want {self.WANT}")])
+        self.assertNotIn("error", [e["event"] for e in self.events()])
+
+    def test_equal_version_dispatches_one_read_per_pass(self):
+        self.pin()
+        self.drop("a.md", HDR.format("A"))
+        self.drop("b.md", HDR.format("B"))
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A", "B"])
+        self.assertEqual(len(self.version_calls()), 1)
+        self.assertEqual(self.fake.version_timeout, conveyor.CC_VERSION_TIMEOUT_S)
+        self.assertNotIn(conveyor.CC_VERSION_ID, self.attn())
+
+    def test_different_version_no_dispatch_one_attention_item(self):
+        self.pin()
+        self.fake.version = (0, "2.1.124 (Claude Code)\n")
+        self.drop("a.md", HDR.format("A"))
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assert_held("2.1.124")
+        self.assertEqual(len([e for e in self.events() if e["event"] == "cc_version_hold"]), 1)
+        self.fake.version = (0, "2.1.123 (Claude Code)\n")  # the orchestrator fixed it
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        self.assertNotIn(conveyor.CC_VERSION_ID, self.attn())
+
+    def test_unreadable_or_timeout_no_dispatch(self):
+        for answer in ((1, "boom"), (0, "garbage"), (0, ""),
+                       subprocess.TimeoutExpired(["claude", "--version"], 20), OSError("no exe")):
+            with self.subTest(answer=answer):
+                self.tearDown()
+                self.setUp()
+                self.pin()
+                self.fake.version = answer
+                self.drop("a.md", HDR.format("A"))
+                self.c.pass_once()
+                self.assert_held("unreadable")
+
+    def test_key_absent_unchanged_behaviour(self):
+        self.fake.version = (0, "9.9.9 (Claude Code)\n")
+        self.drop("a.md", HDR.format("A"))
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        self.assertEqual(self.version_calls(), [])
+        self.pin()  # pinned, then unpinned: the attention item goes with the key
+        self.fake.version = (1, "boom")
+        self.c.pass_once()
+        self.assertIn(conveyor.CC_VERSION_ID, self.attn())
+        (self.base / "pace.json").write_text(json.dumps(conveyor.PACE_DEFAULTS), encoding="utf-8")
+        self.c.pass_once()
+        self.assertNotIn(conveyor.CC_VERSION_ID, self.attn())
+
+    def test_mismatch_never_redispatches_or_fails_a_lane(self):
+        a, _ = TestRedispatch.setup_respawned(self)
+        self.pin()
+        self.fake.version = (0, "2.1.124\n")
+        self.t += conveyor.IDLE_REDISPATCH_S + 1
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        self.assertNotIn(["stop", a["id"]], self.fake.calls)
+        ln = self.lanes()["A"]
+        self.assertEqual(ln.get("redispatches", 0), 0)
+        self.assertFalse(ln.get("finished"))
+        self.assertNotIn(ln.get("status"), ("DEAD", "STUCK"))
+        self.assertIn(conveyor.CC_VERSION_ID, self.attn())
+        self.assertIsNone(self.c.start("B", "opus", "high", HDR.format("B")))  # start() checks too
+
+    def test_invalid_pin_still_holds_and_survives_quota_reset(self):
+        for bad in ("", 2.1, " 2.1.123"):
+            with self.subTest(bad=bad):
+                self.tearDown()
+                self.setUp()
+                self.pin(bad)
+                self.drop("a.md", HDR.format("A"))
+                self.c.pass_once()
+                self.assertEqual(self.fake.bg_calls(), [])
+                self.assertIn(conveyor.PACE_BAD_ID, self.attn())
+                self.assertIn(conveyor.CC_VERSION_ID, self.attn())
+        self.tearDown()
+        self.setUp()
+        self.pin()
+        TestUsageGuard.ledger(self, 96)
+        self.c.pass_once()
+        self.t += 3600
+        TestUsageGuard.ledger(self, 56)  # a reset: pace.json is rewritten
+        self.c.pass_once()
+        pace = json.loads((self.base / "pace.json").read_text(encoding="utf-8"))
+        self.assertEqual((pace["mode"], pace["claude_version"]), ("paced", self.WANT))
 
 
 if __name__ == "__main__":

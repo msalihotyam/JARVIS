@@ -117,6 +117,11 @@ RESET_DROP = 40  # usage falling this many points between two readings = the quo
 PACE_BAD_ID = "pace-invalid"  # attention ids (and ack files)
 RESET_ALERT_ID = "quota-reset-alert"
 RESET_DONE_ID = "quota-reset"
+# Version pin (CONVPIN): pace.json "claude_version" set -> dispatch only when `claude --version`
+# equals it; absent -> no check. Mismatch/unreadable: nothing is sent, no lane is failed.
+CC_VERSION_ID = "cc-version"  # attention id (and ack file)
+CC_VERSION_TIMEOUT_S = 20
+CC_VERSION_RE = re.compile(r"\s*v?(\d+(?:\.\d+)+\S*)")  # "2.1.123 (Claude Code)" -> 2.1.123
 USAGE_FRESH_S = 7 * 86400  # weekly % never drops before the window resets
 GOOD = {"PASS", "COMPLETE", "DONE", "GREEN", "OK"}
 BAD = {"BLOCKED", "STOP", "FAIL", "FAILED"}
@@ -670,6 +675,8 @@ class Conveyor:
         self.pace = {}
         self.backlog_view = []
         self.main_sha = False
+        self.cc_want = None  # pace.json claude_version (None: no check)
+        self.cc_ok = None  # version gate result, decided once per pass (None: not yet)
         self.auto_file = self.base / "autopilot.json"
         self.breaker = None  # {"reason", "since"} while open (autopilot.json), else None
         self.band = []  # status.json "band" lines (breaker, auto-approval)
@@ -803,6 +810,7 @@ class Conveyor:
         """One pass; returns False when `claude agents` could not be read."""
         self.last_error = None
         self.main_sha = False  # not looked up yet this pass
+        self.cc_ok = None  # `claude --version` read again at most once this pass
         lanes = self.load_lanes()
         try:
             agents = self.agents()
@@ -1214,6 +1222,8 @@ class Conveyor:
 
     def start(self, name, model, effort, text):
         """`claude --bg` one lane; returns its short id or None."""
+        if self.cc_hold():  # every dispatch path ends here; not an error, the lane is not failed
+            return None
         rc, out = self.run(["--bg", "--name", name, "--model", model,
                             "--effort", effort, "--settings", SETTINGS, text])
         m = BG_ID_RE.search(out)
@@ -1275,9 +1285,36 @@ class Conveyor:
         return self.free_gb is None or self.free_gb < MIN_FREE_GB
 
     def hold(self):
-        """PAUSE flag, usage guard, low disk or low memory: nothing new starts."""
+        """PAUSE flag, usage guard, low disk, low memory or Claude Code version: nothing new starts."""
         return (self.base / "PAUSE").exists() or self.disk_hold() or self.usage_hold \
-            or self.mem_hold
+            or self.mem_hold or self.cc_hold()
+
+    def cc_version(self):
+        """Installed Claude Code version ("2.1.123") or None when unreadable (rc, timeout, text)."""
+        try:
+            rc, out = self.run(["--version"], timeout=CC_VERSION_TIMEOUT_S)
+        except Exception:  # timeout, missing exe, anything: unreadable (fail closed)
+            return None
+        m = CC_VERSION_RE.match(out or "") if rc == 0 else None
+        return m.group(1) if m else None
+
+    def cc_hold(self):
+        """pace.json claude_version set and `claude --version` differs or is unreadable: True
+        (one attention item "cc-version: have X, want Y"). Decided once per pass."""
+        if self.cc_ok is None:
+            self.cc_ok = True
+            if self.cc_want is not None:
+                have = self.cc_version()
+                if have != self.cc_want:
+                    self.cc_ok = False
+                    why = f"have {have or 'unreadable'}, want {self.cc_want}"
+                    cur = self.pager_flag("cc_version")
+                    if not cur or cur[0] != why:
+                        self.pager_flag("cc_version", [why, self.now()])
+                        self.event("cc_version_hold", have=have, want=self.cc_want)
+            if self.cc_ok and self.pager_flag("cc_version"):
+                self.pager_flag("cc_version", False)
+        return not self.cc_ok
 
     # ---- pace governor ------------------------------------------------
     def load_pace(self):
@@ -1287,8 +1324,13 @@ class Conveyor:
         if not f.exists():
             f.write_text(json.dumps(PACE_DEFAULTS, indent=2), encoding="utf-8")
             return dict(PACE_DEFAULTS), None
+        raw = None
         try:
-            p = {**PACE_DEFAULTS, **json.loads(f.read_text(encoding="utf-8"))}
+            raw = json.loads(f.read_text(encoding="utf-8"))
+            p = {**PACE_DEFAULTS, **raw}
+            cv = p.get("claude_version")
+            if cv is not None and (not isinstance(cv, str) or not cv.strip() or cv != cv.strip()):
+                raise ValueError(f"claude_version {cv!r}")
             if p["mode"] not in ("full_burn", "paced"):
                 raise ValueError(f"mode {p['mode']!r}")
             lane_keys = [k for k in ("max_lanes", "min_lanes", "lanes_present", "lanes_away") if k in p]
@@ -1316,7 +1358,10 @@ class Conveyor:
                 datetime.fromisoformat(p["window_start"]).timestamp()  # TypeError when null
             return p, None
         except (OSError, ValueError, TypeError, OverflowError) as e:
-            return {**PACE_DEFAULTS, "mode": "paced", "window_start": iso(self.now())}, \
+            # a claude_version in the broken file still pins (an invalid one never matches)
+            pin = {"claude_version": raw["claude_version"]} \
+                if isinstance(raw, dict) and raw.get("claude_version") is not None else {}
+            return {**PACE_DEFAULTS, "mode": "paced", "window_start": iso(self.now()), **pin}, \
                 f"{type(e).__name__}: {e}"[:200]
 
     def govern(self):
@@ -1328,7 +1373,8 @@ class Conveyor:
         if u is not None:
             if isinstance(prev, (int, float)) and prev - u >= RESET_DROP:
                 p, err = {**p, "mode": "paced", "window_start": iso(self.now())}, None
-                keep = [*PACE_DEFAULTS, *(k for k in ("max_lanes", "min_lanes", "test_pool_tokens") if k in p)]
+                keep = [*PACE_DEFAULTS, *(k for k in ("max_lanes", "min_lanes", "test_pool_tokens",
+                                                      "claude_version") if k in p)]
                 (self.base / "pace.json").write_text(
                     json.dumps({k: p[k] for k in keep}, indent=2), encoding="utf-8")
                 self.event("quota_reset", before=prev, after=u, window_start=p["window_start"])
@@ -1339,6 +1385,10 @@ class Conveyor:
             self.pager_flag("pace_invalid", [err, self.now()])
         elif not err and cur:
             self.pager_flag("pace_invalid", False)
+        if "claude_version" in p or not err:  # unreadable file without a pin: keep the last one
+            self.cc_want = p.get("claude_version")
+        if self.cc_want is None and self.pager_flag("cc_version"):
+            self.pager_flag("cc_version", False)
         self.nudge_s = p["blocked_nudge_min"] * 60
         if self.sense_presence(p["away_after_min"]):
             self.power_switch(p)
@@ -1785,6 +1835,9 @@ class Conveyor:
         reset = self.pager_flag("quota_reset")
         if reset:
             items.append((RESET_DONE_ID, "kota sıfırlandı, tempo modu açık", reset))
+        cc = self.pager_flag("cc_version")
+        if cc:
+            items.append((CC_VERSION_ID, f"cc-version: {cc[0]}", cc[1]))
         fail = self.pager_flag("power_switch_fail")
         if fail:
             items.append((POWER_SWITCH_ID, f"güç planı değişmedi ({fail[0]})", fail[1]))
