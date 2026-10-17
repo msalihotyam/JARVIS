@@ -29,10 +29,11 @@ from jarvis.contracts import (
     build_model_answer,
 )
 from jarvis.conversation import append_turn
-from jarvis.core import _capture_session_taint, _file_input_taint
+from jarvis.core import _capture_session_taint, _file_input_taint, _proved_file_taint
 from jarvis.memory import ConsolidationPlanRejected, SQLiteMemoryStore
 from jarvis.memory_consolidation import ConsolidationEvent, ConsolidationPlan, Supersession
 from jarvis.memory_guard import Provenance, RecordGuard, SessionTaint, content_hash
+from jarvis.memory_lifetime import Lifetime
 from jarvis.registry import ToolRegistry
 from tests.helpers import isolated_settings, open_core, safe_cleanup
 
@@ -283,6 +284,48 @@ class FileTaintTests(unittest.TestCase):
                 user.refs = refs
                 self.assertIs(_capture_session_taint((user,), SESSION_END, self.roots), expected)
 
+    def test_taint_is_never_laundered_through_a_second_root(self) -> None:
+        # V21HARD1 B5: the originating root is the one root the file is under.
+        other = self.root.parent / "other"
+        other.mkdir()
+        (self.root / "docs").mkdir()
+        (self.root / "docs" / "notes.txt").write_text("x", encoding="utf-8")
+        two, nested = (self.root, other), (self.root, self.root / "docs")
+        for relative, roots, expected in (
+            ("docs/notes.txt", (self.root,), SessionTaint.LOCAL_TRUSTED_FILE),
+            ("docs/notes.txt", (self.root, self.root, Path(f"{self.root}{os.sep}")),
+             SessionTaint.LOCAL_TRUSTED_FILE),  # the read and write roots count once
+            ("docs/notes.txt", two, SessionTaint.LOCAL_TRUSTED_FILE),  # exists under one
+            ("docs/missing.txt", two, SessionTaint.IMPORT),  # under none: two candidates
+            ("docs/missing.txt", (self.root,), SessionTaint.LOCAL_TRUSTED_FILE),
+            ("docs/../docs/notes.txt", (self.root,), SessionTaint.IMPORT),
+            ("../outside/secret.txt", (self.root,), SessionTaint.IMPORT),
+            ("docs/notes.txt", (), SessionTaint.IMPORT),
+        ):
+            with self.subTest(relative=relative, roots=roots):
+                self.assertIs(_proved_file_taint(relative, roots), expected)
+        (other / "docs").mkdir()
+        (other / "docs" / "notes.txt").write_text("x", encoding="utf-8")
+        self.assertIs(_proved_file_taint("docs/notes.txt", two), SessionTaint.IMPORT)
+        (self.root / "docs" / "docs").mkdir()
+        (self.root / "docs" / "docs" / "notes.txt").write_text("x", encoding="utf-8")
+        self.assertIs(_proved_file_taint("docs/notes.txt", nested), SessionTaint.IMPORT)
+
+    def test_a_root_where_the_file_escapes_refuses(self) -> None:
+        other = self.root.parent / "other"
+        other.mkdir()
+        link = other / "docs"
+        try:
+            if os.name == "nt":
+                import _winapi
+                _winapi.CreateJunction(str(self.outside), str(link))
+            else:
+                os.symlink(self.outside, link, target_is_directory=True)
+        except (OSError, AttributeError, ImportError) as exc:
+            self.skipTest(f"no link support: {exc}")
+        (self.outside / "notes.txt").write_text("x", encoding="utf-8")
+        self.assertIs(_proved_file_taint("docs/notes.txt", (self.root, other)), SessionTaint.IMPORT)
+
     def test_core_reads_roots_from_the_file_connectors(self) -> None:
         registry = ToolRegistry()
         registry.register(LocalFileReadConnector(allowed_roots=[self.root]))
@@ -341,6 +384,48 @@ class ConsolidationGuardTests(unittest.TestCase):
         with self.assertRaisesRegex(ConsolidationPlanRejected, "tombstoned"):
             self.store.apply_consolidation_plan(self.plan(old, new))
         self.assertIs(self.store.current_status(old), MemoryRecordStatus.APPROVED)
+
+
+class SessionRecordInsertTests(unittest.TestCase):
+    """V21HARD1 A4: a SESSION record with no conversation id is refused at insert."""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        self.database = Path(temp.name) / "memory.db"
+        self.store = SQLiteMemoryStore(self.database)
+        self.alpha = self.store.create_project("Alpha").id
+        self.chat = self.store.create_conversation(self.alpha).id
+
+    def insert(self, text, *, scoped=None, source=None, lifetime=None):
+        guard = RecordGuard(Provenance.USER_STATED, SessionTaint.USER_TYPED, (),
+                            MemoryRecordKind.FACT, content_hash(text))
+        return self.store.insert_record(MemoryRecord(
+            kind=MemoryRecordKind.FACT, text=text, subject_key="db",
+            scope=MemoryRecordScope(self.alpha, scoped), origin=SESSION_END,
+            actor=MemoryRecordActor.MODEL, confidence=0.8,
+            classification=DataClassification.INTERNAL, source_conversation_id=source,
+            created_at="2026-10-17T00:00:00+00:00",
+        ), guard=guard, lifetime=lifetime)
+
+    def count(self):
+        with closing(sqlite3.connect(self.database)) as connection:
+            return connection.execute("SELECT COUNT(*) FROM memory_records").fetchone()[0]
+
+    def test_session_record_without_a_conversation_is_refused_before_any_write(self) -> None:
+        for text, lifetime in (("use the staging database for now", None),
+                               ("the build runs on windows", "session"),
+                               ("the build runs on windows", Lifetime.SESSION)):
+            with self.subTest(text=text, lifetime=lifetime):
+                with self.assertRaisesRegex(ValueError, "needs a conversation id"):
+                    self.insert(text, lifetime=lifetime)
+                self.assertEqual(self.count(), 0)
+
+    def test_session_record_with_a_conversation_and_permanent_without_one_insert(self) -> None:
+        self.insert("use the staging database for now", source=self.chat)
+        self.insert("use the staging cache for now", scoped=self.chat)
+        self.insert("the build runs on windows")
+        self.assertEqual(self.count(), 3)
 
 
 if __name__ == "__main__":

@@ -508,5 +508,56 @@ class ImportSafetyTests(unittest.TestCase):
         )
 
 
+class OpenedHandleFinalPathTests(unittest.TestCase):
+    """V21HARD1 C1: the opened handle's final path must be the checked path."""
+
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        self.dir = Path(temp.name)
+        (self.dir / "a").mkdir()
+        (self.dir / "b").mkdir()
+        self.path = self.dir / "a" / "export.json"
+        self.path.write_bytes(b"checked")
+        (self.dir / "b" / "export.json").write_bytes(b"swapped in")
+
+    def read(self):
+        return memory_import._read_path(self.path, 1024, ())
+
+    def test_plain_and_case_only_final_paths_read(self):
+        self.assertEqual(self.read(), b"checked")
+        upper = str(self.path.resolve()).upper()
+        with mock.patch.object(memory_import, "_final_path", return_value=upper):
+            self.assertEqual(self.read(), b"checked")
+
+    def test_named_stream_spelling_is_protected(self):
+        for name in ("server.pem:s", "export.json:hidden"):
+            with self.subTest(name=name):
+                self.assertTrue(memory_import.is_protected_path(self.dir / "a" / name))
+        self.assertFalse(memory_import.is_protected_path(self.path))
+
+    def test_other_or_unverifiable_final_path_refuses(self):
+        for effect in (str(self.dir / "b" / "export.json"),
+                       memory_import.ProtectedPathError("cannot verify the opened export path")):
+            with self.subTest(effect=effect), \
+                    mock.patch.object(memory_import, "_final_path", side_effect=[effect]), \
+                    self.assertRaises(memory_import.ProtectedPathError):
+                self.read()
+
+    def test_parent_directory_swapped_for_a_junction_after_the_checks_refuses(self):
+        if os.name != "nt":
+            self.skipTest("junctions are Windows-only")
+        import _winapi
+
+        def swap_then_open(file, *args, **kwargs):
+            (self.dir / "a").rename(self.dir / "a-old")
+            _winapi.CreateJunction(str(self.dir / "b"), str(self.dir / "a"))
+            return open(file, *args, **kwargs)
+
+        with mock.patch.object(memory_import, "open", side_effect=swap_then_open, create=True), \
+                self.assertRaisesRegex(memory_import.ProtectedPathError, "changed while it was opened"):
+            self.read()
+
+
 if __name__ == "__main__":
     unittest.main()

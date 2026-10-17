@@ -38,11 +38,12 @@ class ApproveSupersedeTests(unittest.TestCase):
         self.beta = self.store.create_project("Beta").id
 
     def insert(self, text, *, day, kind=K.DECISION, subject="deploy-day", project=None,
-               conversation=None, origin=MemoryRecordOrigin.CAPTURE_SESSION_END, at=None) -> str:
+               conversation=None, origin=MemoryRecordOrigin.CAPTURE_SESSION_END, at=None,
+               source=None) -> str:
         project = project or self.alpha
         record = MemoryRecord(
             kind=kind, text=text, subject_key=subject,
-            scope=MemoryRecordScope(project, conversation),
+            scope=MemoryRecordScope(project, conversation), source_conversation_id=source,
             origin=origin, actor=MemoryRecordActor.MODEL, confidence=0.8,
             classification=DataClassification.INTERNAL,
             created_at=at or f"2026-10-{day:02d}T00:00:00+00:00",
@@ -88,10 +89,12 @@ class ApproveSupersedeTests(unittest.TestCase):
     def test_a_different_lifetime_never_supersedes(self) -> None:
         # A1: a SESSION ("for now") approval must not hide the PERMANENT
         # project record from other conversations, nor the reverse.
+        # V21HARD1 A4: a SESSION record names the conversation it came from.
+        source = self.store.create_conversation(self.alpha).id
         for kind in (K.DECISION, K.PREFERENCE):
             permanent = self.approved(f"Deploy on Fridays {kind.value}", day=1, kind=kind, subject=kind.value)
             session = self.approved(f"For now deploy on Thursdays {kind.value}", day=2, kind=kind,
-                                    subject=kind.value)
+                                    subject=kind.value, source=source)
             self.assertEqual(("permanent", "session"),
                              (self.store.record_lifetime(permanent).value, self.store.record_lifetime(session).value))
             self.assertIs(S.APPROVED, self.status(permanent), kind)

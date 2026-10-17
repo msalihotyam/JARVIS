@@ -7208,6 +7208,17 @@ class SQLiteMemoryStore:
         decided = decide_lifetime(
             stored.text, requested=decide_lifetime(record.text, requested=lifetime)
         )
+        # A SESSION record is visible only to its conversation: a generic
+        # (model/tool/import) writer without one would leave an invisible
+        # orphan, so it is refused before any write. The human explicit path
+        # and the legacy migration keep their record (it expires).
+        if (
+            decided is Lifetime.SESSION
+            and legacy_id is None
+            and record.actor is not MemoryRecordActor.USER
+            and not (stored.scope.conversation_id or stored.source_conversation_id)
+        ):
+            raise ValueError("a session memory record needs a conversation id")
         cap = expires_for(decided, datetime.fromisoformat(stored.created_at))
         if cap is not None and (
             stored.expires_at is None or datetime.fromisoformat(stored.expires_at) > cap

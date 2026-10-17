@@ -160,6 +160,9 @@ def is_protected_path(
     # \\?\ and UNC spellings dodge the root comparison (and a share is a network read).
     if str(candidate).startswith(("\\\\", "//")):
         return True
+    # An NTFS stream ("x.pem:s") hides the secret suffix; no export path needs one.
+    if ":" in os.path.splitdrive(str(candidate))[1]:
+        return True
     if any(part.lower().startswith(".env") for part in candidate.parts):
         return True
     if candidate.name.lower().endswith(_SECRET_SUFFIXES):
@@ -178,6 +181,33 @@ def _within(candidate: Path, root: Path) -> bool:
         return os.path.commonpath([child, parent]) == parent
     except ValueError:  # different drives
         return False
+
+
+def _final_path(fd: int, resolved: Path) -> str:
+    """The path the OS reports for the opened ``fd``; any failure refuses."""
+    if os.name != "nt":
+        # ponytail: realpath re-walks the name, not the handle; POSIX has no
+        # portable fd->path, use /proc/self/fd or F_GETPATH if ever needed.
+        return os.path.realpath(resolved)
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    get_final = ctypes.WinDLL("kernel32", use_last_error=True).GetFinalPathNameByHandleW
+    get_final.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    get_final.restype = wintypes.DWORD
+    size = 32_768
+    buffer = ctypes.create_unicode_buffer(size)
+    try:
+        length = get_final(msvcrt.get_osfhandle(fd), buffer, size, 0)
+    except OSError as exc:
+        raise ProtectedPathError("cannot verify the opened export path") from exc
+    if not 0 < length < size:
+        raise ProtectedPathError("cannot verify the opened export path")
+    final = buffer.value
+    if not final.startswith("\\\\?\\") or final.upper().startswith("\\\\?\\UNC\\"):
+        raise ProtectedPathError("refusing to read a network or device path")
+    return final[4:]
 
 
 def _read_path(
@@ -204,6 +234,14 @@ def _read_path(
             raise ProtectedPathError("refusing to read a hard-linked file")
         if not os.path.samestat(info, os.lstat(resolved)):
             raise ProtectedPathError("export path changed while it was opened")
+        # samestat sees the last component only: a parent directory swapped
+        # for a junction or link after the checks still lstat-matches. The
+        # OPENED handle's final path must be the checked path, unprotected.
+        final = _final_path(handle.fileno(), resolved)
+        if os.path.normcase(final) != os.path.normcase(str(resolved)):
+            raise ProtectedPathError("export path changed while it was opened")
+        if is_protected_path(final, extra_roots):
+            raise ProtectedPathError("refusing to read a protected path")
         if info.st_size > max_bytes:
             raise ImportTooLargeError(f"file is over {max_bytes} bytes")
         raw = handle.read(max_bytes + 1)

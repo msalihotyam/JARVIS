@@ -1023,10 +1023,29 @@ def _proved_file_taint(relative: Any, roots: Sequence[Path]) -> SessionTaint:
         return SessionTaint.IMPORT
     if "/" not in relative and "\\" not in relative:
         return SessionTaint.IMPORT
+    if ".." in relative.replace("\\", "/").split("/"):
+        return SessionTaint.IMPORT
+    # The taint is never laundered through a second root: the originating
+    # root is the ONE root the file exists under (else, when it exists under
+    # none, the one root the path proves under), and a root where it exists
+    # but escapes (a link out) refuses. Two candidates cannot say which root
+    # the connector read, so they are ``import``. The read and write
+    # connectors usually share a root: it counts once.
+    # ponytail: the turn carries no root, so an escaping link removed after
+    # the read is not seen; carry the root in the envelope to close it.
+    proving: set[str] = set()
+    present: set[str] = set()
     for root in roots:
-        if _file_input_taint(os.path.join(root, relative), (root,)) is SessionTaint.LOCAL_TRUSTED_FILE:
-            return SessionTaint.LOCAL_TRUSTED_FILE
-    return SessionTaint.IMPORT
+        joined = os.path.join(root, relative)
+        proved = _file_input_taint(joined, (root,)) is SessionTaint.LOCAL_TRUSTED_FILE
+        key = os.path.normcase(os.path.realpath(root))
+        if os.path.lexists(joined):
+            if not proved:
+                return SessionTaint.IMPORT
+            present.add(key)
+        if proved:
+            proving.add(key)
+    return SessionTaint.LOCAL_TRUSTED_FILE if len(present or proving) == 1 else SessionTaint.IMPORT
 
 
 def _capture_session_taint(
