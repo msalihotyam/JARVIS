@@ -142,21 +142,26 @@ class SkillsBridgeTests(test_ui.UiTestCase):
         self.assertTrue(ui.skillsEnabled)
         self.assertEqual([DRAFT(3)], [d["id"] for d in ui.pendingDrafts])
 
-    def test_sidebar_entry_opens_the_page_in_both_themes(self) -> None:
+    def test_rail_tile_opens_the_page_in_both_themes(self) -> None:
+        # SKTILE (Salih, 2026-10-17): the entry is the summary-rail tile, not a sidebar row.
         general = self.approved(1)
         self.store.mutate(lambda s: replace(s, skills_enabled=False))
         ui = self.bridge()
         root = self.window(ui)
+        pump(50)
+        self.assertIsNone(root.findChild(object, "railSkills"))           # hidden tile: no entry
+        ui.setCardVisible("rail", "memory", False)
+        self.assertTrue(ui.setCardVisible("rail", "skills", True))
         for theme in ("dark", "space"):
             with self.subTest(theme=theme):
                 ui.setTheme(theme)
                 ui.setPage("home")
                 pump(50)
-                self.assertTrue(self.item(root, "sidebarSkills").isVisible())   # shown with the flag off too
-                self.click(root, "sidebarSkills", until=lambda: root.property("loadedPage") == "skills")
+                self.assertTrue(self.item(root, "railSkills").isVisible())      # shown with the flag off too
+                self.click(root, "railSkills", until=lambda: root.property("loadedPage") == "skills")
                 self.assertEqual("skills", ui.page)
                 self.assertEqual("home", ui.prefs.data["page"])     # never persisted: an older build reads home
-                self.assertTrue(self.item(root, "sidebarSkills").property("current"))
+                self.assertEqual("skills", root.property("loadedPage"))
                 self.assertTrue(self.item(root, "skillsOff").isVisible())
                 self.assertEqual([general], [s["id"] for s in ui.skills])
         ui.enableSkills(True)
