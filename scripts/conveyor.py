@@ -33,6 +33,21 @@ ROOT = Path(__file__).resolve().parents[1]  # repo root (scripts/ -> repo)
 SETTINGS = "build/conveyor/lanes.settings.json"
 MAX_LANES = 3
 STALE_LOCK_S = 300
+# CONVSAFE: a pushed range touching these needs Salih's manual key 1 (never auto-approved):
+# CI, its build-time skip/allow lists, the conveyor itself and the Claude config
+PROTECTED_DIRS = (".github/workflows/", ".claude/")
+PROTECTED_FILES = {"scripts/test_parallel.py", "scripts/ci.ps1", "scripts/quality.ps1", "scripts/conveyor.py"}
+SKIPLIST_RE = re.compile(r"(skip|allow)[_-]?list|load[_-]?sensitive", re.I)
+STATE_DOC = "JARVIS_ACTIVE_STATE.md"  # its "- Load-sensitive list" item (scripts/test_parallel.py)
+LOAD_SENSITIVE_RE = re.compile(r"^- Load-sensitive list.*?(?=^- |^#|\Z)", re.M | re.S)
+CLEANUP_RETRY_S = 86400  # a refused rm / worktree removal is retried the next day
+BEAT_S = 60  # the lock heartbeat inside a long pass, at most this often
+API_PAGE_WINDOW_S = 600  # 2+ lanes on API errors this close together: an account/network page
+API_PAGE_EVERY_S = 7200  # ... repeated this often while it lasts, night hours included
+ORCH_STALE_S = 5400  # build/orch/heartbeat older than this: the orchestrator is not touring
+BUDGET_MSGS = 90  # assistant messages before the one wrap-up nudge
+BUDGET_CHECK_S = 600
+BUDGET_NUDGE = "commit the coherent part, list the rest in OPEN ISSUES, write the report"
 PASS_S = 60
 USAGE_S = 1800  # usage ledger cadence (scripts/usage_ledger.py, else the build/conveyor copy)
 CLEANUP_S = 3600  # a finished lane's session is removed this long after its report was collected
@@ -700,6 +715,8 @@ class Conveyor:
         self.auto_file = self.base / "autopilot.json"
         self.breaker = None  # {"reason", "since"} while open (autopilot.json), else None
         self.band = []  # status.json "band" lines (breaker, auto-approval)
+        self.lanes_bad = None  # why lanes.json could not be read this pass: nothing saves over it
+        self.beat_ts = 0
 
     # ---- lock -------------------------------------------------------
     def acquire_lock(self):
@@ -713,7 +730,13 @@ class Conveyor:
         return True
 
     def heartbeat(self):
+        self.beat_ts = self.now()
         self.lock.write_text(json.dumps({"pid": self.pid, "heartbeat": self.now()}))
+
+    def beat(self):
+        """The heartbeat inside a long pass (a lock older than STALE_LOCK_S is taken over)."""
+        if self.now() - self.beat_ts >= BEAT_S and self.own_lock():
+            self.heartbeat()
 
     def own_lock(self):
         try:
@@ -729,10 +752,31 @@ class Conveyor:
             return default
 
     def load_lanes(self):
-        return self.load_json(self.state_file, {})
+        """{} only while lanes.json does not exist; an unreadable one sets lanes_bad instead
+        (pass_once holds everything and save_lanes never writes over it)."""
+        self.lanes_bad = None
+        try:
+            lanes = json.loads(self.state_file.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return {}
+        except (OSError, ValueError) as e:
+            self.lanes_bad = f"{type(e).__name__}: {str(e)[:100]}"
+            return {}
+        if not isinstance(lanes, dict):
+            self.lanes_bad = f"not an object but {type(lanes).__name__}"
+            return {}
+        return lanes
 
     def save_lanes(self, lanes):
-        self.state_file.write_text(json.dumps(lanes, indent=2))
+        if self.lanes_bad:
+            return
+        self.write_atomic(self.state_file, json.dumps(lanes, indent=2))
+
+    def write_atomic(self, path, text):
+        """tmp + os.replace: a crash mid-write never leaves a torn file."""
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(text, encoding="utf-8")
+        os.replace(tmp, path)
 
     def event(self, kind, **kw):
         rec = {"ts": iso(self.now()), "event": kind, **kw}
@@ -747,7 +791,7 @@ class Conveyor:
     def page(self, text):
         p = self.load_json(self.pager_file, {})
         p.setdefault("pending", []).append(text)
-        self.pager_file.write_text(json.dumps(p, ensure_ascii=False), encoding="utf-8")
+        self.write_atomic(self.pager_file, json.dumps(p, ensure_ascii=False))
 
     def flush_pages(self):
         """Send pending pages as one push, at most one push per PAGE_GAP_S."""
@@ -761,14 +805,14 @@ class Conveyor:
             p["last_push"] = self.now()
         if result in ("sent", "no-topic"):
             p["pending"] = []  # on a send error they are retried after the gap
-        self.pager_file.write_text(json.dumps(p, ensure_ascii=False), encoding="utf-8")
+        self.write_atomic(self.pager_file, json.dumps(p, ensure_ascii=False))
 
     def pager_flag(self, key, value=None):
         p = self.load_json(self.pager_file, {})
         if value is None:
             return p.get(key)
         p[key] = value
-        self.pager_file.write_text(json.dumps(p, ensure_ascii=False), encoding="utf-8")
+        self.write_atomic(self.pager_file, json.dumps(p, ensure_ascii=False))
 
     # ---- reports ------------------------------------------------------
     def find_report(self, name, since=0.0, cwd=None):
@@ -832,6 +876,17 @@ class Conveyor:
         self.main_sha = False  # not looked up yet this pass
         self.cc_ok = None  # `claude --version` read again at most once this pass
         lanes = self.load_lanes()
+        if self.lanes_bad:  # never {} saved over it: nothing dispatched, tracked or removed
+            try:
+                since = self.state_file.stat().st_mtime
+            except OSError:
+                since = 0
+            items = [("lanes-invalid", f"lanes.json unreadable ({self.lanes_bad}): dispatch held "
+                                       "until it is fixed by hand", since)]
+            self.write_status({}, items)
+            self.backstop(items)
+            self.flush_pages()
+            return True
         try:
             agents = self.agents()
         except Exception as e:  # keep going, report it
@@ -848,10 +903,12 @@ class Conveyor:
             self.track(lanes, agents)
         self.ci_wait(lanes)  # before the autopilot: a CI result is acted on in the same pass
         self.autopilot(lanes)  # before dispatch: a new fix lane or an open breaker counts now
+        self.beat()
         if agents is not None:
             self.dispatch(lanes, agents)
             self.prioritize(lanes, agents)
         self.save_lanes(lanes)  # before cleanup's slow CLI calls: dispatches are never lost
+        self.beat()
         self.push_gate(lanes)
         items = self.attention(lanes)
         if agents is not None:
@@ -861,8 +918,36 @@ class Conveyor:
             items = self.attention(lanes)  # a lane cleanup just preserved shows at once
         self.write_status(lanes, items)
         self.backstop(items)
+        self.pager_watch(lanes)
         self.flush_pages()
         return agents is not None
+
+    def pager_watch(self, lanes):
+        """Status-only pages (no command, no link), night hours included: 2+ lanes held or
+        STUCK on API errors within API_PAGE_WINDOW_S -> at once and every API_PAGE_EVERY_S
+        while it lasts; build/orch/heartbeat older than ORCH_STALE_S -> once per stale episode."""
+        now = self.now()
+        ts = sorted(ln["api_err_ts"] for ln in lanes.values() if ln.get("api_err_ts") and (
+            (ln.get("paused") and not ln.get("finished"))
+            or (ln.get("status") == "STUCK" and now - ln.get("finished_ts", 0) < API_PAGE_EVERY_S)))
+        f = self.pager_flag("api_outage")
+        if any(b - a <= API_PAGE_WINDOW_S for a, b in zip(ts, ts[1:])):
+            if not f or now - f["paged"] >= API_PAGE_EVERY_S:
+                self.page(f"Konveyor: {len(ts)} lane API hatasında; hesap/ödeme ya da ağ kesintisi olabilir")
+                self.pager_flag("api_outage", {"since": (f or {}).get("since", now), "paged": now})
+        elif f:
+            self.pager_flag("api_outage", False)
+        try:
+            age = now - (self.root / "build" / "orch" / "heartbeat").stat().st_mtime
+        except OSError:
+            age = None  # no orchestrator heartbeat file: nothing to watch
+        stale = self.pager_flag("orch_stale")
+        if age is not None and age > ORCH_STALE_S:
+            if not stale:
+                self.page("Orkestratör 90 dk tur atmadı; sohbete 'devam' yazın")
+                self.pager_flag("orch_stale", now)
+        elif stale:
+            self.pager_flag("orch_stale", False)
 
     def started_ts(self, ln):
         if "started_ts" in ln:
@@ -994,7 +1079,7 @@ class Conveyor:
             err = a is not None and next((v for k, v in a.items() if API_KEY_RE.search(k)
                                           and isinstance(v, str) and API_ERR_RE.search(v)), None)
             if err and err != ln.get("api_err"):  # the same stale text never re-pauses a cleared lane
-                ln.update(paused=True, api_err=err)  # outage(): the hold, its page and its nudges
+                ln.update(paused=True, api_err=err, api_err_ts=self.now())  # outage(): the hold, its page and its nudges
             if ln.get("paused") and a is None:  # its session is gone: the DEAD path, not a held lane
                 ln.pop("paused")
             if ln.get("paused"):
@@ -1021,7 +1106,10 @@ class Conveyor:
             elif a is not None and not ln.get("respawn_pending"):
                 # stopped without finishing or reporting (reboot/sleep): respawn, once per stop
                 ln.update(respawned=True, respawn_pending=True, respawned_ts=self.now())
-                rc, out = self.run(["respawn", ln["id"]])
+                try:
+                    rc, out = self.run(["respawn", ln["id"]])
+                except Exception as e:  # e.g. a timeout: respawn_pending stays, no second respawn
+                    rc, out = type(e).__name__, ""
                 self.event("respawn", lane=name, id=ln["id"], rc=rc, output=out[-300:])
                 if rc != 0:
                     self.error(f"respawn {name} rc={rc}", lane=name)
@@ -1038,6 +1126,8 @@ class Conveyor:
                     self.redispatch(name, ln)
                 continue
             if alive and not interim and self.watch_idle(name, ln, a):  # INTERIM_TIMEOUT_S owns it
+                continue
+            if alive and self.budget(name, ln, a):
                 continue
             self.unblock(name, ln, a)
         self.outage(lanes, by_id)
@@ -1129,6 +1219,36 @@ class Conveyor:
         self.pager_flag("outage", {"since": now, "nudged": now, "why": why, "lanes": hit})
         self.event("outage_hold", why=why, lanes=hit)
         self.page(f"Kesinti şüphesi ({why}): dispatch durdu, {', '.join(hit)} PAUSED")
+
+    def budget(self, name, ln, a):
+        """At BUDGET_MSGS assistant messages the lane is told once to wrap up (BUDGET_NUDGE)."""
+        if ln.get("budget_nudged") or self.now() - ln.get("budget_ts", 0) < BUDGET_CHECK_S:
+            return False
+        ln["budget_ts"] = self.now()
+        if self.messages(a.get("sessionId") or ln["id"]) < BUDGET_MSGS:
+            return False
+        ln["budget_nudged"] = self.now()
+        self.nudge(name, ln, a, BUDGET_NUDGE, "budget_nudge")
+        return True
+
+    def messages(self, sid):
+        """Distinct assistant messages in the session's transcript; a removed file counts 0."""
+        ids = set()
+        for tx in self.projects.glob(f"*/{sid}.jsonl"):
+            try:
+                with open(tx, encoding="utf-8", errors="replace") as f:
+                    for line in f:
+                        if '"assistant"' not in line:
+                            continue
+                        try:
+                            d = json.loads(line)
+                        except ValueError:
+                            continue
+                        if isinstance(d, dict) and d.get("type") == "assistant" and isinstance(d.get("message"), dict):
+                            ids.add(d["message"].get("id") or d.get("uuid"))
+            except OSError:
+                continue
+        return len(ids)
 
     def watch_idle(self, name, ln, a):
         """CONV12 idle-lane watchdog: a live session idle (not blocked: unblock owns that) with no
@@ -1332,7 +1452,10 @@ class Conveyor:
             ln.update(finished=True, status="DEAD", dead=dead, finished_ts=self.now())
             self.event("finish", lane=name, id=ln["id"], status="DEAD", reason=dead)
             return
-        rc, out = self.run(["stop", ln["id"]])
+        try:
+            rc, out = self.run(["stop", ln["id"]])
+        except Exception as e:  # e.g. a timeout: logged like a failed stop
+            rc, out = type(e).__name__, ""
         self.event("stop", lane=name, id=ln["id"], rc=rc, output=out[-300:])
         sid = self.start(name, ln["model"], ln["effort"], header + CONTINUE + rest)
         if sid:
@@ -1354,8 +1477,12 @@ class Conveyor:
         """`claude --bg` one lane; returns its short id or None."""
         if self.cc_hold():  # every dispatch path ends here; not an error, the lane is not failed
             return None
-        rc, out = self.run(["--bg", "--name", name, "--model", model,
-                            "--effort", effort, "--settings", SETTINGS, text])
+        try:
+            rc, out = self.run(["--bg", "--name", name, "--model", model,
+                                "--effort", effort, "--settings", SETTINGS, text])
+        except Exception as e:  # e.g. a timeout: like a failed start, nothing recorded
+            self.error(f"dispatch {name}: {type(e).__name__}")
+            return None
         m = BG_ID_RE.search(out)
         if rc != 0 or not m:
             self.error(f"dispatch {name} rc={rc}", output=out[-300:])
@@ -1373,6 +1500,7 @@ class Conveyor:
         self.last_start = self.now()  # the post-memory-hold dispatch throttle (hold())
         if INT_RE.match(name):  # auto-fix owns the files of the commits this lane picks
             lanes[name]["main_at_start"] = self.main_head()
+        self.save_lanes(lanes)  # a started session is never lost to a later crash
 
     def usage_pct(self):
         """Weekly plan % from the newest jarvis-flow slice-ledger row (claude has no
@@ -1959,6 +2087,10 @@ class Conveyor:
             if why:
                 items.append((n, "; ".join(why), self.since(ln)))
         for n, ln in lanes.items():  # CONV11: one item per preserved lane, until acked
+            c = ln.get("cleanup") or {}
+            if c.get("retry_ts"):
+                items.append((f"cleanup:{n}", f"cleanup refused ({c['reason']}); retried after "
+                                              f"{iso(c['retry_ts'])}", c["ts"]))
             if "preserved" in ln:
                 pv = ln["preserved"]
                 items.append((f"preserved:{n}", f"lane worktree kept (not removed): {pv['reason']}",
@@ -2073,7 +2205,16 @@ class Conveyor:
                 spec = importlib.util.spec_from_file_location("usage_ledger", script)
                 mod = importlib.util.module_from_spec(spec)
                 spec.loader.exec_module(mod)
-                mod.main(out=self.root / "build" / "ledger" / "usage.json")
+                parse = getattr(mod, "parse_files", None)  # a transcript removed since the listing is skipped
+                if parse:
+                    mod.parse_files = lambda files: parse([f for f in files if Path(f).is_file()])
+                self.beat()
+                try:
+                    mod.main(out=self.root / "build" / "ledger" / "usage.json")
+                except FileNotFoundError:  # removed between that check and the read: once more
+                    self.beat()
+                    mod.main(out=self.root / "build" / "ledger" / "usage.json")
+                self.beat()
                 return
 
     # ---- autopilot (CONV7): the three routine orchestrator decisions -----
@@ -2122,7 +2263,7 @@ class Conveyor:
         self.band = (["breaker: open"] if self.breaker else []) + \
             ([f"auto-approved {last[0][:7]}"] if last and self.now() - last[1] < AUTO_LINE_S else [])
         try:
-            self.auto_file.write_text(json.dumps(ap, indent=2), encoding="utf-8")
+            self.write_atomic(self.auto_file, json.dumps(ap, indent=2))
         except OSError as e:  # e.g. a sharing violation: the next pass re-reads the old state
             self.error(f"autopilot.json: {e}")
 
@@ -2212,7 +2353,41 @@ class Conveyor:
             return why, None, None
         if got != sha or runs.pop() not in CI_RUN_RE.findall(url or ""):
             return "the CI run the gate verified is not the report's", None, None
+        why = self.protected_change(sha)
+        if why:
+            return why, None, None
         return None, approval, url
+
+    def protected_change(self, sha):
+        """Why origin/main..sha needs Salih's manual key 1 (it touches PROTECTED_DIRS,
+        PROTECTED_FILES, a skip/allow list or the state file's load-sensitive list), else None.
+        Fail closed: any git error is a reason."""
+        manual = "needs Salih's manual key 1"
+        try:
+            rc, om = self.cmd(["git", "rev-parse", "--verify", "refs/remotes/origin/main"])
+            if rc == 0:
+                rc, out = self.cmd(["git", "diff", "--name-only", "--no-renames", f"{om.strip()}..{sha}"])
+            if rc != 0:
+                return f"protected-path check: git rc={rc}; {manual}"
+            for p in out.splitlines():
+                if p.startswith('"'):  # a quoted (non-ASCII) path cannot be matched: fail closed
+                    return f"protected-path check: quoted path {p}; {manual}"
+                p = p.strip().replace("\\", "/")
+                if p.startswith(PROTECTED_DIRS) or p in PROTECTED_FILES or SKIPLIST_RE.search(p):
+                    return f"the range touches {p}: {manual}"
+                if p == STATE_DOC:
+                    lists = []
+                    for rev in (om.strip(), sha):
+                        rc, text = self.cmd(["git", "show", f"{rev}:{STATE_DOC}"])
+                        if rc != 0:
+                            return f"protected-path check: git show {STATE_DOC} rc={rc}; {manual}"
+                        m = LOAD_SENSITIVE_RE.search(text)
+                        lists.append(m and m.group(0))
+                    if lists[0] != lists[1]:
+                        return f"the range changes the {STATE_DOC} load-sensitive list: {manual}"
+        except Exception as e:  # a timeout etc.
+            return f"protected-path check: git failed ({type(e).__name__}); {manual}"
+        return None
 
     def main_and_ci(self, text):
         """(None, sha40, ci name) from a report's single 'NEW MAIN SHA: <40 hex>' line and single
@@ -2272,6 +2447,16 @@ class Conveyor:
             return self.ci_slow(name, ln, why, error=True)
         if state == "pending":
             return self.ci_slow(name, ln, why)
+        if state == "cancelled" and not ln["ci"].get("rerun"):  # cancel-in-progress: not a failure
+            m = CI_RUN_RE.search(url or "")
+            try:
+                rc, _ = self.cmd(["gh", "run", "rerun", m.group(1)]) if m else (1, "")
+            except Exception as e:
+                rc = type(e).__name__
+            ln["ci"]["rerun"] = True  # once: a second cancellation is a result
+            self.event("ci_rerun", lane=name, sha=ci["sha"], url=url, rc=rc)
+            if rc == 0:
+                return self.ci_slow(name, ln, "the cancelled run was re-run once")
         line = f"CI: {url} {state}"
         try:
             with open(ln["report"], "a", encoding="utf-8") as f:  # appended, the lane's lines untouched
@@ -2385,7 +2570,7 @@ class Conveyor:
         afx, r = f"{name}-AFX", f"{name}-R"
         main, ci = self.main_head(), ln.get("ci")
         kw = {"INT": name, "AFX": afx, "R": r, "REPORT": ln["report"], "MAIN": main or "",
-              "BRANCH": afx.lower(), "RBRANCH": r.lower()}
+              "BRANCH": afx.lower(), "RBRANCH": f"{name.lower()}-2"}  # each attempt its own ci/ branch
         if ci is None:
             text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
             tests = sorted(set(TEST_ID_RE.findall(text)))
@@ -2642,13 +2827,20 @@ class Conveyor:
         """Stop (if alive) and `claude rm` the sessions of lanes this conveyor started
         (lanes.json only) that finished by report or STUCK at least CLEANUP_S ago, are not
         in attention, and whose usage the ledger has counted since. Any doubt leaves the
-        session; a stop/rm error leaves it for good (ln["cleanup"] records it)."""
+        session; a stop error leaves it for good (ln["cleanup"] records it), a refused rm is
+        retried after CLEANUP_RETRY_S. Then the lane's worktree and branch (worktree_step)."""
         ledger_ran, done = False, 0
         for name, ln in lanes.items():
             if done >= CLEANUP_PER_PASS:
                 return
-            if (not ln.get("finished") or "cleanup" in ln or "preserved" in ln
-                    or name in attention_ids):
+            c = ln.get("cleanup") or {}
+            if (not ln.get("finished") or "preserved" in ln or name in attention_ids
+                    or (c and self.now() < c.get("retry_ts", float("inf")))):
+                continue
+            self.beat()  # each removal is several slow CLI calls
+            if c.get("step") == "worktree":  # its sessions are gone: only the worktree is left
+                done += 1
+                self.worktree_step(name, ln)
                 continue
             t = self.collected_ts(ln)
             if t is None or self.now() - t < CLEANUP_S:
@@ -2708,13 +2900,64 @@ class Conveyor:
             ln["cleanup"] = {"at": iso(self.now()), "result": "removed" if ok else "error",
                              "ids": [a["id"] for a in sess]}
             self.event("cleanup", lane=name, result=ln["cleanup"]["result"], steps=steps)
-            if not ok:
+            if ok:
+                self.worktree_step(name, ln)
+            else:
                 self.error(f"cleanup {name}: {steps[-1]['cmd']} rc={steps[-1]['rc']}", lane=name)
-                if steps[-1]["cmd"] == "rm" and self.worktree_of(sess[-1]):
+                if steps[-1]["cmd"] == "rm":
                     # refused although the branch is integrated (`claude rm --discard-unpushed`
-                    # would also drop uncommitted changes: never passed): keep, do not retry
-                    self.preserve(ln, name, f"claude rm refused: {steps[-1]['output'][-150:]}",
-                                  None, None)
+                    # would also drop uncommitted changes: never passed): retried the next day
+                    self.retry_cleanup(name, ln, "rm", f"claude rm refused: {steps[-1]['output'][-150:]}")
+
+    def retry_cleanup(self, name, ln, step, reason):
+        """An event and an attention item (cleanup:<lane>); the step is retried after CLEANUP_RETRY_S."""
+        ln["cleanup"].update(step=step, reason=reason, ts=self.now(), retry_ts=self.now() + CLEANUP_RETRY_S)
+        self.event("cleanup_refused", lane=name, step=step, reason=reason)
+
+    def worktree_step(self, name, ln):
+        why = self.remove_worktree(name, ln)
+        if why:
+            self.retry_cleanup(name, ln, "worktree", why)
+        else:
+            for k in ("step", "reason", "ts", "retry_ts"):
+                ln["cleanup"].pop(k, None)
+
+    def remove_worktree(self, name, ln):
+        """Remove the lane's worktree (lanes.json ln["worktree"]) when it is clean and its branch
+        is all on main (`git cherry main <branch>`: only '-'), then delete that branch under the
+        same proof. None when done or nothing to do, else why not (fail closed: any git error)."""
+        c = ln["cleanup"]
+        wt = self.worktree_of({"cwd": ln.get("worktree")})
+        try:
+            if wt is not None and wt.exists():
+                rc, out = self.cmd(["git", "-C", str(wt), "status", "--porcelain"])
+                if rc != 0 or out.strip():
+                    return f"worktree {wt.name} not clean (git status rc={rc})"
+                kept = self.unintegrated({"cwd": str(wt)})
+                if kept:
+                    return kept[0]
+                rc, branch = self.branch_of(wt)
+                if rc != 0 or not branch or branch == "main" or branch.startswith("ci/"):
+                    return f"worktree branch {branch} not removable (rc={rc})"
+                c["branch"] = branch  # a retry after the worktree is gone still knows it
+                rc, out = self.cmd(["git", "worktree", "remove", str(wt)])  # never --force
+                if rc != 0:
+                    return f"git worktree remove rc={rc}: {out[-150:]}"
+                self.event("worktree_removed", lane=name, path=str(wt), branch=branch)
+            branch = c.get("branch")
+            if not branch:
+                return None
+            rc, out = self.cmd(["git", "cherry", "main", branch])
+            if rc != 0 or any(x.startswith("+") for x in out.splitlines()):
+                return f"branch {branch} kept: not provably on main (git cherry rc={rc})"
+            rc, out = self.cmd(["git", "branch", "-D", branch])
+            if rc != 0:
+                return f"git branch -D {branch} rc={rc}: {out[-150:]}"
+            c.pop("branch")
+            self.event("branch_deleted", lane=name, branch=branch)
+        except Exception as e:  # a timeout etc.
+            return f"git failed: {type(e).__name__}"
+        return None
 
     def worktree_of(self, a):
         """The session's lane worktree path under <root>/.claude/worktrees, else None
@@ -2734,15 +2977,9 @@ class Conveyor:
         if wt is None:
             return None
         try:
-            rc, out = self.cmd(["git", "worktree", "list", "--porcelain"])
+            rc, branch = self.branch_of(wt)
             if rc != 0:
                 return f"git worktree list rc={rc}", None, None
-            branch, cur = None, None
-            for line in out.splitlines():
-                if line.startswith("worktree "):
-                    cur = Path(os.path.normcase(os.path.abspath(line[9:].strip())))
-                elif line.startswith("branch refs/heads/") and cur == wt:
-                    branch = line[len("branch refs/heads/"):].strip()
             if not branch:
                 return "worktree branch unknown", None, None
             rc, out = self.cmd(["git", "cherry", "main", branch])
@@ -2755,6 +2992,17 @@ class Conveyor:
                 sha = line[1:].strip()
                 return f"{branch} has commits not on main (first {sha[:7]})", branch, sha
         return None
+
+    def branch_of(self, wt):
+        """(rc, the branch checked out at worktree wt or None) from `git worktree list --porcelain`."""
+        rc, out = self.cmd(["git", "worktree", "list", "--porcelain"])
+        branch, cur = None, None
+        for line in out.splitlines() if rc == 0 else []:
+            if line.startswith("worktree "):
+                cur = Path(os.path.normcase(os.path.abspath(line[9:].strip())))
+            elif line.startswith("branch refs/heads/") and cur == wt:
+                branch = line[len("branch refs/heads/"):].strip()
+        return rc, branch
 
     def preserve(self, ln, name, reason, branch, sha):
         """Mark the lane preserved (the orchestrator removes the mark by hand): never rm'd again."""

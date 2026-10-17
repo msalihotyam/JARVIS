@@ -110,7 +110,7 @@ class FakeGit:
         self.calls = []
         self.main, self.origin = MAIN, ORIGIN
         self.fail = {}  # args prefix tuple -> (rc, output) answered instead
-        self.diff = "jarvis/core.py\nscripts/conveyor.py\n"
+        self.diff = "jarvis/core.py\n"  # CONVSAFE: scripts/conveyor.py needs the manual key 1
         self.memory = {ORIGIN: SCHEMA, MAIN: SCHEMA}
         self.contains = "  origin/ci/p2b\n  origin/feature\n"
         self.runs = [{"headSha": MAIN, "status": "completed", "conclusion": "success",
@@ -133,7 +133,7 @@ class FakeGit:
             return 0, self.origin + "\n"
         if a == ("git", "merge-base", "--is-ancestor", self.origin, self.main):
             return 0, ""
-        if a == ("git", "diff", "--name-only", f"{self.origin}..{self.main}"):
+        if a[:3] == ("git", "diff", "--name-only") and a[-1] == f"{self.origin}..{self.main}":
             return 0, self.diff
         if a[:2] == ("git", "show") and a[2].endswith(":jarvis/memory.py"):
             text = self.memory.get(a[2].split(":")[0])
@@ -2475,7 +2475,8 @@ class TestPreserved(Base):
         return p.stdout.strip()
 
     def run_git(self, args, timeout=120):
-        if args[:2] not in (["git", "worktree"], ["git", "cherry"]):
+        if args[:2] not in (["git", "worktree"], ["git", "cherry"], ["git", "-C"]) \
+                and args[:3] != ["git", "branch", "-D"]:
             return self.git(args, timeout)  # the fake main/origin of every other test
         if self.git_fail:
             return self.git_fail
@@ -2514,6 +2515,10 @@ class TestPreserved(Base):
         self.assertNotIn("preserved", self.lanes()["A"])
         self.c.pass_once()
         self.assertEqual(len(self.cli("rm")), 1)
+        self.assertFalse(self.wt.exists())  # CONVSAFE: the clean, integrated worktree and branch go too
+        self.assertEqual(self.g("branch", "--list", "lane-a"), "")
+        self.assertEqual([e["lane"] for e in self.events() if e["event"] in ("worktree_removed", "branch_deleted")],
+                         ["A", "A"])
 
     def test_unintegrated_commit_is_preserved_without_rm(self):
         sha = self.lane_commit()
@@ -2532,17 +2537,24 @@ class TestPreserved(Base):
         self.run_cleanup()
         self.assertIn("unknown", self.assert_preserved_once()["reason"])
 
-    def test_rm_refused_for_integrated_branch_is_preserved(self):
+    def test_rm_refused_for_integrated_branch_is_retried_next_day(self):
         self.fake.rm_rc = 1
         sid = self.run_cleanup()
         self.assertEqual(self.cli("rm"), [["rm", sid]])
-        self.assertIn("refused", self.lanes()["A"]["preserved"]["reason"])
+        self.assertIn("refused", self.lanes()["A"]["cleanup"]["reason"])
+        self.assertNotIn("preserved", self.lanes()["A"])
         for _ in range(3):
             self.t += 60
             self.c.pass_once()
         self.assertEqual(len(self.cli("rm")), 1)
-        self.assertEqual([i["id"] for i in self.status()["attention"] if i["id"].startswith("preserved:")],
-                         ["preserved:A"])
+        self.assertEqual([i["id"] for i in self.status()["attention"] if i["id"].startswith("cleanup:")],
+                         ["cleanup:A"])
+        self.assertEqual(len([e for e in self.events() if e["event"] == "cleanup_refused"]), 1)
+        self.fake.rm_rc = 0
+        self.t = self.lanes()["A"]["cleanup"]["retry_ts"]
+        self.c.pass_once()
+        self.assertEqual(len(self.cli("rm")), 2)
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
 
 
 class TestEarlyStop(Base):
@@ -3354,8 +3366,15 @@ class TestCIHandoff(AutopilotBase):
                 self.int_lane("INT1", SHA_A)
                 self.pending("INT1", SHA_A)
                 self.git.ci(SHA_A, conclusion)
+                if conclusion == "cancelled":  # CONVSAFE: re-run once, a second cancellation is the result
+                    self.git.fail[("gh", "run", "rerun")] = (0, "")
+                    self.c.pass_once()
+                    self.assertEqual(self.lanes()["INT1"]["status"], "CI_PENDING")
+                    self.assertEqual([e["lane"] for e in self.ev("ci_rerun")], ["INT1"])
+                    self.t += 60
                 self.c.pass_once()
                 self.assertEqual(self.lanes()["INT1"]["status"], "BLOCKED")
+                self.assertEqual(len(self.ev("ci_rerun")), conclusion == "cancelled")
                 line = f"CI: https://github.com/x/y/actions/runs/10 {conclusion}"
                 self.assertTrue(self.text("INT1").endswith(f"\n{line}\n"))
                 self.assertEqual((self.approvals(), self.git.pushes()), ([], []))
@@ -3366,6 +3385,7 @@ class TestCIHandoff(AutopilotBase):
                               "auto-fix skipped: CI-handoff lane without its own failed CI run", item["reason"])
 
     def test_ci_failure_queues_one_fix_chain_and_the_rerun_goes_green(self):
+        self.git.diff = "jarvis/core.py\nscripts/conveyor.py\n"
         self.int_lane("INT1", SHA_A)  # dispatched while local main is MAIN
         self.pending("INT1", SHA_A)
         self.git.ci(SHA_A, "failure")
@@ -3387,9 +3407,10 @@ class TestCIHandoff(AutopilotBase):
         call = self.fake.bg_calls()[-1]
         self.assertEqual(call[:3], ["--bg", "--name", "INT1-R"])
         for part in (f"Local main already holds INT1's picks ({SHA_A}; CI run 10 failed)",
-                     "CI BRANCH: ci/int1-r", "build/reports/INT1-R.md"):
+                     "CI BRANCH: ci/int1-2", "build/reports/INT1-R.md"):
             self.assertIn(part, call[-1])
         self.assertTrue(call[-1].endswith("INTEGRATE\n"))
+        self.git.diff = "jarvis/core.py\n"  # CONVSAFE: a conveyor.py range needs the manual key 1
         self.git.main = SHA_B  # the fix commit on top of the failed sha
         self.pending("INT1-R", SHA_B)
         self.assertEqual(self.lanes()["INT1-R"]["status"], "CI_PENDING")  # not stacked on failed INT1
@@ -4217,6 +4238,66 @@ class TestConvHealAutoFix(AutopilotBase):
         self.finish("INT9-AFX", "BLOCKED", "NEEDS FILES: jarvis/b.py\n")
         (ev,) = self.ev("resume_in_place")
         self.assertEqual(ev["lane"], "INT9-AFX")
+
+
+class TestConvSafe(AutopilotBase):
+    """CONVSAFE: protected paths need the manual key 1; unreadable lanes.json holds; status pages."""
+
+    def setUp(self):
+        super().setUp()
+        self.git = self.c.cmd = StackGit([ORIGIN, SHA_A, SHA_B])
+
+    def int_lane(self, name, main):
+        """Dispatch integration lane `name` from the inbox; it then commits up to `main`."""
+        self.drop(f"{name}.md", INT_HDR.format(name) + "INTEGRATE\n")
+        self.c.pass_once()
+        self.assertIn(name, self.fake.bg_names())
+        self.git.main = main
+        self.t += 60
+
+    def pending(self, name, sha):
+        self.finish(name, "CI_PENDING", f"NEW MAIN SHA: {sha}\nCI: pushed ci/{name.lower()}, run in progress\n")
+
+    def test_protected_path_gets_no_automatic_key1(self):
+        for path in ("scripts/conveyor.py", "scripts/ci.ps1", ".github/workflows/tests.yml",
+                     ".claude/settings.json", "tests/load_sensitive_list.txt", '"\\303\\274.txt"'):
+            with self.subTest(path):
+                self.tearDown()
+                self.setUp()
+                self.git.diff = f"jarvis/core.py\n{path}\n"
+                self.int_lane("INT1", SHA_A)
+                self.pending("INT1", SHA_A)
+                self.git.ci(SHA_A)
+                self.c.pass_once()
+                self.assertEqual(self.lanes()["INT1"]["status"], "GREEN")
+                self.assertEqual((self.ev("auto_approve"), self.approvals(), self.git.pushes()), ([], [], []))
+
+    def test_unreadable_lanes_json_holds_dispatch_and_is_never_overwritten(self):
+        f = self.base / "lanes.json"
+        f.write_text("{bad", encoding="utf-8")
+        self.drop("a.md", HDR.format("A"))
+        self.c.pass_once()
+        self.assertEqual(f.read_text(encoding="utf-8"), "{bad")
+        self.assertEqual(self.fake.bg_names(), [])
+        self.assertIn("lanes-invalid", [a["id"] for a in self.status()["attention"]])
+
+    def test_api_outage_and_stale_orchestrator_pages(self):
+        def pages(word):
+            return [p for p in json.loads(self.c.pager_file.read_text(encoding="utf-8"))["pending"] if word in p]
+        lanes = {n: {"paused": True, "api_err_ts": self.t - k} for n, k in (("A", 0), ("B", 300))}
+        self.c.pager_watch(lanes)
+        self.c.pager_watch(lanes)
+        self.assertEqual(len(pages("hesap")), 1)
+        self.t += conveyor.API_PAGE_EVERY_S
+        self.c.pager_watch(lanes)
+        self.assertEqual(len(pages("hesap")), 2)
+        hb = self.root / "build" / "orch" / "heartbeat"
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.write_text("")
+        os.utime(hb, (self.t - conveyor.ORCH_STALE_S - 60,) * 2)
+        self.c.pager_watch({})
+        self.c.pager_watch({})
+        self.assertEqual(len(pages("devam")), 1)
 
 
 if __name__ == "__main__":
