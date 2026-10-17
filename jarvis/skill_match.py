@@ -17,7 +17,13 @@ that the task covers. A skill FITS when the score is at least
 them is in the skill's name or summary, and the coverage is at least
 ``FIT_MIN_COVERAGE``; so a broad skill whose summary names many other things
 (a delete step before an email step, say) is not a fit for a narrow task
-that shares two of its words. A skill is SIMILAR when the score is at least
+that shares two of its words. A fit is a near-identical request (SKSIMASK,
+Salih 2026-10-17): the request (once Core strips declared inputs) must
+equal the skill's name or summary word for word, stop words and question
+marks included, and every task word the skill's text does not bind leaves
+it SIMILAR; so a paraphrase, a reorder, a dropped or extra word, a
+question, an antonym, a swapped qualifier or a retraction is only asked
+about, never auto-run. A skill is SIMILAR when the score is at least
 ``SIMILAR_MIN_SCORE`` with at least ``SIMILAR_MIN_MATCHED`` matched words.
 A one-word task is therefore never a fit.
 
@@ -203,7 +209,9 @@ _NEGATIVE_ENDINGS_TEXT = (
 )
 _NEGATIVE_ENDING_STARTS_TEXT = (
     "mıyor miyor muyor müyor madı medi mamış memiş mayacak meyecek mayacağ "
-    "meyeceğ maz mez mam mem mayız meyiz yama yeme ama eme meksizin maksızın mesene masana"
+    "meyeceğ maz mez mam mem mayız meyiz yama yeme ama eme meksizin maksızın mesene masana "
+    # Colloquial future and progressive ("özetle" + "micem", "miycem", "miyom").
+    "mıca mice muca müce mıyc miyc muyc müyc mıyo miyo muyo müyo"
 )
 # A passive ("silin" + "mesin", "özetlen" + "me") is the verb plus one of these
 # and a negative ending starting with "m".
@@ -677,6 +685,18 @@ def _without_placeholders(text: str) -> str:
     return _PLACEHOLDER.sub(" ", text)
 
 
+def _said(text: str) -> tuple[str, ...]:
+    """A text's folded words in order, stop words kept, then one "?" per question mark."""
+    folded = fold_token(_without_placeholders(text))
+    return tuple(_WORD_RUN.findall(folded)) + ("?",) * folded.count("?")
+
+
+@lru_cache(maxsize=CACHE_MAX)
+def _skill_said(skill: Skill) -> frozenset[tuple[str, ...]]:
+    """The skill's own texts a near-identical request must equal: name and summary."""
+    return frozenset({_said(skill.name), _said(skill.summary)})
+
+
 @lru_cache(maxsize=CACHE_MAX)
 def _skill_words(skill: Skill) -> _SkillWords:
     """A skill's words, bounded per field, per skill and in number.
@@ -1019,10 +1039,12 @@ def _assess(
     request: _CueText,
     literals: tuple[str, ...],
     truncated: bool,
+    said: tuple[str, ...],
 ) -> tuple[MatchKind, int, int, tuple[str, ...]]:
     index = _skill_words(skill)
     body_hits = task.hits(index.body)
     matched = [word for word in task.words if word in body_hits]
+    unbound = [word for word in task.words if word not in body_hits]
     score = 100 * len(matched) // len(task.words)
     if score < SIMILAR_MIN_SCORE or len(matched) < SIMILAR_MIN_MATCHED:
         return MatchKind.NONE, score, 0, ()
@@ -1031,11 +1053,14 @@ def _assess(
     head_size = len(index.headline.exact)
     covered = task.covered(index.headline)
     coverage = 100 * covered // head_size if head_size else 0
+    own_text = said in _skill_said(skill)
     fit = (
-        score >= FIT_MIN_SCORE
+        own_text
+        and score >= FIT_MIN_SCORE
         and len(matched) >= FIT_MIN_MATCHED
         and bool(in_headline)
         and coverage >= FIT_MIN_COVERAGE
+        and not unbound
         and not truncated
     )
     conflicts = _conflicts(skill, index.body, request, literals, task.words) if fit else []
@@ -1051,6 +1076,8 @@ def _assess(
         f"coverage {coverage}: {covered} of {head_size} name and summary words matched"
     )
     if kind is MatchKind.SIMILAR:
+        if not own_text:
+            reasons.append("not a fit: request is not the skill's own text (name or summary)")
         if score < FIT_MIN_SCORE:
             reasons.append(f"not a fit: score below {FIT_MIN_SCORE}")
         if len(matched) < FIT_MIN_MATCHED:
@@ -1059,6 +1086,8 @@ def _assess(
             reasons.append("not a fit: no task word in its name or summary")
         if coverage < FIT_MIN_COVERAGE:
             reasons.append(f"not a fit: coverage below {FIT_MIN_COVERAGE}")
+        if unbound:
+            reasons.append(_named("not a fit: request words the skill does not bind", unbound))
         if truncated:
             reasons.append("not a fit: request too long to read whole")
         reasons.extend(conflicts)
@@ -1145,6 +1174,7 @@ def match_skills(
     task = _TaskWords.build(task_words)
     request = _CueText.read(folded)
     literals = _literals(task_text)
+    said = _said(task_text)
 
     ranked: list[tuple[tuple, MatchCandidate]] = []
     stale: list[tuple[tuple, MatchCandidate]] = []
@@ -1158,7 +1188,7 @@ def match_skills(
             target = stale
         else:  # disabled, deleted, or anything unknown: never offered
             continue
-        kind, score, coverage, reasons = _assess(skill, task, request, literals, truncated)
+        kind, score, coverage, reasons = _assess(skill, task, request, literals, truncated, said)
         if kind is MatchKind.NONE:
             continue
         if target is stale:

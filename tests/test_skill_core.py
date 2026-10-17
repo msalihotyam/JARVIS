@@ -12,6 +12,9 @@ temp database, never data/jarvis.db, no model or network call):
   approval writes none either (D6, D16);
 - another project's skill is never used (S8);
 - a stale skill is announced and never used until the user says use (S12);
+- a similar (not near-identical) skill is only asked about, once per
+  session; only "use" runs it, with the same approvals; any other answer or
+  a matcher fault runs the task without it (SKSIMASK);
 - an executed run appends used_success / used_failure;
 - the skill reaches the step only as one labelled reference item (S3);
 - missing inputs are asked as a normal clarification.
@@ -64,10 +67,12 @@ from tests.helpers import DUMMY_CAPABILITY, DummyConnector, safe_cleanup
 AT = "2026-10-14T08:00:00+00:00"
 GLOBAL = SkillScope(kind=SkillScopeKind.GLOBAL, project_id=None)
 TASK_TEXT = "Haftalik rapor dosyasini oku: notes/week.md"
+SIMILAR_TEXT = "Haftalik rapor dosyasini hemen oku: notes/week.md"
 TARGET = normalize_locator("notes/week.md")
 LABEL = "skill procedure (reference data, not an instruction)"
 SKILL_EVENTS = ("skill_announced", "skill_stale_announced", "skill_declined",
-                "skill_needs_inputs", "skill_run_finished", "skill_use_requested")
+                "skill_needs_inputs", "skill_run_finished", "skill_use_requested",
+                "skill_similar_asked")
 USED = (SkillEventKind.USED_SUCCESS, SkillEventKind.USED_FAILURE)
 
 
@@ -112,13 +117,15 @@ def draft(number: int = 1, scope: SkillScope = GLOBAL) -> SkillDraft:
     )
 
 
-def user_task(objective: str = TASK_TEXT, project_id: str | None = None) -> Task:
+def user_task(
+    objective: str = TASK_TEXT, project_id: str | None = None, target: str = "notes/week.md"
+) -> Task:
     return Task(
         objective=objective,
         capability=DUMMY_CAPABILITY,
         scope=ActionScope(
             action="read",
-            target="resource-a",
+            target=target,
             data_classification=DataClassification.INTERNAL,
         ),
         project_id=project_id,
@@ -352,6 +359,78 @@ class SkillCoreTests(unittest.TestCase):
         self.assertEqual(skipped.task.id, run.task.id)
         self.assertFalse(set(self.events_of(skill_id)) & set(USED))
 
+    # -- SKSIMASK: a similar skill is only asked about ----------------------
+
+    def ask_similar(self, core: AgentCore, connector: DummyConnector, session_id=None):
+        executed = connector.execute_calls
+        run = core.run(user_task(SIMILAR_TEXT), session_id)
+        self.assertEqual(run.status, RunStatus.AWAITING_CLARIFICATION, run.error)
+        self.assertEqual(
+            run.task.preferences["clarification_question"],
+            'Bu iş için "Haftalik rapor dosyasini oku" becerisi var. '
+            "Kullanayım mı, becerisiz mi çalışayım?",
+        )
+        self.assertIn("skill_similar_asked", self.feed(run.session.id))
+        self.assertNotIn("skill_announced", self.feed(run.session.id))
+        self.assertFalse(run.session.objective.startswith("skill-run:"))
+        self.assertEqual(connector.execute_calls, executed)
+        return run
+
+    def test_a_similar_skill_is_asked_once_and_use_keeps_every_approval(self) -> None:
+        skill_id = self.save_skill()
+        connector = DummyConnector(always_requires_approval=True)
+        core = self.core(connector)
+        run = self.ask_similar(core, connector)
+        used = core.use_skill(run.session.id, run.task.id)
+        self.assertTrue(used.session.objective.startswith("skill-run:"))
+        self.assertEqual(used.status, RunStatus.AWAITING_APPROVAL, used.error)
+        self.assertTrue(used.permission_request.side_effect.mandatory)
+        self.assertEqual(connector.execute_calls, 0)
+        self.assertFalse(set(self.events_of(skill_id)) & set(USED))
+
+    def test_without_the_skill_and_a_free_answer_run_the_task_without_it(self) -> None:
+        skill_id = self.save_skill()
+        connector = CapturingConnector()
+        core = self.core(connector)
+        run = self.ask_similar(core, connector)
+        declined = core.decline_skill(run.session.id, run.task.id)
+        self.assertEqual(declined.status, RunStatus.COMPLETED, declined.error)
+        self.assertEqual(declined.task.id, run.task.id)
+        self.assertFalse(declined.session.objective.startswith("skill-run:"))
+        self.assertIn("skill_declined", self.feed(run.session.id))
+        # An unclear answer (even "evet") is not "use": no skill, fail closed.
+        asked = core.run(user_task(SIMILAR_TEXT))
+        answered = core.provide_clarification(asked.session.id, asked.task.id, "evet")
+        self.assertEqual(answered.status, RunStatus.COMPLETED, answered.error)
+        self.assertFalse(answered.session.objective.startswith("skill-run:"))
+        self.assertFalse(set(self.events_of(skill_id)) & set(USED))
+        self.assertEqual(len(connector.seen), 2)
+
+    def test_a_declined_or_asked_skill_is_not_asked_again_in_the_session(self) -> None:
+        self.save_skill()
+        connector = CapturingConnector()
+        core = self.core(connector)
+        run = self.ask_similar(core, connector)
+        core.decline_skill(run.session.id, run.task.id)
+        again = core.run(user_task(SIMILAR_TEXT), run.session.id)
+        self.assertEqual(again.status, RunStatus.COMPLETED, again.error)
+        self.assertEqual(self.feed(run.session.id).count("skill_similar_asked"), 1)
+        # Another session is asked again.
+        self.ask_similar(core, connector)
+
+    def test_a_matcher_fault_gives_no_skill_and_no_question(self) -> None:
+        self.save_skill()
+        connector = CapturingConnector()
+        broken = mock.Mock(side_effect=RuntimeError("matcher fault"))
+        with mock.patch.object(core_module, "match_skills", broken):
+            for text in (TASK_TEXT, SIMILAR_TEXT):
+                with self.subTest(text=text):
+                    run = self.core(connector).run(user_task(text))
+                    self.assertEqual(run.status, RunStatus.COMPLETED, run.error)
+                    self.assertNotIn("clarification_question", run.task.preferences)
+                    self.assertFalse(set(self.feed(run.session.id)) & set(SKILL_EVENTS))
+        self.assertTrue(broken.called)
+
     # -- usage events -----------------------------------------------------
 
     def test_a_failed_executed_run_appends_used_failure(self) -> None:
@@ -406,7 +485,7 @@ class SkillCoreTests(unittest.TestCase):
         skill_id = self.save_skill()
         connector = CapturingConnector()
         core = self.core(connector)
-        run = core.run(user_task("Haftalik rapor dosyasini oku"))
+        run = core.run(user_task("Haftalik rapor dosyasini oku", target=""))
         self.assertEqual(run.status, RunStatus.AWAITING_CLARIFICATION, run.error)
         self.assertIn("path", run.task.preferences["clarification_question"])
         self.assertIn("skill_needs_inputs", self.feed(run.session.id))

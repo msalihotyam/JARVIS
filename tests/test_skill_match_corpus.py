@@ -138,22 +138,90 @@ class CorpusMatchTest(unittest.TestCase):
                 expected = SKILLS[family, lang].skill_id
                 matches = by_lang[lang]["match"]
                 near = by_lang[lang]["near"]
-                hits = 0
+                # SKSIMASK: a paraphrase is surfaced as SIMILAR (one question), so
+                # recall counts FIT or SIMILAR on the expected skill.
+                hits = fit_hits = 0
                 for text in matches:
                     best = match_skills(text, LIBRARY, None).best
-                    hits += best is not None and best.kind is MatchKind.FIT and best.skill_id == expected
+                    found = best is not None and best.skill_id == expected
+                    hits += found and best.kind in (MatchKind.FIT, MatchKind.SIMILAR)
+                    fit_hits += found and best.kind is MatchKind.FIT
                 similar = sum(
                     match_skills(text, LIBRARY, None).kind is MatchKind.SIMILAR for text in near
                 )
                 false_fit = sum(bool(fits(text)) for text in near)
                 parts.append(
-                    f"{lang} recall {hits}/{len(matches)} false-similar {similar}/{len(near)} "
+                    f"{lang} recall {hits}/{len(matches)} fit {fit_hits}/{len(matches)} "
+                    f"false-similar {similar}/{len(near)} "
                     f"false-fit {false_fit}/{len(near)}"
                 )
                 if hits == 0:
                     zero_recall.append((family, lang))
             print(f"skill-match corpus {family}: " + "; ".join(parts))
         self.assertEqual(zero_recall, [])
+
+    # SKSIMASK: these "match" rows were FIT before strict binding; each carries a
+    # word the skill does not bind, so it is now SIMILAR (Core asks once).
+    MOVED_TO_SIMILAR = (
+        ("file_summary", "tr", "Lütfen proje dosyasını özetler misin?"),
+        ("file_summary", "tr", "İzin verirsen proje dosyasını özetle"),
+        ("file_summary", "tr", "proje dosyasını okuyup özetle"),
+        ("file_summary", "tr", "proje dosyasini okuyup ozetler misin"),
+        ("file_summary", "en", "Can you summarize that project file?"),
+        ("code_plan", "tr", "Giriş hatası için bir kod değişikliği planla"),
+        ("code_plan", "tr", "Kod değişikliği için bir plan önerir misin?"),
+        ("code_plan", "tr", "Ayrıştırıcıdaki kod değişikliğini planla"),
+        ("code_plan", "tr", "Kod değişikliğini planlar mısın"),
+        ("code_plan", "en", "plan the code change for the login bug"),
+        ("code_plan", "en", "Can you plan a code change?"),
+        ("code_plan", "en", "propose a plan for the code change to the parser"),
+        ("code_plan", "en", "I need a plan for a code change"),
+        ("code_plan", "en", "help me plan a code change"),
+        ("mail_search", "tr", "E-postada faturaları ara"),
+        ("mail_search", "tr", "e-postada faturalari ara"),
+        ("mail_search", "tr", "E-postada sözleşmeyi ara"),
+        ("mail_search", "tr", "Lütfen e-postada fatura ara"),
+        ("mail_search", "tr", "E-postada şu sorguyla ara"),
+        ("mail_search", "tr", "E-POSTADA FATURALARI ARA"),
+        ("mail_search", "en", "Search my email for invoices"),
+        ("mail_search", "en", "Search my email for receipts"),
+        ("mail_search", "en", "Please search the email for invoices"),
+        ("mail_search", "en", "Search emails for invoices"),
+        ("mail_draft", "tr", "Toplantı için e-posta yanıt taslağı yaz"),
+        ("mail_draft", "tr", "Tedarikçiye bir yanıt taslağı yazar mısın"),
+        ("mail_draft", "tr", "Müşteriye e-posta yanıtı için taslak yaz"),
+        ("mail_draft", "tr", "Bu e-postaya yanıt taslağı hazırla"),
+        ("mail_draft", "en", "draft an email reply about the meeting"),
+        ("mail_draft", "en", "Draft a reply email to the supplier"),
+        ("mail_draft", "en", "Write a draft email reply"),
+        ("mail_draft", "en", "Prepare an email reply draft"),
+        ("mail_draft", "en", "Draft me a quick email reply"),
+        ("github_pull_requests", "tr", "Depodaki açık çekme isteklerini listeler misin"),
+        ("github_pull_requests", "en", "Show me the open pull requests"),
+        ("github_pull_requests", "en", "which pull requests are still open"),
+        ("github_commits", "tr", "Son commit'leri listele"),
+        ("github_commits", "tr", "Depodaki son commitleri listeler misin"),
+        ("github_commits", "tr", "Son on commiti listele"),
+        ("github_commits", "en", "can you list the most recent commits"),
+        ("web_page_read", "tr", "Şu siteyi açıp sayfasını okur musun"),
+        ("web_page_read", "tr", "Web sayfasını açıp okur musun"),
+        ("web_page_read", "en", "Open example.com and read the page text"),
+        ("app_launch", "tr", "Masaüstündeki Excel uygulamasını başlat"),
+        ("app_launch", "tr", "Masaüstü uygulamasını başlatır mısın"),
+        ("app_launch", "en", "Launch the desktop application Notepad"),
+        ("app_launch", "en", "launch the Spotify desktop application"),
+        ("app_launch", "en", "launch desktop application Excel"),
+        ("app_launch", "en", "Open and launch the desktop application"),
+    )
+
+    def test_a_paraphrase_is_similar_to_its_own_skill(self) -> None:
+        for family, lang, text in self.MOVED_TO_SIMILAR:
+            with self.subTest(text=text):
+                self.assertIn(text, FAMILIES[family][lang]["match"])
+                best = match_skills(text, LIBRARY, None).best
+                self.assertIsNotNone(best)
+                self.assertIs(best.kind, MatchKind.SIMILAR)
+                self.assertEqual(best.skill_id, SKILLS[family, lang].skill_id)
 
 
 def probe_kind(skill_text: str, request: str) -> MatchKind:
@@ -296,13 +364,62 @@ class ReviewProbeTest(unittest.TestCase):
         ("Send the invoice to the customer", "Send the customer the invoice"),
     )
 
+    # SKSIMASK residual probes: each must be SIMILAR (asked), never FIT.
+    RESIDUAL = (
+        ("Delete the report file", "Delete the report file. Just kidding."),
+        ("Rapor dosyasını özetle", "Rapor dosyasını özetle, vazgeçtim"),
+        ("Delete the report file", "Refuse to delete the report file"),
+        ("Rapor dosyasını özetle", "Rapor dosyasını özetlemekten kaçın"),
+        ("Rapor dosyasını özetle", "Rapor dosyasının özetlenmesi yasaklandı"),
+        ("Rapor dosyasını özetle", "Rapor dosyasını özetlemicem"),
+        ("Rapor dosyasını özetle", "Rapor dosyasını özetlemiycem"),
+        ("Rapor dosyasını özetle", "Rapor dosyasını özetlemiyom"),
+        ("Delete the report file", "Do n​ot delete the report file"),
+        ("Delete the report file", "Do nоt delete the report file"),
+        ("Upload the report file", "Download the report file"),
+        ("Ses seviyesini artır", "Ses seviyesini azalt"),
+        ("Delete all report files", "Delete half the report files"),
+        ("Yirmi rapor dosyasını sil", "Otuz rapor dosyasını sil"),
+        ("Raporu aliye gönder", "Raporu veliye gönder"),
+        ("Delete the report file", "Delete the report file and shred the disk"),
+        # R12 "15 inputs that break this fix": a truncated request, an
+        # antonym suffix, a question, a tense or mood, a determiner, a time
+        # word or a longer word; a fit must equal the skill's own text.
+        ("Eski dosyaları bul ve sil", "eski dosyaları bul"),
+        ("Faturayı indir yazdır ve arşivle", "faturayı indir yazdır"),
+        ("Dosyayı şifre koyarak yedekle", "Dosyayı şifresiz yedekle"),
+        ("Save the file with password", "Save the file passwordless"),
+        ("Delete the report file", "Should I delete the report file?"),
+        ("Delete the report file", "How do I delete the report file?"),
+        ("Delete the report file", "Why delete the report file?"),
+        ("Delete the report file", "Who deleted the report file?"),
+        ("Delete the report file", "Delete the report file?"),
+        ("Dosyayı özetle", "Dosyayı özetledim"),
+        ("Raporu özetle", "Raporu özetlesem"),
+        ("Raporu özetle ve sil", "Raporu ne özetle ne de sil"),
+        ("Delete the report file", "Who would delete the report file"),
+        ("Delete the report file", "Delete any report files"),
+        ("Raporu özetle", "Raporu daha önce özetle"),
+        ("Raporu özetle", "Raporu artık özetle"),
+        ("Delete the report file", "Delete the report file before"),
+        ("Delete the report file", "Delete the report file after"),
+        ("Delete old files", "Delete old filesystems"),
+    )
+
+    def test_residual_probes_are_similar(self) -> None:
+        for pair in self.RESIDUAL:
+            with self.subTest(request=pair[1]):
+                self.assertIs(probe_kind(*pair), MatchKind.SIMILAR)
+
     def test_review_probes_are_never_a_fit(self) -> None:
         fits = [pair for pair in self.NOT_FIT if probe_kind(*pair) is MatchKind.FIT]
         self.assertEqual(fits, [])
 
-    def test_a_reordered_same_request_still_fits(self) -> None:
-        lost = [pair for pair in self.SAME if probe_kind(*pair) is not MatchKind.FIT]
-        self.assertEqual(lost, [])
+    def test_a_reordered_request_is_similar(self) -> None:
+        # SKSIMASK: a reorder is not the skill's own text, so it is asked about.
+        for pair in self.SAME:
+            with self.subTest(request=pair[1]):
+                self.assertIs(probe_kind(*pair), MatchKind.SIMILAR)
 
     def test_the_same_request_still_fits(self) -> None:
         for text in ("Copy file alpha to folder beta", "alpha dosyasını beta klasörüne kopyala",

@@ -58,14 +58,20 @@ TASK_TEXT = "Haftalik rapor dosyasini oku: notes/week.md"
 OFFER = "Bunu beceri olarak kaydedeyim mi?"
 
 
-def user_task(objective: str = TASK_TEXT) -> Task:
+def user_task(objective: str = TASK_TEXT, target: str = "resource-a") -> Task:
     return Task(
         objective=objective,
         capability=DUMMY_CAPABILITY,
         scope=ActionScope(
-            action="read", target="resource-a", data_classification=DataClassification.INTERNAL
+            action="read", target=target, data_classification=DataClassification.INTERNAL
         ),
     )
+
+
+def skill_task() -> Task:
+    # SKSIMASK: only a near-identical request auto-runs a skill; the target
+    # is the declared path value, so nothing but the skill's own text is left.
+    return user_task(target="notes/week.md")
 
 
 def skill_draft() -> SkillDraft:
@@ -219,7 +225,7 @@ class SkillLearnTests(unittest.TestCase):
         # a5 (SKLEARNSAFE): a failed run only records used_failure; a new
         # version comes from a corrected, completed run (below).
         skill_id = self.save_skill()
-        run = self.core(DummyConnector(outcome=OutcomeStatus.ERROR)).run(user_task())
+        run = self.core(DummyConnector(outcome=OutcomeStatus.ERROR)).run(skill_task())
         self.assertIs(run.session.chain.status, ChainStatus.FAILED)
         anchor_id = run.session.objective.removeprefix("skill-run:")
         self.assertIs(self.store.load_task(anchor_id).status, TaskStatus.FAILED)
@@ -248,7 +254,7 @@ class SkillLearnTests(unittest.TestCase):
     def test_a_corrected_skill_run_proposes_a_version_with_the_correction(self) -> None:
         skill_id = self.save_skill()
         core = self.core(DummyConnector())
-        run = core.run(user_task())
+        run = core.run(skill_task())
         self.assertIs(run.session.chain.status, ChainStatus.COMPLETED)
         anchor_id = run.session.objective.removeprefix("skill-run:")
         owner = self.store.task_session_id(anchor_id)

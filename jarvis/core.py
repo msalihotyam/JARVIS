@@ -50,6 +50,7 @@ from jarvis.contracts import (
     RETRIEVAL_RATIONALE_CAP,
     RETRIEVAL_SUMMARY_CAP,
     VERIFICATION_MAX_EVIDENCE,
+    VISIBILITY_MAX_LIMIT,
     ActionScope,
     AgentRun,
     AttemptState,
@@ -6363,10 +6364,14 @@ class AgentCore:
     def _skill_route(self, session: SessionState, task: Task) -> AgentRun | None:
         """Match a NEW task against the visible skills; ``None`` runs it as usual.
 
-        Only a fit is used, announced and continued unless declined (D6). A
-        stale skill that would fit is announced and waits for the user's use
-        or skip, never used automatically (S12); a similar skill is not used.
-        Values are stripped before matching (D18). Any fault: no skill.
+        Only a fit (near-identical request) is used, announced and continued
+        unless declined (D6). A stale skill that would fit is announced and
+        waits for the user's use or skip, never used automatically (S12). The
+        best similar skill is only ASKED about, once: it runs solely on the
+        user's "use" answer; any other answer runs the task without it, and a
+        skill this session already asked about or declined is not asked
+        again. Values are stripped before matching (D18). Any fault: no skill
+        and no question.
         """
         if (
             not self._skills_on()
@@ -6393,12 +6398,29 @@ class AgentCore:
                         health=skill_lifecycle.health(history),
                     )
             result = match_skills(text, entries.values(), session.project_id)
-            stale = None
+            stale = stale_kind = None
             for candidate in result.needs_revalidation[:1]:
                 entry = entries[candidate.skill_id]
                 as_active = replace(entry, status=SkillStatus.ACTIVE)
-                if match_skills(text, (as_active,), session.project_id).kind is MatchKind.FIT:
-                    stale = entry.skill
+                stale = entry.skill
+                stale_kind = match_skills(text, (as_active,), session.project_id).kind
+            asked = (
+                self._skills_asked(session, task)
+                if MatchKind.SIMILAR in (result.kind, stale_kind)
+                else set()
+            )
+            similar = None
+            if result.kind is MatchKind.SIMILAR and result.best is not None:
+                if result.best.skill.skill_id not in asked:
+                    similar = result.best.skill
+            if stale_kind is not MatchKind.FIT and (
+                similar is not None
+                or stale_kind is not MatchKind.SIMILAR
+                or stale.skill_id in asked
+            ):
+                # A stale paraphrase is still only asked about, below the
+                # active similar skill and once per session.
+                stale = None
         except Exception:  # noqa: BLE001 - matching is advice; fail closed to no skill
             return None
         if result.kind is MatchKind.FIT and result.best is not None:
@@ -6414,7 +6436,35 @@ class AgentCore:
                 session, task, "skill_stale_announced", self._skill_ident(stale)
             )
             return self._advance(session, task, None)
+        if similar is not None:
+            task.preferences[_SKILL_RUN_KEY] = {**self._skill_ident(similar), "state": "similar"}
+            task.preferences["needs_clarification"] = True
+            task.preferences["clarification_question"] = (
+                f'Bu iş için "{similar.name}" becerisi var. '
+                "Kullanayım mı, becerisiz mi çalışayım?"
+            )
+            self._checkpoint(
+                session, task, "skill_similar_asked", self._skill_ident(similar)
+            )
+            return self._advance(session, task, None)
         return None
+
+    def _skills_asked(self, session: SessionState, task: Task) -> set[str]:
+        """Skills this session already asked about (unanswered or answered
+        without "use") or declined; they are not suggested again. Raises on
+        any fault, which the caller turns into no skill and no question.
+
+        ponytail: scans the newest VISIBILITY_MAX_LIMIT tasks of the session;
+        a session-level record if sessions ever grow past that.
+        """
+        asked: set[str] = set()
+        for summary in self.memory.list_tasks(session.id, VISIBILITY_MAX_LIMIT):
+            if summary.id == task.id:
+                continue
+            state = self._skill_state(self.memory.load_task(summary.id))
+            if state.get("state") in ("similar", "declined"):
+                asked.add(str(state.get("skill_id")))
+        return asked
 
     def _skill_inputs(self, skill: Any, task: Task) -> dict[str, str]:
         """The skill's inputs from the values the user typed, by kind, in order.
@@ -6763,24 +6813,26 @@ class AgentCore:
             return lost.run
 
     def use_skill(self, session_id: str, task_id: str) -> AgentRun:
-        """The user's "use" answer to a stale skill's announcement.
+        """The user's "use" answer to a stale or similar skill's question.
 
         The ONLY way a stale skill runs: as a normal revalidation run whose
-        every step still meets policy and approval (S12).
+        every step still meets policy and approval (S12). The only way a
+        similar skill runs: as a normal run with the same approvals; one that
+        went stale meanwhile is not used.
         """
         session, task, failure = self._skill_owned(session_id, task_id)
         if failure is not None:
             return failure
         state = self._skill_state(task)
         if (
-            state.get("state") != "stale"
+            state.get("state") not in ("stale", "similar")
             or task.status is not TaskStatus.AWAITING_CLARIFICATION
             or task.stage is not LoopStage.CLARIFY_OR_ASSUME
         ):
             return self._input_failure(
                 task, ErrorCode.INVALID_TASK, "No skill is waiting for a decision.", session
             )
-        state = {**state, "revalidate": True}
+        state = {**state, "revalidate": state.get("state") == "stale"}
         for key in _SKILL_QUESTION_KEYS:
             task.preferences.pop(key, None)
         task.preferences[_SKILL_RUN_KEY] = state
@@ -6804,7 +6856,10 @@ class AgentCore:
         if failure is not None:
             return failure
         state = self._skill_state(task)
-        if state.get("state") not in ("delegated", "stale", "needs_inputs") or is_terminal(task):
+        if (
+            state.get("state") not in ("delegated", "stale", "similar", "needs_inputs")
+            or is_terminal(task)
+        ):
             return self._input_failure(
                 task, ErrorCode.INVALID_TASK, "This task has no skill to decline.", session
             )

@@ -6,8 +6,8 @@ temp database, never data/jarvis.db, no model or network call):
 - a5: a new-version draft comes ONLY from a run that ended ``completed`` and
   executed the version's steps; a failed run records ``used_failure`` and
   proposes nothing that changes the procedure;
-- a6: a SIMILAR match never makes Core use, announce or ask about a skill
-  (FIT is the only path to use);
+- a6: a SIMILAR match never makes Core use or announce a skill; it is only
+  asked about once (SKSIMASK), and any answer but "use" runs without it;
 - a6: a draft that would not pass the use path's plan (``plan_steps`` and the
   one chain grammar: at most three independent catalog steps) is never
   stored or offered.
@@ -24,7 +24,7 @@ from jarvis.skill_lifecycle import SkillEventKind, health
 from jarvis.skill_types import RunOutcome, RunStep, RunSummary, SkillRef, SkillStatus
 from tests.helpers import DUMMY_CAPABILITY, DummyConnector
 from tests import test_skill_learn as base
-from tests.test_skill_learn import user_task
+from tests.test_skill_learn import skill_task, user_task
 
 SIMILAR_TEXT = "Haftalik rapor hazirla"
 SKILL_EVENTS = ("skill_announced", "skill_stale_announced", "skill_needs_inputs")
@@ -70,7 +70,7 @@ class SkillLearnSafetyTests(unittest.TestCase):
 
     def test_a5_a_failed_skill_run_records_used_failure_and_proposes_no_version(self) -> None:
         skill_id = self.save_skill()
-        run = self.core(DummyConnector(outcome=OutcomeStatus.ERROR)).run(user_task())
+        run = self.core(DummyConnector(outcome=OutcomeStatus.ERROR)).run(skill_task())
         self.assertIs(run.session.chain.status, ChainStatus.FAILED)
         anchor_id = run.session.objective.removeprefix("skill-run:")
         self.assertEqual(self.offers(self.store.task_session_id(anchor_id)), [])
@@ -119,7 +119,7 @@ class SkillLearnSafetyTests(unittest.TestCase):
 
     # -- a6: SIMILAR never uses a skill ---------------------------------------
 
-    def test_a6_a_similar_skill_is_never_used_announced_or_asked_about(self) -> None:
+    def test_a6_a_similar_skill_is_never_used_or_announced_only_asked_about(self) -> None:
         skill_id = self.save_skill()
         task = user_task(SIMILAR_TEXT)
         history = self.store.history(skill_id, None)
@@ -129,14 +129,20 @@ class SkillLearnSafetyTests(unittest.TestCase):
         text = "\n".join((task.objective, task.scope.target))
         self.assertIs(match_skills(text, (entry,), None).kind, MatchKind.SIMILAR)
         core = self.core(DummyConnector())
-        run = core.run(task)
+        asked = core.run(task)
+        # SKSIMASK: one question, nothing used or announced yet.
+        self.assertEqual(asked.status, RunStatus.AWAITING_CLARIFICATION, asked.error)
+        self.assertTrue(asked.task.preferences.get("needs_clarification"))
+        self.assertFalse(asked.session.objective.startswith("skill-run:"))
+        self.assertIsNone(asked.session.chain)
+        # An answer that is not "use" runs the task without the skill.
+        run = core.provide_clarification(asked.session.id, asked.task.id, "bilmiyorum")
         self.assertEqual(run.status, RunStatus.COMPLETED, run.error)
         self.assertFalse(run.session.objective.startswith("skill-run:"))
         self.assertIsNone(run.session.chain)
-        self.assertFalse(run.task.preferences.get("needs_clarification"))
         events = [e["event_type"] for e in self.store.list_events(run.session.id)]
         self.assertFalse(set(SKILL_EVENTS) & set(events), events)
-        # The user's "use" answer cannot turn a similar match into a use.
+        # A late "use" answer cannot turn the finished similar match into a use.
         core.use_skill(run.session.id, run.task.id)
         history = self.store.history(skill_id, None)
         self.assertEqual(

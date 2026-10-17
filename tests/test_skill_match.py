@@ -208,9 +208,10 @@ class StopWordTests(unittest.TestCase):
             "Elektrik faturasını öder",
             ("Elektrik faturasını öde",),
         )
+        # SKSIMASK: "öde" is not the skill's own text ("öder"): only similar.
         result = run("su faturasını öde", water, power)
         self.assertEqual(result.best.skill_id, "su-faturasi")
-        self.assertIs(result.best.kind, MatchKind.FIT)
+        self.assertIs(result.best.kind, MatchKind.SIMILAR)
         self.assertEqual(result.best.score, 100)
         self.assertEqual([c.skill_id for c in result.candidates][1:], ["elektrik-faturasi"])
         self.assertIs(result.candidates[1].kind, MatchKind.SIMILAR)
@@ -238,18 +239,24 @@ class CutTests(unittest.TestCase):
 class TableTests(unittest.TestCase):
     TABLE = (
         # (task, expected kind, expected best skill id or None)
-        ("Haftalık satış raporunu hazırla ve gönder", MatchKind.FIT, "satis-raporu"),
+        # SKSIMASK: only the skill's own name or summary text is a fit; a
+        # paraphrase of it is similar (Core asks once).
+        ("Haftalık satış raporunu hazırla ve gönder", MatchKind.SIMILAR, "satis-raporu"),
+        ("Haftalık satış raporunu hazırlar", MatchKind.FIT, "satis-raporu"),
         ("HAFTALIK SATIŞ RAPORU", MatchKind.FIT, "satis-raporu"),
         ("haftalik satis raporu", MatchKind.FIT, "satis-raporu"),
-        ("Satış raporu", MatchKind.FIT, "satis-raporu"),
+        ("Satış raporu", MatchKind.SIMILAR, "satis-raporu"),
         ("Müşteri listesini temizle ve satış raporu ekle", MatchKind.SIMILAR, "satis-raporu"),
         ("Rapor", MatchKind.SIMILAR, "satis-raporu"),
         ("Bugün hava nasıl olacak?", MatchKind.NONE, None),
-        ("Export the monthly invoices", MatchKind.FIT, "invoice-export"),
+        ("Export the monthly invoices", MatchKind.SIMILAR, "invoice-export"),
+        ("Export monthly invoices", MatchKind.FIT, "invoice-export"),
+        ("Download and export monthly invoices", MatchKind.FIT, "invoice-export"),
         # Two of the four name and summary words: coverage 50, not a fit.
         ("Please download invoices", MatchKind.SIMILAR, "invoice-export"),
-        ("Please download the monthly invoices", MatchKind.FIT, "invoice-export"),
-        ("Back up the database", MatchKind.FIT, "db-backup"),
+        ("Please download the monthly invoices", MatchKind.SIMILAR, "invoice-export"),
+        ("Back up the database", MatchKind.SIMILAR, "db-backup"),
+        ("Back up the database to the archive folder", MatchKind.FIT, "db-backup"),
         ("Print the invoices list", MatchKind.SIMILAR, "invoice-export"),
         ("What is the weather tomorrow?", MatchKind.NONE, None),
         ("", MatchKind.NONE, None),
@@ -320,7 +327,7 @@ class TableTests(unittest.TestCase):
 
 
 class ScopeTests(unittest.TestCase):
-    TASK = "Proje dağıtım notlarını derle"
+    TASK = "Proje dağıtım notları"  # SKSIMASK: the skill's own name, so a fit
 
     def setUp(self) -> None:
         self.p1 = make_skill(
@@ -385,7 +392,7 @@ class ScopeTests(unittest.TestCase):
 
 
 class StatusTests(unittest.TestCase):
-    TASK = "Haftalık satış raporunu hazırla"
+    TASK = "Haftalık satış raporunu hazırlar"  # SKSIMASK: the skill's own summary
 
     def test_disabled_and_deleted_are_never_offered(self) -> None:
         for status in (SkillStatus.DISABLED, SkillStatus.DELETED):
@@ -444,12 +451,22 @@ class OrderTests(unittest.TestCase):
                 self.assertEqual(match_skills(self.TASK, permutation, None), result)
 
     def test_fit_comes_before_a_higher_scoring_similar(self) -> None:
+        # SKSIMASK: a fit binds every request word, so it scores 100 and a
+        # similar skill with the same score still ranks after it.
         no_headline = make_skill("a-steps", "Genel", "Genel işler", ("Satış raporu hazırla",))
-        fit = make_skill("z-fit", "Satış raporu", "Rapor", ("Belgeyi kaydet",))
+        fit = make_skill("z-fit", "Satış raporu hazırla", "Rapor", ("Belgeyi hazırla",))
         result = match_skills(self.TASK, [entry(no_headline), entry(fit)], None)
         self.assertEqual([c.skill_id for c in result.candidates], ["z-fit", "a-steps"])
-        self.assertEqual([c.score for c in result.candidates], [66, 100])
+        self.assertEqual([c.score for c in result.candidates], [100, 100])
+        self.assertEqual(
+            [c.kind for c in result.candidates], [MatchKind.FIT, MatchKind.SIMILAR]
+        )
         self.assertIs(result.best.kind, MatchKind.FIT)
+        # The old 66-scoring "fit" leaves "hazırla" unbound: now only similar.
+        partial = make_skill("z-fit", "Satış raporu", "Rapor", ("Belgeyi kaydet",))
+        result = match_skills(self.TASK, [entry(no_headline), entry(partial)], None)
+        self.assertEqual([c.skill_id for c in result.candidates], ["a-steps", "z-fit"])
+        self.assertIs(result.kind, MatchKind.SIMILAR)
 
     def test_candidates_and_revalidation_are_bounded(self) -> None:
         active = [entry(self._same(f"s{i:02d}")) for i in range(20)]
@@ -550,7 +567,7 @@ class CoverageTests(unittest.TestCase):
         ]
 
     def test_broad_skill_is_not_the_fit_for_a_narrow_task(self) -> None:
-        result = match_skills("Musteriye faturayi gonder", self.offer, None)
+        result = match_skills("Faturayi musteriye gonder", self.offer, None)
         self.assertIs(result.kind, MatchKind.FIT)
         self.assertEqual(result.best.skill_id, "fatura-gonder")
         self.assertEqual((result.best.score, result.best.coverage), (100, 100))
@@ -576,7 +593,10 @@ class CoverageTests(unittest.TestCase):
             None,
         )
         self.assertEqual([c.skill_id for c in result.candidates], ["b-exact", "a-wider"])
-        self.assertEqual([c.kind for c in result.candidates], [MatchKind.FIT, MatchKind.FIT])
+        # SKSIMASK: neither skill's own text, so both similar; same order.
+        self.assertEqual(
+            [c.kind for c in result.candidates], [MatchKind.SIMILAR, MatchKind.SIMILAR]
+        )
         self.assertEqual([c.score for c in result.candidates], [100, 100])
         self.assertEqual([c.coverage for c in result.candidates], [100, 80])
 
@@ -616,8 +636,15 @@ class PlaceholderTests(unittest.TestCase):
     )
     TABLE = (
         # (skill, task, kind, score, coverage, headline words)
-        (INVOICE, "faturayi gonder", MatchKind.FIT, 100, 66, {"faturayi", "adresine", "gonder"}),
-        (DOWNLOAD, "download the pdf and save it", MatchKind.FIT, 66, 100, {"download", "save"}),
+        # SKSIMASK: a fit is the text without its placeholders; less or other
+        # words are similar.
+        (INVOICE, "faturayi gonder", MatchKind.SIMILAR, 100, 66, {"faturayi", "adresine", "gonder"}),
+        (INVOICE, "faturayi adresine gonder", MatchKind.FIT, 100, 100, {"faturayi", "adresine", "gonder"}),
+        # SKSIMASK: "pdf" is a value Core strips before matching (D18); left
+        # in, it is an unbound word, so only similar.
+        (DOWNLOAD, "download and save it", MatchKind.SIMILAR, 100, 100, {"download", "save"}),
+        (DOWNLOAD, "download and save as", MatchKind.FIT, 100, 100, {"download", "save"}),
+        (DOWNLOAD, "download the pdf and save it", MatchKind.SIMILAR, 66, 100, {"download", "save"}),
     )
 
     def test_drafted_skill_is_a_fit_again(self) -> None:
@@ -674,9 +701,17 @@ class BoundaryTests(unittest.TestCase):
         return result
 
     def test_fit_min_score_edge(self) -> None:
+        # SKSIMASK: a fit binds every request word, so the score edge alone
+        # no longer makes one; 60 with two unbound words is only similar.
         at = self._match(3, 2)  # 3 of 5 = 60
         self.assertEqual((at.best.score, at.best.coverage), (60, 100))
-        self.assertIs(at.kind, MatchKind.FIT)
+        self.assertIs(at.kind, MatchKind.SIMILAR)
+        self.assertIn(
+            "not a fit: request words the skill does not bind: zaa, zab", at.best.reasons
+        )
+        bound = self._match(3, 0)  # 3 of 3 = 100, nothing unbound
+        self.assertEqual((bound.best.score, bound.best.coverage), (100, 100))
+        self.assertIs(bound.kind, MatchKind.FIT)
         below = self._match(13, 9)  # 13 of 22 = 59
         self.assertEqual((below.best.score, below.best.coverage), (59, 100))
         self.assertIs(below.kind, MatchKind.SIMILAR)
@@ -692,8 +727,10 @@ class BoundaryTests(unittest.TestCase):
 
     def test_fit_min_coverage_edge(self) -> None:
         def cover(covered: int, extra: int):
+            # SKSIMASK: the request is the skill's own name, so only the
+            # coverage of its summary decides.
             headline = vocab(covered) + vocab(extra, "z")
-            skill = headline_skill("s", headline)
+            skill = make_skill("s", " ".join(vocab(covered)), " ".join(headline), ("Adımı uygula",))
             return match_skills(" ".join(vocab(covered)), [entry(skill)], None)
 
         at = cover(3, 2)  # 3 of 5 = 60

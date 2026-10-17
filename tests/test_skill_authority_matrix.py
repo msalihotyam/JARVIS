@@ -109,12 +109,14 @@ def draft(summary: str = "Haftalik rapor dosyasini oku", suffix: str = "") -> Sk
 
 
 def user_task() -> Task:
+    # SKSIMASK: the target is the declared path value, so the request is the
+    # skill's own text, a near-identical FIT (anything else is only asked).
     return Task(
         objective=TASK_TEXT,
         capability=DUMMY_CAPABILITY,
         scope=ActionScope(
             action="read",
-            target="resource-a",
+            target="notes/week.md",
             data_classification=DataClassification.INTERNAL,
         ),
     )
