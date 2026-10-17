@@ -1196,6 +1196,60 @@ class TestUsageGuard(Base):
         self.assertEqual(self.fake.bg_names(), ["A", "B"])
         self.assertIsNone(self.status()["usage_pct"])
 
+    def live(self, family, body, age=0):
+        d = self.root / "build" / "lanes"
+        d.mkdir(parents=True, exist_ok=True)
+        if isinstance(body, dict):
+            body = json.dumps({"updated_at": time.strftime(
+                "%Y-%m-%dT%H:%M:%S.000Z", time.gmtime(self.t - age)), **body})
+        (d / f"{family}.json").write_text(body, encoding="utf-8")
+
+    def test_live_newer_than_ledger_wins(self):
+        self.ledger(31, age=3600)
+        self.live("opus", {"seven_pct": 33}, age=60)
+        self.live("sonnet", {"seven_pct": 32}, age=120)
+        self.assertEqual(self.c.usage_pct(), 33)
+        self.assertEqual(self.c.usage_source, "live:opus")
+        self.live("haiku", {"seven_pct": 34}, age=60)  # same timestamp: the higher % wins
+        self.assertEqual((self.c.usage_pct(), self.c.usage_source), (34, "live:haiku"))
+        self.c.pass_once()
+        self.assertEqual((self.status()["pace"]["usage_pct"], self.status()["pace"]["usage_source"]),
+                         (34, "live:haiku"))
+
+    def test_ledger_newer_than_live_wins(self):
+        self.ledger(40, age=10)
+        self.live("opus", {"seven_pct": 33}, age=60)
+        self.assertEqual((self.c.usage_pct(), self.c.usage_source), (40, "ledger"))
+
+    def test_stale_live_ignored(self):
+        self.ledger(31, age=3600)
+        self.live("opus", {"seven_pct": 90}, age=conveyor.USAGE_FRESH_S + 1)
+        self.live("sonnet", {"seven_pct": 90}, age=-3600)  # from the future: never wins forever
+        self.assertEqual((self.c.usage_pct(), self.c.usage_source), (31, "ledger"))
+
+    def test_garbage_live_ignored(self):
+        self.ledger(31, age=3600)
+        for i, body in enumerate(["not json", "[1, 2]", "42", "\"x\"", json.dumps({"seven_pct": 50})]):
+            self.live(f"g{i}", body)  # last one: no updated_at
+        for i, pct in enumerate([True, None, "50", -1, 100.5, float("nan")]):
+            self.live(f"p{i}", {"seven_pct": pct})
+        for i, at in enumerate([None, 5, "", "yesterday", "2026-13-40T00:00:00Z"]):
+            self.live(f"t{i}", json.dumps({"seven_pct": 50, "updated_at": at}))
+        (self.root / "build" / "lanes" / "dir.json").mkdir()
+        (self.root / "build" / "lanes" / "bad.json").write_bytes(b"\xff\xfe\x00{")
+        self.assertEqual((self.c.usage_pct(), self.c.usage_source), (31, "ledger"))
+        self.live("sonnet", {"seven_pct": 33})
+        self.assertEqual((self.c.usage_pct(), self.c.usage_source), (33, "live:sonnet"))
+
+    def test_missing_dir_and_nothing_fresh(self):
+        self.assertIsNone(self.c.usage_pct())
+        self.assertIsNone(self.c.usage_source)
+        self.ledger(31)
+        self.assertEqual((self.c.usage_pct(), self.c.usage_source), (31, "ledger"))
+        self.ledger(31, age=conveyor.USAGE_FRESH_S + 1)
+        self.live("opus", {"seven_pct": 33}, age=conveyor.USAGE_FRESH_S + 1)
+        self.assertEqual((self.c.usage_pct(), self.c.usage_source), (None, None))
+
 
 class TestPaceGovernor(TestUsageGuard):
     """pace.json modes, pace bands, the reset alert and reset detection, on a fixed clock."""

@@ -734,7 +734,7 @@ class Conveyor:
         self.pager_file = self.base / "pager.json"
         self.pid = os.getpid()
         self.last_error = None
-        self.usage = None
+        self.usage, self.usage_source = None, None
         self.usage_hold = False
         self.max_lanes = MAX_LANES
         self.pace = {}
@@ -1533,15 +1533,19 @@ class Conveyor:
         self.save_lanes(lanes)  # a started session is never lost to a later crash
 
     def usage_pct(self):
-        """Weekly plan % from the newest jarvis-flow slice-ledger row (claude has no
-        usage command); None when unknown or older than USAGE_FRESH_S."""
+        """Weekly plan % with the newest timestamp among the newest jarvis-flow slice-ledger
+        row (claude has no usage command; written when a lane finishes) and the live
+        "seven_pct" of every build/lanes/<family>.json; ties take the higher %. Readings
+        older than USAGE_FRESH_S and unreadable files are ignored; None when nothing is
+        fresh. The winner's source ("ledger" / "live:<family>") goes to self.usage_source."""
+        cands = []
         f = self.root / "build" / "ledger" / "slices.jsonl"
         try:
             with open(f, "rb") as fh:
                 fh.seek(max(0, fh.seek(0, 2) - 65536))
                 lines = fh.read().decode("utf-8", "replace").splitlines()
         except OSError:
-            return None
+            lines = []
         for line in reversed(lines):
             try:
                 row = json.loads(line)
@@ -1552,8 +1556,20 @@ class Conveyor:
             except (ValueError, KeyError, TypeError):
                 continue
             if isinstance(pct, (int, float)):
-                return pct if self.now() - ts <= USAGE_FRESH_S else None
-        return None
+                if self.now() - ts <= USAGE_FRESH_S:
+                    cands.append((ts, pct, "ledger"))
+                break
+        for f in (self.root / "build" / "lanes").glob("*.json"):
+            try:
+                d = json.loads(f.read_text(encoding="utf-8"))
+                pct, ts = d["seven_pct"], utc_ts(d["updated_at"])
+            except (OSError, ValueError, KeyError, TypeError, IndexError, OverflowError):
+                continue
+            if isinstance(pct, (int, float)) and not isinstance(pct, bool) and 0 <= pct <= 100 \
+                    and 0 <= self.now() - ts <= USAGE_FRESH_S:
+                cands.append((ts, pct, f"live:{f.stem}"))
+        ts, pct, self.usage_source = max(cands, default=(None, None, None))
+        return pct
 
     def busy_names(self, lanes, agents):
         done_ids = {ln["id"] for ln in lanes.values() if ln.get("finished")}
@@ -1722,7 +1738,7 @@ class Conveyor:
         if self.mem_hold:
             band = "memory hold"  # running lanes untouched; nothing new starts (hold())
         self.pace = {"mode": p["mode"], "window_start": p["window_start"], "usage_pct": u,
-                     "pace_line": line if line is None else round(line, 1),
+                     "usage_source": self.usage_source, "pace_line": line if line is None else round(line, 1),
                      "max_lanes": self.max_lanes, "band": band, "limit_pct": limit, "error": err,
                      "presence": self.presence}
         # the first full_burn pass is the pre-governor state: no event for it
