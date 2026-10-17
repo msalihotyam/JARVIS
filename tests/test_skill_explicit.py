@@ -163,7 +163,11 @@ class ExplicitMatchesImplicitTests(_Explicit):
 
     def test_same_missing_inputs_question_as_implicit(self) -> None:
         self.save()
-        implicit = self.core(DummyConnector(), PermissionMode.STRICT).run(replace(user_task(), objective=NAME))
+        # The request names the skill and carries no value: the shared
+        # fixture's target (a path, 49b2c59) would be bound as the input.
+        named = replace(user_task(), objective=NAME)
+        named = replace(named, scope=replace(named.scope, target=""))
+        implicit = self.core(DummyConnector(), PermissionMode.STRICT).run(named)
         self.assertIs(implicit.status, RunStatus.AWAITING_CLARIFICATION, implicit.error)
         explicit = self.core(DummyConnector(), PermissionMode.STRICT).run_skill(NAME)
         self.assertIs(explicit.status, RunStatus.AWAITING_CLARIFICATION, explicit.error)
