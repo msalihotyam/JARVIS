@@ -500,6 +500,14 @@ class ReviewProbeTest(unittest.TestCase):
         ('Set label "alpha beta"', 'Set label "alpha  beta"'),
         ("Delete file alpha-beta", "Delete file alpha_beta"),
         ("Read file résumé.txt", "Read file resume.txt"),
+        # CDXINT54F O1/O2 (Salih A, 2026-10-17): a Turkish mark and an NFC
+        # singleton (Kelvin, Ohm, Angstrom sign) are another text.
+        ("Şirket raporunu sil", "Sirket raporunu sil"),
+        ("arşiv raporunu sil", "arsiv raporunu sil"),
+        ("Raporu göster", "Raporu goster"),
+        ("Set unit K", "Set unit " + chr(0x212A)),
+        ("Set unit " + chr(0x3A9), "Set unit " + chr(0x2126)),
+        ("Set unit " + chr(0xC5), "Set unit " + chr(0x212B)),
     )
     # SKSIMASK4 F2: twenty non-case differences that try to fit; all ask.
     PROBE = (
@@ -576,14 +584,15 @@ class ReviewProbeTest(unittest.TestCase):
                 self.assertIs(probe_kind(text, text), MatchKind.FIT)
 
     def test_case_and_turkish_letters_still_fit(self) -> None:
-        # SKSIMASK2: identity keeps case folding and Turkish letter folding.
+        # SKSIMASK2: identity keeps case folding and the Turkish İ/ı case pairs
+        # (CDXINT54F O1: a ş|s pair moved to SAID).
         for skill_text, request in (
             ("Delete file alpha-beta", "Delete file alpha-beta"),
             ("Delete file alpha_beta", "DELETE FILE alpha_beta"),
             ("Read file résumé.txt", "Read file RÉSUMÉ.TXT"),
             ("Read file résumé", "Read file re" + chr(0x301) + "sume" + chr(0x301)),
-            ("Şirket raporunu sil", "Sirket raporunu sil"),
             ("İstanbul raporunu sil", "istanbul raporunu sil"),
+            ("ISTANBUL RAPORUNU SİL", "ıstanbul raporunu sil"),
         ):
             with self.subTest(request=request):
                 self.assertIs(probe_kind(skill_text, request), MatchKind.FIT)

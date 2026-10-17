@@ -1327,7 +1327,10 @@ class AgentCore:
         task: Task,
         session_id: str | None = None,
         grant: PermissionGrant | None = None,
+        request: str | None = None,
     ) -> AgentRun:
+        # ``request``: the user's own typed text, never stored; only it binds
+        # a skill fit's inputs (SKDRAFTFIT).
         if session_id is None:
             session = self.start_session(task.objective)
         else:
@@ -1379,7 +1382,7 @@ class AgentCore:
         session.latest_task_id = task.id
         try:
             self._checkpoint(session, task, "task_registered")
-            routed = self._skill_route(session, task) if fresh else None
+            routed = self._skill_route(session, task, request) if fresh else None
         except _LifecycleLost as lost:
             return lost.run
         if routed is not None:
@@ -6361,7 +6364,9 @@ class AgentCore:
             "revalidate": revalidate,
         }
 
-    def _skill_route(self, session: SessionState, task: Task) -> AgentRun | None:
+    def _skill_route(
+        self, session: SessionState, task: Task, request: str | None = None
+    ) -> AgentRun | None:
         """Match a NEW task against the visible skills; ``None`` runs it as usual.
 
         Only a fit (near-identical request) is used, announced and continued
@@ -6397,13 +6402,15 @@ class AgentCore:
                         status=skill_lifecycle.status(history),
                         health=skill_lifecycle.health(history),
                     )
-            result = match_skills(text, entries.values(), session.project_id)
+            result = match_skills(text, entries.values(), session.project_id, request=request)
             stale = stale_kind = None
             for candidate in result.needs_revalidation[:1]:
                 entry = entries[candidate.skill_id]
                 as_active = replace(entry, status=SkillStatus.ACTIVE)
                 stale = entry.skill
-                stale_kind = match_skills(text, (as_active,), session.project_id).kind
+                stale_kind = match_skills(
+                    text, (as_active,), session.project_id, request=request
+                ).kind
             asked = (
                 self._skills_asked(session, task)
                 if MatchKind.SIMILAR in (result.kind, stale_kind)
@@ -6424,7 +6431,10 @@ class AgentCore:
         except Exception:  # noqa: BLE001 - matching is advice; fail closed to no skill
             return None
         if result.kind is MatchKind.FIT and result.best is not None:
-            return self._skill_delegate(session, task, result.best.skill)
+            # A fit runs on the spans the user typed, never the model's values;
+            # a caller with no typed request keeps the stripped-value binding.
+            inputs = None if request is None else dict(result.best.inputs)
+            return self._skill_delegate(session, task, result.best.skill, inputs)
         if stale is not None:
             task.preferences[_SKILL_RUN_KEY] = {**self._skill_ident(stale), "state": "stale"}
             task.preferences["needs_clarification"] = True
@@ -6474,8 +6484,10 @@ class AgentCore:
         is taken whole. ``plan_steps`` re-validates every value.
         """
         answer = " ".join(str(task.preferences.get("clarification") or "").split())
-        # An explicit use's message is the command, never a value (SKEXPLICIT).
-        explicit = self._skill_state(task).get("explicit") is True
+        # An explicit use's message is the command, never a value (SKEXPLICIT);
+        # a fit's values were the user's own spans, so only an answer adds one.
+        state = self._skill_state(task)
+        explicit = state.get("explicit") is True or state.get("fit") is True
         text = answer if explicit else "\n".join((task.objective, task.scope.target, answer))
         found: dict[str, list[str]] = {}
         for param in _find_params(text):
@@ -6544,14 +6556,17 @@ class AgentCore:
         except Exception:  # noqa: BLE001 - fail closed: an unplannable draft is not offered
             return False
 
-    def _skill_delegate(self, session: SessionState, task: Task, skill: Any) -> AgentRun:
+    def _skill_delegate(
+        self, session: SessionState, task: Task, skill: Any, inputs: dict[str, str] | None = None
+    ) -> AgentRun:
         """Plan ``skill`` for ``task`` and run it as an ordinary chain.
 
         Missing inputs are asked for as a normal clarification. A refused
         plan or chain runs the task without the skill.
         """
         try:
-            return self._skill_delegate_unguarded(session, task, skill)
+            bound = () if inputs is None else (inputs,)
+            return self._skill_delegate_unguarded(session, task, skill, *bound)
         except _LifecycleLost:
             raise
         except Exception:
@@ -6570,13 +6585,19 @@ class AgentCore:
                 )
             raise
 
-    def _skill_delegate_unguarded(self, session: SessionState, task: Task, skill: Any) -> AgentRun:
+    def _skill_delegate_unguarded(
+        self, session: SessionState, task: Task, skill: Any, inputs: dict[str, str] | None = None
+    ) -> AgentRun:
         prior = self._skill_state(task)
         ident = self._skill_ident(skill, bool(prior.get("revalidate")))
         if prior.get("explicit") is True:
             ident["explicit"] = True
+        if inputs is not None or prior.get("fit") is True:
+            ident["fit"] = True
+        if inputs is None:
+            inputs = self._skill_inputs(skill, task)
         try:
-            chain = self._skill_chain(skill, self._skill_inputs(skill, task), session.project_id)
+            chain = self._skill_chain(skill, inputs, session.project_id)
         except MissingInputsError as missing:
             task.preferences[_SKILL_RUN_KEY] = {**ident, "state": "needs_inputs"}
             task.preferences["needs_clarification"] = True

@@ -92,7 +92,7 @@ def draft(number: int = 1, scope: SkillScope = GLOBAL) -> SkillDraft:
     return SkillDraft(
         draft_id=f"draft-{number:032x}",
         name="Haftalik rapor dosyasini oku",
-        summary="Haftalik rapor dosyasini oku:",  # the task text with its value stripped
+        summary="Haftalik rapor dosyasini oku: {path}",  # the drafted shape (skill_draft)
         scope=scope,
         inputs=(SkillInput(name="path", description="", required=True),),
         steps=(
@@ -132,6 +132,14 @@ def user_task(
     )
 
 
+class TypedCore(AgentCore):
+    """The user typed the objective verbatim: it is the request a FIT binds from."""
+
+    def run(self, task, *args, request=None, **kwargs):
+        typed = task.objective if request is None else request
+        return super().run(task, *args, request=typed, **kwargs)
+
+
 class SkillCoreTests(unittest.TestCase):
     def setUp(self) -> None:
         temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -156,7 +164,7 @@ class SkillCoreTests(unittest.TestCase):
         policy = frozenset(
             {DestinationGrant(connector.manifest.name, DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION)}
         )
-        return AgentCore(
+        return TypedCore(
             registry, self.store, settings, destination_policy=policy, skill_store=self.store
         )
 

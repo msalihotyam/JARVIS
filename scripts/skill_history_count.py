@@ -209,7 +209,10 @@ def _match(skills: _ReadOnlySkills, cache: dict, task: Task, project_id: str | N
         entries = cache[project_id]
         text = "\n".join((task.objective, task.scope.target))
         text = _without_params(text, _find_params(text))
-        result = match_skills(text, entries.values(), project_id)
+        # Offline count: the stored objective stands in for the typed request.
+        result = match_skills(
+            text, entries.values(), project_id, request=task.objective
+        )
         if result.kind is MatchKind.FIT and result.best is not None:
             return "fit"
         for candidate in result.needs_revalidation[:1]:
@@ -218,7 +221,10 @@ def _match(skills: _ReadOnlySkills, cache: dict, task: Task, project_id: str | N
                 status=SkillStatus.ACTIVE,
                 health=entries[candidate.skill_id].health,
             )
-            if match_skills(text, (active,), project_id).kind is MatchKind.FIT:
+            if (
+                match_skills(text, (active,), project_id, request=task.objective).kind
+                is MatchKind.FIT
+            ):
                 return "stale_fit"
         return result.kind.value
     except Exception:  # noqa: BLE001 - Core fails closed to no skill here too

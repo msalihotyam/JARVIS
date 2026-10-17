@@ -1110,8 +1110,8 @@ class InvisibleTextContractTests(unittest.TestCase):
 class DraftMatchContractTests(unittest.TestCase):
     """D18: a skill SKDRAFT drafts from a run with an e-mail, a URL and a path
     is SIMILAR (asked, never auto-run) for the same task with those values
-    removed (SKCORE's job): a stored task with placeholders never FITs by text
-    (Salih 2026-10-17 "Birebir aynıysa")."""
+    removed (SKCORE's job); the user's own request with the values typed back in
+    FITs, each input the user's span (Salih A, 2026-10-17; INT54-AFX F2 H1)."""
 
     EMAIL = "ali.veli@example.com"
     URL = "https://example.com/rapor?id=7"
@@ -1151,6 +1151,13 @@ class DraftMatchContractTests(unittest.TestCase):
                 self.assertIs(result.kind, MatchKind.SIMILAR, result)
                 self.assertEqual(result.best.skill, skill)
                 self.assertEqual(result.best.coverage, 100)
+                self.assertEqual(result.best.inputs, ())
+                result = match_skills(stripped, [entry], project_id, request=task)
+                self.assertIs(result.kind, MatchKind.FIT, result)
+                self.assertEqual(
+                    dict(result.best.inputs),
+                    {"path": self.PATH, "url": self.URL, "email": self.EMAIL},
+                )
 
 
 if __name__ == "__main__":

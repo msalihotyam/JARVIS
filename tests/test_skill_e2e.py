@@ -137,7 +137,7 @@ class SkillGateTests(unittest.TestCase):
 
     def offer(self, objective: str = TEACH):
         """A plain run, its step approved, ends with an offer and no skill."""
-        run = self.app.core.run(self.task(objective, self.alpha))
+        run = self.app.core.run(self.task(objective, self.alpha), request=objective)
         self.assertEqual(run.status, RunStatus.AWAITING_APPROVAL, run.error)
         self.assertEqual(self.grant(self.app, run).status, RunStatus.COMPLETED)
         [offered] = self.payloads(run.session.id, "skill_draft_offered")
@@ -168,7 +168,7 @@ class SkillGateTests(unittest.TestCase):
 
     def use(self, app, objective: str = AGAIN, project_id: str | None = "alpha"):
         project_id = self.alpha if project_id == "alpha" else project_id
-        run = app.core.run(self.task(objective, project_id))
+        run = app.core.run(self.task(objective, project_id), request=objective)
         self.assertTrue(run.session.objective.startswith("skill-run:"), run.error)
         anchor = run.session.objective.removeprefix("skill-run:")
         return run, anchor, self.store.task_session_id(anchor)
@@ -182,7 +182,7 @@ class SkillGateTests(unittest.TestCase):
 
     def test_flag_off_nothing_then_teach_and_use_through_the_normal_approval(self) -> None:
         off = self.compose(skills_enabled=False)
-        run = off.core.run(self.task(TEACH, self.alpha))
+        run = off.core.run(self.task(TEACH, self.alpha), request=TEACH)
         self.assertEqual(self.grant(off, run).status, RunStatus.COMPLETED)
         self.assertPlain(run)
         self.assertEqual(self.store.pending_drafts(self.alpha), ())
@@ -241,7 +241,7 @@ class SkillGateTests(unittest.TestCase):
         off.core.run_chain(run.session.id)
         self.assertEqual(self.connector.execute_calls, calls + 1)
         self.assertFalse(set(self.kinds(skill_id)) & USED)  # nothing recorded with the flag off
-        self.assertPlain(off.core.run(self.task(AGAIN, self.alpha)))
+        self.assertPlain(off.core.run(self.task(AGAIN, self.alpha), request=AGAIN))
 
     # -- D6 / D16 ---------------------------------------------------------------
 
@@ -316,7 +316,7 @@ class SkillGateTests(unittest.TestCase):
             self.assertIs(self.store.load_session(run.session.id).chain.status, ChainStatus.FAILED)
         self.assertEqual(self.kinds(skill_id).count(SkillEventKind.USED_FAILURE), 3)
         self.assertEqual(self.listed(self.alpha)[0]["status"], "stale")
-        run = app.core.run(self.task(AGAIN, self.alpha))
+        run = app.core.run(self.task(AGAIN, self.alpha), request=AGAIN)
         self.assertEqual(run.status, RunStatus.AWAITING_CLARIFICATION, run.error)
         self.assertIn("skill_stale_announced", self.feed(run.session.id))
         self.assertNotIn("skill_announced", self.feed(run.session.id))
@@ -328,7 +328,7 @@ class SkillGateTests(unittest.TestCase):
         skill_id = self.teach()
         self.assertTrue(self.app.skill_delete(skill_id, project_id=self.alpha)["ok"])
         self.assertEqual(self.listed(self.alpha), [])
-        run = self.app.core.run(self.task(AGAIN, self.alpha))
+        run = self.app.core.run(self.task(AGAIN, self.alpha), request=AGAIN)
         self.assertEqual(run.status, RunStatus.AWAITING_APPROVAL, run.error)
         self.assertPlain(run)
 
@@ -345,7 +345,10 @@ class SkillGateTests(unittest.TestCase):
         self.assertNotIn(SECRET, refused["error"])
         self.assertEqual(self.listed(self.alpha), [])
         # A run that carried a secret is never offered at all.
-        run = self.app.core.run(self.task(AGAIN + " password=Hunter2-Secret-Value", self.beta))
+        run = self.app.core.run(
+            self.task(AGAIN + " password=Hunter2-Secret-Value", self.beta),
+            request=AGAIN + " password=Hunter2-Secret-Value",
+        )
         self.assertEqual(self.grant(self.app, run).status, RunStatus.COMPLETED)
         self.assertEqual(self.payloads(run.session.id, "skill_draft_offered"), [])
         self.assertEqual(self.store.pending_drafts(self.beta), ())
@@ -362,7 +365,7 @@ class SkillGateTests(unittest.TestCase):
                 self.assertEqual(self.listed(project_id), [])
                 self.assertFalse(self.app.skill_get(skill_id, project_id=project_id)["ok"])
                 self.assertFalse(self.app.skill_delete(skill_id, project_id=project_id)["ok"])
-                run = self.app.core.run(self.task(AGAIN, project_id))
+                run = self.app.core.run(self.task(AGAIN, project_id), request=AGAIN)
                 self.assertPlain(run)
                 self.assertEqual(self.store.experiences(project_id), ())
         self.assertEqual(self.listed(self.alpha)[0]["status"], "active")

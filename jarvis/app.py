@@ -4574,8 +4574,9 @@ class JarvisApp:
                 if not self._propose_project_folder(task):
                     return refused(IntentStatus.UNSUPPORTED, _NO_FOLDER_PROPOSAL)
             # From here on the ordinary lifecycle owns everything. No grant
-            # is passed: a natural-language request cannot approve itself.
-            run = self.core.run(task, session_id)
+            # is passed: a natural-language request cannot approve itself. The
+            # user's own text goes along: only it can bind a skill fit's inputs.
+            run = self.core.run(task, session_id, request=text)
             return respond(
                 mode, IntentStatus.STRUCTURED, request_id,
                 capability=resolution.capability,
@@ -5793,7 +5794,11 @@ class JarvisApp:
                 "run", ErrorCode.INVALID_TASK, str(exc), EXIT_INVALID_INPUT
             )
         # No grant is ever accepted here: a first run cannot approve itself.
-        return self._present("run", self.core.run(task, session_id))
+        # The CLI user wrote this task JSON themselves (no model in this path),
+        # so its objective is the typed request a skill FIT binds from.
+        return self._present(
+            "run", self.core.run(task, session_id, request=task.objective)
+        )
 
     def resume(self, session_id: str, task_id: str) -> CommandResult:
         return self._present("resume", self.core.resume(session_id, task_id))

@@ -244,7 +244,8 @@ class TableTests(unittest.TestCase):
         ("Haftalık satış raporunu hazırla ve gönder", MatchKind.SIMILAR, "satis-raporu"),
         ("Haftalık satış raporunu hazırlar", MatchKind.FIT, "satis-raporu"),
         ("HAFTALIK SATIŞ RAPORU", MatchKind.FIT, "satis-raporu"),
-        ("haftalik satis raporu", MatchKind.FIT, "satis-raporu"),
+        # CDXINT54F O1 (Salih A, 2026-10-17): a cedilla s is a different text.
+        ("haftalik satis raporu", MatchKind.SIMILAR, "satis-raporu"),
         ("Satış raporu", MatchKind.SIMILAR, "satis-raporu"),
         ("Müşteri listesini temizle ve satış raporu ekle", MatchKind.SIMILAR, "satis-raporu"),
         ("Rapor", MatchKind.SIMILAR, "satis-raporu"),
@@ -634,6 +635,8 @@ class PlaceholderTests(unittest.TestCase):
         ("Download {url} and save as {path}",),
         ("url", "path"),
     )
+    INVOICE_TASK = "Faturayi evil@x.test adresine gonder"
+    DOWNLOAD_TASK = "Download https://evil.test and save as e.pdf"
     TABLE = (
         # (skill, task, kind, score, coverage, headline words)
         # SKSIMASK4: a stored text with a placeholder never fits by text
@@ -655,6 +658,52 @@ class PlaceholderTests(unittest.TestCase):
                 self.assertEqual(result.best.skill_id, skill.skill_id)
                 self.assertEqual((result.best.score, result.best.coverage), (score, coverage))
                 self.assertEqual(sm._skill_words(skill).headline.exact, frozenset(headline))
+
+    def test_typed_values_at_the_placeholders_fit_with_the_users_own_spans(self) -> None:
+        # Salih A (2026-10-17): the skill's text with the user's own values is a
+        # fit, each input the exact span the user typed (INT54-AFX F2 H1).
+        # The model's task text names other values; only the user's bind.
+        invoice, download = self.INVOICE_TASK, self.DOWNLOAD_TASK
+        rows = (
+            (self.INVOICE, invoice, "Faturayi ali@example.com adresine gonder",
+             {"email": "ali@example.com"}),
+            (self.INVOICE, invoice, "faturayı Ali@Example.com ADRESİNE gonder",
+             {"email": "Ali@Example.com"}),
+            (
+                self.DOWNLOAD,
+                download,
+                "Download https://x.test/a b.pdf and save as C:\\out\\a.pdf",
+                {"url": "https://x.test/a b.pdf", "path": "C:\\out\\a.pdf"},
+            ),
+        )
+        for skill, task, request, inputs in rows:
+            with self.subTest(request=request):
+                result = match_skills(task, [entry(skill)], None, request=request)
+                self.assertIs(result.kind, MatchKind.FIT)
+                self.assertEqual(dict(result.best.inputs), inputs)
+
+    def test_a_value_the_user_did_not_type_or_a_differing_literal_is_asked(self) -> None:
+        rows = (
+            (self.INVOICE, None),  # no user text: the model's value never binds
+            (self.INVOICE, "Faturayi adresine gonder"),  # model-only scope.target
+            (self.INVOICE, "Faturayi {email} adresine gonder"),  # not a value
+            (self.INVOICE, "Faturayi  adresine gonder"),  # empty span
+            (self.INVOICE, "Faturayi  ali@x.test adresine gonder"),  # padded span
+            (self.INVOICE, "Faturayi \u200bali@x.test adresine gonder"),  # invisible pad
+            (self.INVOICE, "Faturayiali@x.test adresine gonder"),  # in-word
+            (self.INVOICE, "Faturayi ali@x.test adresine gönder"),  # ö|o
+            (self.INVOICE, "Faturayi ali@x.test adresine gonder."),
+            (self.INVOICE, "Faturayi ali@x.test adresine\ngonder"),
+            (self.INVOICE, "Şaturayi ali@x.test adresine gonder"),
+            (self.DOWNLOAD, "Download a and save as b and save as c"),  # ambiguous
+            (self.DOWNLOAD, "Download a and save as"),
+        )
+        for skill, request in rows:
+            with self.subTest(request=request):
+                task = self.INVOICE_TASK if skill is self.INVOICE else self.DOWNLOAD_TASK
+                result = match_skills(task, [entry(skill)], None, request=request)
+                self.assertIs(result.kind, MatchKind.SIMILAR)
+                self.assertEqual(result.best.inputs, ())
 
     def test_placeholder_names_are_not_words_of_the_text(self) -> None:
         skill = make_skill(

@@ -701,7 +701,62 @@ def _said(text: str, *, stored: bool = False) -> str | None:
             unicodedata.combining(prev) or unicodedata.decomposition(prev)[:1] not in ("", "<")
         ):
             return None
+    # CDXINT54F O2: NFC turns a singleton (Kelvin sign) into a plain letter.
+    if any(" " not in d and d[:1] not in ("", "<") for d in map(unicodedata.decomposition, text)):
+        return None
     return fold_token(text.strip(), identity=True)
+
+
+def _bind_one(template: str, request: str, skill: Skill) -> dict[str, str] | None:
+    """Each placeholder bound to the exact span the user typed there, all else the
+    template's own up to the identity fold (Salih 2026-10-17, option A); None
+    when a span is empty or padded or the split is not the only one."""
+    parts = _PLACEHOLDER.split(template)
+    names = [m.group()[1:-1] for m in _PLACEHOLDER.finditer(template)]
+    declared = {spec.name: spec.required for spec in skill.inputs}
+    edges = [p[-1:] for p in parts[:-1]] + [p[:1] for p in parts[1:]]
+    chars = [fold_token(c, identity=True) for c in request]
+    key, lits = "".join(chars), [fold_token(p, identity=True) for p in parts]
+    end = len(key) - len(lits[-1])
+    if (
+        len(set(names)) != len(names)
+        or not set(names) <= declared.keys()
+        or {n for n, required in declared.items() if required} - set(names)
+        or not all(parts[1:-1])
+        or any(c.isalnum() or c == "_" for c in edges)
+        or any(len(c) != 1 for c in chars)
+        or key != fold_token(request, identity=True)
+        or not (key.startswith(lits[0]) and key.endswith(lits[-1]) and len(lits[0]) < end)
+    ):
+        return None
+    # Leftmost and rightmost placements of the literals agree only for a unique split.
+    lo, at = [], len(lits[0])
+    for lit in lits[1:-1]:
+        at = key.find(lit, at + 1, end)
+        if at < 0:
+            return None
+        lo.append(at)
+        at += len(lit)
+    hi, stop = [], end
+    for lit in reversed(lits[1:-1]):
+        hi.insert(0, stop := key.rfind(lit, 0, stop - 1))
+    starts = (len(lits[0]), *(a + len(lit) for a, lit in zip(lo, lits[1:-1])))
+    values = [request[a:b] for a, b in zip(starts, (*lo, end))]
+    # A typed "{name}" is the template's own text, never a value: ask.
+    if at >= end or lo != hi or any(v != v.strip() or not (v[:1] + v[-1:]).isprintable() or "{" in v for v in values):
+        return None
+    return dict(zip(names, values))
+
+
+def _bind(skill: Skill, request: str | None) -> dict[str, str] | None:
+    """The one binding of the user's own ``request`` to the skill's name or
+    summary placeholders, never the model's text (INT54-AFX F2 H1)."""
+    if request is None or len(request) > MAX_TASK_CHARS or _said(request) is None:
+        return None
+    texts = [t.strip() for t in (skill.name, skill.summary) if _PLACEHOLDER.search(t)]
+    texts = [t for t in texts if not any(o != t and o.startswith(t) for o in texts)]  # clipped name
+    bound = [b for t in texts if _said(t) and (b := _bind_one(t, request.strip(), skill))]
+    return bound[0] if bound and all(b == bound[0] for b in bound) else None
 
 
 @lru_cache(maxsize=CACHE_MAX)
@@ -1003,6 +1058,7 @@ class MatchCandidate:
     score: int
     coverage: int
     reasons: tuple[str, ...]
+    inputs: tuple[tuple[str, str], ...] = ()
 
     @property
     def skill_id(self) -> str:
@@ -1054,6 +1110,7 @@ def _assess(
     literals: tuple[str, ...],
     truncated: bool,
     said: str,
+    bound: bool,
 ) -> tuple[MatchKind, int, int, tuple[str, ...]]:
     index = _skill_words(skill)
     body_hits = task.hits(index.body)
@@ -1067,7 +1124,7 @@ def _assess(
     head_size = len(index.headline.exact)
     covered = task.covered(index.headline)
     coverage = 100 * covered // head_size if head_size else 0
-    own_text = said in _skill_said(skill)
+    own_text = said in _skill_said(skill) or bound
     fit = (
         own_text
         and score >= FIT_MIN_SCORE
@@ -1077,6 +1134,8 @@ def _assess(
         and not unbound
         and not truncated
     )
+    # A bound request is the skill's own text; model-read word gates cannot veto it.
+    fit = fit or bound and not truncated
     conflicts = _conflicts(skill, index.body, request, literals, task.words) if fit else []
     kind = MatchKind.FIT if fit and not conflicts else MatchKind.SIMILAR
     reasons = [
@@ -1155,15 +1214,21 @@ def match_skills(
     task_text: str,
     skills_with_state: Iterable[SkillWithState],
     project_id: str | None,
+    *,
+    request: str | None = None,
 ) -> MatchResult:
     """Match a task against the offered skills; see the module docstring.
 
+    ``request`` is the user's own typed text, never the model's; a fit's
+    inputs are its spans at the skill's placeholders (none without it).
     Offer one entry per skill (its active version). Wrong argument types, a
     malformed ``project_id`` (Core's project id pattern), a skill offered
     twice or more than ``MAX_SKILLS`` skills raise ``SkillMatchError``.
     """
     if type(task_text) is not str:
         raise SkillMatchError("task_text must be a string")
+    if request is not None and type(request) is not str:
+        raise SkillMatchError("request must be None or a string")
     if project_id is not None and (
         type(project_id) is not str or PROJECT_ID_PATTERN.fullmatch(project_id) is None
     ):
@@ -1186,9 +1251,9 @@ def match_skills(
     if not task_words:
         return MatchResult(kind=MatchKind.NONE, best=None, candidates=(), needs_revalidation=())
     task = _TaskWords.build(task_words)
-    request = _CueText.read(folded)
+    cues = _CueText.read(folded)
     literals = _literals(task_text)
-    said = _said(task_text)
+    said = _said(task_text if request is None else request)
 
     ranked: list[tuple[tuple, MatchCandidate]] = []
     stale: list[tuple[tuple, MatchCandidate]] = []
@@ -1202,7 +1267,10 @@ def match_skills(
             target = stale
         else:  # disabled, deleted, or anything unknown: never offered
             continue
-        kind, score, coverage, reasons = _assess(skill, task, request, literals, truncated, said)
+        bound = _bind(skill, request)
+        kind, score, coverage, reasons = _assess(
+            skill, task, cues, literals, truncated, said, bound is not None
+        )
         if kind is MatchKind.NONE:
             continue
         if target is stale:
@@ -1210,8 +1278,9 @@ def match_skills(
                 f"stale: needs revalidation before use (would be {kind.value})",
             )
             kind = MatchKind.SIMILAR
+        inputs = tuple(sorted(bound.items())) if bound and kind is MatchKind.FIT else ()
         candidate = MatchCandidate(
-            skill=skill, kind=kind, score=score, coverage=coverage, reasons=reasons
+            skill=skill, kind=kind, score=score, coverage=coverage, reasons=reasons, inputs=inputs
         )
         target.append((_order_key(kind, score, coverage, entry), candidate))
 
