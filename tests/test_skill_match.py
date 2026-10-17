@@ -705,6 +705,47 @@ class PlaceholderTests(unittest.TestCase):
                 self.assertIs(result.kind, MatchKind.SIMILAR)
                 self.assertEqual(result.best.inputs, ())
 
+    def test_only_one_agreeing_typed_binding_fits_a_placeholder_skill(self) -> None:
+        # CDXINT54G C1-C3: no typed request, an ambiguous or refused template,
+        # or name and summary binding differently is asked, nothing bound.
+        def two(skill_id: str, name: str, summary: str, inputs: tuple[str, ...]) -> Skill:
+            return dataclasses.replace(drafted_skill(skill_id, name, (name,), inputs), summary=summary)
+
+        report = two("report", "Read report1", "Read report1: {path}", ("path",))
+        clip = two("clip", "Read file {path}", "Read file {path} now", ("path",))
+        copy = two("copy", "Copy files {src} to {dst}", "Copy files {src} as {dst}", ("src", "dst"))
+        rows = (
+            (report, "Read report1", None),  # C1: the model's target never binds
+            (report, "Read report1", ""),
+            (report, "Read report1", "   "),
+            (report, "Read report1", "Read report1"),  # the bare name
+            (report, "Read report1", "Read report1:"),
+            (clip, "Read file docs/a", "Read file docs/a now"),  # C2: name says "docs/a now"
+            (clip, "Read file docs/a", "Read file  docs/a now"),  # padded
+            (clip, "Read file docs/a", "Read file docs/\u200ba now"),  # invisible inside
+            (clip, "Read file docs/a", "Read file docs/a now"),
+            (clip, "Read file docs/a", "Read file \u3164"),  # a blank filler value
+            (clip, "Read file docs/a", "Read file docs/a\u034f"),  # trailing joiner
+            (clip, "Read file docs/a", "Read file \u0301docs/a"),  # leading combining mark
+            (copy, "Copy files a to b", "Copy files a to b to c as d"),  # C3: ambiguous name
+            (copy, "Copy files a to b", "Copy files a to b as c"),  # name and summary disagree
+            (copy, "Copy files a to b", "Copy files a to b to c"),  # ambiguous, no summary
+        )
+        for skill, task, request in rows:
+            with self.subTest(request=request):
+                result = match_skills(task, [entry(skill)], None, request=request)
+                self.assertIs(result.kind, MatchKind.SIMILAR)
+                self.assertEqual(result.best.inputs, ())
+        for skill, request, inputs in (
+            (clip, "Read file docs/a", {"path": "docs/a"}),
+            (copy, "Copy files a to b", {"src": "a", "dst": "b"}),
+            (copy, "Copy files a as b", {"src": "a", "dst": "b"}),
+        ):
+            with self.subTest(request=request):
+                result = match_skills(request, [entry(skill)], None, request=request)
+                self.assertIs(result.kind, MatchKind.FIT)
+                self.assertEqual(dict(result.best.inputs), inputs)
+
     def test_placeholder_names_are_not_words_of_the_text(self) -> None:
         skill = make_skill(
             "ph", "Rapor {xyzzy} {a-1}{b_2} gonder", "{kopya}", ("Raporu {plugh} gonder",)

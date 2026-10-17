@@ -707,10 +707,14 @@ def _said(text: str, *, stored: bool = False) -> str | None:
     return fold_token(text.strip(), identity=True)
 
 
+_REFUSED: dict[str, str] = {}  # sentinel: the template aligns but cannot bind (checked by identity)
+
+
 def _bind_one(template: str, request: str, skill: Skill) -> dict[str, str] | None:
     """Each placeholder bound to the exact span the user typed there, all else the
     template's own up to the identity fold (Salih 2026-10-17, option A); None
-    when a span is empty or padded or the split is not the only one."""
+    when the request is not this template, ``_REFUSED`` when it is but a span is
+    empty, padded or unprintable or the split is not the only one."""
     parts = _PLACEHOLDER.split(template)
     names = [m.group()[1:-1] for m in _PLACEHOLDER.finditer(template)]
     declared = {spec.name: spec.required for spec in skill.inputs}
@@ -742,10 +746,23 @@ def _bind_one(template: str, request: str, skill: Skill) -> dict[str, str] | Non
         hi.insert(0, stop := key.rfind(lit, 0, stop - 1))
     starts = (len(lits[0]), *(a + len(lit) for a, lit in zip(lo, lits[1:-1])))
     values = [request[a:b] for a, b in zip(starts, (*lo, end))]
-    # A typed "{name}" is the template's own text, never a value: ask.
-    if at >= end or lo != hi or any(v != v.strip() or not (v[:1] + v[-1:]).isprintable() or "{" in v for v in values):
-        return None
+    # The literals align here, so a bad split is refused, not a non-match. A
+    # typed "{name}" is the template's own text, never a value: ask.
+    if at >= end or lo != hi or any(v != v.strip() or not _plain(v) or "{" in v for v in values):
+        return _REFUSED
     return dict(zip(names, values))
+
+
+# Printable characters that still show nothing: Hangul and braille fillers.
+_BLANKS = frozenset(map(chr, (0x115F, 0x1160, 0x3164, 0xFFA0, 0x2800)))
+
+
+def _plain(value: str) -> bool:
+    """True when every character of a bound value is visible on its own: no
+    control, format, combining mark or blank filler (CDXINT54G F2 #20)."""
+    return value.isprintable() and not any(
+        c in _BLANKS or unicodedata.category(c) in ("Mn", "Me") for c in value
+    )
 
 
 def _bind(skill: Skill, request: str | None) -> dict[str, str] | None:
@@ -754,9 +771,13 @@ def _bind(skill: Skill, request: str | None) -> dict[str, str] | None:
     if request is None or len(request) > MAX_TASK_CHARS or _said(request) is None:
         return None
     texts = [t.strip() for t in (skill.name, skill.summary) if _PLACEHOLDER.search(t)]
-    texts = [t for t in texts if not any(o != t and o.startswith(t) for o in texts)]  # clipped name
-    bound = [b for t in texts if _said(t) and (b := _bind_one(t, request.strip(), skill))]
-    return bound[0] if bound and all(b == bound[0] for b in bound) else None
+    # Every template the request aligns to must bind it alike; one refused
+    # (ambiguous, padded, invisible) alignment asks (CDXINT54G C2/C3).
+    bound = [_bind_one(t, request.strip(), skill) if _said(t) else _REFUSED for t in texts]
+    bound = [b for b in bound if b is not None]
+    if not bound or any(b is _REFUSED for b in bound) or any(b != bound[0] for b in bound):
+        return None
+    return bound[0]
 
 
 @lru_cache(maxsize=CACHE_MAX)
@@ -1124,7 +1145,10 @@ def _assess(
     head_size = len(index.headline.exact)
     covered = task.covered(index.headline)
     coverage = 100 * covered // head_size if head_size else 0
-    own_text = said in _skill_said(skill) or bound
+    # A placeholder skill is its own text only through the user's typed binding
+    # (CDXINT54G C1): no request, or its bare name, never FITs it.
+    placeholder = any(_PLACEHOLDER.search(t) for t in (skill.name, skill.summary))
+    own_text = bound if placeholder else said in _skill_said(skill) or bound
     fit = (
         own_text
         and score >= FIT_MIN_SCORE

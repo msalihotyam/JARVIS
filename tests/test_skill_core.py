@@ -489,8 +489,27 @@ class SkillCoreTests(unittest.TestCase):
 
     # -- missing inputs -------------------------------------------------------
 
+    def test_no_typed_binding_never_fits_a_placeholder_skill(self) -> None:
+        # CDXINT54G C1: no request (folder retry, CLI, scripts) or the bare name
+        # with only a model target is asked about, never run on that target.
+        self.save_skill()
+        connector = CapturingConnector()
+        core = self.core(connector)
+        for run in (
+            AgentCore.run(core, user_task("Haftalik rapor dosyasini oku", target="notes/evil.md")),
+            AgentCore.run(core, user_task()),
+            core.run(user_task("Haftalik rapor dosyasini oku", target="notes/evil.md")),
+        ):
+            self.assertEqual(run.status, RunStatus.AWAITING_CLARIFICATION, run.error)
+            self.assertIn("skill_similar_asked", self.feed(run.session.id))
+            self.assertNotIn("skill_announced", self.feed(run.session.id))
+        self.assertEqual(connector.execute_calls, 0)
+
     def test_missing_inputs_are_asked_for_then_used(self) -> None:
-        skill_id = self.save_skill()
+        # A placeholder-free skill text FITs with its declared input unbound.
+        made = replace(draft(), summary=draft().name)
+        self.store.add_draft(made)
+        skill_id = self.store.approve_draft(made.draft_id, project_id=None).skill_id
         connector = CapturingConnector()
         core = self.core(connector)
         run = core.run(user_task("Haftalik rapor dosyasini oku", target=""))

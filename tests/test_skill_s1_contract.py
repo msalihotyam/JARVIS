@@ -1111,7 +1111,8 @@ class DraftMatchContractTests(unittest.TestCase):
     """D18: a skill SKDRAFT drafts from a run with an e-mail, a URL and a path
     is SIMILAR (asked, never auto-run) for the same task with those values
     removed (SKCORE's job); the user's own request with the values typed back in
-    FITs, each input the user's span (Salih A, 2026-10-17; INT54-AFX F2 H1)."""
+    also asks while its clipped name and summary read the values differently
+    (CDXINT54G C2)."""
 
     EMAIL = "ali.veli@example.com"
     URL = "https://example.com/rapor?id=7"
@@ -1152,12 +1153,12 @@ class DraftMatchContractTests(unittest.TestCase):
                 self.assertEqual(result.best.skill, skill)
                 self.assertEqual(result.best.coverage, 100)
                 self.assertEqual(result.best.inputs, ())
+                # The clipped name ends on {email}, so it binds "<email> adresine
+                # gonder" while the summary binds the e-mail: two readings ask
+                # (CDXINT54G C2, the same shape as "Read file {path}" + " now").
                 result = match_skills(stripped, [entry], project_id, request=task)
-                self.assertIs(result.kind, MatchKind.FIT, result)
-                self.assertEqual(
-                    dict(result.best.inputs),
-                    {"path": self.PATH, "url": self.URL, "email": self.EMAIL},
-                )
+                self.assertIs(result.kind, MatchKind.SIMILAR, result)
+                self.assertEqual(result.best.inputs, ())
 
 
 if __name__ == "__main__":
