@@ -65,6 +65,7 @@ import json
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import sys
 import tempfile
@@ -158,10 +159,13 @@ def load_sensitive() -> set[str]:
     try:
         text = STATE.read_text(encoding="utf-8")
     except OSError:
+        print(f"WARNING: load-sensitive list: {STATE} not readable; 0 ids", flush=True)
         return set()
     section = re.search(r"^- Load-sensitive list.*?(?=^- |^#|\Z)", text, re.MULTILINE | re.DOTALL)
     flat = re.sub(r"\s+", " ", section.group(0)) if section else ""
-    return set(re.findall(r"\b(test_\w+\.\w+\.test_\w+)", flat))
+    ids = set(re.findall(r"\b(test_\w+\.\w+\.test_\w+)", flat))
+    print(f"{'' if ids else 'WARNING: '}load-sensitive list: {len(ids)} ids from {STATE}", flush=True)
+    return ids
 
 
 # -- discovery (in its own process) ---------------------------------------------
@@ -256,8 +260,9 @@ def build_units(discovery: dict, ui: set[str], durations: dict[str, float], test
     about CHUNK_SECONDS each, longest first onto the least-loaded chunk. A class recorded above
     SPLIT_CLASS_SECONDS goes into the chunks one test method at a time (THIZ: its seconds from
     ``tests``, the recorded per-test seconds, else an equal share), so one long class is no
-    longer one long unit. A unit's seconds are the sum of its parts' recorded seconds; None when
-    any class has no record."""
+    longer one long unit. A unit's seconds are the sum of its parts' recorded seconds; a class
+    without a record counts as the module's median class (TESTINFRA); None only when no class of
+    the module has a record."""
     tests = tests or {}
     units = []
     for module, info in sorted(discovery["modules"].items()):
@@ -265,6 +270,9 @@ def build_units(discovery: dict, ui: set[str], durations: dict[str, float], test
         for attr, ids in info["classes"].items():
             known = [durations.get(c) for c in sorted({t.rsplit(".", 1)[0] for t in ids})]
             per[attr] = None if any(k is None for k in known) else sum(known)
+        recorded = [v for v in per.values() if v is not None]
+        if recorded:
+            per = {a: statistics.median(recorded) if v is None else v for a, v in per.items()}
         total = None if any(v is None for v in per.values()) else sum(per.values())
         if not info["split"] or total is None or total <= CHUNK_SECONDS or len(per) == 1 and len(next(iter(info["classes"].values()))) == 1:
             ids = [t for attr_ids in info["classes"].values() for t in attr_ids]
@@ -320,6 +328,8 @@ def discovered_ids(discovery: dict) -> collections.Counter:
 # -- running ------------------------------------------------------------------------
 
 class Result:
+    timed_out = False
+
     def __init__(self, unit, command, returncode, output, wall):
         self.unit, self.command, self.returncode, self.output, self.wall = unit, command, returncode, output, wall
         self.label = unit.label if unit is not None else "rerun"
@@ -344,13 +354,15 @@ class Result:
 
     @property
     def ok(self) -> bool:
-        return self.returncode == 0 and self.parsed and not self.failures and not self.errors and self.accounted
+        return self.returncode == 0 and self.parsed and not self.failures and not self.errors and self.accounted and not self.timed_out
 
 
 def _skips(output: str) -> list[list[str]]:
     """[test id, reason] for every ``... skipped 'reason'`` line of a -v run; the id is the last
-    one named before it (a test with a docstring prints it on the line before)."""
-    seen = [(m.start(), m.group(2)) for m in _SEEN.finditer(output) if m.group(2).endswith("." + m.group(1))]
+    one named before it (a test with a docstring prints it on the line before); a skip raised in
+    setUpClass is its class's."""
+    seen = [(m.start(), m.group(2)) for m in _SEEN.finditer(output)
+            if m.group(1) == "setUpClass" or m.group(2).endswith("." + m.group(1))]
     skips = []
     for match in _SKIPPED.finditer(output):
         named = [test for at, test in seen if at < match.start()]
@@ -406,6 +418,37 @@ def pid_alive(pid: int) -> bool:
         return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(code))) and code.value == 259  # STILL_ACTIVE
     finally:
         kernel32.CloseHandle(handle)
+
+
+def _created(pid: int) -> int | None:
+    """The process's creation time (Windows FILETIME), so a reused pid is not mistaken for the holder;
+    None where it cannot be read."""
+    # ponytail: Windows only (the lanes' platform); elsewhere a reused pid still counts as the holder.
+    if os.name != "nt" or pid <= 0:
+        return None
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel32.OpenProcess.restype = wintypes.HANDLE
+    kernel32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    kernel32.GetProcessTimes.argtypes = (wintypes.HANDLE, *[ctypes.POINTER(wintypes.FILETIME)] * 4)
+    kernel32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    handle = kernel32.OpenProcess(0x1000, False, pid)
+    if not handle:
+        return None
+    try:
+        times = [wintypes.FILETIME() for _ in range(4)]
+        if not kernel32.GetProcessTimes(handle, *(ctypes.byref(t) for t in times)):
+            return None
+        return times[0].dwHighDateTime << 32 | times[0].dwLowDateTime
+    finally:
+        kernel32.CloseHandle(handle)
+
+
+def _same_process(pid: int, created) -> bool:
+    """Alive and, when its creation time was recorded, still the process that recorded it."""
+    if not pid_alive(pid):
+        return False
+    now = _created(pid)
+    return created is None or now is None or created == now
 
 
 def _cas(path: Path, change):
@@ -549,18 +592,25 @@ def _plain(text: object, limit: int = 40) -> str:
 
 
 class UiLock:
-    """CONVUI: the machine-wide UI test lock, ``build/locks/ui.json`` (the A1 record plus ``pid``)."""
+    """CONVUI: the machine-wide UI test lock, ``build/locks/ui.json`` (the A1 record plus ``pid`` and
+    its process ``created`` time). TESTINFRA: waiters line up FIFO in ``ui-queue.json``, INT*/DRY*
+    lanes first; only the head of the line may take a free lock."""
 
     poll = 2.0
     notice = 30.0
 
     def __init__(self, folder: Path, command: str):
-        self.path, self.suite = folder / "ui.json", folder / "suite.json"
+        self.path, self.suite, self.queue = folder / "ui.json", folder / "suite.json", folder / "ui-queue.json"
         self.session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
+        lane = os.environ.get("CONV_LANE") or ROOT.name
         stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
-        self.record = json.dumps({"lane": ROOT.name, "session": self.session, "pid": os.getpid(), "started_at": stamp,
-                                  "command": command[:200], "heartbeat": stamp})
+        pid, created = os.getpid(), _created(os.getpid())
+        self.entry = {"id": f"{pid}-{id(self)}", "prio": 0 if lane.upper().startswith(("INT", "DRY")) else 1,
+                      "pid": pid, "created": created, "lane": lane}
+        self.record = json.dumps({"lane": lane, "session": self.session, "pid": pid, "created": created,
+                                  "id": self.entry["id"], "started_at": stamp, "command": command[:200], "heartbeat": stamp})
         self.held = False
+        self.told = None
 
     def _suite_holder(self) -> str | None:
         """Another session's live full suite (A1 rules: fresh heartbeat, all fields)."""
@@ -582,23 +632,48 @@ class UiLock:
                 pid = int(rec["pid"])
             except (ValueError, KeyError, TypeError):
                 pid = 0  # garbage: stale
-            if pid_alive(pid):
+            if pid > 0 and _same_process(pid, rec.get("created")):  # pid reuse: another process is no holder
                 return f"{_plain(rec.get('lane'))}/{pid} since {_plain(rec.get('started_at'))}", None
         return None, self.record
 
+    def _enqueue(self, text: str):
+        """Joins the line (dropping waiters whose process is gone); who is first in line ahead of us, or None."""
+        try:
+            line = [e for e in json.loads(text) if e["id"] == self.entry["id"] or _same_process(int(e["pid"]), e.get("created"))]
+            if not any(e["id"] == self.entry["id"] for e in line):
+                line.append(self.entry)
+            head = min(range(len(line)), key=lambda i: (int(line[i]["prio"]), i))
+        except (ValueError, KeyError, TypeError, AttributeError):
+            line, head = [self.entry], 0  # empty or garbage: a fresh line
+        first = line[head]
+        ahead = None if first["id"] == self.entry["id"] else f"{_plain(first.get('lane'))}/{_plain(first.get('pid'))}"
+        return ahead, json.dumps(line)
+
+    def _dequeue(self, text: str):
+        try:
+            return None, json.dumps([e for e in json.loads(text) if e["id"] != self.entry["id"]])
+        except (ValueError, KeyError, TypeError, AttributeError):
+            return None, None
+
+    def try_acquire(self) -> bool:
+        suite = self._suite_holder()
+        ahead = _cas(self.queue, self._enqueue)
+        holder = suite or (None if ahead else _cas(self.path, self._take))
+        if holder is None and ahead is None:
+            _cas(self.queue, self._dequeue)
+            self.held = True
+            return True
+        if self.told is None or time.monotonic() - self.told >= self.notice:
+            print(f"waiting for the UI test lock {f'held by {holder}' if holder else f'queued behind {ahead}'}", flush=True)
+            self.told = time.monotonic()
+        return False
+
     def acquire(self) -> None:
-        told = None
-        while True:
-            holder = self._suite_holder() or _cas(self.path, self._take)
-            if holder is None:
-                self.held = True
-                return
-            if told is None or time.monotonic() - told >= self.notice:
-                print(f"waiting for the UI test lock held by {holder}", flush=True)
-                told = time.monotonic()
+        while not self.try_acquire():
             time.sleep(self.poll)
 
     def release(self) -> None:
+        _cas(self.queue, self._dequeue)
         if self.held:
             self.held = False
             _cas(self.path, lambda text: (None, "" if text == self.record else None))
@@ -622,13 +697,39 @@ def worker_env(index: int, bases: list[Path]) -> dict[str, str]:
     return env
 
 
+def unit_timeout(unit: Unit) -> float:
+    """TESTINFRA: 4x the unit's recorded seconds, at least 120 s; 600 s when it has no record."""
+    return 600.0 if unit.seconds is None else max(120.0, 4 * unit.seconds)
+
+
 def run_unit(python: str, unit: Unit, env: dict[str, str], durations: int | None) -> Result:
     command = [python, "-m", "unittest", "-v", *unit.names]
     if durations is not None:
         command[4:4] = ["--durations", str(durations)]
     started = time.monotonic()
-    done = subprocess.run(command, cwd=ROOT, env=env, capture_output=True, text=True, encoding="utf-8", errors="replace")
-    return Result(unit, command, done.returncode, done.stdout + done.stderr, time.monotonic() - started)
+    proc = subprocess.Popen(command, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            text=True, encoding="utf-8", errors="replace", start_new_session=os.name != "nt")
+    limit, timed_out = unit_timeout(unit), False
+    try:
+        out, err = proc.communicate(timeout=limit)
+    except subprocess.TimeoutExpired:
+        # The whole tree: a hung UI test's helper processes would otherwise keep the pipes open.
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/T", "/F", "/PID", str(proc.pid)], capture_output=True)
+        else:
+            os.killpg(proc.pid, 9)
+        proc.kill()
+        out, err = proc.communicate()
+        timed_out = True
+    output = out + err
+    if timed_out:
+        last = next((line.strip() for line in reversed(output.splitlines()) if _SEEN.search(line)), "none")
+        line = f"TIMEOUT: {unit.label} after {limit:.0f}s; last test line: {last}"
+        print(line, flush=True)
+        output += f"\n{line}\n"
+    result = Result(unit, command, proc.returncode, output, time.monotonic() - started)
+    result.timed_out = timed_out
+    return result
 
 
 def execute(args, units: list[Unit], ui_workers: int, workers: int,
@@ -642,22 +743,29 @@ def execute(args, units: list[Unit], ui_workers: int, workers: int,
     ui_left = len(queues["ui"])
     worker_wall: dict[str, float] = {}
 
+    def locked() -> bool:
+        # CONVUI: UI units run only under the machine-wide UI lock; the plain workers do not wait.
+        with gate:
+            return ui_lock is None or ui_lock.held or ui_lock.try_acquire()
+
     def worker(kind: str, index: int) -> None:
         nonlocal ui_left
-        if kind == "ui" and ui_lock is not None:
-            # CONVUI: UI processes start only under the machine-wide UI lock; the plain workers do not wait.
-            with gate:
-                if ui_left and not ui_lock.held:
-                    ui_lock.acquire()
         env, began = worker_env(index, bases), time.monotonic()
         while True:
             with lock:
+                want_ui = kind == "ui" and bool(queues["ui"])
+            may_ui = want_ui and locked()
+            with lock:
                 # THIZ2: an idle UI process takes the leftover non-UI units (never the reverse);
                 # every unit is its own subprocess, so nothing carries over between them.
-                queue = queues[kind] or (queues["plain"] if kind == "ui" else [])
-                if not queue:
-                    break
-                unit = queue.pop(0)
+                # TESTINFRA: so does one still waiting for the UI lock, instead of idling on its token.
+                queue = queues["ui"] if may_ui and queues["ui"] else queues["plain"]
+                unit = queue.pop(0) if queue else None
+            if unit is None:
+                if want_ui and not may_ui:
+                    time.sleep(ui_lock.poll)
+                    continue
+                break
             result = run_unit(args.python, unit, env, durations)
             with lock:
                 results.append(result)
@@ -748,6 +856,7 @@ def main(argv: list[str] | None = None) -> int:
           f" {sum(dispatched.values())} tests dispatched", flush=True)
 
     bases: list[Path] = []
+    tripwire = db_snapshot() if os.environ.get("JARVIS_DB_TRIPWIRE") == "1" else None
     try:
         results, worker_wall, wall, bases = execute(args, units, ui_workers, workers, ui_lock_for(args, units))
         ran = sum(r.ran for r in results)
@@ -770,6 +879,13 @@ def main(argv: list[str] | None = None) -> int:
         rule_d = []
         if broken:
             green = _report_failures(broken, args, bases, rule_d) and accounted
+        if shard is None:
+            for problem in _gate_skips("local", {"skipped": skipped, "skips": [s for r in results for s in r.skips]}):
+                print(f"PROBLEM: {problem}")
+                green = False
+        if tripwire is not None and db_snapshot() != tripwire:
+            print("TRIPWIRE: data/jarvis.db* changed during the run")
+            green = False
         if args.durations:
             _print_durations(results, args.durations)
         if args.write_durations:
@@ -784,6 +900,11 @@ def main(argv: list[str] | None = None) -> int:
             pool.release()
         for base in bases:
             shutil.rmtree(base, ignore_errors=True)
+
+
+def db_snapshot(folder: Path = ROOT / "data") -> dict:
+    """Size and mtime of every ``jarvis.db*`` file: stat only, the database is never opened."""
+    return {p.name: (p.stat().st_size, p.stat().st_mtime_ns) for p in folder.glob("jarvis.db*")}
 
 
 def _print_set_difference(what: str, got: collections.Counter, expected: collections.Counter) -> None:
