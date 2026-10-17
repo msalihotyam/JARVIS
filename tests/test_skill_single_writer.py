@@ -39,7 +39,7 @@ from pathlib import Path
 from unittest import mock
 
 import jarvis
-from jarvis import codex, gmail_cli, intent, project_folders
+from jarvis import codex, experience, gmail_cli, intent, project_folders
 from jarvis.app import _folder_protected, build_default_app
 from jarvis.connectors.claude_code import ClaudeCodeConnector
 from jarvis.connectors.local_files import LocalFileWriteConnector
@@ -62,7 +62,9 @@ from tests.test_claude_connector import OAUTH_MAX_AUTH_STATUS, patch_oauth_envir
 
 JARVIS_DIR = Path(jarvis.__file__).resolve().parent
 SKILL_STORE = JARVIS_DIR / "skill_store.py"
-SKILL_TABLES = ("skills", "skill_events", "skill_drafts", "skill_suppressions", "skill_experiences")
+SKILL_TABLES = (
+    "skills", "skill_events", "skill_drafts", "skill_suppressions", "skill_experiences", "skill_experience_uses",
+)
 TASK_TEXT = "Haftalik rapor dosyasini oku: notes/week.md"
 # A statement's verb and target table, read from the statement's start only:
 # a bound value (a skill body, an event payload) can never match.
@@ -389,6 +391,13 @@ class SkillTablesSingleWriterTests(unittest.TestCase):
             mock.patch.dict(
                 intent.NL_CAPABILITIES,
                 {DUMMY_CAPABILITY: intent.CapabilityHint(None, "read", "echo")},
+            ),
+            # the dummy echo reads no external content; a2 allow-lists it as
+            # test_skill_experience_origin does, so the cycle can write a lesson.
+            mock.patch.object(
+                experience,
+                "NO_EXTERNAL_READ_CAPABILITIES",
+                frozenset({*experience.NO_EXTERNAL_READ_CAPABILITIES, DUMMY_CAPABILITY}),
             ),
         ):
             patcher.start()

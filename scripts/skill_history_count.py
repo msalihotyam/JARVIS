@@ -123,7 +123,10 @@ class _CountingStore:
     only remembered (deterministic ids: True new, False already there)."""
 
     def __init__(self, skills: _ReadOnlySkills) -> None:
+        # Every read _skill_learn makes; b8's dedup lists skills and reads a parent's history.
         self.is_suppressed = skills.is_suppressed
+        self.list_skills = skills.list_skills
+        self.history = skills.history
         self._seen: set[str] = set()
 
     def _add(self, record_id: str) -> bool:

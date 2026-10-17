@@ -107,7 +107,8 @@ class SkillHistoryCountTests(unittest.TestCase):
         self.build(skill=True)
         self.assertCounts(self.counts(), {
             "match.fit": 2, "match.similar": 1, "match.not_eligible": 1, "match.none": 0,
-            "family.file.match.fit": 2, "family.chat.match.similar": 1, "offered": 1,
+            # b8: a run identical to the active skill offers no duplicate draft
+            "family.file.match.fit": 2, "family.chat.match.similar": 1, "offered": 0,
             "skill_rows_broken": 0,
         })
 
