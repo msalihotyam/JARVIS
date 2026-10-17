@@ -489,7 +489,8 @@ class TestInbox(Base):
         self.assertEqual(set(s), {"updated_at", "pid", "paused", "last_error", "usage_pct",
                                   "usage_hold", "pace", "disk_hold", "disk_free_gb",
                                   "memory_hold", "memory", "presence", "lanes",
-                                  "preserved", "backlog", "breaker", "band", "attention"})
+                                  "preserved", "backlog", "breaker", "band", "attention",
+                                  "outage_hold"})
         self.assertFalse(s["paused"])
         self.assertIsNone(s["last_error"])
         (lane,) = s["lanes"]
@@ -1484,7 +1485,13 @@ class TestMemoryGuard(Base):
         self.assertTrue(st["memory_hold"])
         self.assertEqual(st["memory"], {"free_gb": 2.9, "commit_pct": 50.0})
         self.assertEqual(st["pace"]["band"], "memory hold")
-        self.memory = (3.0, 50.0)
+        self.memory = (3.0, 50.0)  # back at the threshold: hysteresis keeps the hold
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])
+        self.memory = (3.0 + conveyor.MEM_MARGIN_GB, 50.0)
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])  # threshold + margin, not yet held MEM_OK_S
+        self.t += conveyor.MEM_OK_S
         self.c.pass_once()
         self.assertEqual(self.fake.bg_names(), ["A"])
         self.assertFalse(self.status()["memory_hold"])
@@ -1497,6 +1504,9 @@ class TestMemoryGuard(Base):
         self.assertEqual(self.fake.bg_calls(), [])
         self.assertTrue(self.status()["memory_hold"])
         self.memory = (32.0, 90.0)
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])  # released only after MEM_OK_S under the line
+        self.t += conveyor.MEM_OK_S
         self.c.pass_once()
         self.assertEqual(self.fake.bg_names(), ["A"])
 
@@ -1514,6 +1524,7 @@ class TestMemoryGuard(Base):
                 (self.base / "pace.json").write_text(json.dumps({"max_commit_pct": pct}), encoding="utf-8")
                 self.memory = (32.0, mem)
                 self.c.memory = self.c.mem()
+                self.c.mem_hold = False  # the threshold alone, not the previous subtest's hysteresis
                 self.c.govern()
                 self.assertEqual(self.c.mem_hold, hold)
         self.assertEqual(conveyor.PACE_DEFAULTS["max_commit_pct"], 90)
@@ -3957,6 +3968,255 @@ class TestVersionPin(Base):
         self.c.pass_once()
         pace = json.loads((self.base / "pace.json").read_text(encoding="utf-8"))
         self.assertEqual((pace["mode"], pace["claude_version"]), ("paced", self.WANT))
+
+
+class TestConvHeal(AutopilotBase):
+    """CONVHEAL: self-healing ledger, outage hold, early death, memory hysteresis, findings."""
+
+    def lane(self, name, age=0):
+        self.drop(f"{name}.md", HDR.format(name) + "TASK\n", age=age)
+
+    def set_lane(self, name, **kw):
+        p = self.base / "lanes.json"
+        data = self.lanes()
+        data[name].update(kw)
+        p.write_text(json.dumps(data), encoding="utf-8")
+
+    def test_report_reader_shapes(self):
+        d = self.root / "r"
+        d.mkdir()
+        shapes = {"# CONVX report\nSTATUS: COMPLETE\n": "COMPLETE", "`STATUS: DONE`\n": "DONE",
+                  "STATUS: PASS (local green) and more\n": "PASS", "```\nSTATUS: BLOCKED\n```\n": "BLOCKED",
+                  "**STATUS:** GREEN\n": "GREEN", "AMENDED: x\nWRITTEN BY: y\n\nSTATUS: OK\n": "OK",
+                  "# STATUS: PASS\n": "PASS", "STATUS: PASS (interim)\n": conveyor.INTERIM,
+                  "": None, "x\n" * 16 + "STATUS: PASS\n": None}
+        for i, (text, want) in enumerate(shapes.items()):
+            p = d / f"{i}.md"
+            p.write_text(text, encoding="utf-8")
+            self.assertEqual(conveyor.report_status(p), want, text)
+        self.assertIsNone(conveyor.report_status(d / "absent.md"))
+
+    def test_lane_ending_without_report_is_missing_with_attention(self):
+        self.lane("N")
+        self.c.pass_once()
+        self.fake.agent("N")["state"] = "done"
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["N"]["status"], "MISSING")
+        self.assertIn("N", self.attn())
+
+    def test_dropped_lane_with_later_pass_report_shows_pass(self):
+        self.lane("N")
+        self.c.pass_once()
+        self.set_lane("N", finished=True, status="DROPPED", finished_ts=self.t)
+        self.t += 60
+        self.report("N", "PASS", mtime=self.t)
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["N"]["status"], "PASS")
+        self.assertTrue(self.ev("heal"))
+        self.assertNotIn("N", self.attn())
+
+    def test_blocked_lane_healed_by_continuation_pass(self):
+        self.lane("X")
+        self.c.pass_once()
+        self.set_lane("X", finished=True, status="BLOCKED", finished_ts=self.t)
+        self.lane("X2")
+        self.t += 60
+        self.c.pass_once()
+        self.set_lane("X2", finished=True, status="PASS", finished_ts=self.t)
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual((self.lanes()["X"]["status"], self.lanes()["X"]["healed_by"]), ("PASS", "X2"))
+        self.assertNotIn("X", self.attn())
+
+    def test_digit_final_lane_is_not_healed_by_another_number(self):
+        self.lane("INT4")
+        self.c.pass_once()
+        self.set_lane("INT4", finished=True, status="BLOCKED", finished_ts=self.t)
+        self.lane("INT41")
+        self.t += 60
+        self.c.pass_once()
+        self.set_lane("INT41", finished=True, status="PASS", finished_ts=self.t)
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT4"]["status"], "BLOCKED")
+        self.assertIn("INT4", self.attn())
+
+    def test_task_text_never_pauses_and_a_gone_paused_session_releases_the_hold(self):
+        self.lane("A")
+        self.c.pass_once()
+        self.fake.agent("A")["summary"] = "fix authentication: unauthorized replies"
+        self.t += 60
+        self.c.pass_once()
+        self.assertFalse(self.status()["outage_hold"])
+        self.fake.agent("A")["error"] = "API Error: 529 overloaded"
+        self.t += 60
+        self.c.pass_once()
+        self.assertTrue(self.status()["outage_hold"])
+        self.fake.agents.remove(self.fake.agent("A"))
+        self.t += 60
+        self.c.pass_once()
+        self.t += 60
+        self.c.pass_once()
+        self.assertNotEqual(self.lanes()["A"].get("state"), "PAUSED")
+        self.assertFalse(self.status()["outage_hold"])
+
+    def test_api_error_holds_dispatch_pauses_and_clears_on_progress(self):
+        self.lane("A")
+        self.c.pass_once()
+        self.fake.agent("A")["error"] = "API Error: 529 overloaded"
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["A"]["state"], "PAUSED")
+        self.assertTrue(self.status()["outage_hold"])
+        self.assertIn("outage", self.attn())
+        self.assertEqual(sum("Kesinti" in p for p in self.pushes), 1)
+        self.lane("B", age=100)
+        self.t += 60
+        self.c.pass_once()
+        self.assertNotIn("B", self.fake.bg_names())
+        self.assertEqual(self.lanes()["A"].get("redispatches", 0), 0)
+        self.t += conveyor.OUTAGE_NUDGE_S
+        self.c.pass_once()
+        self.assertEqual(len(self.ev("outage_nudge")), 1)
+        self.assertEqual(sum("Kesinti" in p for p in self.pushes), 1)
+        wt = self.root / "wtA"
+        wt.mkdir()
+        (wt / "f.py").write_text("x", encoding="utf-8")
+        os.utime(wt / "f.py", (self.t + 30, self.t + 30))
+        self.fake.agent("A")["cwd"] = str(wt)
+        self.t += 60
+        self.c.pass_once()
+        self.assertTrue(self.ev("outage_clear"))
+        self.assertFalse(self.status()["outage_hold"])
+        self.t += 60
+        self.c.pass_once()
+        self.assertIn("B", self.fake.bg_names())
+
+    def test_two_idle_lanes_hold_without_redispatch(self):
+        (self.base / "pace.json").write_text(json.dumps({**conveyor.PACE_DEFAULTS, "max_lanes": 6}), encoding="utf-8")
+        self.lane("A")
+        self.lane("B", age=1)
+        self.c.pass_once()
+        for n in "AB":
+            self.fake.agent(n)["status"] = "idle"
+        self.t += 60
+        self.c.pass_once()
+        self.t += conveyor.OUTAGE_IDLE_S + 1
+        self.c.pass_once()
+        (ev,) = self.ev("outage_hold")
+        self.assertEqual(ev["why"], "2 lanes idle, no progress")
+        self.assertEqual({self.lanes()[n]["state"] for n in "AB"}, {"PAUSED"})
+        self.assertEqual(self.fake.bg_names().count("A"), 1)
+
+    def test_early_death_redispatches_once_in_same_worktree(self):
+        run = self.fake
+        self.c.run = lambda args, **kw: (0, "stopped") if args[0] == "stop" else run(args, **kw)
+        self.lane("N")
+        self.c.pass_once()
+        lane = self.lanes()["N"]
+        self.assertEqual(lane["id"], self.fake.agent("N")["id"])
+        self.assertEqual(lane["worktree"], str(self.root / ".claude" / "worktrees" / "N"))
+        (self.root / ".claude" / "worktrees" / "N").mkdir(parents=True)
+        self.fake.agents.remove(self.fake.agent("N"))
+        self.t += conveyor.DEAD_S + 1
+        self.c.pass_once()
+        self.assertTrue(self.ev("early_death"))
+        self.assertEqual(self.fake.bg_names().count("N"), 2)
+        self.fake.agents.remove(self.fake.agent("N"))
+        self.t += conveyor.DEAD_S + 1
+        self.c.pass_once()
+        self.assertEqual(len(self.ev("early_death")), 1)
+        self.assertEqual(self.fake.bg_names().count("N"), 2)
+
+    def test_memory_hold_hysteresis_and_throttle(self):
+        self.memory = (1.0, 20.0)
+        self.lane("A")
+        self.c.pass_once()
+        self.assertNotIn("A", self.fake.bg_names())
+        self.memory = (4.0, 20.0)
+        self.t += 400
+        self.c.pass_once()
+        self.assertNotIn("A", self.fake.bg_names())
+        self.memory = (4.5, 20.0)
+        self.t += 60
+        self.c.pass_once()
+        self.assertNotIn("A", self.fake.bg_names())
+        self.t += conveyor.MEM_OK_S
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertIn("A", self.fake.bg_names())
+        self.lane("B", age=500)
+        self.t += 60
+        self.c.pass_once()
+        self.assertNotIn("B", self.fake.bg_names())
+        self.t += conveyor.MEM_GAP_S
+        self.c.pass_once()
+        self.assertIn("B", self.fake.bg_names())
+
+    def test_cdx_dry_blocked_is_a_finding_not_a_breaker_count(self):
+        (self.base / "pace.json").write_text(json.dumps({**conveyor.PACE_DEFAULTS, "max_lanes": 6}), encoding="utf-8")
+        names = ["CDX1", "DRY2", "CDX3"]
+        for i, n in enumerate(names):
+            self.lane(n, age=i)
+        self.c.pass_once()
+        for n in names:
+            self.report(n, "BLOCKED", where=n, mtime=self.t)
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual(self.status()["breaker"], "closed")
+        for n in names:
+            self.assertIn(n, self.attn())
+
+    def test_stuck_inbox_prompt_does_not_block_the_rest(self):
+        start = self.c.start
+        self.c.start = lambda name, *a, **kw: None if name == "X" else start(name, *a, **kw)
+        self.lane("X")
+        self.lane("Y", age=1)
+        self.c.pass_once()
+        self.assertIn("inbox:X.md", self.attn())
+        self.assertIn("Y", self.fake.bg_names())
+
+    def test_running_files_written_each_pass(self):
+        self.lane("N")
+        self.c.pass_once()
+        data = json.loads((self.base / "running_files.json").read_text(encoding="utf-8"))
+        self.assertEqual(data, {"N": []})
+
+    def test_pass_with_findings_raises_attention_without_breaker_or_page(self):
+        self.lane("F1")
+        self.c.pass_once()
+        self.report("F1", "PASS", where="F1", mtime=self.t, extra="FINDINGS: x is broken\n")
+        self.t += 60
+        self.c.pass_once()
+        self.assertIn("F1", self.attn())
+        self.assertFalse([p for p in self.pushes if "FINDINGS" in p or "x is broken" in p])
+        self.assertEqual(self.status()["breaker"], "closed")
+        self.lane("F2", age=100)
+        self.c.pass_once()
+        self.report("F2", "PASS", where="F2", mtime=self.t, extra="FINDINGS: none\n")
+        self.t += 60
+        self.c.pass_once()
+        self.assertNotIn("F2", self.attn())
+
+
+class TestConvHealAutoFix(AutopilotBase):
+    def setUp(self):
+        super().setUp()
+        self.git.fail[PICKED] = (0, "jarvis/core.py\nscripts/x.py\n")
+
+    blocked_int = TestAutoFix.blocked_int
+
+    def test_rerun_dead_when_fix_lane_ends_non_good(self):
+        self.blocked_int()
+        self.finish("INT9-AFX", "BLOCKED")
+        self.assertEqual(self.view()["INT9-R"], "dead")
+
+    def test_fix_lane_may_use_needs_files_grant(self):
+        self.blocked_int()
+        self.finish("INT9-AFX", "BLOCKED", "NEEDS FILES: jarvis/b.py\n")
+        (ev,) = self.ev("resume_in_place")
+        self.assertEqual(ev["lane"], "INT9-AFX")
 
 
 if __name__ == "__main__":

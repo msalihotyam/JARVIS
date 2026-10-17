@@ -248,13 +248,28 @@ SHA_HDR_RE = re.compile(r"^[0-9a-f]{7,40}$")
 HEADER_KEYS = ("lane", "model", "effort", "base")
 JS_WS = "\t\n\v\f\r    -     　﻿"  # JS \s
 BG_ID_RE = re.compile(r"backgrounded\s*\S\s*([0-9a-f]{8})")
-STATUS_RE = re.compile(r"(?m)^\s*STATUS:\s*((?i:CI_PENDING)(?!\w)|[A-Za-z]+)")
+STATUS_RE = re.compile(r"STATUS:[\s*`]*((?i:CI_PENDING)(?!\w)|[A-Za-z]+)")
 # CONVINTERIM (Salih 2026-10-13): a report whose first STATUS line says "(interim)" is not a finish;
 # no final report within INTERIM_TIMEOUT_S of the first interim one seen -> a normal BLOCKED finish.
-STATUS_LINE_RE = re.compile(r"(?m)^\s*STATUS:.*$")
 INTERIM = "(INTERIM)"  # never a STATUS_RE word
 INTERIM_TIMEOUT_S = 45 * 60
 INTERIM_WHY = "interim report not finalized within 45 min"
+# CONVHEAL outage hold: an API error in a session's state, or 2+ lanes idle with no progress
+# within OUTAGE_GAP_S of each other, pauses them instead of DEAD/STUCK/redispatch.
+API_ERR_RE = re.compile(r"(?i)billing|credit balance|invalid api key|authentication|unauthorized"
+                        r"|overloaded|api error:? *5\d\d|internal server error|bad gateway"
+                        r"|service unavailable|network error|econnreset|enotfound|etimedout|connection error")
+API_KEY_RE = re.compile(r"(?i)err|^state$|^status$")  # only these session fields; never task text
+OUTAGE_IDLE_S = 5 * 60
+OUTAGE_GAP_S = 10 * 60
+OUTAGE_NUDGE_S = 30 * 60
+OUTAGE_NUDGE = "The API outage seems over; continue your task where you left off."
+MEM_MARGIN_GB = 1.5  # memory hold hysteresis: release at min_free_mem_gb + this, held MEM_OK_S
+MEM_OK_S = 5 * 60
+MEM_GAP_S = 10 * 60  # after a memory hold at most one start per MEM_GAP_S for MEM_RELEASE_S
+MEM_RELEASE_S = 60 * 60
+FINDINGS_RE = re.compile(r"(?m)^[\s>#*`-]*FINDINGS:\s*(.*)$")
+CDX_DRY_RE = re.compile(r"(CDX|DRY)")  # audit lanes: BLOCKED is a finding, not a breaker failure
 TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -604,11 +619,14 @@ def report_status(path):
         text = Path(path).read_text(encoding="utf-8", errors="replace")
     except OSError:
         return None
-    line = STATUS_LINE_RE.search(text)
-    if line and "(interim)" in line.group(0).lower():
-        return INTERIM
-    m = STATUS_RE.search(text)
-    return m.group(1).upper() if m else None
+    # CONVHEAL: the first STATUS line among the first 15 non-empty ones, past fences, **, #,
+    # backticks, a title and AMENDED:/WRITTEN BY: lines; None (empty, no STATUS) -> track's MISSING
+    lines = [s for s in (x.lstrip(" \t>#*`").rstrip() for x in text.splitlines()) if s][:15]
+    for s in lines:
+        m = STATUS_RE.match(s)
+        if m:
+            return INTERIM if "(interim)" in s.lower() else m.group(1).upper()
+    return None
 
 
 def validate_slice(s):
@@ -650,6 +668,8 @@ class Conveyor:
         self.mem = mem
         self.memory = None  # (free GB, commit %) this pass, None unknown
         self.mem_hold = False
+        self.mem_ok_since = self.mem_released = None  # memory hold hysteresis / throttle
+        self.last_start = 0
         self.mem_unknown_logged = False
         self.idle = idle
         self.idle_s = None  # seconds since the last user input this pass, None unknown
@@ -867,6 +887,9 @@ class Conveyor:
             text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
         except OSError:
             text = None
+        found = status in GOOD and text and FINDINGS_RE.search(text)
+        if found and found[1].strip(" `*").lower() not in NONE_WORDS:
+            ln["findings"] = found[1].strip()[:300]  # CONVHEAL: an attention item, no page/breaker
         self.read_report(name, ln, text)
 
     # ---- report reader (advisory) -------------------------------------
@@ -935,6 +958,7 @@ class Conveyor:
 
     def track(self, lanes, agents):
         by_id = {a.get("id"): a for a in agents}
+        held = bool(self.pager_flag("outage"))
         for name, ln in lanes.items():
             a = by_id.get(ln["id"])
             state = "missing" if a is None else a.get("state") or a.get("status") or "unknown"
@@ -942,8 +966,10 @@ class Conveyor:
             ln["state"] = state if alive or state in FINISHED or a is None else "stopped"
             ln["idle"] = alive and a.get("status") == "idle"
             ln["updated_at"] = iso(self.now())
-            if ln.get("finished") and ln.get("status") and ln["status"] != "DEAD":
-                continue  # DEAD: a report the rescued session writes later still finishes it
+            if ln.get("finished") and ln.get("status") in ("DROPPED", "BLOCKED") and self.heal(name, ln, lanes):
+                continue
+            if ln.get("finished") and ln.get("status") and ln["status"] not in ("DEAD", "MISSING"):
+                continue  # DEAD/MISSING: a report the rescued session writes later still finishes it
             found = self.find_report(name, ln.get("report_since") or self.started_ts(ln), a and a.get("cwd"))
             interim = bool(found) and found[1] == INTERIM
             if interim:  # not a finish: the lane runs on and its dependents wait (slice_done)
@@ -965,19 +991,33 @@ class Conveyor:
                 continue
             if ln.get("finished"):
                 continue
+            err = a is not None and next((v for k, v in a.items() if API_KEY_RE.search(k)
+                                          and isinstance(v, str) and API_ERR_RE.search(v)), None)
+            if err and err != ln.get("api_err"):  # the same stale text never re-pauses a cleared lane
+                ln.update(paused=True, api_err=err)  # outage(): the hold, its page and its nudges
+            if ln.get("paused") and a is None:  # its session is gone: the DEAD path, not a held lane
+                ln.pop("paused")
+            if ln.get("paused"):
+                ln["state"] = "PAUSED"
+                continue  # outage hold: never DEAD/MISSING/STUCK, respawned or redispatched
             dead = self.dead_reason(ln, a)
             if dead:  # frees the slot; the session is left for the orchestrator
+                if a is None and not held and self.early_death(name, ln):  # no redispatch in a hold
+                    continue
                 ln.update(finished=True, status="DEAD", dead=dead, finished_ts=self.now())
                 self.event("finish", lane=name, id=ln["id"], status="DEAD", reason=dead)
                 continue
             if state in FINISHED:
                 if interim:  # ended its turn on an interim report: the final one or INTERIM_TIMEOUT_S decides
                     continue
-                ln["finished"] = True
-                self.event("finish", lane=name, id=ln["id"], state=state)
+                # no report: MISSING (attention item; a late report still finishes it)
+                ln.update(finished=True, status="MISSING", finished_ts=self.now())
+                self.event("finish", lane=name, id=ln["id"], state=state, status="MISSING")
                 continue
             if alive:
                 ln["respawn_pending"] = False
+            elif held:
+                continue  # no respawns during an outage hold
             elif a is not None and not ln.get("respawn_pending"):
                 # stopped without finishing or reporting (reboot/sleep): respawn, once per stop
                 ln.update(respawned=True, respawn_pending=True, respawned_ts=self.now())
@@ -1000,6 +1040,95 @@ class Conveyor:
             if alive and not interim and self.watch_idle(name, ln, a):  # INTERIM_TIMEOUT_S owns it
                 continue
             self.unblock(name, ln, a)
+        self.outage(lanes, by_id)
+
+    def heal(self, name, ln, lanes):
+        """A DROPPED/BLOCKED lane whose own report (also one written before the drop) or whose
+        continuation lane (<name><n>) is GOOD shows that PASS. Never a CI-red or interim-timeout
+        BLOCKED; finished_ts stays, so the autopilot never re-reads it (no key 1)."""
+        if ln.get("ci_why") or ln.get("interim_timeout"):
+            return False
+        found = self.find_report(name, self.started_ts(ln))
+        # a digit-final name (INT4) has no numeric continuation: INT41 is another lane
+        by = name if found and found[1] in GOOD else next(
+            (n for n, x in lanes.items() if not name[-1:].isdigit() and re.fullmatch(re.escape(name) + r"\d+", n)
+             and x.get("status") in GOOD and not x.get("ci_why")), None)
+        if by is None:
+            return False
+        was = ln["status"]
+        ln.update(status=found[1] if by == name else lanes[by]["status"], healed_by=by)
+        ln.pop("reading", None)
+        self.event("heal", lane=name, was=was, status=ln["status"], by=by)
+        return True
+
+    def early_death(self, name, ln):
+        """A lane whose process died before its first commit and without a report gets one
+        redispatch in the same worktree (counts toward MAX_REDISPATCH). True when it acted."""
+        if ln.get("early_redispatch") or ln.get("redispatches", 0) >= MAX_REDISPATCH:
+            return False
+        wt = Path(ln.get("worktree") or self.root / ".claude" / "worktrees" / name)
+        if not wt.is_dir():
+            return False  # no worktree to resume in: the plain DEAD path
+        try:
+            rc, ct = self.cmd(["git", "-C", str(wt), "log", "-1", "--format=%ct"])
+            if rc == 0 and float(ct.strip() or 0) >= self.started_ts(ln):
+                return False  # it committed: a finish, not an early death
+        except Exception:  # unreadable: treat as no commit
+            pass
+        ln["early_redispatch"] = True
+        self.event("early_death", lane=name, id=ln["id"])
+        self.redispatch(name, ln)
+        return True
+
+    def outage(self, lanes, by_id):
+        """Outage hold: live lanes whose session shows an API error (billing, credit, auth,
+        overloaded, 5xx, network), or 2+ lanes idle with no progress within OUTAGE_GAP_S of each
+        other -> PAUSED (never STUCK, no redispatch), dispatch/respawns stop (hold()), one page.
+        Every OUTAGE_NUDGE_S ONE paused lane is nudged; on progress the hold clears and the rest
+        are nudged in place. No live calls of its own."""
+        now, o = self.now(), self.pager_flag("outage")
+        live = {n: ln for n, ln in lanes.items() if not ln.get("finished")}
+        paused = {n: ln for n, ln in live.items() if ln.get("paused")}
+
+        def cwd(n):
+            return (by_id.get(lanes[n]["id"]) or {}).get("cwd")
+        if o:
+            if any(lanes[n].get("finished") or not lanes[n].get("paused")
+                   or self.active_since(n, o["since"], cwd(n))
+                   for n in set(o.get("lanes", [])) | set(paused) if n in lanes):
+                self.pager_flag("outage", {})
+                for n, ln in paused.items():
+                    ln.pop("paused", None)
+                    ln.pop("idle_since", None)  # a fresh idle clock: the hold does not snap back
+                    a = by_id.get(ln["id"])
+                    if a:
+                        self.nudge(n, ln, a, OUTAGE_NUDGE, "outage_nudge")
+                self.event("outage_clear", lanes=sorted(paused))
+                return
+            if paused and now - o.get("nudged", o["since"]) >= OUTAGE_NUDGE_S:
+                n = min(paused, key=lambda k: paused[k].get("outage_nudged", 0))
+                a = by_id.get(paused[n]["id"])
+                paused[n]["outage_nudged"] = o["nudged"] = now
+                self.pager_flag("outage", o)
+                if a:
+                    self.nudge(n, paused[n], a, OUTAGE_NUDGE, "outage_nudge")
+            return
+        err = list(paused)  # track() paused them on an API error
+        idle = sorted((ln["idle_since"], n) for n, ln in live.items()
+                      if ln.get("idle_since") and now - ln["idle_since"] >= OUTAGE_IDLE_S
+                      and not self.active_since(n, ln["idle_since"], cwd(n)))
+        cluster = [n for i, (t, n) in enumerate(idle)
+                   if any(j != i and abs(t - u) <= OUTAGE_GAP_S for j, (u, _) in enumerate(idle))]
+        hit = sorted(set(err) | set(cluster if len(cluster) >= 2 else []))
+        if not hit:
+            return
+        why = "API error" if err else f"{len(hit)} lanes idle, no progress"
+        for n in hit:
+            lanes[n]["paused"] = True
+            lanes[n]["state"] = "PAUSED"
+        self.pager_flag("outage", {"since": now, "nudged": now, "why": why, "lanes": hit})
+        self.event("outage_hold", why=why, lanes=hit)
+        self.page(f"Kesinti şüphesi ({why}): dispatch durdu, {', '.join(hit)} PAUSED")
 
     def watch_idle(self, name, ln, a):
         """CONV12 idle-lane watchdog: a live session idle (not blocked: unblock owns that) with no
@@ -1028,7 +1157,8 @@ class Conveyor:
         running lane's, not on the R1 security list, at most GRANT_MAX), its files are extended and
         the SAME session is resumed via nudge(). True when resumed (the lane runs on); otherwise the
         caller finishes it as usual (attention). Once per lane, granted or not."""
-        if INT_RE.match(name) or a is None or ln.get("finished") or "resumed_in_place" in ln:
+        if (INT_RE.match(name) and not name.endswith("-AFX")) or a is None or ln.get("finished") \
+                or "resumed_in_place" in ln:  # CONVHEAL: an -AFX fix lane gets the grant (R1 still denies)
             return False  # a DEAD lane's late report is only collected
         try:
             text = Path(report).read_text(encoding="utf-8", errors="replace")
@@ -1239,7 +1369,8 @@ class Conveyor:
                        "started_at": iso(self.now()), "started_ts": self.now(),
                        "updated_at": iso(self.now()), "state": "working",
                        "prompt": str(prompt.relative_to(self.base)), "files": files or [],
-                       "slice": slice_}
+                       "slice": slice_, "worktree": str(self.root / ".claude" / "worktrees" / name)}
+        self.last_start = self.now()  # the post-memory-hold dispatch throttle (hold())
         if INT_RE.match(name):  # auto-fix owns the files of the commits this lane picks
             lanes[name]["main_at_start"] = self.main_head()
 
@@ -1285,9 +1416,14 @@ class Conveyor:
         return self.free_gb is None or self.free_gb < MIN_FREE_GB
 
     def hold(self):
-        """PAUSE flag, usage guard, low disk, low memory or Claude Code version: nothing new starts."""
+        """PAUSE flag, usage guard, low disk, low memory or Claude Code version, an API outage
+        hold, or within MEM_RELEASE_S of a memory hold a start in the last MEM_GAP_S: nothing
+        new starts."""
+        # ponytail: the one-per-10-min throttle runs for MEM_RELEASE_S after a release, not adaptive
+        throttled = self.mem_released is not None and self.now() - self.mem_released < MEM_RELEASE_S \
+            and self.now() - self.last_start < MEM_GAP_S
         return (self.base / "PAUSE").exists() or self.disk_hold() or self.usage_hold \
-            or self.mem_hold or self.cc_hold()
+            or self.mem_hold or throttled or bool(self.pager_flag("outage")) or self.cc_hold()
 
     def cc_version(self):
         """Installed Claude Code version ("2.1.123") or None when unreadable (rc, timeout, text)."""
@@ -1416,7 +1552,15 @@ class Conveyor:
             band = f"paced: hold at {PACED_LIMIT} %"
         self.max_lanes = 0 if self.usage_hold else n
         m = self.memory
-        self.mem_hold = m is not None and (m[0] < p["min_free_mem_gb"] or m[1] > p["max_commit_pct"])
+        if m is not None and (m[0] < p["min_free_mem_gb"] or m[1] > p["max_commit_pct"]):
+            self.mem_hold, self.mem_ok_since = True, None
+        elif self.mem_hold:  # hysteresis: release at threshold + MEM_MARGIN_GB held MEM_OK_S
+            if m is None or m[0] >= p["min_free_mem_gb"] + MEM_MARGIN_GB:
+                self.mem_ok_since = self.mem_ok_since or self.now()
+                if self.now() - self.mem_ok_since >= MEM_OK_S:
+                    self.mem_hold, self.mem_released = False, self.now()
+            else:
+                self.mem_ok_since = None
         if self.mem_hold:
             band = "memory hold"  # running lanes untouched; nothing new starts (hold())
         self.pace = {"mode": p["mode"], "window_start": p["window_start"], "usage_pct": u,
@@ -1588,7 +1732,11 @@ class Conveyor:
             if name in busy or self.int_blocked(name, lanes):
                 continue  # same-name lane still working, or another integration lane; wait
             sid = self.start(name, hdr["model"], hdr["effort"], text)
-            if not sid:
+            if not sid:  # CONVHEAL: a stuck prompt never blocks the backlog; attention item
+                held.add(f)
+                stuck = self.pager_flag("inbox_stuck") or {}
+                if f.name not in stuck:
+                    self.pager_flag("inbox_stuck", {**stuck, f.name: self.now()})
                 continue
             dest = self.started_path(name)
             os.replace(f, dest)
@@ -1598,7 +1746,7 @@ class Conveyor:
             self.event("dispatch", lane=name, id=sid, model=hdr["model"],
                        effort=hdr["effort"], file=dest.name)
         waiting = list(self.inbox.glob("*.md"))
-        if not set(waiting) - held:  # a breaker-held prompt does not keep a fix lane waiting
+        if not set(waiting) - held:  # a breaker-held or stuck prompt does not keep the backlog waiting
             started = self.dispatch_backlog(lanes, busy) or started
         if started or waiting or self.running(lanes) or any(
                 ln.get("status") == CI_PENDING for ln in lanes.values()):  # a CI wait is work too
@@ -1666,6 +1814,9 @@ class Conveyor:
                 view[sid] = found[1]
             elif s["tier"] == "T2" and s.get("approved") is not True:
                 view[sid] = "needs_t2_approval"
+            elif sid.endswith("-R") and (x := lanes.get(sid[:-2] + "-AFX")) and x.get("finished") \
+                    and x.get("status") not in GOOD | {CI_PENDING}:
+                view[sid] = "dead"  # CONVHEAL: its -AFX ended non-GOOD; never waits forever
             elif not all(self.slice_done(d, lanes, bool(INT_RE.match(sid))) for d in s.get("depends_on", [])):
                 view[sid] = "waiting_deps"
             elif any(files_overlap(s.get("files", []), rf) for rf in run_files):
@@ -1789,7 +1940,7 @@ class Conveyor:
             why = []
             if ln.get("status") == "DEAD":
                 why.append(f"prompt not delivered / session gone: {ln.get('dead')}")
-            elif ln.get("status") in BAD or ln.get("status") == "STUCK":
+            elif ln.get("status") in BAD or ln.get("status") in ("STUCK", "MISSING"):
                 why.append(f"STATUS {ln['status']}")
                 for k, lead in (("ci_why", ""), ("resume_refused", "resume in place refused: "),
                                 ("interim_timeout", "")):
@@ -1803,6 +1954,8 @@ class Conveyor:
                 why.append(f"auto-approval refused: {ln['auto_refused']}")
             if why and ln.get("auto_fix"):
                 why.append(ln["auto_fix"])
+            if ln.get("findings"):  # CONVHEAL: a PASS with findings -> fix lanes (no page, no breaker)
+                why.append(f"FINDINGS: {ln['findings']}")
             if why:
                 items.append((n, "; ".join(why), self.since(ln)))
         for n, ln in lanes.items():  # CONV11: one item per preserved lane, until acked
@@ -1813,6 +1966,14 @@ class Conveyor:
         dry = self.pager_flag("dry")
         if dry and dry is not True:  # True: a v1 flag (paged then); dispatch() gives it a time
             items.append((DRY_ID, "kuyruk boş, çalışan lane yok", dry))
+        o = self.pager_flag("outage")
+        if o:
+            items.append(("outage", f"API kesintisi şüphesi ({o['why']}): dispatch durdu, "
+                                    f"PAUSED: {', '.join(o['lanes'])}", o["since"]))
+        inbox = {f.name for f in self.inbox.glob("*.md")}
+        for fn, since in (self.pager_flag("inbox_stuck") or {}).items():
+            if fn in inbox:
+                items.append((f"inbox:{fn}", "prompt did not start (skipped; backlog goes on)", since))
         low = self.pager_flag("disk_low")
         if low:
             items.append((DISK_ID, f"disk {self.free_gb and round(self.free_gb, 1)} GB boş "
@@ -1871,6 +2032,7 @@ class Conveyor:
             "disk_hold": self.disk_hold(),
             "disk_free_gb": self.free_gb and round(self.free_gb, 1),
             "memory_hold": self.mem_hold,
+            "outage_hold": bool(self.pager_flag("outage")),
             "memory": self.memory and {"free_gb": round(self.memory[0], 1),
                                        "commit_pct": round(self.memory[1], 1)},
             "presence": {"state": self.presence,
@@ -1891,6 +2053,10 @@ class Conveyor:
         tmp = self.base / "status.json.tmp"
         tmp.write_text(json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, self.base / "status.json")
+        tmp = self.base / "running_files.json.tmp"  # LANE_RULES C2: files owned by running lanes
+        tmp.write_text(json.dumps({n: lanes[n].get("files", []) for n in self.running(lanes)},
+                                  indent=2), encoding="utf-8")
+        os.replace(tmp, self.base / "running_files.json")
 
     def note_pass(self, ok):
         """Count failed passes in a row; page once at CRASH_PAGE."""
@@ -1937,8 +2103,8 @@ class Conveyor:
             if st == CI_PENDING:
                 continue  # not terminal: ci_wait sets GREEN/BLOCKED with a new finished_ts
             role = next((r for c in chains.values() for r in ("afx", "r") if c.get(r) == name), None)
-            if st in BAD:
-                ap.setdefault("bad", []).append([name, fin])
+            if st in BAD and not (st == "BLOCKED" and CDX_DRY_RE.match(name)):
+                ap.setdefault("bad", []).append([name, fin])  # an audit lane's BLOCKED: attention only
             if role and st not in GOOD:
                 self.open_breaker(ap, f"auto-fix chain failed: {name} {st}")
             if not INT_RE.match(name) or role == "afx" or name.endswith("-AFX"):
