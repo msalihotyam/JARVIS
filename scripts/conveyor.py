@@ -3118,7 +3118,7 @@ class Conveyor:
 
     def remove_worktree(self, name, ln):
         """Remove the lane's worktree (lanes.json ln["worktree"]) when it is clean and its branch
-        is all on main (`git cherry main <branch>`: only '-'), then delete that branch under the
+        is all on main (off_main: merges included), then delete that branch under the
         same proof. None when done or nothing to do, else why not (fail closed: any git error)."""
         c = ln["cleanup"]
         wt = self.worktree_of({"cwd": ln.get("worktree")})
@@ -3141,9 +3141,9 @@ class Conveyor:
             branch = c.get("branch")
             if not branch:
                 return None
-            rc, out = self.cmd(["git", "cherry", "main", branch])
-            if rc != 0 or any(x.startswith("+") for x in out.splitlines()):
-                return f"branch {branch} kept: not provably on main (git cherry rc={rc})"
+            off = self.off_main(branch)
+            if off:
+                return f"branch {branch} kept: not provably on main ({off[0]})"
             rc, out = self.cmd(["git", "branch", "-D", branch])
             if rc != 0:
                 return f"git branch -D {branch} rc={rc}: {out[-150:]}"
@@ -3166,7 +3166,7 @@ class Conveyor:
     def unintegrated(self, a):
         """(reason, branch, first unintegrated sha) when the session's worktree branch is not
         provably all on local main (read-only git in the canonical checkout), else None.
-        Fail closed: any git error, unknown branch or '+' line in `git cherry` is a reason."""
+        Fail closed: any git error, unknown branch or off_main reason is a reason."""
         wt = self.worktree_of(a)
         if wt is None:
             return None
@@ -3176,15 +3176,46 @@ class Conveyor:
                 return f"git worktree list rc={rc}", None, None
             if not branch:
                 return "worktree branch unknown", None, None
-            rc, out = self.cmd(["git", "cherry", "main", branch])
+            off = self.off_main(branch)
         except Exception as e:  # a timeout etc.
             return f"git failed: {type(e).__name__}", None, None
+        return (off[0], branch, off[1]) if off else None
+
+    def off_main(self, branch):
+        """None when nothing reachable from `branch` is missing on local main, else (reason,
+        first unintegrated sha or None). Every non-merge commit of main..branch needs an
+        equivalent on main (`git cherry`, which skips merges and ignores whitespace), and the tip
+        must equal main on every path any commit of main..branch changed (a merge against each
+        parent), so a merge's own content, a whitespace-only difference or a revert on main is
+        caught too. Full refs: a tag named like the branch or main cannot stand in for it. Fail
+        closed: any git error or unparsable output is a reason; this over-keeps a branch whose
+        paths main edited later, or that merged main in after main picked its work."""
+        main, ref = "refs/heads/main", f"refs/heads/{branch}"
+        rc, out = self.cmd(["git", "cherry", main, ref])
         if rc != 0:
-            return f"git cherry main {branch} rc={rc}", branch, None
+            return f"git cherry main {branch} rc={rc}", None
         for line in out.splitlines():
-            if line.startswith("+"):
-                sha = line[1:].strip()
-                return f"{branch} has commits not on main (first {sha[:7]})", branch, sha
+            sha = line[2:].strip()
+            if not line.startswith(("+ ", "- ")) or not sha:
+                return f"git cherry main {branch}: unparsable {line[:40]!r}", None
+            if line[0] == "+":
+                return f"{branch} has commits not on main (first {sha[:7]})", sha
+        rc, out = self.cmd(["git", "rev-list", f"{main}..{ref}"])
+        if rc != 0:
+            return f"git rev-list main..{branch} rc={rc}", None
+        if not out.split():
+            return None
+        sha = out.split()[0]  # the tip
+        rc, out = self.cmd(["git", "log", "-m", "--no-renames", "--name-only", "--format=", "-z", f"{main}..{ref}"])
+        if rc != 0:
+            return f"git log main..{branch} rc={rc}", sha
+        changed = set(filter(None, out.split("\0")))
+        rc, out = self.cmd(["git", "diff", "--name-only", "--no-renames", "-z", main, ref])
+        if rc != 0:
+            return f"git diff main {branch} rc={rc}", sha
+        missing = changed & set(filter(None, out.split("\0")))
+        if missing:
+            return f"{branch} content not on main ({min(missing)})", sha
         return None
 
     def branch_of(self, wt):

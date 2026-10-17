@@ -2512,7 +2512,7 @@ class TestPreserved(Base):
         self.c.usage_ledger = self.fake_ledger
         self.ledger = self.root / "build" / "ledger" / "usage.json"
         self.c.stop_finished = lambda *a: None
-        self.git_fail = None
+        self.git_fail, self.git_fail_on = None, ["git"]
         self.c.cmd = self.run_git
         self.g("init", "-q", "-b", "main")
         (self.root / "f.txt").write_text("base\n")
@@ -2529,10 +2529,11 @@ class TestPreserved(Base):
         return p.stdout.strip()
 
     def run_git(self, args, timeout=120):
-        if args[:2] not in (["git", "worktree"], ["git", "cherry"], ["git", "-C"]) \
-                and args[:3] != ["git", "branch", "-D"]:
+        if args[:2] not in (["git", "worktree"], ["git", "cherry"], ["git", "-C"], ["git", "rev-list"]) \
+                and args[:3] not in (["git", "branch", "-D"], ["git", "log", "-m"],
+                                     ["git", "diff", "--name-only"]) or args[-1].endswith("..main"):
             return self.git(args, timeout)  # the fake main/origin of every other test
-        if self.git_fail:
+        if self.git_fail and args[:len(self.git_fail_on)] == self.git_fail_on:
             return self.git_fail
         p = conveyor.subprocess.run(args, cwd=self.root, capture_output=True, text=True)
         return p.returncode, p.stdout
@@ -2580,6 +2581,78 @@ class TestPreserved(Base):
         pv = self.assert_preserved_once()
         self.assertEqual((pv["branch"], pv["first_unintegrated_sha"]), ("lane-a", sha))
         self.assertEqual(self.cli("stop"), [])
+
+    def merge_side(self, extra):
+        """lane-a: a --no-ff merge of side branch work that main cherry-picks, own file if extra."""
+        self.g("checkout", "-q", "-b", "side", cwd=self.wt)
+        self.g("cherry-pick", "-x", self.lane_commit())  # -x: not the same sha as the side commit
+        self.g("checkout", "-q", "lane-a", cwd=self.wt)
+        self.g("merge", "-q", "--no-ff", "-m", "merge side", "side", cwd=self.wt)
+        if extra:  # amend keeps both parents: an evil merge
+            (self.wt / "h.txt").write_text("merge-only\n")
+            self.g("add", "h.txt", cwd=self.wt)
+            self.g("commit", "-q", "--amend", "--no-edit", cwd=self.wt)
+        self.assertTrue(self.g("rev-list", "--merges", "main..lane-a"))
+        return self.g("rev-parse", "HEAD", cwd=self.wt)
+
+    def test_merge_with_content_not_on_main_is_preserved(self):
+        sha = self.merge_side(extra=True)  # CONVMERGE: `git cherry` alone skips the merge
+        self.run_cleanup()
+        pv = self.assert_preserved_once()
+        self.assertEqual((pv["branch"], pv["first_unintegrated_sha"]), ("lane-a", sha))
+        self.assertIn("h.txt", pv["reason"])
+        self.assertTrue(self.wt.exists())
+        self.assertEqual(self.g("branch", "--list", "lane-a"), "+ lane-a")  # "+": checked out in the kept worktree
+
+    def test_merge_with_all_content_on_main_is_removed(self):
+        self.merge_side(extra=False)
+        self.run_cleanup()
+        self.assertNotIn("preserved", self.lanes()["A"])
+        self.assertFalse(self.wt.exists())
+        self.assertEqual(self.g("branch", "--list", "lane-a"), "")
+
+    def test_merge_that_drops_picked_work_is_preserved(self):
+        self.merge_side(extra=False)
+        self.g("rm", "-q", "g.txt", cwd=self.wt)  # the merge undoes the side work main picked
+        self.g("commit", "-q", "--amend", "--no-edit", cwd=self.wt)
+        sha = self.g("rev-parse", "HEAD", cwd=self.wt)
+        self.assertEqual(self.c.off_main("lane-a"), ("lane-a content not on main (g.txt)", sha))
+
+    def test_whitespace_only_pick_is_not_integrated(self):
+        self.lane_commit()
+        (self.root / "g.txt").write_text("work  \n")  # cherry's patch-id ignores whitespace
+        self.g("add", "g.txt")
+        self.g("commit", "-q", "-m", "work")
+        self.assertIn("(g.txt)", self.c.off_main("lane-a")[0])
+
+    def test_tags_cannot_shadow_branch_or_main(self):
+        sha = self.lane_commit()
+        self.g("tag", "lane-a", "main")
+        self.g("tag", "main", sha)
+        self.assertEqual(self.c.off_main("lane-a"), (f"lane-a has commits not on main (first {sha[:7]})", sha))
+
+    def test_partial_pick_is_preserved(self):
+        self.g("cherry-pick", self.lane_commit())
+        (self.wt / "h.txt").write_text("more\n")
+        self.g("add", "h.txt", cwd=self.wt)
+        self.g("commit", "-q", "-m", "more", cwd=self.wt)
+        sha = self.g("rev-parse", "HEAD", cwd=self.wt)
+        self.run_cleanup()
+        self.assertEqual(self.assert_preserved_once()["first_unintegrated_sha"], sha)
+        self.assertTrue(self.wt.exists())
+
+    def test_missing_ref_or_git_error_mid_proof_is_not_integrated(self):
+        self.assertIn("rc=", self.c.off_main("no-such-branch")[0])
+        sha = self.merge_side(extra=False)
+        self.assertIsNone(self.c.off_main("lane-a"))
+        self.git_fail = (128, "fatal: boom")
+        for step in (["git", "rev-list"], ["git", "log", "-m"], ["git", "diff", "--name-only"]):
+            self.git_fail_on = step
+            reason, first = self.c.off_main("lane-a")
+            self.assertIn("rc=128", reason)
+            self.assertEqual(first, None if step == ["git", "rev-list"] else sha)
+        self.git_fail, self.git_fail_on = (0, "? junk\n"), ["git", "cherry"]
+        self.assertIn("unparsable", self.c.off_main("lane-a")[0])
 
     def test_git_failure_is_preserved(self):
         self.git_fail = (128, "fatal: boom")
