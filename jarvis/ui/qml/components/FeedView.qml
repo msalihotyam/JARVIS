@@ -466,7 +466,8 @@ Item {
                                        renderType: Theme.textRender
                                        objectName: modelData.interrupted === true ? "feedInterrupted" : ""
                                        // A reply that stopped part-way says so; it is never presented as an answer.
-                                       text: feed.kindLabel(row.kind) + (modelData.interrupted === true ? "  ·  " + qsTr("INTERRUPTED - INCOMPLETE ANSWER") : "")
+                                       text: feed.kindLabel(row.kind) + (modelData.continuation === true ? "  ·  " + qsTr("CONTINUED") : "")
+                                             + (modelData.interrupted === true ? "  ·  " + qsTr("INTERRUPTED - INCOMPLETE ANSWER") : "")
                                        color: modelData.interrupted === true ? Theme.warning : Theme.materialBlue
                                        font: Theme.chatAuthor
                                        lineHeightMode: Text.FixedHeight; lineHeight: 18 }

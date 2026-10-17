@@ -326,6 +326,7 @@ class Bridge(QObject):
     providersChanged = Signal()
     modelApplied = Signal()       # the configured model / effort really changed
     composingChanged = Signal()
+    resumeChanged = Signal()      # whether the composer key can resume a cut reply
     attentionChanged = Signal()   # the safety projection may have changed
 
     def __init__(
@@ -508,6 +509,14 @@ class Bridge(QObject):
         self._ticket: ApprovalTicket | None = None
         self._clarification: dict[str, Any] = {}
         self._request_id = ""
+        # What a Stop cut that the composer key may resume - memory only, so a
+        # restart forgets it: {"kind", "conversation", "request", "entry"}.
+        self._resume: dict[str, Any] | None = None
+        self._continuing = ""            # request id of a running continuation
+        self.feedChanged.connect(self.resumeChanged)
+        self.stateChanged.connect(self.resumeChanged)
+        self.groupsChanged.connect(self.resumeChanged)       # staged context is the user's next message: Send, not Resume
+        self.attachmentsChanged.connect(self.resumeChanged)
         self._config: dict[str, Any] = {}
         self._status: dict[str, Any] = {}
         self._sessions: list[dict] = []
@@ -713,6 +722,8 @@ class Bridge(QObject):
             # in (or added to the history of) the one that is open now.
             self._remember(entry, refs, owner)
             return
+        if kind == "user":
+            self._resume = None          # anything sent ends the offer to resume
         self._feed.append(entry)
         del self._feed[:-FEED_LIMIT]
         self._remember(entry, refs)
@@ -1232,6 +1243,7 @@ class Bridge(QObject):
         else:
             self._parked.pop(left, None)
         self._conversation_store = opened
+        self._resume = None                                       # DFRESUME: a switch ends the offer
         self._finished_unseen.discard(opened.id)                  # R3 (D1/D2): green clears on open
         record = self._run_record if self.openRunning else None
         restored = self._unpark(opened)
@@ -2967,9 +2979,13 @@ class Bridge(QObject):
             self.providersChanged.emit()
         entries = _cut_feed(seen, status, intent, payload) if kept else text_entries(payload)
         answered = status in ("conversation", "research")
+        continuing = self._continuing in ("next", self._request_id) and bool(self._request_id)
+        self._continuing = ""
         for entry in entries:
             # The reply itself; a cut-short reply's notice is JARVIS's own line, not part of it.
             reply = entry["kind"] != "notice" if answered else (kept and entry["kind"] == "jarvis")
+            if continuing and reply and entry["kind"] == "jarvis":
+                entry["continuation"] = True    # DFRESUME: shown as the cut reply's continuation
             if reply and (answered or kept):        # DFSPEED: a reply cut short keeps its timing too
                 measured = self._measured(*self._intent_reports(intent))
                 if measured:
@@ -2981,6 +2997,7 @@ class Bridge(QObject):
             if partial and reply:
                 entry["streamed"] = True        # replaces the preview in place: no second entrance
             self._say(entry.pop("kind"), entry.pop("text"), chat=reply, **entry)
+        self._arm_resume(kept and cut_reason(status) == "cancelled")
         self._clarification = {}
         if status == "structured":
             self._apply_run(payload.get("run"), intent, request=request or text)
@@ -3425,7 +3442,58 @@ class Bridge(QObject):
         request_id = record["request_id"] if record is not None else self._request_id
         if not self.openRunning or not request_id:
             return False
-        return self.backend.cancel_text(request_id)
+        stopped = self.backend.cancel_text(request_id)
+        if stopped:
+            # DFRESUME: armed now, offered once the cut reply is on screen (_arm_resume).
+            self._resume = {"kind": "text", "conversation": self._conversation_store.id,
+                            "request": request_id, "entry": ""}
+        return stopped
+
+    def _arm_resume(self, cut: bool) -> None:
+        """A Stop's cut reply landed: the key offers to resume it - only for a
+        Stop pressed on this request in this conversation, and only if it cut text."""
+        pending = self._resume
+        if pending is None or pending["entry"]:
+            return
+        last = next((e for e in reversed(self._feed) if e.get("interrupted") is True), None)
+        if cut and last is not None and pending["conversation"] == self._conversation_store.id \
+                and pending["request"] == self._request_id:
+            pending["entry"] = last["id"]
+        else:
+            self._resume = None
+        self.resumeChanged.emit()
+
+    @Property(bool, notify=resumeChanged)
+    def canResume(self) -> bool:
+        """DFRESUME: the composer key resumes the reply Stop cut - while it is
+        still this conversation's last reply and nothing was typed or sent since."""
+        pending = self._resume
+        if not pending or not pending["entry"] or self._busy or self._ticket is not None \
+                or self._groups or self._attachments \
+                or self._task.get("status") == "awaiting_clarification" \
+                or pending["conversation"] != self._conversation_store.id:
+            return False
+        ids = [entry["id"] for entry in self._feed]
+        if pending["entry"] not in ids:
+            return False
+        after = self._feed[ids.index(pending["entry"]) + 1:]
+        return all(entry["kind"] in ("notice", "system") for entry in after)
+
+    @Slot(result=bool)
+    def resumeText(self) -> bool:
+        """Continue the cut reply: ONE new request through submitText and every
+        gate it passes - the cut reply is already in the history it sends, as
+        what JARVIS had said. Nothing stored (no approval) is reused."""
+        if not self.canResume:
+            return False
+        self._resume = None                  # one press, one request: a double click finds nothing
+        self.resumeChanged.emit()
+        self._continuing = "next"            # its reply may land inside submitText (sync)
+        sent = self.submitText(tx("Bridge", QT_TRANSLATE_NOOP(
+            "Bridge", "Continue your previous answer exactly where it stopped, without repeating what was already written.")))
+        if self._continuing == "next":
+            self._continuing = self._request_id if sent else ""
+        return sent
 
     # -- slots: approval / task ------------------------------------------
 
@@ -4594,6 +4662,9 @@ class Bridge(QObject):
     def setDraftText(self, text: str) -> None:
         """What the composer holds now; kept for the open screen only."""
         text = str(text)
+        if text.strip() and self._resume is not None:
+            self._resume = None              # DFRESUME: typing ends the offer to resume
+            self.resumeChanged.emit()
         if text != self._draft_text:
             self._draft_text = text
             self._draft_timer.start()

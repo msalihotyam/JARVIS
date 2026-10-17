@@ -281,13 +281,20 @@ Item {
         anchors.right: parent.right; anchors.rightMargin: 4; anchors.verticalCenter: parent.verticalCenter
         width: 44; height: 44
         readonly property bool stopping: composer.conversationBound && bridge.openRunning
-        enabled: stopping || composer.canSend
+        // DFRESUME: after Stop cut a reply, an empty composer's key continues it; typed text wins.
+        readonly property bool resuming: composer.conversationBound && !stopping && !composer.blocked
+                                         && bridge.canResume && input.text.trim() === ""
+        enabled: stopping || resuming || composer.canSend
         opacity: enabled ? 1 : 0.42
         Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
         activeFocusOnTab: true
-        function act() { if (stopping) { if (!bridge.cancelText()) bridge.cancelTask() } else composer.submit() }
+        function act() {
+            if (stopping) { if (!bridge.cancelText()) bridge.cancelTask() }
+            else if (resuming) bridge.resumeText()
+            else composer.submit()
+        }
         Accessible.role: Accessible.Button
-        Accessible.name: stopping ? qsTr("Stop") : qsTr("Send message")
+        Accessible.name: stopping ? qsTr("Stop") : resuming ? qsTr("Resume") : qsTr("Send message")
         Accessible.onPressAction: act()
         Keys.onReturnPressed: act()
         Keys.onSpacePressed: act()
@@ -329,7 +336,7 @@ Item {
                 border.width: 1; border.color: "#66000a14" }
             // The glyph: an 18 px line send arrow.
             Shape {
-                visible: !sendButton.stopping
+                visible: !sendButton.stopping && !sendButton.resuming
                 anchors.centerIn: parent; anchors.horizontalCenterOffset: 1
                 width: 18; height: 18
                 preferredRendererType: Shape.CurveRenderer
@@ -339,6 +346,20 @@ Item {
                     startX: 1.5; startY: 1.5
                     PathLine { x: 16.5; y: 9 } PathLine { x: 1.5; y: 16.5 } PathLine { x: 4; y: 9 } PathLine { x: 1.5; y: 1.5 }
                     PathMove { x: 4; y: 9 } PathLine { x: 10; y: 9 }
+                }
+            }
+            // Resume: an 18 px line play triangle (DFRESUME).
+            Shape {
+                objectName: "composerResumeGlyph"
+                visible: sendButton.resuming
+                anchors.centerIn: parent; anchors.horizontalCenterOffset: 1
+                width: 18; height: 18
+                preferredRendererType: Shape.CurveRenderer
+                ShapePath {
+                    strokeColor: sendButton.hovered ? "#d6f1ff" : "#b8e7ff"; strokeWidth: 1.5; fillColor: "transparent"
+                    joinStyle: ShapePath.RoundJoin; capStyle: ShapePath.RoundCap
+                    startX: 4; startY: 2.5
+                    PathLine { x: 15.5; y: 9 } PathLine { x: 4; y: 15.5 } PathLine { x: 4; y: 2.5 }
                 }
             }
             // Stop: the amber square inside a turning ring (M2). The turn is a documented
@@ -364,7 +385,7 @@ Item {
         MouseArea { id: sendArea; anchors.fill: parent; hoverEnabled: true; cursorShape: Qt.PointingHandCursor; onClicked: sendButton.act() }
     }
     // A sibling, so it also tells why a disabled key is off.
-    HoverTip { objectName: composer.sendName + "Tip"; target: sendButton; text: composer.sendTip }
+    HoverTip { objectName: composer.sendName + "Tip"; target: sendButton; text: sendButton.resuming ? qsTr("Resume") : composer.sendTip }
     }
 
     // C1: the row under the bar - "+" and the permission mode on the left, the

@@ -454,6 +454,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
 <context>
     <name>Bridge</name>
     <message>
+        <source>Continue your previous answer exactly where it stopped, without repeating what was already written.</source>
+        <translation>Önceki yanıtına tam kaldığın yerden, yazılanları tekrarlamadan devam et.</translation>
+    </message>
+    <message>
         <source>uses %1</source>
         <translation>%1 kullanır</translation>
     </message>
@@ -1512,6 +1516,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Mesajı gönder</translation>
     </message>
     <message>
+        <source>Resume</source>
+        <translation>Devam et</translation>
+    </message>
+    <message>
         <source>Stop</source>
         <translation>Durdur</translation>
     </message>
@@ -1961,6 +1969,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>INTERRUPTED - INCOMPLETE ANSWER</source>
         <translation>YARIDA KESİLDİ - EKSİK YANIT</translation>
+    </message>
+    <message>
+        <source>CONTINUED</source>
+        <translation>DEVAM</translation>
     </message>
     <message>
         <source>Show less</source>
