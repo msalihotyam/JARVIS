@@ -230,6 +230,63 @@ class ReviewProbeTest(unittest.TestCase):
         ("Dosyayı kontrol et", "Dosyayı kontrol edemem"),
         ("Dosyayı kontrol et", "Dosyayı kontrol etmesene"),
         ("Testleri çalıştır", "Testler çalıştırılmasın"),
+        # SKMATCHFIX3 (CDXINT54B M1-M5 + R12 classes): an unbound literal,
+        # a negation in another clause, the wider prohibition lexicon and a
+        # request too long to read whole.
+        ("Send the report file to Alice", "Send the report file to Bob"),
+        ("Send the report file to Alice", "Send the report file to Alice and Bob"),
+        ("Send the report file to Alice and Bob", "Send the report file to Alice"),
+        ("Raporu Ali'ye gönder", "Raporu Veli'ye gönder"),
+        ("List the 10 recent commits", "List the 100 recent commits"),
+        ("List the 10 recent commits", "List the recent commits"),
+        ("List the recent commits", "List the 10 recent commits"),
+        ("List the three recent commits", "List the five recent commits"),
+        ("3 dosyayı sil", "5 dosyayı sil"),
+        ("üç dosyayı sil", "beş dosyayı sil"),
+        ("Archive the logs from 2024-01-05", "Archive the logs from 2024-01-06"),
+        ("Archive the logs from today", "Archive the logs from tomorrow"),
+        ("Bugünkü kayıtları arşivle", "Yarınki kayıtları arşivle"),
+        ("Delete \"draft one\" file", "Delete \"draft two\" file"),
+        ("Delete 'draft one' file", "Delete 'draft two' file"),
+        ("Copy C:/tmp/a.txt to backup", "Copy C:/tmp/b.txt to backup"),
+        ("Mail the report to ali@example.com", "Mail the report to veli@example.com"),
+        ("Read the page https://example.com/a", "Read the page https://example.com/b"),
+        ("Delete file alpha but do not delete file beta", "Do not delete file alpha but delete file beta"),
+        ("Delete file alpha and do not delete file beta", "Do not delete file alpha and delete file beta"),
+        ("Dosya alpha'yı sil ama dosya beta'yı silme", "Dosya alpha'yı silme ama dosya beta'yı sil"),
+        ("Dosya alpha'yı sil fakat dosya beta'yı silme", "Dosya alpha'yı silme fakat dosya beta'yı sil"),
+        ("Delete file alpha and keep file beta", "Keep file alpha and delete file beta"),
+        ("Draft the reply without sending it", "Draft the reply and send it"),
+        ("Rapor dosyasını sil", "Sakın rapor dosyasını sil"),
+        ("Rapor dosyasını sil", "Rapor dosyasını asla silme"),
+        ("Rapor dosyasını sil", "Rapor dosyasını hiçbir şekilde silme"),
+        ("Rapor dosyasını sil", "Rapor dosyasını hicbir sekilde sil"),
+        ("Rapor dosyasını sil", "Rapor dosyasını silmeyin"),
+        ("Rapor dosyasını sil", "Rapor dosyasını silmeni istemiyorum"),
+        ("Rapor dosyasını sil", "Rapor dosyasını sakin sil"),
+        ("Dosyayı kontrol et", "Dosyayı kontrol etme"),
+        ("Dosyayı kontrol et", "Dosyayı sakın kontrol etme"),
+        ("Delete the report file", "Never delete the report file"),
+        ("Delete the report file", "Don't ever delete the report file"),
+        ("Delete the report file", "Under no circumstances delete the report file"),
+        ("Delete the report file", "Avoid deleting the report file"),
+        ("Delete the report file", "Refrain from deleting the report file"),
+        ("Delete the report file", "Report the file without deleting"),
+        ("Delete the report file", "Stop deleting the report file"),
+        ("Delete the report file", "Undo delete the report file"),
+        ("Delete the report file", "Delete the report file" + " " * 2000 + "Actually, do not delete it"),
+        ("Delete the report file", "Delete the report file " + "report " * 60 + "do not delete the report file"),
+        ("Delete the report file", "Delete the report file " + "x" * 60),
+        # R12 probe hits: a condition, an added action, a repeat, an age, a
+        # question or a choice the skill does not carry.
+        ("Delete the report file", "Only delete the report file if I say so"),
+        ("Delete the report file", "Delete the report file then restore the report file"),
+        ("Delete the report file", "Delete the report file twice"),
+        ("Delete the report file", "Delete the old report file"),
+        ("Rapor dosyasını sil", "Eski rapor dosyasını sil"),
+        ("Rapor dosyasını sil", "Rapor dosyasını sil mi?"),
+        ("Rapor dosyasını sil", "Rapor dosyasını silsem mi"),
+        ("Delete file alpha but do not delete file beta", "Delete file alpha or do not delete file beta"),
     )
     SAME = (
         ("Faturayı müşteriye gönder", "Müşteriye faturayı gönder"),
@@ -249,7 +306,10 @@ class ReviewProbeTest(unittest.TestCase):
 
     def test_the_same_request_still_fits(self) -> None:
         for text in ("Copy file alpha to folder beta", "alpha dosyasını beta klasörüne kopyala",
-                     "Dosyayı özetle ve göster", "Delete the report file"):
+                     "Dosyayı özetle ve göster", "Delete the report file",
+                     "List the 10 recent commits", "Send the report file to Alice", "3 dosyayı sil",
+                     "Copy C:/tmp/a.txt to backup", "Delete \"draft one\" file", "Raporu Ali'ye gönder",
+                     "Archive the logs from 2024-01-05", "Draft the reply without sending it"):
             with self.subTest(text=text):
                 self.assertIs(probe_kind(text, text), MatchKind.FIT)
 

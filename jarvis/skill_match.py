@@ -32,9 +32,18 @@ Turkish suffix names after an apostrophe ("GitHub'daki"). Negative
 contractions (can't, won't, cannot, any apostrophe) read as "not"; a Turkish
 negative ending counts on any word of the skill. The task must also bind its
 objects and places as the skill does: "copy beta to alpha" is not "copy
-alpha to beta", nor "from" for "to" (``_misordered``). A task that misses
-one is SIMILAR at best: a lost fit is only a hint, a false fit would propose
-the wrong procedure.
+alpha to beta", nor "from" for "to" (``_misordered``). Each negation binds
+to its own clause (punctuation, but/ama/fakat/and/ve/then split them), so
+"delete alpha but not beta" is not "not alpha but delete beta"; never,
+avoid, "under no circumstances", sakın, asla, "hiçbir şekilde" and the
+other prohibitions read as "not". Every fixed literal (a number or numeral,
+a date or weekday, a quoted string, a path, an email or web address, a
+mid-sentence name) must match the skill's one to one; a differing or extra
+literal beyond the skill's declared inputs, or a missing one, is no fit. A
+task cut anywhere before its cues are read (``MAX_TASK_CHARS``,
+``MAX_TASK_WORDS``, a word over ``WORD_MAX``) is never a fit. A task that
+misses one is SIMILAR at best: a lost fit is only a hint, a false fit would
+propose the wrong procedure.
 
 Scope is an allowlist: a global skill is always considered; a project skill
 only when ``project_id`` is that exact project. Another project's skill never
@@ -168,10 +177,20 @@ _NEGATION_BEFORE_TEXT = (
     "won wouldn shouldn couldn haven hasn hadn mustn needn shan "
     "doesnt didnt isnt arent wasnt werent wont wouldnt shouldnt couldnt "
     "havent hasnt hadnt mustnt neednt shant aint "
-    "nothing none neither hiçbir asla"
+    "nothing none neither hiçbir asla sakın hiç katiyen "
+    "avoid avoids avoided avoiding refrain refrains refrained refraining "
+    "forbid forbids forbidden forbidding prohibit prohibits prohibited prohibiting "
+    "prevent prevents prevented preventing skip skips skipped skipping "
+    "omit omits omitted omitting except excluding instead"
 )
 _NEGATION_AFTER_TEXT = (
-    "değil değildir değilim değilsin değiliz değilsiniz değiller yok yerine gerekmez bırak"
+    "değil değildir değilim değilsin değiliz değilsiniz değiller yok yerine gerekmez bırak "
+    "hariç haricinde dışında yasak yasaktır"
+)
+# Phrases read as "not" before tokenizing ("under no circumstances delete").
+_NEGATION_PHRASES = re.compile(
+    r"\b(?:under no circumstances?|in no way|by no means|rather than|instead of|"
+    r"hicbir sekilde|hicbir zaman|ne olursa olsun)\b"
 )
 # A verb plus one of these endings is the negated verb ("özetle" + "me"). The
 # verb is any content word of the skill's name, summary or a step (a word of
@@ -189,7 +208,7 @@ _NEGATIVE_ENDING_STARTS_TEXT = (
 # A passive ("silin" + "mesin", "özetlen" + "me") is the verb plus one of these
 # and a negative ending starting with "m".
 _PASSIVE = ("il", "in", "ul", "un", "l", "n")  # folded: "ıl", "ün" are "il", "un"
-_NEGATED_VERBS_TEXT = "yap et ed"
+_NEGATED_VERBS_TEXT = "yap et ed iste ol"
 # A cue only when it opens a clause ("Open a pull request") or an object
 # pronoun follows it ("(open it first)"), never as an adjective ("List open
 # pull requests", "which are open"); a clause opens at the start, after a
@@ -197,6 +216,8 @@ _NEGATED_VERBS_TEXT = "yap et ed"
 _CLAUSE_START_ONLY_TEXT = "open opens opened"
 _OBJECT_PRONOUNS_TEXT = "it them this that"
 _CLAUSE_OPENERS_TEXT = "and then or please you also just now to ve sonra lütfen"
+# Conjunctions that also close a clause: a negation binds within its clause.
+_CLAUSE_SPLITS_TEXT = "and but or then ve veya ama fakat ancak sonra"
 # Mail words that opening a clause send ("and email it to Bob").
 _MAIL_VERBS_TEXT = "email emails emailed mail mails mailed"
 # English contraction endings: "don't" and "it's" name no place.
@@ -229,6 +250,13 @@ _CUE_GROUPS = {
     "amend": "amend*",
     "reply": "reply* replies replied respond* yanıtla* cevapla*",
     "open":"open opens opened launch* başlat* çalıştır* aç açıp açar açın",
+    "restore": "restor* recover* undelet*",
+    # A question, condition, choice, repeat or age the skill does not carry.
+    "question": "mi mı mu mü",
+    "condition": "if unless when whenever eğer ise yoksa",
+    "choice": "or either veya yahut",
+    "repeat": "twice thrice again tekrar yeniden",
+    "age": "old older oldest new newer newest latest eski yeni",
     # Another object, destination or scope.
     "email": "email* mail* posta* eposta* inbox*",
     "folder": "folder* klasör* dizin*",
@@ -345,6 +373,7 @@ _CLAUSE_OPENERS = _folded_set(_CLAUSE_OPENERS_TEXT)
 _OBJECT_PRONOUNS = _folded_set(_OBJECT_PRONOUNS_TEXT)
 _MAIL_VERBS = _folded_set(_MAIL_VERBS_TEXT)
 _CONTRACTIONS = _folded_set(_CONTRACTION_TEXT)
+_CLAUSE_SPLITS = _folded_set(_CLAUSE_SPLITS_TEXT)
 _CUE_EXACT = {
     fold_token(entry): group
     for group, entries in _CUE_GROUPS.items()
@@ -370,6 +399,35 @@ _LETTER_APOSTROPHES = {0x2BB: "'", 0x2BC: "'", 0x2032: "'"}
 _NEGATIVE_CONTRACTION = re.compile(
     "(?<![^" + chr(0x5C) + "W_])[^" + chr(0x5C) + "W_]*n[" + _APOSTROPHES + " ]t(?![^"
     + chr(0x5C) + "W_])"
+)
+# Literals (``_literals``): quoted texts, the marks of a path, mail or web
+# address, and the number, day, month and relative date words (folded; "on",
+# "one", "bir" and "may" are ordinary words too often to count).
+_QUOTED = re.compile(
+    '"([^"]*)"|' + chr(0x201C) + "([^" + chr(0x201D) + "]*)" + chr(0x201D)
+    + "|" + chr(0xAB) + "([^" + chr(0xBB) + "]*)" + chr(0xBB)
+    + "|(?<![^" + chr(0x5C) + "W_])'([^']*)'(?![^" + chr(0x5C) + "W_])"
+)
+_ADDRESS = re.compile("[/@" + chr(0x5C) * 2 + "]|[^" + chr(0x5C) + "W_][.:][^" + chr(0x5C) + "W_]")
+_LITERAL_EDGE = ".,;:!?()[]{}\"'`" + "".join(map(chr, (0x2018, 0x2019, 0x201C, 0x201D, 0xAB, 0xBB)))
+_LITERAL_EDGE_AFTER = "\"')]}" + "".join(map(chr, (0x2019, 0x201D, 0xBB)))
+_SENTENCE_ENDS = (".", "!", "?", ":")
+_LITERAL_SUFFIX = re.compile("[" + _APOSTROPHES + "]")
+# English clitics after an apostrophe ("Don't", "It's") mark no proper name.
+_CLITICS = frozenset("t s ll re ve d m".split())
+_LITERAL_WORDS = tuple(
+    fold_token(word)
+    for word in (
+        "two three four five six seven eight nine ten eleven twelve thirteen fourteen"
+        " fifteen sixteen seventeen eighteen nineteen twenty hundred thousand million"
+        " iki üç dört beş altı yedi sekiz dokuz yüz bin milyon"
+        " today tomorrow yesterday tonight bugün yarın dün"
+        " monday tuesday wednesday thursday friday saturday sunday"
+        " pazartesi salı çarşamba perşembe cumartesi cuma pazar"
+        " january february march april june july august september october november"
+        " december ocak şubat mart nisan mayıs haziran temmuz ağustos eylül ekim kasım"
+        " aralık"
+    ).split()
 )
 # Slot words and Turkish case suffixes after an apostrophe, read as slot marks
 # in a text's word order ("@" is never part of a word).
@@ -423,16 +481,19 @@ class _CueText:
     order. A negative contraction ("can't") is read as "not".
     """
 
-    particles: tuple[tuple[int, str], ...]
+    particles: tuple[tuple[int, str, int], ...]  # and the negation's clause
     endings: dict[str, tuple[int, ...]]
     cues: tuple[tuple[int, str], ...]
     named: tuple[str, ...]
     order: tuple[str, ...]
+    clauses: tuple[int, ...]  # the clause of each content word
+    clause_words: tuple[frozenset[str], ...]  # each clause's content words
 
     @classmethod
     def read(cls, folded: str) -> _CueText:
         folded = re.sub(r"\bout of\b", "from", folded.translate(_LETTER_APOSTROPHES))
         folded = _NEGATIVE_CONTRACTION.sub(" not ", folded)
+        folded = _NEGATION_PHRASES.sub(" not ", folded)
         found = list(_TOKEN.finditer(folded))
         tokens = [match.group()[:WORD_MAX] for match in found]
         order: list[str] = []
@@ -462,7 +523,8 @@ class _CueText:
             if opened and word in _MAIL_VERBS:
                 cues.append((at, "send"))
             if not is_content:
-                mark = len(word) == 1 and not word.isalnum()
+                # Punctuation and "but", "and", "ama", "ve"... split clauses.
+                mark = (len(word) == 1 and not word.isalnum()) or word in _CLAUSE_SPLITS
                 clause += mark
                 opened = mark or word in _CLAUSE_OPENERS
                 continue
@@ -476,7 +538,9 @@ class _CueText:
                 # A negation governs a word of its own clause only.
                 target = at + 1 if word in _NEGATION_BEFORE else at - 1
                 inside = 0 <= target < len(content) and clauses[target] == clauses[at]
-                particles.append((target if inside else -2, content[target] if inside else ""))
+                particles.append(
+                    (target if inside else -2, content[target] if inside else "", clauses[at])
+                )
             for cut in range(1, len(word)):
                 ending = word[cut:]
                 passive = [ending[len(p):] for p in _PASSIVE if ending[len(p):len(p) + 1] == "m"
@@ -491,27 +555,95 @@ class _CueText:
                 if suffix not in _CONTRACTIONS and _is_content(stem[:WORD_MAX])
             )
         )
+        clause_words: list[set[str]] = [set() for _ in range(clause + 1)]
+        for word, at in zip(content, clauses):
+            if word not in _NEGATION_BEFORE and word not in _NEGATION_AFTER:
+                clause_words[at].add(word)
         return cls(
             tuple(particles),
             {stem: tuple(at) for stem, at in endings.items()},
             tuple(cues),
             named,
             tuple(order),
+            tuple(clauses),
+            tuple(frozenset(words) for words in clause_words),
         )
 
 
-def _cues(text: _CueText, verbs: frozenset[str]) -> tuple[frozenset[str], tuple[str, ...]]:
-    """The cue groups and the negated words of ``text``, given its verbs.
+def _cues(
+    text: _CueText, verbs: frozenset[str]
+) -> tuple[frozenset[str], tuple[str, ...], frozenset[tuple[str, frozenset[str]]]]:
+    """The cue groups, negated words and negation bindings of ``text``.
 
     A negated word names no cue of its own: "without sending" is no "send".
+    A binding is a negated word and the content words of its own clause.
     """
-    governed = {at for at, _ in text.particles}
-    negated = [word for _, word in text.particles]
+    governed = {at for at, _, _ in text.particles}
+    negated = [word for _, word, _ in text.particles]
+    bindings = {(word, text.clause_words[clause]) for _, word, clause in text.particles}
     for stem in sorted((verbs | _NEGATED_VERBS) & text.endings.keys()):
         governed.update(text.endings[stem])
         negated.extend(stem for _ in text.endings[stem])
+        bindings.update((stem, text.clause_words[text.clauses[at]]) for at in text.endings[stem])
     groups = frozenset(group for at, group in text.cues if at not in governed)
-    return groups, tuple(negated)
+    return groups, tuple(negated), frozenset(bindings)
+
+
+def _same_clause(a: frozenset[str], b: frozenset[str]) -> bool:
+    """Every word of each clause is the same word as one of the other's."""
+    return all(any(_same_word(x, y) for y in b) for x in a) and all(
+        any(_same_word(y, x) for x in a) for y in b
+    )
+
+
+def _literals(text: str) -> tuple[str, ...]:
+    """The fixed literals of a raw text, folded, in first-seen order.
+
+    A literal is a quoted text, a token with a digit or a path, mail or web
+    address mark, a capitalised word that does not start a sentence, a stem
+    written before an apostrophe suffix, or a number, day, month or relative
+    date word. A literal names one thing: a different one is a different task.
+    """
+    found: dict[str, None] = {}
+    for parts in _QUOTED.findall(text):
+        quoted = " ".join(_WORD_RUN.findall(fold_token("".join(parts))))
+        if quoted:
+            found['"' + quoted] = None
+        # The quoted words are still read below.
+    opens = True  # the next word starts a sentence
+    for token in text.split():
+        bare = token.strip(_LITERAL_EDGE)
+        stem, *suffix = _LITERAL_SUFFIX.split(bare, maxsplit=1)
+        named = bool(suffix) and fold_token(suffix[0]) not in _CLITICS
+        folded = fold_token(stem)
+        if stem and (any(c.isdigit() for c in stem) or _ADDRESS.search(stem)):
+            found[folded] = None
+        elif len(stem) >= WORD_MIN and stem[0].isupper() and (not opens or named):
+            found[folded] = None
+        else:
+            for word in _WORD_RUN.findall(folded):
+                base = next(
+                    (x for x in _LITERAL_WORDS
+                     if word == x or (len(x) >= PREFIX_MIN and word.startswith(x))),
+                    None,
+                )
+                if base is not None:
+                    found[base] = None
+        opens = token.rstrip(_LITERAL_EDGE_AFTER).endswith(_SENTENCE_ENDS)
+    return tuple(found)
+
+
+def _same_literal(a: str, b: str) -> bool:
+    """Words by the matcher's word rule; numbers, paths and quotes exactly."""
+    return _same_word(a, b) if a.isalpha() and b.isalpha() else a == b
+
+
+@lru_cache(maxsize=CACHE_MAX)
+def _skill_literals(skill: Skill) -> tuple[str, ...]:
+    """The literals of a skill's name, summary and step actions, bounded."""
+    fields = [skill.name, skill.summary] + [step.action for step in skill.steps]
+    text = cut_text(" . ".join(_without_placeholders(field) for field in fields), SKILL_TEXT_MAX)
+    return _literals(text)
 
 
 def words(text: str, limit: int | None = None) -> tuple[str, ...]:
@@ -575,8 +707,15 @@ def _skill_words(skill: Skill) -> _SkillWords:
 @lru_cache(maxsize=CACHE_MAX)
 def _skill_cues(
     skill: Skill,
-) -> tuple[frozenset[str], frozenset[str], tuple[str, ...], tuple[tuple[str, ...], ...]]:
-    """A skill's verbs, cue groups, negated words and field word orders.
+) -> tuple[
+    frozenset[str],
+    frozenset[str],
+    tuple[str, ...],
+    tuple[tuple[str, ...], ...],
+    frozenset[tuple[str, frozenset[str]]],
+]:
+    """A skill's verbs, cue groups, negated words, field word orders and
+    negation bindings.
 
     Its verbs are every content word of its name, summary and each step
     action: a Turkish verb need not end its clause ("özetle ve göster"). Each
@@ -601,8 +740,8 @@ def _skill_cues(
         if position < 2 or position >= 2 + len(skill.inputs):
             verbs.update(word[:WORD_MAX] for word in _WORD_RUN.findall(text) if _is_content(word))
     verbs_set = frozenset(verbs)
-    groups, negated = _cues(_CueText.read(" . ".join(folded)), verbs_set)
-    return verbs_set, groups, negated, tuple(orders)
+    groups, negated, bindings = _cues(_CueText.read(" . ".join(folded)), verbs_set)
+    return verbs_set, groups, negated, tuple(orders), bindings
 
 
 def _misordered(fields: tuple[tuple[str, ...], ...], order: tuple[str, ...]) -> bool:
@@ -680,18 +819,52 @@ def _misordered(fields: tuple[tuple[str, ...], ...], order: tuple[str, ...]) -> 
     return False
 
 
-def _conflicts(skill: Skill, body: _WordIndex, request: _CueText) -> list[str]:
+def _conflicts(
+    skill: Skill,
+    body: _WordIndex,
+    request: _CueText,
+    literals: tuple[str, ...],
+    task_words: tuple[str, ...],
+) -> list[str]:
     """Why ``request`` carries a cue the skill's own text does not (fit rule)."""
-    verbs, own_groups, own_negated, orders = _skill_cues(skill)
-    groups, negated = _cues(request, verbs)
+    verbs, own_groups, own_negated, orders, own_bindings = _skill_cues(skill)
+    groups, negated, bindings = _cues(request, verbs)
     found: list[str] = []
+    # A negation the request leaves out counts once the request names that
+    # word itself: it then asks for what the skill refuses to do.
     negations = sorted(
         {word for word in negated if not any(_same_word(word, own) for own in own_negated)}
+        | {
+            own for own in own_negated
+            if not any(_same_word(word, own) for word in negated)
+            and (not own or any(_same_word(own, word) for word in task_words))
+        }
     )
     if negations:
         found.append(
             _named("not a fit: negates what the skill does not", (w or "-" for w in negations))
         )
+    elif any(
+        not any(
+            _same_word(word, own) and _same_clause(clause, own_clause)
+            for own, own_clause in own_bindings
+        )
+        for word, clause in bindings
+    ):
+        found.append("not a fit: negates in another clause than the skill")
+    own_literals = _skill_literals(skill)
+    extra = [
+        x for x in literals
+        if not any(_same_literal(x, own) for own in own_literals)
+        and not (x.isalpha() and _TaskWords.build((x,)).hits(body))
+    ]
+    missing = [
+        own for own in own_literals
+        if not any(_same_literal(x, own) for x in literals)
+        and not (own.isalpha() and any(_same_word(own, word) for word in task_words))
+    ]
+    if missing or len(extra) > len(skill.inputs):
+        found.append(_named("not a fit: names a literal the skill does not", missing + extra))
     others = sorted(groups - own_groups)
     if others:
         found.append(_named("not a fit: names what the skill does not", others))
@@ -841,7 +1014,11 @@ def _named(label: str, items: Iterable[str]) -> str:
 
 
 def _assess(
-    skill: Skill, task: _TaskWords, request: _CueText
+    skill: Skill,
+    task: _TaskWords,
+    request: _CueText,
+    literals: tuple[str, ...],
+    truncated: bool,
 ) -> tuple[MatchKind, int, int, tuple[str, ...]]:
     index = _skill_words(skill)
     body_hits = task.hits(index.body)
@@ -859,8 +1036,9 @@ def _assess(
         and len(matched) >= FIT_MIN_MATCHED
         and bool(in_headline)
         and coverage >= FIT_MIN_COVERAGE
+        and not truncated
     )
-    conflicts = _conflicts(skill, index.body, request) if fit else []
+    conflicts = _conflicts(skill, index.body, request, literals, task.words) if fit else []
     kind = MatchKind.FIT if fit and not conflicts else MatchKind.SIMILAR
     reasons = [
         f"scope: {skill.scope.kind.value}",
@@ -881,6 +1059,8 @@ def _assess(
             reasons.append("not a fit: no task word in its name or summary")
         if coverage < FIT_MIN_COVERAGE:
             reasons.append(f"not a fit: coverage below {FIT_MIN_COVERAGE}")
+        if truncated:
+            reasons.append("not a fit: request too long to read whole")
         reasons.extend(conflicts)
     return kind, score, coverage, tuple(reasons)
 
@@ -949,12 +1129,22 @@ def match_skills(
             "not starting with -)"
         )
     entries = _entries(skills_with_state)
+    # Any part of the request left unread caps every match at SIMILAR.
+    truncated = len(task_text) > MAX_TASK_CHARS
     task_text = cut_text(task_text, MAX_TASK_CHARS)
-    task_words = words(task_text, MAX_TASK_WORDS)
+    folded = fold_token(task_text)
+    all_words = words(task_text)
+    truncated = (
+        truncated
+        or len(all_words) > MAX_TASK_WORDS
+        or any(len(run) > WORD_MAX for run in _WORD_RUN.findall(folded))
+    )
+    task_words = all_words[:MAX_TASK_WORDS]
     if not task_words:
         return MatchResult(kind=MatchKind.NONE, best=None, candidates=(), needs_revalidation=())
     task = _TaskWords.build(task_words)
-    request = _CueText.read(fold_token(task_text))
+    request = _CueText.read(folded)
+    literals = _literals(task_text)
 
     ranked: list[tuple[tuple, MatchCandidate]] = []
     stale: list[tuple[tuple, MatchCandidate]] = []
@@ -968,7 +1158,7 @@ def match_skills(
             target = stale
         else:  # disabled, deleted, or anything unknown: never offered
             continue
-        kind, score, coverage, reasons = _assess(skill, task, request)
+        kind, score, coverage, reasons = _assess(skill, task, request, literals, truncated)
         if kind is MatchKind.NONE:
             continue
         if target is stale:
