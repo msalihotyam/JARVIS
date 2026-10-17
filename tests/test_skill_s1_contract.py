@@ -784,7 +784,7 @@ class UsableSkillContractTests(unittest.TestCase):
     def best_for(self, history: SkillHistory):
         skill = history.get(1)
         entry = SkillWithState(skill=skill, status=status(history), health=health(history))
-        return match_skills(self.TASK, [entry], None)
+        return match_skills(self.TASK, [entry], None, request=self.TASK)
 
     def test_usable_skill_none_is_never_matchs_best(self):
         skill = make_skill()

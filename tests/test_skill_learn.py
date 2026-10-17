@@ -51,6 +51,7 @@ from jarvis.skill_types import (
     SkillStep,
 )
 from tests.helpers import DUMMY_CAPABILITY, DummyConnector, safe_cleanup
+from tests.test_skill_core import TypedCore
 
 AT = "2026-10-14T08:00:00+00:00"
 GLOBAL = SkillScope(kind=SkillScopeKind.GLOBAL, project_id=None)
@@ -78,7 +79,7 @@ def skill_draft() -> SkillDraft:
     return SkillDraft(
         draft_id=f"draft-{1:032x}",
         name="Haftalik rapor dosyasini oku",
-        summary="Haftalik rapor dosyasini oku:",  # the task text with its value stripped
+        summary="Haftalik rapor dosyasini oku: {path}",  # the typed value is the placeholder span
         scope=GLOBAL,
         inputs=(SkillInput(name="path", description="", required=True),),
         steps=(
@@ -127,7 +128,7 @@ class SkillLearnTests(unittest.TestCase):
         policy = frozenset(
             {DestinationGrant(connector.manifest.name, DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION)}
         )
-        return AgentCore(
+        return TypedCore(
             registry, self.store, settings, destination_policy=policy, skill_store=self.store
         )
 

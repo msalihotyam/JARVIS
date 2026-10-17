@@ -522,6 +522,23 @@ class SkillCoreTests(unittest.TestCase):
         self.assertEqual(connector.seen[0].scope.target, TARGET)
         self.assertEqual(self.events_of(skill_id).count(SkillEventKind.USED_SUCCESS), 1)
 
+    def test_a_placeholder_free_fit_never_binds_the_model_target(self) -> None:
+        # CDXINT54H M1: no request is asked about; a typed fit binds nothing,
+        # so the model's target never becomes the skill's input.
+        made = replace(draft(), summary=draft().name)
+        self.store.add_draft(made)
+        self.store.approve_draft(made.draft_id, project_id=None)
+        connector = CapturingConnector()
+        core = self.core(connector)
+        asked = AgentCore.run(core, user_task("Haftalik rapor dosyasini oku", target="notes/evil.md"))
+        self.assertEqual(asked.status, RunStatus.AWAITING_CLARIFICATION, asked.error)
+        self.assertIn("skill_similar_asked", self.feed(asked.session.id))
+        run = core.run(user_task("Haftalik rapor dosyasini oku", target="notes/evil.md"))
+        self.assertEqual(run.status, RunStatus.AWAITING_CLARIFICATION, run.error)
+        self.assertIn("skill_needs_inputs", self.feed(run.session.id))
+        self.assertIn("path", run.task.preferences["clarification_question"])
+        self.assertEqual(connector.execute_calls, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

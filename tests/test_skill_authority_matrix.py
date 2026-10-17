@@ -61,6 +61,7 @@ from jarvis.skill_types import (
     SkillStep,
 )
 from tests.helpers import DUMMY_CAPABILITY, DummyConnector, safe_cleanup
+from tests.test_skill_core import TypedCore
 
 AT = "2026-10-15T08:00:00+00:00"
 GLOBAL = SkillScope(kind=SkillScopeKind.GLOBAL, project_id=None)
@@ -79,7 +80,7 @@ CLAIMS = (
 )
 
 
-def draft(summary: str = "Haftalik rapor dosyasini oku:", suffix: str = "") -> SkillDraft:
+def draft(summary: str = "Haftalik rapor dosyasini oku: {path}", suffix: str = "") -> SkillDraft:
     return SkillDraft(
         draft_id=f"draft-{1:032x}",
         name="Haftalik rapor dosyasini oku",
@@ -148,7 +149,7 @@ class _Base(unittest.TestCase):
         policy = frozenset(
             {DestinationGrant(connector.manifest.name, DUMMY_CAPABILITY, CLAUDE_CODE_DESTINATION)}
         )
-        return AgentCore(
+        return TypedCore(
             registry, self.store, settings, destination_policy=policy, skill_store=self.store
         )
 

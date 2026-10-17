@@ -126,7 +126,8 @@ LIBRARY = (REPORT_TR, INVOICE_EN, BACKUP_EN)
 
 
 def run(task: str, *skills: Skill, project_id: str | None = None) -> MatchResult:
-    return match_skills(task, [entry(skill) for skill in (skills or LIBRARY)], project_id)
+    # The task is the user's own typed text: only that can be a fit (CDXINT54H M1).
+    return match_skills(task, [entry(skill) for skill in (skills or LIBRARY)], project_id, request=task)
 
 
 class NormalisationTests(unittest.TestCase):
@@ -373,7 +374,7 @@ class ScopeTests(unittest.TestCase):
                 self.assertEqual(self._ids(result), set())
 
     def test_same_project_skill_is_offered(self) -> None:
-        result = match_skills(self.TASK, self.offer, "proj-a")
+        result = match_skills(self.TASK, self.offer, "proj-a", request=self.TASK)
         self.assertIs(result.kind, MatchKind.FIT)
         self.assertEqual(result.best.skill_id, "p1-notes")
         self.assertEqual(result.best.reasons[0], "scope: project")
@@ -404,7 +405,7 @@ class StatusTests(unittest.TestCase):
                 self.assertEqual(result.needs_revalidation, ())
 
     def test_stale_is_only_in_needs_revalidation_and_never_a_fit(self) -> None:
-        result = match_skills(self.TASK, [entry(REPORT_TR, SkillStatus.STALE)], None)
+        result = match_skills(self.TASK, [entry(REPORT_TR, SkillStatus.STALE)], None, request=self.TASK)
         self.assertIs(result.kind, MatchKind.NONE)
         self.assertIsNone(result.best)
         self.assertEqual(result.candidates, ())
@@ -417,7 +418,7 @@ class StatusTests(unittest.TestCase):
     def test_stale_does_not_hide_an_active_fit_and_is_not_best(self) -> None:
         twin = make_skill("satis-raporu-2", REPORT_TR.name, REPORT_TR.summary, ("Raporu hazırla",))
         result = match_skills(
-            self.TASK, [entry(REPORT_TR, SkillStatus.STALE, health(9)), entry(twin)], None
+            self.TASK, [entry(REPORT_TR, SkillStatus.STALE, health(9)), entry(twin)], None, request=self.TASK
         )
         self.assertIs(result.kind, MatchKind.FIT)
         self.assertEqual(result.best.skill_id, "satis-raporu-2")
@@ -456,7 +457,7 @@ class OrderTests(unittest.TestCase):
         # similar skill with the same score still ranks after it.
         no_headline = make_skill("a-steps", "Genel", "Genel işler", ("Satış raporu hazırla",))
         fit = make_skill("z-fit", "Satış raporu hazırla", "Rapor", ("Belgeyi hazırla",))
-        result = match_skills(self.TASK, [entry(no_headline), entry(fit)], None)
+        result = match_skills(self.TASK, [entry(no_headline), entry(fit)], None, request=self.TASK)
         self.assertEqual([c.skill_id for c in result.candidates], ["z-fit", "a-steps"])
         self.assertEqual([c.score for c in result.candidates], [100, 100])
         self.assertEqual(
@@ -568,7 +569,8 @@ class CoverageTests(unittest.TestCase):
         ]
 
     def test_broad_skill_is_not_the_fit_for_a_narrow_task(self) -> None:
-        result = match_skills("Faturayi musteriye gonder", self.offer, None)
+        task = "Faturayi musteriye gonder"
+        result = match_skills(task, self.offer, None, request=task)
         self.assertIs(result.kind, MatchKind.FIT)
         self.assertEqual(result.best.skill_id, "fatura-gonder")
         self.assertEqual((result.best.score, result.best.coverage), (100, 100))
@@ -746,6 +748,43 @@ class PlaceholderTests(unittest.TestCase):
                 self.assertIs(result.kind, MatchKind.FIT)
                 self.assertEqual(dict(result.best.inputs), inputs)
 
+    def test_a_fit_needs_a_typed_request_and_every_aligned_template_to_bind(self) -> None:
+        # CDXINT54H M1: no typed request never fits, with or without
+        # placeholders; a placeholder-free fit binds nothing. M2: a template
+        # whose literals align but cannot bind refuses its siblings too.
+        def two(skill_id: str, name: str, summary: str, inputs: tuple[str, ...]) -> Skill:
+            return dataclasses.replace(drafted_skill(skill_id, name, (name,), inputs), summary=summary)
+
+        plain = make_skill("plain", "Read report1", "Read report1", ("Read {path}",), inputs=("path",))
+        for skill, task in ((plain, "Read report1"), (self.INVOICE, self.INVOICE_TASK)):
+            for request in (None, "", "   ", "\t\n"):
+                with self.subTest(skill=skill.skill_id, request=request):
+                    result = match_skills(task, [entry(skill)], None, request=request)
+                    self.assertIs(result.kind, MatchKind.SIMILAR)
+                    self.assertEqual(result.best.inputs, ())
+        result = match_skills("Read report1", [entry(plain)], None, request="Read report1")
+        self.assertIs(result.kind, MatchKind.FIT)
+        self.assertEqual(result.best.inputs, ())
+        dot = two("dot", "Read file {path}.txt", "Read file {path}", ("path",))
+        dot2 = two("dot2", "Read file {path}", "Read file {path}.txt", ("path",))
+        edge = two("edge", "Copy files {src} to {dst}x", "Copy files {src} as {dst}", ("src", "dst"))
+        pre = two("pre", "Get x{path}", "Get {path}", ("path",))
+        amb = two("amb", "Copy files {src} to {dst}", "Copy files {src} as {dst}", ("src", "dst"))
+        rows = (
+            (dot, "Read file .txt"),  # H2a: empty value before the suffix
+            (dot2, "Read file .txt"),
+            (edge, "Copy files a to b to c as dx"),  # H2b: "{dst}x" aligns, cannot bind
+            (edge, "Copy files a to bx"),  # name binds, summary's literal is absent
+            (pre, "Get xa"),  # prefix edge after alignment
+            (amb, "Copy files a to b to c as d"),  # ambiguous split
+            (amb, "Copy files a to b as b"),  # both bind, disagree
+        )
+        for skill, request in rows:
+            with self.subTest(request=request):
+                result = match_skills(request, [entry(skill)], None, request=request)
+                self.assertIs(result.kind, MatchKind.SIMILAR)
+                self.assertEqual(result.best.inputs, ())
+
     def test_placeholder_names_are_not_words_of_the_text(self) -> None:
         skill = make_skill(
             "ph", "Rapor {xyzzy} {a-1}{b_2} gonder", "{kopya}", ("Raporu {plugh} gonder",)
@@ -787,8 +826,8 @@ class BoundaryTests(unittest.TestCase):
     def _match(self, matched: int, unmatched: int):
         hit = vocab(matched)
         miss = vocab(unmatched, "z")
-        result = match_skills(" ".join(hit + miss), [entry(headline_skill("s", hit))], None)
-        return result
+        task = " ".join(hit + miss)
+        return match_skills(task, [entry(headline_skill("s", hit))], None, request=task)
 
     def test_fit_min_score_edge(self) -> None:
         # SKSIMASK: a fit binds every request word, so the score edge alone
@@ -821,7 +860,8 @@ class BoundaryTests(unittest.TestCase):
             # coverage of its summary decides.
             headline = vocab(covered) + vocab(extra, "z")
             skill = make_skill("s", " ".join(vocab(covered)), " ".join(headline), ("Adımı uygula",))
-            return match_skills(" ".join(vocab(covered)), [entry(skill)], None)
+            task = " ".join(vocab(covered))
+            return match_skills(task, [entry(skill)], None, request=task)
 
         at = cover(3, 2)  # 3 of 5 = 60
         self.assertEqual((at.best.score, at.best.coverage), (100, 60))

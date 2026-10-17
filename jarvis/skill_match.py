@@ -713,14 +713,24 @@ _REFUSED: dict[str, str] = {}  # sentinel: the template aligns but cannot bind (
 def _bind_one(template: str, request: str, skill: Skill) -> dict[str, str] | None:
     """Each placeholder bound to the exact span the user typed there, all else the
     template's own up to the identity fold (Salih 2026-10-17, option A); None
-    when the request is not this template, ``_REFUSED`` when it is but a span is
-    empty, padded or unprintable or the split is not the only one."""
+    only when a literal of the template is absent from the request (it is not
+    this template), ``_REFUSED`` for every other failure: an empty, padded or
+    unprintable span, an overlap, an unsupported template, a split that is not
+    the only one (CDXINT54H M2)."""
     parts = _PLACEHOLDER.split(template)
     names = [m.group()[1:-1] for m in _PLACEHOLDER.finditer(template)]
     declared = {spec.name: spec.required for spec in skill.inputs}
     edges = [p[-1:] for p in parts[:-1]] + [p[:1] for p in parts[1:]]
     chars = [fold_token(c, identity=True) for c in request]
     key, lits = "".join(chars), [fold_token(p, identity=True) for p in parts]
+    whole, at = fold_token(request, identity=True), len(lits[0])
+    if not (whole.startswith(lits[0]) and whole.endswith(lits[-1])):
+        return None
+    for lit in lits[1:-1]:
+        at = whole.find(lit, at)
+        if at < 0:
+            return None
+        at += len(lit)
     end = len(key) - len(lits[-1])
     if (
         len(set(names)) != len(names)
@@ -729,16 +739,16 @@ def _bind_one(template: str, request: str, skill: Skill) -> dict[str, str] | Non
         or not all(parts[1:-1])
         or any(c.isalnum() or c == "_" for c in edges)
         or any(len(c) != 1 for c in chars)
-        or key != fold_token(request, identity=True)
-        or not (key.startswith(lits[0]) and key.endswith(lits[-1]) and len(lits[0]) < end)
+        or key != whole
+        or len(lits[0]) >= end
     ):
-        return None
+        return _REFUSED
     # Leftmost and rightmost placements of the literals agree only for a unique split.
     lo, at = [], len(lits[0])
     for lit in lits[1:-1]:
         at = key.find(lit, at + 1, end)
         if at < 0:
-            return None
+            return _REFUSED
         lo.append(at)
         at += len(lit)
     hi, stop = [], end
@@ -768,7 +778,9 @@ def _plain(value: str) -> bool:
 def _bind(skill: Skill, request: str | None) -> dict[str, str] | None:
     """The one binding of the user's own ``request`` to the skill's name or
     summary placeholders, never the model's text (INT54-AFX F2 H1)."""
-    if request is None or len(request) > MAX_TASK_CHARS or _said(request) is None:
+    if not request or not request.strip() or len(request) > MAX_TASK_CHARS:
+        return None
+    if _said(request) is None:
         return None
     texts = [t.strip() for t in (skill.name, skill.summary) if _PLACEHOLDER.search(t)]
     # Every template the request aligns to must bind it alike; one refused
@@ -1130,7 +1142,7 @@ def _assess(
     request: _CueText,
     literals: tuple[str, ...],
     truncated: bool,
-    said: str,
+    said: str | None,
     bound: bool,
 ) -> tuple[MatchKind, int, int, tuple[str, ...]]:
     index = _skill_words(skill)
@@ -1148,7 +1160,7 @@ def _assess(
     # A placeholder skill is its own text only through the user's typed binding
     # (CDXINT54G C1): no request, or its bare name, never FITs it.
     placeholder = any(_PLACEHOLDER.search(t) for t in (skill.name, skill.summary))
-    own_text = bound if placeholder else said in _skill_said(skill) or bound
+    own_text = bound if placeholder else said is not None and said in _skill_said(skill)
     fit = (
         own_text
         and score >= FIT_MIN_SCORE
@@ -1277,7 +1289,9 @@ def match_skills(
     task = _TaskWords.build(task_words)
     cues = _CueText.read(folded)
     literals = _literals(task_text)
-    said = _said(task_text if request is None else request)
+    # Only the user's own typed text can be a skill's own text: no request, or
+    # a blank one, never FITs, even a placeholder-free skill (CDXINT54H M1).
+    said = _said(request) if request and request.strip() else None
 
     ranked: list[tuple[tuple, MatchCandidate]] = []
     stale: list[tuple[tuple, MatchCandidate]] = []

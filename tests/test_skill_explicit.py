@@ -162,7 +162,11 @@ class ExplicitMatchesImplicitTests(_Explicit):
                     self.assertEqual(explicit, implicit)
 
     def test_same_missing_inputs_question_as_implicit(self) -> None:
-        self.save()
+        # A placeholder-free text the bare name equals fits with no value
+        # bound (CDXINT54H M1), so the core asks for the missing input.
+        made = replace(named_draft(NAME), summary=NAME)
+        self.store.add_draft(made)
+        self.store.approve_draft(made.draft_id, project_id=None)
         # The request names the skill and carries no value: the shared
         # fixture's target (a path, 49b2c59) would be bound as the input.
         named = replace(user_task(), objective=NAME)

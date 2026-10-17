@@ -6431,9 +6431,9 @@ class AgentCore:
         except Exception:  # noqa: BLE001 - matching is advice; fail closed to no skill
             return None
         if result.kind is MatchKind.FIT and result.best is not None:
-            # A fit runs on the spans the user typed, never the model's values;
-            # a caller with no typed request keeps the stripped-value binding.
-            inputs = None if request is None else dict(result.best.inputs)
+            # A fit runs on the spans the user typed only, never re-derived from
+            # the model's objective or target; none bound binds nothing (CDXINT54H M1).
+            inputs = dict(result.best.inputs)
             return self._skill_delegate(session, task, result.best.skill, inputs)
         if stale is not None:
             task.preferences[_SKILL_RUN_KEY] = {**self._skill_ident(stale), "state": "stale"}

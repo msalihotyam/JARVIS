@@ -233,7 +233,7 @@ def probe_kind(skill_text: str, request: str) -> MatchKind:
         "steps": [{"action": skill_text, "capability": "file_read", "inputs": []}],
     }
     entry = SkillWithState(skill=build_skill(raw), status=SkillStatus.ACTIVE, health=NO_HEALTH)
-    return match_skills(request, (entry,), None).kind
+    return match_skills(request, (entry,), None, request=request).kind
 
 
 class ReviewProbeTest(unittest.TestCase):
