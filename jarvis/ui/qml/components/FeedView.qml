@@ -537,6 +537,10 @@ Item {
                                     selectByMouse: true
                                     // A selection survives the click on "Quote".
                                     persistentSelection: row.conversational
+                                    // Tab reaches a message and shows its meta line; a screen
+                                    // reader hears the time even while the line is hidden.
+                                    activeFocusOnTab: true
+                                    Accessible.description: telemetry.line ? modelData.time + " · " + telemetry.line : modelData.time
                                     wrapMode: Text.Wrap
                                     objectName: "feedMessage_" + row.kind
                                     color: row.kind === "system" ? Theme.textMuted : Theme.text
@@ -840,45 +844,56 @@ Item {
                             }
                         }
                     }
-                    // The time, beneath the turn: at the right under the operator's
-                    // bubble, at the left under JARVIS; a soft outline keeps it
-                    // legible over the planet's bright horizon.
-                    Text {
-                        id: stamp
-                        objectName: "feedStamp"
-                        readonly property int gap: 5
-                        x: row.isUser ? row.width - width - 6 : card.x + (row.isJarvis ? 18 : 0)
-                        y: card.height + gap
-                        text: modelData.time; color: Theme.textMuted
-                        renderType: Theme.textRender
-                        font: Theme.chatMeta
-                        lineHeightMode: Text.FixedHeight; lineHeight: 18
+                    // The meta line (time, telemetry, actions): one rule for every kind -
+                    // hidden until the pointer is over the message, it has keyboard focus
+                    // or a selection, or an action is confirming. Opacity only, so its
+                    // space stays reserved and nothing jumps when it appears.
+                    readonly property bool metaShown: rowHover.hovered || message.activeFocus || message.selectedText.length > 0
+                                                      || copyAction.confirming || rememberNote.visible
+                    HoverHandler { id: rowHover }
+                    Item {
+                        objectName: "feedMeta"
+                        width: row.width; height: row.height
+                        opacity: row.metaShown ? 1 : 0
+                        Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
+                        // The time, beneath the turn: at the right under the operator's
+                        // bubble, at the left under JARVIS.
+                        Text {
+                            id: stamp
+                            objectName: "feedStamp"
+                            readonly property int gap: 5
+                            x: row.isUser ? row.width - width - 6 : card.x + (row.isJarvis ? 18 : 0)
+                            y: card.height + gap
+                            text: modelData.time; color: Theme.textMuted
+                            renderType: Theme.textRender
+                            font: Theme.chatMeta
+                            lineHeightMode: Text.FixedHeight; lineHeight: 18
+                        }
+                        // What a finished answer or task result took: beside its time, quieter
+                        // still, and never on the person's own message.
+                        Text {
+                            id: telemetry
+                            objectName: "feedTelemetry"
+                            readonly property string line: row.isUser ? "" : feed.telemetryLine(modelData.telemetry, typeof i18n !== "undefined" ? i18n.qtLocale : "en_US")
+                            visible: line !== ""
+                            x: stamp.x + stamp.width + 14; y: stamp.y
+                            text: line
+                            color: Theme.textMuted
+                            renderType: Theme.textRender
+                            font: stamp.font
+                            lineHeightMode: Text.FixedHeight; lineHeight: 18
+                            Text { anchors.right: parent.left; anchors.rightMargin: 5; text: "·"; color: parent.color
+                                   renderType: Theme.textRender; font: parent.font; lineHeightMode: Text.FixedHeight; lineHeight: 18 }
+                        }
                     }
-                    // What a finished answer or task result took: beside its time, quieter
-                    // still, and never on the person's own message.
-                    Text {
-                        id: telemetry
-                        objectName: "feedTelemetry"
-                        readonly property string line: row.isUser ? "" : feed.telemetryLine(modelData.telemetry, typeof i18n !== "undefined" ? i18n.qtLocale : "en_US")
-                        visible: line !== ""
-                        x: stamp.x + stamp.width + 14; y: stamp.y
-                        text: line
-                        color: Theme.textMuted
-                        renderType: Theme.textRender
-                        font: stamp.font
-                        lineHeightMode: Text.FixedHeight; lineHeight: 18
-                        Text { anchors.right: parent.left; anchors.rightMargin: 5; text: "·"; color: parent.color
-                               renderType: Theme.textRender; font: parent.font; lineHeightMode: Text.FixedHeight; lineHeight: 18 }
-                    }
-                    // Copy / Quote, hidden until hover: only on what the person wrote
-                    // and on General Chat replies or a clarification question - never on
-                    // cards, notices, errors, external data or task results.
+                    // Copy / Quote: only on what the person wrote and on General Chat
+                    // replies or a clarification question - never on cards, notices,
+                    // errors, external data or task results.
                     readonly property bool conversational: row.isUser || modelData.chat === true || row.kind === "clarify"
-                    HoverHandler { id: rowHover; enabled: row.conversational }
                     Row {
                         objectName: "messageActions_" + index
                         visible: row.conversational
-                        opacity: rowHover.hovered || message.selectedText.length > 0 || copyAction.confirming || rememberNote.visible ? 1 : 0
+                        opacity: row.metaShown ? 1 : 0
                         Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
                         spacing: 14
                         y: stamp.y
@@ -949,6 +964,7 @@ Item {
                 TextEdit {
                     id: streamText
                     objectName: "streamingReplyText"
+                    activeFocusOnTab: true
                     visible: streamRow.streaming
                     x: feed.messageX; y: streamName.y + streamName.height + 4
                     width: Math.min(streamRow.width - feed.messageX, 760)
@@ -1035,9 +1051,12 @@ Item {
                     }
                 }
                 HoverHandler { id: streamHover }
+                // The same rule as a finished message's meta line.
                 Row {
+                    objectName: "streamActions"
                     visible: streamRow.streaming
-                    opacity: streamHover.hovered || streamCopy.confirming ? 1 : 0
+                    opacity: streamHover.hovered || streamText.activeFocus || streamText.selectedText.length > 0 || streamCopy.confirming ? 1 : 0
+                    Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
                     spacing: 14
                     anchors.verticalCenter: liveStatus.verticalCenter
                     x: liveStatus.x + liveStatus.width + 18
