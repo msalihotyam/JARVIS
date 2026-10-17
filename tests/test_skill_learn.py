@@ -78,7 +78,7 @@ def skill_draft() -> SkillDraft:
     return SkillDraft(
         draft_id=f"draft-{1:032x}",
         name="Haftalik rapor dosyasini oku",
-        summary="Haftalik rapor dosyasini oku",
+        summary="Haftalik rapor dosyasini oku:",  # the task text with its value stripped
         scope=GLOBAL,
         inputs=(SkillInput(name="path", description="", required=True),),
         steps=(

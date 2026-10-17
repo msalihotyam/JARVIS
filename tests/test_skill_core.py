@@ -92,7 +92,7 @@ def draft(number: int = 1, scope: SkillScope = GLOBAL) -> SkillDraft:
     return SkillDraft(
         draft_id=f"draft-{number:032x}",
         name="Haftalik rapor dosyasini oku",
-        summary="Haftalik rapor dosyasini oku",
+        summary="Haftalik rapor dosyasini oku:",  # the task text with its value stripped
         scope=scope,
         inputs=(SkillInput(name="path", description="", required=True),),
         steps=(

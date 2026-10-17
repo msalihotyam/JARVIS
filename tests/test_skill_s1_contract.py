@@ -1109,14 +1109,15 @@ class InvisibleTextContractTests(unittest.TestCase):
 
 class DraftMatchContractTests(unittest.TestCase):
     """D18: a skill SKDRAFT drafts from a run with an e-mail, a URL and a path
-    is a SKMATCH fit for the same task with those values removed (SKCORE's
-    job): the "{name}" placeholders are not words of the skill."""
+    is SIMILAR (asked, never auto-run) for the same task with those values
+    removed (SKCORE's job): a stored task with placeholders never FITs by text
+    (Salih 2026-10-17 "Birebir aynıysa")."""
 
     EMAIL = "ali.veli@example.com"
     URL = "https://example.com/rapor?id=7"
     PATH = "C:/notlar/a.txt"
 
-    def test_a_drafted_skill_fits_the_task_without_its_values(self):
+    def test_a_drafted_skill_is_asked_for_the_task_without_its_values(self):
         task = (
             f"Haftalik raporu {self.PATH} dosyasindan oku, {self.URL} adresine yukle "
             f"ve linki {self.EMAIL} adresine gonder"
@@ -1147,7 +1148,7 @@ class DraftMatchContractTests(unittest.TestCase):
                     skill=skill, status=status(history), health=health(history)
                 )
                 result = match_skills(stripped, [entry], project_id)
-                self.assertIs(result.kind, MatchKind.FIT, result)
+                self.assertIs(result.kind, MatchKind.SIMILAR, result)
                 self.assertEqual(result.best.skill, skill)
                 self.assertEqual(result.best.coverage, 100)
 

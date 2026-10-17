@@ -685,32 +685,27 @@ def _without_placeholders(text: str) -> str:
     return _PLACEHOLDER.sub(" ", text)
 
 
-# Identity keeps what names an object: the text split on whitespace runs, a
-# quoted span one token with its inner whitespace as typed, every non-space
-# symbol and every accent kept except a Turkish letter's own mark (c/s
-# cedilla, g breve, o/u diaeresis, a/i/u circumflex), which folds away as in
-# ``fold_token``. Literals are tokens, so their order is compared too.
-_SAID_TOKEN = re.compile("(?:" + _QUOTED.pattern + "|" + chr(0x5C) + "S)+")
-_LONE_PLACEHOLDER = re.compile("(?<!" + chr(0x5C) + "S)" + _PLACEHOLDER.pattern + "(?!" + chr(0x5C) + "S)")
-# A colon ending a line labels a value the caller already stripped
-# ("oku: notes/week.md" -> "oku:"); it names nothing, so it is not said.
-_BARE_LABEL = re.compile(":(?=[ \t]*(?:\n|" + chr(0x5C) + "Z))")
-
-
-def _said(text: str, *, stored: bool = False) -> tuple[str, ...] | None:
-    """A text's identity-folded whitespace tokens in order; placeholders are
-    removed from a stored skill text only, never from a request. A stored text
-    with a placeholder inside a word has no identity (None): no request equals it."""
-    if stored:
-        text = _LONE_PLACEHOLDER.sub(" ", text)
-        if _PLACEHOLDER.search(text):
+def _said(text: str, *, stored: bool = False) -> str | None:
+    """A text's identity: the whole stripped string through
+    ``fold_token(identity=True)`` (case, NFC/NFD, Turkish I/i only). Every
+    other difference - punctuation, quote, symbol, order, inner whitespace,
+    a word more or less - is a different text, so a request FITs only when it
+    is the skill's own text (Salih, 2026-10-17 "Birebir aynıysa"). A stored
+    text with any placeholder has no identity (None): no request equals it.
+    Nor has a text with a mark stacked on a marked letter (the Turkish fold
+    would drop it, so it would vanish)."""
+    if stored and _PLACEHOLDER.search(text):
+        return None
+    for prev, char in zip(text, text[1:]):
+        if unicodedata.combining(char) and (
+            unicodedata.combining(prev) or unicodedata.decomposition(prev)[:1] not in ("", "<")
+        ):
             return None
-    text = _BARE_LABEL.sub("", text)
-    return tuple(m.group(0) for m in _SAID_TOKEN.finditer(fold_token(text, identity=True)))
+    return fold_token(text.strip(), identity=True)
 
 
 @lru_cache(maxsize=CACHE_MAX)
-def _skill_said(skill: Skill) -> frozenset[tuple[str, ...]]:
+def _skill_said(skill: Skill) -> frozenset[str]:
     """The skill's own texts a near-identical request must equal: name and summary."""
     said = {_said(skill.name, stored=True), _said(skill.summary, stored=True)}
     return frozenset(said - {None})
@@ -1058,7 +1053,7 @@ def _assess(
     request: _CueText,
     literals: tuple[str, ...],
     truncated: bool,
-    said: tuple[str, ...],
+    said: str,
 ) -> tuple[MatchKind, int, int, tuple[str, ...]]:
     index = _skill_words(skill)
     body_hits = task.hits(index.body)

@@ -484,11 +484,66 @@ class ReviewProbeTest(unittest.TestCase):
             with self.subTest(request=request):
                 self.assertIsNot(probe_kind(skill_text, request), MatchKind.FIT)
 
-    def test_whitespace_runs_and_unicode_forms_still_fit(self) -> None:
+    # SKSIMASK4 (Salih, 2026-10-17 "Birebir aynıysa"): only a request that is
+    # the skill's own whole text, up to case and Unicode form, fits; CDXINT54E
+    # F1/F2, CDXINT54D M1-M5 and CDXINT54C A1 are asked about both ways.
+    SAID = (
+        ("Delete file C:", "Delete file C"),
+        ("Set label x'alpha beta'", "Set label x'alpha  beta'"),
+        ("Delete file .env", "Delete  file .env"),
+        ("Read file report", "Read file report:"),
+        ("Delete file .env", "Delete file env"),
+        ("Delete file alpha+beta", "Delete file alpha=beta"),
+        ("Set amount .5", "Set amount 5"),
+        ("Set range -5 to +5", "Set range +5 to -5"),
+        ("Copy file alpha/beta to alpha@beta", "Copy file alpha@beta to alpha/beta"),
+        ('Set label "alpha beta"', 'Set label "alpha  beta"'),
+        ("Delete file alpha-beta", "Delete file alpha_beta"),
+        ("Read file résumé.txt", "Read file resume.txt"),
+    )
+    # SKSIMASK4 F2: twenty non-case differences that try to fit; all ask.
+    PROBE = (
+        ("Delete file report", "Delete file report:"),
+        ("Delete file report", "Delete file report."),
+        ("Delete file report", "Delete file  report"),
+        ("Delete file report", "Delete\tfile report"),
+        ("Delete file report", "Delete file" + chr(0xA0) + "report"),
+        ("Delete file report", "Delete file rep" + chr(0x200B) + "ort"),
+        ("Delete file report", "Delete file 'report'"),
+        ("Delete file report", "Delete file " + chr(0x201C) + "report" + chr(0x201D)),
+        ("Delete file report", "Delete file report!"),
+        ("Delete file report", "Delete file r" + chr(0x435) + "port"),
+        ("Delete file report", "Delete file " + chr(0xFF52) + "eport"),
+        ("Delete file report", "Delete report file"),
+        ("Delete file report", "Delete file report now"),
+        ("Delete file report", "Delete report"),
+        ("Set amount 5", "Set amount " + chr(0x2212) + "5"),
+        ("Set amount 5", "Set amount +5"),
+        ("Set amount 5", "Set amount 5%"),
+        ("Delete file C:", "Delete file C:/"),
+        ("Read file {name}", "Read file {name}"),
+        ("Read file {name}", "Read file report"),
+        # A stored text holds no tab or newline, so these go one way only.
+        ("Delete file .env", "Delete  file\t.env"),
+        ("Read file report", "Read file report:  \n "),
+        # A stacked Turkish mark the fold would drop.
+        ("arşiv klasörüne kopyala", "arşiv klasö̈rüne kopyala"),
+        ("arşiv klasörüne kopyala", "arş̧iv klasörüne kopyala"),
+    )
+
+    def test_any_non_case_difference_is_asked_about(self) -> None:
+        for skill_text, request in self.SAID:
+            for pair in ((skill_text, request), (request, skill_text)):
+                with self.subTest(pair=pair):
+                    self.assertIs(probe_kind(*pair), MatchKind.SIMILAR)
+        for pair in self.PROBE:
+            with self.subTest(pair=pair):
+                self.assertIs(probe_kind(*pair), MatchKind.SIMILAR)
+
+    def test_unicode_forms_still_fit(self) -> None:
         for skill_text, request in (
-            ("Delete file .env", "Delete  file\t.env"),
             ("Set range -5 to +5", "Set range -5 to +5"),
-            ("Read file report", "Read file report:  \n "),
+            ("Read file report", "  Read file report \n "),
             ('Set label "alpha  beta"', 'Set label "alpha  beta"'),
             ("Read file aq" + chr(0x301), "Read file aq" + chr(0x301)),
             ("Read file " + chr(0xE9), "Read file e" + chr(0x301)),

@@ -636,14 +636,14 @@ class PlaceholderTests(unittest.TestCase):
     )
     TABLE = (
         # (skill, task, kind, score, coverage, headline words)
-        # SKSIMASK: a fit is the text without its placeholders; less or other
-        # words are similar.
+        # SKSIMASK4: a stored text with a placeholder never fits by text
+        # (Salih, 2026-10-17 "Birebir aynıysa"); it is asked about.
         (INVOICE, "faturayi gonder", MatchKind.SIMILAR, 100, 66, {"faturayi", "adresine", "gonder"}),
-        (INVOICE, "faturayi adresine gonder", MatchKind.FIT, 100, 100, {"faturayi", "adresine", "gonder"}),
+        (INVOICE, "faturayi adresine gonder", MatchKind.SIMILAR, 100, 100, {"faturayi", "adresine", "gonder"}),
         # SKSIMASK: "pdf" is a value Core strips before matching (D18); left
         # in, it is an unbound word, so only similar.
         (DOWNLOAD, "download and save it", MatchKind.SIMILAR, 100, 100, {"download", "save"}),
-        (DOWNLOAD, "download and save as", MatchKind.FIT, 100, 100, {"download", "save"}),
+        (DOWNLOAD, "download and save as", MatchKind.SIMILAR, 100, 100, {"download", "save"}),
         (DOWNLOAD, "download the pdf and save it", MatchKind.SIMILAR, 66, 100, {"download", "save"}),
     )
 

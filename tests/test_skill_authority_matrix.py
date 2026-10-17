@@ -79,7 +79,7 @@ CLAIMS = (
 )
 
 
-def draft(summary: str = "Haftalik rapor dosyasini oku", suffix: str = "") -> SkillDraft:
+def draft(summary: str = "Haftalik rapor dosyasini oku:", suffix: str = "") -> SkillDraft:
     return SkillDraft(
         draft_id=f"draft-{1:032x}",
         name="Haftalik rapor dosyasini oku",
