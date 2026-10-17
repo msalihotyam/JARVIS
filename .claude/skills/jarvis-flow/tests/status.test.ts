@@ -31,7 +31,7 @@ test('pure: the fingerprint ignores only the timestamp', { timeoutMs: 60000 }, a
 })
 
 test('pure: report extraction and lane safety', { timeoutMs: 60000 }, async () => {
-  expect(extractReport('text\nSTATUS: PASS\nmore')).toBe('text\nSTATUS: PASS\nmore')
+  expect(extractReport('text\nSTATUS: PASS\nmore')).toBe('STATUS: PASS\nmore')
   expect(extractReport('STATUS: PASS')).toBe('STATUS: PASS')
   expect(extractReport('no status here\n  STATUS: indented')).toBeNull()
   expect(extractReport('')).toBeNull()
@@ -104,7 +104,7 @@ test('a final report is captured to build/reports/<lane>.md', { timeoutMs: 60000
   const report = 'work done\nSTATUS: PASS\nCOMMIT: abc'
   await $.turn.start({ text: 'x', turnId: 't1' })
   await $.turn.complete(done('t1', report))
-  expect(w.files.get('/repo/build/reports/SB1.md')).toBe(report)
+  expect(w.files.get('/repo/build/reports/SB1.md')).toBe('STATUS: PASS\nCOMMIT: abc')
 })
 
 test('a turn without a STATUS line, or without a lane, writes no report', { timeoutMs: 60000 }, async ($, on) => {
@@ -121,10 +121,13 @@ test('an existing report is kept as a timestamped copy before it is replaced', {
   const w = world(on)
   put(w, '/repo/build/reports/SB1.md', 'STATUS: FAIL\nold')
   await startSession($)
+  // the old report was written before this turn started
+  await w.clock.set(60000)
   await userPrompt($, header('SB1') + '\nbody')
+  await $.turn.start({ text: 'x', turnId: 't1' })
   await $.turn.complete(done('t1', 'STATUS: PASS\nnew'))
   expect(w.files.get('/repo/build/reports/SB1.md')).toBe('STATUS: PASS\nnew')
-  expect(w.files.get('/repo/build/reports/SB1.19700101-000000.md')).toBe('STATUS: FAIL\nold')
+  expect(w.files.get('/repo/build/reports/SB1.19700101-000100.md')).toBe('STATUS: FAIL\nold')
 })
 
 test('a report identical to the one on disk changes nothing', { timeoutMs: 60000 }, async ($, on) => {

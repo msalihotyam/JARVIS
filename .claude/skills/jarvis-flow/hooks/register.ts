@@ -16,12 +16,14 @@ import {
 } from './lib/inbox.ts'
 import { BATTERY_ARGV, gate, isFreshWorking, parseBattery, type Gate, type Power } from './lib/power.ts'
 import { canonicalRootOf, fingerprint, stateOf, worktreeOf, type LastAuto, type Status } from './lib/status.ts'
-import { extractReport, safeLane } from './lib/report.ts'
+import { extractReport, isFreshReport, reportDirs, safeLane } from './lib/report.ts'
 import { conveyorOf, renderBand, type BandState, type Conveyor } from './lib/band.ts'
 import {
   BEAT_MS,
   CAS_ARGV,
+  HOLDER_PID_ARGV,
   HOLD_MAX_MS,
+  PID_ALIVE_ARGV,
   POLL_SECONDS,
   PY_COUNT_ARGV,
   SLEEP_ARGV,
@@ -100,6 +102,8 @@ const usedKeys = new Set<string>()
 let tickTimer: { cancel: () => void } | null = null
 let powerTimer: { cancel: () => void } | null = null
 let reportLane: string | null = null
+// when this session's current main-loop turn started (null = no turn.start seen)
+let turnStartMs: number | null = null
 // wave 2
 let sessionId = ''
 let sevenPct: number | null = null
@@ -230,6 +234,29 @@ async function writeStatus($: any): Promise<void> {
   if (print === lastWritten) return
   await $.fs.write(root + '/build/lanes/' + famName + '.json', JSON.stringify(status, null, 2) + '\n')
   lastWritten = print
+}
+
+// The lane wrote <lane>.md itself during this turn (canonical or its own checkout):
+// then the chat answer is never captured over it. No turn start seen = treat any
+// STATUS file as fresh (never overwrite what may be the lane's own report).
+async function laneWroteReport($: any, name: string): Promise<boolean> {
+  let live = cwd
+  try {
+    live = (await $.session.cwd()).replace(/\\/g, '/')
+  } catch {
+    // keep the session-start cwd
+  }
+  for (const dir of reportDirs(root, live)) {
+    const path = dir + '/' + name + '.md'
+    try {
+      if (!(await $.fs.exists(path))) continue
+      const st = await $.fs.stat(path)
+      if (isFreshReport(await $.fs.read(path), st.mtimeMs, turnStartMs ?? 0)) return true
+    } catch {
+      // unreadable: not a report the lane wrote
+    }
+  }
+  return false
 }
 
 function lintContext(mainSha: string | null): LintContext {
@@ -537,6 +564,32 @@ async function casLock($: any, expect: string | null | { stale: number }, next: 
   return out.exitCode === 0
 }
 
+// This session's Claude Code pid for the lock record (looked up once; null = not found, no pid recorded).
+let holderPid: number | null | undefined
+async function myPid($: any): Promise<number | null> {
+  if (holderPid === undefined) {
+    const out = await runCmd($, HOLDER_PID_ARGV, undefined, 15000)
+    const n = out.exitCode === 0 ? toCount(out.stdout) : null
+    holderPid = n !== null && n > 0 ? n : null
+  }
+  return holderPid
+}
+
+// Only a clear 'dead' counts: an error leaves the holder alive (the heartbeat rule still applies).
+async function pidDead($: any, pid: number | undefined): Promise<boolean> {
+  if (pid === undefined) return false
+  const out = await runCmd($, PID_ALIVE_ARGV, { JF_PID: String(pid) }, 15000)
+  return out.exitCode === 0 && out.stdout.trim() === 'dead'
+}
+
+// Runner processes under the lock record's holder pid (all of them when the pid is unknown).
+async function suiteRunning($: any, raw: string | null): Promise<number | null> {
+  const rec = raw === null ? null : parseLock(raw)
+  const pid = rec?.pid ?? (await myPid($))
+  const out = await runCmd($, SUITE_RUNNING_ARGV, pid === null ? undefined : { JF_PID: String(pid) }, 20000)
+  return out.exitCode === 0 ? toCount(out.stdout) : null
+}
+
 async function pyCount($: any): Promise<number | null> {
   const out = await runCmd($, PY_COUNT_ARGV, undefined, 15000)
   return out.exitCode === 0 ? toCount(out.stdout) : null
@@ -563,14 +616,16 @@ function attempt($: any, tc: TestCommand, command: string): Promise<Attempt> {
     const now = await $.clock.now()
     const read = await readLock($)
     if (read === 'busy') return { kind: 'busy' }
-    const st: LockState = lockState(read, now, sessionId)
+    let st: LockState = lockState(read, now, sessionId)
+    // a holder whose Claude Code process is gone is stale at once, not after 45 min
+    if (st.state === 'held' && (await pidDead($, st.rec.pid))) st = lockState(read, now, sessionId, true)
     if (st.state === 'mine') {
       if (!tc.lock) return { kind: 'go', acquired: false }
       if (held.holds > 0) {
         return { kind: 'deny', text: "jarvis-flow suite queue: this session's own full suite is still running. Wait for it to finish before starting another." }
       }
       // the lock is ours from before a reload of this mod, or a release that did not finish: take it again
-      const fresh = newLock(laneLabel(), sessionId, command, now, st.rec.started_at)
+      const fresh = newLock(laneLabel(), sessionId, command, now, st.rec.started_at, await myPid($))
       if (!(await casLock($, read as string, fresh))) return { kind: 'lost' }
       held.raw = fresh
       held.startedAt = st.rec.started_at
@@ -580,7 +635,7 @@ function attempt($: any, tc: TestCommand, command: string): Promise<Attempt> {
     }
     if (st.state === 'held') return { kind: 'held', lane: plain(st.rec.lane), minutes: minutesSince(st.rec.started_at, now) }
     if (!tc.lock) return { kind: 'go', acquired: false }
-    const stamp = newLock(laneLabel(), sessionId, command, now)
+    const stamp = newLock(laneLabel(), sessionId, command, now, undefined, await myPid($))
     const expect = st.state === 'free' ? (read === null ? null : '') : { stale: now }
     if (!(await casLock($, expect, stamp))) return { kind: 'lost' }
     held.holds = 1
@@ -592,7 +647,7 @@ function attempt($: any, tc: TestCommand, command: string): Promise<Attempt> {
 }
 
 // Decides whether a test command may start. A full suite takes the lock (or waits for
-// it, up to 40 min); a UI-loading unittest run only waits while another session holds
+// it, up to 50 min); a UI-loading run only waits while another session holds
 // it. The holder's own runs are never held (a second full suite of its own is refused).
 async function gateSuite($: any, tc: TestCommand, command: string, signal: any): Promise<SuiteGate> {
   const t0 = await $.clock.now()
@@ -611,7 +666,7 @@ async function gateSuite($: any, tc: TestCommand, command: string, signal: any):
       return { deny: r.text, acquired: false, otherHeld }
     }
     if (r.kind === 'busy') {
-      // an unreadable lock file (a directory, a permission): do not make the model wait 40 min for it
+      // an unreadable lock file (a directory, a permission): do not make the model wait 50 min for it
       busySince = busySince ?? now
       if (now - busySince >= BUSY_DENY_MS) {
         suiteWaiting.on = null
@@ -635,7 +690,7 @@ async function gateSuite($: any, tc: TestCommand, command: string, signal: any):
         return {
           deny:
             "jarvis-flow suite queue: lane '" + r.lane + "' has held the full-suite lock for " + r.minutes + ' min and this command waited ' + Math.round(waited / 60000) +
-            ' min for it. Do not start another suite now: wait (for example sleep 300), then retry the same command. A lock with no heartbeat for 45 min is taken over automatically (build/locks/suite.json).',
+            ' min for it: rerun the same command in the foreground (that call waits for the lock again). A lock whose holder process is gone, or with no heartbeat for 45 min, is taken over automatically (build/locks/suite.json).',
           acquired: false,
           otherHeld,
         }
@@ -690,8 +745,7 @@ function adoptOrFree($: any): Promise<void> {
     const read = await readLock($)
     const rec = typeof read === 'string' ? parseLock(read) : null
     if (typeof read === 'string' && rec !== null && rec.session === plain(sessionId, 80)) {
-      const out = await runCmd($, SUITE_RUNNING_ARGV, undefined, 20000)
-      if (out.exitCode === 0 && (toCount(out.stdout) ?? 0) > 0) {
+      if (((await suiteRunning($, read)) ?? 0) > 0) {
         const now = await $.clock.now()
         held.holds = 1
         held.raw = read
@@ -732,7 +786,7 @@ function beatSuite($: any): Promise<boolean> {
     if (now - held.lastBeat < BEAT_MS) return true
     const started = held.raw
     const old = parseLock(started)
-    const next = newLock(laneLabel(), sessionId, old ? old.command : '', now, held.startedAt ?? undefined)
+    const next = newLock(laneLabel(), sessionId, old ? old.command : '', now, held.startedAt ?? undefined, old?.pid ?? (await myPid($)))
     if (await casLock($, started, next)) {
       held.raw = next
       held.lastBeat = now
@@ -763,8 +817,7 @@ async function watchBackground($: any): Promise<void> {
   const now = await $.clock.now()
   if (now - bg.since < 30000 || now - bg.lastPoll < 30000) return
   bg.lastPoll = now
-  const out = await runCmd($, SUITE_RUNNING_ARGV, undefined, 20000)
-  const n = out.exitCode === 0 ? toCount(out.stdout) : null
+  const n = await suiteRunning($, held.raw)
   if (n === null) return
   bg.zero = n === 0 ? bg.zero + 1 : 0
   if (bg.zero >= 2) await releaseSuite($, true)
@@ -1041,6 +1094,13 @@ export function register(on: any) {
 
   on('turn.start', async ($: any, e: any, next: any) => {
     if (active) {
+      if (e.agentId === undefined) {
+        try {
+          turnStartMs = await $.clock.now()
+        } catch {
+          turnStartMs = null
+        }
+      }
       busy = true
       startingSince = null
       turnRec = null
@@ -1150,7 +1210,7 @@ export function register(on: any) {
       try {
         const report = extractReport(e.answer)
         const name = safeLane(reportLane)
-        if (report !== null && name !== null) {
+        if (report !== null && name !== null && !(await laneWroteReport($, name))) {
           const path = root + '/build/reports/' + name + '.md'
           if (await $.fs.exists(path)) {
             const old = await $.fs.read(path)

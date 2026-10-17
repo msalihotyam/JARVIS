@@ -56,29 +56,16 @@ that same unpushed commit (say so on the first report line).
 
 ## 5. Report (at most 15 lines, plain text)
 
-```
-STATUS: PASS | BLOCKED
-TIERS: risk T0|T1|T2; test tier run
-COMMIT: <hash> <subject>   (BLOCKED: what is uncommitted)
-FILES: <paths>
-RUNS: <command: real counts, duration> per run
-REVIEW: <subagent verdict PASS | findings and what was done> (T0/T1)
-SHOTS: <screenshot paths> or none
-GIT STATUS --SHORT: <output>
-PUSHED: no
-OPEN ISSUES: <none | list>
-```
+Write the report file yourself (path: LANE_RULES C7 / your prompt). Its first
+line is STATUS: <WORD>; no fence, no title. In the chat print only
+'Report: build/reports/<slice-id>.md'.
+
+Its lines, in this order: `STATUS: PASS | BLOCKED`, `TIERS: risk T0|T1|T2;
+test tier run`, `COMMIT: <hash> <subject>` (BLOCKED: what is uncommitted),
+`FILES: <paths>`, `RUNS: <command: real counts, duration>` per run,
+`REVIEW: <subagent verdict PASS | findings and what was done>` (T0/T1),
+`SHOTS: <screenshot paths> or none`, `GIT STATUS --SHORT: <output>`,
+`PUSHED: no`, `OPEN ISSUES: <none | list>`.
 
 Real counts and durations only. A queue slice also writes the same text to
 its `NN-<slug>.report.md` (`jarvis-queue`).
-Every lane also writes the full report, exactly as reported, to
-`build/reports/<slice-id>.md` (gitignored; create the folder if missing) and
-still prints it in the chat, so Salih can just say "<slice-id> bitti".
-
-A prompt starts with the `@jarvis lane=<slice-id> model=<opus|sonnet|haiku>
-effort=<medium|high|xhigh> base=<sha|main>` header (RUNBOOK "Mods (jarvis-flow)").
-The jarvis-flow mod lints it, shows the lane band and the status file, and
-captures the final report: a turn whose last text has a line starting
-`STATUS:` is written to `build/reports/<lane>.md` by the mod, so the lane
-need not write it twice; the report block itself must still start its lines
-with `STATUS:`.

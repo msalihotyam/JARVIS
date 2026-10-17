@@ -38,6 +38,12 @@ export type World = {
   mainHead: string
   head: string
   baseIsAncestor: boolean
+  // this session's Claude Code pid as the holder-pid lookup reports it (null = not found)
+  holderPid: number | null
+  // pids the alive check reports dead
+  deadPids: Set<number>
+  // JF_PID of each runner-process count ('' = none passed)
+  suitePidArgs: string[]
   model: string
   // make session.model fail, to prove the lint is fail-open
   breakModel: boolean
@@ -88,6 +94,9 @@ export function world(on: any, opts: WorldOptions = {}): World {
     mainHead: opts.mainHead ?? 'aaaaaaaaaaaa',
     head: opts.head ?? 'aaaaaaaaaaaa',
     baseIsAncestor: opts.baseIsAncestor ?? true,
+    holderPid: null,
+    deadPids: new Set(),
+    suitePidArgs: [],
     model: opts.model ?? SONNET,
     breakModel: false,
     failWrites: false,
@@ -215,7 +224,15 @@ export function world(on: any, opts: WorldOptions = {}): World {
         } else if (env.JF_MODE === 'stale') {
           if (!have) return { value: { exitCode: 4, stdout: '', stderr: '' } }
           // same rule as the PowerShell: replace unless it is a valid, fresh record
-          if (lockState(String(w.files.get(path)), Number(env.JF_NOW), '').state === 'held') return { value: { exitCode: 3, stdout: '', stderr: '' } }
+          const cur = String(w.files.get(path))
+          const pid = (() => {
+            try {
+              return Number(JSON.parse(cur).pid)
+            } catch {
+              return NaN
+            }
+          })()
+          if (lockState(cur, Number(env.JF_NOW), '', w.deadPids.has(pid)).state === 'held') return { value: { exitCode: 3, stdout: '', stderr: '' } }
         } else {
           if (!have || String(w.files.get(path)).trim() !== String(env.JF_EXPECT ?? '').trim()) return { value: { exitCode: 3, stdout: '', stderr: '' } }
         }
@@ -241,7 +258,12 @@ export function world(on: any, opts: WorldOptions = {}): World {
         })()
       }
       if (command.includes('JF_PYCOUNT')) return ok(String(w.pyProcs) + '\n')
-      if (command.includes('JF_SUITE_RUNNING')) return ok(String(w.suiteProcs) + '\n')
+      if (command.includes('JF_SUITE_RUNNING')) {
+        w.suitePidArgs.push(String(env.JF_PID ?? ''))
+        return ok(String(w.suiteProcs) + '\n')
+      }
+      if (command.includes('JF_HOLDER_PID')) return w.holderPid === null ? no() : ok(String(w.holderPid) + '\n')
+      if (command.includes('JF_PID_ALIVE')) return ok(w.deadPids.has(Number(env.JF_PID)) ? 'dead\n' : 'alive\n')
       if (command.includes('Move-Item')) {
         const from = norm(env.JF_SRC)
         const to = norm(env.JF_DST)

@@ -1,5 +1,5 @@
 import { expect, test } from 'claude-code/testing'
-import { classifyCommand, isGated, lockState, newLock, parseTestOutput, plain } from '../hooks/lib/suite.ts'
+import { HOLD_MAX_MS, STALE_LOCK_MS, classifyCommand, isGated, lockState, newLock, parseLock, parseTestOutput, plain } from '../hooks/lib/suite.ts'
 import { header, put, startSession, userPrompt, world } from './world.ts'
 
 const LOCK = '/repo/build/locks/suite.json'
@@ -20,7 +20,7 @@ test('pure: which commands are test runs', { timeoutMs: 60000 }, async () => {
   const k = (c: string) => classifyCommand(c)
   expect(k('python scripts\\test_parallel.py')).toMatchObject({ kind: 'full', lock: true })
   expect(k('python scripts/test_parallel.py --workers 4 2>&1 | tail -20')).toMatchObject({ kind: 'full', lock: true })
-  expect(k('cd /r && uv run python scripts/test_parallel.py tests.test_ui')).toMatchObject({ kind: 'full', lock: true })
+  expect(k('cd /r && uv run python scripts/test_parallel.py tests.test_ui')).toMatchObject({ kind: 'targeted', lock: false, ui: true, targets: ['tests.test_ui'] })
   expect(k('powershell -File scripts\\test.ps1 -Parallel')).toMatchObject({ kind: 'full', lock: true })
   expect(k('python -m unittest tests.test_intent')).toMatchObject({ kind: 'targeted', lock: false, ui: false })
   expect(k('python -m unittest tests.test_ui.Foo.test_bar')).toMatchObject({ kind: 'alone', ui: true, targets: ['tests.test_ui.Foo.test_bar'] })
@@ -31,7 +31,6 @@ test('pure: which commands are test runs', { timeoutMs: 60000 }, async () => {
   // ordinary spellings of the same run
   for (const c of [
     'PYTHONUTF8=1 python scripts/test_parallel.py',
-    'QT_QPA_PLATFORM=offscreen python scripts/test_parallel.py tests.test_ui',
     'timeout 3600 python scripts/test_parallel.py',
     'Start-Process python -ArgumentList scripts\\test_parallel.py -Wait',
     'Start-Job { python scripts\\test_parallel.py }',
@@ -40,6 +39,7 @@ test('pure: which commands are test runs', { timeoutMs: 60000 }, async () => {
     'cmd /c "python scripts\\test_parallel.py"',
   ]) expect(k(c), c).toMatchObject({ kind: 'full', lock: true })
   expect(k('QT_QPA_PLATFORM=offscreen python -m unittest tests.test_ui_shell')).toMatchObject({ ui: true })
+  expect(k('QT_QPA_PLATFORM=offscreen python scripts/test_parallel.py tests.test_ui')).toMatchObject({ kind: 'targeted', lock: false, ui: true })
   expect(k('git add scripts/test_parallel.py')).toBeNull()
   expect(k('grep -n unittest JARVIS_RUNBOOK.md')).toBeNull()
   expect(k('powershell -Command "Get-Content scripts\\test_parallel.py"')).toBeNull()
@@ -153,7 +153,7 @@ test('A1: a held lock holds the call, the band says who runs and for how long, t
   expect(w.files.get(LOCK)).toBe('')
 })
 
-test('A1: after 40 minutes the call is refused with a reason that says wait, then retry', { timeoutMs: 180000 }, async ($, on) => {
+test('A1: after 50 minutes (past the 45 min stale limit) the call is refused: rerun in the foreground, no sleep', { timeoutMs: 180000 }, async ($, on) => {
   const w = world(on)
   put(w, LOCK, theirs(0))
   await startSession($)
@@ -165,9 +165,9 @@ test('A1: after 40 minutes the call is refused with a reason that says wait, the
   const res = await $.tool.call(bash(FULL))
   expect(w.toolRuns).toEqual([])
   expect(res.deny).toContain("lane 'OTHER'")
-  expect(res.deny).toContain('wait')
-  expect(res.deny).toContain('retry')
-  expect(w.clock.now()).toBeGreaterThanOrEqual(40 * MIN)
+  expect(res.deny).toContain('rerun the same command in the foreground')
+  expect(res.deny).not.toMatch(/sleep|poll/i)
+  expect(w.clock.now()).toBeGreaterThanOrEqual(50 * MIN)
   // the other lane's lock was not touched
   expect(JSON.parse(w.files.get(LOCK) as string).session).toBe('sess-other')
 })
@@ -499,5 +499,90 @@ test('A1: a suite lock that is ours again after a release gets a fresh heartbeat
   put(w, LOCK, theirs(0, { session: 'sess-me' }))
   await $.tool.call(bash(FULL))
   expect(w.toolRuns).toEqual([FULL])
+  expect(w.files.get(LOCK)).toBe('')
+})
+
+test('pure: test_parallel with module targets is targeted; no target, --shard and --aggregate are the full suite', { timeoutMs: 60000 }, async () => {
+  const k = (c: string) => classifyCommand(c)
+  expect(k('python scripts/test_parallel.py tests.test_intent')).toMatchObject({ kind: 'targeted', lock: false, ui: false, targets: ['tests.test_intent'] })
+  expect(k('python scripts\\test_parallel.py tests.test_intent tests.test_ui_shell')).toMatchObject({ kind: 'targeted', lock: false, ui: true })
+  expect(k('python scripts/test_parallel.py --workers 4 --report r.json tests.test_a > o.log 2>&1')).toMatchObject({ kind: 'targeted', targets: ['tests.test_a'] })
+  expect(k('python scripts/test_parallel.py --workers 4')).toMatchObject({ kind: 'full', lock: true, ui: true })
+  expect(k('python scripts/test_parallel.py --shard 1/4 --report r.json')).toMatchObject({ kind: 'full', lock: true })
+  expect(k('python scripts/test_parallel.py --shard=2/4 tests.test_a')).toMatchObject({ kind: 'full', lock: true })
+  expect(k('python scripts/test_parallel.py --aggregate build/shards --shards 4')).toMatchObject({ kind: 'full', lock: true })
+  expect(k('powershell -File scripts\\test.ps1 tests.test_a')).toMatchObject({ kind: 'full', lock: true })
+  // a targeted non-UI run is not gated at all, a targeted UI run is (it waits while another session's suite runs)
+  expect(isGated(k('python scripts/test_parallel.py tests.test_intent'))).toBe(false)
+  expect(isGated(k('python scripts/test_parallel.py tests.test_ui'))).toBe(true)
+})
+
+test("A1: a targeted test_parallel run takes no lock and never waits behind another lane's suite", { timeoutMs: 60000 }, async ($, on) => {
+  const w = world(on)
+  put(w, LOCK, theirs(0))
+  await startSession($)
+  const cmd = 'python scripts/test_parallel.py tests.test_intent'
+  const res = await $.tool.call(bash(cmd))
+  expect(res.deny).toBeUndefined()
+  expect(w.sleeps).toBe(0)
+  expect(w.toolRuns).toEqual([cmd])
+  expect(JSON.parse(w.files.get(LOCK) as string).session).toBe('sess-other')
+})
+
+test('pure: the wait limit is longer than the stale limit; a holder pid is kept and a dead one is stale', { timeoutMs: 60000 }, async () => {
+  expect(HOLD_MAX_MS).toBeGreaterThan(STALE_LOCK_MS)
+  const now = 100 * MIN
+  const withPid = JSON.stringify({ ...JSON.parse(theirs(now - MIN)), pid: 4242 })
+  expect(parseLock(withPid)?.pid).toBe(4242)
+  expect(parseLock(JSON.stringify({ ...JSON.parse(theirs(now)), pid: 'x' }))?.pid).toBeUndefined()
+  expect(lockState(withPid, now, 's').state).toBe('held')
+  expect(lockState(withPid, now, 's', true).state).toBe('stale')
+  // no pid on record: only the heartbeat rule applies
+  expect(lockState(theirs(now - MIN), now, 's', true).state).toBe('held')
+  expect(JSON.parse(newLock('SB1', 's', 'x', now, undefined, 77)).pid).toBe(77)
+  expect('pid' in JSON.parse(newLock('SB1', 's', 'x', now, undefined, null))).toBe(false)
+})
+
+test('A1: a lock whose holder process is dead is taken over at once', { timeoutMs: 60000 }, async ($, on) => {
+  const w = world(on)
+  await startSession($)
+  await w.clock.set(60 * MIN)
+  put(w, LOCK, JSON.stringify({ ...JSON.parse(theirs(60 * MIN - MIN)), pid: 4242 }))
+  w.deadPids.add(4242)
+  const res = await $.tool.call(bash(FULL))
+  expect(res.deny).toBeUndefined()
+  expect(w.sleeps).toBe(0)
+  expect(w.toolRuns).toEqual([FULL])
+  expect(w.files.get(LOCK)).toBe('')
+})
+
+test('A1: a live holder pid keeps the lock held', { timeoutMs: 60000 }, async ($, on) => {
+  const w = world(on)
+  await startSession($)
+  await w.clock.set(60 * MIN)
+  put(w, LOCK, JSON.stringify({ ...JSON.parse(theirs(60 * MIN - MIN)), pid: 4242 }))
+  w.onSleep = (n) => {
+    if (n === 2) w.files.set(LOCK, '')
+  }
+  const res = await $.tool.call(bash(FULL))
+  expect(res.deny).toBeUndefined()
+  expect(w.sleeps).toBe(2)
+})
+
+test("A1: the lock records this session's pid and the background watch counts only that pid's runners", { timeoutMs: 120000 }, async ($, on) => {
+  const w = world(on)
+  w.holderPid = 777
+  await startSession($)
+  w.suiteProcs = 2
+  const res = await $.tool.call(bash(FULL, { run_in_background: true }))
+  expect(res.deny).toBeUndefined()
+  expect(JSON.parse(w.files.get(LOCK) as string)).toMatchObject({ session: 'sess-me', pid: 777 })
+  await w.clock.advance(2 * MIN)
+  // the heartbeat keeps the pid
+  expect(JSON.parse(w.files.get(LOCK) as string).pid).toBe(777)
+  expect(w.suitePidArgs.length).toBeGreaterThan(0)
+  expect(w.suitePidArgs.every((p) => p === '777')).toBe(true)
+  w.suiteProcs = 0
+  await w.clock.advance(62 * 1000)
   expect(w.files.get(LOCK)).toBe('')
 })
