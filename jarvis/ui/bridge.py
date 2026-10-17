@@ -177,7 +177,12 @@ def _draft_merged(base: dict | None, front: dict) -> dict[str, Any]:
 
 def _parks(slots: dict) -> bool:
     """OD1: kept for a conversation that is not open only while it needs the person or Resume."""
-    return _waiting(slots) or task_outcome(slots["task"]).get("kind") == "paused"
+    return (_waiting(slots) or task_outcome(slots["task"]).get("kind") == "paused"
+            or slots["task"].get("status") in _PAUSE_STATUSES)
+
+
+# DFPAUSE: a task the person paused (or that stops at its step boundary) waits for Resume.
+_PAUSE_STATUSES = ("paused", "pause_requested")
 
 
 def _proved_path(run: Any) -> str:
@@ -230,6 +235,8 @@ def _project_run(prior: dict, payload: Any, intent: Any = None) -> dict[str, Any
     # request missing its binding reads as unavailable, never as absent.
     slots["approval"] = approval_card(payload)
     slots["last_outcome"] = outcome_kind(payload, facts=_run_facts(prior["task"], payload, intent))
+    if slots["task"].get("status") in _PAUSE_STATUSES:
+        slots["last_outcome"] = "idle"      # DFPAUSE: nothing is asked of the person; Resume is on the card
     return slots
 
 
@@ -2863,6 +2870,11 @@ class Bridge(QObject):
         elif self._last_outcome == "completed" and self._task:
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Task %1 completed"),
                         (self._task_label(),)), "system")
+        elif self._task.get("status") == "paused":
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Task %1 paused"), (self._task_label(),)), "system")
+        elif self._task.get("status") == "pause_requested":
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Task %1 pausing: stops when this step ends"),
+                        (self._task_label(),)), "system")
         elif self._task:
             self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Task %1 %2"),
                         (self._task_label(), self._task.get("run_status"))), "system")
@@ -3145,6 +3157,20 @@ class Bridge(QObject):
     def taskLive(self) -> bool:
         return bool(self._session_id) and (self.openRunning or (
             bool(self._task.get("status")) and self._task.get("status") not in TERMINAL_STATUSES))
+
+    @Property(bool, notify=stateChanged)
+    def taskPaused(self) -> bool:
+        """DFPAUSE: the open conversation's task is paused; its card offers Resume and Cancel.
+        A pause_requested task nothing is driving (a lost claim, a crash) counts too;
+        storage refuses the resume while a step of it is still open."""
+        return (not self._busy and not self.openRunning and bool(self._session_id)
+                and self._task.get("status") in _PAUSE_STATUSES)
+
+    @Property(bool, notify=stateChanged)
+    def taskPausing(self) -> bool:
+        """DFPAUSE: a pause was asked for; the step in flight finishes and no new step starts."""
+        record = self._run_record if self.openRunning else None
+        return bool(record is not None and record.get("pausing")) or self._task.get("status") == "pause_requested"
 
     # -- local telemetry: a gauge, never a capability ---------------------------
 
@@ -3715,6 +3741,30 @@ class Bridge(QObject):
         self.approvalChanged.emit()
         self._run("cancel", lambda: self.backend.cancel(session_id, task_id), self._delivered(self._apply_run))
 
+    @Slot(result=bool)
+    def pauseTask(self) -> bool:
+        """DFPAUSE: Stop on a running task pauses it at its next step boundary. Asked at once
+        (the worker is busy with the run itself) with the ids cancel would use; the run then
+        returns paused through its own delivery. False when nothing was paused - never a cancel."""
+        record = self._run_record if self.openRunning else None
+        if record is None:
+            return False
+        session_id = record["session_id"]
+        task_id = (self.backend.active_task_id(session_id) if session_id else None) or record["task_id"]
+        if not session_id or not task_id:
+            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "No task to pause is registered yet."))
+            return False
+        result = self.backend.pause(session_id, task_id)
+        status = (result.get("task") or {}).get("status") if isinstance(result, dict) else None
+        if status not in _PAUSE_STATUSES:
+            self._tell("system", QT_TRANSLATE_NOOP("Bridge", "The task could not be paused; nothing was changed."))
+            return False
+        record["pausing"] = True
+        self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Task %1 pausing: stops when this step ends"),
+                    (self._task_label(),)), "system")
+        self.stateChanged.emit()
+        return True
+
     def _discard_snapshots(self) -> None:
         """Throw away every attachment snapshot JARVIS copied for this session -
         except those the recorded run in flight still references: a provider
@@ -3774,6 +3824,21 @@ class Bridge(QObject):
             return
         self._session_id = str(session_id)
         self._run("task", lambda: self.backend.resume(str(session_id), str(task_id)), self._delivered(self._apply_run),
+                  executing=True)
+
+    @Slot()
+    def resumePausedTask(self) -> None:
+        """DFPAUSE: the card's Resume continues the open conversation's paused task from its
+        first unfinished step; Core asks every gate again."""
+        if self._busy or not self.taskPaused:
+            return
+        if self._restored_unlinked():
+            self._refuse_unlinked()
+            return
+        session_id, task_id = self._session_id, str(self._task.get("task_id") or "")
+        if not task_id:
+            return
+        self._run("task", lambda: self.backend.resume_paused(session_id, task_id), self._delivered(self._apply_run),
                   executing=True)
 
     # -- slots: read-only data ---------------------------------------------

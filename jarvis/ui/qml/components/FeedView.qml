@@ -942,7 +942,8 @@ Item {
                 readonly property string phase: streaming ? "writing"
                                                 : working ? (bridge.executing ? "executing" : "preparing")
                                                 : (bridge.coreState === "awaiting_approval" || bridge.coreState === "awaiting_input") ? bridge.coreState : ""
-                readonly property string label: phase === "writing" ? qsTr("Writing the answer")
+                readonly property string label: working && bridge.taskPausing ? qsTr("Stopping: when this step ends")
+                                              : phase === "writing" ? qsTr("Writing the answer")
                                               : phase === "executing" ? qsTr("Executing")
                                               : phase === "preparing" ? Theme.stateLabel("running")
                                               : Theme.stateLabel(phase)
@@ -1063,6 +1064,23 @@ Item {
                     x: liveStatus.x + liveStatus.width + 18
                     MessageAction { id: streamCopy; objectName: "streamCopy"; label: qsTr("Copy"); confirmation: qsTr("Copied")
                                     onActivated: bridge.copyText(bridge.streamText) }
+                }
+            }
+            // DFPAUSE: the open conversation's paused task - Resume continues it from its first
+            // unfinished step (every gate asked again), Cancel ends it for good. Not part of the feed.
+            Item {
+                objectName: "pausedTaskCard"
+                visible: bridge.taskPaused
+                width: stack.width
+                height: visible ? pausedLine.height + 12 : 0
+                Row {
+                    id: pausedLine
+                    x: feed.messageX; y: 6
+                    spacing: 14
+                    Text { objectName: "pausedTaskLabel"; anchors.verticalCenter: parent.verticalCenter
+                           text: qsTr("Task paused"); color: Theme.warning; renderType: Theme.textRender; font: Theme.chatStatus }
+                    MessageAction { objectName: "pausedTaskResume"; label: qsTr("Resume"); onActivated: bridge.resumePausedTask() }
+                    MessageAction { objectName: "pausedTaskCancel"; label: qsTr("Cancel"); onActivated: bridge.cancelTask() }
                 }
             }
             // DFQUEUE: this conversation's messages waiting for the one run at a time, after

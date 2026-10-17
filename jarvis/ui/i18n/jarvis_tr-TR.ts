@@ -937,6 +937,22 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
         <translation>Önceki sohbet sürdürülüyor (%1 mesaj)</translation>
     </message>
     <message>
+        <source>Task %1 paused</source>
+        <translation>Görev %1 duraklatıldı</translation>
+    </message>
+    <message>
+        <source>Task %1 pausing: stops when this step ends</source>
+        <translation>Görev %1 duruyor: bu adım bitince duracak</translation>
+    </message>
+    <message>
+        <source>No task to pause is registered yet.</source>
+        <translation>Henüz duraklatılabilecek kayıtlı bir görev yok.</translation>
+    </message>
+    <message>
+        <source>The task could not be paused; nothing was changed.</source>
+        <translation>Görev duraklatılamadı; hiçbir şey değişmedi.</translation>
+    </message>
+    <message>
         <source>JARVIS is frozen, so the message was not queued; it stays in the draft.</source>
         <translation>JARVIS dondurulmuş olduğu için mesaj sıraya alınmadı; taslakta duruyor.</translation>
     </message>
@@ -1466,6 +1482,10 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>JARVIS is working…</source>
         <translation>JARVIS çalışıyor…</translation>
+    </message>
+    <message>
+        <source>Stopping: when this step ends</source>
+        <translation>duruyor: bu adım bitince</translation>
     </message>
     <message>
         <source>JARVIS is working in another conversation</source>
@@ -2025,6 +2045,22 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <message>
         <source>Remember</source>
         <translation>Hatırla</translation>
+    </message>
+    <message>
+        <source>Stopping: when this step ends</source>
+        <translation>duruyor: bu adım bitince</translation>
+    </message>
+    <message>
+        <source>Task paused</source>
+        <translation>Görev duraklatıldı</translation>
+    </message>
+    <message>
+        <source>Resume</source>
+        <translation>Devam et</translation>
+    </message>
+    <message>
+        <source>Cancel</source>
+        <translation>İptal et</translation>
     </message>
     <message>
         <source>Queued (%1)</source>

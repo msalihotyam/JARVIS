@@ -179,16 +179,18 @@ class BackgroundRunTests(UiTestCase):
         bridge.backend.cancel = lambda s, t: cancels.append((s, t)) or {}
         QMetaObject.invokeMethod(send, "act")
         self.assertEqual([record["request_id"]], texts)
-        # ... and the Composer fallback: cancelTask by the record's session; T2b: no cached task id,
-        # the authoritative lookup from the record's session answers.
+        # ... and the Composer fallback: pauseTask (DFPAUSE: Stop pauses a task, never cancels it)
+        # by the record's session; T2b: no cached task id, the authoritative lookup answers.
         bridge.backend.cancel_text = lambda request_id: texts.append(request_id) or False
-        looked = []
+        looked, pauses = [], []
         bridge.backend.active_task_id = lambda s: looked.append(s) or "t-live"
+        bridge.backend.pause = lambda s, t: pauses.append((s, t)) or {"task": {"status": "pause_requested"}}
         bridge._session_id = ""                                             # the screen's identity is not used
         QMetaObject.invokeMethod(send, "act")
         self.assertEqual([session], looked)
+        self.assertEqual([(session, "t-live")], pauses)
         self.finish(bridge)
-        self.assertEqual([(session, "t-live")], cancels)
+        self.assertEqual([], cancels)
 
     def test_t2b_the_cached_task_is_only_the_fallback_and_nothing_known_says_so(self) -> None:
         bridge, store, a, b = self.two(task_proposal("code_analysis", objective="Bu projeyi incele."),

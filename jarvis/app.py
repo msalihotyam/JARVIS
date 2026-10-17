@@ -6269,6 +6269,22 @@ class JarvisApp:
             return owned
         return self._present("cancel", self.core.cancel(session_id, task_id))
 
+    def pause(self, session_id: str, task_id: str) -> CommandResult:
+        """DFPAUSE: stop the task at its next step boundary, resumably."""
+        owned = self._ownership_failure("pause", session_id, task_id)
+        if owned is not None:
+            return owned
+        return self._present("pause", self.core.pause(session_id, task_id))
+
+    def resume_paused(self, session_id: str, task_id: str) -> CommandResult:
+        """DFPAUSE: continue a paused task; every gate is asked again."""
+        owned = self._ownership_failure("resume_paused", session_id, task_id)
+        if owned is not None:
+            return owned
+        return self._present(
+            "resume_paused", self.core.resume_paused(session_id, task_id)
+        )
+
     def _decide(
         self,
         command: str,

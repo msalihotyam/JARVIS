@@ -237,6 +237,10 @@ class SchedulerRunner:
     ) -> RunnerAction:
         """Route ONE unsettled generation to the boundary that owns its state."""
         status = run.status
+        # DFPAUSE: a user-paused task is never auto-resumed from here. Every
+        # path below that could continue a task goes through Core._advance,
+        # which reports a paused (or pausing) task as it stands; only the
+        # user's own Resume (Core.resume_paused) moves it again.
         if status is JobRunStatus.AWAITING_APPROVAL:
             # PARKED, and left parked. A person was asked something and has
             # not answered; no sweep answers it, expires it, resumes past it

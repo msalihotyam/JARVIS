@@ -443,6 +443,12 @@ class Backend:
     def cancel(self, session_id: str, task_id: str) -> dict:
         return self._call("cancel", lambda s: self._app(s).cancel(session_id, task_id))
 
+    def pause(self, session_id: str, task_id: str) -> dict:
+        return self._call("pause", lambda s: self._app(s).pause(session_id, task_id))
+
+    def resume_paused(self, session_id: str, task_id: str) -> dict:
+        return self._call("resume_paused", lambda s: self._app(s).resume_paused(session_id, task_id))
+
     def clarify(self, session_id: str, task_id: str, text: str) -> dict:
         return self._call("clarify", lambda s: self._app(s).clarify(session_id, task_id, text))
 

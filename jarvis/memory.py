@@ -230,6 +230,9 @@ _EXECUTION_BLOCKING_STATUSES = frozenset(
         TaskStatus.COMPLETED.value,
         TaskStatus.FAILED.value,
         TaskStatus.REJECTED.value,
+        # DFPAUSE: a pause wins over a step not yet claimed.
+        TaskStatus.PAUSE_REQUESTED.value,
+        TaskStatus.PAUSED.value,
     }
 )
 
@@ -249,6 +252,14 @@ _TERMINAL_STATUS_VALUES = frozenset(
         TaskStatus.CANCELLED.value,
     }
 )
+
+#: DFPAUSE: a PAUSE_REQUESTED task with an attempt in one of these states may
+#: still be finishing a step, so resume_paused refuses it. PREPARED is not
+#: here: it never crossed the connector boundary, and begin_execution's
+#: PREPARED -> IN_FLIGHT claim has a single winner.
+# ponytail: no in-process "who is driving" registry; a resume racing a live loop
+# relies on attempt convergence + the CAS claim (+ the 1-thread UI pool).
+_OPEN_OR_DOUBTFUL_ATTEMPTS = frozenset({AttemptState.IN_FLIGHT, AttemptState.UNKNOWN_OUTCOME})
 
 #: Phase 2C. ``settle_job_run``'s default for ``condition_result`` means
 #: PRESERVE the run's own existing value, never "set it to None" - ``None``
@@ -2233,9 +2244,47 @@ class SQLiteMemoryStore:
         reports ``False`` so the caller can drop its dependent writes instead of
         assuming success. Every lifecycle write goes through the guard; only the
         explicit ``save_task`` setup primitive passes ``force`` to stage state.
+
+        DFPAUSE. A pause is the same kind of authority. A loop that is still
+        finishing its step writes PAUSE_REQUESTED back instead of RUNNING or
+        VERIFYING, and a loop that stops at a gate writes PAUSED. Once a row is
+        PAUSED, only the resume transition, a cancellation or the boundary
+        write itself may change it. Both are applied to the column AND the
+        document, so ``_authoritative_task_row`` still sees one status.
         """
+        status_override: TaskStatus | None = None
+        if not force:
+            stored = connection.execute(
+                "SELECT status FROM tasks WHERE id = ?", (task.id,)
+            ).fetchone()
+            stored_status = stored[0] if stored is not None else None
+            if stored_status == TaskStatus.PAUSED.value and task.status not in {
+                TaskStatus.PAUSED,
+                TaskStatus.CANCEL_REQUESTED,
+                TaskStatus.CANCELLED,
+            }:
+                return False
+            if stored_status == TaskStatus.PAUSE_REQUESTED.value:
+                if task.status in {
+                    TaskStatus.PENDING,
+                    TaskStatus.RUNNING,
+                    TaskStatus.VERIFYING,
+                }:
+                    status_override = TaskStatus.PAUSE_REQUESTED
+                elif task.status in {
+                    TaskStatus.AWAITING_CLARIFICATION,
+                    TaskStatus.AWAITING_APPROVAL,
+                    TaskStatus.AWAITING_COST_OVERRIDE,
+                }:
+                    # The loop reached a gate while pausing: the task stops
+                    # here. Written to the caller's object too, so the
+                    # checkpoint opens no approval for a question nobody may
+                    # answer until a resume asks it afresh.
+                    task.status = TaskStatus.PAUSED
         task.touch()
         document = task.to_dict()
+        if status_override is not None:
+            document["status"] = status_override.value
         # M5 retention. The raw intended write bytes exist in the task row for
         # exactly one reason: ``resume`` rebuilds a task solely from storage,
         # so bytes that are not stored cannot be re-attested or written. Once
@@ -2261,7 +2310,7 @@ class SQLiteMemoryStore:
             task.id,
             session_id,
             SQLiteMemoryStore._json(document),
-            task.status.value,
+            (status_override or task.status).value,
             task.stage.value,
             task.updated_at,
         )
@@ -2946,7 +2995,7 @@ class SQLiteMemoryStore:
                 self._write_checkpoint_and_event(
                     connection, session, task, event_type, payload, checkpoint.created_at
                 )
-                if pending_request is not None:
+                if pending_request is not None and task.status is not TaskStatus.PAUSED:
                     self._upsert_pending_approval(connection, pending_request)
         except _StaleWriterLost:
             return False
@@ -3360,6 +3409,149 @@ class SQLiteMemoryStore:
                 {"connector_cancelled": False},
             )
         return CancellationOutcome(verdict, session, task)
+
+    # -- DFPAUSE: pause at a step boundary, resume a paused task ------------
+
+    def execution_pause_requested(self, session_id: str, task_id: str) -> bool:
+        """Whether this exact task is authoritatively paused or pausing.
+
+        The loop's step-boundary question, two columns wide for the same
+        reason ``execution_cancellation_requested`` is: no document is read.
+        """
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT session_id, status FROM tasks WHERE id = ?", (task_id,)
+            ).fetchone()
+        if row is None or row["session_id"] != session_id:
+            return False
+        return row["status"] in {
+            TaskStatus.PAUSE_REQUESTED.value,
+            TaskStatus.PAUSED.value,
+        }
+
+    @staticmethod
+    def _withdraw_task_approvals(
+        connection: sqlite3.Connection, session_id: str, task_id: str
+    ) -> None:
+        """No approval outlives a pause, on either side of it.
+
+        Every unconsumed grant this task was given - one-shot or remembered -
+        is expired, and its open question is superseded, so the step after a
+        resume meets every gate fresh. A remembered grant another task gave the
+        session is not this task's to withdraw and keeps applying.
+        """
+        now = utc_now()
+        connection.execute(
+            "UPDATE permission_grants SET expires_at = ? "
+            "WHERE session_id = ? AND task_id = ? AND approved = 1 "
+            "AND consumed_by_attempt IS NULL AND expires_at > ?",
+            (now, session_id, task_id, now),
+        )
+        connection.execute(
+            "UPDATE pending_approvals SET status = 'superseded', "
+            "resolved_at = ? "
+            "WHERE task_id = ? AND session_id = ? AND status = 'pending'",
+            (now, task_id, session_id),
+        )
+
+    def pause_task(self, session_id: str, task_id: str) -> CancellationOutcome:
+        """Durably pause a task in ONE transaction, never stopping a step.
+
+        The same two ids, the same rebinding and the same refusals as
+        :meth:`cancel_task`. A task waiting at a gate has no step running, so
+        it is ``"paused"`` at once. Any other open task becomes
+        PAUSE_REQUESTED (``"pausing"``): the step in flight finishes, and the
+        loop writes PAUSED at its next boundary. A task already pausing,
+        paused or cancelling is ``"not_pausable"``.
+        """
+        try:
+            with self._connection(write=True) as connection:
+                session = self._authoritative_session_row(connection, session_id)
+                if session is None:
+                    return CancellationOutcome("unknown_session")
+                task = self._authoritative_task_row(connection, session_id, task_id)
+                if task is None:
+                    return CancellationOutcome("not_found")
+                if task.status.value in _TERMINAL_STATUS_VALUES:
+                    return CancellationOutcome("terminal", session, task)
+                states = {
+                    attempt.state
+                    for attempt in self._attempt_rows(connection, task_id)
+                }
+                if AttemptState.UNKNOWN_OUTCOME in states:
+                    return CancellationOutcome("in_doubt", session, task)
+                if task.cancellation_requested or task.status in {
+                    TaskStatus.CANCEL_REQUESTED,
+                    TaskStatus.PAUSE_REQUESTED,
+                    TaskStatus.PAUSED,
+                }:
+                    return CancellationOutcome("not_pausable", session, task)
+                if task.status in {
+                    TaskStatus.AWAITING_CLARIFICATION,
+                    TaskStatus.AWAITING_APPROVAL,
+                    TaskStatus.AWAITING_COST_OVERRIDE,
+                }:
+                    task.status = TaskStatus.PAUSED
+                    verdict = "paused"
+                else:
+                    task.status = TaskStatus.PAUSE_REQUESTED
+                    verdict = "pausing"
+                if not self._upsert_task(
+                    connection, session_id, task, expected_owner=session_id
+                ):
+                    raise _CancellationLost(session, task)
+                self._withdraw_task_approvals(connection, session_id, task_id)
+                self._write_checkpoint_and_event(
+                    connection, session, task, "pause_requested", {}
+                )
+            return CancellationOutcome(verdict, session, task)
+        except _CancellationLost as lost:
+            return CancellationOutcome("lost", lost.session, lost.task)
+
+    def resume_paused(
+        self, session_id: str, task_id: str
+    ) -> CancellationOutcome:
+        """Make a PAUSED task runnable again, in ONE transaction.
+
+        An authoritative PAUSED row moves. A PAUSE_REQUESTED row moves only
+        when no attempt of the task is IN_FLIGHT or UNKNOWN_OUTCOME:
+        no step is in flight, so nothing is left to settle it - a lost claim,
+        a freeze, a delegated skill step parked at its gate, a crash. With a
+        step still open it is ``"not_paused"``. The task goes back to
+        PENDING at the stage it stopped at, so the loop continues from there:
+        a completed step is never re-entered. Approvals are withdrawn again,
+        so nothing granted before the pause - or in the instant around it -
+        reaches the resumed run.
+        """
+        with self._connection(write=True) as connection:
+            session = self._authoritative_session_row(connection, session_id)
+            if session is None:
+                return CancellationOutcome("unknown_session")
+            task = self._authoritative_task_row(connection, session_id, task_id)
+            if task is None:
+                return CancellationOutcome("not_found")
+            if task.status.value in _TERMINAL_STATUS_VALUES:
+                return CancellationOutcome("terminal", session, task)
+            settled = task.status is TaskStatus.PAUSED or (
+                task.status is TaskStatus.PAUSE_REQUESTED
+                and not any(
+                    attempt.state in _OPEN_OR_DOUBTFUL_ATTEMPTS
+                    for attempt in self._attempt_rows(connection, task_id)
+                )
+            )
+            if not settled:
+                return CancellationOutcome("not_paused", session, task)
+            task.status = TaskStatus.PENDING
+            session.latest_task_id = task_id
+            session.active_task_id = task_id
+            self._upsert_session(connection, session)
+            # Ownership and the PAUSED status were proved in this transaction.
+            self._upsert_task(connection, session_id, task, force=True)
+            self._withdraw_task_approvals(connection, session_id, task_id)
+            self._write_checkpoint_and_event(
+                connection, session, task, "task_resumed", {}
+            )
+        return CancellationOutcome("resumed", session, task)
 
     def has_remembered_scope_grant(
         self, session_id: str, scope_fingerprint: str

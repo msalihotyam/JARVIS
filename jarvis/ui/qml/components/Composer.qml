@@ -274,7 +274,7 @@ Item {
     // 44 px target. Dimmed and inert while nothing can be sent. M2: the
     // pointer lifts it a step with a soft glow and a fine ring; a press sets
     // it down. While JARVIS runs it IS the stop key in the same spot - an
-    // amber square inside a turning ring - and cancels the running call.
+    // amber square inside a turning ring - and stops the running call (a task pauses).
     Item {
         id: sendButton
         objectName: composer.sendName
@@ -282,14 +282,19 @@ Item {
         width: 44; height: 44
         readonly property bool stopping: composer.conversationBound && bridge.openRunning
         // DFRESUME: after Stop cut a reply, an empty composer's key continues it; typed text wins.
-        readonly property bool resuming: composer.conversationBound && !stopping && !composer.blocked
-                                         && bridge.canResume && input.text.trim() === ""
+        // DFPAUSE: on a running task Stop pauses it at its step boundary; a paused last task's
+        // empty-composer key resumes it. Typed text is always a new request, never the task's.
+        readonly property bool resumingTask: composer.conversationBound && !stopping && !composer.blocked
+                                             && bridge.taskPaused && input.text.trim() === ""
+        readonly property bool resuming: resumingTask || (composer.conversationBound && !stopping && !composer.blocked
+                                         && bridge.canResume && input.text.trim() === "")
         enabled: stopping || resuming || composer.canSend
         opacity: enabled ? 1 : 0.42
         Behavior on opacity { NumberAnimation { duration: Theme.hoverMs } }
         activeFocusOnTab: true
         function act() {
-            if (stopping) { if (!bridge.cancelText()) bridge.cancelTask() }
+            if (stopping) { if (!bridge.cancelText()) bridge.pauseTask() }
+            else if (resumingTask) bridge.resumePausedTask()
             else if (resuming) bridge.resumeText()
             else composer.submit()
         }
@@ -500,7 +505,8 @@ Item {
             visible: sendButton.stopping
             anchors.left: leftChips.right; anchors.leftMargin: 12; anchors.verticalCenter: parent.verticalCenter
             width: Math.max(0, Math.min(implicitWidth, rightChips.x - x - 8)); elide: Text.ElideRight
-            text: qsTr("JARVIS is working…"); color: Theme.warning; renderType: Theme.textRender; font: Theme.caption
+            text: bridge.taskPausing ? qsTr("Stopping: when this step ends") : qsTr("JARVIS is working…")
+            color: Theme.warning; renderType: Theme.textRender; font: Theme.caption
         }
         // R1: JARVIS works for ANOTHER conversation. One run at a time: a send here waits in
         // the queue (DFQUEUE), and a mouse-first link opens the conversation it works for.

@@ -342,6 +342,10 @@ class TaskStatus(str, Enum):
     REJECTED = "rejected"
     CANCEL_REQUESTED = "cancel_requested"
     CANCELLED = "cancelled"
+    #: DFPAUSE: a pause is durable but a step may still be running; the loop
+    #: turns it into PAUSED at its next step boundary. Neither is terminal.
+    PAUSE_REQUESTED = "pause_requested"
+    PAUSED = "paused"
 
 
 class RunStatus(str, Enum):
