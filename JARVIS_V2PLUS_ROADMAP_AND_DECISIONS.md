@@ -261,6 +261,13 @@ Kaynak: `build/v21/PLAN_DRAFT_V21.md` (V2.1 plan taslağı, KARAR-1..5 soruları
 - kod imzalama (maliyet = Salih kararı)
 - imzalı güncellemeler
 
+### Referans: Synara (2026-10-17, Salih onayı; üretici iddiası, kod doğrulanmadı)
+- Ayrı Beta kanalı: kendi verisi ve kendi güncelleme beslemesi; kararlı kanalla veri paylaşmaz.
+- DB göçünden önce kurtarılabilir yedek; göç düşerse geri yükle / yeniden dene seçeneği.
+- Kurulum sonrası açılış (startup) duman testi ve kalıcı kurulum işareti.
+- İlk-çalıştırma sihirbazı ayarlardan yeniden oynatılabilir.
+- Kaynak checkout'u kurulu uygulamanın verisini asla açmaz.
+
 ---
 
 ## V2.2 — Skills + Experience Learning
@@ -471,6 +478,14 @@ Grok Bot’tan alınacak:
 
 Ancak bütün handoff’lar Core sınırları içinde kalır.
 
+### Referans: Synara (2026-10-17, Salih onayı; üretici iddiası, kod doğrulanmadı)
+- Alt ajan listesi: brief, adım, süre, sonuç; durdurulan iş asla "tamamlandı" görünmez.
+- Ebeveyn tüm çocukları bekler; yeniden başlatmada sahibi kaybolan çocuğun komutu tekrar gönderilmez; teslimi belirsiz olan "belirsiz" kalır.
+- Kalıcı hedefte durma kuralları tablosu: kuyruktaki kullanıcı girdisi, onay, plan modu, kesinti, hata, zaman aşımı, tekrarlayan engel → dur ve sor.
+- Özerklik kontrolsüz döngüye dönüşmez.
+- Dikkat panosu: Taslak / Sürüyor / Sizi bekliyor / Bitti + takıldı / onay / girdi işaretleri.
+- Onaylar tek yerde toplanır; yalnız kullanıcı/Core onaylar (yukarıdaki KESİN authority kuralı değişmez).
+
 ---
 
 ## V2.4A — Jev Decision Engine Evaluation + Decision Layer
@@ -644,6 +659,13 @@ KESİN yön:
 - JARVIS UI açık olmasa bile uygun mimari ile background işler.
 - Windows scheduling / background host / ileride remote runtime değerlendirilecek.
 - Core security/authority korunur.
+
+### Referans: Synara (2026-10-17, Salih onayı; üretici iddiası, kod doğrulanmadı)
+- Otomasyon başına ardışık-hata eşiği: sayaç, kapanma nedeni ve zamanlar kalıcı; başarı sayacı sıfırlar.
+- Eşikte otomasyon kendini kapatır; yeniden açma açık kullanıcı eylemidir.
+- Elle yeniden çalıştırma kanıt tutar; otomasyon kapalı oluşturulabilir.
+- İzleyici kalıbı ("auto-fix CI" örneği): isteğe bağlı; çalışan iş / onay / soru bitene kadar bekler.
+- Sınırlı deneme; ilerleme yoksa açıklamayla durur; asla kendi başına birleştirmez.
 
 ---
 
@@ -821,6 +843,15 @@ Adaylar:
 - GitHub issue/PR writes
 
 Hepsi ayrı authority/approval tasarımıyla.
+
+### Referans: Synara (2026-10-17, Salih onayı; üretici iddiası, kod doğrulanmadı)
+- Model: dış uygulamalar JARVIS görevlerini MCP ile oluşturur; yalnız loopback.
+- Kısa ömürlü eşleştirme kodu; ham kimlik bilgisi istemci ayarına girmez.
+- Kapsama göre filtrelenmiş araç listesi.
+- Kimlik bilgisi opak, süreli, iptal edilebilir, tek-hedefli; hash ile saklanır, iptal anında geçerli.
+- Dakika başı ve aktif görev slotu sınırları; denetim satırları (tam istem yok); requestId ile tekrar önleme.
+- JARVIS farkı: kapsam varsayılan KAPALI (allowlist; Synara'nın "tüm projeler" varsayılanı alınmaz); sırlar Windows Credential Manager'da.
+- Her işlem yine Core pipeline'ından geçer.
 
 ---
 
