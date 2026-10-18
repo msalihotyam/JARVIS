@@ -15,7 +15,6 @@ triggers anything.
 See JARVIS_RUNBOOK.md "Konveyor".
 """
 import calendar
-import importlib.util
 import json
 import os
 import re
@@ -53,6 +52,7 @@ BUDGET_CHECK_S = 600
 BUDGET_NUDGE = "commit the coherent part, list the rest in OPEN ISSUES, write the report"
 PASS_S = 60
 USAGE_S = 1800  # usage ledger cadence (scripts/usage_ledger.py, else the build/conveyor copy)
+LEDGER_TIMEOUT_S = 300  # a ledger subprocess still running after this is killed
 CLEANUP_S = 3600  # a finished lane's session is removed this long after its report was collected
 CLEANUP_PER_PASS = 5  # stop/rm calls are slow; keep one pass well under the stale-lock time
 # CONVIDLE: `claude agents` lists a finished idle background session as state "working"; early
@@ -699,7 +699,8 @@ def validate_slice(s):
 class Conveyor:
     def __init__(self, root=ROOT, runner=real_runner, now=time.time, send=ntfy_send,
                  post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage,
-                 projects=None, mem=real_mem, idle=real_idle, procs=None, net=real_net):
+                 projects=None, mem=real_mem, idle=real_idle, procs=None, net=real_net,
+                 popen=subprocess.Popen):
         self.root = Path(root)
         # session transcripts: <claude config dir>/projects/<project slug>/<sessionId>.jsonl
         self.projects = Path(projects) if projects else \
@@ -750,6 +751,9 @@ class Conveyor:
         self.band = []  # status.json "band" lines (breaker, auto-approval)
         self.lanes_bad = None  # why lanes.json could not be read this pass: nothing saves over it
         self.beat_ts = 0
+        self.popen = popen
+        self.ledger_proc = None  # (Popen, start ts) of the usage ledger subprocess still running
+        self.ledger_ts = float("-inf")  # last ledger start
 
     # ---- lock -------------------------------------------------------
     def acquire_lock(self):
@@ -2246,24 +2250,41 @@ class Conveyor:
         if n == CRASH_PAGE:
             self.page(f"Konveyor: {n} geçiş üst üste hata verdi ({self.last_error})")
 
-    def usage_ledger(self):
-        """Run the usage ledger (read-only transcript parse into build/ledger/usage.json):
-        scripts/usage_ledger.py, else the older runtime copy in build/conveyor/."""
+    def usage_ledger(self, force=False):
+        """The usage ledger (read-only transcript parse into build/ledger/usage.json:
+        scripts/usage_ledger.py, else the older runtime copy in build/conveyor/) as a
+        subprocess, never waited on: each call reaps a finished run (a nonzero exit or a run
+        killed after LEDGER_TIMEOUT_S is one error event), and starts one when none runs and
+        USAGE_S passed since the last start (force: at once)."""
+        if self.ledger_proc:
+            proc, started = self.ledger_proc
+            rc = proc.poll()
+            if rc is None and self.now() - started < LEDGER_TIMEOUT_S:
+                return
+            if rc is None:
+                proc.kill()  # before forgetting it: a failed kill is retried next pass
+            self.ledger_proc = None
+            if rc is None:
+                self.error(f"usage ledger: killed after {LEDGER_TIMEOUT_S}s")
+            elif rc != 0:
+                self.error(f"usage ledger: exit {rc} (build/ledger/usage.log)")
+            return
+        if not force and self.now() - self.ledger_ts < USAGE_S:
+            return
         for script in (self.root / "scripts" / "usage_ledger.py", self.base / "usage_ledger.py"):
             if script.exists():
-                spec = importlib.util.spec_from_file_location("usage_ledger", script)
-                mod = importlib.util.module_from_spec(spec)
-                spec.loader.exec_module(mod)
-                parse = getattr(mod, "parse_files", None)  # a transcript removed since the listing is skipped
-                if parse:
-                    mod.parse_files = lambda files: parse([f for f in files if Path(f).is_file()])
-                self.beat()
+                self.ledger_ts = self.now()
+                out = self.root / "build" / "ledger" / "usage.json"
                 try:
-                    mod.main(out=self.root / "build" / "ledger" / "usage.json")
-                except FileNotFoundError:  # removed between that check and the read: once more
-                    self.beat()
-                    mod.main(out=self.root / "build" / "ledger" / "usage.json")
-                self.beat()
+                    out.parent.mkdir(parents=True, exist_ok=True)
+                    with open(out.parent / "usage.log", "wb") as log:
+                        proc = self.popen([sys.executable, str(script), str(out)], cwd=self.root,
+                                          stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                          stderr=log, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+                except OSError as e:
+                    self.error(f"usage ledger: {e!r}")
+                    return
+                self.ledger_proc = (proc, self.ledger_ts)
                 return
 
     # ---- autopilot (CONV7): the three routine orchestrator decisions -----
@@ -3049,12 +3070,14 @@ class Conveyor:
                 continue  # nothing listed to remove
             sids = [a["sessionId"] for a in sess] if doubt is None else []
             if doubt is None and not self.ledger_has(sids, t + CLEANUP_S):
-                # at most once per USAGE_S: a ledger that keeps failing is not re-parsed every pass
+                # at most once per USAGE_S: a ledger that keeps failing is not re-parsed every pass.
+                # It only starts the subprocess (never waits): until a run counts the session,
+                # ledger_has below is a doubt, so nothing is removed.
                 if not ledger_ran and self.now() - (self.pager_flag("cleanup_ledger_ts") or 0) >= USAGE_S:
                     ledger_ran = True
                     self.pager_flag("cleanup_ledger_ts", self.now())
                     try:
-                        self.usage_ledger()
+                        self.usage_ledger(force=True)
                     except Exception as e:
                         self.error(f"usage ledger: {e!r}")
                 if not self.ledger_has(sids, t + CLEANUP_S):
@@ -3262,22 +3285,26 @@ class Conveyor:
     def loop(self, once=False):
         if not self.acquire_lock():
             return 0  # another instance is alive
-        last_usage = 0.0
         flush_errors = set()  # note_pass/flush_pages errors already logged
         while True:
             ok = False
             try:
                 self.heartbeat()
                 ok = self.pass_once()
-                if not once and self.now() - last_usage >= USAGE_S:
-                    last_usage = self.now()
-                    self.usage_ledger()
             except Exception as e:
                 try:
                     fn, at = where_raised(e)
                     self.error(f"pass: {e!r}", file=fn and str(fn), at=at)
                 except Exception:
                     pass
+            if not once:  # reaps / starts the ledger subprocess, never waits on it; a raising pass cannot skip the kill
+                try:
+                    self.usage_ledger()
+                except Exception as e:
+                    try:
+                        self.error(f"usage ledger: {e!r}")
+                    except Exception:
+                        pass
             try:
                 self.note_pass(ok)
                 self.flush_pages()

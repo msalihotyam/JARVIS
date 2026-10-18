@@ -150,6 +150,19 @@ class FakeGit:
         return [c for c in self.calls if c[:2] == ["git", "push"]]
 
 
+class FakeProc:
+    """A usage ledger subprocess: still running until rc is set."""
+
+    def __init__(self, argv, **kw):
+        self.argv, self.kw, self.rc, self.killed = argv, kw, None, False
+
+    def poll(self):
+        return self.rc
+
+    def kill(self):
+        self.killed = True
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -166,12 +179,13 @@ class Base(unittest.TestCase):
         self.key = ""  # reader off by default; never the real key lookup (env/registry)
         self.posts = []
         self.reply = (500, None)
+        self.ledger_procs = []  # never a real ledger subprocess
         self.c = Conveyor(self.root, self.fake, now=lambda: self.t,
                           send=lambda text: self.pushes.append(text) or "sent",
                           post=self.fake_post, key=lambda: self.key,
                           cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
                           mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs,
-                          net=lambda: self.net)
+                          net=lambda: self.net, popen=self.fake_popen)
         self.base = self.root / "build" / "conveyor"
         self.hour = 12  # local hour for the night rule: never the real clock's
         hour = mock.patch.object(conveyor, "local_hour", lambda t: self.hour)
@@ -182,6 +196,12 @@ class Base(unittest.TestCase):
         if isinstance(self.free, Exception):
             raise self.free
         return mock.Mock(free=self.free)
+
+    def fake_popen(self, argv, **kw):
+        if getattr(self, "fake_popen_error", None):
+            raise self.fake_popen_error
+        self.ledger_procs.append(FakeProc(argv, **kw))
+        return self.ledger_procs[-1]
 
     def fake_post(self, key, body):
         self.posts.append(body)
@@ -2311,7 +2331,7 @@ class TestCleanup(Base):
         self.ledger = self.root / "build" / "ledger" / "usage.json"
         self.c.stop_finished = lambda *a: None  # these cover the rm path with a live session (TestEarlyStop)
 
-    def fake_ledger(self):
+    def fake_ledger(self, force=False):
         self.ledger_runs += 1
         if self.ledger_error:
             raise self.ledger_error
@@ -2486,17 +2506,127 @@ class TestCleanup(Base):
     def test_ledger_prefers_scripts_copy(self):
         c = Conveyor(self.root, self.fake, now=lambda: self.t, cmd=self.git, disk=self.fake_disk,
                      projects=self.root / "projects", mem=lambda: self.memory,
-                     idle=lambda: self.idle, procs=self.procs)
-        mod = "from pathlib import Path\ndef main(out):\n    Path(out).parent.mkdir(parents=True, exist_ok=True)\n" \
-              "    Path(out).write_text('{}')\n"
+                     idle=lambda: self.idle, procs=self.procs, popen=self.fake_popen)
         (self.root / "scripts").mkdir()
-        (self.root / "scripts" / "usage_ledger.py").write_text(mod.replace("'{}'", "'scripts'"))
-        (self.base / "usage_ledger.py").write_text(mod.replace("'{}'", "'build'"))
+        (self.root / "scripts" / "usage_ledger.py").write_text("")
+        (self.base / "usage_ledger.py").write_text("")
         c.usage_ledger()
-        self.assertEqual(self.ledger.read_text(), "scripts")
         (self.root / "scripts" / "usage_ledger.py").unlink()
-        c.usage_ledger()
-        self.assertEqual(self.ledger.read_text(), "build")
+        self.ledger_procs[0].rc = 0
+        c.usage_ledger()  # reaps
+        c.usage_ledger(force=True)
+        self.assertEqual([p.argv[1:] for p in self.ledger_procs],
+                         [[str(self.root / "scripts" / "usage_ledger.py"), str(self.ledger)],
+                          [str(self.base / "usage_ledger.py"), str(self.ledger)]])
+        self.assertEqual(self.ledger_procs[0].argv[0], sys.executable)
+
+
+class TestLedgerSubprocess(Base):
+    """The usage ledger runs as a subprocess the loop polls, never waits on."""
+
+    def setUp(self):
+        super().setUp()
+        (self.root / "scripts").mkdir()
+        (self.root / "scripts" / "usage_ledger.py").write_text("")
+
+    def errors(self):
+        return [e for e in self.events() if e["event"] == "error"]
+
+    def test_running_ledger_is_not_waited_on_and_not_restarted(self):
+        self.c.usage_ledger()
+        for _ in range(3):
+            self.t += 60
+            self.c.usage_ledger()
+            self.c.usage_ledger(force=True)
+        self.assertEqual(len(self.ledger_procs), 1)
+        self.assertFalse(self.ledger_procs[0].killed)
+        self.assertEqual(self.errors(), [])
+
+    def test_timeout_kills_once_with_one_error(self):
+        self.c.usage_ledger()
+        self.t += conveyor.LEDGER_TIMEOUT_S - 1
+        self.c.usage_ledger()
+        self.assertFalse(self.ledger_procs[0].killed)
+        self.t += 1
+        self.c.usage_ledger()
+        self.c.usage_ledger()
+        self.assertTrue(self.ledger_procs[0].killed)
+        self.assertEqual(len(self.errors()), 1)
+        self.assertIn("killed", self.c.last_error)
+        self.assertEqual(len(self.ledger_procs), 1)  # the next start waits for USAGE_S
+
+    def test_exit_codes_and_cadence(self):
+        self.c.usage_ledger()
+        self.ledger_procs[0].rc = 1
+        self.c.usage_ledger()
+        self.c.usage_ledger()
+        self.assertEqual(len(self.errors()), 1)
+        self.assertIn("exit 1", self.c.last_error)
+        self.t += conveyor.USAGE_S - 1
+        self.c.usage_ledger()
+        self.assertEqual(len(self.ledger_procs), 1)
+        self.t += 1
+        self.c.usage_ledger()
+        self.ledger_procs[1].rc = 0
+        self.c.usage_ledger()
+        self.assertEqual((len(self.ledger_procs), len(self.errors())), (2, 1))
+
+    def test_popen_error_is_one_error(self):
+        self.fake_popen_error = OSError("no python")
+        self.c.usage_ledger()
+        self.c.usage_ledger()
+        self.assertEqual(len(self.errors()), 1)
+        self.assertIn("no python", self.c.last_error)
+
+    def test_loop_beats_while_slow_ledger_runs(self):
+        (self.base / "PAUSE").write_text("")
+        beats, sleeps, t0 = [], [], self.t
+
+        def sleep(s):
+            sleeps.append(s)
+            self.t += 100
+
+        with mock.patch.object(self.c, "heartbeat", side_effect=lambda: beats.append(self.t)), \
+                mock.patch.object(self.c, "own_lock", side_effect=lambda: len(sleeps) < 4), \
+                mock.patch.object(conveyor.time, "sleep", side_effect=sleep):
+            self.assertEqual(self.c.loop(), 0)
+        self.assertLessEqual({t0, t0 + 100, t0 + 200, t0 + 300}, set(beats))  # every pass beat
+        self.assertEqual(len(self.ledger_procs), 1)
+        self.assertTrue(self.ledger_procs[0].killed)  # 4th pass: LEDGER_TIMEOUT_S after the start
+        self.assertEqual(len(self.errors()), 1)
+
+    def test_raising_pass_still_kills_a_timed_out_ledger(self):
+        sleeps = []
+
+        def sleep(s):
+            sleeps.append(s)
+            self.t += 100
+
+        with mock.patch.object(self.c, "pass_once", side_effect=RuntimeError("boom")), \
+                mock.patch.object(self.c, "own_lock", side_effect=lambda: len(sleeps) < 4), \
+                mock.patch.object(conveyor.time, "sleep", side_effect=sleep):
+            self.assertEqual(self.c.loop(), 0)
+        self.assertEqual(len(self.ledger_procs), 1)
+        self.assertTrue(self.ledger_procs[0].killed)
+        self.assertEqual(sum("killed" in e["message"] for e in self.errors()), 1)
+
+    finished = TestCleanup.finished
+    cli = TestCleanup.cli
+
+    def test_cleanup_removes_nothing_while_ledger_runs_or_fails(self):
+        self.c.stop_finished = lambda *a: None
+        self.finished()
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        self.assertEqual(len(self.ledger_procs), 1)  # cleanup started it, never waited
+        self.c.pass_once()
+        self.ledger_procs[0].rc = 1
+        self.t += conveyor.USAGE_S
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [])
+        self.assertTrue(any(e["event"] == "cleanup_skip" for e in self.events()))
+        self.assertEqual([e["message"] for e in self.errors()], ["usage ledger: exit 1 (build/ledger/usage.log)"])
 
 
 class TestPreserved(Base):
