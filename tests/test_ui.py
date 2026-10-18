@@ -695,6 +695,59 @@ class AuthorityTests(UiTestCase):
         self.assertTrue(bridge.approvalPending)
         bridge.waitIdle()
 
+    def _record_writes(self, conversation, refuse: int = 0) -> list[int]:
+        """The thread of every conversation write; the first ``refuse`` are refused."""
+        threads: list[int] = []
+        write = conversation.store.update_conversation_state
+
+        def recording(conversation_id, change):
+            threads.append(threading.get_ident())
+            if len(threads) <= refuse:
+                raise OSError("disk I/O error")
+            return write(conversation_id, change)
+
+        conversation.store.update_conversation_state = recording
+        return threads
+
+    def test_the_user_turn_is_written_on_the_worker_before_its_run(self) -> None:
+        bridge = self.bridge(task_proposal("code_analysis"), sync=False)
+        conversation = bridge._conversation_store
+        threads = self._record_writes(conversation)
+        bridge.submitText("Bu projeyi incele.")
+        bridge.waitIdle()
+        pump(50)
+        bridge.waitIdle()
+        self.assertTrue(threads)
+        self.assertNotEqual(threading.main_thread().ident, threads[0])   # F-gt: never the GUI thread
+        stored = conversation.store.load_conversation_state(conversation.id)
+        self.assertEqual("Bu projeyi incele.", stored.turns[0].text)    # queued ahead of its run
+        self.assertEqual([t.text for t in stored.turns], [t.text for t in conversation.state.turns])
+
+    def test_a_refused_queued_user_turn_is_said_and_dropped(self) -> None:
+        bridge = self.bridge(sync=False)
+        conversation = bridge._conversation_store
+        self._record_writes(conversation, refuse=1)
+        bridge._say("user", "Kaydedilemez.")
+        bridge.waitIdle()
+        pump(50)
+        errors = [n["text"] for n in bridge.activity if n["kind"] == "error"]
+        self.assertEqual(1, sum("could not be saved" in text for text in errors))
+        self.assertNotIn("Kaydedilemez.", [t.text for t in conversation.state.turns])
+
+    def test_shutdown_writes_a_user_turn_still_queued(self) -> None:
+        bridge = self.bridge(sync=False)
+        conversation = bridge._conversation_store
+        blocker = threading.Event()
+        bridge._run("block", lambda: blocker.wait(10), lambda _result: None)   # the worker is busy
+        bridge._say("user", "Kaybolmasın.")
+        self.assertEqual(0, len(conversation.store.load_conversation_state(conversation.id).turns))   # queued
+        bridge.shutdown()
+        stored = conversation.store.load_conversation_state(conversation.id)
+        self.assertEqual(["Kaybolmasın."], [t.text for t in stored.turns])
+        blocker.set()
+        bridge.waitIdle()
+        self.assertEqual(1, len(conversation.store.load_conversation_state(conversation.id).turns))
+
     def test_secrets_never_reach_the_feed(self) -> None:
         bridge = self.bridge(task_proposal("code_analysis", objective=f"incele {SECRET}"))
         bridge.submitText(f"incele api_key={SECRET}")

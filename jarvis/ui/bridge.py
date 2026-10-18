@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import weakref
 from pathlib import Path
 from datetime import datetime, timedelta
 from typing import Any, Callable
@@ -395,6 +396,7 @@ class Bridge(QObject):
         self._sequence: dict[str, int] = {}
         self._handlers: dict[tuple[str, int], Callable[[Any], None]] = {}
         self._pending_jobs: dict[tuple[str, int], Callable[[], None]] = {}
+        self._deferred: weakref.WeakSet[PersistedConversation] = weakref.WeakSet()   # flushed at shutdown
         # -- state --
         self._busy = False
         # DFQUEUE: messages sent while JARVIS works elsewhere, oldest first (bridge memory only).
@@ -728,11 +730,18 @@ class Bridge(QObject):
         """
         kind, message = entry["kind"], entry["msg"]
         store = owner or self._conversation_store
+        # F-gt: the user's turn is written (and checkpointed) on the worker, queued
+        # ahead of its own run; never on the GUI thread, never at shutdown.
+        deferred = kind == "user" and not self.sync and not self._shutting_down
         if kind == "user" and isinstance(message, str):
             first = not any(turn.kind == "user" for turn in store.state.turns)
+            if deferred and store.defer is None:
+                store.defer = lambda job, conv=store: self._run(
+                    f"save:{uuid4().hex}", job, lambda _result: self._saved(conv))
+                self._deferred.add(store)
             turn = store.append(role="user", kind="user", message=message,
                                 text=history_text(message, entry.get("groups"), entry.get("attachments")),
-                                refs=refs or (), key=f"{self._store_run}:{entry['id']}")
+                                refs=refs or (), key=f"{self._store_run}:{entry['id']}", deferred=deferred)
             if first and turn is not None:
                 self._name_conversation(store, message)
             if turn is not None:
@@ -759,11 +768,27 @@ class Bridge(QObject):
                          text=result_history(shown, entry.get("capability"), entry.get("destination")),
                          capability=str(entry.get("capability") or ""), destination=str(entry.get("destination") or ""),
                          path=str(entry.get("path") or ""))
-        if store.store is not None and store.diagnostic:
-            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "The conversation could not be saved: %1"),
-                        (store.diagnostic,)), "error")
+        if not deferred:                    # a queued write reports through _saved
+            self._save_failed(store)
         if store is self._conversation_store and (kind == "result" or (kind == "jarvis" and entry.get("chat"))):
             self._refresh_context_usage()   # never on the user's turn: it would queue ahead of its own run
+
+    def _saved(self, conversation: PersistedConversation) -> None:
+        """A queued write finished: the screen takes the verified state, and a
+        refused turn is said, once."""
+        conversation._settle()
+        self._save_failed(conversation)
+
+    def _flush_saves(self) -> None:
+        """Write every queued save now (GUI thread; only before a lifecycle step or shutdown)."""
+        for conversation in {*self._deferred, self._conversation_store}:
+            conversation.flush()
+            self._save_failed(conversation)
+
+    def _save_failed(self, conversation: PersistedConversation) -> None:
+        if conversation.store is not None and conversation.diagnostic:
+            self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "The conversation could not be saved: %1"),
+                        (conversation.diagnostic,)), "error")
 
     def _conversation(self) -> tuple:
         """The canonical conversation's raw turns as ``{role, text}``.
@@ -943,14 +968,17 @@ class Bridge(QObject):
         title = task_title(message)[:120]
         if conversation.store is None:
             return
-        try:
-            # Never over a name the person already gave (Gate 6D-a).
-            record = conversation.store.load_conversation(conversation.id)
-            if title and record is not None and not record.title:
-                conversation.store.set_conversation_title(conversation.id, title)
-        except Exception:  # noqa: BLE001 - a label only; the conversation is unaffected
-            pass
-        self._refresh_conversations()
+        store, conversation_id = conversation.store, conversation.id
+
+        def name() -> None:   # on the worker, after the turn's own write (F-gt)
+            try:
+                # Never over a name the person already gave (Gate 6D-a).
+                record = store.load_conversation(conversation_id)
+                if title and record is not None and not record.title:
+                    store.set_conversation_title(conversation_id, title)
+            except Exception:  # noqa: BLE001 - a label only; the conversation is unaffected
+                pass
+        self._run(f"name:{uuid4().hex}", name, lambda _result: self._refresh_conversations())
 
     @staticmethod
     def _listed_title(record: Any) -> Any:
@@ -1195,6 +1223,7 @@ class Bridge(QObject):
         what waits for the person or Resume (``park``: not when it is left
         because it was deleted or archived), and ``opened`` gets back what it
         kept, once proven still its own."""
+        self._flush_saves()                                       # its queued turns are on disk before anything reloads it
         left = self._conversation_store.id
         if park and opened.id != left:                            # re-opening the same one (attach) starts fresh
             self._park(left, self._live_slots())
@@ -2271,6 +2300,7 @@ class Bridge(QObject):
         """Preview attaching the open conversation to ``project_id`` or to a
         new project named ``new_name`` ("" / "" clears the preview)."""
         self._attach_preview, self._attach_notice = {}, ""
+        self._flush_saves()
         if project_id or new_name:
             target = self._attach_target(project_id, new_name)
             payload = self.backend.conversation_attach_preview(str(self._conversation_store.id or ""), **target)
@@ -2285,6 +2315,7 @@ class Bridge(QObject):
         previewed. Afterwards the conversation is re-opened, so the next task
         starts a fresh Core session."""
         held = self._attach_preview
+        self._flush_saves()
         if not held or held.get("blocked") or self._runs_in(held["conversation_id"]):
             return False
         if held["request"] != self._attach_target(project_id, new_name):
@@ -2394,6 +2425,7 @@ class Bridge(QObject):
         return self._lifecycle_notice == ""
 
     def _lifecycle_refused(self, conversation_id: str) -> bool:
+        self._flush_saves()
         if self._runs_in(conversation_id):
             self._lifecycle_notice = tx("Bridge", QT_TRANSLATE_NOOP("Bridge", "Wait for the current run to finish."))
         elif not conversation_id:
@@ -2425,6 +2457,7 @@ class Bridge(QObject):
         """Hold what a permanent delete of ``conversation_id`` would remove
         ("" clears it); the dialog shows it and the confirm sends it."""
         self._delete_preview, self._lifecycle_notice = {}, ""
+        self._flush_saves()
         if str(conversation_id):
             payload = self.backend.conversation_delete_preview(str(conversation_id))
             self._lifecycle_notice = self._error_message(payload)
@@ -2439,6 +2472,7 @@ class Bridge(QObject):
         refreshes the preview and is never retried."""
         conversation_id = str(conversation_id)
         held = self._delete_preview
+        self._flush_saves()                                          # a queued turn moves next_seq: refused, not lost
         if self._runs_in(conversation_id) or not held or held.get("blocked") or held.get("conversation_id") != conversation_id:
             return False
         payload = self.backend.conversation_delete(conversation_id, confirm=conversation_id,
@@ -6094,8 +6128,9 @@ class Bridge(QObject):
         if not self._quitting:
             self._return_queue()               # DFQUEUE: a quit by another path keeps them too, as drafts
         self._save_drafts()                    # DFDRAFT: the last keystrokes too (no-op after confirmQuit's)
-        # A turn whose write met a busy file is written now, not lost with the process.
-        self._conversation_store.flush()
+        # A turn whose write met a busy file, or still queued for the worker, is
+        # written now, not lost with the process.
+        self._flush_saves()
         self._memory_hook("memory_capture_shutdown", self._conversation_store.id or "")   # bounded (I12)
 
     def _memory_hook(self, name: str, conversation_id: str) -> None:

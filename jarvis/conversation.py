@@ -49,6 +49,7 @@ import json
 import math
 import os
 import re
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field, replace
@@ -926,6 +927,13 @@ class PersistedConversation:
     ``store`` ``None`` is a conversation that cannot be saved at all (the
     configuration was refused): it lives in memory for this window only and
     ``diagnostic`` says so from the start.
+
+    ``append(deferred=True)`` with a ``defer`` set (the window's worker) keeps
+    the write off the caller's thread: ``state`` shows the turn at once, the
+    write is queued in order, and ``_settle`` then takes the verified state
+    and the first failure as ``diagnostic``. Every immediate change and
+    ``flush`` first writes what is queued, so order is kept and nothing is
+    left behind at shutdown.
     """
 
     def __init__(self, store: Any, conversation_id: str | None, state: ConversationState | None = None,
@@ -937,8 +945,15 @@ class PersistedConversation:
         self.diagnostic = "" if store is not None else "the conversation store is unavailable"
         self._instance = hashlib.sha256(f"{os.getpid()}:{time.time_ns()}:{id(self)}".encode()).hexdigest()[:12]
         self._auto = 0
+        #: Runs a queued write off the caller's thread (``defer(job)``); ``None`` writes at once.
+        self.defer: Callable[[Callable[[], None]], None] | None = None
+        self._pending: list[Callable[[ConversationState], ConversationState]] = []
+        self._lock = threading.Lock()          # guards the queue and its results
+        self._write_lock = threading.Lock()    # one writer at a time: queue order is store order
+        self._verified = self.state
+        self._error = ""
 
-    def append(self, **fields: Any) -> Turn | None:
+    def append(self, *, deferred: bool = False, **fields: Any) -> Turn | None:
         if not fields.get("key"):
             self._auto += 1
             fields["key"] = f"auto:{self._instance}:{self._auto}"
@@ -949,9 +964,45 @@ class PersistedConversation:
         # The hook fires on the stored apply only (it runs once, on the
         # authoritative record), never on the local preview above.
         on_compact = self._precompact()
-        return turn if self._change(
-            lambda base: append_turn(base, raw_turns_max=self.raw_turns_max, on_compact=on_compact, **fields)[0]
-        ) else None
+
+        def apply(base: ConversationState) -> ConversationState:
+            return append_turn(base, raw_turns_max=self.raw_turns_max, on_compact=on_compact, **fields)[0]
+
+        if deferred and self.defer is not None and self.store is not None and self.id is not None:
+            self.state = state
+            with self._lock:
+                self._pending.append(apply)
+            self.defer(self._drain)
+            return turn
+        return turn if self._change(apply) else None
+
+    def _drain(self) -> None:
+        """Write every queued change in order (any thread). A refused one is
+        dropped and its reason kept for ``_settle`` (fail closed)."""
+        with self._write_lock:
+            while True:
+                with self._lock:
+                    if not self._pending:
+                        return
+                    apply = self._pending[0]
+                verified, error = None, ""
+                try:
+                    verified = self.store.update_conversation_state(self.id, apply)
+                except Exception as exc:  # noqa: BLE001 - storage boundary; fail closed
+                    error = f"the conversation could not be saved: {type(exc).__name__}"
+                with self._lock:
+                    self._pending.pop(0)    # only now: ``_settle`` never sees an in-flight write as done
+                    if verified is None:
+                        self._error = self._error or error
+                    else:
+                        self._verified = verified
+
+    def _settle(self) -> None:
+        """Take what the queued writes left (caller's thread), once none is queued."""
+        with self._lock:
+            if self._pending or self.store is None or self.id is None:
+                return
+            self.state, self.diagnostic, self._error = self._verified, self._error, ""
 
     def _precompact(self) -> Callable[[tuple[Turn, ...]], None] | None:
         """This conversation's PreCompact callback, or ``None`` when no hook."""
@@ -975,17 +1026,24 @@ class PersistedConversation:
         return next((t.shown for t in self.state.titles if t.id == id), "")
 
     def flush(self) -> None:
-        """Nothing is ever pending: every change was written, or refused."""
+        """Write every queued change now: afterwards each was written, or refused."""
+        self._drain()
+        self._settle()
 
     def _change(self, apply) -> bool:
         if self.store is None or self.id is None:
             self.state = apply(self.state)
             return False
+        # A queued write goes first (store order is turn order); its refusal
+        # stays for ``_settle``, whose caller reports it.
+        self._drain()
         try:
-            self.state = self.store.update_conversation_state(self.id, apply)
+            verified = self.store.update_conversation_state(self.id, apply)
         except Exception as exc:  # noqa: BLE001 - storage boundary; fail closed
             self.diagnostic = f"the conversation could not be saved: {type(exc).__name__}"
             return False
+        with self._lock:
+            self.state = self._verified = verified
         self.diagnostic = ""
         return True
 

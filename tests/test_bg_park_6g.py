@@ -490,6 +490,7 @@ class ParkedStateTests(UiTestCase):
                                        task_proposal("code_analysis", objective="Yeniden incele."), sync=False)
         session = self.own_session(bridge, store, a)
         self.assertTrue(bridge.submitText("Yeniden incele."))                 # queued: the run is in flight
+        bridge._pool.step()                                                    # F-gt: the user turn is saved first
         self.assertEqual((True, a), (bridge.busy, bridge.runningConversationId))
         held, cancels, real = {}, [], bridge.backend.cancel
         bridge.backend.active_task_id = lambda s: "t-not-yet"                 # Core registers it inside the run
@@ -540,6 +541,7 @@ class ParkedStateTests(UiTestCase):
         bridge._apply_run(self.waiting_run(session))                          # A's task waits for an answer
         bridge.backend.clarify = lambda s, t, text: self.waiting_run(session, status="completed")
         self.assertTrue(bridge.submitText("Rapor Türkçe olsun."))            # the answer: queued, in flight
+        bridge._pool.step()                                                    # F-gt: the user turn is saved first
         bridge.backend.active_task_id = lambda s: "t-clar"
         bridge.backend.cancel = lambda s, t: {"command": "cancel", "error": {"code": "task_not_found", "message": "gone"}}
         bridge.cancelTask()                                                    # Durdur: queued behind the answer
