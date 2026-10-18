@@ -334,11 +334,6 @@ class CliWorkingDirectoryTests(DataDirectoryCase):
         self.assertTrue(popen.called)  # control: the default root still launches
         self.assertOutsideData(launched_cwd(popen))
 
-    # BLOCKED (SKSINGLEWRITER): by design (Settings.gmail_config_dir) every gws
-    # call - login, status, reads, writes - runs in <data>\gmail-config\run.
-    # A V2.1 confidential-transport design decision, not a lane fix. Real
-    # assert: an unexpected success once moved - drop the decorator then.
-    @unittest.expectedFailure
     def test_the_gmail_cli_starts_outside_the_data_directory(self) -> None:
         self.assertOutsideData(gmail_cli._run_directory(str(self.settings.gmail_config_dir)))
 

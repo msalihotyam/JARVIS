@@ -193,9 +193,9 @@ class Settings:
         """The JARVIS-dedicated browser profile directory (Google Chrome's
         ``--user-data-dir``).
 
-        DERIVED, never configured, and beside the memory database for the
-        same reason the Gmail config directory is: the browser JARVIS drives
-        must never be the operator's own logged-in one - never Chrome's own
+        DERIVED, never configured, and beside the memory database: the
+        browser JARVIS drives must never be the operator's own logged-in
+        one - never Chrome's own
         ``%LOCALAPPDATA%\\Google\\Chrome\\User Data``. Not a secret and not a
         credential: a location.
 
@@ -209,14 +209,25 @@ class Settings:
     def gmail_config_dir(self) -> Path:
         """The JARVIS-dedicated Google Workspace CLI configuration directory.
 
-        DERIVED, never configured: it lives beside the memory database, in
-        JARVIS's own data directory, so the one credential route Gmail
-        accepts is always the credential ``jarvis gmail login`` established
-        INTO this directory through the controlled ``gws auth login``, and
-        never the operator's ambient ``~/.config/gws`` session. Part of the
-        trusted local boundary, JARVIS-owned like the database beside it.
-        Not a secret and not a credential: a location.
+        DERIVED, never configured, so the one credential route Gmail accepts
+        is always the credential ``jarvis gmail login`` established INTO this
+        directory through the controlled ``gws auth login``, and never the
+        operator's ambient ``~/.config/gws`` session. A SIBLING of the data
+        directory (``<data>-gws-gmail``), never inside it: Core is the single
+        writer of the data directory and the gws child writes its config, its
+        keyring and its ``run`` directory here. Derived from the memory
+        database like every other location, so a relocated data directory
+        carries its Gmail directory along. Not a secret and not a credential:
+        a location.
         """
+        data = Path(self.memory_database).resolve().parent
+        return data.parent / f"{data.name}-gws-gmail"
+
+    @property
+    def legacy_gmail_config_dir(self) -> Path:
+        """Where :attr:`gmail_config_dir` lived until it left the data
+        directory; read only by the one-time startup move
+        (``jarvis.gmail_cli.migrate_gmail_config_dir``)."""
         return Path(self.memory_database).resolve().parent / "gws-gmail"
 
     def __post_init__(self) -> None:

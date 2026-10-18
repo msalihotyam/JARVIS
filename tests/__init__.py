@@ -69,3 +69,21 @@ def _refuse_live_database(self, database_path) -> None:  # type: ignore[no-untyp
 
 if getattr(_memory.SQLiteMemoryStore.__init__, "__name__", "") != _refuse_live_database.__name__:
     _memory.SQLiteMemoryStore.__init__ = _refuse_live_database
+
+# The CLI moves the legacy Gmail directory out of the data directory at every
+# start, before any store is opened. A test whose settings let the default
+# through must never move the operator's live one: for the live data
+# directory the move is a no-op. Bound here, before ``jarvis.cli`` imports it.
+from jarvis import gmail_cli as _gmail_cli  # noqa: E402
+
+_migrate_gmail = _gmail_cli.migrate_gmail_config_dir
+
+
+def _never_move_live_gmail(legacy, current):  # type: ignore[no-untyped-def]
+    if Path(legacy).resolve().parent == LIVE_DATABASE.parent:
+        return None
+    return _migrate_gmail(legacy, current)
+
+
+if getattr(_gmail_cli.migrate_gmail_config_dir, "__name__", "") != _never_move_live_gmail.__name__:
+    _gmail_cli.migrate_gmail_config_dir = _never_move_live_gmail

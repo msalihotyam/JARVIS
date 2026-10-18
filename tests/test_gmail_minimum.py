@@ -110,6 +110,7 @@ from jarvis.gmail_cli import (
     gmail_route_check,
     gmail_step_lock,
     held_credential,
+    migrate_gmail_config_dir,
     observed_gmail_identity,
     read_credential_attestation,
     run_operation_plan,
@@ -2054,11 +2055,13 @@ class ConfiguredAuthorityTests(unittest.TestCase):
         identity, policy = gmail_authority(settings)
         self.assertEqual(ACCOUNT, identity.principal)
         self.assertEqual(GMAIL_CREDENTIAL_ROUTE, identity.credential_route)
-        # The dedicated directory is derived from JARVIS's own data directory,
-        # beside the memory database - never the operator's ambient gws config.
+        # The dedicated directory is derived from JARVIS's own data directory:
+        # its sibling, never inside it (Core is the data directory's only
+        # writer) and never the operator's ambient gws config.
+        data = Path(settings.memory_database).resolve().parent
         self.assertEqual(str(settings.gmail_config_dir), identity.config_dir)
-        self.assertEqual("gws-gmail", Path(identity.config_dir).name)
-        self.assertEqual(Path(settings.memory_database).resolve().parent, Path(identity.config_dir).parent)
+        self.assertEqual(f"{data.name}-gws-gmail", Path(identity.config_dir).name)
+        self.assertEqual(data.parent, Path(identity.config_dir).parent)
         self.assertTrue(os.path.isabs(identity.config_dir))
         self.assertEqual(POLICY, policy)
         self.assertNotIn(DestinationGrant(GMAIL_CONNECTOR, "gmail_attachment_read", DEST), policy)
@@ -2068,6 +2071,92 @@ class ConfiguredAuthorityTests(unittest.TestCase):
             with self.subTest(principal=bad):
                 with self.assertRaises(ValueError):
                     Settings(gmail_principal=bad)
+
+
+class ConfigDirMigrationTests(unittest.TestCase):
+    """The one-time move of the legacy directory out of the data directory:
+    rename only, never merge or copy, and every warning names no path."""
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, self.temp)
+        settings = Settings(memory_database=str(Path(self.temp.name, "data", "jarvis.db")))
+        self.legacy = settings.legacy_gmail_config_dir
+        self.current = settings.gmail_config_dir
+        self.legacy.mkdir(parents=True)
+
+    def assert_no_path(self, warning: str | None) -> None:
+        self.assertIsNotNone(warning)
+        for named in (self.temp.name, str(self.legacy), str(self.current), "gws-gmail", "\\", "/"):
+            self.assertNotIn(named, warning)
+
+    def test_the_legacy_directory_moves_once_and_its_attestation_follows(self) -> None:
+        attest(str(self.legacy))
+        self.assertIsNone(migrate_gmail_config_dir(self.legacy, self.current))
+        self.assertFalse(self.legacy.exists())
+        self.assertEqual(CREDENTIAL_BYTES, Path(self.current, "credentials.enc").read_bytes())
+        moved = read_credential_attestation(str(self.current))
+        self.assertIsNone(gmail_attestation_refusal(moved, principal=ACCOUNT, config_dir=str(self.current), credentials=CREDENTIAL_BYTES))
+        # Idempotent: once moved there is nothing left to do or report.
+        self.assertIsNone(migrate_gmail_config_dir(self.legacy, self.current))
+        self.assertEqual(moved, read_credential_attestation(str(self.current)))
+
+    def test_a_crash_between_the_rename_and_the_attestation_is_repaired_at_the_next_start(self) -> None:
+        attest(str(self.legacy))
+        os.rename(self.legacy, self.current)  # the move landed; the attestation did not follow
+        self.assertIsNone(migrate_gmail_config_dir(self.legacy, self.current))
+        self.assertEqual(str(self.current), read_credential_attestation(str(self.current)).config_dir)
+
+    def test_nothing_to_move_is_silent(self) -> None:
+        self.legacy.rmdir()
+        self.assertIsNone(migrate_gmail_config_dir(self.legacy, self.current))
+        self.assertFalse(self.current.exists())
+
+    def test_both_present_keeps_the_current_and_touches_neither(self) -> None:
+        attest(str(self.legacy), credentials=b"legacy-bytes")
+        self.current.mkdir()
+        attest(str(self.current))
+        warning = migrate_gmail_config_dir(self.legacy, self.current)
+        self.assert_no_path(warning)
+        self.assertEqual(b"legacy-bytes", Path(self.legacy, "credentials.enc").read_bytes())
+        self.assertEqual(CREDENTIAL_BYTES, Path(self.current, "credentials.enc").read_bytes())
+        self.assertEqual(str(self.legacy), read_credential_attestation(str(self.legacy)).config_dir)
+        self.assertEqual(str(self.current), read_credential_attestation(str(self.current)).config_dir)
+
+    def test_a_failed_move_leaves_the_legacy_directory_in_use(self) -> None:
+        attest(str(self.legacy))
+        with mock.patch.object(gmail_cli.os, "rename", side_effect=PermissionError("held")):
+            warning = migrate_gmail_config_dir(self.legacy, self.current)
+        self.assert_no_path(warning)
+        self.assertFalse(self.current.exists())
+        self.assertEqual(CREDENTIAL_BYTES, Path(self.legacy, "credentials.enc").read_bytes())
+        self.assertEqual(str(self.legacy), read_credential_attestation(str(self.legacy)).config_dir)
+
+    def test_a_legacy_link_is_never_followed(self) -> None:
+        outside = Path(self.temp.name, "outside")
+        outside.mkdir()
+        attest(str(outside))
+        self.legacy.rmdir()
+        made = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(self.legacy), str(outside)], capture_output=True
+        ) if os.name == "nt" else None
+        if made is None or made.returncode != 0:
+            try:
+                os.symlink(outside, self.legacy, target_is_directory=True)
+            except OSError:
+                self.skipTest("no junction or symlink can be made here")
+        self.addCleanup(os.rmdir, self.legacy)  # unlinks the link, never its target
+        warning = migrate_gmail_config_dir(self.legacy, self.current)
+        self.assert_no_path(warning)
+        self.assertFalse(self.current.exists())
+        self.assertTrue(os.path.lexists(self.legacy))
+        self.assertEqual(CREDENTIAL_BYTES, Path(outside, "credentials.enc").read_bytes())
+
+    def test_a_legacy_file_is_not_moved(self) -> None:
+        self.legacy.rmdir()
+        self.legacy.write_bytes(b"not a directory")
+        self.assert_no_path(migrate_gmail_config_dir(self.legacy, self.current))
+        self.assertFalse(self.current.exists())
 
 
 class TaskInputTests(unittest.TestCase):

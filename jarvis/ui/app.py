@@ -197,7 +197,20 @@ def main(argv: list[str] | None = None, *, instance: str | None = None) -> int:
     # The weather key is taken OUT of the environment before anything starts, so
     # no child process (Claude, Codex, Antigravity...) ever inherits it.
     weather_key = os.environ.pop(WEATHER_KEY_ENV, "").strip()
-    bridge = Bridge(Backend(), UiPreferences(), weather_key=weather_key)
+    backend = Backend()
+    # The one-time move of the Gmail directory out of the data directory, as
+    # ``jarvis.cli.main`` does it: a window-only operator gets it too. Only for
+    # a usable configuration; the warning names no path.
+    loaded = backend.store.load()
+    if loaded.usable is True:
+        from jarvis import gmail_cli
+
+        warning = gmail_cli.migrate_gmail_config_dir(
+            loaded.settings.legacy_gmail_config_dir, loaded.settings.gmail_config_dir
+        )
+        if warning is not None:
+            print(f"jarvis: warning: {warning}", file=sys.stderr)
+    bridge = Bridge(backend, UiPreferences(), weather_key=weather_key)
     engine = create_engine(bridge, icon=icon)
     if not engine.rootObjects():
         teardown(bridge, engine)      # the same orderly end: no late delivery into a deleted bridge

@@ -110,11 +110,12 @@ import contextlib
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping
@@ -138,6 +139,7 @@ from jarvis.gmail import (
     GmailExecutionUnavailable,
     GmailOutcomeUnknown,
     GmailResourceKind,
+    _same_path,
     gmail_address_refusal,
     gmail_listing_thread_ids,
     gws_thread_metadata_arguments,
@@ -563,6 +565,75 @@ def write_credential_attestation(config_dir: str, attestation: GmailCredentialAt
         with contextlib.suppress(OSError):
             os.remove(temp)
         raise GmailCommandFailed("the credential attestation could not be written") from exc
+
+
+_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+
+
+def migrate_gmail_config_dir(legacy: str | Path, current: str | Path) -> str | None:
+    """The one-time move of the dedicated directory out of the data directory.
+
+    ``None`` when there is nothing to report (no legacy directory - the
+    idempotent steady state - or the move just succeeded); otherwise a bounded
+    warning naming no path. Only a same-volume rename of the whole directory:
+    nothing is copied, merged or read except the attestation record. A legacy
+    entry that is a link/junction/reparse point or not a directory is refused
+    untouched; when both directories exist the current one wins and the
+    legacy one is left as it is (fail closed, no merge); a failed rename
+    leaves the legacy directory where it was, still usable.
+    """
+    try:
+        info = os.lstat(legacy)
+    except FileNotFoundError:
+        return _follow_moved_attestation(legacy, current)
+    except OSError:
+        return "the legacy Gmail directory inside the data directory cannot be inspected; it was not moved"
+    if (
+        stat.S_ISLNK(info.st_mode)
+        or getattr(info, "st_file_attributes", 0) & _REPARSE_POINT
+        or not stat.S_ISDIR(info.st_mode)
+    ):
+        return "the legacy Gmail directory inside the data directory is a link or not a directory; it was not moved"
+    try:
+        os.lstat(current)
+    except FileNotFoundError:
+        pass
+    except OSError:
+        return "the Gmail directory beside the data directory cannot be inspected; the legacy one was not moved"
+    else:
+        return (
+            "a legacy Gmail directory is still inside the data directory beside the current one; "
+            "the current one is used and the legacy one is untouched - remove it once checked"
+        )
+    try:
+        os.rename(legacy, current)
+    except OSError:
+        return "the Gmail directory could not be moved out of the data directory; the legacy one stays in use"
+    return _follow_moved_attestation(legacy, current)
+
+
+def _follow_moved_attestation(legacy: str | Path, current: str | Path) -> str | None:
+    """Point the attestation at the moved directory. Runs at every start, not
+    only right after the rename, so a crash between the two is repaired on the
+    next start. A ``current`` that is a link/junction is never read through."""
+    try:
+        info = os.lstat(current)
+    except OSError:
+        return None
+    if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & _REPARSE_POINT:
+        return None
+    try:
+        attestation = read_credential_attestation(str(current))
+    except (GmailCommandFailed, RecursionError):
+        return None
+    if _same_path(attestation.config_dir, str(legacy)):
+        try:
+            write_credential_attestation(
+                str(current), replace(attestation, config_dir=str(current))
+            )
+        except GmailCommandFailed:
+            return "the Gmail directory moved but its attestation was not updated; run 'jarvis gmail login'"
+    return None
 
 
 @contextlib.contextmanager
@@ -1047,6 +1118,7 @@ __all__ = [
     "gmail_route_check",
     "gmail_step_lock",
     "held_credential",
+    "migrate_gmail_config_dir",
     "read_credential_attestation",
     "write_credential_attestation",
     "gws_executable",

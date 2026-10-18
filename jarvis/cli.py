@@ -61,7 +61,7 @@ from jarvis.contracts import (
 )
 from jarvis.core import migrate_legacy_memory
 from jarvis.gmail import GmailExecutionUnavailable
-from jarvis.gmail_cli import gmail_controlled_login
+from jarvis.gmail_cli import gmail_controlled_login, migrate_gmail_config_dir
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.settings import (
     CLAUDE_MODEL_PATTERN,
@@ -146,7 +146,8 @@ def _build_parser() -> _ArgumentParser:
     # Gmail minimum: the controlled login that establishes and attests the
     # JARVIS-dedicated authorized-user credential. It builds no registry,
     # connector, AgentCore or model; it runs exactly one child,
-    # ``gws auth login``, into the dedicated directory and records what it
+    # ``gws auth login``, into the dedicated directory beside (never inside)
+    # the data directory - ``Settings.gmail_config_dir`` - and records what it
     # produced. Provenance is the type proof, so the login must be this
     # build's own - see ``jarvis.gmail_cli.gmail_controlled_login``.
     gmail_command = commands.add_parser(
@@ -1094,6 +1095,16 @@ def main(
         else load_settings()
     )
     base: Settings = settings_result.settings
+    # The one-time move of the Gmail directory out of the data directory;
+    # a no-op once moved. Only for usable settings: a fail-closed fallback
+    # does not name the operator's data directory. The warning names no path.
+    gmail_move_warning = (
+        migrate_gmail_config_dir(base.legacy_gmail_config_dir, base.gmail_config_dir)
+        if settings_result.usable
+        else None
+    )
+    if gmail_move_warning is not None:
+        print(f"jarvis: warning: {gmail_move_warning}", file=sys.stderr)
     try:
         args = parser.parse_args(argv)
     except _ArgumentFailure as exc:
