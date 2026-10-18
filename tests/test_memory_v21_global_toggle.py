@@ -12,6 +12,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from jarvis.contracts import (
     DataClassification,
@@ -24,6 +25,7 @@ from jarvis.contracts import (
     MemoryRecordStatus,
 )
 from jarvis.memory import CONVERSATION_GLOBAL_MEMORY_TOGGLES, SQLiteMemoryStore
+from jarvis.memory_filter import classify_subject_key
 from jarvis.memory_guard import Provenance, RecordGuard, SessionTaint, content_hash
 from tests.helpers import safe_cleanup
 
@@ -171,19 +173,102 @@ class GlobalToggleTests(unittest.TestCase):
         # The project scope is unchanged: Alpha still sees only Alpha.
         self.assertEqual([mine], [v.record.record_id for v in self.store.list_records(MemoryRecordScope(self.alpha))])
 
+    def global_ids(self, query: str = "ruff", limit: int = 20) -> tuple[set, set]:
+        listed = {v.record.record_id for v in self.store.list_records(self.global_scope())}
+        found = {v.record.record_id for v, _ in self.store.search_records(query, self.global_scope(), limit=limit)}
+        return listed, found
+
+    @staticmethod
+    def forced_secret(record_id: str):
+        """Row-level SECRET fixture: the schema refuses classification='secret'
+        and MemoryRecord refuses SECRET, so the row is turned SECRET as it is
+        read back, past both walls, to reach the global read filter."""
+        original = SQLiteMemoryStore._record_view_from_row
+
+        def view_from_row(row):
+            view = original(row)
+            if view is not None and view.record.record_id == record_id:
+                object.__setattr__(view.record, "classification", DataClassification.SECRET)
+            return view
+
+        return mock.patch.object(SQLiteMemoryStore, "_record_view_from_row", staticmethod(view_from_row))
+
     def test_global_reads_never_return_secret_or_filter_refused_rows(self) -> None:
         clean = self.add("beta uses ruff", self.beta)
+        sensitive = self.add("beta ruff sensitive row", self.beta)
         secret = self.add("beta ruff secret row", self.beta)
         leaked = self.add("beta ruff tampered row", self.beta)
-        # The schema itself never stores a SECRET row (the read filter is a second wall).
-        with self.assertRaises(sqlite3.IntegrityError):
-            self.sql("UPDATE memory_records SET classification = 'secret' WHERE record_id = ?", (secret,))
-        self.sql("UPDATE memory_records SET classification = 'sensitive' WHERE record_id = ?", (secret,))
+        self.sql("UPDATE memory_records SET classification = 'sensitive' WHERE record_id = ?", (sensitive,))
         # A credential that reached the table past the write-time checks.
         self.sql("UPDATE memory_records SET text = 'ruff password: hunter2xyz' WHERE record_id = ?", (leaked,))
         self.store.set_global_memory_toggle(self.cid, True, USER)
-        self.assertEqual({clean, secret}, {v.record.record_id for v in self.store.list_records(self.global_scope())})
-        self.assertEqual({clean, secret}, {v.record.record_id for v, _ in self.store.search_records("ruff", self.global_scope())})
+        with self.forced_secret(secret):
+            listed, found = self.global_ids()
+            # The project scope still reads it: only the global read bans SECRET.
+            in_project = {v.record.record_id for v in self.store.list_records(MemoryRecordScope(self.beta))}
+        self.assertEqual({clean, sensitive}, listed)
+        self.assertEqual({clean, sensitive}, found)
+        self.assertIn(secret, in_project)
+
+    def test_search_pages_past_refused_rows_and_never_under_delivers(self) -> None:
+        refused = [self.add(f"beta ruff tampered row {n}", self.beta) for n in range(6)]
+        for record_id in refused:
+            self.sql("UPDATE memory_records SET text = 'ruff password: hunter2xyz' WHERE record_id = ?", (record_id,))
+        clean = {self.add(f"beta uses ruff in the long build pipeline {n}", self.beta) for n in range(2)}
+        self.store.set_global_memory_toggle(self.cid, True, USER)
+        for fts in (True, False):
+            with self.subTest(fts=fts), mock.patch("jarvis.memory.memory_records_fts_available", return_value=fts), \
+                    mock.patch("jarvis.memory._RECORD_LIST_MAX_LIMIT", 3):  # page size 3: 8 rows span three pages
+                for limit in (1, 2, 3):
+                    found = [v.record.record_id for v, _ in
+                             self.store.search_records("ruff", self.global_scope(), limit=limit)]
+                    self.assertEqual(min(limit, 2), len(found))
+                    self.assertTrue(set(found) <= clean)
+                project = [v.record.record_id for v, _ in self.store.search_records("ruff", MemoryRecordScope(self.beta), limit=2)]
+                self.assertEqual(clean, set(project))
+
+    def test_reads_recheck_the_subject_key_against_normalized_secret_shapes(self) -> None:
+        # The key normalizer folds case and separators, hiding these shapes
+        # from the text filter; the read filter must still refuse each.
+        shapes = {
+            "separator": "ghp-abcdefghijklmnopqrstuvwxyz0123456789",
+            "case": "akiaiosfodnn7example",
+            "space": "bearer-eyjhbgcioijiuzi1nij9-eyjzdwiioiixin0-abcdefghijk",
+            "plain": "password-hunter2xyz",
+            "underscore-pat": "github-pat-11abcdefg0123456789-abcdefghijklmnopqrstuvwxyz",
+        }
+        legit = self.add("beta ruff legit key", self.beta)
+        self.sql("UPDATE memory_records SET subject_key = 'password-policy' WHERE record_id = ?", (legit,))
+        tampered = {}
+        for name, key in shapes.items():
+            tampered[name] = self.add(f"beta ruff key {name}", self.beta)
+            self.sql("UPDATE memory_records SET subject_key = ? WHERE record_id = ?", (key, tampered[name]))
+        self.store.set_global_memory_toggle(self.cid, True, USER)
+        listed, found = self.global_ids()
+        in_project = {v.record.record_id for v in self.store.list_records(MemoryRecordScope(self.beta))}
+        for name, record_id in tampered.items():
+            with self.subTest(name):
+                self.assertNotIn(record_id, listed)
+                self.assertNotIn(record_id, found)
+                self.assertNotIn(record_id, in_project)
+        self.assertEqual({legit}, listed)
+        self.assertEqual({legit}, found)
+
+
+class SubjectKeyFilterTests(unittest.TestCase):
+    def test_folded_secret_shapes_are_refused_and_plain_keys_pass(self) -> None:
+        refused = ["ghp-abcdefghijklmnopqrstuvwxyz0123456789", "akiaiosfodnn7example",
+                   "password-hunter2xyz", "bearer-eyjhbgcioijiuzi1nij9-eyjzdwiioiixin0-abcdefghijk",
+                   "tooling-password-hunter2xyz"]
+        allowed = ["tooling", "python-version", "password-policy", "api-key-rotation-policy",
+                   "secret-management", "deploy-token-rotation", "aws-region", "openai-api-key"]
+        for key in refused:
+            with self.subTest(refused=key):
+                self.assertFalse(classify_subject_key(key).allowed)
+        for key in allowed:
+            with self.subTest(allowed=key):
+                self.assertTrue(classify_subject_key(key).allowed)
+        self.assertFalse(classify_subject_key(None).allowed)  # fail-closed on a non-string
 
 
 if __name__ == "__main__":

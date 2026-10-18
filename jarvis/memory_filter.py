@@ -375,3 +375,23 @@ def classify_candidate_text(text: str) -> FilterVerdict:
         return _scan(text)
     except Exception:  # noqa: BLE001 - any failure refuses the candidate (I5)
         return FilterVerdict(False, "filter_error", "filter failed; refused")
+
+
+def classify_subject_key(key: str) -> FilterVerdict:
+    """Like classify_candidate_text for a normalized subject key.
+
+    The key normalizer casefolds and turns punctuation into "-", which hides
+    case- and separator-shaped secrets (ghp_..., AKIA..., "Bearer x") from
+    the text filter, so the folded-away forms are checked too. Fail-closed.
+    ponytail: mixed-case prefixes (AIza...) and words split by stripped
+    characters cannot be rebuilt from the key; only the raw key at the
+    writer closes that.
+    """
+    if not isinstance(key, str):
+        return classify_candidate_text(key)
+    verdict = classify_candidate_text(key)
+    for form in (key.replace("-", "_"), key.upper(), key.replace("-", " ")):
+        if not verdict.allowed:
+            break
+        verdict = classify_candidate_text(form)
+    return verdict

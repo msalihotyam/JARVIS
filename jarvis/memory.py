@@ -182,7 +182,7 @@ from jarvis.memory_doctor import (
     RepairAction,
     RepairProposal,
 )
-from jarvis.memory_filter import classify_candidate_text
+from jarvis.memory_filter import classify_candidate_text, classify_subject_key
 from jarvis.memory_guard import (
     REFUSE,
     Provenance,
@@ -1321,6 +1321,9 @@ _LEGACY_RECORD_KINDS = {
     ProjectMemoryKind.RULE: MemoryRecordKind.RULE,
 }
 _RECORD_LIST_MAX_LIMIT = 500
+# search_records pages past rows the read filter refuses until it has
+# ``limit`` readable rows; this caps the rows one search may scan.
+_RECORD_SEARCH_MAX_SCAN = 10 * _RECORD_LIST_MAX_LIMIT
 _RECORD_COLUMNS = (
     "r.record_id, r.kind, r.text, r.subject_key, r.project_id, "
     "r.conversation_id, r.origin, r.actor, r.tool, r.confidence, "
@@ -8618,19 +8621,36 @@ class SQLiteMemoryStore:
             raise ValueError(
                 f"query_text has more than {_RECORD_SEARCH_MAX_TOKENS} words"
             )
+        results: list[tuple[MemoryRecordView, float]] = []
         with self._connection() as connection:
             connection.execute("BEGIN")  # toggle check and read: one snapshot
             try:
-                rows, ranks = self._search_rows(connection, scope, tokens, where, params, limit)
+                # The read filter runs after SQL LIMIT, so page on (same
+                # snapshot, stable order) until limit readable rows or the
+                # scan cap: refused rows never shrink the result. Pages are
+                # full-size so the scan is at most 10 queries; a readable row
+                # past the cap is not returned.
+                page = _RECORD_LIST_MAX_LIMIT
+                offset = 0
+                while len(results) < limit and offset < _RECORD_SEARCH_MAX_SCAN:
+                    rows, ranks = self._search_rows(
+                        connection, scope, tokens, where, params, page, offset
+                    )
+                    for row, rank in zip(rows, ranks):
+                        view = self._record_view_from_row(row)
+                        if (
+                            view is not None
+                            and self._view_readable(view, scope)
+                            and len(results) < limit
+                        ):
+                            results.append((view, rank))
+                    if len(rows) < page:
+                        break
+                    offset += page
                 if self._memory_off_any(connection, (scope.conversation_id, for_conversation_id)):
-                    rows, ranks = [], []
+                    results = []
             finally:
                 connection.rollback()
-        results = []
-        for row, rank in zip(rows, ranks):
-            view = self._record_view_from_row(row)
-            if view is not None and self._view_readable(view, scope):
-                results.append((view, rank))
         return results
 
     def _search_rows(
@@ -8641,6 +8661,7 @@ class SQLiteMemoryStore:
         where: str,
         params: list[object],
         limit: int,
+        offset: int = 0,
     ) -> tuple[list[sqlite3.Row], list[float]]:
         """search_records' query, inside the caller's read transaction."""
         self._require_global_read(connection, scope)
@@ -8648,8 +8669,8 @@ class SQLiteMemoryStore:
             match = " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
             rows = connection.execute(
                 f"{_RECORD_SEARCH_FTS_SQL} WHERE {MEMORY_RECORDS_FTS} MATCH ? "  # nosec B608 - constant SQL fragments only
-                f"AND {where} ORDER BY search_rank, r.created_at, r.record_id LIMIT ?",
-                [match, *params, limit],
+                f"AND {where} ORDER BY search_rank, r.created_at, r.record_id LIMIT ? OFFSET ?",
+                [match, *params, limit, offset],
             ).fetchall()
             ranks = [float(row["search_rank"]) for row in rows]
         else:
@@ -8670,8 +8691,8 @@ class SQLiteMemoryStore:
                 patterns += [f"%{escaped}%", f"%{escaped}%"]
             rows = connection.execute(
                 f"{_RECORD_CURRENT_SQL} WHERE {where} AND {like} "  # nosec B608 - constant SQL fragments only
-                "ORDER BY r.created_at, r.record_id LIMIT ?",
-                [*params, *patterns, limit],
+                "ORDER BY r.created_at, r.record_id LIMIT ? OFFSET ?",
+                [*params, *patterns, limit, offset],
             ).fetchall()
             ranks = [0.0] * len(rows)
         return rows, ranks
@@ -8703,7 +8724,7 @@ class SQLiteMemoryStore:
             return False
         return (
             classify_candidate_text(view.record.text).allowed
-            and classify_candidate_text(view.record.subject_key).allowed
+            and classify_subject_key(view.record.subject_key).allowed
         )
 
     def _legacy_record_views(self, project_id: str) -> list[MemoryRecordView]:
