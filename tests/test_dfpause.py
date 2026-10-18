@@ -475,6 +475,45 @@ class PauseCoreTests(unittest.TestCase):
         self.assertNotIn(self.status(anchor), (TaskStatus.PAUSED, TaskStatus.PAUSE_REQUESTED))
         self.assertEqual(connector.execute_calls, 0)
 
+    # -- DFPAUSEFIX2: a typed "skill-run:<id>" objective is not a runner -------
+
+    def test_a_forged_runner_objective_reaches_no_other_sessions_task(self) -> None:
+        core = self.core(DummyConnector(always_requires_approval=True))
+        victim = core.run(user_task())
+        a = victim.task.id
+        for objective in ("skill-run:" + a, "skill-run:" + a.upper(), " skill-run:" + a):
+            forged = core.run(user_task(objective=objective))
+            s, t = forged.session.id, forged.task.id
+            for verb, mine in (
+                (core.pause, TaskStatus.PAUSED),
+                (core.resume_paused, TaskStatus.AWAITING_APPROVAL),
+                (core.cancel, TaskStatus.CANCELLED),
+            ):
+                before = self.store.load_task(a)
+                verb(s, t)
+                self.assertEqual(self.store.load_task(a), before, (objective, verb.__name__))
+                self.assertIs(self.status(t), mine, (objective, verb.__name__))   # its own task only
+        self.assertIs(self.status(a), TaskStatus.AWAITING_APPROVAL)
+        self.assertEqual(core.pause(victim.session.id, a).status, RunStatus.AWAITING_CLARIFICATION)
+        self.assertEqual(core.resume_paused(victim.session.id, a).status, RunStatus.AWAITING_APPROVAL)
+
+    def test_a_forged_runner_session_neither_reads_nor_settles_the_victims_pause(self) -> None:
+        connector = HookConnector()
+        core = self.core(connector)
+        seen = []
+
+        def forge(session) -> None:
+            a = session.latest_task_id
+            core.pause(session.id, a)
+            forged = core.start_session("skill-run:" + a)
+            seen.append((core._skill_anchor_paused(forged), self.status(a)))
+            core._skill_anchor_settle_pause(forged)
+            seen.append((None, self.status(a)))
+
+        connector.hook = forge
+        core.run(user_task())
+        self.assertEqual(seen, [(False, TaskStatus.PAUSE_REQUESTED), (None, TaskStatus.PAUSE_REQUESTED)])
+
     def test_f2_resume_after_a_cancel_of_a_crashed_step_stays_cancelled(self) -> None:
         core, connector, _, anchor, owner, step = self.crashed_mid_step()
         self.assertEqual(core.cancel(owner, anchor).status, RunStatus.CANCELLING)

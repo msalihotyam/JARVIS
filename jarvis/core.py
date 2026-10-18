@@ -1729,19 +1729,35 @@ class AgentCore:
 
     def _skill_anchor_target(self, session_id: str, task_id: str) -> tuple[str, str]:
         """DFPAUSEFIX: a step of a skill runner pauses and resumes as the task
-        it runs for, so the chain is never split from its anchor. Only a task
-        of that runner session redirects; anything else is decided as given."""
+        it runs for, so the chain is never split from its anchor. Only the
+        step bound at a GENUINE runner's cursor redirects (DFPAUSEFIX2);
+        anything else is decided as given, so it reaches no other session."""
         try:
-            session = self.memory.load_session(session_id)
-            if session is None or not session.objective.startswith(_SKILL_SESSION_PREFIX):
+            anchor_id = self._skill_runner_anchor(self.memory.load_session(session_id))
+            if not anchor_id or self.memory.task_session_id(task_id) != session_id:
                 return session_id, task_id
-            if self.memory.task_session_id(task_id) != session_id:
-                return session_id, task_id
-            anchor_id = session.objective[len(_SKILL_SESSION_PREFIX):]
             owner = self.memory.task_session_id(anchor_id)
+            if owner and self._skill_bound_step(owner, anchor_id) == (session_id, task_id):
+                return owner, anchor_id
         except Exception:  # noqa: BLE001 - an unreadable row redirects nothing
-            return session_id, task_id
-        return (owner, anchor_id) if owner else (session_id, task_id)
+            pass
+        return session_id, task_id
+
+    def _skill_runner_anchor(self, session: SessionState | None) -> str:
+        """DFPAUSEFIX2: the anchor id a GENUINE skill runner works for, else "".
+        The objective is user text and proves nothing alone: the session id
+        must be the uuid5 core derives from it, and the anchor must name this
+        session as its runner."""
+        if session is None or not session.objective.startswith(_SKILL_SESSION_PREFIX):
+            return ""
+        if session.id != str(uuid5(NAMESPACE_URL, session.objective)):
+            return ""
+        anchor_id = session.objective[len(_SKILL_SESSION_PREFIX):]
+        try:
+            anchor = self.memory.load_task(anchor_id)
+        except Exception:  # noqa: BLE001 - an unreadable row proves nothing
+            return ""
+        return anchor_id if self._skill_state(anchor).get("chain_session_id") == session.id else ""
 
     def _skill_bound_step(self, session_id: str, task_id: str) -> tuple[str, str] | None:
         """``(runner session, step task)`` bound at a delegated task's chain
@@ -7266,18 +7282,19 @@ class AgentCore:
 
     def _skill_anchor_paused(self, session: SessionState) -> bool:
         """DFPAUSEFIX: True when this skill runner's anchor asked to pause."""
-        if not session.objective.startswith(_SKILL_SESSION_PREFIX):
+        anchor_id = self._skill_runner_anchor(session)
+        if not anchor_id:
             return False
-        anchor_id = session.objective[len(_SKILL_SESSION_PREFIX):]
         owner = self.memory.task_session_id(anchor_id)
         return owner is not None and self.memory.execution_pause_requested(owner, anchor_id)
 
     def _skill_anchor_settle_pause(self, final: SessionState | None) -> None:
         """DFPAUSE: the anchor's own loop is not running while its chain is, so
         the driver turns a still-pending pause into PAUSED once it stopped."""
-        if final is None or not final.objective.startswith(_SKILL_SESSION_PREFIX):
+        anchor_id = self._skill_runner_anchor(final)
+        if final is None or not anchor_id:
             return
-        anchor = self.memory.load_task(final.objective[len(_SKILL_SESSION_PREFIX):])
+        anchor = self.memory.load_task(anchor_id)
         if anchor is None or anchor.status is not TaskStatus.PAUSE_REQUESTED:
             return
         owner = self.memory.load_session(self.memory.task_session_id(anchor.id) or "")
