@@ -1,127 +1,31 @@
 # JARVIS Active State
 
-Overwrite-style snapshot of NOW (rules: `JARVIS_RUNBOOK.md` → "Active state
-file"; freshness: "Session bootstrap"). History lives in git.
+Snapshot of NOW (runbook "Active state file"); STATEDOCS 2026-10-18.
 
 ## PROJECT STATE
 
-Active milestone: V2.0 Projects (dogfood-capable; the official V2
-daily-driver gate is V2.1). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md`,
-"V2.0 — Projects" (scope freeze, Next release inbox, slice estimates) and §3.7
-"Salih kararları — V2.0 Gate 6G / 6H planı". V2.0 scope is frozen (Salih
-2026-10-06): only bugs and blockers.
+Active: V2.1 close and V2.2 close in parallel; V2.4 Step 0 started (V24S0
+PASS a400ca9: ~20 slices, est. 18-26, plan `build/reports/V24S0-plan.md`).
+V2.0 closed 2026-10-13. V2.1+V2.2 ship as one release: the release lane opens
+once INT56 is green and on origin, then 2-3 days dogfood with skills on
+(Salih 2026-10-17). Roadmap: `JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md`.
 
-Gates 1–5, 6A–6H and S5 (model list) are on main. **V2.0 CLOSED 2026-10-13**
-(Salih 23:29, orchestrator 23:32). Current work: V2.1 Hafıza (INT43 and INT44
-pushed; INT45 in a CI fix).
+INT chain: INT49G 5793ebd (CI green, Ran 908 OK) → INT55 93ef714 (FLOWFIX)
+→ INT53 cd7aa82 (13 picks) → INT54: CDXINT54C BLOCKED A1 → SKSIMASK PASS
+acdcd58 → SKSIMASK4B → SKDRAFTFIT/2/3 → CDXINT54I PASS → INT54R2 353cbe2
+(Ran 5184 OK) = origin/main. Local main ea29fc7 = INTCONV2 (conveyor +
+TESTINFRA): INTCONV2R BLOCKED on 5 UI tests red also on base (O27
+known-red, root cause lane UIRED5); INTCONV2P CI_PENDING on `ci/intconv2`.
+Queued: INT57 (docs + watchdog + FLOWUSAGE 121861e), INT58 (DFHOVER 119da76,
+DFRESUME, DFPAUSE 20ae99a, DFPAUSEFIX/2, CDXDFPAUSEC), INT59.
 
-Installed and active: `1.0.0-df463a5` (INT40); `1.0.0-3d6400b` previous
-(rollback target); 3 releases installed; release manager consistent; Desktop
-shortcut OK. Salih's dogfood checks on `1.0.0-df463a5` passed (2026-10-13):
-T font rendering (sidebar, tiles, clock strip, motto, model menu, conversation
-text), motion (sections, menus, panels, pages, conversation switches), message
-queue, timing line under replies, "siz" everywhere. A few very small bugs seen,
-not worth fixing now; Salih will report them (not listed yet).
+## Open items
 
-Conveyor lanes follow `build/conveyor/notes/LANE_RULES.md` (runbook
-"Konveyor" → "Lane process").
-
-## Open blockers
-
-**V21BUSY (V2.1 cleanup, T2) green, 2026-10-11:** committed on lane branch
-`v21busy` (base v21k3 95b67d3, so V21K3's memory.py is under it); not
-integrated, not pushed. Store write transactions retry `BEGIN IMMEDIATE` on
-SQLITE_BUSY (whole transaction, nothing read or written yet): 3 attempts,
-pauses 0.05/0.2 s, 15 s total cap, then the original error as before; every
-retry and the give-up logged (`jarvis.memory` WARNING). Full suite as
-foreground shards (N = 12 fallback; 6/6 shard 4 hit the 10-min cap)
-aggregate 5446 OK (skipped=2), no rule D reruns. Report:
-`build/reports/V21BUSY.md`.
-
-**V21K3 (V2.1 cleanup, T2) green, 2026-10-11 (V21K3C):** committed on lane
-branch `v21k3` (base ca3ffb5; pick db67868, then the fix commit); not
-integrated, not pushed. (a) a K3 reject after a changed proposal ends
-REJECTED (Core falls back to the stored request, every identity/fingerprint
-check kept); (b) a malformed folder link row reads "unreadable", never
-folderless. Targeted 119 OK; full suite as foreground shards
-(`test_parallel.py --shard I/12`, the N = 12 fallback after 6/6 shard 4 hit
-the 10-min cap) aggregate 5441 OK over 12 shards (skipped=2), no rule D
-reruns. One independent review (no BLOCKER/MAJOR; NITs fixed). Left out of
-scope: ARCHITECTURE.md:3600 wording, connectors/project_folder.py docstring.
-Reports: `build/reports/V21K3.md`, `V21K3B.md`, `V21K3C.md`.
-
-**G6H3POL (6H follow-up D-6/F-2/B-1, T2) green, 2026-10-11 (G6H3POLB):**
-committed on lane branch `g6h3pol` (base 8ebe7e3; pick 81bccb8, then the
-fix commit); not integrated, not pushed. Targeted 135 OK (skipped=1); full
-suite `test_parallel.py --workers 4 --ui-workers 2` 5394 OK (skipped=2),
-1301 s, no rule D reruns. One independent review (1 MAJOR + 2 MINOR + 1 NIT
-fixed). F-2: pick-existing checks the folder read-only, rejects through
-Core, then links, so the request ends REJECTED. B-1 docstring. D-6 for the
-English refusals plus project_folders' Turkish one. Left for the V2.1 list
-(via G6DOCS): the D-6 remainder (`tests/test_g6h1b_ui.py`,
-`tests/test_g6h2_folder_ui.py`, `jarvis/ui/present.py`, the _UNVERIFIED
-suffix) and the FAILED residual when the proposal changed before Core's
-reject (needs core.py). Reports: `build/reports/G6H3POL.md`, `G6H3POLB.md`.
-
-**G6H3 (6H H3 K3 chat approval card, T2) green, 2026-10-11 (G6H3C):**
-committed on lane branch `worktree-G6H3` (base fea0ead); integrated on local main by INT26, not pushed.
-K3: a folderless active project's chat proposes its folder through a Core
-approval card; JARVIS computes the path, the card shows it ("Bu
-bilgisayar"), every mode asks. Salih "6H3 A": archived = held by Core,
-accepted. Composition pins re-pointed additively (`tests/test_app.py`
-registry names + `project-folder-create`; `tests/test_github_phase1.py`
-policy + the K3 DestinationGrant). Full suite on the frozen tree 5369 OK
-(skipped=2), 662 s. Report: `build/reports/G6H3C.md`.
-CLI follow-up (G6H3CLI, Salih 2026-10-11 "A"): `jarvis approve` refuses a K3
-request (only the app card shows the path); reject allowed; app.py unchanged.
-On lane branch `worktree-G6H3CLI` (base aa6cdb6), not integrated; full suite
-5385 OK (skipped=2), 668 s. Report: `build/reports/G6H3CLI.md`.
-
-**G6H1 (6H H1 folder link, T2) green, 2026-10-10 (G6H1B):** committed on lane
-branch `worktree-G6H1` (base e3b2015), integrated on local main (INT16, not pushed); lane commit f417e57; additive
-`project_folder_links` store, `jarvis/project_folders.py` path safety,
-`project_folder_result` app boundary; context only, no Core change. Targeted
-(9 modules) 573 OK; full suite on a quiet machine 5107/0/0 with the known
-native `test_ui` crash group (0xC0000005, 32 ids) green under rule D (3 split
-groups and the crash-point tests alone all pass; TUICRASH ff1b4fd on main
-fixes the crash). Next: conveyor push gate.
-
-**G6H1K (6H H1b folder creation, K1 popup, T2) green, 2026-10-10:** on lane
-branch `worktree-G6H1K` (base 46a040f, G6H2 present), not integrated;
-"Klasör oluştur" (+ "Masaüstünde") in the new-project popup, D1 path
-recomputed and required equal, creation inside the store's one transaction
-(`project_folders.create_and_link`, origin `created`), held no-follow
-handles with handle-relative `NtCreateFile`, nothing removed, link state read
-back. Independent review: 1 MAJOR + 2 MINOR, all fixed. Targeted (10 modules)
-727 OK; full suite 5315/0/0 (601 s, skipped 2). Next: integrate on "entegre et".
-
-**G6R1C (6G R1 background run, T2) green, 2026-10-10:** on lane branch
-`worktree-6g-r1b` (base 0e2e746), not integrated; bridge run record (memory
-only), navigation lifted for recorded runs, running-only refusals, preview
-gate, delivery-time ownership, composer "başka bir sohbette" link. Targeted
-154 OK; full suite 5191/0/0 (514.7 s). R2 (parked approvals, freeze/resume)
-open. Next: integrate on "entegre et".
-
-## Do not reopen
-
-- V2 M1 Edge → Chrome migration complete (incl. packaged + rollback).
-- Gate 0: reuse `projects`; Global = `project_id` NULL; opaque ids; owner
-  fixed (only exception 6C, Global → project, one-way, once); scope is
-  context, never authority; no `SCHEMA_VERSION` bump while schema-10 releases
-  are rollback targets (additive tables only, no ALTER).
-- Gates 1–5 (§4.22–§4.24) incl. project archive, instructions, files.
-- Gate 6 UX (6A–6D-b, 6E, 6F) as built; 6F F7: a Global conversation deletes
-  in one step, an active project's unarchived one must be archived first.
-- The 6G/6H plan as recorded in the roadmap (mockup v16 approved 2026-10-05).
-- Mechanical lamp and freeze-key skins 3–4 shipped in V2.0 (Salih 2026-10-11,
-  A-2/A-3 accepted). Status lamp default stays as shipped: mechanical, glass
-  orb selectable in settings (G-2, orchestrator decision). V2.1 keeps the usage
-  popover's context-window block and owns `conversation_global_memory_toggles`.
-- Gate 6G close (Salih 2026-10-11): A-4 W3 work panel floats beside the stream
-  instead of the approved right-rail top: accepted, OPEN DOGFOOD item (Salih
-  judges it). B-2 K1 "Oluştur" while frozen still creates the folder (click =
-  approval, Q5), K3/E7 refuse: deferred, freeze feature revisited after V2.
-  "Gate 6G review leftovers" list lives in the roadmap V2.1 section.
+- V2.1 hardening wave: V21HARD1 PASS d07bc10 accepted; V21HARD2 PASS
+  6cf3879 (items 5-7 → V21HARD2B) and V21HARD3 PASS 70a3580 (→ V21HARD3W,
+  writer-side key block) both go into INT59; FGT (F-gt) not done.
+- V2.2 INT54 landed (origin 353cbe2); left: joint release + dogfood.
+- MEMEVAL3 PASS 4037591 (OR-merge ADOPT), not integrated; no embeddings call.
 
 ## Decisions / external / backlog
 
@@ -161,44 +65,16 @@ open. Next: integrate on "entegre et".
   (orchestrator 2026-10-13: render/animation timing under parallel lanes; pass alone).
   `scripts/test_parallel.py` reruns every listed `module.Class.test` id itself; rule D
   for whole-module entries is applied by hand.
-- Cloud sessions: unused until the cloud-branch push decision (RUNBOOK).
-- Push: `main` not authorized; `ci/*` branches are standing-authorized
-  (RUNBOOK "Push"); CI = `scripts\ci.ps1`.
-- Old dashboard retired (Salih 2026-10-06). The orchestrator's board is the
-  artifact "JARVIS Pano" (https://claude.ai/artifact/LboCEVPnvVb9QapsNbD8GZ).
-- Gate 7 done (2026-10-13): D-3 live Claude replies through Salih's own CLI
-  worked (timing line, queued run); D-4 PASS: packaged `release.ps1 -Rollback`
-  (`1.0.0-df463a5` → `1.0.0-3d6400b`, the old release opened with the
-  conversations) and `-Activate 1.0.0-df463a5` back; `~/.jarvis/conversation.json`
-  backed up first (`%USERPROFILE%\JARVIS-backups\conversation-D4-20261013.json`)
-  and unchanged after. Codex review queue (one commit per session): session1
-  remainder, Gate 5, 6A–6D-b, fixes.
-- Backlog: project-filtered jobs query; catalog test skips on a system
-  Python; Gate 4B Edge retirement deferred; regenerate
-  `scripts/test_durations.json` now and then (`--write-durations`).
+- Push: `main` only via the conveyor two-key gate; `ci/*` standing-authorized
+  (RUNBOOK "Push"). Pace up to 8 lanes (Salih 2026-10-18 12:20); O23 quota
+  stop at 90%; O28 no local full suite in INT prompts. Board: "JARVIS Pano"
+  (https://claude.ai/artifact/LboCEVPnvVb9QapsNbD8GZ).
+- Rollback/safety: `1.0.0-df463a5` active, `1.0.0-3d6400b` rollback; backups
+  `%USERPROFILE%\JARVIS-backups`; `SCHEMA_VERSION` stays 10; dashboard WIP in
+  stash (never stage `dev/dashboard/*`); never stage `uv.lock`.
 
 ## Next action (in order)
 
-V2.0 closed (2026-10-13). Next: the V2.1 Hafıza waves (INT45 CI fix, then
-the following waves); Salih's small V2.0 bug list when he sends it.
-
-Core refresh (DFCOREA, parked in `build/conveyor/hold/`) postponed by Salih
-(2026-10-12): a later week near the weekly quota renewal if quota is
-plentiful, else the very last item.
-
-## Rollback / safety anchors
-
-- Releases (`%USERPROFILE%\Apps\JARVIS\release-state.json`): `1.0.0-df463a5`
-  active; `1.0.0-3d6400b` previous (rollback target, D-4 verified
-  2026-10-13); 3 releases installed.
-- `%USERPROFILE%\JARVIS-backups`: `releases\legacy-1.0.0-5976769` (+
-  `.manifest.sha256`, 2929 files verified) and `2026-09-30-gate7`
-  (`data\jarvis.db` + `~\.jarvis\*.json`, SHA-256 manifest, taken before
-  8fbbaef first opened the DB).
-- `data\jarvis.pre-v2.db` verified; `SCHEMA_VERSION` stays 10 while any
-  schema-10 release is a rollback target; V2 only reads
-  `~/.jarvis/conversation.json`.
-- Dashboard WIP is parked in git stash "Salih dashboard WIP (2026-09-12),
-  parked 2026-10-06"; never stage `dev/dashboard/*`.
-- `uv.lock` is excluded locally via `.git/info/exclude`; never stage or
-  commit it.
+INTCONV2P CI → push ea29fc7; INT57; INT58; V21HARD2B + V21HARD3W → INT59;
+FGT; CDXINT56 → INT56 (with GMAILMOVE) → release lane; V2.4 after Step 0.
+DFCOREA (`build/conveyor/hold/`) postponed: near quota renewal, else last.

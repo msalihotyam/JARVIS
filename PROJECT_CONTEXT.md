@@ -207,20 +207,24 @@ değildir; devralmak yinelenen bir dış etki riski olurdu. Böyle bir kuşak
 süresiz bloke kalır ve tek sonuçlanmamış kuşak kuralı gereği sonraki
 kuşakları da bloke eder. Otomatik yeniden deneme yoktur; çözüm insandır.
 
+**Sonraki fazlarda eklenenler (kod 2026-10-17 itibarıyla doğrulandı)**
+
+- Dağıtıcı var: `jarvis/dispatch.py` (2B1 tek seferlik köprü, 2B2a
+  kurtarma) claim edilmiş kuşağı taze bir AgentCore oturumuna bağlar ve
+  `AgentCore.run_chain`'e bir kez verir; onay, grant ve harcama yine
+  Core'dadır. 2C: `jarvis/condition_watch.py` koşul-izleme yüklemini
+  değerlendirir, TRUE'da dağıtıcıya devreder.
+- Sürücüler (yetki eklemez): CLI `scheduler run`, Otomasyonlar düğmesi ve
+  `jarvis/ui/app.py` `install_scheduler_sweeps` (uygulama açıkken 2,5 sn sonra ilk
+  tarama, sonra 30 sn'lik QTimer). Windows servisi yoktur; uygulama kapalıyken vade
+  taranmaz.
+
 **Henüz uygulanmadı**
 
-- Dağıtıcı; vadesi gelen job'da uyanan üretim yolu yok. Depo yüzeyini
-  çağıran tek şey testlerdir.
-- AgentCore task materyalizasyonu ve zamanlanmış iş için onay oluşturma.
-- Arka plan servisi/çalışanı/döngüsü; hiçbir zamanlayıcı iş parçacığı yoktur
-  ve her vade/lease-süresi yargısı **çağıranın verdiği** anda verilir.
-- Koşul değerlendirmesi, bildirim ve `on_true` eylem yürütmesi. 2A bir
-  koşul-izleme kuşağını (kontrol fırsatını) materyalize eder, yüklemi
-  değerlendirmez.
-- Bilinmeyen sonucun otomatik yeniden denenmesi.
+- Bilinmeyen sonucun otomatik yeniden denenmesi (kasıtlı: çözüm insandır).
+- Uygulamadan bağımsız arka plan servisi.
 
-Zamanlayıcı bu nedenle **hâlâ uçtan uca kullanılabilir değildir**. Job
-oluşturmak ve bir kuşağı claim etmek hiçbir şey başlatmaz, onay vermez ve
+Job oluşturmak ve bir kuşağı claim etmek tek başına onay vermez ve
 gelecekteki parasal harcamayı yetkilendirmez. Ayrıntılı sözleşme
 `ARCHITECTURE.md` §4.21'dedir.
 
@@ -253,15 +257,21 @@ gelecekteki parasal harcamayı yetkilendirmez. Ayrıntılı sözleşme
   deterministik "hiç saklanmaz" filtresi, görev-hedefli getirme ve kaynak
   etiketli teslim, sohbet başına varsayılan kapalı "tüm projelerin hafızası"
   anahtarı, "Hatırla", onay/ret/geri al. Mimari: `ARCHITECTURE.md` §6.1.
-- Onay politikası: Fact/Lesson otomatik ve geri alınabilir; Decision/Rule ve
-  Q1 kararına kadar Preference onay bekler.
+- Onay politikası: Fact/Lesson otomatik ve geri alınabilir; Decision/Rule
+  onay bekler; Preference, Q1 kararı gereği SECGUARD/SECSTORE/SECCAPTURE
+  entegre olana dek onay bekler (otomatiğe geçiş: SECPREFAUTO).
+- Durum (2026-10-17): V2.1a `main`'de; sertleştirme dalgası açık — V21HARD1
+  (d07bc10) kabul, V21HARD2 (6cf3879, 5-7 → V21HARD2B) ve V21HARD3
+  (70a3580, → V21HARD3W) INT59'da birlikte; FGT bitmedi; sonra CDXINT56 ve
+  INT56.
 - Açık: SessionEnd/PreCompact tetikleri ve sıkıştırma app'te kurulu ama
   UI'dan henüz çağrılmıyor (MEMTRIGWIRE, backlog); dalga E (sıkıştır/doctor
   köprüsü, bağlam kullanımı bloğu, Doctor paneli; INT47), MEMGATE uçtan uca
   testi ve Salih'in elle kapısı
   (`ARCHITECTURE.md` §6.2). `memory_extract_model` ayarı ve çıkarım atlama
-  politikası tanımlı, capture yoluna henüz bağlı değil. Açık sorular
-  Q1-Q7: `build/v21/SLICES_V21.md`.
+  politikası tanımlı, capture yoluna henüz bağlı değil. Q1-Q7 kararlandı
+  (2026-10-14): `build/v21/SEC_PLAN.md` "Q1-Q7 (orchestrator decisions,
+  binding for every SEC slice)".
 
 ## Beceriler (V2.2) durumu (2026-10-15)
 
@@ -276,6 +286,10 @@ gelecekteki parasal harcamayı yetkilendirmez. Ayrıntılı sözleşme
   (Salih, 2026-10-15): dersler ders başına onaysız; dış içerik okuyabilecek
   adımlı çalıştırma ders bırakmaz (izin listesi boş).
 - Kapı testi `tests/test_skill_e2e.py`; kayıt motoru V2.6'ya kalır.
+- Durum (2026-10-17): INT54 CDXINT54I PASS ile INT54R2'de `main`'e girdi
+  (origin `main` 353cbe2). V2.1 ve V2.2 tek sürüm olarak çıkar: INT56
+  yeşil ve origin'de olunca sürüm lane'i açılır, 2-3 gün beceriler açık
+  dogfood (Salih 2026-10-17).
 
 ## Proje hafızasını güncelleme kuralı
 

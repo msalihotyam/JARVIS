@@ -1,7 +1,7 @@
 # JARVIS V2+ — Roadmap, Decisions & Reference Architecture
 
 **Belge tarihi:** 2026-09-19  
-**Son güncelleme:** 2026-10-06 — G0: V2.0 Gate 6G/6H planı (§3.7), kapsam dondurma + Next release inbox ve kaba dilim tahminleri (V2.0), V2.1'e taşınan arayüz kalemleri.
+**Son güncelleme:** 2026-10-17 — STATEDOCS: V2.4 Salih kararları (2026-10-17), V2.2 karar kayıtları (a2, b1-b8, Beceriler alt kartı, "kullanayım mı?"), dağıtım zamanlaması V2 sonu, MEMEVAL3 notu.
 **Amaç:** JARVIS V1 sonrasında uygulanması planlanan V2 ve daha ileri ürün kararlarını tek yerde korumak.  
 **Bu belge canlı proje durumu değildir.** Commit, branch, milestone ilerlemesi veya `JARVIS_ACTIVE_STATE.md` anlık bilgileri burada tutulmaz.
 
@@ -244,6 +244,10 @@ Kaynak: `build/v21/PLAN_DRAFT_V21.md` (V2.1 plan taslağı, KARAR-1..5 soruları
 
 - KARAR-1: ek tablolar, SCHEMA_VERSION 10'da kalır.
 - KARAR-2: önce yerel FTS5 + typed filtreler; embedding V2.1b'de ölçüme göre.
+  - Embedding kararı (2026-10-17): karar kaydı yok. MEMEVAL3 (PASS 4037591,
+    entegre değil) like_or/fts_or için ADOPT verdi; raporun kendi sözüyle
+    "the ADOPT only says the OR merge beats AND; it is not an embeddings
+    result".
 - KARAR-3: karma - Decision/Rule kullanıcı onaylı, Fact/Lesson otomatik + geri alınabilir.
 - KARAR-4: V2.1a / V2.1b ayrımı kabul.
 - KARAR-5: temizliklerin hepsi: D-1/D-2 yetim kod/testler (silme = hold'a taşıma), B-3 açık repodaki kullanıcı adı/yol, küçük temizlikler (ARCHITECTURE.md:3655 eski metin, cli.py:925 Türkçe K3 reddi, test_motion_6g settingsOrb sıra bağımlılığı, "Mark as unread").
@@ -253,7 +257,7 @@ Kaynak: `build/v21/PLAN_DRAFT_V21.md` (V2.1 plan taslağı, KARAR-1..5 soruları
 
 ## Dağıtım: installer + onboarding
 
-**Durum: ONAYLI YÖN** (Salih 2026-09-30). Zamanlama: V2.1'den sonra; kesin tasarım o milestone başında yapılır.
+**Durum: ONAYLI YÖN** (Salih 2026-09-30). Zamanlama: V2'nin sonunda (Salih 2026-10-12; bkz. "Kesin ana sıra"); kesin tasarım o milestone başında yapılır.
 
 - kullanıcı-başına (per-user) installer
 - veri depodan `%LOCALAPPDATA%`'ya taşınır, bir göç (migration) ile
@@ -342,6 +346,22 @@ V2.2 kapsamındadır; V2.0 dondurulmuş kalır, buraya hiçbir şey öne çekilm
 8. Bir skill asla sır, kimlik bilgisi ya da kişisel veri içermez. Veri sınıflandırmasına uyar; kapsamı global ya da tek bir proje olur.
 9. Her skill kullanım sayısını, son başarıyı ve başarısızlık sayılarını tutar (Skill Health'i besler). Kullanıcının skill'leri görüntüleyip düzenleyebildiği, devre dışı bırakıp silebildiği bir skill listesi vardır.
 10. Skill prosedürdür, otorite değildir: her adım yine Core politikasından ve onaydan geçer; skill hiçbir şeyi önceden onaylayamaz (V2.2 değişmezinin yinelenmesi).
+
+### Salih kararları (2026-10-15 / 2026-10-17)
+Kaynaklar: `build/v22/RESEARCH_V22.md` (a)/(b) önerileri, `build/orch/ORCH_NOTEBOOK.md`.
+
+- a2 (2026-10-15 01:42): ders başına onay yok; dış içerik okumadığı kesin bilinmeyen herhangi bir adımı olan çalıştırma ders bırakmaz (bilinmeyen = dış). Dış içerik derslere girmez.
+- b1-b8 (2026-10-15 01:42, "hepsi girsin"): V2.2 içinde, gate'i bekletmeden:
+  - b1 deneyim kontrol yüzeyi (dersleri listele/gör/kapat/sil, "N ders kullanıldı", enjekte edilen ders kimlikleri kaydı);
+  - b2 gerçek geçmişte salt-okur sayım (Salih onayıyla, ağsız, analiz);
+  - b3 TR/EN eşleştirme korpusu (eşikler yalnız bu kanıtla değişir);
+  - b4 açık çağırma ("/beceri <ad>", Beceriler sayfasında "Çalıştır");
+  - b5 ilk gerçek kayıttan önce biçim sürümü;
+  - b6 Core tek yazar testi (data\ korunan yol, skill tablolarına yalnız SkillStore);
+  - b7 bastırmayı geri alma (append-only kaldırma satırı);
+  - b8 teklif anında tekrar kontrolü ("X'in yeni sürümü olarak kaydet").
+- Beceriler alt kartı (2026-10-17 01:17): Beceriler kenar çubuğunda satır değil, alt kartlardan biri (SummaryRail; en fazla 4 kart görünür, Salih seçer).
+- "Kullanayım mı?" kuralı (2026-10-17 02:54): FIT yalnız /beceri ya da birebir eşleşmede; SIMILAR sessiz kalmaz, tek soru "kullanayım mı?"; oturumda reddedilen tekrar sorulmaz. 12:45: "birebir" = yalnız harf/Unicode katlaması. 14:32: yer tutuculu beceri, değer dışında metin aynıysa çalışır; değer yalnız kullanıcının yazdığı span'den, model hedefinden asla; belirsiz bölmede sorar.
 
 ---
 
@@ -485,6 +505,13 @@ Ancak bütün handoff’lar Core sınırları içinde kalır.
 - Özerklik kontrolsüz döngüye dönüşmez.
 - Dikkat panosu: Taslak / Sürüyor / Sizi bekliyor / Bitti + takıldı / onay / girdi işaretleri.
 - Onaylar tek yerde toplanır; yalnız kullanıcı/Core onaylar (yukarıdaki KESİN authority kuralı değişmez).
+
+### Salih kararları (2026-10-17)
+Kaynak: `build/orch/v24_research.md` "Salih'in vermesi gereken on bir karar"; ORCH_NOTEBOOK 2026-10-17 06:06.
+
+- On bir kararın tümü raporun "Öneri" sütununu izler (Jev pilotunun harcama/veri çıkışı, çocuk model çağrısı onay biçimi, onay zaman aşımı → reddet + `needs_input`, yeniden başlatma/uyku → `interrupted` + açık devam, Rule of Two ayrımı, asgari isimli ajan profili, rol adları, bütçe → `blocked:budget` ve API'ye geçiş yok, komut yürütme yok, Adım 0'da "günlük kullanım" tanımı, Edge → Chrome ilanı açıkça).
+- Jev geliştirme pilotu ertelendi.
+- "Aynı anda iki çalıştırma" (2026-10-07'de V2.1 hedefi olarak istendi) V2.4 Work kapsamına taşındı.
 
 ---
 
