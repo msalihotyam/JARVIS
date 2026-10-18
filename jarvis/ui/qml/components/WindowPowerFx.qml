@@ -53,6 +53,13 @@ Item {
     // render list when it is taken and released (~100 ms each), so there the band collapses
     // over the darkening live content instead.
     property bool snapshots: GraphicsInfo.api !== GraphicsInfo.Software
+    // UIRED5: the software renderer also skips the per-frame Shape geometry (scanlines, rim
+    // comets, flare) and the sparks: under load each software frame blocks the GUI thread
+    // long enough to push the minimize / hide / quit past the effect + 60 ms.
+    readonly property bool lite: GraphicsInfo.api === GraphicsInfo.Software
+    // UIRED5: the safety's deadline on the wall clock. The Timer runs on the animation clock,
+    // which slow frames hold back; each frame also checks the real time.
+    property real due: 0
     readonly property int span: phase === "up" ? 600 : 520
     // The visuals' clock: a power down's holds at 0 until the snapshot is grabbed, so none of
     // the effect is ever in it (the timeline itself - and so the minimize - never waits); then
@@ -98,7 +105,7 @@ Item {
     // Faint scanlines every 3 px in window coordinates (they never travel with the snapshot); only during a run.
     readonly property var scanLines: {
         var out = []
-        for (var y = 1; phase !== "" && y < height; y += 3) out.push([Qt.point(0, y), Qt.point(width, y)])
+        for (var y = 1; phase !== "" && !lite && y < height; y += 3) out.push([Qt.point(0, y), Qt.point(width, y)])
         return out
     }
 
@@ -140,9 +147,9 @@ Item {
             snapshotHeld = true; swaps = 0
             if (host) host.update()
         }
-        run.start(); safety.start()
+        run.start(); safety.start(); due = Date.now() + safety.interval
     }
-    function stopRun() { run.stop(); safety.stop(); swaps = -1; snapshotHeld = false }
+    function stopRun() { run.stop(); safety.stop(); due = 0; swaps = -1; snapshotHeld = false }
     function settle() {
         stopRun()
         if (phase !== "down") { phase = ""; return }
@@ -169,6 +176,7 @@ Item {
                 fx.powerUp()
             }
         }
+        function onAfterAnimating() { if (fx.due > 0 && Date.now() >= fx.due) Qt.callLater(fx.settle) }
         function onFrameSwapped() {
             if (fx.swaps < 0) return
             fx.swaps += 1
@@ -268,7 +276,7 @@ Item {
                 Shape {
                     id: rimRun
                     anchors.fill: parent
-                    visible: fx.down && fx.ms > 0 && fx.ms < 200
+                    visible: fx.down && fx.ms > 0 && fx.ms < 200 && !fx.lite
                     // Each comet runs half the edge, from the core round to the point opposite it.
                     readonly property real half: fx.width + fx.height
                     readonly property real head: fx.inOutCubic(fx.seg(0, 180)) * (half + 700)
@@ -361,6 +369,7 @@ Item {
                     id: flare
                     readonly property real r: fx.coreSize * 0.6
                     x: fx.coreX - r; y: fx.coreY - r; width: 2 * r; height: width
+                    visible: !fx.lite
                     opacity: fx.flare
                     ShapePath {
                         strokeWidth: -1
@@ -388,7 +397,7 @@ Item {
                     }
                 }
                 Repeater {
-                    model: fx.down ? 18 : 0
+                    model: fx.down && !fx.lite ? 18 : 0
                     Rectangle {
                         required property int index
                         readonly property real angle: index * 137.5 % 360
