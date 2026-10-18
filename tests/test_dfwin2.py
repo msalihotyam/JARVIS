@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import time
 
-from tests.test_ui import _APP, UiTestCase, find, pump, tap  # noqa: F401 - the offscreen platform and the application
+from tests.test_ui import _APP, UiTestCase, find, pump, reflow_still, tap  # noqa: F401 - the offscreen platform and the application
 from tests.helpers import wait_until
 from tests.test_v21win import CAP, LATENCY
 
@@ -32,6 +32,7 @@ class WindowPowerCloseTests(UiTestCase):
         root.showNormal()
         root.resize(1920, 1080)
         pump(350)
+        reflow_still(self, root, 350)   # UIRED5: slow offscreen frames under load outlast the fixed wait; settle before timing
         if not ambient:
             bridge.setAmbientEffects(False)
             pump(50)
