@@ -49,6 +49,7 @@ from jarvis.desktop import (
     desktop_window_view,
     parse_desktop_window_id,
 )
+from jarvis.trusted_exec import NO_CONSOLE_WINDOW
 
 DESKTOP_TIMEOUT_SECONDS = 60
 #: How long a launch waits for the new program to be ready for input. A
@@ -477,6 +478,7 @@ class Win32Desktop:
             process = subprocess.Popen(
                 [app.replace("/", "\\")],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                creationflags=NO_CONSOLE_WINDOW,
             )
         except OSError as exc:
             raise DesktopExecutionUnavailable(f"the application could not be started: {exc.strerror}") from exc

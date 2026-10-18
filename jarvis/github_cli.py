@@ -76,7 +76,7 @@ import tempfile
 from dataclasses import dataclass
 from typing import Any, Mapping
 
-from jarvis.trusted_exec import resolve_trusted_executable
+from jarvis.trusted_exec import NO_CONSOLE_WINDOW, resolve_trusted_executable
 from jarvis.github import (
     GH_ARGUMENT_MAX_CHARS,
     GH_MAX_ARGUMENTS,
@@ -241,6 +241,7 @@ def _run(
             cwd=_neutral_directory(),
             timeout=timeout,
             check=False,
+            creationflags=NO_CONSOLE_WINDOW,
         )
     except subprocess.TimeoutExpired as exc:
         raise GitHubCommandFailed(

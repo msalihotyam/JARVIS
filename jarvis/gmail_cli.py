@@ -120,7 +120,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterator, Mapping
 
-from jarvis.trusted_exec import resolve_trusted_executable
+from jarvis.trusted_exec import NO_CONSOLE_WINDOW, resolve_trusted_executable
 from jarvis.gmail import (
     GMAIL_ATTESTATION_MAX_BYTES,
     GMAIL_ATTESTATION_NAME,
@@ -333,6 +333,8 @@ def _run(
     closed; output captured as bounded bytes and decoded with replacement.
     Nothing from ``stderr`` is returned or re-raised; the controlled login
     alone lets the child inherit it, so the operator sees the consent URL.
+    Every other spawn is created with ``NO_CONSOLE_WINDOW``: a call from the
+    window process must not open a console window per ``gws`` child.
     """
     if type(arguments) is not tuple or not arguments:
         raise GmailCommandFailed("no argument vector was derived")
@@ -358,6 +360,7 @@ def _run(
             shell=False,
             env=environment,
             cwd=cwd,
+            **({} if inherit_stderr else {"creationflags": NO_CONSOLE_WINDOW}),
         )
     except OSError as exc:
         raise GmailCommandFailed("the Google Workspace CLI could not be started") from exc

@@ -120,6 +120,7 @@ from jarvis.gmail_cli import (
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
+from jarvis.trusted_exec import NO_CONSOLE_WINDOW
 from tests.helpers import safe_cleanup
 
 ACCOUNT = "operator@example.com"
@@ -1593,6 +1594,92 @@ class ControlledLoginTests(SeamTestCase):
         self.assertEqual(ErrorCode.CONFIG_INVALID.value, unconfigured.payload["error"]["code"])
         self.assertEqual(64, _dispatch_gmail_command(settings, argparse.Namespace(gmail_action=None), login=fake_login).exit_code)
         self.assertEqual(1, len(calls), "only the configured login call ran the login")
+
+    def test_the_login_alone_keeps_the_console_and_inherits_stderr(self) -> None:
+        runner = login_runner()
+        self.login(runner)
+        self.assertEqual(1, len(runner.calls))
+        self.assertIsNone(runner.calls[0]["stderr"], "the consent URL must reach the operator")
+        self.assertNotIn("creationflags", runner.calls[0])
+
+
+class ConsoleWindowTests(SeamTestCase):
+    """GMAILWIN: a ``gws`` child spawned from the window process must not
+    open a console window - every non-interactive spawn carries
+    ``NO_CONSOLE_WINDOW`` and pipes its stderr."""
+
+    def assert_windowless(self, calls: list[dict]) -> None:
+        self.assertTrue(calls)
+        for call in calls:
+            self.assertEqual(NO_CONSOLE_WINDOW, call["creationflags"], call["argv"])
+            self.assertEqual(subprocess.PIPE, call["stderr"], call["argv"])
+
+    def test_the_flag_is_the_real_no_window_flag_on_windows(self) -> None:
+        if sys.platform == "win32":
+            self.assertEqual(subprocess.CREATE_NO_WINDOW, NO_CONSOLE_WINDOW)
+            self.assertNotEqual(0, NO_CONSOLE_WINDOW)
+
+    def test_a_direct_run_is_windowless(self) -> None:
+        Path(self.run_dir).mkdir()
+        runner = fake_runner()
+        _run(("auth", "status"), config_dir=self.config, cwd=self.run_dir, environ={}, path_lookup=fake_path_lookup, popen=runner)
+        self.assert_windowless(runner.calls)
+
+    def test_the_route_check_is_windowless(self) -> None:
+        runner = scripted_runner()
+        gmail_route_check(self.config, environ={}, path_lookup=fake_path_lookup, popen=runner)
+        self.assert_windowless(runner.calls)
+
+    def test_the_identity_observation_is_windowless(self) -> None:
+        runner = scripted_runner(answer=json.dumps({"emailAddress": ACCOUNT}).encode())
+        observed_gmail_identity(ACCOUNT, self.config, path_lookup=fake_path_lookup, popen=runner, environ={})
+        self.assert_windowless(runner.calls)
+
+    def test_every_enabled_operation_is_windowless(self) -> None:
+        for capability in GMAIL_ENABLED_CAPABILITIES:
+            with self.subTest(capability=capability):
+                plan = gmail_operation_plan(frame_for(capability))
+                runner = scripted_runner(answer=json.dumps(payload_for(plan)).encode())
+                run_operation_plan(plan, config_dir=self.config, environ={}, path_lookup=fake_path_lookup, popen=runner)
+                self.assert_windowless(runner.calls)
+                self.assertTrue(any("auth" not in call["argv"] for call in runner.calls), "the operation itself spawned")
+
+    def test_a_failing_child_is_still_windowless(self) -> None:
+        runner = fake_runner(returncode=1, stderr=b"boom")
+        Path(self.run_dir).mkdir()
+        with self.assertRaises(GmailCommandFailed):
+            _run(("auth", "status"), config_dir=self.config, cwd=self.run_dir, environ={}, path_lookup=fake_path_lookup, popen=runner)
+        self.assert_windowless(runner.calls)
+
+    def test_every_gh_spawn_is_windowless(self) -> None:
+        from jarvis import github_cli
+
+        for returncode in (0, 1):
+            with self.subTest(returncode=returncode):
+                calls: list[dict] = []
+
+                def runner(argv, **kwargs):
+                    calls.append(kwargs)
+                    return subprocess.CompletedProcess(argv, returncode, stdout=b"{}", stderr=b"")
+
+                try:
+                    github_cli._run(("repo", "view"), environ={}, path_lookup=lambda name: "C:/tools/gh.exe", runner=runner)
+                except github_cli.GitHubCommandFailed:
+                    self.assertEqual(1, returncode)
+                self.assertEqual([NO_CONSOLE_WINDOW], [call["creationflags"] for call in calls])
+
+    @unittest.skipUnless(sys.platform == "win32", "Win32 desktop launch")
+    def test_a_desktop_launch_is_windowless(self) -> None:
+        from jarvis import desktop_win32
+
+        process = mock.Mock(pid=4321, _handle=7)
+        with mock.patch.object(desktop_win32.subprocess, "Popen", return_value=process) as popen, \
+                mock.patch.object(desktop_win32, "_user32") as user32:
+            user32.WaitForInputIdle.return_value = 0
+            result = desktop_win32.Win32Desktop.launch(desktop_win32.Win32Desktop.__new__(desktop_win32.Win32Desktop), "C:/Apps/tool.exe")
+        self.assertEqual((4321, True), result)
+        self.assertEqual(NO_CONSOLE_WINDOW, popen.call_args.kwargs["creationflags"])
+        self.assertEqual(["C:\\Apps\\tool.exe"], popen.call_args.args[0])
 
 
 # --------------------------------------------------------------------------
