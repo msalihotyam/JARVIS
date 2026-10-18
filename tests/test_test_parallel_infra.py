@@ -35,11 +35,30 @@ class Temp(unittest.TestCase):
 
 
 class TimeoutTests(Temp):
+    def _local(self):
+        env = {k: v for k, v in os.environ.items() if k != "CI"}
+        return mock.patch.dict(os.environ, env, clear=True), mock.patch.object(tp, "SHARDED", False)
+
     def test_limits(self):
         unit = lambda s: tp.Unit("test_x", [""], [], s, False)  # noqa: E731
-        self.assertEqual(tp.unit_timeout(unit(None)), 600.0)
-        self.assertEqual(tp.unit_timeout(unit(10.0)), 120.0)
-        self.assertEqual(tp.unit_timeout(unit(100.0)), 400.0)
+        env, sharded = self._local()
+        with env, sharded:
+            self.assertEqual(tp.unit_timeout(unit(None)), 600.0)
+            self.assertEqual(tp.unit_timeout(unit(10.0)), 120.0)
+            self.assertEqual(tp.unit_timeout(unit(100.0)), 400.0)
+
+    def test_ci_limits(self):
+        """INT57B: a 27 s unit gets 600 s under CI (the variable or --shard), 120 s locally."""
+        unit = lambda s: tp.Unit("test_x", [""], [], s, False)  # noqa: E731
+        env, sharded = self._local()
+        with env, sharded:
+            self.assertEqual(tp.unit_timeout(unit(27.0)), 120.0)
+            with mock.patch.dict(os.environ, {"CI": "true"}):
+                self.assertEqual(tp.unit_timeout(unit(27.0)), 600.0)
+                self.assertEqual(tp.unit_timeout(unit(100.0)), 1000.0)
+                self.assertEqual(tp.unit_timeout(unit(None)), 600.0)
+            with mock.patch.object(tp, "SHARDED", True):
+                self.assertEqual(tp.unit_timeout(unit(27.0)), 600.0)
 
     def test_a_hung_unit_is_killed_with_its_tree_and_named(self):
         (self.dir / "tests").mkdir()

@@ -697,8 +697,16 @@ def worker_env(index: int, bases: list[Path]) -> dict[str, str]:
     return env
 
 
+#: set by main() for a --shard run, so the CI timeout applies even without the CI variable
+SHARDED = False
+
+
 def unit_timeout(unit: Unit) -> float:
-    """TESTINFRA: 4x the unit's recorded seconds, at least 120 s; 600 s when it has no record."""
+    """TESTINFRA: 4x the unit's recorded seconds, at least 120 s; 600 s when it has no record.
+    INT57B: under CI (the CI variable or --shard) 10x, at least 600 s: loaded windows-latest shards run
+    I/O-heavy units far past their recorded seconds; CI's 90 min job timeout stays the outer bound."""
+    if os.environ.get("CI") or SHARDED:
+        return max(600.0, 10 * (unit.seconds or 0.0))
     return 600.0 if unit.seconds is None else max(120.0, 4 * unit.seconds)
 
 
@@ -828,6 +836,8 @@ def main(argv: list[str] | None = None) -> int:
             print("--shard must be I/N with 1 <= I <= N, over the whole suite", file=sys.stderr)
             return 2
         shard = (int(match.group(1)), int(match.group(2)))
+        global SHARDED
+        SHARDED = True
 
     workers, ui_workers = worker_counts(os.cpu_count() or 2, free_mem_gb(), args.workers, args.ui_workers)
     began = time.monotonic()
