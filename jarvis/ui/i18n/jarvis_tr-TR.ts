@@ -455,7 +455,7 @@ Bu metin yürütülemeyen bir geliştirme örneğidir.</translation>
     <name>Bridge</name>
     <message>
         <source>Continue your previous answer exactly where it stopped, without repeating what was already written.</source>
-        <translation>Önceki yanıtına tam kaldığın yerden, yazılanları tekrarlamadan devam et.</translation>
+        <translation>Önceki yanıtınıza tam kaldığınız yerden, yazılanları tekrarlamadan devam edin.</translation>
     </message>
     <message>
         <source>uses %1</source>
@@ -3116,6 +3116,14 @@ yok</translation>
         <translation>reddedildi</translation>
     </message>
     <message>
+        <source>pausing</source>
+        <translation>duraklatılıyor</translation>
+    </message>
+    <message>
+        <source>paused</source>
+        <translation>duraklatıldı</translation>
+    </message>
+    <message>
         <source>cancellation requested</source>
         <translation>iptal istendi</translation>
     </message>
@@ -5477,6 +5485,14 @@ yetkinlik: %4  işlem: %5  bağlayıcı: %6  okunabilir: %7</translation>
         <translation>Kullanılabilir</translation>
     </message>
     <message>
+        <source>Pausing</source>
+        <translation>Duraklatılıyor</translation>
+    </message>
+    <message>
+        <source>Paused</source>
+        <translation>Duraklatıldı</translation>
+    </message>
+    <message>
         <source>Current request</source>
         <translation>Geçerli istek</translation>
     </message>
@@ -6336,6 +6352,14 @@ DOĞRULANMADI</translation>
     <message>
         <source>Replaced by a newer record</source>
         <translation>Yenisiyle değiştirildi</translation>
+    </message>
+    <message>
+        <source>Pausing</source>
+        <translation>Duraklatılıyor</translation>
+    </message>
+    <message>
+        <source>Paused</source>
+        <translation>Duraklatıldı</translation>
     </message>
     <message>
         <source>Retired</source>

@@ -85,6 +85,8 @@ CODE_WORDS = {
         "rejected": QT_TRANSLATE_NOOP("Wording", "Denied"),
         "cancel_requested": QT_TRANSLATE_NOOP("Wording", "Cancelling"),
         "cancelled": QT_TRANSLATE_NOOP("Wording", "Cancelled"),
+        "pause_requested": QT_TRANSLATE_NOOP("Wording", "Pausing"),
+        "paused": QT_TRANSLATE_NOOP("Wording", "Paused"),
     },
     "memory_classification": {
         "public": QT_TRANSLATE_NOOP("Wording", "Public"),

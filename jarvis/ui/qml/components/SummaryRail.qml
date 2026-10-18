@@ -53,6 +53,7 @@ Item {
         return ({ pending: qsTr("Pending"), running: qsTr("Running"), verifying: qsTr("Verifying"), awaiting_approval: qsTr("Awaiting you"),
                   awaiting_clarification: qsTr("Needs a detail"), awaiting_cost_override: qsTr("Cost check"),
                   completed: qsTr("Completed"), failed: qsTr("Failed"), rejected: qsTr("Denied"),
+                  pause_requested: qsTr("Pausing"), paused: qsTr("Paused"),
                   cancel_requested: qsTr("Cancelling"), cancelling: qsTr("Cancelling"), cancelled: qsTr("Cancelled") })[s]
                || (s ? qsTr("Unrecognized (%1)").arg(s) : "")
     }

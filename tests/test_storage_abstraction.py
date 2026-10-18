@@ -1711,6 +1711,10 @@ class InMemoryStore:
             return False
         return task.status is TaskStatus.CANCEL_REQUESTED
 
+    def execution_pause_requested(self, session_id: str, task_id: str) -> bool:
+        # DFPAUSE's step-boundary bit; this double never pauses a task.
+        return False
+
     def cancel_task(
         self, session_id: str, task_id: str
     ) -> CancellationOutcome:
