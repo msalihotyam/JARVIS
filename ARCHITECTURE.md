@@ -53,6 +53,15 @@ Bu döngü kod, araştırma, dosya, tarayıcı ve bilgisayar kontrolü görevler
 
 Connector'lar ortak bir arayüz kullanacaktır. Sağlayıcıya veya belirli bir CLI'a özgü ayrıntılar Agent Core'a sızmayacaktır.
 
+**Numaralandırma notu (V24S0, 2026-10-18).** §4 alt başlıkları tarihsel
+sırayla eklendi; mevcut çapraz başvurular bozulmasın diye hiçbiri yeniden
+numaralandırılmaz. 4.5, 4.6, 4.18 ve 4.19 hiç atanmadı (boş numara, kayıp
+bölüm değil). 4.20-4.26 fiziksel olarak §10'dan sonra durur. "4.21" iki
+kez kullanıldı: GitHub v1 temeli ve Zamanlayıcı temeli; ikincisi
+"4.21 (Zamanlayıcı)" diye anılır, 4.21.1 Zamanlayıcıya aittir. Görev zinciri
+sürücüsü §4.27'de, V2.4 kararları dosya sonundaki "V2.4 kararları"
+bölümündedir.
+
 ### 4.1 Yürütülebilir CLI yüzeyi ve composition root (B1, uygulandı)
 
 Kesinleşen kararlar:
@@ -3155,7 +3164,9 @@ deftere hiçbir kayıt eklenmez.
 
 Bu maddeler ihtiyaç doğduğunda güvenlik, lisans, bakım maliyeti ve gerçek fayda açısından ayrıca değerlendirilecektir.
 
-### 4.21 Zamanlayıcı temeli — saf çekirdekler ve dayanıklı job deposu (Scheduler faz 1A + 1B, uygulandı)
+### 4.21 (Zamanlayıcı) Zamanlayıcı temeli — saf çekirdekler ve dayanıklı job deposu (Scheduler faz 1A + 1B, uygulandı)
+
+Numara GitHub v1 temeliyle (yukarıdaki 4.21) çakışır; bkz. §4 numaralandırma notu.
 
 Zamanlayıcı ayrı katmanlara bölünmüştür ve bugüne kadar yalnızca aşağıdaki
 üçü vardır. Bu bölümün ilk işi neyin **olmadığını** söylemektir: JARVIS bugün
@@ -3386,6 +3397,32 @@ bir çağıran değeridir, gizli olmadığı iddia edilemez.
 
 Zamanlayıcı bu nedenle **hâlâ uçtan uca kullanılabilir değildir**. Bu fazın
 tamamladığı şey depolama, yönetim ve **koordinasyon** temelidir.
+
+**Güncel durum (V24S0 kod doğrulaması, 2026-10-18; yukarıdaki blok faz 2A
+sınırının tarihsel kaydıdır).** Dağıtıcı artık vardır ve uçtan uca çalışır:
+
+- `jarvis/dispatch.py` (faz 2B1 tek atış köprüsü, 2B2a kurtarma, 2C koşul
+  izleme): `dispatch_job_run` lease'i kanıtlanmış bir üretimi
+  `memory._bind_dispatch` ile atomik olarak yeni bir AgentCore oturumuna ve
+  bildirilmiş zincire bağlar, sonra `AgentCore.run_chain`'i (§4.27) bir kez
+  çağırır; `dispatch_condition_watch_true` aynı bağlamayı koşul doğru
+  çıktığında yapar; `recover_job_run` / `cancel_job_run` kurtarma ve iptal
+  yoludur. Sonuçlar: refused, settled, parked, unknown, blocked,
+  cancel_intent. Kanıtlanamayan her şey RUNNING kalır (fail-closed;
+  bilinmeyen sonuç otomatik yeniden denenmez).
+- Çağıranlar: `jarvis/scheduler_runner.py` (`SchedulerRunner`) ve
+  `jarvis/condition_watch.py`.
+- Barındırıcılar: CLI `scheduler-run` (`App.run_scheduler`), arayüzdeki
+  Otomasyonlar düğmesi (`Backend.scheduler_once`) ve arayüz açıkken
+  `jarvis/ui/app.py` `install_scheduler_sweeps`: ilk tarama 2,5 sn sonra,
+  ardından 30 sn'de bir aynı `scheduler_once` (tepsiye gizliyken de).
+- Ayrı arka plan servisi / Windows kaydı **yoktur**: JARVIS kapalıyken hiçbir
+  zamanlanmış iş çalışmaz. Zamanlanmış iş sıradan görev yolundan geçer;
+  onay, maliyet, H2 ve doğrulama atlanmaz (§4.27).
+
+Çelişki böylece koda göre çözülür: §4.22/§4.25'teki dispatch başvuruları
+günceldir. `PROJECT_CONTEXT.md`'deki "dağıtıcı yok" ifadesi bayattır; o dosya
+bu dilimin kapsamı dışındadır.
 
 ### 4.22 Konuşma kalıcılığı ve kapsam temeli (V2 Projects, uygulandı)
 
@@ -3984,3 +4021,181 @@ kullanıcıya gösterilir.
   sayfası arayüz dilinde bir uyarı gösterir; satır asla onarılmaz.
   İkisi de onaylamaz ve ikisi de hem ana onay kartında (`SafetyCards.qml`)
   hem Command kartında (`ApprovalCard.qml`) vardır.
+
+### 4.27 Görev zinciri sürücüsü (`AgentCore.run_chain`, uygulandı)
+
+Bir oturumun bildirilmiş zincirini (`ChainState`, adımlar `ChainStep`)
+sırayla yürüten tek sürücü `AgentCore.run_chain(session_id)`'dir
+(`jarvis/core.py`). Yeni bir yetki yolu değildir; her adım sıradan bir
+`Task` olarak sıradan tek-görev yolundan geçer.
+
+- Döngü `MAX_CHAIN_STEPS` ile sınırlıdır ve her turda oturumu ve zinciri
+  depodan yeniden okur. Çakışma, zincirin ACTIVE olmaması veya iptal
+  döngüyü durdurur.
+- Her adımda `_run_chain_step` sırasıyla: kill switch, arşivlenmiş proje
+  reddi, `build_chain_step_task`, `memory.materialize_chain_step`, saklanmış
+  görevin `chain_task_refusal` ile yeniden kanıtı, `_chain_connector_refusal`,
+  ardından `self.resume(session_id, task_id)`: onay, maliyet, H2 ve
+  doğrulama bu sıradan yoldadır, zincir hiçbirini atlamaz.
+- Adım AWAITING_APPROVAL veya AWAITING_CLARIFICATION'da kalırsa döngü durur
+  (kullanıcı çözünce zincir yeniden sürülür); aksi halde
+  `memory.advance_chain_step` sonraki adıma geçer.
+- `ChainStep` kendi başına yetki taşımayan, durağan bir bildirimdir; adım
+  görevleri INTERNAL sınıflandırmayla oluşur.
+- Çağıranlar: CLI `chain-run`, skill çalıştırıcısı ve dağıtıcı
+  (`jarvis/dispatch.py`, §4.21 (Zamanlayıcı) güncel durum notu).
+
+Sınır: ara çıktılar, kontrol noktaları, kanıt ve kabul kaydı tutulmaz;
+çökme sonrası "devam" yalnız zincir imlecidir. V2.4 Work defteri bu açığı
+kapatır (aşağıdaki "V2.4 kararları").
+
+## V2.4 kararları (Salih 2026-10-17 06:0x: 11 kararın hepsi araştırma önerisi gibi; Jev pilotu ertelendi; 'aynı anda iki çalıştırma' V2.4 Work kapsamında)
+
+Kaynak: orkestratörün 2026-10-17 ürün denetimi ve araştırma raporundaki
+"Öneri" sütunu. Burada kayıt edilen her şey **tasarım kararıdır**; henüz
+hiçbiri kodda yoktur. Dilim planı depoda değil, `build/reports/V24S0-plan.md`
+dosyasındadır.
+
+### Alınan 11 karar
+
+1. **Jev pilotu: (c) ertele.** V2.4 ürünü Jev'i çağırmaz; Jev ileride
+   yalnız sıkılaştırıcı (tighten-only) olabilir.
+2. **Plana bağlı alt-çalıştırma çıkış zarfı.** Onaylanan plan; hedef
+   sağlayıcı, veri sınıfları, girdi artefakt başvuruları, bütçe ve TTL içeren
+   bir zarf taşır; her çağrının tasdiki zarfa karşı denetlenir. Yalnız araçsız
+   ve salt-okur girdili model çağrılarına uygulanır.
+3. **Onay zaman aşımı = ret + `needs_input`.** Zaman aşımı asla örtük onay
+   değildir.
+4. **Çökme: `interrupted` + açık devam + Core yeniden doğrulaması**
+   (kimlik → yetenek → hedef → kapsam → onay). TTL dolmuşsa veya politika
+   değişmişse yeniden onay. Yalnız bilgisayar uyanıkken çalışır.
+5. **İkili Kural (Rule of Two).** Bir çalıştırma şu üçünden en fazla ikisini
+   aynı anda taşır: güvenilmeyen girdi, hassas veri/araca erişim, dışa çıkış
+   veya durum değiştirme. Üçü birden gerekiyorsa insan onayı zorunludur.
+6. **Asgari AgentProfile** ve 1-2 yerleşik profil ("Araştırmacı",
+   "Belge/Veri Analisti"). Profil hafızası, kullanıcı profilleri ve profil
+   arayüzü alt sürüme kalır.
+7. **Önce rol adı, "o" diye anılır.** Kullanıcı sahip ve onaylayıcıdır;
+   ajanlara kişi adı verilmez.
+8. **Bütçe aşımı: `blocked:budget`, API'ye geri düşüş yok.** Değerleri
+   Salih belirler.
+9. **Kabul: Core yerel kontrolleri + kullanıcı kabulü.** Komut çalıştırma
+   kabul kontrolü olarak henüz yoktur; ileride kendi tehdit modeliyle gelir.
+10. **Günlük kullanım noktası: Adım 5'in sonu.**
+11. **Edge→Chrome tamamlandı.** Tek çalışma zamanı Chrome; Edge profili
+    yalnız geri dönüş olarak kalır (§5.1).
+
+Ek kapsam kararı: **farklı konuşmalarda aynı anda iki çalıştırma** V2.4 Work
+gereksinimidir.
+
+DECISION TAKEN: kararlar araştırmanın "Öneri" sütunundaki ifadeyle, Salih'in
+"hepsi öneri gibi" onayıyla kaydedildi (alternatif: her kararı ayrı seçenek
+tablosuyla yeniden açmak - onay zaten verildi).
+
+### Adım 0 iç açık bulguları (kod doğrulaması, 2026-10-18)
+
+- **Açık 1, görev zinciri sürücüsü:** vardır, §4.27. Sıralı, sınırlı,
+  sıradan görev yolunu kullanır; ara artefakt/kanıt/kontrol noktası yoktur.
+- **Açık 2, zamanlayıcı ve dağıtıcı çelişkisi:** kod dağıtıcının var
+  olduğunu gösterir (§4.21 (Zamanlayıcı) güncel durum notu). Uygulama
+  açıkken 30 sn'lik tarama; Windows servisi yok. `PROJECT_CONTEXT.md`'deki
+  "dağıtıcı yok" ifadesi bayattır.
+- **Açık 4, salt-okur connector envanteri:** sınıf olarak salt-okur olan tek
+  connector `local-file-read`'dir (LOCAL_READ). Claude Code, GitHub, Gmail,
+  Browser ve Desktop connector'larının varsayılan etkisi EXTERNAL_EGRESS'tir;
+  yerel yazma connector'ları LOCAL_WRITE. NONE ve LOCAL_READ dışındaki her
+  etki `MANDATORY_APPROVAL_EFFECTS` içindedir. Uzaktan okuma bu nedenle
+  bugün onay ister; Plan/Explore tavanı (NONE, proje LOCAL_READ, planlama
+  model çağrıları) mevcut sınıflarla kurulabilir.
+- **Açık 6, doğrulama ve kanıt kaydı:** her connector `verify()` ile bir
+  `VerificationRecord` (NOT_RUN, PASSED, FAILED, INCONCLUSIVE) döndürür;
+  doğrulama yapısaldır. Kanıt kaydı, kabul modeli ve iş düzeyinde doğrulama
+  **yoktur**; `progress.build_progress_artifacts`'ı hiçbir üretim akışı
+  doldurmaz.
+- **Açık 10, schema-10 geri dönüş koşulu ve W2 veri sözleşmesi:**
+  `SCHEMA_VERSION` 10'dur. Schema-10 sürümleri 10'dan büyük sürümü reddeder,
+  fazladan yalıtılmış tabloları yok sayar (§4.22 uyumluluk kuralı). Work
+  defteri bu nedenle yalnız `IF NOT EXISTS` ile yeni tablo/indeks ekler,
+  schema-10 tablolarına ALTER yapmaz ve nesnelerini
+  `COMPATIBILITY_SCHEMA_OBJECTS`'e kaydeder. W2 veri sözleşmesi bugün
+  yoktur; aşağıda tanımlanır.
+
+### Kararların gerektirdiği tasarım
+
+**Work defteri.** Bir Work çalıştırmasının tek doğruluk kaynağı.
+Alanlar: hedef, plan (hash'li nesne), alt görevler, kontrol noktaları,
+artefaktlar, kanıt, kabul, sonuç. Ek tablolar (`work_run`, `work_event`,
+`work_step`), yalnız ekleme yapılan olay kaydı, deterministik adım
+anahtarları, kaydedilmiş model çıktıları, H2 deneme bağlantısı ve
+idempotency anahtarı. SQLite `synchronous=FULL`, tek örnek kilidi + boot id,
+yedek `VACUUM INTO`. Mevcut görev zinciri (§4.27) Work adımlarının yürütücüsü
+olarak kalır; defter onun üstünde kayıt ve devam katmanıdır.
+
+**Durum makinesi.** queued → planning → awaiting_plan_approval → running ⇄
+{needs_input, awaiting_approval, blocked, paused} → verifying →
+awaiting_acceptance → completed; diğer uçlar failed, stopped, interrupted,
+needs_replan.
+
+**Çökme semantiği (karar 4).** Açılışta kilidi önceki boot id'ye ait,
+bitmemiş her çalıştırma `interrupted` olur; asla kendiliğinden sürmez.
+Devam yalnız açık kullanıcı eylemiyle olur ve Core zinciri yeniden
+doğrular (kimlik → yetenek → hedef → kapsam → onay); TTL dolmuş veya
+politika değişmişse yeniden onay ister. Belirsiz bir dış etki tekrarlanmaz
+(idempotency anahtarı, H2).
+
+**Plan hash nesnesi ve çıkış zarfı (karar 2).** Hash'lenen içerik: hedef,
+adımlar, alt-çalıştırma kapsamları, kanonik hedefler,
+connector/işlem/veri sınıfları, kontroller, bütçeler, alt-çalıştırma sayısı,
+son geçerlilik. Onay kaydı {plan hash, zarf, onaylayan, zaman, son
+geçerlilik}. Esaslı değişiklik yeni hash üretir ve onayı geçersiz kılar.
+Onay kartını Core üretir; risk tüm alt-çalıştırmaların toplamı üzerinden
+değerlendirilir. Alt-çalıştırma yetkisi: {child id, ebeveyn, plan hash,
+connector/işlem/hedef/veri sınıfı alt kümesi, TTL ≤ onay TTL'si, azami
+çağrı, uç derinlik}; hiçbir şey miras alınmaz. Alt-çalıştırma varsayılanı 0,
+azami 5; alt ve genel bütçeler, otomatik yeniden başlatma yok, kill switch
+tümünü durdurur. Alt CLI duruşu: Agent aracı yok veya
+`CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1`, bypass bayrağı yok, yapılandırma
+bütünlük denetimi, sabitlenmiş sürüm, Codex salt-okur sandbox. Alt sonuç
+tipli döner: yeniden ifade edilmiş hedef, kanıt kimlikli bulgular, boşluklar,
+durum (completed, partial, failed, timeout, blocked_by_gate), yapılmayan
+eylemler.
+
+**Onay zaman aşımı (karar 3).** Süresi dolan onay isteği ret olarak
+kaydedilir ve çalıştırma `needs_input`'a geçer.
+
+**İkili Kural (karar 5).** Core plan onayında ve her alt-çalıştırma
+yetkisinde üç özelliği hesaplar; üçü birden varsa plan kendiliğinden
+yürümez, açık insan onayı ister.
+
+**AgentProfile (karar 6, 7).** Alanlar: id, rol etiketi, amaç, talimat
+metni (yalnız veri), yetenek tavanı, görev tipi çalışanı, model politikası,
+durum (draft, active, paused, archived). AgentRun geçicidir. Etkin yetki =
+profil ∩ plan ∩ Core politikası. Ajan başına hafıza yok. Arayüzde rol adı
+görünür, ajan "o" diye anılır.
+
+**Bütçe (karar 8).** Bütçe aşıldığında çalıştırma `blocked` (neden
+`budget`) olur; başka bir sağlayıcıya veya API'ye geri düşmez. Limitler
+Salih'in ayarıdır.
+
+**Kabul ve kanıt (karar 9).** Kontrol tipleri: artefakt varlığı/boyutu/
+biçimi/şeması, deterministik içerik kuralları, geri okuma, tazelik,
+kullanıcı kabulü. Komut çalıştırma kabul kontrolü değildir. Kanıt makbuzu
+artefakt değişince bayatlar. `claim_done` → verifying; `needs_revision` en
+fazla 3 kez; kapılar fail-closed ("doğrulanamadı").
+
+**W2 veri sözleşmesi.** W2 yalnız Work defterinden beslenir; yüzde çubuğu
+yoktur. N dakika olay gelmezse `needs_attention`.
+
+**İki eşzamanlı çalıştırma.** Her `work_run` satırı bir konuşmaya bağlıdır;
+genel "tek çalıştırma" kilidi yoktur. Aynı konuşmada en fazla bir etkin
+çalıştırma, farklı konuşmalarda iki çalıştırma aynı anda yürür. Tek kilit
+veritabanı örnek kilididir. Bütçe ve kill switch genel kalır.
+
+**Günlük kullanım ve tarayıcı (karar 10, 11).** Günlük kullanım Adım 5
+sonunda başlar. Tarayıcı işi Chrome üzerinden yürür; Edge geçişi kapanmış
+kabul edilir.
+
+**Regresyon paketi.** Yedi senaryo: alt-çalıştırma enjeksiyonu, sahte onay,
+onaydan sonra plan değişikliği, politika değişikliği sonrası devam, döngü,
+okuma araçlarıyla dışa sızdırma, CLI yapılandırma kurcalama; ayrıca ~20
+görevde tek ajanla karşılaştırma.
