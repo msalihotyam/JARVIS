@@ -12,7 +12,7 @@ import threading
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from collections import Counter
-from datetime import datetime
+from datetime import datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import AbstractSet, Any, Callable
@@ -1175,9 +1175,8 @@ class CaptureStop:
         finally:
             if held:
                 self._lock.release()
-        # ponytail: a CLI spawned between this cancel and the adapter
-        # registering its process runs to the adapter timeout. Upgrade: an
-        # adapter-side cancel-before-spawn flag.
+        # A cancel that lands before the adapter spawns is kept by the adapter,
+        # which then never starts the CLI (claude_code / codex cancel-before-spawn).
         for task_id, model in calls:
             try:
                 model.cancel(task_id)
@@ -1265,6 +1264,27 @@ def _finish_capture_run(store: Any, result: MemoryCaptureOutcome) -> None:
             "WHERE run_id = ? AND finished_at IS NULL",
             (utc_now(), result.outcome, json.dumps(result.counts(), sort_keys=True), result.run_id),
         )
+
+
+#: A claimed run open this long has no live owner: every capture call is
+#: bounded by its adapter timeout, far below this.
+CAPTURE_RUN_STALE_SECONDS = 3600
+
+
+def _release_stale_capture_runs(store: Any, now: str) -> int:
+    """Startup sweep: a claimed run whose process died (still open past
+    ``CAPTURE_RUN_STALE_SECONDS``) is closed as ``aborted``. Never replayed -
+    its run id stays claimed - and a finished row (``unknown_outcome``
+    included) is never touched. Returns how many it released."""
+    # ponytail: the row has no owner pid (schema 10 stays), so age stands in
+    # for "owner gone". Upgrade: an owner column in an additive table.
+    before = (datetime.fromisoformat(now) - timedelta(seconds=CAPTURE_RUN_STALE_SECONDS)).isoformat()
+    with _capture_run_connection(store) as connection:
+        return connection.execute(
+            "UPDATE memory_capture_runs SET finished_at = ?, outcome = 'aborted' "
+            "WHERE finished_at IS NULL AND started_at < ?",
+            (now, before),
+        ).rowcount
 
 
 class AgentCore:

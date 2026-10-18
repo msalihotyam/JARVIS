@@ -9,7 +9,7 @@ import re
 import sqlite3
 import time
 import unicodedata
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -8411,12 +8411,16 @@ class SQLiteMemoryStore:
             "conflicts": len(plan.conflicts),
         }
 
-    def consolidate_scope(self, project_id: str, now: str) -> dict[str, int]:
+    def consolidate_scope(
+        self, project_id: str, now: str, *, writing: AbstractContextManager | None = None
+    ) -> dict[str, int]:
         """Load one project's V2.1 records, plan, apply; returns counts.
 
         Idempotent: only live records are planned, so a second call over an
         applied plan finds nothing to do. ``apply_consolidation_plan``
         re-checks every step, so a concurrent change refuses the plan.
+        ``writing`` (capture's shutdown gate) is entered around the apply
+        only: reads and planning never hold it.
         """
         validate_project_id(project_id)
         with self._connection() as connection:
@@ -8454,7 +8458,9 @@ class SQLiteMemoryStore:
             ),
             conflicts=plan.conflicts,
         )
-        return {**self.apply_consolidation_plan(plan), "skipped_tombstoned": len(dropped)}
+        with writing if writing is not None else nullcontext():
+            applied = self.apply_consolidation_plan(plan)
+        return {**applied, "skipped_tombstoned": len(dropped)}
 
     def list_records(
         self,

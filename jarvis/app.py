@@ -23,7 +23,7 @@ import sqlite3
 import threading
 import time
 from collections import Counter
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timezone
 from dataclasses import dataclass, replace
 from functools import cached_property
@@ -158,6 +158,7 @@ from jarvis.core import (
     _capture_run_connection,
     _claim_capture_run,
     _finish_capture_run,
+    _release_stale_capture_runs,
     _validated_capture_candidate,
 )
 from jarvis import memory_capture, memory_import
@@ -3823,8 +3824,8 @@ class MemoryTriggers:
         self._lock = threading.Lock()
         self._jobs: dict[str, list[tuple[Any, Any, tuple[Any, ...] | None]]] = {}
         self._threads: dict[str, threading.Thread] = {}
-        # ponytail: process-local high-water mark of seqs handed to capture;
-        # a restart re-offers turns and Core's run-id ledger dedupes them.
+        # High-water mark of seqs captured; ``_mark`` also writes it to the ok
+        # run's ledger row and ``_mark_for`` re-derives it after a restart.
         self._captured: dict[str, int] = {}
         self._closed = False
         self._stop = CaptureStop()
@@ -3948,13 +3949,49 @@ class MemoryTriggers:
         top = max((turn.seq for turn in turns), default=0)
         with self._lock:
             self._captured[conversation_id] = max(self._captured.get(conversation_id, 0), top)
+            app = self._apps.get(conversation_id)
+        run_id = getattr(outcome, "run_id", None)
+        if app is None or type(run_id) is not str or not top:
+            return
+        # Durable: the mark rides on the ok run's counts, so a restart
+        # re-derives it (``_mark_for``) instead of capturing the turns again.
+        # A failed write leaves the in-process mark holding.
+        with suppress(Exception), self._stop.write(), _capture_run_connection(app.memory) as connection:
+            connection.execute(
+                "UPDATE memory_capture_runs SET counts = json_set(counts, '$.through_seq',"
+                " max(coalesce(json_extract(counts, '$.through_seq'), 0), ?))"
+                " WHERE run_id = ? AND conversation_id = ? AND outcome = 'ok' AND json_valid(counts)",
+                (top, run_id, conversation_id))
 
-    def _with_carry(self, conversation_id: str, turns: tuple[Any, ...]) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
+    def _mark_for(self, memory: Any, conversation_id: str) -> int:
+        """The captured-through seq: this process's mark, or on a cold start
+        the highest one an ok run recorded, so a restart never re-captures."""
+        with self._lock:
+            if conversation_id in self._captured:
+                return self._captured[conversation_id]
+        try:
+            with memory._connection() as connection:
+                row = connection.execute(
+                    "SELECT MAX(json_extract(counts, '$.through_seq')) FROM memory_capture_runs"
+                    " WHERE conversation_id = ? AND outcome = 'ok' AND json_valid(counts)",
+                    (conversation_id,)).fetchone()
+            durable = int(row[0] or 0)
+        except Exception:  # noqa: BLE001 - unreadable ledger: offer every raw turn, re-read next time
+            return 0
+        with self._lock:
+            self._captured[conversation_id] = max(self._captured.get(conversation_id, 0), durable)
+            return self._captured[conversation_id]
+
+    def _with_carry(self, conversation_id: str, turns: tuple[Any, ...],
+                    mark: int = 0) -> tuple[tuple[Any, ...], tuple[Any, ...]]:
         """(the carried turns + the new ones, the new ones). A re-offered turn
         is not new; a carry the new turns do not continue (seqs) is dropped;
         the oldest carried turns give way to Core's cap, the new ones never."""
         with self._lock:
-            carry = self._carry.get(conversation_id, ())
+            # A carried turn the mark covers was captured: it never rides again.
+            carry = tuple(turn for turn in self._carry.get(conversation_id, ()) if turn.seq > mark)
+            if not carry:
+                self._carry.pop(conversation_id, None)
         new = tuple(turn for turn in turns if not carry or turn.seq > carry[-1].seq)
         if new and carry and new[0].seq != carry[-1].seq + 1:
             carry = ()
@@ -4011,11 +4048,10 @@ class MemoryTriggers:
         if not capture_gate_open(app.memory, conversation_id):
             return
         raw = app.memory.load_conversation_state(conversation_id).turns
-        with self._lock:
-            mark = self._captured.get(conversation_id, 0)
+        mark = self._mark_for(app.memory, conversation_id)
         fresh = tuple(turn for turn in raw if turn.seq > mark)
         # Folded turns a PreCompact skip left ride in front, as at SessionEnd.
-        batch, new = self._with_carry(conversation_id, fresh)
+        batch, new = self._with_carry(conversation_id, fresh, mark)
         # Core's own skip rule, before any claim or call: a short session or
         # a reported quota below the floor costs nothing. Temporary
         # conversations are never armed (touch), so never reach this.
@@ -4073,10 +4109,9 @@ class MemoryTriggers:
                 self._carry_on(conversation_id, batch, outcome)
             return
         raw = app.memory.load_conversation_state(conversation_id).turns
-        with self._lock:
-            mark = self._captured.get(conversation_id, 0)
+        mark = self._mark_for(app.memory, conversation_id)
         fresh = tuple(turn for turn in raw if turn.seq > mark)
-        batch, new = self._with_carry(conversation_id, fresh)
+        batch, new = self._with_carry(conversation_id, fresh, mark)
         if batch:
             if batch == raw:
                 outcome = app.core.capture_memory(conversation_id, trigger, model, stop=stop)
@@ -4085,8 +4120,8 @@ class MemoryTriggers:
             self._after_capture(conversation_id, batch, new, self._settled(app.memory, outcome, stop))
         record = app.memory.load_conversation(conversation_id)
         if record is not None and record.project_id:
-            with stop.write():
-                app.memory.consolidate_scope(record.project_id, utc_now())
+            # Planning reads run outside the writer; only the apply holds it.
+            app.memory.consolidate_scope(record.project_id, utc_now(), writing=stop.write())
 
     def halt(self, timeout: float = 0.0) -> bool:
         """Close for good: once this returns no capture write starts (one in
@@ -4249,6 +4284,9 @@ class JarvisApp:
             if capture_gate_open(store, conversation_id):
                 triggers.schedule(target, conversation_id, MemoryRecordOrigin.CAPTURE_PRECOMPACT, turns)
         register_precompact_hook(store, hook)
+        # Startup: runs a dead process left claimed are released, not replayed.
+        with suppress(Exception):  # no ledger yet: nothing to release
+            _release_stale_capture_runs(store, utc_now())
         # Idle capture watches only where conversations are watched (the UI),
         # with the same current-app resolver.
         triggers.start_idle_watch(target)

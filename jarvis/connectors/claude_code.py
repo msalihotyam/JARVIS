@@ -375,6 +375,8 @@ class ClaudeCodeConnector(BaseConnector):
         self.effort = None if effort is None else validate_claude_effort(effort)
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._process_lock = threading.Lock()
+        #: Task ids cancelled before their CLI spawned; ``complete`` refuses them.
+        self._cancelled: set[str] = set()
         #: The located CLI, resolved on first use and then reused (DB-001).
         self._executable: TrustedExecutable | None = None
 
@@ -666,33 +668,44 @@ class ClaudeCodeConnector(BaseConnector):
         # What the CLI reads on stdin, when the call does not carry its prompt
         # in argv (see ``_stdin_payload``). ``None`` keeps today's argv-only call.
         stdin_text = self._stdin_payload(prompt)
-        try:
-            process = subprocess.Popen(
-                command,
-                cwd=working_directory,
-                stdin=subprocess.PIPE if stdin_text is not None else None,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                shell=False,
-                # Defense in depth: metered credential routes are stripped
-                # from the external model subprocess environment.
-                env=self._sanitized_environment(),
-                creationflags=NO_CONSOLE_WINDOW,
-            )
-        except FileNotFoundError:
-            return self._error_result(
-                task,
-                ErrorCode.CONNECTOR_UNAVAILABLE,
-                "Claude Code CLI is not installed or is not on PATH.",
-                retryable=True,
-                billing_class=billing_class,
-                billing_evidence=evidence,
-            )
-
+        # Spawn and registration share the lock with ``cancel``: a cancel either
+        # finds the process or lands first and the CLI is never started.
         with self._process_lock:
+            if task.id in self._cancelled:
+                self._cancelled.discard(task.id)
+                return self._error_result(
+                    task,
+                    ErrorCode.CANCELLED,
+                    "The call was cancelled before Claude Code started; nothing was sent.",
+                    retryable=False,
+                    billing_class=billing_class,
+                    billing_evidence=evidence,
+                )
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=working_directory,
+                    stdin=subprocess.PIPE if stdin_text is not None else None,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    shell=False,
+                    # Defense in depth: metered credential routes are stripped
+                    # from the external model subprocess environment.
+                    env=self._sanitized_environment(),
+                    creationflags=NO_CONSOLE_WINDOW,
+                )
+            except FileNotFoundError:
+                return self._error_result(
+                    task,
+                    ErrorCode.CONNECTOR_UNAVAILABLE,
+                    "Claude Code CLI is not installed or is not on PATH.",
+                    retryable=True,
+                    billing_class=billing_class,
+                    billing_evidence=evidence,
+                )
             self._processes[task.id] = process
         if stdin_text is not None:
             try:
@@ -717,6 +730,9 @@ class ClaudeCodeConnector(BaseConnector):
         finally:
             with self._process_lock:
                 self._processes.pop(task.id, None)
+                # ponytail: a cancel after this pop (or before an early refusal)
+                # leaves one uuid in _cancelled; ids are never reused, so no false refusal.
+                self._cancelled.discard(task.id)
 
         if task.cancellation_requested:
             return ToolResult(
@@ -918,7 +934,10 @@ class ClaudeCodeConnector(BaseConnector):
     def cancel(self, task_id: str) -> bool:
         with self._process_lock:
             process = self._processes.get(task_id)
-        if process is None or process.poll() is not None:
+            if process is None:
+                self._cancelled.add(task_id)  # not spawned yet: never will be
+                return False
+        if process.poll() is not None:
             return False
         process.terminate()
         return True

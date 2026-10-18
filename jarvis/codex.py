@@ -300,6 +300,8 @@ class CodexIntentAdapter:
         self.observed: dict[str, dict[str, Any]] = {}
         self._processes: dict[str, subprocess.Popen[str]] = {}
         self._lock = threading.Lock()
+        #: Task ids cancelled before their CLI spawned; ``complete`` refuses them.
+        self._cancelled: set[str] = set()
 
     def context_profile(self) -> ContextProfile:
         """What one call can carry, REPORTED to the Conversation Context Core,
@@ -316,7 +318,10 @@ class CodexIntentAdapter:
     def cancel(self, task_id: str) -> bool:
         with self._lock:
             process = self._processes.get(task_id)
-        if process is None or process.poll() is not None:
+            if process is None:
+                self._cancelled.add(task_id)  # not spawned yet: never will be
+                return False
+        if process.poll() is not None:
             return False
         process.terminate()
         return True
@@ -374,13 +379,19 @@ class CodexIntentAdapter:
             # sandbox, the approval policy and the disabled features are unchanged.
             command += ["-i", *images, "--"]
         command.append("-")
-        try:
-            process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       text=True, encoding="utf-8", errors="replace", env=_environment(), shell=False,
-                                       creationflags=NO_CONSOLE_WINDOW)
-        except OSError:
-            return self._refused("The Codex CLI could not be started.", ErrorCode.CONNECTOR_UNAVAILABLE)
+        # Spawn and registration share the lock with ``cancel``: a cancel either
+        # finds the process or lands first and the CLI is never started.
         with self._lock:
+            if task.id in self._cancelled:
+                self._cancelled.discard(task.id)
+                shutil.rmtree(workdir, ignore_errors=True)
+                return self._refused("The call was cancelled before Codex started; nothing was sent.", ErrorCode.CANCELLED)
+            try:
+                process = subprocess.Popen(command, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                           text=True, encoding="utf-8", errors="replace", env=_environment(), shell=False,
+                                           creationflags=NO_CONSOLE_WINDOW)
+            except OSError:
+                return self._refused("The Codex CLI could not be started.", ErrorCode.CONNECTOR_UNAVAILABLE)
             self._processes[task.id] = process
         try:
             stdout, _ = process.communicate(prompt, timeout=CODEX_TIMEOUT_SECONDS)
@@ -391,6 +402,9 @@ class CodexIntentAdapter:
         finally:
             with self._lock:
                 self._processes.pop(task.id, None)
+                # ponytail: a cancel after this pop (or before an early refusal)
+                # leaves one uuid in _cancelled; ids are never reused, so no false refusal.
+                self._cancelled.discard(task.id)
             shutil.rmtree(workdir, ignore_errors=True)
         text, usage, failed, notes = "", {}, False, []
         for line in stdout.splitlines():
