@@ -10,13 +10,20 @@ from __future__ import annotations
 import sqlite3
 import unittest
 from contextlib import closing
+from dataclasses import replace
+from datetime import datetime, timedelta
 
 from PySide6.QtCore import QMetaObject
 
-from jarvis.contracts import AttemptState, ChainStatus, ErrorCode, PermissionGrant, RunStatus, SideEffect, TaskStatus
+from jarvis.contracts import (
+    ORPHAN_MIN_AGE, AttemptRecovery, AttemptState, ChainStatus, ErrorCode, PermissionGrant, RunStatus,
+    SideEffect, TaskStatus,
+)
+from jarvis.lifecycle import is_terminal
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.skill_store import SkillStore
-from tests.helpers import DummyConnector, wait_until
+from jarvis.skill_types import SkillStep
+from tests.helpers import DUMMY_CAPABILITY, DummyConnector, wait_until
 from tests import test_skill_core as base
 from tests import test_skill_core_cancel as cancel
 from tests import test_ui
@@ -24,6 +31,10 @@ from tests.test_intent import StubConnector, task_proposal
 from tests.test_skill_core import user_task
 from tests.test_skill_core_cancel import HookConnector
 from tests.test_ui import UiTestCase, pump
+
+
+class _SimulatedCrash(BaseException):
+    """The process dies right here: nothing below the raise runs or settles."""
 
 
 class PauseCoreTests(unittest.TestCase):
@@ -259,6 +270,217 @@ class PauseCoreTests(unittest.TestCase):
             db.execute("UPDATE execution_attempts SET state = ? WHERE task_id = ?", (state, run.task.id))
         done = core.resume_paused(run.session.id, run.task.id)
         self.assertEqual(done.status, RunStatus.COMPLETED, done.error)
+        self.assertEqual(connector.execute_calls, 0)
+
+    # -- DFPAUSEFIX: M2 a pause racing the next bind, M3 a crash mid-step -------
+
+    def save_skill(self, steps: int) -> None:
+        made = replace(base.draft(), steps=tuple(
+            SkillStep(index=i, action=cancel.STEP, capability=DUMMY_CAPABILITY, inputs=("path",), check=None)
+            for i in range(1, steps + 1)
+        ))
+        self.store.add_draft(made)
+        self.store.approve_draft(made.draft_id, project_id=None)
+
+    def delegated(self, steps: int, *, index=None, after=False, crash=False, mid_step=False):
+        """Run a ``steps``-step skill; pause its anchor once just before (or just
+        after) step ``index`` (0-based) binds, or during step 1 - and maybe die
+        right there. Returns (core, connector, runner, anchor, owner)."""
+        self.save_skill(steps)
+        connector = HookConnector()
+        core = self.core(connector)
+        bind = core.memory.materialize_chain_step
+        runners, fired = [], []
+
+        def pause(session_id: str) -> None:
+            fired.append(session_id)
+            anchor = self.store.load_session(session_id).objective.removeprefix("skill-run:")
+            core.pause(self.store.task_session_id(anchor), anchor)
+            if crash:
+                raise _SimulatedCrash
+
+        def pause_at_bind(session_id, chain_id, digest, step_index, task):
+            hit = step_index == index and not fired
+            runners.append(session_id)
+            if hit and not after:
+                pause(session_id)
+            bound = bind(session_id, chain_id, digest, step_index, task)
+            if hit and after:
+                pause(session_id)
+            return bound
+
+        core.memory.materialize_chain_step = pause_at_bind
+        if mid_step:
+            connector.hook = lambda session: pause(session.id)
+        try:
+            core.run(user_task())
+        except _SimulatedCrash:
+            pass
+        core.memory.materialize_chain_step = bind
+        anchor = self.store.load_session(runners[0]).objective.removeprefix("skill-run:")
+        return core, connector, runners[0], anchor, self.store.task_session_id(anchor)
+
+    def restart(self, connector=None):
+        self.store = SkillStore(self.database)
+        connector = connector or DummyConnector()
+        return self.core(connector), connector
+
+    def assertPausedThenResumesOnce(self, core, connector, owner, anchor, steps, ran):
+        """PAUSED with ``ran`` steps executed; Resume runs only the rest, and a
+        second Resume changes nothing."""
+        self.assertIs(self.status(anchor), TaskStatus.PAUSED)
+        self.assertEqual(connector.execute_calls, ran)
+        done = core.resume_paused(owner, anchor)
+        self.assertEqual(done.status, RunStatus.COMPLETED, done.error)
+        self.assertEqual(connector.execute_calls, steps)
+        core.resume_paused(owner, anchor)
+        self.assertIs(self.status(anchor), TaskStatus.COMPLETED)
+        self.assertEqual(connector.execute_calls, steps)
+
+    def test_m2_a_pause_just_before_the_next_bind_is_never_lost(self) -> None:
+        core, connector, _, anchor, owner = self.delegated(2, index=1)
+        # Codex probe: step 2 ran and the anchor COMPLETED. Now it stops.
+        self.assertPausedThenResumesOnce(core, connector, owner, anchor, steps=2, ran=1)
+
+    def test_m2_a_pause_just_after_the_next_bind_pauses_the_bound_step(self) -> None:
+        core, connector, runner, anchor, owner = self.delegated(2, index=1, after=True)
+        step = self.store.load_session(runner).chain.step_task_ids[1]
+        self.assertIs(self.status(step), TaskStatus.PAUSED)
+        self.assertPausedThenResumesOnce(core, connector, owner, anchor, steps=2, ran=1)
+
+    def crashed_mid_step(self):
+        """Codex M3: Stop, then the process dies while step 1 executes."""
+        _, _, runner, anchor, owner = self.delegated(2, mid_step=True, crash=True)
+        step = self.store.load_session(runner).chain.step_task_ids[0]
+        core, connector = self.restart()
+        self.assertIs(self.status(anchor), TaskStatus.PAUSE_REQUESTED)
+        self.assertIs(self.status(step), TaskStatus.PAUSE_REQUESTED)
+        return core, connector, runner, anchor, owner, step
+
+    def recover(self, step: str) -> None:
+        """The operator's orphan recovery of the step's in-doubt attempt."""
+        with closing(sqlite3.connect(self.database)) as db:
+            db.row_factory = sqlite3.Row
+            row = db.execute("SELECT * FROM execution_attempts WHERE task_id = ?", (step,)).fetchone()
+        aged = datetime.fromisoformat(row["updated_at"]) + ORPHAN_MIN_AGE + timedelta(minutes=1)
+        self.store.declare_attempt_orphaned(
+            row["session_id"], step, row["id"], now=aged, actor_label="test", reason="crash"
+        )
+        self.store.abandon_unknown_attempt(row["session_id"], step, row["id"], AttemptRecovery.ABANDONED)
+
+    def test_m3_resume_after_a_crash_mid_step_refuses_without_changing_anything(self) -> None:
+        core, connector, _, anchor, owner, step = self.crashed_mid_step()
+        for _ in range(2):
+            refused = core.resume_paused(owner, anchor)
+            self.assertEqual(refused.status, RunStatus.FAILED)
+            self.assertIs(self.status(anchor), TaskStatus.PAUSE_REQUESTED)
+            self.assertIs(self.status(step), TaskStatus.PAUSE_REQUESTED)
+        self.assertEqual(connector.execute_calls, 0)
+        self.recover(step)
+        ended = core.resume_paused(owner, anchor)
+        self.assertTrue(is_terminal(self.store.load_task(anchor)), ended.error)
+        self.assertEqual(connector.execute_calls, 0)                      # nothing restarted the doubtful step
+
+    def test_m3_cancel_after_a_crash_mid_step_reaches_a_terminal_state(self) -> None:
+        core, connector, runner, anchor, owner, step = self.crashed_mid_step()
+        self.assertEqual(core.cancel(owner, anchor).status, RunStatus.CANCELLING)
+        self.recover(step)
+        self.assertEqual(core.cancel(owner, anchor).status, RunStatus.CANCELLED)
+        self.assertIs(self.status(anchor), TaskStatus.CANCELLED)
+        self.assertTrue(is_terminal(self.store.load_task(step)))
+        self.assertIs(self.store.load_session(runner).chain.status, ChainStatus.CANCELLED)
+        self.assertEqual(connector.execute_calls, 0)
+
+    def test_f2_every_boundary_of_one_two_and_three_step_chains(self) -> None:
+        cases = [(n, i, after) for n in (1, 2, 3) for i in range(n) for after in (False, True)]
+        for steps, index, after in cases:                                 # 12 inputs
+            with self.subTest(steps=steps, index=index, after=after):
+                self.setUp()
+                core, connector, _, anchor, owner = self.delegated(steps, index=index, after=after)
+                self.assertPausedThenResumesOnce(core, connector, owner, anchor, steps, ran=index)
+        for steps in (1, 2, 3):                                           # 3 inputs: during step 1
+            with self.subTest(steps=steps, mid_step=True):
+                self.setUp()
+                core, connector, _, anchor, owner = self.delegated(steps, mid_step=True)
+                self.assertPausedThenResumesOnce(core, connector, owner, anchor, steps, ran=1)
+
+    def test_f2_a_crash_at_each_bind_phase_waits_for_the_user(self) -> None:
+        for after in (False, True):                                       # 2 inputs
+            with self.subTest(after=after):
+                self.setUp()
+                _, _, _, anchor, owner = self.delegated(2, index=1, after=after, crash=True)
+                core, connector = self.restart()
+                self.assertIs(self.status(anchor), TaskStatus.PAUSE_REQUESTED)   # no auto-resume
+                self.assertEqual(connector.execute_calls, 0)
+                done = core.resume_paused(owner, anchor)
+                self.assertEqual(done.status, RunStatus.COMPLETED, done.error)
+                self.assertEqual(connector.execute_calls, 1)              # only step 2, once
+                core.resume_paused(owner, anchor)
+                self.assertIs(self.status(anchor), TaskStatus.COMPLETED)
+                self.assertEqual(connector.execute_calls, 1)
+
+    def test_f2_approval_wait_cancel_and_a_typed_message_while_delegated_is_paused(self) -> None:
+        with self.subTest("pause during the approval wait"):              # 3 inputs
+            self.setUp()
+            self.save_skill(2)
+            connector = DummyConnector(always_requires_approval=True)
+            core = self.core(connector)
+            run = core.run(user_task())
+            anchor = self.store.load_session(run.session.id).objective.removeprefix("skill-run:")
+            owner = self.store.task_session_id(anchor)
+            self.assertEqual(core.pause(owner, anchor).status, RunStatus.AWAITING_CLARIFICATION)
+            self.assertIs(self.status(anchor), TaskStatus.PAUSED)
+            old = PermissionGrant.for_request(run.permission_request)
+            self.assertNotEqual(core.resume(run.session.id, run.permission_request.task_id, old).status,
+                                RunStatus.COMPLETED)
+            again = core.resume_paused(owner, anchor)
+            self.assertEqual(again.status, RunStatus.AWAITING_APPROVAL, again.error)
+            core.resume_paused(owner, anchor)
+            self.assertNotIn(self.status(anchor), (TaskStatus.PAUSED, TaskStatus.COMPLETED))
+            self.assertEqual(connector.execute_calls, 0)
+        with self.subTest("cancel after pause"):
+            self.setUp()
+            core, connector, runner, anchor, owner = self.delegated(2, index=1)
+            self.assertEqual(core.cancel(owner, anchor).status, RunStatus.CANCELLED)
+            self.assertIs(self.store.load_session(runner).chain.status, ChainStatus.CANCELLED)
+            self.assertEqual(core.resume_paused(owner, anchor).status, RunStatus.CANCELLED)
+            self.assertIs(self.status(anchor), TaskStatus.CANCELLED)
+            self.assertEqual(connector.execute_calls, 1)
+        with self.subTest("typed message while paused"):
+            self.setUp()
+            core, connector, _, anchor, owner = self.delegated(2, index=1)
+            other = core.run(user_task())
+            self.assertNotIn(anchor, (other.task.id, other.session.objective.removeprefix("skill-run:")))
+            self.assertIs(self.status(anchor), TaskStatus.PAUSED)
+            ran = connector.execute_calls
+            done = core.resume_paused(owner, anchor)
+            self.assertEqual(done.status, RunStatus.COMPLETED, done.error)
+            self.assertEqual(connector.execute_calls, ran + 1)            # only the paused run's step 2
+
+    def test_f2_a_runner_step_pauses_and_resumes_as_its_anchor(self) -> None:
+        self.save_skill(2)
+        connector = DummyConnector(always_requires_approval=True)
+        core = self.core(connector)
+        run = core.run(user_task())
+        runner, step = run.session.id, run.permission_request.task_id
+        anchor = self.store.load_session(runner).objective.removeprefix("skill-run:")
+        core.pause(runner, step)
+        self.assertIs(self.status(anchor), TaskStatus.PAUSED)
+        self.assertIs(self.status(step), TaskStatus.PAUSED)
+        self.assertEqual(core.run_chain(runner)[0].status, RunStatus.AWAITING_CLARIFICATION)
+        chain = self.store.load_session(runner).chain
+        self.assertFalse(chain.step_task_ids[1:] and chain.step_task_ids[1])  # no step 2 started
+        again = core.resume_paused(runner, step)
+        self.assertEqual(again.status, RunStatus.AWAITING_APPROVAL, again.error)   # gate re-asked
+        self.assertNotIn(self.status(anchor), (TaskStatus.PAUSED, TaskStatus.PAUSE_REQUESTED))
+        self.assertEqual(connector.execute_calls, 0)
+
+    def test_f2_resume_after_a_cancel_of_a_crashed_step_stays_cancelled(self) -> None:
+        core, connector, _, anchor, owner, step = self.crashed_mid_step()
+        self.assertEqual(core.cancel(owner, anchor).status, RunStatus.CANCELLING)
+        self.recover(step)
+        self.assertEqual(core.resume_paused(owner, anchor).status, RunStatus.CANCELLED)
+        self.assertIs(self.status(anchor), TaskStatus.CANCELLED)
         self.assertEqual(connector.execute_calls, 0)
 
 

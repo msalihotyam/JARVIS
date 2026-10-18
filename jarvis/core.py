@@ -1679,16 +1679,21 @@ class AgentCore:
         flight finishes, and the loop refuses to start the next one. A task
         waiting at a gate pauses at once and its open question is withdrawn.
         """
-        bound = self._skill_bound_step(session_id, task_id)
+        session_id, task_id = self._skill_anchor_target(session_id, task_id)
         outcome = self.memory.pause_task(session_id, task_id)
         refused = self._pause_refusal(session_id, task_id, outcome)
         if refused is not None:
             return refused
         if outcome.verdict in ("paused", "pausing"):
+            # DFPAUSEFIX: looked up AFTER the anchor is paused, so a step bound
+            # past the chain's pre-start re-check is always found and paused.
+            bound = self._skill_bound_step(session_id, task_id)
             if bound is not None:
                 # The skill's live step stops at ITS boundary; the chain then
                 # sees the anchor paused and starts no further step.
-                self.memory.pause_task(*bound)
+                if self.memory.pause_task(*bound).verdict == "paused":
+                    # It waited at a gate, so nothing runs: the anchor is paused.
+                    self._skill_anchor_settle_pause(self.memory.load_session(bound[0]))
             return AgentRun(RunStatus.AWAITING_CLARIFICATION, outcome.session, outcome.task)
         return self._pause_not_possible(outcome.session, outcome.task)
 
@@ -1702,18 +1707,41 @@ class AgentCore:
         PAUSE_REQUESTED task with no step open or in doubt (storage decides);
         a task still finishing a step, cancelled or finished is refused.
         """
+        session_id, task_id = self._skill_anchor_target(session_id, task_id)
         bound = self._skill_bound_step(session_id, task_id)
+        if bound is not None:
+            # DFPAUSEFIX: the bound step first. A step still finishing or in
+            # doubt refuses, and then the task stays paused with it unchanged.
+            step = self.memory.load_task(bound[1])
+            if step is not None and step.status in _PAUSE_STATUSES:
+                if self.memory.resume_paused(*bound).verdict != "resumed":
+                    session = self.memory.load_session(session_id)
+                    task = self.memory.load_task(task_id)
+                    if session is not None and task is not None:
+                        return self._pause_not_possible(session, task)
         outcome = self.memory.resume_paused(session_id, task_id)
         refused = self._pause_refusal(session_id, task_id, outcome)
         if refused is not None:
             return refused
         if outcome.verdict != "resumed":
             return self._pause_not_possible(outcome.session, outcome.task)
-        if bound is not None:
-            step = self.memory.load_task(bound[1])
-            if step is not None and step.status in _PAUSE_STATUSES:
-                self.memory.resume_paused(*bound)
         return self._advance(outcome.session, outcome.task, None)
+
+    def _skill_anchor_target(self, session_id: str, task_id: str) -> tuple[str, str]:
+        """DFPAUSEFIX: a step of a skill runner pauses and resumes as the task
+        it runs for, so the chain is never split from its anchor. Only a task
+        of that runner session redirects; anything else is decided as given."""
+        try:
+            session = self.memory.load_session(session_id)
+            if session is None or not session.objective.startswith(_SKILL_SESSION_PREFIX):
+                return session_id, task_id
+            if self.memory.task_session_id(task_id) != session_id:
+                return session_id, task_id
+            anchor_id = session.objective[len(_SKILL_SESSION_PREFIX):]
+            owner = self.memory.task_session_id(anchor_id)
+        except Exception:  # noqa: BLE001 - an unreadable row redirects nothing
+            return session_id, task_id
+        return (owner, anchor_id) if owner else (session_id, task_id)
 
     def _skill_bound_step(self, session_id: str, task_id: str) -> tuple[str, str] | None:
         """``(runner session, step task)`` bound at a delegated task's chain
@@ -7232,9 +7260,13 @@ class AgentCore:
         """DFPAUSE: True when a skill runner's anchor asked to pause and the
         next step is not yet bound, so no new step starts. A bound step paused
         with the anchor and stops at its own boundary inside resume."""
-        if not session.objective.startswith(_SKILL_SESSION_PREFIX):
-            return False
         if chain.cursor < len(chain.step_task_ids) and chain.step_task_ids[chain.cursor]:
+            return False
+        return self._skill_anchor_paused(session)
+
+    def _skill_anchor_paused(self, session: SessionState) -> bool:
+        """DFPAUSEFIX: True when this skill runner's anchor asked to pause."""
+        if not session.objective.startswith(_SKILL_SESSION_PREFIX):
             return False
         anchor_id = session.objective[len(_SKILL_SESSION_PREFIX):]
         owner = self.memory.task_session_id(anchor_id)
@@ -7255,14 +7287,34 @@ class AgentCore:
         try:
             self._checkpoint(owner, anchor, "task_paused")
         except _LifecycleLost:
-            pass  # a terminal writer (a cancel) won; nothing is left to pause
+            return  # a terminal writer (a cancel) won; nothing is left to pause
+        # DFPAUSEFIX: a bound step that was asked to pause and is not executing
+        # pauses with its anchor; one still in flight or in doubt keeps its state.
+        chain = final.chain
+        bound = chain.step_task_ids[chain.cursor] if chain and chain.cursor < len(chain.step_task_ids) else ""
+        step = self.memory.load_task(bound) if bound else None
+        if step is None or step.status is not TaskStatus.PAUSE_REQUESTED or any(
+            a.state in (AttemptState.IN_FLIGHT, AttemptState.UNKNOWN_OUTCOME)
+            for a in self.memory.execution_attempts(step.id)
+        ):
+            return
+        step.status = TaskStatus.PAUSED
+        try:
+            self._checkpoint(final, step, "task_paused")
+        except _LifecycleLost:
+            pass
 
     def _skill_paused_view(self, task: Task, run: AgentRun) -> AgentRun:
         """DFPAUSE: report a delegated anchor that paused as paused, not as the
         last step the chain touched."""
         fresh = self.memory.load_task(task.id)
         owner = self.memory.load_session(self.memory.task_session_id(task.id) or "")
-        if fresh is None or owner is None or fresh.status not in _PAUSE_STATUSES:
+        if fresh is None or owner is None:
+            return run
+        if run.task is None and fresh.status is TaskStatus.CANCELLED:
+            # DFPAUSEFIX: no step ran because the task was cancelled; say so.
+            return AgentRun(RunStatus.CANCELLED, owner, fresh)
+        if fresh.status not in _PAUSE_STATUSES:
             return run
         return AgentRun(RunStatus.AWAITING_CLARIFICATION, owner, fresh)
 
@@ -8102,7 +8154,9 @@ class AgentCore:
             # its lessons are kept, no draft is offered (reported for SKFEED).
             self._skill_learn(self._skill_chain_summary(final, final.objective, {}), offer=False)
         if last is None:
-            last = AgentRun(RunStatus.COMPLETED, final, None)
+            # DFPAUSEFIX: a paused runner did not complete.
+            status = RunStatus.AWAITING_CLARIFICATION if verdict == "paused" else RunStatus.COMPLETED
+            last = AgentRun(status, final, None)
         elif final is not None:
             # Report the chain as storage holds it NOW, not as it looked when
             # the step began.
@@ -8221,6 +8275,11 @@ class AgentCore:
         # The ORDINARY entry point. Everything after this line - approval,
         # billing, the attempt journal, the connector call, verification,
         # persistence - is the existing single-task machinery, unchanged.
+        if self._skill_anchor_paused(session):
+            # DFPAUSEFIX: re-checked after the bind, right before the start, so a
+            # pause that landed after the loop's check starts nothing; a later
+            # pause finds this step bound and pauses it (Core.pause).
+            return None, "paused"
         run = self.resume(session.id, task_id)
         if run.status is RunStatus.AWAITING_APPROVAL:
             return run, "awaiting_approval"
