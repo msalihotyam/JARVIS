@@ -792,6 +792,12 @@ class MemoryCaptureOutcome:
 #: The tool name a migrated legacy record is written under.
 _MIGRATE_TOOL = "memory_migrate"
 
+#: Spells a legacy id's digits as letters for the migrated subject key. A
+#: random uuid4 holds digit runs the never-stored filter refuses as a phone,
+#: card or ID number (~0.5% of ids) and that refusal is a permanent skip; a
+#: digit-free key cannot trip it. Bijective, so keys stay unique per id.
+_LEGACY_KEY_DIGITS = str.maketrans("0123456789", "qrtvwyzjgp")
+
 
 @dataclass(frozen=True, slots=True)
 class LegacyMigrationReport:
@@ -901,7 +907,7 @@ def migrate_legacy_memory(
                     MemoryRecord(
                         kind=kind,
                         text=item.text,
-                        subject_key=f"legacy-{item.id}",
+                        subject_key=f"legacy-{item.id.translate(_LEGACY_KEY_DIGITS)}",
                         scope=MemoryRecordScope(item.project_id),
                         origin=MemoryRecordOrigin.LEGACY_M1,
                         actor=MemoryRecordActor.TOOL,

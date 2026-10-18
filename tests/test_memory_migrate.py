@@ -115,6 +115,16 @@ class LegacyMigrationTests(unittest.TestCase):
         # Every legacy row is now mapped for the Doctor exit gate.
         self.assertEqual(self.store.doctor_snapshot(self.alpha).legacy_items, ())
 
+    def test_an_id_whose_digits_read_as_a_card_number_still_migrates(self) -> None:
+        # INT57C: this uuid4's digit run reads as a payment card; it was
+        # keyed into the subject key, refused there and skipped for good.
+        card_like = "18311520-9153-4570-a74c-b33c643716a5"
+        with self.connect() as connection:
+            connection.execute("UPDATE project_memory_items SET id = ? WHERE id = ?", (card_like, self.fact))
+        report = migrate_legacy_memory(self.store, self.alpha)
+        self.assertEqual((report.migrated, report.skipped, report.failed), (3, 3, 0))
+        self.assertNotIn(card_like, dict(report.skip_reasons))
+
     def test_second_run_creates_nothing(self) -> None:
         first = migrate_legacy_memory(self.store, None)
         self.assertEqual((first.outcome, first.migrated, first.skipped), ("ok", 3, 3))
