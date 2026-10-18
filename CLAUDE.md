@@ -14,10 +14,15 @@ adımlarını uygula: runbook + `JARVIS_ACTIVE_STATE.md` + aktif roadmap
 bölümü, ardından durum dosyasının son commit'inden bu yana git ile tazelik
 kontrolü.
 
-Konveyor lane'leri (istemin ilk satırı `@jarvis lane=` ile başlar) bunun
-yerine ana checkout'taki `build/conveyor/notes/LANE_BRIEF.md` ve `LANE_RULES.md`
-dosyalarını ve kendi istemini okur; runbook, durum ve roadmap'i bütün okumaz,
-gerekeni başlıkla grep'leyip bölüm bölüm okur. Neden: kota (Salih, 2026-10-12).
+Konveyör lane'leri (istemin ilk satırı `@jarvis lane=` ile başlar) bunun
+yerine yalnız ana checkout'taki `build/conveyor/notes/LANE_RULES.md`'yi ve
+kendi istemini okur; runbook, durum, roadmap ve `jarvis-slice` /
+`jarvis-queue` / `jarvis-lifecycle` skill'lerini yüklemez. Lane'lerde
+LANE_RULES bu dosyanın "Test ve bitiş" ve "Lane ve worktree" maddelerinin
+yerine geçer (dosya sahipliği C2, test kapsamı C3, önceden var olan hatalar
+C4, rapor C7); depo/git güvenliği ve veri/şema kuralları hiçbir yerde
+gevşemez. Neden: kota ve çelişkisiz tek kaynak (Salih, 2026-10-12;
+orkestratör sistem denetimi, 2026-10-17).
 
 Dilim (slice) başlatırken `jarvis-slice`, kuyruk çalıştırırken `jarvis-queue`
 skill'ini kullan (`.claude/skills/`). İstem biçimi: runbook → "Prompt template
@@ -68,14 +73,13 @@ Test ve bitiş:
   Neden: suite pahalıdır (runbook → "Testing discipline").
 - Kural D: yalnız yük-duyarlı listedeki testler düşerse her biri tek başına
   bir kez yeniden koşulur, geçerse koşu yeşildir (ikisini de kaydet); başka
-  her hata bloklar. Neden: makine boş değildir. Ek: listede olmayan ama
-  tek başına geçen hatalarda tam suite sakin makinede bir kez daha; yine
-  düşerse DUR. Neden: gerçek kırılmayı yük gürültüsünden ayırır.
+  her hata bloklar. Neden: makine boş değildir.
 - Fail-closed: belirsizlik, daha yüksek risk tier'ı veya başka lane'in dosyası
   çıkarsa dur ve raporla; tahminle devam etme. Neden: sessiz genişleme güvenlik
   ve çakışma riskidir.
 - Commit öncesi `git diff --check`; amend yalnız aynı commit'i tamamlamak
-  içindir ve raporun ilk satırında söylenir.
+  içindir ve raporun İKİNCİ satırında `AMENDED: <neden>` olarak söylenir
+  (ilk satır her zaman STATUS).
 
 Lane ve worktree:
 
@@ -88,8 +92,9 @@ Lane ve worktree:
   olur.
 - Her lane yalnız sahip olduğu dosyalara dokunur. Neden: bir dosya aynı anda
   tek lane'indir.
-- Son rapor `build/reports/<slice-id>.md` dosyasına da yazılır (`build/`
-  gitignore'lu). Neden: orkestratör raporu depodan okur.
+- Son rapor çalıştığın checkout'taki `build/reports/<slice-id>.md`
+  dosyasına da yazılır (worktree içindeyken worktree'ninki; konveyör ikisini
+  de bulur; `build/` gitignore'lu). Neden: orkestratör raporu depodan okur.
 
 ## Kod Erişimi
 
@@ -101,4 +106,5 @@ Lane ve worktree:
 - Sembolik erişim soruyu yanıtlayabiliyorken geniş tam-dosya okumalarından ve
   tekrarlayan Grep/Glob taramalarından kaçın.
 - Serena yetersiz veya erişilemez olduğunda yerel Read/Grep/Glob'a düş.
+- Konveyör lane'lerinde Serena yoktur: `jarvis-scout` / Explore kullan.
 - Kaynak kod her zaman nihai otoritedir.

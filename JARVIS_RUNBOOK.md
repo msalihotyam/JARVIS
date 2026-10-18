@@ -478,8 +478,10 @@ gitignored and never committed.
   `{ac,pct}`, paused, last_auto. The effort is the one the last request used, so
   it is known only after the first turn of a session.
 - **Report capture.** When a turn ends and its final text has a line starting
-  `STATUS:`, the text is written to `build/reports/<lane>.md`. An existing,
-  different file is first kept as `<lane>.<yyyymmdd-hhmmss>.md`.
+  `STATUS:`, the text from that STATUS line on (nothing before it) is written
+  to `build/reports/<lane>.md`. It never overwrites a fresh report the lane
+  wrote itself during the turn. An existing, different, older file is first
+  kept as `<lane>.<yyyymmdd-hhmmss>.md`.
 - **Prompt lint** (on submit, never for the mod's own submissions): a header
   model family that differs from this chat's blocks with "Bu istem <X> için, bu
   sohbet <Y>. Doğru sohbete yapıştır."; a differing effort blocks with "Önce
@@ -521,15 +523,18 @@ folders `build/locks/`, `build/flakes/`, `build/ledger/` and `build/reviews/`
 are gitignored like the others.
 
 - **Suite queue (A1).** At most one full suite (`python scripts\test_parallel.py`
-  in any form, or `scripts\test.ps1`) at a time across all sessions on this PC.
-  The lock is `build/locks/suite.json` (lane, session id, started_at, command,
-  heartbeat); it is taken and freed with an exclusive compare-and-swap open, so
-  two sessions cannot both win. The holder writes a heartbeat once a minute; a
-  lock is stale after 45 min without one (a forged future time or a garbage file
-  counts as stale too) and is then taken over. Another session's full-suite call
-  is HELD up to 40 min, the hook waiting inside `$.process.run` calls, with the
-  band showing "Test kuyruğu: <lane> koşuyor, <n> dk"; after 40 min the call is
-  refused with a reason that says wait, then retry. While a full suite holds the
+  without module arguments, or `scripts\test.ps1`) at a time across all sessions
+  on this PC. A targeted run (`python scripts\test_parallel.py <modules>`) takes
+  no suite lock. The lock is `build/locks/suite.json` (lane, session id, holder
+  pid, started_at, command, heartbeat); it is taken and freed with an exclusive
+  compare-and-swap open, so two sessions cannot both win. The holder writes a
+  heartbeat once a minute; a lock is stale after 45 min without one (a forged
+  future time or a garbage file counts as stale too) and is then taken over.
+  Another session's full-suite call is HELD up to 50 min (longer than the 45 min
+  stale window, so a dead holder is taken over inside one wait), the hook
+  waiting inside `$.process.run` calls, with the band showing "Test kuyruğu:
+  <lane> koşuyor, <n> dk"; after 50 min the call is refused with a reason that
+  says rerun the same command in the foreground. While a full suite holds the
   lock, other sessions' `python -m unittest` runs that load UI tests (a
   `test_ui*`-style target, a whole-suite `discover`) are held the same way. The
   holder's own runs are never held. The lock is freed on the tool result, on an
