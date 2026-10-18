@@ -3,21 +3,24 @@
 from __future__ import annotations
 
 import contextlib
+import json
 import unittest
 from types import SimpleNamespace
 from unittest import mock
 
 import jarvis.memory as memory_module
-from jarvis import codex, intent
+from jarvis import codex, intent, memory_capture
 from jarvis.app import MemoryTriggers
 from jarvis.connectors.claude_code import ClaudeCodeConnector
 from jarvis.contracts import (
     ActionScope,
     DataClassification,
     ErrorCode,
+    MemoryRecordOrigin,
     SessionState,
     Task,
 )
+from jarvis.conversation import append_turn
 from jarvis.core import (
     MemoryCaptureOutcome,
     _capture_run_connection,
@@ -26,10 +29,13 @@ from jarvis.core import (
     _release_stale_capture_runs,
 )
 from jarvis.memory import SQLiteMemoryStore
-from tests.helpers import isolated_settings
+from jarvis.registry import ToolRegistry
+from tests.helpers import isolated_settings, open_core
 from tests.test_claude_connector import OAUTH_MAX_AUTH_STATUS, patch_oauth_environment
+from tests.test_memory_capture_core import FakeModel
 
 NOW = "2026-10-18T12:00:00+00:00"
+SESSION_END = MemoryRecordOrigin.CAPTURE_SESSION_END
 
 
 class StoreTest(unittest.TestCase):
@@ -73,26 +79,143 @@ class ConsolidationLockScopeTests(StoreTest):
 
 
 class DurableMarkTests(StoreTest):
-    def test_a_restart_rederives_the_mark_from_the_ok_run(self) -> None:
-        self.assertTrue(_claim_capture_run(self.store, "r1", self.cid, "session_end"))
-        _finish_capture_run(self.store, MemoryCaptureOutcome(run_id="r1", outcome="ok"))
-        first = MemoryTriggers()
-        first._apps[self.cid] = SimpleNamespace(memory=self.store)
-        first._mark(self.cid, [SimpleNamespace(seq=4), SimpleNamespace(seq=7)],
-                    MemoryCaptureOutcome(run_id="r1", outcome="ok"))
-        self.assertEqual(7, MemoryTriggers()._mark_for(self.store, self.cid))
-        # A lower later mark never moves it back.
-        first._mark(self.cid, [SimpleNamespace(seq=2)], MemoryCaptureOutcome(run_id="r1", outcome="ok"))
-        self.assertEqual(7, MemoryTriggers()._mark_for(self.store, self.cid))
+    def ledger(self, run_id: str, outcome: str | None, counts: str) -> None:
+        """One run row as any writer may have left it (finished or not)."""
+        with _capture_run_connection(self.store) as connection:
+            connection.execute(
+                "INSERT INTO memory_capture_runs (run_id, conversation_id, trigger, started_at, finished_at, "
+                "outcome, counts) VALUES (?, ?, 'session_end', ?, ?, ?, ?)",
+                (run_id, self.cid, NOW, None if outcome is None else NOW, outcome, counts))
 
-    def test_a_refused_run_leaves_no_durable_mark(self) -> None:
-        self.assertTrue(_claim_capture_run(self.store, "r2", self.cid, "session_end"))
-        refused = MemoryCaptureOutcome(run_id="r2", outcome="provider_error")
-        _finish_capture_run(self.store, refused)
-        first = MemoryTriggers()
-        first._apps[self.cid] = SimpleNamespace(memory=self.store)
-        first._mark(self.cid, [SimpleNamespace(seq=3)], refused)
-        self.assertEqual(0, MemoryTriggers()._mark_for(self.store, self.cid))
+    def mark(self) -> int | None:
+        return MemoryTriggers()._mark_for(self.store, self.cid)  # a fresh process: no in-process mark
+
+    def test_a_restart_rederives_the_mark_from_the_one_finish_write(self) -> None:
+        self.assertTrue(_claim_capture_run(self.store, "r1", self.cid, "session_end", 7))
+        _finish_capture_run(self.store, MemoryCaptureOutcome(run_id="r1", outcome="ok", approved=1), 7)
+        self.assertEqual(7, self.mark())
+        # A lower later run never moves it back.
+        self.assertTrue(_claim_capture_run(self.store, "r0", self.cid, "session_end", 2))
+        _finish_capture_run(self.store, MemoryCaptureOutcome(run_id="r0", outcome="ok"), 2)
+        self.assertEqual(7, self.mark())
+
+    def test_a_refused_run_with_no_record_leaves_its_range_offered(self) -> None:
+        # (c) a refusal before any write: the turns go to the next leave.
+        for run_id, outcome in (("r2", "provider_error"), ("r3", "skipped:short"),
+                                ("r4", "malformed_answer"), ("r5", "parse_error")):
+            self.assertTrue(_claim_capture_run(self.store, run_id, self.cid, "session_end", 3))
+            _finish_capture_run(self.store, MemoryCaptureOutcome(run_id=run_id, outcome=outcome), 3)
+        self.assertEqual(0, self.mark())
+
+    def test_a_failed_finish_after_records_still_covers_the_range(self) -> None:
+        # (a) the claim carries the mark; the finish write never happened.
+        self.ledger("r1", None, '{"through_seq": 6}')
+        self.assertEqual(6, self.mark())
+
+    def test_an_aborted_run_after_a_committed_record_covers_its_range(self) -> None:
+        # (b) aborted (cancel, shutdown or stale sweep) after one record.
+        self.ledger("r1", "aborted", '{"approved": 1, "pending": 0, "through_seq": 5}')
+        self.assertEqual(5, self.mark())
+
+    def test_a_swept_open_run_covers_its_range(self) -> None:
+        self.assertTrue(_claim_capture_run(self.store, "r1", self.cid, "session_end", 4))
+        with _capture_run_connection(self.store) as connection:
+            connection.execute("UPDATE memory_capture_runs SET started_at = ?", ("2026-10-18T10:00:00+00:00",))
+        self.assertEqual(1, _release_stale_capture_runs(self.store, NOW))
+        self.assertEqual(4, self.mark())
+
+    def test_every_outcome_that_may_have_written_covers_its_range(self) -> None:
+        cases = (("internal_error", '{"approved": 0, "pending": 0, "through_seq": 3}', 3),
+                 ("some_future_outcome", '{"through_seq": 4}', 4),
+                 ("provider_error", '{"approved": 0, "pending": 1, "through_seq": 5}', 5),
+                 ("ok", '{"approved": 0, "pending": 0, "through_seq": 6}', 6))
+        for index, (outcome, counts, expected) in enumerate(cases):
+            with self.subTest(outcome=outcome):
+                self.ledger(f"r{index}", outcome, counts)
+                self.assertEqual(expected, self.mark())
+
+    def cite(self, record_id: str, turn_ids: str, origin: str = "capture_session_end") -> None:
+        """One record as a capture (or any writer) left it, citing its turns."""
+        with self.store._connection(write=True) as connection:
+            connection.execute(
+                "INSERT INTO memory_records (record_id, kind, text, subject_key, project_id, scope_kind, "
+                "origin, actor, confidence, classification, created_at, source_conversation_id, "
+                "source_turn_ids) VALUES (?, 'fact', 'x', 'x', ?, 'project', ?, 'model', 0.9, 'internal', "
+                "?, ?, ?)", (record_id, self.project, origin, NOW, self.cid, turn_ids))
+
+    def test_idle_claims_and_unmarked_rows_add_nothing_of_their_own(self) -> None:
+        self.ledger("idle-1", None, "{}")
+        self.ledger("r1", "ok", '{"approved": 2}')
+        self.cite("m0", '["t9-0123456789"]', origin="explicit_user")
+        self.assertEqual(0, self.mark())
+
+    def test_a_row_older_than_the_mark_covers_the_turns_its_records_cite(self) -> None:
+        # A run from before through_seq (aborted, or ok whose mark write failed).
+        self.ledger("r1", "aborted", '{"approved": 1, "pending": 0}')
+        self.cite("m1", '["t3-0123456789", "t5-abcdef0123"]')
+        self.cite("m2", '["t4-0123456789"]', origin="capture_precompact")
+        self.assertEqual(5, self.mark())
+
+    def test_an_unreadable_cited_turn_captures_nothing(self) -> None:
+        for index, turn_ids in enumerate(('not json', '{"t5-x": 1}', '"t5-x"', '[5]', '["5-x"]',
+                                          '["t-x"]', '["tx-1"]', '["t٥-x"]')):
+            with self.subTest(turn_ids=turn_ids):
+                self.cite(f"bad{index}", turn_ids)
+                self.assertIsNone(self.mark())
+                with self.store._connection(write=True) as connection:
+                    connection.execute("DELETE FROM memory_records WHERE record_id = ?", (f"bad{index}",))
+
+    def test_an_unreadable_mark_captures_nothing(self) -> None:
+        for index, counts in enumerate(('not json', '[]', '{"through_seq": "7"}', '{"through_seq": -1}',
+                                        '{"through_seq": true}', '{"through_seq": 7, "approved": "1"}')):
+            with self.subTest(counts=counts):
+                self.ledger(f"bad{index}", "ok", counts)
+                self.assertIsNone(self.mark())
+                with _capture_run_connection(self.store) as connection:
+                    connection.execute("DELETE FROM memory_capture_runs WHERE run_id = ?", (f"bad{index}",))
+        with mock.patch.object(self.store, "_connection", side_effect=OSError("locked")):
+            self.assertIsNone(self.mark())
+
+    def test_the_in_process_mark_follows_the_same_rule(self) -> None:
+        triggers = MemoryTriggers()
+        turns = [SimpleNamespace(seq=2), SimpleNamespace(seq=3)]
+        triggers._mark(self.cid, turns, MemoryCaptureOutcome(run_id="r1", outcome="provider_error"))
+        self.assertEqual(0, triggers._mark_for(self.store, self.cid))
+        triggers._mark(self.cid, turns, MemoryCaptureOutcome(run_id="r1", outcome="aborted"))
+        self.assertEqual(3, triggers._mark_for(self.store, self.cid))
+        triggers._mark(self.cid, [SimpleNamespace(seq=1)], MemoryCaptureOutcome(run_id="r2", outcome="ok"))
+        self.assertEqual(3, triggers._mark_for(self.store, self.cid))
+
+
+class FinishFailsEndToEndTests(unittest.TestCase):
+    def setUp(self) -> None:
+        skip = mock.patch.object(memory_capture, "extraction_skip_reason", return_value=None)
+        skip.start()
+        self.addCleanup(skip.stop)
+        settings = isolated_settings(self)
+        self.store = SQLiteMemoryStore(settings.memory_database)
+        self.core = open_core(ToolRegistry(), self.store, settings, destination_policy=frozenset())
+        self.cid = self.store.create_conversation(self.store.create_project("Alpha").id).id
+        ids = []
+
+        def change(state):
+            for index, text in enumerate(("We deploy on Fridays only.", "The build uses uv.")):
+                state, turn = append_turn(state, role="user", kind="user", text=text, message=text, key=f"k{index}")
+                ids.append(turn.id)
+            return state
+
+        self.store.update_conversation_state(self.cid, change)
+        self.last = ids[-1]
+        self.model = FakeModel(json.dumps({"candidates": [{
+            "kind": "fact", "text": "The build uses uv.", "subject_key": "tooling",
+            "confidence": 0.9, "evidence_turn_ids": [self.last]}]}))
+
+    def test_a_restart_after_a_failed_finish_write_never_captures_again(self) -> None:
+        with mock.patch("jarvis.core._finish_capture_run", side_effect=OSError("database is locked")):
+            first = self.core.capture_memory(self.cid, SESSION_END, self.model)
+        self.assertEqual(("ok", 1), (first.outcome, first.approved))
+        top = int(self.last.split("-")[0][1:])
+        self.assertEqual(top, MemoryTriggers()._mark_for(self.store, self.cid))
 
 
 class StaleRunSweepTests(StoreTest):

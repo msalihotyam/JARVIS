@@ -155,7 +155,9 @@ from jarvis.core import (
     CaptureStop,
     MemoryCaptureOutcome,
     capture_gate_open,
+    capture_wrote_nothing,
     _capture_run_connection,
+    _captured_through,
     _claim_capture_run,
     _finish_capture_run,
     _release_stale_capture_runs,
@@ -3824,8 +3826,8 @@ class MemoryTriggers:
         self._lock = threading.Lock()
         self._jobs: dict[str, list[tuple[Any, Any, tuple[Any, ...] | None]]] = {}
         self._threads: dict[str, threading.Thread] = {}
-        # High-water mark of seqs captured; ``_mark`` also writes it to the ok
-        # run's ledger row and ``_mark_for`` re-derives it after a restart.
+        # High-water mark of seqs captured in this process; the durable one is
+        # the ledger's (Core writes it with the run) and ``_mark_for`` takes both.
         self._captured: dict[str, int] = {}
         self._closed = False
         self._stop = CaptureStop()
@@ -3942,42 +3944,23 @@ class MemoryTriggers:
             pass
 
     def _mark(self, conversation_id: str, turns: Iterable[Any], outcome: Any) -> None:
-        # Only a run Core finished (or already had) moves the mark; a
-        # provider/run-store refusal leaves the turns for the next leave.
-        if getattr(outcome, "outcome", None) not in ("ok", "duplicate"):
+        # Core's rule (``_captured_through``): every run that may have written
+        # records moves the mark; only a refusal before any write leaves the
+        # turns for the next leave. The durable mark is Core's, not ours.
+        if capture_wrote_nothing(getattr(outcome, "outcome", None)):
             return
         top = max((turn.seq for turn in turns), default=0)
         with self._lock:
             self._captured[conversation_id] = max(self._captured.get(conversation_id, 0), top)
-            app = self._apps.get(conversation_id)
-        run_id = getattr(outcome, "run_id", None)
-        if app is None or type(run_id) is not str or not top:
-            return
-        # Durable: the mark rides on the ok run's counts, so a restart
-        # re-derives it (``_mark_for``) instead of capturing the turns again.
-        # A failed write leaves the in-process mark holding.
-        with suppress(Exception), self._stop.write(), _capture_run_connection(app.memory) as connection:
-            connection.execute(
-                "UPDATE memory_capture_runs SET counts = json_set(counts, '$.through_seq',"
-                " max(coalesce(json_extract(counts, '$.through_seq'), 0), ?))"
-                " WHERE run_id = ? AND conversation_id = ? AND outcome = 'ok' AND json_valid(counts)",
-                (top, run_id, conversation_id))
 
-    def _mark_for(self, memory: Any, conversation_id: str) -> int:
-        """The captured-through seq: this process's mark, or on a cold start
-        the highest one an ok run recorded, so a restart never re-captures."""
-        with self._lock:
-            if conversation_id in self._captured:
-                return self._captured[conversation_id]
+    def _mark_for(self, memory: Any, conversation_id: str) -> int | None:
+        """The captured-through seq: the higher of this process's mark and the
+        ledger's, so a restart never re-captures. ``None`` when the ledger
+        cannot be read: the caller then captures nothing (fail closed)."""
         try:
-            with memory._connection() as connection:
-                row = connection.execute(
-                    "SELECT MAX(json_extract(counts, '$.through_seq')) FROM memory_capture_runs"
-                    " WHERE conversation_id = ? AND outcome = 'ok' AND json_valid(counts)",
-                    (conversation_id,)).fetchone()
-            durable = int(row[0] or 0)
-        except Exception:  # noqa: BLE001 - unreadable ledger: offer every raw turn, re-read next time
-            return 0
+            durable = _captured_through(memory, conversation_id)
+        except Exception:  # noqa: BLE001 - unreadable ledger: no capture, re-read next time
+            return None
         with self._lock:
             self._captured[conversation_id] = max(self._captured.get(conversation_id, 0), durable)
             return self._captured[conversation_id]
@@ -4049,6 +4032,8 @@ class MemoryTriggers:
             return
         raw = app.memory.load_conversation_state(conversation_id).turns
         mark = self._mark_for(app.memory, conversation_id)
+        if mark is None:
+            return
         fresh = tuple(turn for turn in raw if turn.seq > mark)
         # Folded turns a PreCompact skip left ride in front, as at SessionEnd.
         batch, new = self._with_carry(conversation_id, fresh, mark)
@@ -4110,8 +4095,9 @@ class MemoryTriggers:
             return
         raw = app.memory.load_conversation_state(conversation_id).turns
         mark = self._mark_for(app.memory, conversation_id)
-        fresh = tuple(turn for turn in raw if turn.seq > mark)
-        batch, new = self._with_carry(conversation_id, fresh, mark)
+        batch: tuple[Any, ...] = ()
+        if mark is not None:  # an unreadable ledger captures nothing; consolidation still runs
+            batch, new = self._with_carry(conversation_id, tuple(turn for turn in raw if turn.seq > mark), mark)
         if batch:
             if batch == raw:
                 outcome = app.core.capture_memory(conversation_id, trigger, model, stop=stop)

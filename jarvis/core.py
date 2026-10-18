@@ -1200,14 +1200,19 @@ def _session_user_turns(session_turns: tuple[Any, ...], batch: tuple[Any, ...]) 
             for seq, message in words.items()]
 
 
-def _claim_capture_run(store: Any, run_id: str, conversation_id: str, trigger: str) -> bool:
-    """Insert the run row first, as the idempotency claim; ``False`` if it exists."""
+def _claim_capture_run(store: Any, run_id: str, conversation_id: str, trigger: str,
+                       through_seq: int | None = None) -> bool:
+    """Insert the run row first, as the idempotency claim; ``False`` if it exists.
+
+    ``through_seq`` (the batch's last seq) rides on the claim itself: a run
+    that dies or whose finish write fails still covers its range."""
+    counts = "{}" if through_seq is None else json.dumps({"through_seq": through_seq})
     with _capture_run_connection(store) as connection:
         try:
             connection.execute(
-                "INSERT INTO memory_capture_runs (run_id, conversation_id, trigger, started_at) "
-                "VALUES (?, ?, ?, ?)",
-                (run_id, conversation_id, trigger, utc_now()),
+                "INSERT INTO memory_capture_runs (run_id, conversation_id, trigger, started_at, counts) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (run_id, conversation_id, trigger, utc_now(), counts),
             )
         except sqlite3.IntegrityError:
             return False
@@ -1257,13 +1262,78 @@ def _validated_capture_turns(turns: Any, state: Any) -> tuple[Turn, ...] | None:
     return tuple(turn if turn.seq in raw else replace(turn, path="") for turn in turns)
 
 
-def _finish_capture_run(store: Any, result: MemoryCaptureOutcome) -> None:
+def _finish_capture_run(store: Any, result: MemoryCaptureOutcome,
+                        through_seq: int | None = None) -> None:
+    """The one finish write: outcome, counts and the durable mark together."""
+    counts = result.counts()
+    if through_seq is not None:
+        counts["through_seq"] = through_seq
     with _capture_run_connection(store) as connection:
         connection.execute(
             "UPDATE memory_capture_runs SET finished_at = ?, outcome = ?, counts = ? "
             "WHERE run_id = ? AND finished_at IS NULL",
-            (utc_now(), result.outcome, json.dumps(result.counts(), sort_keys=True), result.run_id),
+            (utc_now(), result.outcome, json.dumps(counts, sort_keys=True), result.run_id),
         )
+
+
+#: Run outcomes Core returns before any record write: a run that ended with
+#: one of these and no approved/pending record leaves its turns uncaptured.
+CAPTURE_NOTHING_WRITTEN = frozenset({
+    "invalid_trigger", "unknown_conversation", "no_project", "invalid_turns", "no_turns",
+    "global_memory_used", "run_store_error", "provider_error", "malformed_answer", "parse_error",
+})
+
+
+def capture_wrote_nothing(outcome: Any) -> bool:
+    """True only for an outcome Core returns before writing any record."""
+    return type(outcome) is str and (outcome in CAPTURE_NOTHING_WRITTEN or outcome.startswith("skipped:"))
+
+
+def _captured_through(store: Any, conversation_id: str) -> int:
+    """The highest seq any run of the conversation may have captured.
+
+    Every run counts - ok, aborted, internal_error, unfinished, unknown -
+    except one finished with a nothing-written outcome and no record - and
+    every turn a capture record cites. Raises when the ledger or a cited
+    turn id is unreadable or a row's mark is malformed (fail closed)."""
+    with store._connection() as connection:
+        rows = connection.execute(
+            "SELECT outcome, counts FROM memory_capture_runs WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchall()
+        # A row older than the mark carries no through_seq: the turns its
+        # records cite are covered whatever its range was (t<seq>-<hash>).
+        cited = connection.execute(
+            "SELECT source_turn_ids FROM memory_records WHERE source_conversation_id = ? "
+            "AND origin IN ('capture_session_end', 'capture_precompact')",
+            (conversation_id,),
+        ).fetchall()
+    mark = 0
+    for (raw,) in cited:
+        turn_ids = json.loads(raw)
+        if type(turn_ids) is not list:
+            raise ValueError("capture record source_turn_ids is not a list")
+        for turn_id in turn_ids:
+            seq = turn_id[1:].split("-", 1)[0] if type(turn_id) is str and turn_id[:1] == "t" else ""
+            if not (seq.isascii() and seq.isdigit()):
+                raise ValueError("capture record cites an unreadable turn id")
+            mark = max(mark, int(seq))
+    for outcome, raw in rows:
+        counts = json.loads(raw)
+        if type(counts) is not dict:
+            raise ValueError("capture run counts is not an object")
+        if "through_seq" not in counts:
+            continue  # an idle window claim, or a row older than the mark (cited above)
+        top = counts["through_seq"]
+        if type(top) is not int or top < 0:
+            raise ValueError("capture run through_seq is not a seq")
+        written = [counts.get(key, 0) for key in ("approved", "pending")]
+        if any(type(value) is not int for value in written):
+            raise ValueError("capture run counts are not integers")
+        if capture_wrote_nothing(outcome) and not any(written):
+            continue
+        mark = max(mark, top)
+    return mark
 
 
 #: A claimed run open this long has no live owner: every capture call is
@@ -5786,7 +5856,7 @@ class AgentCore:
             if _global_memory_ever_used(self.memory, conversation_id):
                 return MemoryCaptureOutcome(run_id=run_id, outcome="global_memory_used")
             with _capture_writing(stop):
-                claimed = _claim_capture_run(self.memory, run_id, conversation_id, label)
+                claimed = _claim_capture_run(self.memory, run_id, conversation_id, label, turns[-1].seq)
         except CaptureCancelled:
             return MemoryCaptureOutcome(run_id=run_id, outcome="aborted")
         except Exception:  # noqa: BLE001 - no run store means no model call
@@ -5804,8 +5874,8 @@ class AgentCore:
             result = MemoryCaptureOutcome(run_id=run_id, outcome="internal_error")
         try:
             with _capture_writing(stop):
-                _finish_capture_run(self.memory, result)
-        except Exception:  # noqa: BLE001 - the row stays unfinished (stopped: shutdown aborts it)
+                _finish_capture_run(self.memory, result, turns[-1].seq)
+        except Exception:  # noqa: BLE001 - the row stays unfinished, its claim still covers the turns
             pass
         return result
 
