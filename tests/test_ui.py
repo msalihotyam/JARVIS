@@ -4897,7 +4897,12 @@ class ConversationUxTests(UiTestCase):
     ambient = True      # THIZ: its subject is the glide
 
     item = PresentationTests.item
-    window = PresentationTests.window
+
+    def window(self, bridge):
+        root = PresentationTests.window(self, bridge)
+        reflow_still(self, root, 350)   # UIRED5: a reflow still running under slow offscreen frames moves the feed's end
+        self.win = root
+        return root
 
     def feed(self, root):
         return self.item(root, "conversationFeed")
@@ -4906,6 +4911,9 @@ class ConversationUxTests(UiTestCase):
         for i in range(count):
             bridge._say("jarvis" if i % 2 else "user", f"Entry {i}: enough text to give the stream a real height at this width.")
         pump(800)
+        feed = self.feed(self.win)      # UIRED5: the filling glide has landed at the end before the next is measured
+        self.assertTrue(wait_until(lambda: not feed.property("gliding")
+                        and feed.property("contentHeight") - feed.property("viewportHeight") - feed.property("contentY") <= 1, SETTLE_FLOOR_MS))
 
     def test_a_new_reply_glides_once_to_the_end_and_idle_does_not_move(self) -> None:
         bridge = self.bridge()
@@ -4914,7 +4922,7 @@ class ConversationUxTests(UiTestCase):
         self.fill(bridge)
         count = feed.property("glideCount")
         bridge._say("jarvis", "Yeni yanıt geldi ✅", chat=True)
-        pump(120)
+        wait_until(lambda: feed.property("gliding"), SETTLE_FLOOR_MS)  # UIRED5: the new delegate's first frame blocks 0.4-0.75 s offscreen under load; a jump never glides
         self.assertTrue(feed.property("gliding"))                                     # animated, not a jump
         self.assertLess(feed.property("contentY"), feed.property("contentHeight") - feed.property("viewportHeight") - 1)
         pump(600)
