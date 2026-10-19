@@ -140,12 +140,13 @@ class TestR7PushBlockedLocalMain(tc.Base):
 
 
 class TestR8PermissionErrorOnReplace(tc.Base):
-    def test_a_locked_status_file_raises_a_pass_error_on_every_tick(self):
+    def test_a_locked_status_file_is_retried_then_skipped_without_a_pass_error(self):
         """R8 2026-10-18T15:52:04 -> 2026-10-19T01:13:51: os.replace of status.json.tmp hit
         PermissionError(13) (a reader held status.json) 11 times; status.json went stale.
 
-        TODAY: every pass raises, logs an "error" event "pass: PermissionError(13, ...)",
-        and status.json keeps the last good snapshot (or never appears).
+        TODAY (CONVSTATUS, was: every pass raised "pass: PermissionError(13, ...)"): the replace
+        is retried REPLACE_TRIES times, then one "write status.json" error per pass; the pass
+        completes and status.json keeps the last good snapshot.
         TARGET: retry the replace with backoff and skip status for this pass; do not
         raise a pass error on every tick.
         """
@@ -160,14 +161,17 @@ class TestR8PermissionErrorOnReplace(tc.Base):
 
         self.c.pass_once()
         good = self.status()["updated_at"]
-        with mock.patch.object(conveyor.os, "replace", locked):
+        with mock.patch.object(conveyor.os, "replace", locked), \
+                mock.patch.object(conveyor.time, "sleep") as sleep:
             for _ in range(2):
                 self.t += 60
                 self.c.loop(once=True)
+        self.assertEqual(sleep.call_count, 2 * (conveyor.REPLACE_TRIES - 1))
         errors = [e for e in self.events() if e["event"] == "error"]
         self.assertEqual(len(errors), 2)
         for e in errors:
-            self.assertTrue(e["message"].startswith("pass: PermissionError(13"), e)
+            self.assertTrue(e["message"].startswith("write status.json: PermissionError(13"), e)
+            self.assertTrue(e["message"].endswith(f"after {conveyor.REPLACE_TRIES} tries"), e)
         self.assertEqual(self.status()["updated_at"], good)
 
 

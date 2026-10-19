@@ -1,5 +1,6 @@
 """Konveyor v1 (scripts/conveyor.py) with a fake claude runner; no network, no model calls."""
 import contextlib
+import errno
 import importlib.util
 import json
 import os
@@ -2656,6 +2657,167 @@ class TestLedgerSubprocess(Base):
         self.assertEqual(self.cli("stop", "rm"), [])
         self.assertTrue(any(e["event"] == "cleanup_skip" for e in self.events()))
         self.assertEqual([e["message"] for e in self.errors()], ["usage ledger: exit 1 (build/ledger/usage.log)"])
+
+
+class TestSharedWrite(Base):
+    """CONVSTATUS: a reader holding a shared file (PermissionError on os.replace) is retried, then
+    one error event; the pass never aborts. The heartbeat stays fresh across the CLI loops."""
+
+    fake_ledger, finished, cli = TestCleanup.fake_ledger, TestCleanup.finished, TestCleanup.cli
+
+    def setUp(self):
+        super().setUp()
+        self.ledger_runs, self.ledger_error, self.ledger_skip = 0, None, set()
+        self.c.usage_ledger = self.fake_ledger
+        self.ledger = self.root / "build" / "ledger" / "usage.json"
+        self.sleeps = []
+        p = mock.patch.object(conveyor.time, "sleep", side_effect=self.sleeps.append)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def errors(self):
+        return [e["message"] for e in self.events() if e["event"] == "error"]
+
+    def locked(self, *names, n=None, exc=None):
+        """Patch os.replace: a target in `names` raises (PermissionError 13) its first n times (all if None)."""
+        real, hits = os.replace, []
+
+        def replace(src, dst):
+            if Path(dst).name in names and (n is None or len(hits) < n):
+                hits.append(dst)
+                raise exc or PermissionError(13, "denied")
+            return real(src, dst)
+        return mock.patch.object(conveyor.os, "replace", side_effect=replace)
+
+    def spies(self, *names):
+        return [mock.patch.object(self.c, n, wraps=getattr(self.c, n)) for n in names]
+
+    def test_transient_lock_retried_then_written(self):
+        with self.locked("status.json", n=3):
+            self.c.pass_once()
+        self.assertIn("updated_at", self.status())
+        self.assertEqual(self.errors(), [])
+        self.assertEqual(self.sleeps, [conveyor.REPLACE_GAP_S] * 3)
+
+    def test_always_locked_one_error_pass_completes(self):
+        with contextlib.ExitStack() as st:
+            st.enter_context(self.locked("status.json"))
+            backstop, pager_watch, flush = (st.enter_context(p) for p in
+                                            self.spies("backstop", "pager_watch", "flush_pages"))
+            self.c.loop(once=True)
+        self.assertEqual(self.errors(), ["write status.json: PermissionError(13, 'denied') after 5 tries"])
+        self.assertEqual(self.sleeps, [conveyor.REPLACE_GAP_S] * (conveyor.REPLACE_TRIES - 1))
+        for m in (backstop, pager_watch, flush):
+            m.assert_called()
+        self.assertFalse((self.base / "status.json").exists())
+        self.assertTrue((self.base / "running_files.json").exists())  # the rest of write_status ran
+
+    def test_running_files_locked_status_still_written(self):
+        with self.locked("running_files.json"):
+            self.c.pass_once()
+        self.assertIn("updated_at", self.status())
+        self.assertEqual(self.errors(), ["write running_files.json: PermissionError(13, 'denied') after 5 tries"])
+
+    def test_lanes_locked_one_error_pass_continues(self):
+        self.drop("A.md", HDR.format("A"))
+        with self.locked("lanes.json"):
+            self.c.pass_once()
+        errors = self.errors()  # one per save_lanes call of the pass
+        self.assertTrue(errors)
+        self.assertEqual(set(errors), {"write lanes.json: PermissionError(13, 'denied') after 5 tries"})
+        self.assertIn("updated_at", self.status())
+
+    def test_pager_locked_page_does_not_raise(self):
+        with self.locked("pager.json"):
+            self.c.page("x")
+        self.assertEqual(self.errors(), ["write pager.json: PermissionError(13, 'denied') after 5 tries"])
+
+    def test_push_state_written_with_retry(self):
+        self.c.push_file.write_text("{}", encoding="utf-8")
+        with self.locked(self.c.push_file.name):
+            self.c.push_gate({})
+        self.assertEqual(self.errors(),
+                         [f"write {self.c.push_file.name}: PermissionError(13, 'denied') after 5 tries"])
+
+    def test_lanes_bad_branch_still_runs_backstop_and_flush(self):
+        (self.base / "lanes.json").write_text("not json", encoding="utf-8")
+        with contextlib.ExitStack() as st:
+            st.enter_context(self.locked("status.json"))
+            backstop, flush = (st.enter_context(p) for p in self.spies("backstop", "flush_pages"))
+            self.c.pass_once()
+        backstop.assert_called_once()
+        flush.assert_called_once()
+        self.assertIn("write status.json: PermissionError(13, 'denied') after 5 tries", self.errors())
+        self.assertEqual((self.base / "lanes.json").read_text(encoding="utf-8"), "not json")
+
+    def test_status_exception_does_not_end_the_pass(self):
+        with contextlib.ExitStack() as st:
+            st.enter_context(mock.patch.object(self.c, "write_status", side_effect=ValueError("bad")))
+            backstop, pager_watch, flush = (st.enter_context(p) for p in
+                                            self.spies("backstop", "pager_watch", "flush_pages"))
+            self.c.loop(once=True)
+        self.assertEqual(self.errors(), ["status: ValueError('bad')"])
+        for m in (backstop, pager_watch, flush):
+            m.assert_called()
+
+    def test_status_stale_item_after_ten_minutes(self):
+        ids = lambda: [i[0] for i in self.c.attention(self.c.load_lanes())]  # noqa: E731
+        with self.locked("status.json"):
+            self.c.pass_once()  # first failed write starts the clock
+        self.assertEqual(self.c.status_fail_ts, self.t)
+        self.t += conveyor.STATUS_STALE_S - 1
+        self.assertNotIn("status_stale", ids())
+        self.t += 2
+        self.assertIn("status_stale", ids())
+        self.c.pass_once()  # unlocked: a good write clears it
+        self.assertIsNone(self.c.status_fail_ts)
+        self.assertNotIn("status_stale", ids())
+
+    def test_other_os_errors_raise_without_retry(self):
+        with self.locked("x.json", exc=OSError(errno.ENOSPC, "full")), self.assertRaises(OSError) as cm:
+            self.c.write_atomic(self.base / "x.json", "{}")
+        self.assertNotIsInstance(cm.exception, PermissionError)
+        self.assertEqual(self.sleeps, [])
+
+    def slow_cli(self):
+        """Each stop/rm takes 70 s (> BEAT_S); returns the heartbeat age seen at each call."""
+        ages, real = [], self.c.run
+
+        def run(args, *a, **kw):
+            if args[0] in ("stop", "rm"):
+                ages.append(self.t - self.c.beat_ts)
+                self.t += 70
+            return real(args, *a, **kw)
+
+        def heartbeat():
+            self.c.beat_ts = self.t
+        self.c.run = run
+        for p in (mock.patch.object(self.c, "heartbeat", side_effect=heartbeat),
+                  mock.patch.object(self.c, "own_lock", return_value=True)):
+            p.start()
+            self.addCleanup(p.stop)
+        return ages
+
+    def test_heartbeat_fresh_across_slow_cleanup(self):
+        self.c.stop_finished = lambda *a: None
+        sid = self.finished()
+        ages = self.slow_cli()
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [["stop", sid], ["rm", sid]])
+        self.assertTrue(all(a < conveyor.BEAT_S for a in ages), ages)
+
+    def test_heartbeat_fresh_across_slow_early_stops(self):
+        for n in ("A", "B"):
+            self.drop(f"{n}.md", HDR.format(n))
+        self.c.pass_once()
+        for n in ("A", "B"):
+            self.fake.agent(n).update({"state": "done", "status": "idle"})
+            self.report(n, "PASS")
+        ages = self.slow_cli()
+        self.c.pass_once()
+        self.assertEqual(len(self.cli("stop")), 2)
+        self.assertTrue(all(a < conveyor.BEAT_S for a in ages), ages)
 
 
 class TestPreserved(Base):

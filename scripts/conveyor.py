@@ -44,6 +44,9 @@ GIT_PIN = ["git", "-c", "log.diffMerges=separate", "-c", "diff.ignoreSubmodules=
            "-c", "status.showUntrackedFiles=all", "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false"]
 CLEANUP_RETRY_S = 86400  # a refused rm / worktree removal is retried the next day
 BEAT_S = 60  # the lock heartbeat inside a long pass, at most this often
+REPLACE_TRIES = 5  # os.replace onto a file a reader holds open (Windows) is retried this often ...
+REPLACE_GAP_S = 0.2  # ... this far apart, then skipped with one error event
+STATUS_STALE_S = 600  # status.json older than this: a status_stale attention item
 API_PAGE_WINDOW_S = 600  # 2+ lanes on API errors this close together: an account/network page
 API_PAGE_EVERY_S = 7200  # ... repeated this often while it lasts, night hours included
 ORCH_STALE_S = 5400  # build/orch/heartbeat older than this: the orchestrator is not touring
@@ -736,6 +739,10 @@ class Conveyor:
         self.lock = self.base / "conveyor.lock"
         self.state_file = self.base / "lanes.json"  # lanes this conveyor owns
         self.pager_file = self.base / "pager.json"
+        # a lanes.json / pager.json write that failed (locked): kept here and used instead of
+        # the file until a write succeeds, so a started lane or a page/dedupe flag is not lost
+        self.lanes_unsaved = self.pager_unsaved = None
+        self.status_fail_ts = None  # first failed status.json write since the last good one
         self.pid = os.getpid()
         self.last_error = None
         self.usage, self.usage_source = None, None
@@ -808,13 +815,25 @@ class Conveyor:
     def save_lanes(self, lanes):
         if self.lanes_bad:
             return
-        self.write_atomic(self.state_file, json.dumps(lanes, indent=2))
+        ok = self.write_atomic(self.state_file, json.dumps(lanes, indent=2))
+        self.lanes_unsaved = None if ok else lanes
 
     def write_atomic(self, path, text):
-        """tmp + os.replace: a crash mid-write never leaves a torn file."""
+        """tmp + os.replace: a crash mid-write never leaves a torn file. A reader holding the
+        target open (panel, pano, bridge mount) makes os.replace raise PermissionError on
+        Windows: retried REPLACE_TRIES times, then one error event and False - never raises
+        for that, so the pass goes on (the next pass writes again)."""
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(text, encoding="utf-8")
-        os.replace(tmp, path)
+        for i in range(REPLACE_TRIES):
+            try:  # the tmp too: a sync mount may hold the leftover of a failed try
+                tmp.write_text(text, encoding="utf-8")
+                os.replace(tmp, path)
+                return True
+            except PermissionError as e:
+                if i == REPLACE_TRIES - 1:
+                    self.error(f"write {path.name}: {e!r} after {REPLACE_TRIES} tries")
+                    return False
+                time.sleep(REPLACE_GAP_S)
 
     def event(self, kind, **kw):
         rec = {"ts": iso(self.now()), "event": kind, **kw}
@@ -826,14 +845,21 @@ class Conveyor:
         self.event("error", message=msg, **kw)
 
     # ---- pager --------------------------------------------------------
+    def load_pager(self):
+        return self.pager_unsaved if self.pager_unsaved is not None else self.load_json(self.pager_file, {})
+
+    def save_pager(self, p):
+        ok = self.write_atomic(self.pager_file, json.dumps(p, ensure_ascii=False))
+        self.pager_unsaved = None if ok else p
+
     def page(self, text):
-        p = self.load_json(self.pager_file, {})
+        p = self.load_pager()
         p.setdefault("pending", []).append(text)
-        self.write_atomic(self.pager_file, json.dumps(p, ensure_ascii=False))
+        self.save_pager(p)
 
     def flush_pages(self):
         """Send pending pages as one push, at most one push per PAGE_GAP_S."""
-        p = self.load_json(self.pager_file, {})
+        p = self.load_pager()
         if not p.get("pending") or self.now() - p.get("last_push", 0) < PAGE_GAP_S:
             return
         text = "\n".join(p["pending"])[:1000]
@@ -843,14 +869,14 @@ class Conveyor:
             p["last_push"] = self.now()
         if result in ("sent", "no-topic"):
             p["pending"] = []  # on a send error they are retried after the gap
-        self.write_atomic(self.pager_file, json.dumps(p, ensure_ascii=False))
+        self.save_pager(p)
 
     def pager_flag(self, key, value=None):
-        p = self.load_json(self.pager_file, {})
+        p = self.load_pager()
         if value is None:
             return p.get(key)
         p[key] = value
-        self.write_atomic(self.pager_file, json.dumps(p, ensure_ascii=False))
+        self.save_pager(p)
 
     # ---- reports ------------------------------------------------------
     def find_report(self, name, since=0.0, cwd=None):
@@ -913,7 +939,7 @@ class Conveyor:
         self.last_error = None
         self.main_sha = False  # not looked up yet this pass
         self.cc_ok = None  # `claude --version` read again at most once this pass
-        lanes = self.load_lanes()
+        lanes = self.lanes_unsaved if self.lanes_unsaved is not None else self.load_lanes()
         if self.lanes_bad:  # never {} saved over it: nothing dispatched, tracked or removed
             try:
                 since = self.state_file.stat().st_mtime
@@ -921,7 +947,7 @@ class Conveyor:
                 since = 0
             items = [("lanes-invalid", f"lanes.json unreadable ({self.lanes_bad}): dispatch held "
                                        "until it is fixed by hand", since)]
-            self.write_status({}, items)
+            self.status_written({}, items)
             self.backstop(items)
             self.flush_pages()
             return True
@@ -954,7 +980,7 @@ class Conveyor:
             self.cleanup(lanes, agents, {i for i, _, _ in items})
             self.save_lanes(lanes)
             items = self.attention(lanes)  # a lane cleanup just preserved shows at once
-        self.write_status(lanes, items)
+        self.status_written(lanes, items)
         self.backstop(items)
         self.pager_watch(lanes)
         self.flush_pages()
@@ -2205,6 +2231,10 @@ class Conveyor:
             items.append((BREAKER_ID, f"breaker open: {self.breaker['reason']}; product slices held "
                                       "until build/conveyor/breaker-reset is touched",
                           self.breaker["since"]))
+        failed = self.status_fail_ts  # first failed write since the last good one (this process)
+        if failed is not None and self.now() - failed > STATUS_STALE_S:
+            items.append(("status_stale", f"status.json not written for "
+                                          f"{int(self.now() - failed) // 60} min", failed))
         return [i for i in items if not self.acked(i[0], i[2])]
 
     def backstop(self, items):
@@ -2251,13 +2281,22 @@ class Conveyor:
             "band": self.band,
             "attention": [{"id": i, "reason": why, "since": iso(since)} for i, why, since in items],
         }
-        tmp = self.base / "status.json.tmp"
-        tmp.write_text(json.dumps(status, indent=2, ensure_ascii=False), encoding="utf-8")
-        os.replace(tmp, self.base / "status.json")
-        tmp = self.base / "running_files.json.tmp"  # LANE_RULES C2: files owned by running lanes
-        tmp.write_text(json.dumps({n: lanes[n].get("files", []) for n in self.running(lanes)},
-                                  indent=2), encoding="utf-8")
-        os.replace(tmp, self.base / "running_files.json")
+        ok = self.write_atomic(self.base / "status.json", json.dumps(status, indent=2, ensure_ascii=False))
+        self.write_atomic(self.base / "running_files.json",  # LANE_RULES C2: files owned by running lanes
+                          json.dumps({n: lanes[n].get("files", []) for n in self.running(lanes)}, indent=2))
+        return ok
+
+    def status_written(self, lanes, items):
+        """write_status that never ends the pass: backstop / pager_watch / flush_pages run after it."""
+        ok = False
+        try:
+            ok = self.write_status(lanes, items)
+        except Exception as e:
+            self.error(f"status: {e!r}")
+        if ok:
+            self.status_fail_ts = None
+        elif self.status_fail_ts is None:
+            self.status_fail_ts = self.now()
 
     def note_pass(self, ok):
         """Count failed passes in a row; page once at CRASH_PAGE."""
@@ -2856,7 +2895,7 @@ class Conveyor:
         names = {f.name for f in files}
         state = {k: v for k, v in state.items() if k in names}  # approval gone: item gone
         if state or self.push_file.exists():
-            self.push_file.write_text(json.dumps(state, indent=2), encoding="utf-8")
+            self.write_atomic(self.push_file, json.dumps(state, indent=2))
 
     def fast_forward(self, sha):
         """CONVINT: None when local main holds `sha` (already, or after `git merge --ff-only` in
@@ -3048,6 +3087,7 @@ class Conveyor:
             done += 1
             steps = []
             for a in live:
+                self.beat()  # each stop is a slow CLI call
                 try:
                     rc, out = self.run(["stop", a["id"]])
                 except Exception as e:
@@ -3099,6 +3139,7 @@ class Conveyor:
                 if not self.ledger_has(sids, t + CLEANUP_S):
                     doubt = "usage ledger has not counted the session since"
             if doubt is None:  # the pass may be minutes old: act only on a fresh listing
+                self.beat()
                 try:
                     sess, doubt = self.lane_sessions(name, ids, self.agents(), es)
                 except Exception as e:
@@ -3114,6 +3155,7 @@ class Conveyor:
                 continue
             done += 1
             for a in sess:
+                self.beat()  # git per session
                 kept = self.unintegrated(a)
                 if kept:
                     self.preserve(ln, name, *kept)
@@ -3123,6 +3165,7 @@ class Conveyor:
             steps = []
             for a in sess:
                 for cmd in (["stop"] if "pid" in a else []) + ["rm"]:
+                    self.beat()
                     try:
                         rc, out = self.run([cmd, a["id"]])
                     except Exception as e:  # e.g. a timeout: an error, the session is left
@@ -3137,6 +3180,7 @@ class Conveyor:
                              "ids": [a["id"] for a in sess]}
             self.event("cleanup", lane=name, result=ln["cleanup"]["result"], steps=steps)
             if ok:
+                self.beat()
                 self.worktree_step(name, ln)
             else:
                 self.error(f"cleanup {name}: {steps[-1]['cmd']} rc={steps[-1]['rc']}", lane=name)
