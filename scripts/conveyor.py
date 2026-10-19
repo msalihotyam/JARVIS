@@ -617,6 +617,17 @@ def iso(t):
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(t))
 
 
+def ack_name(item_id):
+    """Ack file name of an attention id (CONVFIX61): a plain id ([A-Za-z0-9][A-Za-z0-9_.-]*,
+    no trailing '.', no Windows device name) is its own name, so an older ack keeps working;
+    any other id is '+' and its UTF-8 hex ('+' never starts a plain id: no alias, no '.'/'..'
+    escape). Limit: plain ids differing only in case share an ack on NTFS."""
+    if (re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]*", item_id) and not item_id.endswith(".")
+            and not re.fullmatch(r"(?i)(CON|PRN|AUX|NUL|COM\d|LPT\d)(\..*)?", item_id)):
+        return item_id
+    return "+" + item_id.encode("utf-8", "surrogatepass").hex()
+
+
 def local_hour(t):
     return time.localtime(t).tm_hour
 
@@ -2126,19 +2137,16 @@ class Conveyor:
 
     def acked(self, item_id, since):
         """Orchestrator ack: build/conveyor/ack/<name> exists (never deleted here) and is
-        not older than the item, so an earlier same-name ack hides nothing new. <name> is the
-        id with ':' and every other character Windows forbids in a file name turned into '_'
-        (cleanup:A -> cleanup_A; "cleanup:A" would be an NTFS stream); an id with none of
-        them is its own name, so an ack written before this rule keeps working."""
+        not older than the item, so an earlier same-name ack hides nothing new. <name> is
+        ack_name(id): injective, so cleanup:A and cleanup_A never share an ack."""
         try:
-            name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", item_id)
-            return (self.base / "ack" / name).stat().st_mtime >= since
+            return (self.base / "ack" / ack_name(item_id)).stat().st_mtime >= since
         except (OSError, ValueError):
             return False
 
     def attention(self, lanes):
-        """Unacked items for the orchestrator as (id, reason, since): a lane with a bad
-        STATUS or STUCK, a running lane blocked too long, a non-pass reading, and the backlog
+        """Unacked items for the orchestrator as (id, reason, since): a lane with a non-good
+        STATUS (bad, STUCK or unknown), a running lane blocked too long, a non-pass reading, and the backlog
         running dry. Routine ids (self.quiet: a PASS needing only the orchestrator, FINDINGS,
         cleanup refused, preserved) stay on the board but never page (backstop)."""
         items, self.quiet = [], set()
@@ -2159,8 +2167,10 @@ class Conveyor:
                                 ("interim_timeout", "")):
                     if ln.get(k):
                         why.append(lead + ln[k])
+            elif ln.get("status") not in GOOD | {CI_PENDING}:  # CONVFIX61: unknown status pages (fail-closed)
+                why.append(f"STATUS {ln.get('status')}")
             else:
-                loud = False  # CONVPAGE: pages only with a page reason below
+                loud = False  # CONVPAGE: a good status pages only with a page reason below
             r = ln.get("reading") or {}
             if r.get("kind", "pass") != "pass":
                 lead = "reader says needs_salih" if r["kind"] == "needs_salih" else f"reader {r['kind']}"
@@ -2282,8 +2292,11 @@ class Conveyor:
             "attention": [{"id": i, "reason": why, "since": iso(since)} for i, why, since in items],
         }
         ok = self.write_atomic(self.base / "status.json", json.dumps(status, indent=2, ensure_ascii=False))
-        self.write_atomic(self.base / "running_files.json",  # LANE_RULES C2: files owned by running lanes
-                          json.dumps({n: lanes[n].get("files", []) for n in self.running(lanes)}, indent=2))
+        try:  # CONVFIX61: ok is the status.json write alone
+            self.write_atomic(self.base / "running_files.json",  # LANE_RULES C2: files owned by running lanes
+                              json.dumps({n: lanes[n].get("files", []) for n in self.running(lanes)}, indent=2))
+        except Exception as e:
+            self.error(f"running_files.json: {e!r}")
         return ok
 
     def status_written(self, lanes, items):

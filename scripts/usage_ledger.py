@@ -243,12 +243,11 @@ def main(projects=PROJECTS, out=OUT, now=lambda: datetime.now(IST), clock=time.m
     if not isinstance(state, dict):
         state = {}
     dirs = [p for p in Path(projects).iterdir() if p.is_dir() and p.name.lower().startswith(PREFIX)]
-    files = []
-    for p in dirs:
-        try:
-            files += list(p.rglob("*.jsonl"))
-        except OSError:  # removed while listing
-            continue
+    def walk_error(e):  # Path.rglob swallows every OSError: os.walk reports them here
+        if not isinstance(e, (FileNotFoundError, NotADirectoryError)):  # removed while listing: skip
+            raise e  # any other OSError (locked, denied) fails the run: a stale count must not look fresh
+    files = [Path(r, f) for p in dirs for r, _, fs in os.walk(p, onerror=walk_error)
+             for f in fs if f.lower().endswith(".jsonl")]
     new, parts, last = {}, [], clock()
     for f in files:
         prev = state.get(str(f))

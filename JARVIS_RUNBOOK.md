@@ -907,12 +907,17 @@ the optional report reader below. One instance at a time
     effort medium.
   - Pace only via the number of parallel lanes (pace governor above).
 - **Attention and pager (ntfy).** Salih's rule (2026-10-09): lane events go to
-  the orchestrator, not to Salih. A lane report `STATUS: BLOCKED/STOP/FAIL`, a
+  the orchestrator, not to Salih. A lane report `STATUS: BLOCKED/STOP/FAIL` or
+  any other non-good status (unknown ones too), a
   `STUCK` lane, a non-`pass` reading (below) and the backlog running dry (no
   lane running, no inbox file waiting and nothing to dispatch; id
   `backlog-dry`, one item per episode) are items in `status.json` `attention`
   (`{id, reason, since}`), not pushes. The orchestrator acks an item by
-  creating or touching `build/conveyor/ack/<id>` (existence only, never
+  creating or touching `build/conveyor/ack/<name>`: a plain id (letters,
+  digits, `_.-`, e.g. `backlog-dry`) is its own name, any other id (e.g.
+  `cleanup:A`) is `+` and its UTF-8 hex (`python -c "import sys;
+  sys.path.insert(0,'scripts'); import conveyor; print(conveyor.ack_name('cleanup:A'))"`
+  prints it) (existence only, never
   deleted; an ack older than the item's `since` does not count, so a reused
   lane name needs a fresh touch). ntfy (topic from `JARVIS_NTFY_TOPIC`, same
   rules as the jarvis-flow pager; never logged) reaches Salih only for: an

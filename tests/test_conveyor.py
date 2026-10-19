@@ -2276,6 +2276,36 @@ class TestReader(Base):
         self.assertIn("A", self.attn())
         self.assertTrue(self.escalated())
 
+    def test_unknown_status_with_needs_orchestrator_pages(self):
+        """CONVFIX61 F4: only a good status may be quiet; PARTIAL + needs_orchestrator pages."""
+        self.reply = answer({"kind": "needs_orchestrator", "summary": "entegre", "next": "n"})
+        self.finish_a(status="PARTIAL")
+        self.assertIn("A", self.attn())
+        self.assertNotIn("A", self.c.quiet)
+        self.assertTrue(self.escalated())
+
+    def test_unknown_status_with_pass_reading_pages(self):
+        self.finish_a(status="PARTIAL")
+        self.assertIn("A", self.attn())
+        self.assertTrue(self.escalated())
+
+    def test_status_loudness_is_an_allow_list(self):
+        """Lane state set directly: lowercase, empty and missing statuses are unknown, so loud."""
+        for status, item, quiet in (("pass", True, False), ("", True, False), (None, True, False),
+                                    ("PARTIAL", True, False), ("MISSING", True, False),
+                                    ("DEAD", True, False), ("FAIL", True, False),
+                                    ("PASS", False, False), ("CI_PENDING", False, False)):
+            with self.subTest(status=status):
+                ln = {"finished_ts": 5, "dead": "x"}
+                if status is not None:
+                    ln["status"] = status
+                ids = [i for i, _, _ in self.c.attention({"A": ln})]
+                self.assertEqual("A" in ids, item)
+                self.assertEqual("A" in self.c.quiet, quiet)
+                ln["reading"] = {"kind": "needs_orchestrator", "summary": "s"}
+                self.c.attention({"A": ln})  # a routine reading never quiets a non-good status
+                self.assertEqual("A" in self.c.quiet, not item)
+
     def test_needs_salih_ack_prevents_escalation(self):
         self.reply = answer({"kind": "needs_salih", "summary": "karar", "next": "n"})
         self.finish_a()
@@ -2717,6 +2747,19 @@ class TestSharedWrite(Base):
             self.c.pass_once()
         self.assertIn("updated_at", self.status())
         self.assertEqual(self.errors(), ["write running_files.json: PermissionError(13, 'denied') after 5 tries"])
+        self.assertIsNone(self.c.status_fail_ts)
+
+    def test_running_files_other_error_status_still_ok(self):
+        """CONVFIX61 F6: ok comes only from status.json; a running_files error is logged, not stale."""
+        for exc in (ValueError("x"), OSError(5, "io")):
+            with self.subTest(exc=exc):
+                with self.locked("running_files.json", exc=exc):
+                    self.c.pass_once()
+                self.assertIn("updated_at", self.status())
+                self.assertEqual(self.errors()[-1], f"running_files.json: {exc!r}")
+                self.assertIsNone(self.c.status_fail_ts)
+                self.t += conveyor.STATUS_STALE_S + 1
+                self.assertNotIn("status_stale", [i for i, _, _ in self.c.attention({})])
 
     def test_lanes_locked_one_error_pass_continues(self):
         self.drop("A.md", HDR.format("A"))
@@ -3134,15 +3177,39 @@ class TestPreserved(Base):
         self.assertNotIn("preserved:A", "\n".join(self.pushes))
 
     def test_ack_name_is_windows_safe(self):
-        """CONVPAGE: the ack for cleanup:A is the file cleanup_A."""
+        """CONVFIX61 F3: the ack for cleanup:A is ack_name('cleanup:A'); cleanup_A (a lane id's
+        ack name) does not clear it."""
         self.fake.rm_rc = 1
         self.run_cleanup()
         self.assertEqual(self.cleanup_ids(), ["cleanup:A"])
         (self.base / "ack").mkdir(exist_ok=True)
-        (self.base / "ack" / "cleanup_A").write_text("")
-        os.utime(self.base / "ack" / "cleanup_A", (self.t + 5, self.t + 5))
-        self.c.pass_once()
-        self.assertEqual(self.cleanup_ids(), [])
+        for name, left in (("cleanup_A", ["cleanup:A"]), (conveyor.ack_name("cleanup:A"), [])):
+            (self.base / "ack" / name).write_text("")
+            os.utime(self.base / "ack" / name, (self.t + 5, self.t + 5))
+            self.c.pass_once()
+            self.assertEqual(self.cleanup_ids(), left)
+
+    def test_ack_name_is_injective_and_plain_file_name(self):
+        """CONVFIX61 F3: every non-plain id is '+'+hex; no two sample ids share a name and no
+        name holds a Windows-forbidden char, a separator, a trailing dot/space or a device name."""
+        ids = ["A", "INT61", "dry-x", "a", "cleanup:A", "cleanup_A", "preserved:A", ".", "..", "",
+               "A.", "A ", " A", "CON", "nul", "com1.txt", "Lpt9", "İ", "ş", "+41", "+",
+               "a/b", "a\\b", "../x", "x\x00", "A\x1f", "\ud800"] + list('<>:"/\\|?*')
+        names = [conveyor.ack_name(i) for i in ids]
+        self.assertEqual(len(set(names)), len(ids))
+        for i in ("A", "INT61", "dry-x", "a", "cleanup_A"):
+            self.assertEqual(conveyor.ack_name(i), i)  # plain ids keep their old ack name
+        for i, n in zip(ids, names):
+            with self.subTest(id=i):
+                self.assertRegex(n, r"\A[A-Za-z0-9+][A-Za-z0-9_.-]*\Z")
+                self.assertFalse(n.endswith("."))
+                self.assertNotRegex(n, r"(?i)\A(CON|PRN|AUX|NUL|COM\d|LPT\d)(\..*)?\Z")
+                self.assertTrue(n == i or n.startswith("+"))
+        p = self.base / "ack"
+        p.mkdir(exist_ok=True)
+        for n in names:  # every name is one file inside ack/
+            (p / n).write_text("")
+            self.assertEqual((p / n).resolve().parent, p.resolve())
 
 
 class TestEarlyStop(Base):

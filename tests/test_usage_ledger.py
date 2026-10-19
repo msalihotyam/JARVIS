@@ -239,6 +239,42 @@ class T(unittest.TestCase):
         self.assertFalse(self.out.exists())
         self.assertEqual(self.check(), 20)  # only the two files the killed run did not finish
 
+    def walk_raising(self, exc):
+        """Listing a subdir of the second JARVIS dir raises exc (Path.rglob would swallow it)."""
+        sub = self.d / "c--Users-realk-Masa-st--JARVIS--claude-worktrees-x" / "sub"
+        sub.mkdir(parents=True)
+        (sub / "b.jsonl").write_bytes(lines(A("m2", 7, sid="s2")))
+        (self.proj / "a.jsonl").write_bytes(lines(A("m1", 5)))
+        real = os.scandir
+
+        def scandir(p="."):
+            if os.fspath(p) == str(sub):
+                raise exc
+            return real(p)
+        return mock.patch.object(os, "scandir", scandir)
+
+    def test_unlistable_dir_fails_the_run(self):
+        """CONVFIX61 F2: a denied or failing walk is not a vanished dir: the run fails, usage.json kept."""
+        for exc in (PermissionError(13, "denied"), OSError(5, "io")):
+            with self.subTest(exc=exc):
+                self.tearDown()
+                self.setUp()
+                self.out.parent.mkdir()
+                self.out.write_text('{"sessions": []}', encoding="utf-8")
+                with self.walk_raising(exc), self.assertRaises(OSError):
+                    self.run_main()
+                self.assertEqual(self.out.read_text(encoding="utf-8"), '{"sessions": []}')
+
+    def test_vanished_dir_is_skipped(self):
+        for exc in (FileNotFoundError(2, "gone"), NotADirectoryError(20, "not a dir")):
+            with self.subTest(exc=exc):
+                self.tearDown()
+                self.setUp()
+                with self.walk_raising(exc):
+                    self.run_main()
+                self.assertEqual([s["session_id"] for s in json.loads(self.out.read_text(encoding="utf-8"))["sessions"]],
+                                 ["s1"])
+
 
 if __name__ == "__main__":
     unittest.main()
