@@ -31,6 +31,7 @@ class FakeClaude:
         self.n = 0
         self.fail_agents = False
         self.rm_rc = 0
+        self.rm_out = "rm failed"
 
     def __call__(self, args, timeout=120, cwd=None):
         self.calls.append(args)
@@ -56,7 +57,7 @@ class FakeClaude:
         if args[0] == "rm":
             if self.rm_rc == 0:
                 self.agents = [a for a in self.agents if a["id"] != args[1]]
-            return self.rm_rc, "removed" if self.rm_rc == 0 else "rm failed"
+            return self.rm_rc, "removed" if self.rm_rc == 0 else self.rm_out.format(sid=args[1])
         return 1, "unknown"
 
     def bg_calls(self):
@@ -2226,6 +2227,34 @@ class TestReader(Base):
         self.c.pass_once()
         self.assertEqual(len(self.pushes), 1)  # once per item
 
+    def escalated(self):
+        self.t += conveyor.ATTENTION_PAGE_S + 3600
+        self.c.pass_once()
+        return "vermedi: A: " in "\n".join(self.pushes)
+
+    def test_routine_pass_items_stay_on_the_board_without_a_page(self):
+        """CONVPAGE: PASS + needs_orchestrator and PASS + FINDINGS never page Salih."""
+        self.reply = answer({"kind": "needs_orchestrator", "summary": "entegre", "next": "n"})
+        self.finish_a(extra="FINDINGS: küçük not\n")
+        self.assertEqual(self.attn(), ["A", conveyor.DRY_ID])
+        self.assertFalse(self.escalated())
+        self.assertIn("A", self.attn())
+
+    def test_findings_alone_never_page(self):
+        self.finish_a(extra="FINDINGS: küçük not\n")
+        self.assertIn("A", self.attn())
+        self.assertFalse(self.escalated())
+
+    def test_blocked_status_pages(self):
+        self.finish_a(status="BLOCKED")
+        self.assertIn("A", self.attn())
+        self.assertTrue(self.escalated())
+
+    def test_stuck_status_pages(self):
+        self.finish_a(status="STUCK")
+        self.assertIn("A", self.attn())
+        self.assertTrue(self.escalated())
+
     def test_needs_salih_ack_prevents_escalation(self):
         self.reply = answer({"kind": "needs_salih", "summary": "karar", "next": "n"})
         self.finish_a()
@@ -2766,6 +2795,62 @@ class TestPreserved(Base):
         self.c.pass_once()
         self.assertEqual(len(self.cli("rm")), 2)
         self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
+
+    def cleanup_ids(self):
+        return [i["id"] for i in self.status()["attention"] if i["id"].startswith("cleanup:")]
+
+    def test_rm_refused_for_commits_in_main_is_retried_but_not_listed(self):
+        """CONVPAGE: unpushed commits already on local main only wait for the next push."""
+        sha = self.lane_commit()
+        self.g("cherry-pick", sha)
+        self.fake.rm_rc = 1
+        self.fake.rm_out = ("Worktree has unpushed commits. To discard the worktree and its commits: "
+                            f"claude rm {{sid}} --discard-unpushed {sha}@abc1234\n")
+        self.run_cleanup()
+        self.assertIs(self.lanes()["A"]["cleanup"]["in_main"], True)
+        self.assertEqual(self.cleanup_ids(), [])
+        self.fake.rm_rc = 0
+        self.t = self.lanes()["A"]["cleanup"]["retry_ts"]
+        self.c.pass_once()
+        self.assertEqual(len(self.cli("rm")), 2)
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
+        self.assertNotIn("in_main", self.lanes()["A"]["cleanup"])
+
+    def test_rm_refused_for_commits_not_in_main_is_listed(self):
+        self.fake.rm_rc = 1
+        self.fake.rm_out = ("To discard the worktree and its commits: "
+                            f"claude rm {{sid}} --discard-unpushed {'d' * 40}@abc1234")
+        self.run_cleanup()
+        self.assertIs(self.lanes()["A"]["cleanup"]["in_main"], False)
+        self.assertEqual(self.cleanup_ids(), ["cleanup:A"])
+
+    def test_cleanup_refused_and_preserved_never_page(self):
+        self.fake.rm_rc = 1
+        self.run_cleanup()
+        self.assertEqual(self.cleanup_ids(), ["cleanup:A"])
+        self.t += conveyor.ATTENTION_PAGE_S + 60
+        self.c.pass_once()
+        self.assertNotIn("cleanup:A", "\n".join(self.pushes))
+        self.assertEqual(self.cleanup_ids(), ["cleanup:A"])  # still on the board
+
+    def test_preserved_never_pages(self):
+        self.lane_commit()
+        self.run_cleanup()
+        self.assert_preserved_once()
+        self.t += conveyor.ATTENTION_PAGE_S + 60
+        self.c.pass_once()
+        self.assertNotIn("preserved:A", "\n".join(self.pushes))
+
+    def test_ack_name_is_windows_safe(self):
+        """CONVPAGE: the ack for cleanup:A is the file cleanup_A."""
+        self.fake.rm_rc = 1
+        self.run_cleanup()
+        self.assertEqual(self.cleanup_ids(), ["cleanup:A"])
+        (self.base / "ack").mkdir(exist_ok=True)
+        (self.base / "ack" / "cleanup_A").write_text("")
+        os.utime(self.base / "ack" / "cleanup_A", (self.t + 5, self.t + 5))
+        self.c.pass_once()
+        self.assertEqual(self.cleanup_ids(), [])
 
 
 class TestEarlyStop(Base):

@@ -749,6 +749,7 @@ class Conveyor:
         self.breaker = None  # {"reason", "since"} while open (autopilot.json), else None
         self.band = []  # status.json "band" lines (breaker, auto-approval)
         self.lanes_bad = None  # why lanes.json could not be read this pass: nothing saves over it
+        self.quiet = set()  # attention ids that never page (attention() refills it)
         self.beat_ts = 0
 
     # ---- lock -------------------------------------------------------
@@ -2094,18 +2095,23 @@ class Conveyor:
         return ln.get("finished_ts") or self.started_ts(ln)
 
     def acked(self, item_id, since):
-        """Orchestrator ack: build/conveyor/ack/<id> exists (never deleted here) and is
-        not older than the item, so an earlier same-name ack hides nothing new."""
+        """Orchestrator ack: build/conveyor/ack/<name> exists (never deleted here) and is
+        not older than the item, so an earlier same-name ack hides nothing new. <name> is the
+        id with ':' and every other character Windows forbids in a file name turned into '_'
+        (cleanup:A -> cleanup_A; "cleanup:A" would be an NTFS stream); an id with none of
+        them is its own name, so an ack written before this rule keeps working."""
         try:
-            return (self.base / "ack" / item_id).stat().st_mtime >= since
-        except OSError:
+            name = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", item_id)
+            return (self.base / "ack" / name).stat().st_mtime >= since
+        except (OSError, ValueError):
             return False
 
     def attention(self, lanes):
         """Unacked items for the orchestrator as (id, reason, since): a lane with a bad
         STATUS or STUCK, a running lane blocked too long, a non-pass reading, and the backlog
-        running dry."""
-        items = []
+        running dry. Routine ids (self.quiet: a PASS needing only the orchestrator, FINDINGS,
+        cleanup refused, preserved) stay on the board but never page (backstop)."""
+        items, self.quiet = [], set()
         for n, ln in lanes.items():
             if not ln.get("finished") and ln.get("blocked_attention"):  # CONV9, see unblock()
                 items.append((n, f"lane blocked, needs orchestrator: blocked since "
@@ -2114,7 +2120,7 @@ class Conveyor:
                 continue
             if "finished_ts" not in ln:  # running, a quiet v0 lane, or read before this version
                 continue
-            why = []
+            why, loud = [], True
             if ln.get("status") == "DEAD":
                 why.append(f"prompt not delivered / session gone: {ln.get('dead')}")
             elif ln.get("status") in BAD or ln.get("status") in ("STUCK", "MISSING"):
@@ -2123,27 +2129,35 @@ class Conveyor:
                                 ("interim_timeout", "")):
                     if ln.get(k):
                         why.append(lead + ln[k])
+            else:
+                loud = False  # CONVPAGE: pages only with a page reason below
             r = ln.get("reading") or {}
             if r.get("kind", "pass") != "pass":
                 lead = "reader says needs_salih" if r["kind"] == "needs_salih" else f"reader {r['kind']}"
                 why.append(f"{lead}: {r.get('summary', '')}")
+                loud = loud or r["kind"] != "needs_orchestrator"
             if ln.get("auto_refused"):
                 why.append(f"auto-approval refused: {ln['auto_refused']}")
+                loud = True
             if why and ln.get("auto_fix"):
                 why.append(ln["auto_fix"])
             if ln.get("findings"):  # CONVHEAL: a PASS with findings -> fix lanes (no page, no breaker)
                 why.append(f"FINDINGS: {ln['findings']}")
             if why:
                 items.append((n, "; ".join(why), self.since(ln)))
+                if not loud:
+                    self.quiet.add(n)
         for n, ln in lanes.items():  # CONV11: one item per preserved lane, until acked
             c = ln.get("cleanup") or {}
-            if c.get("retry_ts"):
+            if c.get("retry_ts") and not c.get("in_main"):  # in_main: only waits for the next push
                 items.append((f"cleanup:{n}", f"cleanup refused ({c['reason']}); retried after "
                                               f"{iso(c['retry_ts'])}", c["ts"]))
+                self.quiet.add(f"cleanup:{n}")
             if "preserved" in ln:
                 pv = ln["preserved"]
                 items.append((f"preserved:{n}", f"lane worktree kept (not removed): {pv['reason']}",
                               pv["ts"]))
+                self.quiet.add(f"preserved:{n}")
         dry = self.pager_flag("dry")
         if dry and dry is not True:  # True: a v1 flag (paged then); dispatch() gives it a time
             items.append((DRY_ID, "kuyruk boş, çalışan lane yok", dry))
@@ -2196,6 +2210,8 @@ class Conveyor:
             return
         done = self.pager_flag("backstop") or {}
         for i, why, since in items:
+            if i in self.quiet:  # CONVPAGE: routine, the board is enough
+                continue
             if self.now() - since >= ATTENTION_PAGE_S and done.get(i) != since:
                 self.page(f"Orkestratör {ATTENTION_PAGE_S // 60} dk tepki vermedi: {i}: {why}")
                 done[i] = since
@@ -3104,11 +3120,27 @@ class Conveyor:
                 if steps[-1]["cmd"] == "rm":
                     # refused although the branch is integrated (`claude rm --discard-unpushed`
                     # would also drop uncommitted changes: never passed): retried the next day
-                    self.retry_cleanup(name, ln, "rm", f"claude rm refused: {steps[-1]['output'][-150:]}")
+                    self.retry_cleanup(name, ln, "rm", f"claude rm refused: {steps[-1]['output'][-150:]}",
+                                       self.rm_in_main(steps[-1]["output"]))
 
-    def retry_cleanup(self, name, ln, step, reason):
-        """An event and an attention item (cleanup:<lane>); the step is retried after CLEANUP_RETRY_S."""
-        ln["cleanup"].update(step=step, reason=reason, ts=self.now(), retry_ts=self.now() + CLEANUP_RETRY_S)
+    def rm_in_main(self, out):
+        """True when a claude rm refusal names only unpushed commits whose tip is provably on
+        local main (off_main): they wait for the next push, nothing for the orchestrator.
+        Fail closed: another text, uncommitted changes or any doubt is False."""
+        m = re.search(r"discard the worktree and its commits: claude rm (\S+) --discard-unpushed "
+                      r"([0-9a-f]{40})@[0-9a-f]+\s*\Z", out)
+        if not m or "uncommitted" in out.lower():
+            return False
+        try:
+            return self.off_main(f"session {m[1]}", m[2]) is None
+        except Exception:
+            return False
+
+    def retry_cleanup(self, name, ln, step, reason, in_main=False):
+        """An event and an attention item (cleanup:<lane>, none when in_main: the refused commits
+        are already on local main); the step is retried after CLEANUP_RETRY_S."""
+        ln["cleanup"].update(step=step, reason=reason, ts=self.now(), retry_ts=self.now() + CLEANUP_RETRY_S,
+                             in_main=in_main)
         self.event("cleanup_refused", lane=name, step=step, reason=reason)
 
     def worktree_step(self, name, ln):
@@ -3116,7 +3148,7 @@ class Conveyor:
         if why:
             self.retry_cleanup(name, ln, "worktree", why)
         else:
-            for k in ("step", "reason", "ts", "retry_ts"):
+            for k in ("step", "reason", "ts", "retry_ts", "in_main"):
                 ln["cleanup"].pop(k, None)
 
     def remove_worktree(self, name, ln):
