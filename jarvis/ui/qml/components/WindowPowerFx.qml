@@ -131,6 +131,9 @@ Item {
     function end() {
         var what = finish
         finish = ""
+        // UIRED5FIX: the safety and its wall-clock deadline can end a power down before slow frames
+        // let the timeline reach 1: it always ends whole (its run is already stopped).
+        if (down) { t = 1; grabbed = true }
         if (what === "close") { closeReleased = true; host.close() }
         else if (what === "quit") quitNow()
         else minimizeNow()
