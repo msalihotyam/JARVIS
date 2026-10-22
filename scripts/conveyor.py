@@ -90,7 +90,8 @@ FACT_HEAD = "FACT NOTE (written by the conveyor from git and files, not by a mod
 FACT_TAIL = "continue from here; do not redo finished steps; finish the report"
 TEST_SUMMARY_RE = re.compile(r"\bRan \d+ tests?\b|\b\d+ (?:tests?|failures?|passed|failed)\b|^\s*(?:RUNS|TESTS)\s*:")
 SECRET_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w+|(?i:bearer)\s+[\w.~+/=-]{8,}"
-                       r"|(?i:token|password|passwd|secret|api[_-]?key)\s*[=:]\s*\S+")
+                       r"|[\"']?(?i:token|password|passwd|secret|api[_-]?key)[\"']?\s*[=:]\s*"
+                       r"(?:\"(?:[^\"\\\n]|\\.)*\"?|'(?:[^'\\\n]|\\.)*'?|\S+)")  # JSON/quoted values whole
 CTX_TAIL_BYTES = 65536  # the CLI's context-full error is the transcript's last assistant entry
 GRANT_MAX = 3
 NEEDS_RE = re.compile(r"(?m)^[ \t]*NEEDS FILES:[ \t]*(.*)$")
@@ -781,7 +782,8 @@ def validate_slice(s):
     return None
 
 
-CI_TARGET_RE = re.compile(r"CI BRANCH:?[ \t]*`?ci/([A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*)")  # no end-of-sentence dot
+# the whole token up to whitespace, minus a closing backtick and an end-of-sentence mark
+CI_TARGET_RE = re.compile(r"CI BRANCH:?[ \t]*`?ci/(\S*?)`?[.,;:)]?(?=\s|$)")
 
 
 def lint_slice(s, prompt_text, exists, known_ids):
@@ -803,6 +805,8 @@ def lint_slice(s, prompt_text, exists, known_ids):
         if len(targets) != 1 or "" in targets:
             return f"prompt names {len(targets - {''})} CI BRANCH: ci/<x> targets, not one"
         x, lid = targets.pop(), sid.lower()
+        if not re.fullmatch(r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*", x):
+            return f"CI BRANCH ci/{x} is not one ci/<x> token"
         # ci/<id>, a re-push ci/<id>-<n>, or a re-run lane (INT60R2, INT45-R) naming its base
         if not any(lid.startswith(b) and re.fullmatch(r"(-?r\d*)?", lid[len(b):])
                    for b in {x, re.sub(r"-\d+$", "", x)}):
@@ -3590,21 +3594,19 @@ class Conveyor:
     def merged_equivalent(self, branch, tip=None):
         """(True, [{commit, main, how}]) when every commit of origin/main..branch is already on
         origin/main under another sha (CLEANPATCH: a cherry-pick, or its hunks landed by a later
-        commit), else (False, reason). Every commit needs a 3-way merge of it onto origin/main
-        (base: its parent) that leaves origin/main's tree unchanged ("content", or "patch-id" when
-        `git cherry` says "-"); a "-" commit whose lines main edited since counts only when a main
-        commit carries its patch verbatim apart from hunk positions, since patch-id ignores
-        whitespace (ponytail: a hunk landing elsewhere in the file still passes that fallback; a
-        3-way check per hunk if it matters). "main" is the latest origin/main commit touching
-        the commit's paths (evidence, not a proof). Fail closed: origin/main unknown, any git error
-        or unparsable output, a merge, root, empty or binary-only commit is False. A "-" commit that
+        commit), else (False, reason). Every commit needs a 3-way merge of it (base: its parent) that
+        leaves a tree unchanged: origin/main's ("content", or "patch-id" when `git cherry` says "-"),
+        or, for a "-" commit whose lines main edited since, that of an origin/main commit with the
+        same patch-id (CLEANFIX: a real 3-way check, so the hunk landing elsewhere in a file or
+        differing in whitespace is refused). "main" is the latest origin/main commit touching the
+        commit's paths, or that patch-id commit. Fail closed: origin/main unknown, any git error or
+        unparsable output, a merge, root, empty or binary-only commit is False. A "-" commit that
         main reverted later still counts (as off_main's cherry step)."""
         hexsha = r"[0-9a-f]{40}|[0-9a-f]{64}"
-        patch = ["--format=%x00", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", "-U3"]
 
-        def norm(out):  # one patch per commit, without blob ids and hunk positions
-            return [[ln if not ln.startswith("@@ ") else "@@" for ln in p.strip("\n").split("\n")
-                     if not ln.startswith("index ")] for p in out.split("\0") if p.strip("\n")]
+        def noop_merge(c, onto, tree):  # c's change (base c^) merged onto `onto` leaves `tree`
+            rc, mt = self.cmd([*GIT_PIN, "merge-tree", "--write-tree", f"--merge-base={c}^", onto, c])
+            return rc == 0 and mt.split()[:1] == [tree]
         try:
             rc, om = self.cmd([*GIT_PIN, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"])
             om = om.strip()  # one proof against one sha, though a fetch moves the ref
@@ -3639,20 +3641,28 @@ class Conveyor:
                 if rc != 0 or any(len(r) != 3 for r in recs) or all(r[0] == "-" for r in recs):
                     return False, f"{branch}: commit {c[:7]} empty, binary-only or root (git diff rc={rc})"
                 paths = [f":(literal){r[2]}" for r in recs]
-                rc, mt = self.cmd([*GIT_PIN, "merge-tree", "--write-tree", f"--merge-base={c}^", om, c])
-                if rc != 0 or mt.split()[:1] != [tree]:
-                    # patch-id ignores whitespace: a "-" commit main edited since needs its patch
-                    # verbatim (hunk positions aside) in a main commit; binary blobs are in the patch-id
-                    rc, mine = self.cmd([*GIT_PIN, "log", "-p", "-1", *patch, c, "--", *paths])
-                    rc2, theirs = self.cmd([*GIT_PIN, "log", "-p", "--no-merges", *patch, f"{c}^..{om}", "--",
-                                            *paths])
-                    if cherry[c] != "-" or rc or rc2 or not norm(mine) or norm(mine)[0] not in norm(theirs):
-                        return False, f"{branch} has commits not on origin/main (first {c[:7]})"
                 how = "patch-id" if cherry[c] == "-" else "content"
-                rc, hit = self.cmd([*GIT_PIN, "log", "-1", "--format=%H", om, "--", *paths])
-                if rc != 0 or not re.fullmatch(hexsha, hit.strip()):
-                    return False, f"git log origin/main -- <{c[:7]} paths> rc={rc}"
-                pairs.append({"commit": c, "main": hit.strip(), "how": how})
+                if noop_merge(c, om, tree):
+                    rc, hit = self.cmd([*GIT_PIN, "log", "-1", "--format=%H", om, "--", *paths])
+                    if rc != 0 or not re.fullmatch(hexsha, hit.strip()):
+                        return False, f"git log origin/main -- <{c[:7]} paths> rc={rc}"
+                    pairs.append({"commit": c, "main": hit.strip(), "how": how})
+                    continue
+                hit = None
+                if how == "patch-id":  # "=": an origin/main commit with a patch-id of a lane commit
+                    rc, out2 = self.cmd([*GIT_PIN, "rev-list", "--cherry-mark", "--right-only", "--no-merges",
+                                         f"{c}...{om}"])
+                    marks = out2.split()
+                    if rc != 0 or not all(m[:1] in "=+" and re.fullmatch(hexsha, m[1:]) for m in marks):
+                        return False, f"git rev-list --cherry-mark {c[:7]}...origin/main rc={rc}"
+                    for m in (m[1:] for m in marks if m[0] == "="):
+                        rc, mtree = self.cmd([*GIT_PIN, "rev-parse", "--verify", "--quiet", f"{m}^{{tree}}"])
+                        if rc == 0 and re.fullmatch(hexsha, mtree.strip()) and noop_merge(c, m, mtree.strip()):
+                            hit = m
+                            break
+                if not hit:
+                    return False, f"{branch} has commits not on origin/main (first {c[:7]})"
+                pairs.append({"commit": c, "main": hit, "how": how})
         except Exception as e:  # a timeout etc.
             return False, f"git failed: {type(e).__name__}"
         return True, pairs

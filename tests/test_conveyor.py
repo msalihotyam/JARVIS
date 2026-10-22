@@ -680,6 +680,17 @@ class TestLintSlice(unittest.TestCase):
         self.assertIsNone(lint("INT60-R", "CI BRANCH: ci/int60-2\n"))
         self.assertIsNone(self.lint("X", prompt="CI BRANCH: ci/a\nCI BRANCH: ci/b\n"))  # not integration
 
+    def test_ci_target_is_the_whole_token(self):
+        """CLEANFIX (CDXINT63C m1): a ci/<x> prefix of a longer token is not the target."""
+        def lint(prompt):
+            return self.lint("INT63", ["@main-checkout"], prompt)
+        self.assertEqual(lint("CI BRANCH: ci/int63/foreign\n"), "CI BRANCH ci/int63/foreign is not one ci/<x> token")
+        self.assertEqual(lint("CI BRANCH: ci/int63!x\n"), "CI BRANCH ci/int63!x is not one ci/<x> token")
+        self.assertEqual(lint("CI BRANCH: `ci/int63`x\n"), "CI BRANCH ci/int63`x is not one ci/<x> token")
+        self.assertIn("names 2 CI BRANCH", lint("CI BRANCH: ci/int63\nCI BRANCH: ci/int63/x\n"))
+        self.assertIsNone(lint("Push to CI BRANCH: `ci/int63`.\n"))
+        self.assertIsNone(lint("CI BRANCH: ci/int63"))  # end of prompt
+
     def test_granted_paths_exist(self):
         self.assertEqual(self.lint("X", ["jarvis/nope.py"]),
                          "granted path jarvis/nope.py not in the main checkout (mark it (new) in the prompt)")
@@ -1061,6 +1072,18 @@ class TestFactNote(unittest.TestCase):
         for s in ("sk-ant-", "ghp_", "hunter2", "topic-xyz"):
             self.assertNotIn(s, note)
         self.assertIn("  1111111 key [secret] and [secret]\n  2222222 [secret] [topic]\n", note)
+
+    def test_no_quoted_secrets(self):
+        """CLEANFIX (CDXINT63C M3): JSON / quoted keys and values, both quote styles, go whole."""
+        self.out[("log", "--oneline", "c82d2d6..HEAD")] = (
+            '1111111 cfg "api_key": "abc def" end\n'
+            "2222222 cfg 'token'='s3 cr \\' et' end\n"
+            '3333333 {"password":"p w","x":1}\n')
+        note = conveyor.fact_note(self.cmd, self.wt, "c82d2d6", "A")
+        for s in ("abc", "def", "s3", "\\'", "p w", "api_key", "token", "password"):
+            self.assertNotIn(s, note)
+        self.assertIn('  1111111 cfg [secret] end\n  2222222 cfg [secret] end\n  3333333 {[secret],"x":1}\n',
+                      note)
 
 
 class TestBlockedLane(Base):
@@ -3240,6 +3263,46 @@ class TestPreserved(Base):
         self.assertEqual(self.equivalent_pairs(), [])
         self.assertEqual(self.c.merged_equivalent("lane-a"),
                          (False, f"lane-a has commits not on origin/main (first {sha[:7]})"))
+
+    def test_hunk_elsewhere_in_file_is_not_equivalent(self):
+        """CLEANFIX (CDXINT63C M1): main made the same edit to an identical block elsewhere in the
+        file; patch-id matches, the lane's change is not on main."""
+        block = "a\nb\nc\nB\nd\ne\nf\n"
+        self.main_commit({"f2.txt": block * 2})
+        self.g("merge", "-q", "--ff-only", "main", cwd=self.wt)
+        (self.wt / "f2.txt").write_text(block.replace("B", "X") + block)
+        self.g("commit", "-q", "-am", "first B", cwd=self.wt)
+        sha = self.g("rev-parse", "HEAD", cwd=self.wt)
+        self.main_commit({"f2.txt": block + block.replace("B", "X")})
+        self.origin_main()
+        self.assertEqual(self.g("cherry", "main", "lane-a"), f"- {sha}")
+        self.assertEqual(self.c.merged_equivalent("lane-a"),
+                         (False, f"lane-a has commits not on origin/main (first {sha[:7]})"))
+        self.run_cleanup()
+        self.assertEqual(self.assert_preserved_once()["first_unintegrated_sha"], sha)
+        self.assertEqual(self.equivalent_pairs(), [])
+
+    def test_content_landed_then_edited_on_main_is_not_equivalent(self):
+        """No patch-id match ("+") and main edited the lines since: nothing proves the lane's code."""
+        sha = self.lane_commit()
+        self.main_commit({"g.txt": "work\n", "h.txt": "more\n"})
+        self.main_commit({"g.txt": "work, edited on main\n"})
+        self.origin_main()
+        self.assertEqual(self.g("cherry", "main", "lane-a"), f"+ {sha}")
+        self.assertEqual(self.c.merged_equivalent("lane-a"),
+                         (False, f"lane-a has commits not on origin/main (first {sha[:7]})"))
+
+    def test_cherry_pick_then_main_edit_names_the_cherry_pick_commit(self):
+        sha = self.lane_commit()
+        self.g("cherry-pick", "-x", sha)
+        pick = self.g("rev-parse", "main")
+        self.main_commit({"g.txt": "work, edited on main\n"})
+        self.origin_main()
+        self.assertEqual(self.c.merged_equivalent("lane-a"),
+                         (True, [{"commit": sha, "main": pick, "how": "patch-id"}]))
+        self.git_fail, self.git_fail_on = (128, ""), ["git", "rev-list", "--cherry-mark"]
+        self.assertEqual(self.c.merged_equivalent("lane-a"),
+                         (False, f"git rev-list --cherry-mark {sha[:7]}...origin/main rc=128"))
 
     def test_binary_beside_text_is_proved_binary_only_is_refused(self):
         """A .qm beside its .ts: same blob on origin/main is equivalent, another blob or a
