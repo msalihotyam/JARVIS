@@ -4237,15 +4237,16 @@ class TestCIHandoff(AutopilotBase):
                 self.int_lane("INT1", SHA_A)
                 self.pending("INT1", SHA_A)
                 self.git.ci(SHA_A, conclusion)
-                if conclusion == "cancelled":  # CONVSAFE: re-run once, a second cancellation is the result
-                    self.git.fail[("gh", "run", "rerun")] = (0, "")
-                    self.c.pass_once()
-                    self.assertEqual(self.lanes()["INT1"]["status"], "CI_PENDING")
-                    self.assertEqual([e["lane"] for e in self.ev("ci_rerun")], ["INT1"])
-                    self.t += 60
+                # CONVSAFE / CIRERUN: re-run once, a second cancellation or failure is the result
+                self.git.fail[("gh", "run", "rerun")] = (0, "")
+                self.c.pass_once()
+                self.assertEqual(self.lanes()["INT1"]["status"], "CI_PENDING")
+                self.assertEqual([(e["lane"], e["reason"]) for e in self.ev("ci_rerun")],
+                                 [("INT1", "first failure" if conclusion == "failure" else "cancelled")])
+                self.t += 60
                 self.c.pass_once()
                 self.assertEqual(self.lanes()["INT1"]["status"], "BLOCKED")
-                self.assertEqual(len(self.ev("ci_rerun")), conclusion == "cancelled")
+                self.assertEqual(len(self.ev("ci_rerun")), 1)
                 line = f"CI: https://github.com/x/y/actions/runs/10 {conclusion}"
                 self.assertTrue(self.text("INT1").endswith(f"\n{line}\n"))
                 self.assertEqual((self.approvals(), self.git.pushes()), ([], []))
@@ -4309,6 +4310,81 @@ class TestCIHandoff(AutopilotBase):
         self.assertEqual(self.status()["breaker"], "closed")  # BREAKERV2: the chain stops, not every lane
         self.assertEqual(self.ev("auto_fix_failed")[0]["fix"], "INT1-R")
         self.assertEqual(self.git.pushes(), [])
+
+    def reruns(self):
+        return [c for c in self.git.calls if c[:3] == ["gh", "run", "rerun"]]
+
+    def first_failure(self):
+        self.int_lane("INT1", SHA_A)
+        self.pending("INT1", SHA_A)
+        self.git.ci(SHA_A, "failure")
+        self.git.fail[("gh", "run", "rerun")] = (0, "")
+        self.c.pass_once()
+        self.t += 60
+
+    def test_first_ci_failure_reruns_failed_jobs_once_and_stays_pending(self):  # CIRERUN
+        self.first_failure()
+        self.assertEqual(self.lanes()["INT1"]["status"], "CI_PENDING")
+        self.assertEqual(self.reruns(), [["gh", "run", "rerun", "10", "--failed"]])
+        (ev,) = self.ev("ci_rerun")
+        self.assertEqual((ev["lane"], ev["sha"], ev["rc"], ev["reason"]), ("INT1", SHA_A, 0, "first failure"))
+        self.assertEqual((self.ev("auto_fix"), self.ev("ci_result")), ([], []))
+        self.assertEqual((self.approvals(), self.git.pushes()), ([], []))
+
+    def test_rerun_success_turns_green_and_the_gate_pushes(self):  # CIRERUN
+        self.first_failure()
+        self.git.ci(SHA_A)  # the re-run attempt goes green
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT1"]["status"], "GREEN")
+        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{SHA_A}:refs/heads/main"]])
+        self.assertEqual((len(self.reruns()), self.ev("auto_fix")), (1, []))
+
+    def test_second_ci_failure_goes_to_auto_fix_without_another_rerun(self):  # CIRERUN
+        self.first_failure()
+        self.git.ci(SHA_A, "failure")
+        self.c.pass_once()
+        self.c.pass_once()  # the flag holds: no rerun on a later pass either
+        self.assertEqual(self.lanes()["INT1"]["status"], "BLOCKED")
+        self.assertEqual(len(self.reruns()), 1)
+        (afx,) = self.ev("auto_fix")
+        self.assertEqual((afx["fix"], afx["rerun"]), ("INT1-AFX", "INT1-R"))
+        self.assertEqual(self.git.pushes(), [])
+
+    def test_a_rerun_that_does_not_start_goes_to_auto_fix_in_the_same_pass(self):  # CIRERUN fail closed
+        for how in ("rc", "raise"):
+            with self.subTest(how):
+                self.tearDown()
+                self.setUp()
+                self.int_lane("INT1", SHA_A)
+                self.pending("INT1", SHA_A)
+                self.git.ci(SHA_A, "failure")
+                if how == "rc":
+                    self.git.fail[("gh", "run", "rerun")] = (1, "boom")
+                else:
+                    self.git.raise_on = ("gh", "run", "rerun")
+                self.c.pass_once()
+                self.assertEqual(self.lanes()["INT1"]["status"], "BLOCKED")
+                (ev,) = self.ev("ci_rerun")
+                self.assertEqual(ev["rc"], 1 if how == "rc" else "TimeoutError")
+                (afx,) = self.ev("auto_fix")
+                self.assertEqual(afx["fix"], "INT1-AFX")
+                self.assertEqual(self.git.pushes(), [])
+
+    def test_a_failure_after_a_cancel_rerun_is_not_rerun_again(self):  # CIRERUN: one automatic rerun per sha
+        self.int_lane("INT1", SHA_A)
+        self.pending("INT1", SHA_A)
+        self.git.ci(SHA_A, "cancelled")
+        self.git.fail[("gh", "run", "rerun")] = (0, "")
+        self.c.pass_once()
+        self.assertEqual(self.reruns(), [["gh", "run", "rerun", "10"]])
+        self.assertEqual(self.lanes()["INT1"]["status"], "CI_PENDING")
+        self.t += 60
+        self.git.ci(SHA_A, "failure")
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT1"]["status"], "BLOCKED")
+        self.assertEqual(len(self.reruns()), 1)
+        self.assertEqual(len(self.ev("ci_rerun")), 1)
+        self.assertEqual(len(self.ev("auto_fix")), 1)
 
     def test_dependents_of_a_blocked_int_wait_for_its_rerun(self):
         lanes = {"INT1": {"status": "BLOCKED"}, "INT1-R": {"status": "CI_PENDING"}, "F": {"status": "BLOCKED"},

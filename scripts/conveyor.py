@@ -2632,16 +2632,21 @@ class Conveyor:
             return self.ci_slow(name, ln, why, error=True)
         if state == "pending":
             return self.ci_slow(name, ln, why)
-        if state == "cancelled" and not ln["ci"].get("rerun"):  # cancel-in-progress: not a failure
+        # cancel-in-progress is not a failure; a first failure may be a flaky shard (CIRERUN): one automatic
+        # rerun per sha for either, a second red or a rerun that did not start is a result
+        if state in ("cancelled", "failure") and not ln["ci"].get("rerun"):
             m = CI_RUN_RE.search(url or "")
             try:
-                rc, _ = self.cmd(["gh", "run", "rerun", m.group(1)]) if m else (1, "")
+                rc, _ = (self.cmd(["gh", "run", "rerun", m.group(1)] + ["--failed"] * (state == "failure"))
+                         if m else (1, ""))
             except Exception as e:
                 rc = type(e).__name__
-            ln["ci"]["rerun"] = True  # once: a second cancellation is a result
-            self.event("ci_rerun", lane=name, sha=ci["sha"], url=url, rc=rc)
+            ln["ci"]["rerun"] = True  # once per sha, whichever came first
+            self.event("ci_rerun", lane=name, sha=ci["sha"], url=url, rc=rc,
+                       reason="first failure" if state == "failure" else "cancelled")
             if rc == 0:
-                return self.ci_slow(name, ln, "the cancelled run was re-run once")
+                return self.ci_slow(name, ln, f"the {'failed' if state == 'failure' else 'cancelled'} run was "
+                                              "re-run once")
         line = f"CI: {url} {state}"
         try:
             with open(ln["report"], "a", encoding="utf-8") as f:  # appended, the lane's lines untouched
