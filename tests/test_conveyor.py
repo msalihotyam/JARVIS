@@ -3786,23 +3786,41 @@ class TestAutoFix(AutopilotBase):
         self.finish("INT9-R", "BLOCKED", f"FAILURE: {FAILING}\n")
         self.assertEqual(len(self.ev("auto_fix")), 1)
         self.assertNotIn("INT9-R-AFX", self.fake.bg_names())
-        self.assertEqual(self.status()["breaker"], "open")  # the chain failed
+        self.assertEqual(self.status()["breaker"], "closed")  # BREAKERV2: the chain stops, not every lane
+        (ev,) = self.ev("auto_fix_failed")
+        self.assertEqual((ev["lane"], ev["fix"], ev["status"]), ("INT9", "INT9-R", "BLOCKED"))
         # the orchestrator runs INT9 again by hand and it blocks again: attention only
-        (self.base / "breaker-reset").touch()
         self.int_lane()
         self.finish("INT9", "BLOCKED", f"FAILURE: {FAILING}\n")
         self.assertEqual(len(self.ev("auto_fix")), 1)
         self.assertEqual(self.ev("auto_fix_skipped")[-1]["reason"], "auto-fix already used for this integration lane")
         self.assertEqual(self.fake.bg_names().count("INT9-AFX"), 1)
 
-    def test_failed_fix_opens_the_breaker_and_the_rerun_never_runs(self):
+    def test_failed_fix_stops_the_chain_and_pages_without_the_breaker(self):
+        """BREAKERV2 (EVTAUDIT R3): a failed -AFX stops its chain and re-raises INT9 with the
+        fix lane's files; the breaker stays closed and other lanes keep dispatching."""
+        (self.base / "pace.json").write_text(json.dumps({"max_lanes": 6}), encoding="utf-8")
         self.blocked_int()
         self.finish("INT9-AFX", "BLOCKED")
         self.c.pass_once()
-        self.assertEqual(self.status()["breaker"], "open")
-        self.assertIn(conveyor.BREAKER_ID, self.attn())
-        self.assertIn("auto-fix chain failed: INT9-AFX BLOCKED", self.ev("breaker")[0]["reason"])
+        self.assertEqual(self.status()["breaker"], "closed")
+        self.assertEqual(self.ev("breaker"), [])
+        self.assertNotIn(conveyor.BREAKER_ID, self.attn())
+        (ev,) = self.ev("auto_fix_failed")
+        self.assertEqual((ev["lane"], ev["fix"], ev["status"], ev["files"]),
+                         ("INT9", "INT9-AFX", "BLOCKED", ["jarvis/core.py", "scripts/x.py"]))
         self.assertNotIn("INT9-R", self.fake.bg_names())
+        self.assertEqual(self.view()["INT9-R"], "dead")
+        (item,) = [a for a in self.status()["attention"] if a["id"] == "INT9"]
+        self.assertIn("auto-fix failed: INT9-AFX BLOCKED; chain stopped, files: jarvis/core.py, scripts/x.py",
+                      item["reason"])
+        self.assertNotIn("INT9", self.c.quiet)  # a blocking item: it pages
+        self.drop("p.md", HDR.format("P"))
+        self.c.pass_once()
+        self.assertIn("P", self.fake.bg_names())
+        self.t += conveyor.ATTENTION_PAGE_S
+        self.c.pass_once()
+        self.assertTrue(any("INT9" in p for p in self.pushes))
 
     def test_skips(self):
         cases = {
@@ -3897,6 +3915,45 @@ class TestBreaker(AutopilotBase):
         self.c.pass_once()
         self.assertEqual(self.status()["breaker"], "closed")
         self.blocked("D")
+        self.assertEqual(self.status()["breaker"], "closed")
+
+    def test_root_id(self):
+        for name, root in (("INT5-2-AFX", "INT5"), ("int5-r", "INT5"), ("INT5-S", "INT5"),
+                           ("INT5-AFX-R", "INT5"), ("-R", "-R"), ("A", "A"), ("A-2", "A-2")):
+            self.assertEqual(conveyor.root_id(name), root, name)
+
+    def test_one_root_counts_once(self):
+        """BREAKERV2: a lane, its -AFX/-R and a second BLOCKED report of the same lane are one
+        bad finish; review/dry lanes never count; an unknown name is its own root."""
+        (self.base / "pace.json").write_text(json.dumps({"max_lanes": 6}), encoding="utf-8")
+        self.blocked("A", "A-AFX", "A-R", "CDX1", "DRY1")
+        self.finish("A", "BLOCKED")  # the same lane reports BLOCKED again
+        self.assertEqual(self.status()["breaker"], "closed")
+        self.blocked("ZZ")
+        self.assertEqual(self.status()["breaker"], "closed")
+        self.blocked("Q-7")  # any other name is its own root and counts (fail closed)
+        self.assertEqual(self.status()["breaker"], "open")
+        self.assertRegex(self.ev("breaker")[0]["reason"], r"^3 lanes .* within 2 h: A(-R)?, ZZ, Q-7$")
+
+    def test_a_later_good_finish_closes_the_breaker(self):
+        (self.base / "pace.json").write_text(json.dumps({"max_lanes": 6}), encoding="utf-8")
+        self.drop("g.md", HDR.format("G"))
+        self.drop("h.md", HDR.format("H"))
+        self.c.pass_once()
+        self.blocked("A", "B")
+        self.drop("c.md", HDR.format("C"))
+        self.c.pass_once()
+        self.t += 60
+        self.report("C", "BLOCKED", mtime=self.t)
+        self.report("H", "PASS", mtime=self.t)  # GOOD in the pass that opens it: not after it
+        self.c.pass_once()
+        self.t += 60
+        self.assertEqual(self.status()["breaker"], "open")
+        self.finish("G", "PASS")
+        self.assertEqual(self.status()["breaker"], "closed")
+        self.assertNotIn(conveyor.BREAKER_ID, self.attn())
+        self.assertEqual([(e["state"], e["reason"]) for e in self.ev("breaker")][1:], [("closed", "auto: G PASS")])
+        self.blocked("D")  # the count starts again
         self.assertEqual(self.status()["breaker"], "closed")
 
 
@@ -4249,7 +4306,8 @@ class TestCIHandoff(AutopilotBase):
         self.assertEqual(len(self.ev("auto_fix")), 1)
         self.assertNotIn("INT1-R-AFX", self.fake.bg_names())
         self.assertEqual(self.fake.bg_names().count("INT1-AFX"), 1)
-        self.assertEqual(self.status()["breaker"], "open")  # the chain failed
+        self.assertEqual(self.status()["breaker"], "closed")  # BREAKERV2: the chain stops, not every lane
+        self.assertEqual(self.ev("auto_fix_failed")[0]["fix"], "INT1-R")
         self.assertEqual(self.git.pushes(), [])
 
     def test_dependents_of_a_blocked_int_wait_for_its_rerun(self):

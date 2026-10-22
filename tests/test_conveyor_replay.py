@@ -1,9 +1,9 @@
-"""Replay net for scripts/conveyor.py: EVTAUDIT section 4 incidents (R1 R2 R4 R7 R8)
+"""Replay net for scripts/conveyor.py: EVTAUDIT section 4 incidents (R1 R2 R3 R4 R7 R8)
 replayed through pass_once with a fake clock, fake runner and fake git.
 
 Each test asserts TODAY's behaviour, bad outcomes included. Its docstring carries the
 incident window and a TARGET: line (EVTAUDIT "What the conveyor should have done"); the
-fix slice for that seed flips the assertions to the TARGET.
+fix slice for that seed flips the assertions to the TARGET (R2 R3: BREAKERV2).
 
 Fixtures are inline, anonymised and live in a tmp dir (tests.test_conveyor.Base).
 """
@@ -59,31 +59,60 @@ class TestR2BreakerStorm(Replay):
             self.dispatch(n)
             self.finish(n, "BLOCKED")
 
-    def test_same_root_blocked_lanes_open_the_breaker_and_a_pass_does_not_close_it(self):
+    def test_same_root_blocked_counts_once_and_a_pass_closes_the_breaker(self):
         """R2 2026-10-13T02:45:42 -> 13:15:27: the breaker stayed open 10.5 h after three
         BLOCKED lanes that shared one root cause, though later lanes passed.
 
-        TODAY: three BLOCKED lanes within 2 h open the breaker whatever their root; a CDX
-        review lane's BLOCKED is not counted; a later PASS lane leaves it open.
-        TARGET: count only distinct-root BLOCKED (CDX/DRY review findings excluded) and
-        auto-reset when the next lane passes.
+        TODAY = TARGET (BREAKERV2): count only distinct-root BLOCKED (CDX/DRY review findings
+        excluded) and auto-reset when the next lane passes.
         """
         self.blocked("CDX1")
+        self.blocked("F1", "F1-AFX", "F1-R")  # one root: one bad finish
         self.assertEqual(self.status()["breaker"], "closed")
-        self.blocked("F1", "F2")  # F1..F3 share one root cause
+        self.blocked("F2")
         self.dispatch("F3", "G1")  # G1 is already running when the breaker opens
         self.finish("F3", "BLOCKED")
         self.assertEqual(self.status()["breaker"], "open")
         (opened,) = self.ev("breaker")
         self.assertEqual(opened["state"], "open")
-        self.assertIn("F1, F2, F3", opened["reason"])
+        self.assertIn("F1-R, F2, F3", opened["reason"])
         self.assertNotIn("CDX1", opened["reason"])
         self.finish("G1", "PASS")
-        self.t += 3600
+        self.assertEqual(self.status()["breaker"], "closed")
+        self.assertNotIn(conveyor.BREAKER_ID, self.attn())
+        self.assertEqual([(e["state"], e["reason"]) for e in self.ev("breaker")][1:], [("closed", "auto: G1 PASS")])
+
+
+class TestR3AutoFixChainFail(Replay):
+    def setUp(self):
+        super().setUp()
+        self.git.fail[tc.PICKED] = (0, "jarvis/core.py\nscripts/x.py\n")
+
+    def test_a_failed_fix_lane_stops_its_chain_and_pages_without_the_breaker(self):
+        """R3 2026-10-18T21:56:33 -> 22:52: INT58 BLOCKED, its auto-fix INT58-AFX BLOCKED and
+        the breaker opened for every lane.
+
+        TODAY = TARGET (BREAKERV2): stop at chain 1, route to Salih with the fix lane's file
+        list, and do not open the breaker for all lanes.
+        """
+        self.int_lane("INT1")
+        self.finish("INT1", "BLOCKED", f"FAILURE:\n  {tc.FAILING}\n")
+        (afx,) = self.ev("auto_fix")
+        self.assertEqual((afx["fix"], afx["rerun"]), ("INT1-AFX", "INT1-R"))
+        self.assertIn("INT1-AFX", self.fake.bg_names())
+        self.finish("INT1-AFX", "BLOCKED")
         self.c.pass_once()
-        self.assertEqual(self.status()["breaker"], "open")
-        self.assertIn(conveyor.BREAKER_ID, self.attn())
-        self.assertEqual([e["state"] for e in self.ev("breaker")], ["open"])
+        self.assertEqual(self.status()["breaker"], "closed")
+        self.assertEqual(self.ev("breaker"), [])
+        self.assertEqual(self.view()["INT1-R"], "dead")
+        self.assertNotIn("INT1-R", self.fake.bg_names())
+        (item,) = [a for a in self.status()["attention"] if a["id"] == "INT1"]
+        self.assertIn("auto-fix failed: INT1-AFX BLOCKED; chain stopped, files: jarvis/core.py, scripts/x.py",
+                      item["reason"])
+        self.dispatch("P1")  # other lanes keep running
+        self.t += conveyor.ATTENTION_PAGE_S
+        self.c.pass_once()
+        self.assertTrue(any("INT1" in p for p in self.pushes))
 
 
 class TestR4CIRedFlaky(Replay):
