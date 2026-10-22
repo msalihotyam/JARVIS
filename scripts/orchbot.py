@@ -9,6 +9,9 @@ EVTAUDIT (R4, R7, #1). A bad input logs one escalate_orchestrator decision; a pa
 BOTAGREE: each pass also observes what the orchestrator/conveyor actually did (ack files, approvals,
 new backlog ids, pace.json, page / ci_rerun events), matches it to the bot's decisions on the same
 target within MATCH_S, logs one "verdict" line per decided match and keeps shadow.json "agreement".
+BOTFACTS: each pass also writes build/bot/facts.md (atomic, <= FACTS_MAX bytes): the FACT part of an
+orchestrator handoff rendered by code from the files, every line naming its source; a missing or
+unreadable source prints "unknown (<file>)", never a guess.
 
     python scripts/orchbot.py --shadow [--root DIR] [--once] [--quota-ceiling PCT]
 """
@@ -20,6 +23,7 @@ import posixpath
 import re
 import sys
 import time
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -48,6 +52,28 @@ GRAD_DAYS, GRAD_PUSHES = 7, 10  # stage 4 exit: >= 1 week, >= 10 key-1 decisions
 KEY1 = {"write_key1", "ask_salih_key1"}
 STAMP_RE = re.compile(r"\.\d{8}-\d{6}$")  # approvals/done/<name>.<YYYYmmdd-HHMMSS> on a name clash
 PACE_KEYS = ("max_lanes", "min_lanes", "lanes_present", "lanes_away")  # a decrease = dispatch held
+FACTS_MAX = 6 * 1024
+ALIVE_S = 10 * 60  # status.json older than this = the conveyor is not writing (stale)
+SECRET_RES = (  # facts.md never carries a URL (ntfy topic), a key or a key=value secret
+    (re.compile(r"https?://\S+"), "[url]"),
+    (re.compile(r"\b(?:sk-|ghp_|gho_|github_pat_|xox[abp]-|AKIA)[\w-]{6,}"), "[key]"),
+    (re.compile(r"(?i)\b(token|key|secret|password|passwd|topic|bearer|auth\w*)(\s*[:=]\s*)\S+"), r"\1\2[redacted]"),
+    # long token between dashes, so push-<40 hex>-lane (approval names) and a hex sha never match
+    (re.compile(r"(?=[\w+]*[g-zG-Z])(?=[\w+]*\d)[\w+]{32,}"), "[redacted]"),
+)
+HEX_RE = re.compile(r"\b[0-9a-f]{7,40}\b")
+COMMIT_RE = re.compile(r"(?m)^[ \t]*COMMIT:?(.*)$")
+CI_RE = re.compile(r"(?m)^[ \t]*CI BRANCH:?[ \t]*(ci/[\w./-]+)")
+FACT_REPORTS = 8
+TRIM = ("reports", "attention", "slices", "approvals", "lanes")  # size cap: oldest report rows go first
+
+
+def clean(line):
+    """One facts.md line with no secret: cv.redacted (sk-ant-, the ntfy topic) then SECRET_RES."""
+    line = cv.redacted(line, "", 400)
+    for rx, repl in SECRET_RES:
+        line = rx.sub(repl, line)
+    return line
 
 
 def num(v):
@@ -194,6 +220,13 @@ class Bot:
             if self.fresh("bad:agreement", self.now()):
                 self.decide(self.now(), "agreement", "escalate_orchestrator", "FAILCLOSED", "orchbot",
                             f"agreement error: {e!r}"[:300])
+        try:
+            if not self.retry(self.write_facts):
+                raise OSError(f"write failed after {cv.REPLACE_TRIES} tries")
+        except Exception as e:  # the old facts.md stays; one decision per episode, the pass goes on
+            if self.fresh("bad:facts", self.now()):
+                self.decide(self.now(), "facts.md write failed", "escalate_orchestrator", "FAILCLOSED",
+                            "facts.md", f"{e!r}"[:300])
         self.save()
         return self.new
 
@@ -361,6 +394,198 @@ class Bot:
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(st, indent=1, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
+
+    # ---- facts (BOTFACTS) --------------------------------------------------------------------
+    def write_facts(self):
+        """facts.md via tmp + os.replace: the old file stays whole until the new one is complete."""
+        path = self.out / "facts.md"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(self.facts(), encoding="utf-8")
+        os.replace(tmp, path)
+
+    def quiet(self, path, kind=dict):
+        """The JSON at path when it is a `kind`, else None. No decision: facts.md prints unknown."""
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        return data if isinstance(data, kind) else None
+
+    def facts(self):
+        """The facts.md text: fixed section order, every line ends with its source file; a missing
+        or unreadable source prints "unknown (<file>)", never a guess. Over FACTS_MAX the oldest
+        list rows go first (reports, then attention, slices, approvals, lanes)."""
+        now = self.now()
+        st = self.quiet(self.conv / "status.json")
+        pace = self.quiet(self.conv / "pace.json")
+        backlog = self.quiet(self.conv / "backlog.json", (dict, list))
+        S = "status.json"
+
+        def unk(f):
+            return f"unknown ({f})"
+
+        def yn(v):
+            return "yes" if v else "no"
+
+        def get(k, ok):
+            return st[k] if st is not None and ok(st.get(k)) else None
+
+        # DECISION TAKEN: status.json publishes no main sha today, so main prints unknown until the
+        # conveyor writes status["main"] = {"local": sha, "origin": sha} (alternative: run git, a
+        # process the shadow bot must not need)
+        main = get("main", lambda v: isinstance(v, dict))
+        main_lines = [f"{k}: {v[:10]} ({S})" if isinstance(v, str) and HEX_RE.fullmatch(v) else f"{k}: {unk(S)}"
+                      for k, v in (("local", (main or {}).get("local")), ("origin", (main or {}).get("origin")))]
+
+        conv = []
+        upd = parse_ts(get("updated_at", lambda v: isinstance(v, str)))
+        if upd is None:
+            conv.append(f"alive: {unk(S)}")
+        else:
+            age = int(now - upd)
+            conv.append(f"alive: {'yes' if age <= ALIVE_S else 'no (stale)'}, status written {age // 60} min ago ({S})")
+        paused = get("paused", lambda v: isinstance(v, bool))
+        conv.append(f"paused: {yn(paused)} ({S})" if paused is not None else f"paused: {unk(S)}")
+        band = get("band", lambda v: isinstance(v, list))
+        conv.append(f"band: {', '.join(map(str, band)) or 'none'} ({S})" if band is not None else f"band: {unk(S)}")
+
+        quota = []
+        pct, hold = get("usage_pct", num), get("usage_hold", lambda v: isinstance(v, bool))
+        quota.append(f"usage: {pct:g}% ({S})" if pct is not None else f"usage: {unk(S)}")
+        quota.append(f"usage hold: {yn(hold)} ({S})" if hold is not None else f"usage hold: {unk(S)}")
+        reset = None
+        days = pace.get("days", cv.PACE_DEFAULTS["days"]) if pace is not None else None
+        if num(days) and isinstance(pace.get("window_start"), str):
+            try:
+                reset = cv.iso(datetime.fromisoformat(pace["window_start"]).timestamp() + days * 86400)
+            except (ValueError, OverflowError, OSError):
+                reset = None
+        quota.append(f"window reset: {reset} (pace.json)" if reset else f"window reset: {unk('pace.json')}")
+        mhold = get("memory_hold", lambda v: isinstance(v, bool))
+        free = (get("memory", lambda v: isinstance(v, dict)) or {}).get("free_gb")
+        quota.append(f"memory hold: {yn(mhold)}{f', free {free:g} GB' if num(free) else ''} ({S})"
+                     if mhold is not None else f"memory hold: {unk(S)}")
+
+        lanes = get("lanes", lambda v: isinstance(v, list))
+        lane_rows = []
+        for ln in lanes or []:
+            if not isinstance(ln, dict):
+                continue
+            t = parse_ts(ln.get("started_at"))
+            mins = f"{int(now - t) // 60} min" if t is not None else "unknown min"
+            lane_rows.append(f"{ln.get('id') or ln.get('name')}: {ln.get('model')}/{ln.get('effort')}, "
+                             f"running {mins}, state {ln.get('state')} ({S})")
+
+        raw = backlog.get("slices") if isinstance(backlog, dict) else backlog
+        slices = {str(s.get("id")): s for s in raw if isinstance(s, dict)} if isinstance(raw, list) else None
+        queue = get("backlog", lambda v: isinstance(v, list))
+        slice_rows = []
+        for b in [b for b in queue or [] if isinstance(b, dict) and b.get("id")][:5]:
+            state = str(b.get("state"))
+            if state != "waiting_deps":
+                slice_rows.append(f"{b['id']}: {state} ({S})")
+            elif slices is None:
+                slice_rows.append(f"{b['id']}: waits on {unk('backlog.json')}")
+            else:
+                deps = (slices.get(str(b["id"])) or {}).get("depends_on") or []
+                deps = ", ".join(map(str, deps)) if isinstance(deps, list) else str(deps)
+                slice_rows.append(f"{b['id']}: waits on {deps or 'unknown'} ({S} + backlog.json)")
+
+        report_rows = self.fact_reports()
+        approval_rows = self.fact_approvals()
+        breaker = get("breaker", lambda v: isinstance(v, str))
+        gate = [f"push gate breaker: {breaker} ({S})" if breaker is not None else f"push gate breaker: {unk(S)}"]
+
+        att = get("attention", lambda v: isinstance(v, list))
+        att_rows = [f"{a.get('id')}: {str(a.get('reason'))[:120]} since {a.get('since')} ({S})"
+                    for a in att or [] if isinstance(a, dict)]
+
+        g = self.st.get("agreement", {}).get("graduation")
+        if isinstance(g, dict) and all(num(g.get(k)) for k in ("days", "pushes", "agree_pct")):
+            grad = [f"days {g['days']:g}/{GRAD_DAYS}, key-1 pushes {g['pushes']:g}/{GRAD_PUSHES}, "
+                    f"agree {g['agree_pct']:g}%, ready {yn(g.get('ready') is True)} (shadow.json)"]
+        else:
+            grad = [f"graduation: {unk('shadow.json')}"]
+
+        none = {"lanes": f"none ({S})", "slices": f"none ({S})", "approvals": "none (build/approvals)",
+                "attention": f"none ({S})", "reports": "none (build/reports)"}
+        # (title, fixed lines, trimmable rows or None when the source is unknown, key)
+        secs = [("main", main_lines, [], None), ("conveyor", conv, [], None), ("quota", quota, [], None),
+                ("running lanes", [], lane_rows if lanes is not None else None, "lanes"),
+                ("next slices", [], slice_rows if queue is not None else None, "slices"),
+                ("last reports", [], report_rows, "reports"),
+                ("approvals and push gate", gate, approval_rows, "approvals"),
+                ("attention", [], att_rows if att is not None else None, "attention"),
+                ("bot graduation", grad, [], None)]
+        unknown = {"lanes": unk(S), "slices": unk(S), "approvals": unk("build/approvals"),
+                   "attention": unk(S), "reports": unk("build/reports")}
+        cut = dict.fromkeys(none, 0)
+
+        def render():
+            out = [f"# JARVIS facts at {cv.iso(now)} (scripts/orchbot.py)",
+                   "Written by code from the files named on each line; unknown means the file was missing "
+                   "or unreadable (scripts/orchbot.py)"]
+            for title, fixed, rows, key in secs:
+                out += ["", f"## {title}"] + [f"- {x}" for x in fixed]
+                if key:
+                    if rows is None:
+                        out.append(f"- {unknown[key]}")
+                    elif rows or cut[key]:
+                        out += [f"- {x}" for x in rows]
+                    else:
+                        out.append(f"- {none[key]}")
+                    if cut[key]:
+                        out.append(f"- ... {cut[key]} more rows not shown (size cap, scripts/orchbot.py)")
+            return "\n".join(clean(x) for x in out) + "\n"
+
+        text = render()
+        for title, fixed, rows, key in sorted((s for s in secs if s[3]), key=lambda s: TRIM.index(s[3])):
+            while rows and len(text.encode("utf-8")) > FACTS_MAX:
+                rows.pop()  # newest first, so the last row is the oldest
+                cut[key] += 1
+                text = render()
+        # ponytail: byte cut as the last resort, only reachable with absurd fixed lines
+        return text if len(text.encode("utf-8")) <= FACTS_MAX else \
+            text.encode("utf-8")[:FACTS_MAX - 1].decode("utf-8", "ignore") + "\n"
+
+    def fact_reports(self):
+        """The last FACT_REPORTS reports by mtime, newest first: STATUS, COMMIT, CANDIDATE SHA, CI BRANCH."""
+        d = self.root / "build" / "reports"
+        try:
+            paths = sorted((p for p in d.iterdir() if p.suffix == ".md" and p.is_file()),
+                           key=lambda p: p.stat().st_mtime, reverse=True)[:FACT_REPORTS]
+        except OSError:
+            return None
+        rows = []
+        for p in paths:
+            src = f"build/reports/{p.name}"
+            try:
+                with open(p, encoding="utf-8", errors="replace") as f:
+                    rep = f.read(REPORT_MAX)
+            except OSError:
+                rows.append(f"{p.stem}: {f'unknown ({src})'}")
+                continue
+            first = rep.split("\n", 1)[0].strip()
+            parts = [first[len("STATUS:"):].strip() if first.startswith("STATUS:") else "STATUS unknown"]
+            for label, rx in (("commit", COMMIT_RE), ("candidate", cv.CANDIDATE_RE)):
+                m = rx.search(rep)
+                h = HEX_RE.search(m.group(1)) if m else None
+                if h:
+                    parts.append(f"{label} {h.group(0)[:10]}")
+            m = CI_RE.search(rep)
+            if m:
+                parts.append(f"ci {m.group(1)}")
+            rows.append(f"{p.stem}: {', '.join(parts)} ({src})")
+        return rows
+
+    def fact_approvals(self):
+        """Pending approval files (build/approvals, not done/)."""
+        try:
+            names = sorted(n for n in os.listdir(self.root / "build" / "approvals")
+                           if cv.APPROVAL_RE.fullmatch(n) and (self.root / "build" / "approvals" / n).is_file())
+        except OSError:
+            return None
+        return [f"{n} pending (build/approvals)" for n in names]
 
     # ---- agreement (BOTAGREE) ----------------------------------------------------------------
     def check_agreement(self):

@@ -381,7 +381,9 @@ class FailClosedTest(BotCase):
 class ShadowWriteTest(BotCase):
     def test_permission_error_retried_5x_then_one_escalation(self):
         self.events({"ts": "2026-10-15T11:00:00", "event": "pace", "usage_pct": 99})
-        with mock.patch.object(orchbot.os, "replace", side_effect=PermissionError("held")) as rep:
+        # facts.md is out of this test (FactsTest covers its own write failure)
+        with mock.patch.object(orchbot.os, "replace", side_effect=PermissionError("held")) as rep, \
+                mock.patch.object(orchbot.Bot, "write_facts"):
             ds = self.run_bot()
         self.assertEqual(rep.call_count, 5)
         self.assertEqual(self.sleeps, [0.2] * 4)
@@ -528,6 +530,143 @@ class AgreementTest(BotCase):
                 g = self.shadow()["agreement"]["graduation"]
                 self.assertEqual(g, {"days": days, "pushes": total, "agree_pct": round(100 * agree / total, 1),
                                      "ready": ready})
+
+
+class FactsTest(BotCase):
+    SECTIONS = ["## main", "## conveyor", "## quota", "## running lanes", "## next slices", "## last reports",
+                "## approvals and push gate", "## attention", "## bot graduation"]
+
+    def fixtures(self):
+        self.put("build/conveyor/status.json", {
+            "updated_at": "2026-10-15T11:58:00", "paused": False, "band": ["day"], "usage_pct": 42.5,
+            "usage_hold": False, "memory_hold": True, "memory": {"free_gb": 2.5}, "breaker": "closed",
+            "main": {"local": SHA, "origin": SHA2},
+            "lanes": [{"id": "BOTX", "name": "BOTX", "model": "opus", "effort": "medium", "state": "running",
+                       "started_at": "2026-10-15T11:30:00"}],
+            "backlog": [{"id": "A", "state": "ready"}, {"id": "B", "state": "waiting_deps"}],
+            "attention": [{"id": "lane:Z", "reason": "report missing", "since": "2026-10-15T10:00:00"}]})
+        self.put("build/conveyor/pace.json", {"window_start": "2026-10-13T09:00:00", "days": 7})
+        self.put("build/conveyor/backlog.json", {"slices": [{"id": "A"}, {"id": "B", "depends_on": ["A"]}]})
+        self.report("OLD", f"STATUS: BLOCKED\nCOMMIT: {SHA2}\n", "2026-10-15T09:00:00")
+        self.report("NEW", f"STATUS: PASS\nBRANCH: new\nCOMMIT: {SHA}\nCANDIDATE SHA: {SHA2}\nCI BRANCH: ci/new\n",
+                    "2026-10-15T10:00:00")
+        self.put(f"build/approvals/push-{SHA}-botfacts", "ok")
+        self.put(f"build/approvals/done/push-{SHA2[:12]}", "ok")
+
+    def report(self, name, text, at):
+        p = self.put(f"build/reports/{name}.md", text)
+        os.utime(p, (ts(at), ts(at)))
+
+    def facts(self):
+        return (self.root / "build" / "bot" / "facts.md").read_text(encoding="utf-8")
+
+    def test_full_render_fixed_order_every_line_sourced(self):
+        self.fixtures()
+        self.run_bot()
+        text = self.facts()
+        self.assertEqual([x for x in text.splitlines() if x.startswith("## ")], self.SECTIONS)
+        for x in text.splitlines():
+            if x.startswith("- ") or x.startswith("# "):
+                self.assertRegex(x, r"\([\w./ +-]+\)$")
+        for want in [f"- local: {SHA[:10]} (status.json)", f"- origin: {SHA2[:10]} (status.json)",
+                     "- alive: yes, status written 2 min ago (status.json)", "- paused: no (status.json)",
+                     "- band: day (status.json)", "- usage: 42.5% (status.json)", "- usage hold: no (status.json)",
+                     f"- window reset: {orchbot.cv.iso(ts('2026-10-13T09:00:00') + 7 * 86400)} (pace.json)",
+                     "- memory hold: yes, free 2.5 GB (status.json)",
+                     "- BOTX: opus/medium, running 30 min, state running (status.json)",
+                     "- A: ready (status.json)", "- B: waits on A (status.json + backlog.json)",
+                     f"- NEW: PASS, commit {SHA[:10]}, candidate {SHA2[:10]}, ci ci/new (build/reports/NEW.md)",
+                     f"- OLD: BLOCKED, commit {SHA2[:10]} (build/reports/OLD.md)",
+                     "- push gate breaker: closed (status.json)", f"- push-{SHA}-botfacts pending (build/approvals)",
+                     "- lane:Z: report missing since 2026-10-15T10:00:00 (status.json)",
+                     "- days 0/7, key-1 pushes 0/10, agree 0%, ready no (shadow.json)"]:
+            self.assertIn(want + "\n", text)
+        self.assertLess(text.index("- NEW:"), text.index("- OLD:"))
+        self.assertNotIn(SHA2[:12] + " pending", text)
+
+    def test_each_missing_source_prints_unknown(self):
+        self.fixtures()
+        cases = {"build/conveyor/status.json": ["- local: unknown (status.json)", "- alive: unknown (status.json)",
+                                                "- usage: unknown (status.json)", "- push gate breaker: unknown"],
+                 "build/conveyor/pace.json": ["- window reset: unknown (pace.json)"],
+                 "pace.json days": ["- window reset: unknown (pace.json)"],
+                 "build/conveyor/backlog.json": ["- B: waits on unknown (backlog.json)"],
+                 "backlog.json slices": ["- B: waits on unknown (backlog.json)"],
+                 "backlog.json ids": ["- B: waits on unknown (status.json + backlog.json)"],
+                 "build/reports": ["## last reports\n- unknown (build/reports)"],
+                 "build/approvals": ["- unknown (build/approvals)"]}
+        for gone, wants in cases.items():
+            with self.subTest(gone=gone):
+                self.fixtures()
+                p = self.root / gone
+                if gone == "pace.json days":
+                    self.put("build/conveyor/pace.json", {"window_start": "2026-10-13T09:00:00", "days": "7"})
+                elif gone == "backlog.json slices":
+                    self.put("build/conveyor/backlog.json", {"slices": 5})
+                elif gone == "backlog.json ids":
+                    self.put("build/conveyor/backlog.json", {"slices": [{"id": ["A"]}]})
+                elif p.is_dir():
+                    shutil.rmtree(p)
+                else:
+                    p.write_text("{not json", encoding="utf-8")
+                self.run_bot()
+                for want in wants:
+                    self.assertIn(want, self.facts())
+                self.assertEqual([x for x in self.facts().splitlines() if x.startswith("## ")], self.SECTIONS)
+        b = orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append)
+        b.st = {"agreement": {"graduation": {"days": "x"}}}
+        self.assertIn("- graduation: unknown (shadow.json)\n", b.facts())
+
+    def test_size_cap_trims_oldest_report_rows_first(self):
+        self.fixtures()
+        pad = " ".join(["padding"] * 45)
+        for i in range(8):
+            self.report(f"R{i}", f"STATUS: PASS {pad}\n", f"2026-10-15T0{i}:30:00")
+        self.put("build/conveyor/status.json", {"attention": [
+            {"id": f"att{i}", "reason": "a" * 100, "since": "2026-10-15T10:00:00"} for i in range(20)]})
+        self.run_bot()
+        text = self.facts()
+        self.assertLessEqual(len(text.encode("utf-8")), orchbot.FACTS_MAX)
+        self.assertIn("- R7: PASS", text)  # newest stays
+        self.assertNotIn("- R0: PASS", text)  # oldest goes first
+        self.assertRegex(text, r"- \.\.\. \d+ more rows not shown \(size cap")
+        self.assertEqual(sum(x.startswith("- att") for x in text.splitlines()), 20)  # attention untouched
+        self.assertEqual([x for x in text.splitlines() if x.startswith("## ")], self.SECTIONS)
+
+    def test_atomic_write_old_file_kept_on_failure(self):
+        self.fixtures()
+        self.run_bot()
+        old = self.facts()
+        self.assertFalse((self.root / "build" / "bot" / "facts.md.tmp").exists())
+        real = orchbot.os.replace
+
+        def held(a, b):
+            if Path(b).name == "facts.md":
+                raise PermissionError("held")
+            return real(a, b)
+
+        self.clock.set("2026-10-15T13:00:00")
+        with mock.patch.object(orchbot.os, "replace", side_effect=held):
+            ds = self.run_bot()
+            ds += self.run_bot()
+        self.assertEqual(self.facts(), old)
+        self.assertEqual(self.acts(ds), [("escalate_orchestrator", "FAILCLOSED", "facts.md")])
+
+    def test_no_secret_patterns(self):
+        self.fixtures()
+        topic = "jarvis-topic-q9"
+        self.put("build/conveyor/status.json", {
+            "lanes": [{"id": f"https://ntfy.sh/{topic}", "model": "sk-ant-api03-AAAABBBBCCCC", "effort": "x",
+                       "started_at": "2026-10-15T11:00:00", "state": "ghp_" + "a1" * 18}],
+            "attention": [{"id": "t", "reason": f"token=hunter2secret topic {topic} " + "Z9" * 20,
+                           "since": "x"}]})
+        self.report("LEAK", "STATUS: PASS key: abc123def\nCOMMIT: AKIAABCDEFGHIJKL\n", "2026-10-15T11:00:00")
+        with mock.patch.dict(os.environ, {"JARVIS_NTFY_TOPIC": topic}):
+            self.run_bot()
+        text = self.facts()
+        for bad in (topic, "ntfy.sh", "sk-ant", "ghp_", "hunter2", "abc123def", "AKIA", "Z9Z9Z9Z9"):
+            self.assertNotIn(bad, text)
+        self.assertLessEqual(len(text.encode("utf-8")), orchbot.FACTS_MAX)
 
 
 class MainTest(BotCase):
