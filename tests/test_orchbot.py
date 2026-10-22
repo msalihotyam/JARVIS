@@ -202,7 +202,8 @@ class StateRulesTest(BotCase):
     def test_routine_attention_older_than_25_min_is_acked_once(self):
         old, young = "2026-10-15T11:30:00", "2026-10-15T11:50:00"
         self.put("build/conveyor/status.json", {"attention": [
-            {"id": "cleanup:L1", "reason": "x", "since": old},
+            {"id": "cleanup:L1", "reason": "cleanup refused (git worktree remove rc=1: x); retried after x",
+             "since": old},
             {"id": "L2", "reason": "FINDINGS: 3; reader needs_orchestrator: y", "since": old},
             {"id": "L3", "reason": "BLOCKED: tests", "since": old},
             {"id": "preserved:L4", "reason": "x", "since": young},
@@ -212,6 +213,34 @@ class StateRulesTest(BotCase):
         os.utime(ack, (ts("2026-10-15T11:30:01"),) * 2)
         self.assertGreaterEqual(ack.stat().st_mtime, ts(old))
         self.assertEqual(self.acts(self.run_bot()), [("ack", "O33", "cleanup:L1"), ("ack", "O33", "L2")])
+        self.assertEqual(self.run_bot(), [])
+
+    def test_cleanup_refusal_not_on_main_is_kept_and_logged_once_a_day(self):
+        old = "2026-10-15T11:30:00"
+        unmerged = {
+            "cleanup:MDREAD": "cleanup refused (worktree-mdread has commits not on main (first abc1234)); retried after x",
+            "cleanup:C2": "cleanup refused (worktree-c2 Content Not On Main (tree differs)); retried after x",
+            "cleanup:C3": "cleanup refused (claude rm refused: run claude rm 1f2e --discard-unpushed abc@x); retried",
+            "cleanup:C4": "cleanup refused (claude rm refused: ...ed-unpushed abc@x); retried after x",
+            "cleanup:C5": "cleanup refused (branch worktree-c5 kept: not provably on main (x)); retried after x",
+            "cleanup:C6": "cleanup refused (worktree-c6 has merge commits); retried after x",
+            "cleanup:C7": "cleanup refused (worktree x not clean); retried after x",
+            "cleanup:C8": "cleanup refused (claude rm refused: git worktree remove rc=1: x); retried after x",
+            "cleanup:C9": "",
+        }
+        proven = {
+            "cleanup:OK1": "cleanup refused (git worktree remove rc=1: locked); retried after x",
+            "cleanup:OK2": "cleanup refused (git update-ref -d worktree-ok2 rc=128: err); retried after x",
+        }
+        self.put("build/conveyor/status.json", {"attention": [
+            {"id": i, "reason": r, "since": old} for i, r in (unmerged | proven).items()]})
+        keep = [("none", "KEEP-UNMERGED", i) for i in unmerged]
+        self.assertEqual(self.acts(self.run_bot()), keep + [("ack", "O33", i) for i in proven])
+        self.clock.set("2026-10-15T23:59:00")
+        self.assertEqual(self.run_bot(), [])
+        self.assertFalse(any((self.conv / "ack" / orchbot.cv.ack_name(i)).exists() for i in unmerged))
+        self.clock.set("2026-10-16T00:01:00")
+        self.assertEqual(self.acts(self.run_bot()), keep)
         self.assertEqual(self.run_bot(), [])
 
     def test_quota_above_ceiling_holds_dispatch_once_per_episode(self):
