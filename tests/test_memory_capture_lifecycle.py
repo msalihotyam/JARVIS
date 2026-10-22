@@ -16,7 +16,11 @@ from jarvis.contracts import (
     ActionScope,
     DataClassification,
     ErrorCode,
+    MemoryRecord,
+    MemoryRecordActor,
+    MemoryRecordKind,
     MemoryRecordOrigin,
+    MemoryRecordScope,
     SessionState,
     Task,
 )
@@ -28,7 +32,7 @@ from jarvis.core import (
     _finish_capture_run,
     _release_stale_capture_runs,
 )
-from jarvis.memory import SQLiteMemoryStore
+from jarvis.memory import MemoryRecordRefused, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from tests.helpers import isolated_settings, open_core
 from tests.test_claude_connector import OAUTH_MAX_AUTH_STATUS, patch_oauth_environment
@@ -238,6 +242,29 @@ class StaleRunSweepTests(StoreTest):
         # Released, never replayed: the run id stays claimed.
         self.assertFalse(_claim_capture_run(self.store, "old", self.cid, "session_end"))
         self.assertEqual(0, _release_stale_capture_runs(self.store, NOW))
+
+
+class DeleteWinsTests(StoreTest):
+    def capture(self, scope_conversation=None) -> MemoryRecord:
+        return MemoryRecord(
+            kind=MemoryRecordKind.FACT, text="We deploy on Fridays.", subject_key="deploys",
+            scope=MemoryRecordScope(self.project, scope_conversation),
+            origin=MemoryRecordOrigin.CAPTURE_SESSION_END, actor=MemoryRecordActor.MODEL,
+            confidence=0.9, classification=DataClassification.INTERNAL,
+            created_at=NOW, source_conversation_id=self.cid)
+
+    def test_a_capture_finishing_after_the_delete_is_dropped(self) -> None:
+        kept = self.store.insert_record(self.capture()).record.record_id  # positive control: before the delete
+        self.store.archive_conversation(self.cid)
+        preview = self.store.conversation_delete_preview(self.cid)
+        self.store.delete_conversation(self.cid, confirm=self.cid, expected_next_seq=preview["expected_next_seq"],
+                                       expected_title=preview["title"])
+        for scope_conversation in (None, self.cid):
+            with self.subTest(scope_conversation=scope_conversation):
+                with self.assertRaises(MemoryRecordRefused):
+                    self.store.insert_record(self.capture(scope_conversation))
+        self.assertEqual([kept], [v.record.record_id for v in self.store.list_records(
+            MemoryRecordScope(self.project, None))])
 
 
 class CancelBeforeSpawnTests(unittest.TestCase):

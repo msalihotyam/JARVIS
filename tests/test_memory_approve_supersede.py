@@ -39,14 +39,14 @@ class ApproveSupersedeTests(unittest.TestCase):
 
     def insert(self, text, *, day, kind=K.DECISION, subject="deploy-day", project=None,
                conversation=None, origin=MemoryRecordOrigin.CAPTURE_SESSION_END, at=None,
-               source=None) -> str:
+               source=None, supersedes=None) -> str:
         project = project or self.alpha
         record = MemoryRecord(
             kind=kind, text=text, subject_key=subject,
             scope=MemoryRecordScope(project, conversation), source_conversation_id=source,
             origin=origin, actor=MemoryRecordActor.MODEL, confidence=0.8,
             classification=DataClassification.INTERNAL,
-            created_at=at or f"2026-10-{day:02d}T00:00:00+00:00",
+            created_at=at or f"2026-10-{day:02d}T00:00:00+00:00", supersedes=supersedes,
         )
         return self.store.insert_record(record).record.record_id
 
@@ -136,6 +136,29 @@ class ApproveSupersedeTests(unittest.TestCase):
         # The restored record is undoable again; nothing is resurrected twice.
         self.store.undo(old, MemoryRecordActor.USER)
         self.assertIs(S.RETRACTED, self.status(old))
+
+    def test_a_restored_record_can_be_superseded_again(self) -> None:
+        # A3: the reversed supersession row must not block a later one.
+        for path in ("approval", "explicit"):
+            with self.subTest(path=path):
+                subject = f"a3-{path}"
+                old = self.approved("Fridays", day=1, subject=subject)
+                new = self.approved("Thursdays", day=2, subject=subject)
+                self.store.undo(new, MemoryRecordActor.USER)
+                if path == "approval":
+                    later = self.approved("Wednesdays", day=3, subject=subject)
+                else:
+                    # Older than `old`, so approving it supersedes nothing by itself.
+                    later = self.approved("Wednesdays", day=1, subject=subject, supersedes=old,
+                                          at="2026-09-30T00:00:00+00:00")
+                    self.assertIs(S.APPROVED, self.status(old))
+                    self.store.supersede(old, later, MemoryRecordActor.MODEL)
+                self.assertIs(S.SUPERSEDED, self.status(old))
+                self.assertIs(S.RETRACTED, self.status(new))
+                # The purge chain still reaches the retracted newer record both ways.
+                for start in (old, new):
+                    self.assertIn(new, self.store.purge_preview([start])["record_ids"])
+                    self.assertIn(old, self.store.purge_preview([start])["record_ids"])
 
     def test_model_import_and_consolidation_paths_never_supersede(self) -> None:
         old = self.approved("Fridays", day=1)
