@@ -244,11 +244,15 @@ class Base(unittest.TestCase):
         (self.base / "prompts").mkdir(exist_ok=True)
         out = []
         for s in slices:
+            is_int = bool(conveyor.INT_RE.match(s["id"]))
             s = {"title": s["id"], "model": "sonnet", "effort": "medium", "tier": "T1",
-                 "files": [], "depends_on": [], "prompt": f"build/conveyor/prompts/{s['id']}.md", **s}
+                 "files": ["@main-checkout"] if is_int else [], "depends_on": [],
+                 "prompt": f"build/conveyor/prompts/{s['id']}.md", **s}
             p = self.root / s["prompt"]
-            if not p.exists():
-                p.write_text(f"TASK {s['id']}\nbody\n", encoding="utf-8")
+            if not p.exists():  # a valid default under lint_slice: CI target, granted files new
+                p.write_text(f"TASK {s['id']}\nbody\n"
+                             + (f"CI BRANCH: ci/{s['id'].lower()}\n" if is_int else "")
+                             + "".join(f"{f} (new)\n" for f in s["files"]), encoding="utf-8")
             out.append(s)
         (self.base / "backlog.json").write_text(json.dumps({"slices": out}), encoding="utf-8")
 
@@ -612,6 +616,21 @@ class TestBacklog(Base):
         self.c.pass_once()
         self.assertNotIn(conveyor.BACKLOG_BAD_ID, self.attn())
 
+    def test_lint_slice_held_others_dispatched(self):
+        self.backlog({"id": "DEP", "depends_on": ["GHOST"]}, {"id": "MISS", "files": ["jarvis/nope.py"]},
+                     {"id": "INTCONV", "files": ["@main-checkout"]}, {"id": "NUL", "depends_on": ["G\x00"]},
+                     {"id": "OK"})
+        (self.base / "prompts" / "MISS.md").write_text("TASK\n", encoding="utf-8")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["OK"])
+        v = self.view()
+        self.assertEqual(v["DEP"], "held: unknown depends_on GHOST")
+        self.assertEqual(v["NUL"], "held: unknown depends_on G\x00")  # a NUL path never crashes the pass
+        self.assertTrue(v["MISS"].startswith("held: granted path jarvis/nope.py not in"))
+        self.assertEqual(v["INTCONV"], "held: @main-checkout needs an integration (INT...) id")
+        (item,) = [a for a in self.status()["attention"] if a["id"] == conveyor.BACKLOG_BAD_ID]
+        self.assertIn("slice DEP: held: unknown depends_on GHOST", item["reason"])
+
     def test_invalid_slices_reported(self):
         self.backlog({"id": "A", "tier": "T9"}, {"id": "B"})
         self.c.pass_once()
@@ -620,6 +639,64 @@ class TestBacklog(Base):
         (self.base / "backlog.json").write_text("{nope", encoding="utf-8")
         self.c.pass_once()
         self.assertTrue(any("backlog.json" in r.get("error", "") for r in self.status()["backlog"]))
+
+
+class TestLintSlice(unittest.TestCase):
+    HAVE = {"scripts/conveyor.py", "tests"}
+
+    def lint(self, sid, files=(), prompt="TASK\n", deps=(), known=("A",)):
+        return conveyor.lint_slice({"id": sid, "files": list(files), "depends_on": list(deps)},
+                                   prompt, self.HAVE.__contains__, set(known))
+
+    def test_prompt_readable_and_non_empty(self):
+        self.assertEqual(self.lint("X", prompt=None), "prompt unreadable or not UTF-8")
+        self.assertEqual(self.lint("X", prompt="﻿ \n\t"), "prompt empty")
+        self.assertIsNone(self.lint("X", prompt="TASK X\n"))
+
+    def test_integration_form_unambiguous(self):
+        ci = "CI BRANCH: ci/int63\n"
+        self.assertEqual(self.lint("INTCONV", ["@main-checkout"], "CI BRANCH: ci/intconv\n"),
+                         "@main-checkout needs an integration (INT...) id")  # INT_RE: not INTC...
+        self.assertIn('needs files ["@main-checkout"]', self.lint("INT61FIX", [], "CI BRANCH: ci/int61fix"))
+        self.assertIn('needs files ["@main-checkout"]',
+                      self.lint("INT63", ["@main-checkout", "scripts/conveyor.py"], ci))
+        self.assertIsNone(self.lint("INT63", ["@main-checkout"], ci))
+        self.assertIsNone(self.lint("INTCONV", ["scripts/conveyor.py"]))
+
+    def test_integration_names_one_matching_ci_target(self):
+        def lint(sid, prompt):
+            return self.lint(sid, ["@main-checkout"], prompt)
+        self.assertIn("names 0 CI BRANCH", lint("INT63", "push to ci/int63\n"))
+        self.assertIn("names 2 CI BRANCH", lint("INT63", "CI BRANCH: ci/int63\nCI BRANCH: ci/int64\n"))
+        self.assertIn("names 0 CI BRANCH", lint("INT63", "CI BRANCH: ci/\n"))
+        self.assertIn("names 1 CI BRANCH", lint("INT63", "CI BRANCH: ci/int63\nCI BRANCH: ci/\n"))
+        self.assertEqual(lint("INT63", "CI BRANCH: ci/int6\n"), "CI BRANCH ci/int6 does not match INT63")
+        self.assertIn("does not match", lint("INT63", "CI BRANCH: ci/int630\n"))
+        self.assertIn("does not match", lint("INT49B", "CI BRANCH: ci/int49\n"))
+        self.assertIsNone(lint("INT63", "CI BRANCH: ci/int63\nre-state: CI BRANCH: `ci/int63`\n"))
+        self.assertIsNone(lint("INT63", "Push to CI BRANCH: ci/int63.\n"))  # sentence dot is not the branch
+        self.assertIsNone(lint("INT63", "CI BRANCH: ci/int63-2\n"))
+        self.assertIsNone(lint("INT60R2", "CI BRANCH: ci/int60\n"))
+        self.assertIsNone(lint("INT60-R", "CI BRANCH: ci/int60-2\n"))
+        self.assertIsNone(self.lint("X", prompt="CI BRANCH: ci/a\nCI BRANCH: ci/b\n"))  # not integration
+
+    def test_granted_paths_exist(self):
+        self.assertEqual(self.lint("X", ["jarvis/nope.py"]),
+                         "granted path jarvis/nope.py not in the main checkout (mark it (new) in the prompt)")
+        self.assertIn("granted path @none", self.lint("X", ["@none"]))
+        self.assertIn("granted path docs/*.md", self.lint("X", ["docs/*.md"]))
+        self.assertIn("jarvis/nope.py", self.lint("X", ["jarvis/nope.py"], "jarvis/new.py (new)\n"))
+        self.assertIn("granted path a.py not in", self.lint("X", ["a.py"], "jarvis/a.py (new)\n"))  # whole path
+        for bad in ("C:/Windows", "/etc", "../CONVLINT/scripts", "tests\\..\\..", ""):
+            self.assertIn("is not relative inside the main checkout", self.lint("X", [bad], f"{bad} (new)\n"))
+        self.assertIsNone(self.lint("X", ["scripts\\new.py"], "scripts/new.py (new)\n"))
+        self.assertIsNone(self.lint("X", ["scripts/conveyor.py", "tests/*.py", "tests\\*"]))
+        self.assertIsNone(self.lint("X", ["build/reports/X.md", "build\\reports\\Y.md"]))
+        self.assertIsNone(self.lint("X", ["jarvis/new.py"], "- `jarvis/new.py` (NEW)\n"))
+
+    def test_depends_on_known(self):
+        self.assertEqual(self.lint("X", deps=["A", "GHOST", "B"]), "unknown depends_on GHOST, B")
+        self.assertIsNone(self.lint("X", deps=["A"]))
 
 
 class TestFinishedByReport(Base):
