@@ -33,10 +33,11 @@ The serial run stays the reference when a result is disputed.
   ``--write-durations`` records CI's own seconds for the next plan. It prints
   every skip with its reason and fails on any skip not on ``ALLOWED_SKIPS``.
 * CONVUI: the UI units of one run at a time on this machine (Salih 2026-10-12,
-  "arayuz testleri sirayla"). A run with UI units takes ``build/locks/ui.json``
-  of the main checkout before its first UI process and frees it when its last
-  UI unit ends (or on an error); meanwhile another run's UI processes wait in the
-  foreground and its non-UI units go on. A full suite holding the A1 suite lock
+  "arayuz testleri sirayla"). TESTLOCK: a run's non-UI units go first, without
+  the lock; its UI processes ask for ``build/locks/ui.json`` of the main checkout
+  only once no non-UI unit is left to start, and the lock is freed as soon as its
+  last UI unit ends (or on an error). A waiter prints who holds it and for how
+  long. A full suite holding the A1 suite lock
   (``build/locks/suite.json``) of another session counts as holding it; a holder
   whose pid is gone is taken over. No lock under CI (the ``CI`` variable) or with
   ``--no-ui-lock``.
@@ -46,8 +47,10 @@ The serial run stays the reference when a result is disputed.
   (``POOL_TOKENS``, or ``test_pool_tokens`` in ``build/conveyor/pace.json``):
   ``build/locks/pool.json`` holds each run's tokens by pid. A run takes up to what
   it would start before its first worker (fewer when that is what is free, waiting
-  in the foreground while none is), gives them back at its end, and the tokens of a
-  pid that is gone are reclaimed. No pool under CI.
+  in the foreground while none is; TESTLOCK: never more than ceil(budget / active
+  runs), so one big run cannot starve the others), gives a token back as each of its
+  workers runs out of units (the last one at its end), and the tokens of a pid that is gone are reclaimed.
+  No pool under CI.
 
     python scripts/test_parallel.py [--workers N] [--ui-workers K] [--durations N] [--no-rerun]
                                     [--python PATH] [--shard I/N] [--report PATH] [--no-ui-lock]
@@ -548,7 +551,8 @@ class TestPool:
     def _take(self, want: int):
         def change(text):
             held = self._held(text)
-            got = min(want, self.budget - sum(held.values()))
+            # TESTLOCK: a fair share, ceil(budget / active runs), so one big run cannot starve the others.
+            got = min(want, -(-self.budget // (len(held) + 1)), self.budget - sum(held.values()))
             if got >= 1:
                 held[self.key] = got
             return max(got, 0), json.dumps(held)
@@ -566,6 +570,18 @@ class TestPool:
                 print(f"waiting for a free test worker token (machine budget {self.budget}, all held)", flush=True)
                 told = time.monotonic()
             time.sleep(self.poll)
+
+    def give_back(self) -> None:
+        """TESTLOCK: a worker that ran out of units returns its token now, not at the run's end; the
+        last token stays until release() (the rule D reruns after the workers still use one)."""
+        if self.held > 1:
+            self.held -= 1
+
+            def change(text):
+                held = self._held(text)
+                held[self.key] = self.held
+                return None, json.dumps(held)
+            _cas(self.path, change)
 
     def release(self) -> None:
         if self.held:
@@ -591,6 +607,24 @@ def _plain(text: object, limit: int = 40) -> str:
     return re.sub(r"[^A-Za-z0-9._:+-]", "_", str(text))[:limit]
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _held_for(started_at: object) -> str:
+    """TESTLOCK: ' for 1h40m' since a holder's ``started_at`` (naive = UTC); '' when unknown or in the future."""
+    try:
+        start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
+        if start.tzinfo is None:
+            start = start.replace(tzinfo=timezone.utc)
+        minutes = int((_now() - start).total_seconds() // 60)
+    except (AttributeError, TypeError, ValueError, OverflowError):
+        return ""
+    if minutes < 0:
+        return ""
+    return f" for {minutes // 60}h{minutes % 60:02d}m" if minutes >= 60 else f" for {minutes}m"
+
+
 class UiLock:
     """CONVUI: the machine-wide UI test lock, ``build/locks/ui.json`` (the A1 record plus ``pid`` and
     its process ``created`` time). TESTINFRA: waiters line up FIFO in ``ui-queue.json``, INT*/DRY*
@@ -603,7 +637,7 @@ class UiLock:
         self.path, self.suite, self.queue = folder / "ui.json", folder / "suite.json", folder / "ui-queue.json"
         self.session = os.environ.get("CLAUDE_CODE_SESSION_ID", "")
         lane = os.environ.get("CONV_LANE") or ROOT.name
-        stamp = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        stamp = _now().isoformat(timespec="seconds")
         pid, created = os.getpid(), _created(os.getpid())
         self.entry = {"id": f"{pid}-{id(self)}", "prio": 0 if lane.upper().startswith(("INT", "DRY")) else 1,
                       "pid": pid, "created": created, "lane": lane}
@@ -618,12 +652,12 @@ class UiLock:
             rec = json.loads(self.suite.read_text(encoding="utf-8"))
             if not all(isinstance(rec.get(k), str) for k in _SUITE_FIELDS) or (self.session and rec["session"] == self.session):
                 return None
-            age = time.time() - datetime.fromisoformat(rec["heartbeat"].replace("Z", "+00:00")).timestamp()
+            age = _now().timestamp() - datetime.fromisoformat(rec["heartbeat"].replace("Z", "+00:00")).timestamp()
         except (OSError, ValueError, AttributeError):
             return None  # no file, free (empty), mid-write or garbage: not a holder
         if not -_FUTURE_SKEW <= age <= _SUITE_STALE:
             return None
-        return f"{_plain(rec['lane'])} (full suite) since {_plain(rec['started_at'])}"
+        return f"{_plain(rec['lane'])} (full suite){_held_for(rec['started_at'])} since {_plain(rec['started_at'])}"
 
     def _take(self, text: str):
         if text.strip() and text != self.record:
@@ -633,7 +667,7 @@ class UiLock:
             except (ValueError, KeyError, TypeError):
                 pid = 0  # garbage: stale
             if pid > 0 and _same_process(pid, rec.get("created")):  # pid reuse: another process is no holder
-                return f"{_plain(rec.get('lane'))}/{pid} since {_plain(rec.get('started_at'))}", None
+                return f"{_plain(rec.get('lane'))}/{pid}{_held_for(rec.get('started_at'))} since {_plain(rec.get('started_at'))}", None
         return None, self.record
 
     def _enqueue(self, text: str):
@@ -656,6 +690,9 @@ class UiLock:
             return None, None
 
     def try_acquire(self) -> bool:
+        if not self.held:  # TESTLOCK: the lock is taken after the non-UI units, so stamp when taken, not when built
+            stamp = _now().isoformat(timespec="seconds")
+            self.record = json.dumps({**json.loads(self.record), "started_at": stamp, "heartbeat": stamp})
         suite = self._suite_holder()
         ahead = _cas(self.queue, self._enqueue)
         holder = suite or (None if ahead else _cas(self.path, self._take))
@@ -741,7 +778,7 @@ def run_unit(python: str, unit: Unit, env: dict[str, str], durations: int | None
 
 
 def execute(args, units: list[Unit], ui_workers: int, workers: int,
-            ui_lock: UiLock | None = None) -> tuple[list[Result], dict[str, float], float, list[Path]]:
+            ui_lock: UiLock | None = None, pool: TestPool | None = None) -> tuple[list[Result], dict[str, float], float, list[Path]]:
     durations = 0 if args.write_durations or args.report else (args.durations or None)
     bases: list[Path] = []
     results: list[Result] = []
@@ -754,19 +791,24 @@ def execute(args, units: list[Unit], ui_workers: int, workers: int,
     def locked() -> bool:
         # CONVUI: UI units run only under the machine-wide UI lock; the plain workers do not wait.
         with gate:
-            return ui_lock is None or ui_lock.held or ui_lock.try_acquire()
+            if ui_lock is None or ui_lock.held:
+                return True
+            with lock:  # TESTLOCK: not taken again once another worker ran the last UI unit and released it
+                left = bool(queues["ui"])
+            return left and ui_lock.try_acquire()
 
     def worker(kind: str, index: int) -> None:
         nonlocal ui_left
         env, began = worker_env(index, bases), time.monotonic()
         while True:
             with lock:
-                want_ui = kind == "ui" and bool(queues["ui"])
+                # TESTLOCK: the UI lock is asked for only once no non-UI unit is left to start.
+                want_ui = kind == "ui" and bool(queues["ui"]) and not queues["plain"]
             may_ui = want_ui and locked()
             with lock:
-                # THIZ2: an idle UI process takes the leftover non-UI units (never the reverse);
-                # every unit is its own subprocess, so nothing carries over between them.
-                # TESTINFRA: so does one still waiting for the UI lock, instead of idling on its token.
+                # THIZ2: an idle UI process takes the non-UI units (never the reverse); every unit is
+                # its own subprocess, so nothing carries over between them. TESTLOCK: it drains them
+                # first, without the lock, so the lock covers the UI units only.
                 queue = queues["ui"] if may_ui and queues["ui"] else queues["plain"]
                 unit = queue.pop(0) if queue else None
             if unit is None:
@@ -782,12 +824,15 @@ def execute(args, units: list[Unit], ui_workers: int, workers: int,
                     if not ui_left and ui_lock is not None:
                         ui_lock.release()
         worker_wall[f"{kind}{index}"] = time.monotonic() - began
+        if pool is not None:
+            with lock:  # workers end together; give_back's check-then-decrement is not thread-safe
+                pool.give_back()
 
     started = time.monotonic()
     plan = [("ui", i) for i in range(1, ui_workers + 1)] + [("plain", i) for i in range(ui_workers + 1, ui_workers + workers + 1)]
     try:
-        with futures.ThreadPoolExecutor(len(plan)) as pool:
-            for job in [pool.submit(worker, kind, i) for kind, i in plan]:
+        with futures.ThreadPoolExecutor(len(plan)) as executor:
+            for job in [executor.submit(worker, kind, i) for kind, i in plan]:
                 job.result()
     finally:
         if ui_lock is not None:
@@ -868,7 +913,7 @@ def main(argv: list[str] | None = None) -> int:
     bases: list[Path] = []
     tripwire = db_snapshot() if os.environ.get("JARVIS_DB_TRIPWIRE") == "1" else None
     try:
-        results, worker_wall, wall, bases = execute(args, units, ui_workers, workers, ui_lock_for(args, units))
+        results, worker_wall, wall, bases = execute(args, units, ui_workers, workers, ui_lock_for(args, units), pool=pool)
         ran = sum(r.ran for r in results)
         skipped = sum(r.skipped for r in results)
         failures = sum(r.failures for r in results)
