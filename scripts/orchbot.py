@@ -33,6 +33,9 @@ KEEP = 50
 SEEN_S = 7 * 86400
 REPORT_MAX = 256 * 1024
 ROUTINE_RE = re.compile(r"^(reader needs_orchestrator|FINDINGS):")
+# the only cleanup refusals raised after the work was proven on main (conveyor remove_worktree: worktree
+# remove after the clean+integrated checks, branch delete after the off-main check); any other is kept
+PROVEN_RE = re.compile(r"^cleanup refused \(git (?:worktree remove|update-ref -d \S+) rc=-?\d+: ")
 FILES_RE = re.compile(r"(?m)^[ \t]*(?:[A-Z]+ )*FILES:[ \t]*(.*)$")
 TS_FMT = "%Y-%m-%dT%H:%M:%S"
 HEAD_N = 256  # events.jsonl rotation fingerprint: a hash of its first bytes
@@ -446,6 +449,12 @@ class Bot:
                 continue
             ack = self.conv / "ack" / cv.ack_name(iid)
             if ack.exists() and ack.stat().st_mtime >= since:
+                continue
+            if iid.startswith("cleanup:") and not PROVEN_RE.match(reason):
+                # BOTV1: work not proven on main stays in front of a human (fail closed); logged once a day
+                if self.once(f"keep:{iid}:{cv.iso(now)[:10]}", now):
+                    self.decide(now, f"cleanup refusal {iid}: work not on main", "none", "KEEP-UNMERGED",
+                                iid, reason[:300])
                 continue
             if self.once(f"ack:{iid}:{it.get('since')}", now):
                 self.decide(now, f"routine attention {iid} {int((now - since) // 60)} min old", "ack", "O33",
