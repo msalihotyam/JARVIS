@@ -530,13 +530,16 @@ def pool_budget(folder: Path) -> int:
 
 
 class TestPool:
-    """CONVAUTO goal D: the machine-wide budget of test worker processes, ``build/locks/pool.json`` = {pid: tokens}."""
+    """CONVAUTO goal D: the machine-wide budget of test worker processes, ``build/locks/pool.json`` = {pid: tokens}.
+    TESTLOCKFIX: waiters line up FIFO in ``pool-queue.json``; only the head of the line may take tokens."""
 
     poll = 2.0
     notice = 30.0
 
     def __init__(self, folder: Path, budget: int):
         self.path, self.budget, self.key, self.held = folder / "pool.json", budget, str(os.getpid()), 0
+        self.queue, self.told = folder / "pool-queue.json", None
+        self.entry = {"id": f"{os.getpid()}-{id(self)}", "pid": os.getpid(), "created": _created(os.getpid())}
 
     def _held(self, text: str) -> dict[str, int]:
         """The other live runs' tokens (garbage: none; a pid that is gone: reclaimed)."""
@@ -548,28 +551,72 @@ class TestPool:
         return {k: v for k, v in items if k.isdigit() and k != self.key and isinstance(v, int) and v > 0
                 and pid_alive(int(k))}
 
-    def _take(self, want: int):
+    def _take(self, want: int, waiting: int = 1):
         def change(text):
             held = self._held(text)
             # TESTLOCK: a fair share, ceil(budget / active runs), so one big run cannot starve the others.
-            got = min(want, -(-self.budget // (len(held) + 1)), self.budget - sum(held.values()))
+            # TESTLOCKFIX: the runs waiting in line (us included) count as active.
+            got = min(want, -(-self.budget // (len(held) + waiting)), self.budget - sum(held.values()))
             if got >= 1:
                 held[self.key] = got
             return max(got, 0), json.dumps(held)
         return _cas(self.path, change)
 
+    def _line(self, text: str) -> list[dict]:
+        """The live waiters, first come first; us at the end if new (a bad entry dropped alone; empty or
+        garbage: a fresh line)."""
+        def live(e):
+            try:
+                return e["id"] == self.entry["id"] or _same_process(int(e["pid"]), e.get("created"))
+            except (ValueError, KeyError, TypeError, AttributeError):
+                return False
+        try:
+            line = json.loads(text)
+        except (ValueError, TypeError):
+            line = []
+        # ponytail: a live process that never releases its pool keeps its place; add a stamp and a stale timeout if seen
+        line = [e for e in line if live(e)] if isinstance(line, list) else []
+        return line if any(e["id"] == self.entry["id"] for e in line) else [*line, self.entry]
+
+    def try_acquire(self, want: int) -> int:
+        """One poll of acquire(): tokens if we are first in line and any is free, else 0 (and a notice).
+        TESTLOCKFIX m2: a newcomer never takes tokens ahead of a run already waiting."""
+        def change(text):
+            line = self._line(text)
+            if line[0]["id"] != self.entry["id"]:
+                return (0, line[0]), json.dumps(line)
+            got = self._take(want, len(line))  # queue then pool: the one nesting order, so no deadlock
+            return (got, None), json.dumps(line[1:] if got else line)
+        got, ahead = _cas(self.queue, change)
+        if got:
+            self.held = got
+            return got
+        if self.told is None or time.monotonic() - self.told >= self.notice:
+            why = f"queued behind pid {_plain(ahead.get('pid'))}" if ahead else "all held"
+            print(f"waiting for a free test worker token (machine budget {self.budget}, {why})", flush=True)
+            self.told = time.monotonic()
+        return 0
+
+    def _leave(self) -> None:
+        def change(text):
+            try:
+                line = json.loads(text)
+            except (ValueError, TypeError):
+                return None, None
+            if not isinstance(line, list):
+                return None, None
+            return None, json.dumps([e for e in line if not (isinstance(e, dict) and e.get("id") == self.entry["id"])])
+        _cas(self.queue, change)
+
     def acquire(self, want: int) -> int:
-        """Up to `want` (>= 1) tokens; waits in the foreground while none is free."""
-        told = None
-        while True:
-            got = self._take(want)
-            if got:
-                self.held = got
-                return got
-            if told is None or time.monotonic() - told >= self.notice:
-                print(f"waiting for a free test worker token (machine budget {self.budget}, all held)", flush=True)
-                told = time.monotonic()
-            time.sleep(self.poll)
+        """Up to `want` (>= 1) tokens; waits in the foreground, in line, while none is free."""
+        try:
+            while not (got := self.try_acquire(want)):
+                time.sleep(self.poll)
+        except BaseException:  # Ctrl+C or an error while waiting: out of the line, so the runs behind go on
+            self._leave()
+            raise
+        return got
 
     def give_back(self) -> None:
         """TESTLOCK: a worker that ran out of units returns its token now, not at the run's end; the
@@ -584,6 +631,7 @@ class TestPool:
             _cas(self.path, change)
 
     def release(self) -> None:
+        self._leave()
         if self.held:
             self.held = 0
             _cas(self.path, lambda text: (None, json.dumps(self._held(text))))
@@ -706,9 +754,13 @@ class UiLock:
             self.told = time.monotonic()
         return False
 
+    def wait(self) -> None:
+        """The pause between two polls (TESTLOCKFIX m7: the tests replace it with an event)."""
+        time.sleep(self.poll)
+
     def acquire(self) -> None:
         while not self.try_acquire():
-            time.sleep(self.poll)
+            self.wait()
 
     def release(self) -> None:
         _cas(self.queue, self._dequeue)
@@ -814,7 +866,7 @@ def execute(args, units: list[Unit], ui_workers: int, workers: int,
                 unit = queue.pop(0) if queue else None
             if unit is None:
                 if want_ui and not may_ui:
-                    time.sleep(ui_lock.poll)
+                    ui_lock.wait()
                     continue
                 break
             result = run_unit(args.python, unit, env, durations)
