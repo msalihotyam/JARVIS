@@ -724,6 +724,51 @@ def validate_slice(s):
     return None
 
 
+CI_TARGET_RE = re.compile(r"CI BRANCH:?[ \t]*`?ci/([A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]+)*)")  # no end-of-sentence dot
+
+
+def lint_slice(s, prompt_text, exists, known_ids):
+    """Why a valid slice must not be dispatched, else None (CONVLINT; pure: `prompt_text` is
+    the prompt's UTF-8 text or None when unreadable, `exists(path)` asks the main checkout,
+    `known_ids` holds the backlog ids and the lanes with a report)."""
+    if prompt_text is None:
+        return "prompt unreadable or not UTF-8"
+    if not prompt_text.lstrip("﻿").strip():
+        return "prompt empty"
+    sid, files = s["id"], s.get("files", [])
+    is_int = bool(INT_RE.match(sid))
+    if is_int and files != ["@main-checkout"]:
+        return 'integration id needs files ["@main-checkout"]'
+    if not is_int and "@main-checkout" in files:
+        return "@main-checkout needs an integration (INT...) id"
+    if is_int:
+        targets = set(CI_TARGET_RE.findall(prompt_text))
+        if len(targets) != 1 or "" in targets:
+            return f"prompt names {len(targets - {''})} CI BRANCH: ci/<x> targets, not one"
+        x, lid = targets.pop(), sid.lower()
+        # ci/<id>, a re-push ci/<id>-<n>, or a re-run lane (INT60R2, INT45-R) naming its base
+        if not any(lid.startswith(b) and re.fullmatch(r"(-?r\d*)?", lid[len(b):])
+                   for b in {x, re.sub(r"-\d+$", "", x)}):
+            return f"CI BRANCH ci/{x} does not match {sid}"
+    for f in files:
+        p = f.replace("\\", "/")
+        if f == "@main-checkout":
+            continue
+        if not p or re.match(r"/|[A-Za-z]:", p) or ".." in p.split("/"):
+            return f"granted path {f} is not relative inside the main checkout"
+        if p.startswith("build/reports/") or any(  # the whole path, not a longer path's suffix
+                re.search(r"(?<![\w./\\-])" + re.escape(x) + r"[`'\"]?\s*\((?i:new)\)", prompt_text)
+                for x in {f, p}):
+            continue
+        g = re.search(r"[*?[]", p)  # a glob: its literal directory must exist
+        if not exists(p[:g.start()].rpartition("/")[0] if g else p):
+            return f"granted path {f} not in the main checkout (mark it (new) in the prompt)"
+    unknown = [d for d in s.get("depends_on", []) if d not in known_ids]
+    if unknown:
+        return f"unknown depends_on {', '.join(unknown)}"
+    return None
+
+
 class Conveyor:
     def __init__(self, root=ROOT, runner=real_runner, now=time.time, send=ntfy_send,
                  post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage,
@@ -1998,6 +2043,7 @@ class Conveyor:
     def load_backlog(self):
         """(valid slices, errors): the autopilot's fix-forward slices first, then backlog.json."""
         good = list((self.auto_state() or {}).get("slices", []))
+        self.lint_ids = set()  # backlog.json slices get lint_slice; the autopilot's are generated
         f = self.base / "backlog.json"
         if not f.exists():
             return good, []
@@ -2015,7 +2061,24 @@ class Conveyor:
                 errors.append(f"slice {i} ({s.get('id') if isinstance(s, dict) else '?'}): {why}")
             else:
                 good.append(s)
+                self.lint_ids.add(s["id"])
         return good, errors
+
+    def backlog_lint(self, s, ids, lanes):
+        """lint_slice against the main checkout; a dependency is known as a backlog id, a lane
+        or a report."""
+        try:
+            text = (self.root / s["prompt"]).read_bytes().decode("utf-8")
+        except (OSError, ValueError):  # ValueError: undecodable, or a NUL in the path
+            text = None
+        known = ids | set(lanes)
+        for d in s.get("depends_on", []):
+            try:
+                if self.find_report(d):
+                    known.add(d)
+            except (OSError, ValueError):
+                pass  # stays unknown: held, never a crashed pass
+        return lint_slice(s, text, lambda p: (self.root / p).exists(), known)
 
     def slice_done(self, sid, lanes, for_int=False):
         """A dependency is done at a good STATUS; for an integration lane also at CI_PENDING
@@ -2036,6 +2099,7 @@ class Conveyor:
         """First dispatchable slice (or None) and a {id: state} view of the backlog."""
         view, choice = {}, None
         run_files = [lanes[n].get("files", []) for n in self.running(lanes)]
+        ids = {x["id"] for x in slices}
         for s in slices:
             sid = s["id"]
             if sid in lanes:
@@ -2046,6 +2110,8 @@ class Conveyor:
             found = self.find_report(sid)
             if found:
                 view[sid] = found[1]
+            elif sid in getattr(self, "lint_ids", ()) and (why := self.backlog_lint(s, ids, lanes)):
+                view[sid] = "held: " + why  # CONVLINT: never dispatched, the others still are
             elif s["tier"] == "T2" and s.get("approved") is not True:
                 view[sid] = "needs_t2_approval"
             elif sid.endswith("-R") and (x := lanes.get(sid[:-2] + "-AFX")) and x.get("finished") \
