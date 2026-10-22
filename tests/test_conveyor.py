@@ -2,6 +2,7 @@
 import contextlib
 import errno
 import importlib.util
+import io
 import json
 import os
 import re
@@ -2826,6 +2827,175 @@ class TestCleanup(Base):
                          [[str(self.root / "scripts" / "usage_ledger.py"), str(self.ledger)],
                           [str(self.base / "usage_ledger.py"), str(self.ledger)]])
         self.assertEqual(self.ledger_procs[0].argv[0], sys.executable)
+
+    # SESSIONSWEEP: stopped prev copies are not doubt; transcripts archived after cleanup + ledger
+
+    def redispatched(self, old_name="A"):
+        old = self.finished()
+        self.drop("a2.md", HDR.format("A"))
+        self.c.pass_once()
+        new = self.lanes()["A"]["id"]
+        next(a for a in self.fake.agents if a["id"] == old).update(state="stopped", name=old_name)
+        self.fake.agent("A").update(state="done", status="idle")
+        self.report("A", "PASS")
+        self.c.pass_once()
+        self.assertEqual((self.lanes()["A"]["prev_ids"], self.lanes()["A"]["finished"]), ([old], True))
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        return old, new
+
+    def test_stopped_prev_copy_is_removed_with_the_lane(self):
+        old, new = self.redispatched()
+        self.assertEqual(sorted(c[1] for c in self.cli("rm")), sorted([old, new]))
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
+
+    def test_stopped_prev_copy_with_other_doubt_still_refused(self):
+        old, new = self.redispatched(old_name="X")
+        self.assertEqual(self.cli("rm"), [])
+        self.assertEqual([e["reason"] for e in self.events() if e["event"] == "cleanup_skip"],
+                         [f"{old}: kind/name/state/session not as expected"])
+
+    def slug(self):
+        return re.sub(r"[^A-Za-z0-9]", "-", str(self.c.root))
+
+    def archive_on(self, value=None):
+        self.base.mkdir(parents=True, exist_ok=True)
+        (self.base / "pace.json").write_text(json.dumps(
+            {"session_archive_dir": str(self.root / "arch") if value is None else value}))
+
+    def transcript(self, sid, proj=None, mtime=None):
+        d = self.root / "projects" / (proj or self.slug())
+        d.mkdir(parents=True, exist_ok=True)
+        f = d / f"{sid}.jsonl"
+        f.write_text("{}")
+        t = self.t - 5 if mtime is None else mtime
+        os.utime(f, (t, t))
+        return f
+
+    def counted(self, *sids, at=None):
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        self.ledger.write_text(json.dumps({
+            "generated_at": conveyor.datetime.fromtimestamp(self.t if at is None else at).astimezone().isoformat(),
+            "sessions": [{"session_id": s} for s in sids]}))
+
+    def cleaned(self, lid="0000aaaa", **kw):
+        return {"id": lid, "finished": True, "cleanup": {"at": conveyor.iso(self.t), "result": "removed"}, **kw}
+
+    def archived(self):
+        return [e for e in self.events() if e["event"].startswith("session_archive")]
+
+    def test_archived_only_after_cleanup_removed_and_ledger(self):
+        self.archive_on()
+        sid = self.finished()
+        f = self.transcript(self.fake.agent("A")["sessionId"])
+        sub = f.with_suffix("")
+        sub.mkdir()
+        (sub / "x.jsonl").write_text("{}")
+        os.utime(sub, (self.t - 5, self.t - 5))
+        self.c.pass_once()
+        self.assertTrue(f.exists())  # not cleaned yet
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()  # cleanup removes; this pass's listing still shows the session
+        self.assertEqual(self.cli("rm"), [["rm", sid]])
+        self.assertTrue(f.exists())
+        self.assertEqual(self.archived(), [])
+        self.c.pass_once()
+        to = self.root / "arch" / time.strftime("%Y-%m", time.localtime(self.t)) / self.slug()
+        self.assertFalse(f.exists() or sub.exists())
+        self.assertTrue((to / f.name).is_file() and (to / sub.name / "x.jsonl").is_file())
+        self.c.pass_once()
+        self.assertEqual([(e["event"], e["lane"], sorted(e["paths"])) for e in self.archived()],
+                         [("session_archived", "A", sorted([str(to / f.name), str(to / sub.name)]))])
+
+    def test_archive_moves_prev_ids_and_keeps_foreign_and_own_sessions(self):
+        self.archive_on()
+        a, b = self.transcript("0000aaaa-1"), self.transcript("0000bbbb-1")
+        foreign = self.transcript("0000aaaa-1", proj="C--other-project")
+        salih = self.transcript("0000cccc-1")
+        self.counted("0000aaaa-1", "0000bbbb-1", "0000cccc-1")
+        res = self.c.archive_sessions({"A": self.cleaned(prev_ids=["0000bbbb"])}, [])
+        self.assertEqual([(n, sorted(f)) for n, f in res], [("A", sorted([str(b), str(a)]))])
+        self.assertFalse(a.exists() or b.exists())
+        self.assertTrue(foreign.exists() and salih.exists())
+
+    def test_archive_never_unfinished_uncleaned_preserved_attention_or_listed(self):
+        self.archive_on()
+        lanes = {"U": self.cleaned("0000a001", finished=False),
+                 "E": {**self.cleaned("0000a002"), "cleanup": {"at": conveyor.iso(self.t), "result": "error"}},
+                 "P": self.cleaned("0000a003", preserved={"reason": "x"}),
+                 "B": self.cleaned("0000a004"), "L": self.cleaned("0000a005")}
+        files = [self.transcript(f"0000a00{i}-1") for i in range(1, 6)]
+        self.counted(*(f.stem for f in files))
+        self.assertEqual(self.c.archive_sessions(lanes, [{"id": "0000a005"}], {"B"}), [])
+        self.assertTrue(all(f.exists() for f in files))
+        self.assertEqual(self.archived(), [])
+
+    def test_archive_doubts_leave_the_session_and_log_once(self):
+        self.archive_on()
+        lanes = {"A": self.cleaned()}
+        f = self.transcript("0000aaaa-1")
+        for ledger, reason in [(None, "usage ledger has not counted the session since cleanup"),
+                               ((self.t - 1, "0000aaaa-1"), "usage ledger has not counted the session since cleanup"),
+                               ((self.t, "other"), "usage ledger has not counted the session since cleanup")]:
+            if ledger:
+                self.counted(ledger[1], at=ledger[0])
+            self.c.archive_sessions(lanes, [])
+            self.c.archive_sessions(lanes, [])
+        self.counted("0000aaaa-1")
+        os.utime(f, (self.t + 5, self.t + 5))
+        self.c.archive_sessions(lanes, [])
+        os.utime(f, (self.t - 5, self.t - 5))
+        self.transcript("0000aaaa-2")
+        self.c.archive_sessions(lanes, [])
+        self.assertTrue(f.exists())
+        self.assertEqual([e["reason"] for e in self.archived()],
+                         ["usage ledger has not counted the session since cleanup",
+                          "transcript modified after cleanup", "ambiguous session id"])
+
+    def test_archive_off_without_an_absolute_dir(self):
+        f = self.transcript("0000aaaa-1")
+        self.counted("0000aaaa-1")
+        for value in ["missing", "", "   ", "relative/dir", None]:
+            if value != "missing":
+                self.archive_on(value if value is not None else "")
+            self.assertEqual(self.c.archive_sessions({"A": self.cleaned()}, []), [])
+        self.assertTrue(f.exists())
+        self.assertEqual(self.archived(), [])
+
+    def test_archive_move_failure_logs_and_keeps(self):
+        self.archive_on()
+        f = self.transcript("0000aaaa-1")
+        self.counted("0000aaaa-1")
+        with mock.patch.object(conveyor.shutil, "move", side_effect=OSError("locked")):
+            self.assertEqual(self.c.archive_sessions({"A": self.cleaned()}, []), [])
+            self.assertEqual(self.c.archive_sessions({"A": self.cleaned()}, []), [])
+        self.assertTrue(f.exists())
+        ev = self.archived()
+        self.assertEqual([(e["event"], e["lane"], e["moved"]) for e in ev], [("session_archive_failed", "A", [])])
+        self.assertIn("locked", ev[0]["error"])
+
+    def test_archive_corrupt_prev_ids_and_bad_dir_never_crash(self):
+        self.archive_on("C:\\x\x00y" if os.name == "nt" else "/x\x00y")
+        f = self.transcript("0000aaaa-1")
+        self.counted("0000aaaa-1")
+        for pv in [None, "0000aaaa", 5]:
+            self.c.archive_seen.clear()
+            self.assertEqual(self.c.archive_sessions({"A": self.cleaned(prev_ids=pv)}, []), [])
+        self.assertTrue(f.exists())
+        self.assertEqual({e["event"] for e in self.archived()}, {"session_archive_failed"})
+
+    def test_archive_dry_run_and_cli_write_nothing(self):
+        self.archive_on()
+        f = self.transcript("0000aaaa-1")
+        self.counted("0000aaaa-1")
+        (self.base / "lanes.json").write_text(json.dumps({"A": self.cleaned()}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(conveyor.archive_cli(self.c, True), 0)
+        self.assertEqual(out.getvalue().splitlines(), ["would move: 1 lanes, 1 paths", f"  A: {f.name}"])
+        self.assertTrue(f.exists())
+        self.assertFalse((self.root / "arch").exists())
+        self.assertEqual(self.archived(), [])
 
 
 class TestLedgerSubprocess(Base):

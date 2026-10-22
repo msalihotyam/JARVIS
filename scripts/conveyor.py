@@ -889,6 +889,7 @@ class Conveyor:
         self.chain_dead = set()  # slice ids of failed auto-fix chains: never dispatched (BREAKERV2)
         self.band = []  # status.json "band" lines (breaker, auto-approval)
         self.lanes_bad = None  # why lanes.json could not be read this pass: nothing saves over it
+        self.archive_seen = {}  # lane -> last session-archive skip/failure logged (SESSIONSWEEP)
         self.quiet = set()  # attention ids that never page (attention() refills it)
         self.beat_ts = 0
         self.popen = popen
@@ -1110,7 +1111,8 @@ class Conveyor:
         if agents is not None:
             self.stop_finished(lanes, agents, {i for i, _, _ in items})
             self.cleanup(lanes, agents, {i for i, _, _ in items})
-            self.save_lanes(lanes)
+            self.save_lanes(lanes)  # before the archive: it changes no lane, cleanup is never lost
+            self.archive_sessions(lanes, agents, {i for i, _, _ in items}, limit=CLEANUP_PER_PASS)
             items = self.attention(lanes)  # a lane cleanup just preserved shows at once
         self.status_written(lanes, items)
         self.backstop(items)
@@ -3288,7 +3290,8 @@ class Conveyor:
         """(listed sessions of these lane ids, doubt or None). A doubt is any row that is not
         this lane's finished background session: other kind or name, unknown state, busy,
         or no session id of its own. State "stopped" is fine only for ids in `stopped`
-        (sessions this conveyor's early stop stopped itself); state "working" only with
+        (sessions this conveyor's early stop stopped itself, and cleanup's prev_ids: copies a
+        nudge or redispatch replaced, SESSIONSWEEP); state "working" only with
         `idle_working` and status exactly "idle" (early stop's aged finished lanes)."""
         by_id = {a.get("id"): a for a in agents}
         sess = [by_id[i] for i in ids if i in by_id]
@@ -3369,7 +3372,8 @@ class Conveyor:
             if t is None or self.now() - t < CLEANUP_S:
                 continue
             ids = ln.get("prev_ids", []) + [ln["id"]]
-            es = ln.get("early_stopped", [])
+            # SESSIONSWEEP: a stopped prev copy is this lane's own replaced session, not a doubt
+            es = ln.get("early_stopped", []) + ln.get("prev_ids", [])
             sess, doubt = self.lane_sessions(name, ids, agents, es)
             if not sess and not doubt:
                 continue  # nothing listed to remove
@@ -3448,6 +3452,90 @@ class Conveyor:
                     # the next day
                     self.retry_cleanup(name, ln, "rm", f"claude rm refused: {steps[-1]['output'][-150:]}",
                                        self.rm_in_main(steps[-1]["output"]))
+
+    def archive_sessions(self, lanes, agents, attention_ids=(), dry_run=False, limit=None):
+        """SESSIONSWEEP: move (never delete) the transcripts (<projects>/<slug>/<id>-*.jsonl and
+        <id>-* dirs) of lanes whose cleanup removed their sessions to pace.json
+        "session_archive_dir"/<YYYY-MM>/<project dir>/ (missing or blank: off). Only this
+        repo's project dirs, only ids in lanes.json (prev_ids too), never a listed, unfinished,
+        preserved, attention or still listed lane. Any doubt (written after cleanup, the ledger
+        has not counted it since, destination exists, ambiguous id) leaves it and logs
+        session_archive_skip once per lane+reason; a failed move logs session_archive_failed
+        and leaves the lane for this process. Returns [(lane, [source paths])]; dry_run moves
+        and logs nothing."""
+        p = self.load_json(self.base / "pace.json", {})
+        dest = str((p.get("session_archive_dir") if isinstance(p, dict) else None) or "").strip()
+        if not dest or not Path(dest).is_absolute():
+            return []
+        slug = re.sub(r"[^A-Za-z0-9]", "-", str(self.root))
+        index = {}
+        try:
+            for d in Path(self.projects).iterdir():
+                if d.is_dir() and (d.name == slug or d.name.startswith(slug + "--claude-worktrees-")):
+                    for e in d.iterdir():
+                        index.setdefault(e.name[:8], []).append(e)
+        except OSError:
+            return []
+        listed = {a.get("id") for a in agents}
+        usage, out = None, []
+        for name, ln in lanes.items():
+            if limit is not None and len(out) >= limit:
+                break
+            c = ln.get("cleanup") or {}
+            if (not ln.get("finished") or c.get("result") != "removed" or "preserved" in ln
+                    or name in attention_ids or self.archive_seen.get(name) == "failed"):
+                continue
+            pv = ln.get("prev_ids")
+            ids = [i for i in (pv if isinstance(pv, list) else []) + [ln.get("id")]
+                   if isinstance(i, str) and len(i) >= 8]
+            files = [e for i in ids for e in index.get(i[:8], []) if e.name.startswith(i + "-")]
+            if not files or any(i in listed for i in ids):  # still listed: rm's pass, retried later
+                continue
+            if usage is None:
+                data = self.load_json(self.root / "build" / "ledger" / "usage.json", {})
+                try:
+                    usage = (datetime.fromisoformat(data["generated_at"]).timestamp(),
+                             {s["session_id"] for s in data["sessions"]})
+                except (KeyError, TypeError, ValueError):
+                    usage = (None, set())
+            stems = {e.name.split(".")[0] for e in files}
+            month = time.strftime("%Y-%m", time.localtime(self.now()))
+            targets = [Path(dest) / month / e.parent.name / e.name for e in files]
+            try:
+                at = time.mktime(time.strptime(c.get("at", ""), "%Y-%m-%dT%H:%M:%S"))
+                late = any(e.stat().st_mtime > at + 1 for e in files)  # at is whole seconds
+            except (OSError, TypeError, ValueError, OverflowError):
+                at, late = None, True
+            doubt = ("cleanup time unreadable" if at is None
+                     else "transcript modified after cleanup" if late
+                     else "ambiguous session id"
+                     if any(len({e.name.split(".")[0] for e in files if e.name.startswith(i + "-")}) > 1 for i in ids)
+                     else "usage ledger has not counted the session since cleanup"
+                     if usage[0] is None or usage[0] < at or not stems <= usage[1]
+                     else "archive destination exists" if any(t.exists() for t in targets)
+                     else None)
+            if doubt:
+                if not dry_run and self.archive_seen.get(name) != doubt:
+                    self.archive_seen[name] = doubt
+                    self.event("session_archive_skip", lane=name, reason=doubt)
+                continue
+            if dry_run:
+                out.append((name, [str(e) for e in files]))
+                continue
+            self.beat()
+            moved = []
+            try:
+                for e, t in zip(files, targets):
+                    t.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(e), str(t))
+                    moved.append(str(t))
+            except (OSError, ValueError) as ex:  # ValueError: a NUL in session_archive_dir
+                self.archive_seen[name] = "failed"
+                self.event("session_archive_failed", lane=name, error=repr(ex)[:300], moved=moved)
+                continue
+            self.event("session_archived", lane=name, paths=moved)
+            out.append((name, [str(e) for e in files]))
+        return out
 
     def rm_in_main(self, out):
         """True when a claude rm refusal names only unpushed commits whose tip is provably on
@@ -3772,5 +3860,26 @@ class Conveyor:
                 return 0  # someone took the lock over
 
 
+def archive_cli(c, dry_run):
+    """--archive-sessions [--dry-run]: archive_sessions for every already-cleaned lane at once
+    (backfill). Never writes lanes.json; an unreadable lanes.json or agents listing exits 1."""
+    lanes = c.load_lanes()
+    if c.lanes_bad:
+        print(f"lanes.json unreadable: {c.lanes_bad}")
+        return 1
+    try:
+        agents = c.agents()
+    except (OSError, RuntimeError, ValueError) as e:
+        print(f"claude agents failed: {e!r}"[:300])
+        return 1
+    res = c.archive_sessions(lanes, agents, {i for i, _, _ in c.attention(lanes)}, dry_run=dry_run)
+    print(f"{'would move' if dry_run else 'moved'}: {len(res)} lanes, {sum(len(f) for _, f in res)} paths")
+    for name, files in res[:20]:
+        print(f"  {name}: {', '.join(Path(f).name for f in files)}")
+    return 0
+
+
 if __name__ == "__main__":
+    if "--archive-sessions" in sys.argv:
+        sys.exit(archive_cli(Conveyor(), "--dry-run" in sys.argv))
     sys.exit(Conveyor().loop(once="--once" in sys.argv))
