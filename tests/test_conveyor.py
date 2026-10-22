@@ -976,6 +976,93 @@ class TestRedispatch(Base):
         self.assertEqual(self.fake.bg_names(), ["A"])
 
 
+THRASH = {"type": "assistant", "model": "<synthetic>", "apiError": "autocompact_thrashing", "error": "invalid_request",
+          "isApiErrorMessage": True, "message": {"role": "assistant", "content": [{"type": "text", "text": (
+              "Autocompact is thrashing: the context refilled to the limit within 3 turns of the previous "
+              "compact, 3 times in a row.")}]}}  # TESTLOCK transcript, 2026-10-22T12:05:36Z
+
+
+class TestFactNote(unittest.TestCase):
+    """CTXRESUME: the fact note a nudged / resumed-in-place session starts with, built by code."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.wt = Path(tmp.name)
+        self.out = {("rev-parse", "--abbrev-ref", "HEAD"): "ctxresume\n",
+                    ("log", "--oneline", "c82d2d6..HEAD"): "1111111 fix: b\n2222222 feat: a\n",
+                    ("status", "--short"): " M scripts/conveyor.py\n?? tests/new.py\n",
+                    ("diff", "--name-only", "c82d2d6", "--"): "scripts/conveyor.py\n"}
+        self.calls = []
+
+    def cmd(self, args, timeout=120):
+        self.calls.append((args, timeout))
+        n = len(conveyor.GIT_PIN)
+        self.assertEqual(args[:n + 2], [*conveyor.GIT_PIN, "-C", str(self.wt)])
+        return 0, self.out[tuple(args[n + 2:])]
+
+    def test_note_from_a_fake_worktree(self):
+        (self.wt / "build" / "reports").mkdir(parents=True)
+        (self.wt / "build" / "reports" / "A.md").write_text(
+            "STATUS: BLOCKED\nBRANCH: a\nRan 414 tests in 12.0s\nOK\nRUNS: 3 modules, 0 failures\nnotes\n",
+            encoding="utf-8")
+        self.assertEqual(conveyor.fact_note(self.cmd, self.wt, "c82d2d6", "A"), "\n".join([
+            conveyor.FACT_HEAD, "branch: ctxresume",
+            "report build/reports/A.md: present; STATUS: BLOCKED",
+            "last test summary in report: RUNS: 3 modules, 0 failures",
+            "commits c82d2d6..HEAD (max 10):", "  1111111 fix: b", "  2222222 feat: a",
+            "git status --short (max 30):", "   M scripts/conveyor.py", "  ?? tests/new.py",
+            "files changed vs c82d2d6:", "  scripts/conveyor.py", conveyor.FACT_TAIL]))
+        self.assertEqual({t for _, t in self.calls}, {conveyor.FACT_GIT_TIMEOUT_S})
+        self.assertEqual(len(self.calls), 4)
+
+    def test_no_report_no_commits(self):
+        self.out[("log", "--oneline", "c82d2d6..HEAD")] = ""
+        note = conveyor.fact_note(self.cmd, self.wt, "c82d2d6", "A")
+        self.assertIn("commits c82d2d6..HEAD (max 10):\n  none\n", note)
+        self.assertIn("report build/reports/A.md: absent\nlast test summary in report: none\n", note)
+
+    def test_size_cap_and_line_caps(self):
+        self.out[("status", "--short")] = "".join(f"?? {'d' * 20}/{i}.py\n" for i in range(100))
+        self.out[("diff", "--name-only", "c82d2d6", "--")] = "".join(f"{'ç' * 60}/{i}.py\n" for i in range(500))
+        note = conveyor.fact_note(self.cmd, self.wt, "c82d2d6", "A")
+        self.assertLessEqual(len(note.encode("utf-8")), conveyor.FACT_CAP)
+        self.assertTrue(note.endswith("\n[... cut ...]\n" + conveyor.FACT_TAIL))
+        self.assertIn("  ... 70 more\n", note)  # status capped at 30 lines before the byte cap
+        self.assertIn("report build/reports/A.md: absent\nlast test summary in report: none\n", note)
+        self.out[("log", "--oneline", "c82d2d6..HEAD")] = "".join(f"{i:07d} x\n" for i in range(12))
+        self.assertIn("  ... 2 more\n", conveyor.fact_note(self.cmd, self.wt, "c82d2d6", "A"))
+
+    def test_git_timeout_reads_unknown(self):
+        def slow(args, timeout=120):
+            self.calls.append((args, timeout))
+            raise subprocess.TimeoutExpired(args, timeout)
+        note = conveyor.fact_note(slow, self.wt, "c82d2d6", "A")
+        for what in ("branch: unknown (branch", "  unknown (commits", "  unknown (status", "  unknown (files changed"):
+            self.assertIn(what + ": TimeoutExpired)\n", note)
+        self.assertEqual({t for _, t in self.calls}, {conveyor.FACT_GIT_TIMEOUT_S})
+        self.assertTrue(note.endswith(conveyor.FACT_TAIL))
+
+    def test_no_worktree_bad_base_bad_rc(self):
+        note = conveyor.fact_note(self.cmd, None, "main", "A")
+        self.assertIn("branch: unknown (branch: no lane worktree)\n", note)
+        self.assertIn("report build/reports/A.md: unknown (no lane worktree)\n", note)
+        self.assertEqual(self.calls, [])
+        note = conveyor.fact_note(lambda args, timeout=120: (128, "fatal"), self.wt, "-x;rm", "A")
+        self.assertIn("commits base..HEAD (max 10):\n  unknown (base: not a ref name)\n", note)
+        self.assertIn("branch: unknown (branch: rc 128)\n", note)
+        self.assertIn("report build/reports/../x.md: unknown (lane name)\n", conveyor.fact_note(self.cmd, self.wt, "c82d2d6", "../x"))
+
+    def test_no_secrets(self):
+        self.out[("log", "--oneline", "c82d2d6..HEAD")] = (
+            "1111111 key sk-ant-api03-AbCdEf_123 and ghp_" + "a" * 36 + "\n2222222 token=hunter2 topic-xyz\n")
+        with mock.patch.dict(os.environ, {"JARVIS_NTFY_TOPIC": "topic-xyz"}):
+            note = conveyor.fact_note(self.cmd, self.wt, "c82d2d6", "A")
+        for s in ("sk-ant-", "ghp_", "hunter2", "topic-xyz"):
+            self.assertNotIn(s, note)
+        self.assertIn("  1111111 key [secret] and [secret]\n  2222222 [secret] [topic]\n", note)
+
+
 class TestBlockedLane(Base):
     """CONV9: G6R1, INT18, G6R1B sat 'blocked' after a network loss (2026-10-10)."""
 
@@ -1013,9 +1100,11 @@ class TestBlockedLane(Base):
         self.t += 600
         self.c.pass_once()
         sid = self.a["sessionId"]
+        note = conveyor.fact_note(self.git, self.c.worktree_of(self.a), "1234567", "A")  # CTXRESUME
         self.assertEqual(self.resumes(), [[
             "--bg", "--resume", sid, "--name", "A", "--model", "opus", "--effort", "high",
-            "--settings", str(self.root / conveyor.SETTINGS), conveyor.NUDGE]])
+            "--settings", str(self.root / conveyor.SETTINGS), note + "\n\n" + conveyor.NUDGE]])
+        self.assertTrue(note.startswith(conveyor.FACT_HEAD + "\nbranch: unknown (branch: rc 1)\n"))
         stop = self.fake.calls.index(["stop", self.a["id"]])
         self.assertLess(stop, self.fake.calls.index(self.resumes()[0]))  # stopped first
         self.assertEqual(self.fake.cwds[self.fake.calls.index(self.resumes()[0])], str(self.wt))
@@ -1044,6 +1133,64 @@ class TestBlockedLane(Base):
         self.c.pass_once()
         self.assertEqual((self.resumes(), self.nudges()), ([], []))
         self.net = True  # back: the nudge goes out on the next pass
+        self.c.pass_once()
+        self.assertEqual(len(self.resumes()), 1)
+
+    def test_git_timeout_note_reads_unknown_and_nudge_still_sent(self):  # CTXRESUME
+        self.git.raise_on = tuple(conveyor.GIT_PIN)
+        self.net = True
+        self.t += 600
+        self.c.pass_once()
+        (call,) = self.resumes()
+        note, nudge = call[-1].rsplit("\n\n", 1)
+        self.assertEqual(nudge, conveyor.NUDGE)
+        self.assertIn("branch: unknown (branch: TimeoutError)", note)
+        self.assertIn("  unknown (commits: TimeoutError)", note)
+        self.assertIn("  unknown (status: TimeoutError)", note)
+        self.assertIn("  unknown (files changed: TimeoutError)", note)
+        self.assertTrue(note.endswith(conveyor.FACT_TAIL))
+        self.assertEqual([s["rc"] for s in self.nudges()[0]["steps"]], [0, 0])
+
+    def transcript(self, *entries):
+        p = self.root / "projects" / "x" / f"{self.a['sessionId']}.jsonl"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("".join(json.dumps(e) + "\n" for e in entries), encoding="utf-8")
+
+    def test_context_full_nudged_at_once(self):  # CTXRESUME: TESTLOCK/BOTAGREE 2026-10-22
+        self.transcript({"type": "user", "message": {"role": "user", "content": "go"}}, THRASH,
+                        {"type": "cost-state"}, {"type": "worktree-state"})
+        self.net = True
+        self.t += 60
+        self.c.pass_once()
+        (call,) = self.resumes()
+        self.assertTrue(call[-1].startswith(conveyor.FACT_HEAD + "\n"))
+        self.assertTrue(call[-1].endswith(conveyor.FACT_TAIL + "\n\n" + conveyor.NUDGE))
+        (ev,) = self.nudges()
+        self.assertEqual((ev["n"], ev["context_full"]), (1, True))
+
+    def test_context_full_needs_network(self):
+        self.transcript(THRASH)
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual((self.resumes(), self.nudges()), ([], []))
+
+    def test_context_full_text_elsewhere_keeps_the_timer(self):
+        said = {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "text", "text": "autocompact_thrashing Prompt is too long"}]}}
+        self.transcript(THRASH, said)  # a later normal assistant entry decides
+        self.net = True
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual((self.resumes(), self.nudges()), ([], []))
+        self.transcript({"type": "user", "isApiErrorMessage": True, "apiError": "autocompact_thrashing"})
+        self.c.pass_once()
+        self.assertEqual((self.resumes(), self.nudges()), ([], []))
+
+    def test_prompt_too_long_api_error_counts(self):
+        self.transcript({"type": "assistant", "isApiErrorMessage": True, "message": {
+            "role": "assistant", "content": [{"type": "text", "text": "Prompt is too long"}]}})
+        self.net = True
+        self.t += 60
         self.c.pass_once()
         self.assertEqual(len(self.resumes()), 1)
 
@@ -4981,8 +5128,10 @@ class TestResumeInPlace(Base):
         self.assertFalse(ln.get("finished"))
         self.assertEqual(ln["files"], ["jarvis/a.py", "jarvis/b.py", "tests/test_b.py"])
         (call,) = self.resumes()
-        self.assertEqual((call[2], call[-1]), (sid, "You may now edit jarvis/b.py, tests/test_b.py "
+        note, grant = call[-1].rsplit("\n\n", 1)  # CTXRESUME: the fact note comes first
+        self.assertEqual((call[2], grant), (sid, "You may now edit jarvis/b.py, tests/test_b.py "
                          "(orchestrator-approved by rule R3). Finish your goal and rewrite your report."))
+        self.assertTrue(note.startswith(conveyor.FACT_HEAD + "\n") and note.endswith(conveyor.FACT_TAIL))
         (ev,) = [e for e in self.events() if e["event"] == "resume_in_place"]
         self.assertEqual(ev["paths"], ["jarvis/b.py", "tests/test_b.py"])
         self.assertNotIn("F", self.attn())

@@ -210,5 +210,37 @@ class TestR8PermissionErrorOnReplace(tc.Base):
         self.assertEqual(self.status()["updated_at"], good)
 
 
+class TestTestlockContextFull(tc.Base):
+    def test_a_thrashing_session_is_nudged_at_once_with_a_fact_note(self):
+        """TESTLOCK 2026-10-22T12:05:36Z (BOTAGREE the same): "Autocompact is thrashing" after
+        two auto-compactions; the lane sat blocked until blocked_nudge_min, then the copy
+        resumed blind and redid work.
+
+        TODAY = TARGET (CTXRESUME): the next pass with network nudges at once (context_full)
+        and the message starts with the code-built fact note before the nudge text.
+        """
+        self.t = T0
+        self.drop("a.md", tc.HDR.format("A") + "do things\n")
+        self.c.pass_once()
+        a = self.fake.agent("A")
+        wt = self.root / ".claude" / "worktrees" / "a"
+        wt.mkdir(parents=True)
+        a.update(state="blocked", status="idle", cwd=str(wt))
+        p = self.root / "projects" / "C--JARVIS--claude-worktrees-TESTLOCK" / f"{a['sessionId']}.jsonl"
+        p.parent.mkdir(parents=True)
+        tail = [{"type": "user", "message": {"role": "user", "content": "go"}}, tc.THRASH] + [
+            {"type": t} for t in ("system", "cost-state", "worktree-state", "custom-title", "summary")]
+        p.write_text("".join(json.dumps(e) + "\n" for e in tail), encoding="utf-8")
+        self.c.pass_once()  # first seen blocked
+        self.net = True
+        self.t += 60  # well under blocked_nudge_min
+        self.c.pass_once()
+        (call,) = [c for c in self.fake.calls if c[:2] == ["--bg", "--resume"]]
+        self.assertTrue(call[-1].startswith(conveyor.FACT_HEAD + "\nbranch: "))
+        self.assertIn(conveyor.FACT_TAIL + "\n\n" + conveyor.NUDGE, call[-1])
+        (ev,) = [e for e in self.events() if e["event"] == "nudge"]
+        self.assertEqual((ev["n"], ev["context_full"]), (1, True))
+
+
 if __name__ == "__main__":
     unittest.main()

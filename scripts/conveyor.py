@@ -83,6 +83,15 @@ IDLE_NUDGE = ("Write your report file now with the STATUS line; if you were wait
 # CONV12 / LANE_RULES R3: a feature lane BLOCKED only on 'NEEDS FILES: <path>[, <path>]' is resumed once.
 GRANT_NUDGE = ("You may now edit {paths} (orchestrator-approved by rule R3). Finish your goal and "
                "rewrite your report.")
+# CTXRESUME: a nudge / resume in place starts with a fact note built by code (fact_note)
+FACT_CAP = 3072  # utf-8 bytes, the closing instruction included
+FACT_GIT_TIMEOUT_S = 10
+FACT_HEAD = "FACT NOTE (written by the conveyor from git and files, not by a model):"
+FACT_TAIL = "continue from here; do not redo finished steps; finish the report"
+TEST_SUMMARY_RE = re.compile(r"\bRan \d+ tests?\b|\b\d+ (?:tests?|failures?|passed|failed)\b|^\s*(?:RUNS|TESTS)\s*:")
+SECRET_RE = re.compile(r"sk-ant-[A-Za-z0-9_-]+|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w+|(?i:bearer)\s+[\w.~+/=-]{8,}"
+                       r"|(?i:token|password|passwd|secret|api[_-]?key)\s*[=:]\s*\S+")
+CTX_TAIL_BYTES = 65536  # the CLI's context-full error is the transcript's last assistant entry
 GRANT_MAX = 3
 NEEDS_RE = re.compile(r"(?m)^[ \t]*NEEDS FILES:[ \t]*(.*)$")
 BLOCKER_RE = re.compile(r"(?im)^[ \t]*(?:BLOCKER\w*|BLOCKED[ \t]+\w+|FAIL\w*|ERRORS?|REASON)[ \t]*:[ \t]*(.*)$")
@@ -612,6 +621,54 @@ def clip(text, n=READER_MAX_CHARS):
     if len(text) <= n:
         return text
     return text[:n // 2] + "\n[... truncated ...]\n" + text[-(n // 2):]
+
+
+def fact_note(cmd, wt, base, lane):
+    """CTXRESUME: what a resumed lane session already did, read from its worktree by code, never
+    by a model: branch, commits base..HEAD, dirty files, files changed vs base, its report's
+    STATUS line and last test summary. Every git call has a timeout; a failure reads "unknown
+    (<what>)". At most FACT_CAP utf-8 bytes, key-shaped text removed, FACT_TAIL always kept."""
+    def git(what, *args, n=30):
+        if wt is None:
+            return [f"unknown ({what}: no lane worktree)"]
+        try:
+            rc, out = cmd([*GIT_PIN, "-C", str(wt), *args], timeout=FACT_GIT_TIMEOUT_S)
+        except Exception as e:  # a timeout too: the note says so, the nudge goes on
+            return [f"unknown ({what}: {type(e).__name__})"]
+        if rc != 0:
+            return [f"unknown ({what}: rc {rc})"]
+        lines = [x.rstrip() for x in out.splitlines() if x.strip()]
+        return lines[:n] + ([f"... {len(lines) - n} more"] if len(lines) > n else []) or ["none"]
+    ok = bool(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._/-]{0,99}", str(base)))
+    b = base if ok else "base"
+    commits = git("commits", "log", "--oneline", f"{base}..HEAD", n=10) if ok \
+        else ["unknown (base: not a ref name)"]
+    changed = git("files changed", "diff", "--name-only", base, "--") if ok else commits
+    report = tests = "unknown (no lane worktree)" if wt is None else "unknown (lane name)"
+    if wt is not None and re.fullmatch(r"[A-Za-z0-9._-]{1,80}", lane):
+        try:
+            p = Path(wt) / "build" / "reports" / f"{lane}.md"
+            text = p.read_text(encoding="utf-8", errors="replace") if p.is_file() else None
+            if text is None:
+                report, tests = "absent", "none"
+            else:
+                lines = text.splitlines()
+                report = "present; " + next((x.strip() for x in lines if x.startswith("STATUS:")), "no STATUS line")
+                tests = next((x.strip()[:200] for x in reversed(lines) if TEST_SUMMARY_RE.search(x)), "none")
+        except OSError as e:
+            report = tests = f"unknown (report: {type(e).__name__})"
+    # report and test lines before the long lists, so the byte cap cuts file names, not them
+    body = "\n".join([FACT_HEAD, "branch: " + git("branch", "rev-parse", "--abbrev-ref", "HEAD", n=1)[0],
+                      f"report build/reports/{lane}.md: {report}", f"last test summary in report: {tests}",
+                      f"commits {b}..HEAD (max 10):", *("  " + x for x in commits),
+                      "git status --short (max 30):", *("  " + x for x in git("status", "status", "--short")),
+                      f"files changed vs {b}:", *("  " + x for x in changed)])
+    topic = os.environ.get("JARVIS_NTFY_TOPIC", "").strip()
+    body = SECRET_RE.sub("[secret]", body.replace(topic, "[topic]") if topic else body)
+    room = FACT_CAP - len(("\n[... cut ...]\n" + FACT_TAIL).encode())
+    if len(body.encode()) + len(FACT_TAIL) + 1 > FACT_CAP:
+        body = body.encode()[:room].decode("utf-8", "ignore") + "\n[... cut ...]"
+    return body + "\n" + FACT_TAIL
 
 
 def iso(t):
@@ -1366,6 +1423,32 @@ class Conveyor:
         self.nudge(name, ln, a, BUDGET_NUDGE, "budget_nudge")
         return True
 
+    def context_full(self, a):
+        """CTXRESUME: the session's last assistant transcript entry is the CLI's own context-full
+        error (isApiErrorMessage: autocompact thrashing, or prompt too long), read from the last
+        CTX_TAIL_BYTES. Text that only mentions it never counts; any read error is False."""
+        sid = str(a.get("sessionId") or "")
+        if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid):
+            return False
+        for tx in self.projects.glob(f"*/{sid}.jsonl"):
+            try:
+                with open(tx, "rb") as f:
+                    f.seek(max(0, f.seek(0, 2) - CTX_TAIL_BYTES))
+                    lines = f.read().decode("utf-8", "replace").splitlines()
+            except OSError:
+                continue
+            for line in reversed(lines):
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(d, dict) and d.get("type") == "assistant":
+                    if d.get("isApiErrorMessage") is True and (d.get("apiError") == "autocompact_thrashing"
+                                                               or "Prompt is too long" in json.dumps(d.get("message"))):
+                        return True
+                    break
+        return False
+
     def messages(self, sid):
         """Distinct assistant messages in the session's transcript; a removed file counts 0."""
         ids = set()
@@ -1471,9 +1554,10 @@ class Conveyor:
             return
         now = self.now()
         since = ln.setdefault("blocked_since", now)
-        if (ln.get("nudges", 0) < MAX_NUDGES and now - since >= self.nudge_s
-                and now - ln.get("nudged_ts", 0) >= NUDGE_GAP_S and self.net()):
-            self.nudge(name, ln, a)
+        due = now - since >= self.nudge_s
+        if (ln.get("nudges", 0) < MAX_NUDGES and now - ln.get("nudged_ts", 0) >= NUDGE_GAP_S
+                and (due or self.context_full(a)) and self.net()):
+            self.nudge(name, ln, a, **({} if due else {"context_full": True}))  # CTXRESUME: at once
         elif (now - since >= BLOCKED_ATTENTION_S and "blocked_attention" not in ln
                 and not self.active_since(name, now - BLOCKED_ATTENTION_S, a.get("cwd"))):
             ln["blocked_attention"] = now
@@ -1493,6 +1577,12 @@ class Conveyor:
         if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid):
             self.event(kind, lane=name, id=ln["id"], steps=[{"error": "no session id"}], **kw)
             return False
+        if kind in ("nudge", "resume_in_place"):  # CTXRESUME: the copy must not start blind
+            try:
+                note = fact_note(self.cmd, self.worktree_of(a), ln.get("base") or "main", name)
+            except Exception as e:  # never block the nudge
+                note = f"{FACT_HEAD}\nunknown (fact note: {type(e).__name__})\n{FACT_TAIL}"
+            text = note + "\n\n" + text
         cwd = a.get("cwd") if a.get("cwd") and Path(a["cwd"]).is_dir() else str(self.root)
         resume = ["--bg", "--resume", sid, "--name", name, "--model", ln["model"], "--effort",
                   ln["effort"], "--settings", str(self.root / SETTINGS), text]
