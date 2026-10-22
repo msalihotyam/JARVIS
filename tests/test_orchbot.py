@@ -64,9 +64,15 @@ class BotCase(unittest.TestCase):
     def shadow(self):
         return json.loads((self.root / "build" / "bot" / "shadow.json").read_text(encoding="utf-8"))
 
-    def logged(self):
+    def lines(self):
         p = self.root / "build" / "bot" / "decisions.jsonl"
-        return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()]
+        return [json.loads(x) for x in p.read_text(encoding="utf-8").splitlines()] if p.exists() else []
+
+    def logged(self):
+        return [d for d in self.lines() if "verdict" not in d]
+
+    def verdicts(self):
+        return [d for d in self.lines() if "verdict" in d]
 
 
 class R4CiRedTest(BotCase):
@@ -404,6 +410,124 @@ class ShadowWriteTest(BotCase):
         self.assertEqual(st["counters"]["ask_salih_key1"], 60)
         self.assertEqual(len(self.logged()), 60)
         self.assertFalse((self.root / "build" / "bot" / "shadow.json.tmp").exists())
+
+
+class AgreementTest(BotCase):
+    """BOTAGREE: a bot decision vs the orchestrator's actual action on the same target within MATCH_S."""
+    def setUp(self):
+        super().setUp()
+        self.put("build/conveyor/lanes.json", {"L1": {"files": ["jarvis/a.py"], "ci": {"cand": True, "sha": SHA}}})
+        self.events({"ts": "2026-10-15T11:00:00", "event": "ci_result", "lane": "L1", "sha": SHA,
+                     "result": "success"})
+        self.assertEqual(self.acts(self.run_bot()), [("write_key1", "O26", "L1")])  # pending at 11:00, baseline
+
+    def approve(self, at, text="approved", name=f"push-{SHA}-L1"):
+        p = self.put(f"build/approvals/{name}", text)
+        os.utime(p, (ts(at), ts(at)))
+
+    def seed(self, agreement):
+        s = self.shadow()  # keep the cursor so the green event is not replayed
+        s["agreement"] = agreement
+        self.put("build/bot/shadow.json", s)
+
+    def kinds(self):
+        return [v["verdict"] for v in self.verdicts()]
+
+    def test_agree_and_an_idempotent_re_pass(self):
+        self.approve("2026-10-15T11:30:00")
+        self.clock.set("2026-10-15T12:05:00")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["agree"])
+        v = self.verdicts()[0]
+        self.assertEqual((v["key"], v["bot"]["would_do"], v["orchestrator"]["did"], v["orchestrator"]["side"]),
+                         ("key1:l1", "write_key1", "write_key1", "orchestrator"))
+        ag = self.shadow()["agreement"]
+        self.assertEqual(ag["key1"], {"agree": 1, "total": 1})
+        self.assertEqual(ag["totals"], {"write_key1": {"agree": 1}})
+        self.assertEqual(ag["rules"], {"O26": {"agree": 1}})
+        self.assertEqual((ag["pending"], ag["actual"], ag["recent"]), ([], [], []))
+        self.assertEqual(ag["since"], "2026-10-15")
+        for at in ("2026-10-15T12:06:00", "2026-10-15T14:00:00"):
+            self.clock.set(at)
+            self.run_bot()
+        self.assertEqual(self.kinds(), ["agree"])
+        again = self.shadow()["agreement"]
+        self.assertEqual({k: again[k] for k in ("totals", "rules", "key1", "recent")},
+                         {k: ag[k] for k in ("totals", "rules", "key1", "recent")})
+
+    def test_disagree_keeps_both_sides(self):
+        self.approve("2026-10-15T11:30:00", "approved by salih")
+        self.clock.set("2026-10-15T12:05:00")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["disagree"])
+        ag = self.shadow()["agreement"]
+        self.assertEqual(ag["key1"], {"agree": 0, "total": 1})
+        self.assertEqual(len(ag["recent"]), 1)
+        r = ag["recent"][0]
+        self.assertEqual((r["bot"]["would_do"], r["bot"]["at"], r["orchestrator"]["did"], r["orchestrator"]["at"]),
+                         ("write_key1", "2026-10-15T11:00:00", "ask_salih_key1", "2026-10-15T11:30:00"))
+
+    def test_unmatched_after_the_window(self):
+        self.clock.set("2026-10-15T12:00:00")
+        self.run_bot()
+        self.assertEqual(self.kinds(), [])
+        self.clock.set("2026-10-15T12:00:01")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["unmatched"])
+        v = self.verdicts()[0]
+        self.assertIsNone(v["orchestrator"])
+        self.assertEqual(self.shadow()["agreement"]["key1"], {"agree": 0, "total": 1})
+
+    def test_missed_an_action_the_bot_never_proposed(self):
+        self.approve("2026-10-15T12:10:00", name=f"push-{SHA2}-L2")
+        self.clock.set("2026-10-15T13:10:00")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["unmatched"])  # the 11:00 L1 decision; the L2 action is still in its window
+        self.clock.set("2026-10-15T13:10:01")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["unmatched", "missed"])
+        v = self.verdicts()[1]
+        self.assertEqual((v["key"], v["bot"], v["orchestrator"]["did"]), ("key1:l2", None, "write_key1"))
+        ag = self.shadow()["agreement"]
+        self.assertEqual(ag["key1"], {"agree": 0, "total": 2})
+        self.assertEqual([r["verdict"] for r in ag["recent"]], ["unmatched", "missed"])
+
+    def test_window_edge_3600_matches(self):
+        self.approve("2026-10-15T12:00:00")
+        self.clock.set("2026-10-15T12:00:00")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["agree"])
+
+    def test_window_edge_3601_is_unmatched_then_missed(self):
+        self.approve("2026-10-15T12:00:01")
+        self.clock.set("2026-10-15T12:00:01")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["unmatched"])
+        self.clock.set("2026-10-15T13:00:02")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["unmatched", "missed"])
+
+    def test_malformed_block_resets_to_empty(self):
+        no_rule = [{"at": 0, "action": "write_key1", "key": "key1:l1"}]
+        for bad in ({"pending": "x"}, {"pending": no_rule}, "x", {"key1": {"agree": "1", "total": 1}}, {"known": {"acks": []}}):
+            with self.subTest(bad=bad):
+                self.seed(bad)
+                ds = self.run_bot()
+                self.assertEqual(self.acts(ds), [("escalate_orchestrator", "FAILCLOSED", "shadow.json agreement")])
+                ag = self.shadow()["agreement"]
+                self.assertEqual(set(ag), set(orchbot.agree_blank()))
+                self.assertEqual((ag["pending"], ag["key1"], ag["totals"]), ([], {"agree": 0, "total": 0}, {}))
+
+    def test_graduation_thresholds(self):
+        now = self.clock()
+        for days, agree, total, ready in ((6, 10, 10, False), (7, 9, 9, False), (7, 9, 10, False),
+                                          (7, 10, 10, True)):
+            with self.subTest(days=days, agree=agree, total=total):
+                self.seed({"start": now - days * 86400, "key1": {"agree": agree, "total": total}})
+                self.assertEqual(self.run_bot(), [])
+                g = self.shadow()["agreement"]["graduation"]
+                self.assertEqual(g, {"days": days, "pushes": total, "agree_pct": round(100 * agree / total, 1),
+                                     "ready": ready})
 
 
 class MainTest(BotCase):
