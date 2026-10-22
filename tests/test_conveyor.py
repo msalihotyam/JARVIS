@@ -4033,6 +4033,66 @@ class TestBreaker(AutopilotBase):
         self.blocked("D")  # the count starts again
         self.assertEqual(self.status()["breaker"], "closed")
 
+    def open_with(self, *running):
+        """Dispatch `running`, then A, B and C go BLOCKED one after the other: the breaker opens."""
+        (self.base / "pace.json").write_text(json.dumps({"max_lanes": 6}), encoding="utf-8")
+        for n in running:
+            self.drop(f"{n}.md", HDR.format(n))
+        self.c.pass_once()
+        self.t += 60
+        self.blocked("A", "B", "C")
+        self.assertEqual(self.status()["breaker"], "open")
+
+    def ap(self):
+        return json.loads((self.base / "autopilot.json").read_text(encoding="utf-8"))
+
+    def test_an_opener_root_or_review_lane_pass_leaves_it_open(self):  # BREAKERFIX F1
+        self.open_with("A-R", "CDX9", "DRY9", "G")
+        self.assertEqual(self.ap()["breaker"]["roots"], ["A", "B", "C"])
+        for n in ("A-R", "CDX9", "DRY9"):
+            self.finish(n, "PASS")
+            self.assertEqual(self.status()["breaker"], "open", n)
+        self.finish("G", "PASS")  # an unrelated root closes it
+        self.assertEqual(self.status()["breaker"], "closed")
+        self.assertEqual([(e["state"], e["reason"]) for e in self.ev("breaker")][1:], [("closed", "auto: G PASS")])
+
+    def test_a_root_that_went_bad_while_open_cannot_close_it(self):  # BREAKERFIX F1
+        self.open_with("D", "D-R", "G")
+        self.finish("D", "BLOCKED")
+        self.assertEqual(self.ap()["breaker"]["roots"], ["A", "B", "C", "D"])
+        self.finish("D-R", "PASS")
+        self.assertEqual(self.status()["breaker"], "open")
+        self.finish("G", "PASS")
+        self.assertEqual(self.status()["breaker"], "closed")
+
+    def test_a_record_without_roots_closes_by_reset_only(self):  # BREAKERFIX F1 fail closed
+        self.open_with("G")
+        ap = self.ap()
+        del ap["breaker"]["roots"]
+        (self.base / "autopilot.json").write_text(json.dumps(ap), encoding="utf-8")
+        self.finish("G", "PASS")
+        self.assertEqual(self.status()["breaker"], "open")
+        self.assertNotIn("roots", self.ap()["breaker"])
+
+    def test_one_pass_gives_the_same_result_in_any_lane_order(self):  # BREAKERFIX F3
+        seen = []
+        for rev in (False, True):
+            with self.subTest(reversed=rev):
+                self.tearDown()
+                self.setUp()
+                self.open_with("D", "G", "A-R")
+                self.report("G", "PASS", mtime=self.t)
+                self.report("D", "BLOCKED", mtime=self.t - 30)
+                self.report("A-R", "PASS", mtime=self.t - 20)
+                lanes = self.lanes()
+                (self.base / "lanes.json").write_text(json.dumps(dict(sorted(lanes.items(), reverse=rev))))
+                self.c.pass_once()
+                ap = self.ap()
+                seen.append((self.status()["breaker"], ap.get("breaker"), ap["bad"],
+                             [(e["state"], e["reason"]) for e in self.ev("breaker")]))
+        self.assertEqual(seen[0], seen[1])
+        self.assertEqual(seen[0][0], "closed")  # D's BLOCKED came first, then G closed it
+
 
 class TestNightQuiet(AutopilotBase):
     def test_escalation_waits_for_the_morning(self):
@@ -4462,6 +4522,35 @@ class TestCIHandoff(AutopilotBase):
         self.assertEqual(len(self.reruns()), 1)
         self.assertEqual(len(self.ev("ci_rerun")), 1)
         self.assertEqual(len(self.ev("auto_fix")), 1)
+
+    def test_a_second_lane_or_a_redispatch_on_the_same_sha_gets_no_second_rerun(self):  # BREAKERFIX F2
+        for who in ("INT2", "INT1"):  # another lane / the same lane with a fresh ci record
+            with self.subTest(who):
+                self.tearDown()
+                self.setUp()
+                self.first_failure()
+                lanes = self.lanes()
+                ln = lanes.pop("INT1")
+                del ln["ci"]
+                lanes[who] = ln
+                (self.base / "lanes.json").write_text(json.dumps(lanes))
+                self.git.ci(SHA_A, "failure")
+                self.c.pass_once()
+                self.assertEqual(self.lanes()[who]["status"], "BLOCKED")
+                self.assertEqual(len(self.reruns()), 1)
+                self.assertEqual(len(self.ev("ci_rerun")), 1)
+                ap = json.loads((self.base / "autopilot.json").read_text(encoding="utf-8"))
+                self.assertEqual(ap["ci_rerun"][SHA_A]["lane"], "INT1")
+
+    def test_unreadable_autopilot_state_means_no_rerun(self):  # BREAKERFIX F2 fail closed
+        self.int_lane("INT1", SHA_A)
+        self.pending("INT1", SHA_A)
+        self.git.ci(SHA_A, "failure")
+        self.git.fail[("gh", "run", "rerun")] = (0, "")
+        (self.base / "autopilot.json").write_text("{broken", encoding="utf-8")
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT1"]["status"], "BLOCKED")
+        self.assertEqual((self.reruns(), self.ev("ci_rerun")), ([], []))
 
     def test_dependents_of_a_blocked_int_wait_for_its_rerun(self):
         lanes = {"INT1": {"status": "BLOCKED"}, "INT1-R": {"status": "CI_PENDING"}, "F": {"status": "BLOCKED"},

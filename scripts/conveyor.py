@@ -2446,8 +2446,12 @@ class Conveyor:
         for a GREEN integration report (auto_approve) and queue one fix-forward chain for a
         BLOCKED one (auto_fix). A chain lane that fails stops its chain (chain_dead) and
         re-raises its lane as an attention item; it never opens the breaker (BREAKERV2). A
-        GOOD finish after the breaker opened, or a breaker-reset touched after it, closes it.
-        Unreadable state: no action and the breaker counts as open (fail closed)."""
+        breaker-reset touched after it opened closes it, and so does a GOOD finish after it
+        opened whose root is not one of the breaker's bad roots (those that opened it or went
+        BAD while it was open) and that is no CDX/DRY review lane (BREAKERFIX); a record
+        without roots closes by reset only. Lanes are walked in finished order, so one pass
+        gives the same result whatever the lanes order. Unreadable state: no action and the
+        breaker counts as open (fail closed)."""
         ap = self.auto_state()
         if ap is None:
             self.breaker = {"reason": "build/conveyor/autopilot.json unreadable (fix it by hand)",
@@ -2459,7 +2463,7 @@ class Conveyor:
             ap["breaker"], ap["bad"] = None, []
             self.event("breaker", state="closed", reason=b["reason"])
         chains = ap.setdefault("chains", {})
-        for name, ln in lanes.items():
+        for name, ln in sorted(lanes.items(), key=lambda kv: (kv[1].get("finished_ts") or 0, kv[0])):
             fin = ln.get("finished_ts")
             if fin is None or fin < ap["since"] or ln.get("ap") == fin:
                 continue
@@ -2469,13 +2473,16 @@ class Conveyor:
                 continue  # not terminal: ci_wait sets GREEN/BLOCKED with a new finished_ts
             role = next((r for c in chains.values() for r in ("afx", "r", "s")
                          if c.get(r) == name or r == "afx" and name in c.get("afxs", ())), None)
-            if (b := ap.get("breaker")) and st in GOOD and fin > b["since"]:
+            root = root_id(name)  # a lane, its -AFX/-R and its reruns are one failure
+            if ((b := ap.get("breaker")) and st in GOOD and fin > b["since"] and "roots" in b
+                    and root not in b["roots"] and not CDX_DRY_RE.match(root)):  # BREAKERFIX F1
                 ap["breaker"] = None  # a BAD finishing after this GOOD (same pass) still counts
                 ap["bad"] = [x for x in ap.get("bad", []) if x[1] > fin]
                 self.event("breaker", state="closed", reason=f"auto: {name} {st}")
             if st in BAD and not (st == "BLOCKED" and CDX_DRY_RE.match(name)):  # audit finding
-                root = root_id(name)  # a lane, its -AFX/-R and its reruns are one failure
                 ap["bad"] = [x for x in ap.get("bad", []) if root_id(x[0]) != root] + [[name, fin]]
+                if (b := ap.get("breaker")) and root not in b.get("roots", [root]):
+                    b["roots"].append(root)  # its fix passing is no sign the failure is gone either
             if role and st not in GOOD:
                 self.chain_failed(name, st, fin, chains, lanes)
             if not INT_RE.match(name) or role == "afx" or name.endswith("-AFX"):
@@ -2511,7 +2518,11 @@ class Conveyor:
         try:
             b = ap.get("breaker")
             ok = isinstance(ap["since"], num) and (
-                b is None or isinstance(b["reason"], str) and isinstance(b["since"], num)) and all(
+                b is None or isinstance(b["reason"], str) and isinstance(b["since"], num) and (
+                    "roots" not in b or isinstance(b["roots"], list)
+                    and all(isinstance(r, str) for r in b["roots"]))) and isinstance(
+                ap.get("ci_rerun", {}), dict) and all(
+                isinstance(k, str) and isinstance(v, dict) for k, v in ap.get("ci_rerun", {}).items()) and all(
                 isinstance(x[0], str) and isinstance(x[1], num) for x in ap.get("bad", [])) and all(
                 isinstance(c, dict) for c in ap.get("chains", {}).values()) and not any(
                 validate_slice(s) for s in ap.get("slices", [])) and (
@@ -2523,8 +2534,25 @@ class Conveyor:
 
     def open_breaker(self, ap, reason):
         if not ap.get("breaker"):
-            ap["breaker"] = {"reason": reason[:300], "since": self.now()}
+            ap["breaker"] = {"reason": reason[:300], "since": self.now(),
+                             "roots": sorted({root_id(x[0]) for x in ap.get("bad", [])})}
             self.event("breaker", state="open", reason=reason[:300])
+
+    def ci_rerun_claim(self, name, sha):
+        """True once per sha: the automatic CI rerun of `sha` is recorded in autopilot.json
+        before gh runs, so no other lane or re-dispatch of the sha gets one (BREAKERFIX F2).
+        Unreadable state or a failed write: False, the result stands (fail closed)."""
+        ap = self.auto_state()
+        if ap is None or sha in ap.get("ci_rerun", {}):
+            return False
+        # ponytail: ci_rerun is never pruned (one small dict per CI'd sha); prune by ts if it grows
+        ap.setdefault("ci_rerun", {})[sha] = {"lane": name, "ts": self.now()}
+        try:
+            self.write_atomic(self.auto_file, json.dumps(ap, indent=2))
+        except OSError as e:
+            self.error(f"autopilot.json: {e}")
+            return False
+        return True
 
     def chain_failed(self, name, st, fin, chains, lanes):
         """Fix lane `name` of an auto-fix chain ended non-GOOD: the chain stops (chain_dead,
@@ -2699,15 +2727,17 @@ class Conveyor:
         if state == "pending":
             return self.ci_slow(name, ln, why)
         # cancel-in-progress is not a failure; a first failure may be a flaky shard (CIRERUN): one automatic
-        # rerun per sha for either, a second red or a rerun that did not start is a result
-        if state in ("cancelled", "failure") and not ln["ci"].get("rerun"):
+        # rerun per sha for either, whichever came first, across lanes and re-dispatches (BREAKERFIX: the sha
+        # is recorded in autopilot.json ci_rerun before gh runs); a second red, a rerun that did not start or
+        # a record that cannot be read or written is a result
+        if state in ("cancelled", "failure") and not ln["ci"].get("rerun") and self.ci_rerun_claim(name, ci["sha"]):
             m = CI_RUN_RE.search(url or "")
             try:
                 rc, _ = (self.cmd(["gh", "run", "rerun", m.group(1)] + ["--failed"] * (state == "failure"))
                          if m else (1, ""))
             except Exception as e:
                 rc = type(e).__name__
-            ln["ci"]["rerun"] = True  # once per sha, whichever came first
+            ln["ci"]["rerun"] = True  # this lane's copy of the claim
             self.event("ci_rerun", lane=name, sha=ci["sha"], url=url, rc=rc,
                        reason="first failure" if state == "failure" else "cancelled")
             if rc == 0:
