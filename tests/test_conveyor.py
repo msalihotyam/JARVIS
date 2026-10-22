@@ -3025,6 +3025,153 @@ class TestPreserved(Base):
         self.assertEqual((pv["branch"], pv["first_unintegrated_sha"]), ("lane-a", sha))
         self.assertEqual(self.cli("stop"), [])
 
+    def origin_main(self, rev="main"):
+        self.g("update-ref", "refs/remotes/origin/main", self.g("rev-parse", rev))
+
+    def main_commit(self, files):
+        for n, text in files.items():
+            (self.root / n).write_text(text)
+        self.g("add", *files)
+        self.g("commit", "-q", "-m", "main")
+
+    def equivalent_pairs(self):
+        return [e["pairs"] for e in self.events() if e["event"] == "cleanup_equivalent"]
+
+    def assert_cleaned(self, sid):
+        self.assertEqual(self.cli("rm"), [["rm", sid]])
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
+        self.assertNotIn("preserved", self.lanes()["A"])
+        self.assertFalse(self.wt.exists())
+        self.assertEqual(self.g("branch", "--list", "lane-a"), "")
+
+    def test_cherry_pick_then_main_edit_is_cleaned_as_equivalent(self):
+        """CLEANPATCH: off_main refuses (main edited g.txt later); the patch-id is on origin/main."""
+        sha = self.lane_commit()
+        self.g("cherry-pick", "-x", sha)  # -x: another sha (same second, same metadata = same sha)
+        self.assertNotEqual(self.g("rev-parse", "main"), sha)
+        self.main_commit({"g.txt": "work, edited on main\n"})
+        self.origin_main()
+        self.assertTrue(self.c.off_main("lane-a"))
+        sid = self.run_cleanup()
+        self.assert_cleaned(sid)
+        pairs = self.equivalent_pairs()
+        self.assertTrue(pairs)
+        self.assertEqual({(p["commit"], p["how"]) for ps in pairs for p in ps}, {(sha, "patch-id")})
+
+    def test_content_on_main_by_later_commit_is_cleaned_as_equivalent(self):
+        sha = self.lane_commit()
+        self.main_commit({"g.txt": "work\n", "h.txt": "more\n"})  # same hunk, other patch-id
+        self.origin_main()
+        sid = self.run_cleanup()
+        self.assert_cleaned(sid)
+        main = self.g("rev-parse", "main")
+        self.assertEqual({(p["commit"], p["main"], p["how"]) for ps in self.equivalent_pairs() for p in ps},
+                         {(sha, main, "content")})
+
+    def test_one_real_commit_among_equivalent_ones_is_preserved(self):
+        self.g("cherry-pick", "-x", self.lane_commit())
+        (self.wt / "k.txt").write_text("real work\n")
+        self.g("add", "k.txt", cwd=self.wt)
+        self.g("commit", "-q", "-m", "real", cwd=self.wt)
+        real = self.g("rev-parse", "HEAD", cwd=self.wt)
+        self.origin_main()
+        self.run_cleanup()
+        pv = self.assert_preserved_once()
+        self.assertEqual(pv["first_unintegrated_sha"], real)
+        self.assertEqual(self.equivalent_pairs(), [])
+        ok, why = self.c.merged_equivalent("lane-a")
+        self.assertEqual((ok, why), (False, f"lane-a has commits not on origin/main (first {real[:7]})"))
+
+    def test_patch_id_match_differing_in_whitespace_only_is_preserved(self):
+        """patch-id ignores whitespace: an indentation change on main is not the lane's code."""
+        sha = self.lane_commit()
+        self.main_commit({"g.txt": "    work\n"})
+        self.origin_main()
+        self.assertEqual(self.g("cherry", "main", "lane-a"), f"- {sha}")
+        self.run_cleanup()
+        self.assertEqual(self.assert_preserved_once()["first_unintegrated_sha"], sha)
+        self.assertEqual(self.equivalent_pairs(), [])
+        self.assertEqual(self.c.merged_equivalent("lane-a"),
+                         (False, f"lane-a has commits not on origin/main (first {sha[:7]})"))
+
+    def test_binary_beside_text_is_proved_binary_only_is_refused(self):
+        """A .qm beside its .ts: same blob on origin/main is equivalent, another blob or a
+        binary-only commit is not."""
+        def lane(files, msg):
+            for n, data in files.items():
+                (self.wt / n).write_bytes(data)
+            self.g("add", *files, cwd=self.wt)
+            self.g("commit", "-q", "-m", msg, cwd=self.wt)
+            return self.g("rev-parse", "HEAD", cwd=self.wt)
+        sha = lane({"t.ts": b"text\n", "t.qm": b"q\0lane"}, "ts+qm")
+        self.g("cherry-pick", "-x", sha)
+        self.origin_main()
+        self.assertEqual(self.c.merged_equivalent("lane-a"),
+                         (True, [{"commit": sha, "main": self.g("rev-parse", "main"), "how": "patch-id"}]))
+        other = lane({"t.ts": b"text 2\n", "t.qm": b"q\0lane 2"}, "ts+qm 2")
+        self.main_commit({"t.ts": "text 2\n"})  # the text landed, but main rebuilt the .qm
+        (self.root / "t.qm").write_bytes(b"q\0main 2")
+        self.g("commit", "-q", "-am", "qm 2")
+        self.origin_main()
+        self.assertEqual(self.c.merged_equivalent("lane-a"),
+                         (False, f"lane-a has commits not on origin/main (first {other[:7]})"))
+        self.g("switch", "-q", "-c", "bin")
+        (self.root / "t.qm").write_bytes(b"q\0bin")
+        self.g("commit", "-q", "-am", "qm only")
+        only = self.g("rev-parse", "HEAD")
+        self.assertEqual(self.c.merged_equivalent("bin"),
+                         (False, f"bin: commit {only[:7]} empty, binary-only or root (git diff rc=0)"))
+
+    def test_equivalence_git_error_or_unknown_origin_is_preserved(self):
+        sha = self.lane_commit()
+        self.main_commit({"g.txt": "work\n", "h.txt": "more\n"})
+        self.assertEqual(self.c.merged_equivalent("lane-a"), (False, "origin/main unknown"))
+        self.origin_main()
+        self.git_fail, self.git_fail_on = (128, ""), ["git", "merge-tree"]
+        self.run_cleanup()
+        pv = self.assert_preserved_once()
+        self.assertEqual(pv["first_unintegrated_sha"], sha)
+        self.assertEqual(self.equivalent_pairs(), [])
+        self.git_fail_on = ["git", "cherry"]
+        self.assertFalse(self.c.merged_equivalent("lane-a")[0])
+
+    def discard_setup(self, origin="main"):
+        sha = self.lane_commit()
+        self.g("cherry-pick", "-x", sha)
+        self.origin_main(origin)
+        self.fake.rm_rc = 1
+        self.fake.rm_out = ("Worktree has unpushed commits. To discard the worktree and its commits: "
+                            f"claude rm {{sid}} --discard-unpushed {sha}@abc1234\n")
+
+        def run(args, **kw):  # claude rm accepts the discard token
+            if "--discard-unpushed" in args:
+                self.fake.rm_rc = 0
+            return self.fake(args, **kw)
+        self.c.run = run
+        return sha
+
+    def test_rm_refusal_discards_only_proven_equivalent_commits(self):
+        sha = self.discard_setup()
+        sid = self.run_cleanup()
+        self.assertEqual(self.cli("rm"), [["rm", sid], ["rm", sid, "--discard-unpushed", f"{sha}@abc1234"]])
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
+        ev = [e for e in self.events() if e["event"] == "cleanup_equivalent" and e.get("session") == sid]
+        self.assertEqual([(p["commit"], p["how"]) for p in ev[0]["pairs"]], [(sha, "patch-id")])
+        self.assertFalse(self.wt.exists())
+
+    def test_rm_refusal_never_discards_without_equivalence_or_when_dirty(self):
+        self.discard_setup(origin="main~1")  # on local main only: origin/main lacks it
+        self.run_cleanup()
+        self.assertEqual([c for c in self.cli("rm") if "--discard-unpushed" in c], [])
+        self.assertIs(self.lanes()["A"]["cleanup"]["in_main"], True)
+
+    def test_rm_refusal_never_discards_dirty_worktree(self):
+        self.discard_setup()
+        (self.wt / "untracked.txt").write_text("x\n")
+        self.run_cleanup()
+        self.assertEqual([c for c in self.cli("rm") if "--discard-unpushed" in c], [])
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "error")
+
     def merge_side(self, extra):
         """lane-a: a --no-ff merge of side branch work that main cherry-picks, own file if extra."""
         self.g("checkout", "-q", "-b", "side", cwd=self.wt)
@@ -3392,6 +3539,16 @@ class TestEarlyStop(Base):
             self.c.pass_once()
         self.assertEqual(self.cli("stop", "rm"), [["stop", sid]])
         self.assertEqual(self.lanes()["A"]["early_stopped"], [sid])
+
+    def test_idle_working_stopped_at_180_s(self):  # CLEANPATCH: 600 -> 180
+        self.assertEqual(conveyor.STOP_WORKING_S, 180)
+        sid = self.finished(agent={"state": "working"})
+        self.t += 179
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [])
+        self.t += 1
+        self.c.pass_once()
+        self.assertEqual(self.cli("stop", "rm"), [["stop", sid]])
 
     def test_busy_or_unknown_status_working_left(self):
         self.finished(agent={"state": "working", "status": "busy"})

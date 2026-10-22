@@ -60,7 +60,7 @@ CLEANUP_S = 3600  # a finished lane's session is removed this long after its rep
 CLEANUP_PER_PASS = 5  # stop/rm calls are slow; keep one pass well under the stale-lock time
 # CONVIDLE: `claude agents` lists a finished idle background session as state "working"; early
 # stop takes it only when its status is "idle" and the report was collected this long ago
-STOP_WORKING_S = 600
+STOP_WORKING_S = 180
 CLEAN_STATES = {"done", "blocked", "failed"}  # session states cleanup acts on; anything else: leave
 FINISHED = {"done", "idle"}
 IDLE_REDISPATCH_S = 600  # respawned lane with no activity this long -> re-dispatch
@@ -3311,7 +3311,7 @@ class Conveyor:
             done += 1
             for a in sess:
                 self.beat()  # git per session
-                kept = self.unintegrated(a)
+                kept = self.unintegrated(a, name)
                 if kept:
                     self.preserve(ln, name, *kept)
                     break
@@ -3326,6 +3326,15 @@ class Conveyor:
                     except Exception as e:  # e.g. a timeout: an error, the session is left
                         rc, out = type(e).__name__, ""
                     steps.append({"cmd": cmd, "id": a["id"], "rc": rc, "output": out[-300:]})
+                    found = self.rm_discard(a, out) if cmd == "rm" and rc != 0 else None
+                    if found:  # CLEANPATCH: the unpushed commits are on origin/main under other shas
+                        self.event("cleanup_equivalent", lane=name, session=a["id"], pairs=found[1])
+                        self.beat()
+                        try:
+                            rc, out = self.run(["rm", a["id"], "--discard-unpushed", found[0]])
+                        except Exception as e:
+                            rc, out = type(e).__name__, ""
+                        steps.append({"cmd": cmd, "id": a["id"], "rc": rc, "output": out[-300:], "discard": True})
                     if rc != 0:
                         break
                 if steps[-1]["rc"] != 0:
@@ -3341,7 +3350,8 @@ class Conveyor:
                 self.error(f"cleanup {name}: {steps[-1]['cmd']} rc={steps[-1]['rc']}", lane=name)
                 if steps[-1]["cmd"] == "rm":
                     # refused although the branch is integrated (`claude rm --discard-unpushed`
-                    # would also drop uncommitted changes: never passed): retried the next day
+                    # would also drop uncommitted changes: passed only on rm_discard's proof): retried
+                    # the next day
                     self.retry_cleanup(name, ln, "rm", f"claude rm refused: {steps[-1]['output'][-150:]}",
                                        self.rm_in_main(steps[-1]["output"]))
 
@@ -3357,6 +3367,34 @@ class Conveyor:
             return self.off_main(f"session {m[1]}", m[2]) is None
         except Exception:
             return False
+
+    def rm_discard(self, a, out):
+        """(token, pairs) for `claude rm <id> --discard-unpushed <token>` when a claude rm refusal
+        names only unpushed commits that merged_equivalent proves are on origin/main, and the
+        session's worktree is clean (status and skip/assume entries) with HEAD at that sha.
+        Fail closed: another text, uncommitted changes, no worktree or any doubt is None."""
+        m = re.search(r"discard the worktree and its commits: claude rm (\S+) --discard-unpushed "
+                      r"(([0-9a-f]{40})@[0-9a-f]+)\s*\Z", out)
+        wt = self.worktree_of(a)
+        if not m or "uncommitted" in out.lower() or wt is None:
+            return None
+        try:
+            same, pairs = self.merged_equivalent(f"session {m[1]}", m[3])
+            if not same or not wt.exists():
+                return None
+            rc, st = self.cmd([*GIT_PIN, "-C", str(wt), "status", "--porcelain", "--untracked-files=all",
+                               "--ignore-submodules=none"])
+            if rc != 0 or st.strip():
+                return None
+            rc, st = self.cmd([*GIT_PIN, "-C", str(wt), "ls-files", "-v"])
+            if rc != 0 or any(not ln_.startswith("H ") for ln_ in st.splitlines()):
+                return None
+            rc, head = self.cmd([*GIT_PIN, "-C", str(wt), "rev-parse", "--verify", "HEAD"])
+            if rc != 0 or head.strip() != m[3]:
+                return None
+        except Exception:
+            return None
+        return m[2], pairs
 
     def retry_cleanup(self, name, ln, step, reason, in_main=False):
         """An event and an attention item (cleanup:<lane>, none when in_main: the refused commits
@@ -3388,7 +3426,7 @@ class Conveyor:
                 rc, out = self.cmd([*GIT_PIN, "-C", str(wt), "ls-files", "-v"])  # status hides skip/assume edits
                 if rc != 0 or any(not ln_.startswith("H ") for ln_ in out.splitlines()):
                     return f"worktree {wt.name} kept: skip-worktree/assume-unchanged entries (rc={rc})"
-                kept = self.unintegrated({"cwd": str(wt)})
+                kept = self.unintegrated({"cwd": str(wt)}, name)
                 if kept:
                     return kept[0]
                 rc, branch = self.branch_of(wt)
@@ -3412,7 +3450,10 @@ class Conveyor:
                 return f"branch {branch} kept: symbolic ref or git symbolic-ref rc={rc}"
             off = self.off_main(branch, tip)
             if off:
-                return f"branch {branch} kept: not provably on main ({off[0]})"
+                same, pairs = self.merged_equivalent(branch, tip)
+                if not same:
+                    return f"branch {branch} kept: not provably on main ({off[0]})"
+                self.event("cleanup_equivalent", lane=name, branch=branch, pairs=pairs)
             rc, out = self.cmd(["git", "update-ref", "--no-deref", "-d", ref, tip])  # only if still the proven tip
             if rc != 0:
                 return f"git update-ref -d {branch} rc={rc}: {out[-150:]}"
@@ -3432,9 +3473,10 @@ class Conveyor:
         home = Path(os.path.normcase(os.path.abspath(self.root / ".claude" / "worktrees")))
         return wt if home in wt.parents else None
 
-    def unintegrated(self, a):
+    def unintegrated(self, a, name=None):
         """(reason, branch, first unintegrated sha) when the session's worktree branch is not
         provably all on local main (read-only git in the canonical checkout), else None.
+        An off_main reason is overruled only by merged_equivalent (a cleanup_equivalent event).
         Fail closed: any git error, unknown branch or off_main reason is a reason."""
         wt = self.worktree_of(a)
         if wt is None:
@@ -3446,9 +3488,84 @@ class Conveyor:
             if not branch:
                 return "worktree branch unknown", None, None
             off = self.off_main(branch)
+            if off:
+                same, pairs = self.merged_equivalent(branch)
+                if same:
+                    self.event("cleanup_equivalent", lane=name, branch=branch, pairs=pairs)
+                    return None
         except Exception as e:  # a timeout etc.
             return f"git failed: {type(e).__name__}", None, None
         return (off[0], branch, off[1]) if off else None
+
+    def merged_equivalent(self, branch, tip=None):
+        """(True, [{commit, main, how}]) when every commit of origin/main..branch is already on
+        origin/main under another sha (CLEANPATCH: a cherry-pick, or its hunks landed by a later
+        commit), else (False, reason). Every commit needs a 3-way merge of it onto origin/main
+        (base: its parent) that leaves origin/main's tree unchanged ("content", or "patch-id" when
+        `git cherry` says "-"); a "-" commit whose lines main edited since counts only when a main
+        commit carries its patch verbatim apart from hunk positions, since patch-id ignores
+        whitespace (ponytail: a hunk landing elsewhere in the file still passes that fallback; a
+        3-way check per hunk if it matters). "main" is the latest origin/main commit touching
+        the commit's paths (evidence, not a proof). Fail closed: origin/main unknown, any git error
+        or unparsable output, a merge, root, empty or binary-only commit is False. A "-" commit that
+        main reverted later still counts (as off_main's cherry step)."""
+        hexsha = r"[0-9a-f]{40}|[0-9a-f]{64}"
+        patch = ["--format=%x00", "--no-renames", "--no-ext-diff", "--no-textconv", "--no-color", "-U3"]
+
+        def norm(out):  # one patch per commit, without blob ids and hunk positions
+            return [[ln if not ln.startswith("@@ ") else "@@" for ln in p.strip("\n").split("\n")
+                     if not ln.startswith("index ")] for p in out.split("\0") if p.strip("\n")]
+        try:
+            rc, om = self.cmd([*GIT_PIN, "rev-parse", "--verify", "--quiet", "refs/remotes/origin/main"])
+            om = om.strip()  # one proof against one sha, though a fetch moves the ref
+            if rc != 0 or not re.fullmatch(hexsha, om):
+                return False, "origin/main unknown"
+            ref = tip or f"refs/heads/{branch}"
+            rc, out = self.cmd([*GIT_PIN, "rev-list", "--merges", f"{om}..{ref}"])
+            if rc != 0 or out.split():
+                return False, f"{branch}: merge commits or git rev-list --merges rc={rc}"
+            rc, out = self.cmd([*GIT_PIN, "cherry", om, ref])
+            if rc != 0:
+                return False, f"git cherry origin/main {branch} rc={rc}"
+            cherry = {}
+            for line in out.splitlines():
+                if not line.startswith(("+ ", "- ")) or not re.fullmatch(hexsha, line[2:].strip()):
+                    return False, f"git cherry origin/main {branch}: unparsable {line[:40]!r}"
+                cherry[line[2:].strip()] = line[0]
+            rc, out = self.cmd([*GIT_PIN, "rev-list", "--reverse", f"{om}..{ref}"])
+            if rc != 0 or set(out.split()) != set(cherry):
+                return False, f"git rev-list origin/main..{branch} rc={rc} disagrees with git cherry"
+            rc, tree = self.cmd([*GIT_PIN, "rev-parse", "--verify", "--quiet", f"{om}^{{tree}}"])
+            tree = tree.strip()
+            if rc != 0 or not re.fullmatch(hexsha, tree):
+                return False, f"git rev-parse origin/main^{{tree}} rc={rc}"
+            pairs = []
+            for c in out.split():
+                rc, st = self.cmd([*GIT_PIN, "diff", "--numstat", "--no-renames", "--ignore-submodules=none", "-z",
+                                   f"{c}^", c])
+                recs = [r.split("\t", 2) for r in st.split("\0") if r]
+                # a binary file beside text is proved like text: its patch-id hashes both blob ids and
+                # merge-tree exits 1 on a differing blob; a binary-only commit stays in doubt
+                if rc != 0 or any(len(r) != 3 for r in recs) or all(r[0] == "-" for r in recs):
+                    return False, f"{branch}: commit {c[:7]} empty, binary-only or root (git diff rc={rc})"
+                paths = [f":(literal){r[2]}" for r in recs]
+                rc, mt = self.cmd([*GIT_PIN, "merge-tree", "--write-tree", f"--merge-base={c}^", om, c])
+                if rc != 0 or mt.split()[:1] != [tree]:
+                    # patch-id ignores whitespace: a "-" commit main edited since needs its patch
+                    # verbatim (hunk positions aside) in a main commit; binary blobs are in the patch-id
+                    rc, mine = self.cmd([*GIT_PIN, "log", "-p", "-1", *patch, c, "--", *paths])
+                    rc2, theirs = self.cmd([*GIT_PIN, "log", "-p", "--no-merges", *patch, f"{c}^..{om}", "--",
+                                            *paths])
+                    if cherry[c] != "-" or rc or rc2 or not norm(mine) or norm(mine)[0] not in norm(theirs):
+                        return False, f"{branch} has commits not on origin/main (first {c[:7]})"
+                how = "patch-id" if cherry[c] == "-" else "content"
+                rc, hit = self.cmd([*GIT_PIN, "log", "-1", "--format=%H", om, "--", *paths])
+                if rc != 0 or not re.fullmatch(hexsha, hit.strip()):
+                    return False, f"git log origin/main -- <{c[:7]} paths> rc={rc}"
+                pairs.append({"commit": c, "main": hit.strip(), "how": how})
+        except Exception as e:  # a timeout etc.
+            return False, f"git failed: {type(e).__name__}"
+        return True, pairs
 
     def off_main(self, branch, tip=None):
         """None when nothing reachable from `branch` is missing on local main, else (reason,
