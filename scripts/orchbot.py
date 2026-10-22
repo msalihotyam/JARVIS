@@ -18,6 +18,13 @@ scripts/conveyor.py change, a T2 approval keeping the queue dry - in the build/p
 An ask closes when its condition clears; open/close log one decision each; unknown input gives no
 ask and one escalate. Ask text is redacted and never names a path outside the repo.
 
+BOTLIVE: build/bot/live.json {"ack", "asks", "hold_dispatch", "page_salih": bool} turns single actions live;
+missing/malformed = all shadow, build/bot/OFF = all shadow (checked every pass). Live writes only
+build/conveyor/ack/<name>, build/conveyor/PAUSE (text "bot: <rule>", removed only when the bot made it) and
+the asks.json pano marker; each one logs a decisions.jsonl line with mode "live", before/after and an undo
+hint. page_salih never goes live: the conveyor pager reads only build/conveyor/pager.json. A loop guard
+trip demotes that action to shadow until live.demoted.<action> is deleted from shadow.json.
+
     python scripts/orchbot.py --shadow [--root DIR] [--once] [--quota-ceiling PCT]
 """
 import argparse
@@ -86,6 +93,11 @@ LANES_MAX = 10
 CONVEYOR_PY = "scripts/conveyor.py"
 RESTART_CMD = ("Stop-ScheduledTask -TaskName 'JARVIS Konveyor'; Start-Sleep 310; "
                "Start-ScheduledTask -TaskName 'JARVIS Konveyor'")
+LIVE_KEYS = ("ack", "asks", "hold_dispatch", "page_salih")  # the live.json schema
+# Only these can ever go live. page_salih stays out: the conveyor pager reads build/conveyor/pager.json
+# only, which is outside what the bot may write; everything else in ACTIONS is never live.
+LIVE_OK = ("ack", "asks", "hold_dispatch")
+PAUSE_TEXT = "bot: "  # + rule; a PAUSE with other text is not the bot's and is never removed
 
 
 def clean(line):
@@ -130,6 +142,16 @@ def proc_started(pid):
 
 def num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def stamp(p):
+    """A file's before/after for a live decision line: "absent", or its mtime, size and first 80 bytes."""
+    try:
+        s = p.stat()
+        head = p.read_bytes()[:80].decode("utf-8", errors="replace")
+    except OSError:
+        return "absent"
+    return {"mtime": cv.iso(s.st_mtime), "bytes": s.st_size, "text": head}
 
 
 def agree_key(action, target):
@@ -197,6 +219,10 @@ SHAPES = {  # shadow.json keys; a present key of another shape resets the state 
     "asks": lambda v: isinstance(v, dict) and all(isinstance(x, str) for x in v.values()),
     "conv": lambda v: isinstance(v, dict) and all(num(v.get(k, 0)) for k in ("pid", "seen")),
     "conv_push": lambda v: isinstance(v, dict) and num(v.get("at", 0)) and isinstance(v.get("sha", ""), str),
+    "live": lambda v: isinstance(v, dict) and all(isinstance(v.get(k, {}), dict) and all(num(x) for x in v.get(k, {}).values())
+                                                  for k in ("demoted", "acks"))
+    and isinstance(v.get("pause", {}), dict) and isinstance(v.get("pause", {}).get("text", ""), str)
+    and num(v.get("pause", {}).get("mtime", 0)) and isinstance(v.get("asks", False), bool),
 }
 
 
@@ -243,13 +269,20 @@ class Bot:
         self.conv = self.root / "build" / "conveyor"
         self.out = self.root / "build" / "bot"
         self.now, self.sleep, self.ceiling, self.from_start = now, sleep, quota_ceiling, from_start
+        self.live = set()  # BOTLIVE: only run() loads live.json; the replay drives decide() and stays shadow
 
     # ---- state -------------------------------------------------------------------------------
     def run(self):
         """One pass; returns the decisions it appended."""
         self.out.mkdir(parents=True, exist_ok=True)
         self.new, self.reports, self.verdicts, self.observed = [], {}, [], []
+        self.live = set()
         self.st = self.load_state()
+        try:
+            self.live = self.load_live()
+        except Exception as e:  # RecursionError on deep nesting too: fail closed to shadow
+            self.live = set()
+            self.bad("live.json", e)
         self.check_agreement()
         self.lanes = self.read_json(self.conv / "lanes.json", {})
         self.backlog = self.read_json(self.conv / "backlog.json", {})
@@ -286,10 +319,25 @@ class Bot:
                 self.decide(self.now(), "facts.md write failed", "escalate_orchestrator", "FAILCLOSED",
                             "facts.md", f"{e!r}"[:300])
         try:
+            self.release_pause()
+        except Exception as e:  # the PAUSE stays (the safe side); one decision per episode
+            if self.fresh("bad:pause", self.now()):
+                self.decide(self.now(), "PAUSE release failed", "escalate_orchestrator", "FAILCLOSED", "PAUSE",
+                            f"{e!r}"[:300])
+        try:
             asks = self.asks()
             if not self.retry(self.write_asks, asks):
                 raise OSError(f"write failed after {cv.REPLACE_TRIES} tries")
             self.log_asks(asks)
+            live, on = self.st.setdefault("live", {}), "asks" in self.live
+            if on != bool(live.get("asks")):
+                if on:
+                    live["asks"] = True
+                else:
+                    live.pop("asks", None)
+                self.live_rec({"saw": "live.json asks", "rule": "LIVE", "target": "asks", "detail": ""},
+                              "build/bot/asks.json", "live" if not on else "shadow", "live" if on else "shadow",
+                              f"set asks {str(not on).lower()} in build/bot/live.json", did="mark" if on else "unmark")
         except Exception as e:  # the old asks.json stays and so does the open set; the pass goes on
             if self.fresh("bad:asks", self.now()):
                 self.decide(self.now(), "asks.json write failed", "escalate_orchestrator", "FAILCLOSED",
@@ -300,7 +348,7 @@ class Bot:
     def load_state(self):
         blank = {"cursor": None, "decisions": [], "counters": {}, "seen": {}, "history": [],
                  "fixes": {}, "respawns": {}, "head": "", "agreement": agree_blank(),
-                 "asks": {}, "conv": {}, "conv_push": {}}
+                 "asks": {}, "conv": {}, "conv_push": {}, "live": {}}
         path = self.out / "shadow.json"
         if not path.exists():
             return blank
@@ -319,6 +367,10 @@ class Bot:
             # DECISION TAKEN: resume at the end of events.jsonl (alternative: replay it all, a storm)
             self.st = blank
             blank["cursor"] = self.events_size()
+            if (self.out / "live.json").exists():
+                # DECISION TAKEN: a state reset demotes every live action (alternative: keep them live);
+                # PAUSE ownership is lost with the state, so a bot PAUSE then waits for a human
+                blank["live"] = {"demoted": {k: self.now() for k in LIVE_OK}}
             self.decide(self.now(), "shadow.json unreadable", "escalate_orchestrator", "FAILCLOSED",
                         "shadow.json", f"{e!r}; state reset, cursor at the end of events.jsonl")
             return blank
@@ -406,6 +458,7 @@ class Bot:
 
     def decide(self, at, saw, action, rule, target, detail="", key=None):
         assert action in ACTIONS, action  # nosec B101 - a programming error, the closed enum
+        orig = action
         hist = [h for h in self.st["history"] if at - h[0] < LOOP_S]
         if action not in ("none", "escalate_orchestrator") and \
                 sum(h[1] == action and h[2] == target for h in hist) >= LOOP_N - 1:
@@ -421,6 +474,100 @@ class Bot:
         if key:
             self.st["agreement"]["pending"].append({"at": at, "action": action, "rule": rule, "target": target,
                                                     "key": key, "detail": rec["detail"]})
+        # BOTLIVE: only the LIVE_OK file actions; every other action stays a log line whatever live.json says
+        if orig in self.live and action != orig:  # the loop guard tripped: back to shadow until reset
+            self.demote(orig, rec["detail"], "LOOP")
+        elif action in self.live and action in ("ack", "hold_dispatch"):
+            try:
+                self.act_live(rec)
+            except (OSError, ValueError) as e:
+                self.demote(action, f"{e!r}"[:300], "FAILCLOSED")
+                self.decide(at, f"live {action} failed", "escalate_orchestrator", "FAILCLOSED", "live",
+                            f"{e!r}"[:300])
+
+    # ---- live (BOTLIVE) ----------------------------------------------------------------------
+    def load_live(self):
+        """The live actions for this pass: OFF wins, a malformed live.json is all shadow, a demoted
+        action stays shadow until its live.demoted entry is deleted from shadow.json."""
+        if (self.out / "OFF").exists():
+            return set()
+        cfg = self.read_json(self.out / "live.json", {})
+        bad = sorted(str(k) for k, v in cfg.items() if k not in LIVE_KEYS or type(v) is not bool)
+        if bad:
+            self.bad("live.json", ValueError(f"unknown key or not a bool: {', '.join(bad)}"[:200]))
+            return set()
+        if cfg.get("page_salih") and self.fresh("live:page_salih", self.now()):
+            self.decide(self.now(), "live.json page_salih", "escalate_orchestrator", "LIVE", "live.json",
+                        "page_salih cannot go live: the pager reads only build/conveyor/pager.json")
+        demoted = self.st.get("live", {}).get("demoted", {})
+        return {k for k in LIVE_OK if cfg.get(k) is True and k not in demoted}
+
+    def live_rec(self, rec, path, before, after, undo, did=None):
+        """One decisions.jsonl line per live action (mode "live"); not counted, not matched for agreement."""
+        self.new.append({"ts": cv.iso(self.now()), "mode": "live", "saw": rec["saw"], "did": did or rec.get("would_do"),
+                         "rule": rec["rule"], "target": rec["target"], "file": path, "before": before,
+                         "after": after, "undo": undo, "detail": rec["detail"]})
+
+    def act_live(self, rec):
+        live = self.st.setdefault("live", {})
+        if rec["would_do"] == "ack":
+            name = cv.ack_name(rec["target"])
+            if not name or name.startswith(".") or any(c in name for c in "/\\:"):
+                raise ValueError(f"unsafe ack name {name!r}")
+            p = self.conv / "ack" / name
+            before = stamp(p)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            p.touch()
+            os.utime(p, (self.now(),) * 2)
+            live.setdefault("acks", {})[name] = p.stat().st_mtime
+            self.live_rec(rec, f"build/conveyor/ack/{name}", before, stamp(p),
+                          f"delete build/conveyor/ack/{name}" if before == "absent"
+                          else f"set its mtime back to {before['mtime']}")
+            return
+        p, owned = self.conv / "PAUSE", live.get("pause")
+        if p.exists():  # a PAUSE is never rewritten; one the bot did not create is never the bot's
+            self.live_rec(rec, "build/conveyor/PAUSE", stamp(p), stamp(p),
+                          "delete build/conveyor/PAUSE" if owned else "none: a PAUSE the bot did not create is kept",
+                          did="kept")
+            return
+        text = PAUSE_TEXT + rec["rule"]
+        with open(p, "x", encoding="utf-8") as f:
+            f.write(text)
+        live["pause"] = {"text": text, "mtime": p.stat().st_mtime, "at": self.now()}
+        self.live_rec(rec, "build/conveyor/PAUSE", "absent", stamp(p), "delete build/conveyor/PAUSE")
+
+    def release_pause(self):
+        """Removes the bot's own PAUSE once its quota/outage episode is over; a PAUSE whose text or mtime
+        changed is no longer the bot's and is never removed."""
+        live = self.st.get("live", {})
+        owned = live.get("pause")
+        if not owned:
+            return
+        p = self.conv / "PAUSE"
+        try:
+            text, mtime = p.read_text(encoding="utf-8"), p.stat().st_mtime
+        except FileNotFoundError:
+            text = mtime = None
+        if text is None or text != owned.get("text") or mtime != owned.get("mtime"):
+            live.pop("pause")
+            return
+        # DECISION TAKEN: release only while hold_dispatch is live (alternative: always release it)
+        if "hold_dispatch" not in self.live or any(
+                self.now() - self.st["seen"].get(k, -EPISODE_S - 1) <= EPISODE_S for k in ("quota", "outage")):
+            return
+        before = stamp(p)
+        p.unlink()
+        live.pop("pause")
+        self.live_rec({"saw": "quota/outage episode over", "rule": "LIVE", "target": "dispatch", "detail": ""},
+                      "build/conveyor/PAUSE", before, "absent", f"recreate build/conveyor/PAUSE with {text!r}",
+                      did="unpause")
+
+    def demote(self, action, why, rule):
+        self.st.setdefault("live", {}).setdefault("demoted", {})[action] = self.now()
+        self.live.discard(action)
+        self.live_rec({"saw": f"live {action}", "rule": rule, "target": action, "detail": why},
+                      "build/bot/shadow.json", "live", "shadow",
+                      f"delete live.demoted.{action} in build/bot/shadow.json", did="demote")
 
     def save(self):
         now = self.now()
@@ -459,6 +606,8 @@ class Bot:
         """shadow.json via tmp + os.replace."""
         st = dict(self.st, decisions=(self.st["decisions"] + self.new)[-KEEP:], updated=cv.iso(self.now()),
                   asks_open=len(self.st["asks"]))
+        if not st.get("live"):  # shadow-only output stays as it was before BOTLIVE
+            st.pop("live", None)
         path = self.out / "shadow.json"
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(st, indent=1, ensure_ascii=False), encoding="utf-8")
@@ -469,8 +618,10 @@ class Bot:
         """asks.json via tmp + os.replace, the build/pano/build.py ask shape plus id/since/source."""
         path = self.out / "asks.json"
         tmp = path.with_name(path.name + ".tmp")
-        tmp.write_text(json.dumps({"updated": cv.iso(self.now()), "asks": asks}, indent=1, ensure_ascii=False),
-                       encoding="utf-8")
+        body = {"updated": cv.iso(self.now()), "asks": asks}
+        if "asks" in self.live:  # BOTLIVE: marked for the pano
+            body = {"updated": body["updated"], "live": True, "asks": [dict(a, pano=True) for a in asks]}
+        tmp.write_text(json.dumps(body, indent=1, ensure_ascii=False), encoding="utf-8")
         try:
             os.replace(tmp, path)
         except OSError:
@@ -853,7 +1004,7 @@ class Bot:
         acks = {}
         for name, _, mt in files(self.conv / "ack"):
             acks[name] = mt
-            if mt > known["acks"].get(name, -1):
+            if mt > known["acks"].get(name, -1) and self.st.get("live", {}).get("acks", {}).get(name) != mt:
                 act(mt, "ack", "ack:" + name.lower(), "orchestrator", f"ack/{name}")
         approvals = set()
         for d in (self.root / "build" / "approvals", self.root / "build" / "approvals" / "done"):
@@ -1150,8 +1301,9 @@ class Bot:
 
 
 def main(argv=None, now=time.time):
-    ap = argparse.ArgumentParser(description="Orchestrator bot, shadow mode: logs what it would do.")
-    ap.add_argument("--shadow", action="store_true", required=True, help="log only (the only mode in v0)")
+    ap = argparse.ArgumentParser(description="Orchestrator bot: shadow mode plus the live.json-gated live actions.")
+    ap.add_argument("--shadow", action="store_true", required=True,
+                    help="required; live actions only via build/bot/live.json (build/bot/OFF forces shadow)")
     ap.add_argument("--root", default=str(cv.ROOT), help="repo root (default: this checkout)")
     ap.add_argument("--once", action="store_true", help="one pass (v0 always runs one; schedule it)")
     ap.add_argument("--quota-ceiling", type=float, default=90, help="hold dispatch above this usage %%")

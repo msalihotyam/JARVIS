@@ -1036,5 +1036,193 @@ class MainTest(BotCase):
         self.assertIn("--shadow", err.getvalue())
 
 
+class LiveTest(BotCase):
+    """BOTLIVE: each live action vs shadow, OFF wins, malformed or never-live config is shadow, PAUSE
+    ownership, the loop guard demotes."""
+    L2 = "FINDINGS: 3; reader needs_orchestrator: y"
+    QUOTA = {"ts": "2026-10-15T11:00:00", "event": "pace", "usage_pct": 99}
+
+    def live(self, **cfg):
+        return self.put("build/bot/live.json", cfg)
+
+    def attention(self, since, iid="L2", reason=L2):
+        self.put("build/conveyor/status.json", {"attention": [{"id": iid, "reason": reason, "since": since}]})
+
+    def recs(self, ds):
+        return [d for d in ds if d.get("mode") == "live"]
+
+    def shadow_acts(self, ds):
+        return self.acts([d for d in ds if "mode" not in d])
+
+    def ack(self, iid="L2"):
+        return self.conv / "ack" / orchbot.cv.ack_name(iid)
+
+    def pause(self):
+        return self.conv / "PAUSE"
+
+    def test_ack_live_touches_the_ack_and_logs_before_after_undo(self):
+        self.live(ack=True)
+        self.attention("2026-10-15T11:30:00")
+        ds = self.run_bot()
+        self.assertEqual(self.shadow_acts(ds), [("ack", "O33", "L2")])
+        self.assertTrue(self.ack().exists())
+        self.assertEqual(self.ack().stat().st_mtime, ts("2026-10-15T12:00:00"))
+        [r] = self.recs(ds)
+        self.assertEqual((r["did"], r["rule"], r["target"], r["before"]), ("ack", "O33", "L2", "absent"))
+        self.assertEqual(r["file"], "build/conveyor/ack/" + orchbot.cv.ack_name("L2"))
+        self.assertEqual(r["undo"], "delete build/conveyor/ack/" + orchbot.cv.ack_name("L2"))
+        self.assertEqual(r["after"]["bytes"], 0)
+        self.assertIn(r, self.logged())
+        self.clock.set("2026-10-15T12:10:00")
+        self.assertEqual(self.run_bot(), [])  # the ack now hides the item
+
+    def test_ack_shadow_touches_nothing(self):
+        self.live(ack=False, asks=True)
+        self.attention("2026-10-15T11:30:00")
+        ds = self.run_bot()
+        self.assertEqual(self.shadow_acts(ds), [("ack", "O33", "L2")])
+        self.assertFalse(self.ack().exists())
+        self.assertEqual([r["target"] for r in self.recs(ds)], ["asks"])
+
+    def test_ack_live_respects_keep_unmerged(self):
+        self.live(ack=True)
+        iid = "cleanup:MDREAD"
+        self.attention("2026-10-15T11:30:00", iid, "cleanup refused (worktree-mdread has commits not on main "
+                                                   "(first abc1234)); retried after x")
+        ds = self.run_bot()
+        self.assertEqual(self.acts(ds), [("none", "KEEP-UNMERGED", iid)])
+        self.assertFalse(self.ack(iid).exists())
+
+    def test_asks_live_marks_them_for_the_pano_and_shadow_does_not(self):
+        self.put("build/conveyor/lanes.json", {"INT63": {"files": [".github/workflows/tests.yml"],
+                                                         "status": "GREEN", "ci": {"cand": True, "sha": SHA}}})
+        path = self.root / "build" / "bot" / "asks.json"
+        self.run_bot()
+        body = json.loads(path.read_text(encoding="utf-8"))
+        self.assertNotIn("live", body)
+        self.assertEqual([("pano" in a) for a in body["asks"]], [False])
+        self.live(asks=True)
+        self.clock.set("2026-10-15T12:05:00")
+        [r] = self.recs(self.run_bot())
+        self.assertEqual((r["did"], r["target"], r["file"], r["before"], r["after"]),
+                         ("mark", "asks", "build/bot/asks.json", "shadow", "live"))
+        self.assertEqual(r["undo"], "set asks false in build/bot/live.json")
+        body = json.loads(path.read_text(encoding="utf-8"))
+        self.assertIs(body["live"], True)
+        self.assertEqual([(a["id"], a["pano"]) for a in body["asks"]], [("key1:INT63", True)])
+        self.clock.set("2026-10-15T12:10:00")
+        self.assertEqual(self.recs(self.run_bot()), [])  # marked once, not every pass
+        self.live(asks=False)
+        self.clock.set("2026-10-15T12:15:00")
+        self.assertEqual([r["did"] for r in self.recs(self.run_bot())], ["unmark"])
+        self.assertNotIn("live", json.loads(path.read_text(encoding="utf-8")))
+
+    def test_hold_dispatch_live_pauses_then_releases_its_own_pause(self):
+        self.live(hold_dispatch=True)
+        self.events(self.QUOTA)
+        ds = self.run_bot()
+        self.assertEqual(self.shadow_acts(ds), [("hold_dispatch", "O23", "dispatch")])
+        self.assertEqual(self.pause().read_text(encoding="utf-8"), "bot: O23")
+        [r] = self.recs(ds)
+        self.assertEqual((r["did"], r["before"], r["undo"]), ("hold_dispatch", "absent", "delete build/conveyor/PAUSE"))
+        self.clock.set("2026-10-15T12:30:00")
+        self.assertEqual(self.run_bot(), [])
+        self.assertTrue(self.pause().exists())  # the quota episode is still open
+        self.clock.set("2026-10-15T13:30:00")
+        [r] = self.recs(self.run_bot())
+        self.assertEqual((r["did"], r["after"], r["undo"]), ("unpause", "absent",
+                                                            "recreate build/conveyor/PAUSE with 'bot: O23'"))
+        self.assertFalse(self.pause().exists())
+
+    def test_hold_dispatch_shadow_writes_no_pause(self):
+        self.events(self.QUOTA)
+        self.assertEqual(self.shadow_acts(self.run_bot()), [("hold_dispatch", "O23", "dispatch")])
+        self.assertFalse(self.pause().exists())
+
+    def test_a_pause_the_bot_did_not_create_is_never_removed(self):
+        self.live(hold_dispatch=True)
+        self.put("build/conveyor/PAUSE", "salih")
+        self.events(self.QUOTA)
+        [r] = self.recs(self.run_bot())
+        self.assertEqual((r["did"], r["undo"]), ("kept", "none: a PAUSE the bot did not create is kept"))
+        self.clock.set("2026-10-15T15:00:00")
+        self.run_bot()
+        self.assertEqual(self.pause().read_text(encoding="utf-8"), "salih")
+
+    def test_a_bot_pause_a_human_edited_is_no_longer_the_bots(self):
+        self.live(hold_dispatch=True)
+        self.events(self.QUOTA)
+        self.run_bot()
+        self.put("build/conveyor/PAUSE", "salih: keep it")
+        self.clock.set("2026-10-15T15:00:00")
+        self.assertEqual(self.recs(self.run_bot()), [])
+        self.assertEqual(self.pause().read_text(encoding="utf-8"), "salih: keep it")
+        self.assertNotIn("pause", self.shadow().get("live", {}))
+
+    def test_off_wins_over_live_json(self):
+        self.live(ack=True, asks=True, hold_dispatch=True)
+        self.put("build/bot/OFF", "")
+        self.attention("2026-10-15T11:30:00")
+        self.events(self.QUOTA)
+        ds = self.run_bot()
+        self.assertEqual(self.recs(ds), [])
+        self.assertEqual(self.shadow_acts(ds), [("hold_dispatch", "O23", "dispatch"), ("ack", "O33", "L2")])
+        self.assertFalse(self.ack().exists() or self.pause().exists())
+        self.assertNotIn("live", json.loads((self.root / "build/bot/asks.json").read_text(encoding="utf-8")))
+
+    def test_malformed_live_json_is_shadow_and_escalates(self):
+        for n, body in enumerate(("{not json", {"ack": "yes"}, {"ack": 1}, [True])):
+            with self.subTest(body=body):
+                self.put("build/bot/live.json", body if isinstance(body, str) else json.dumps(body))
+                self.attention(f"2026-10-15T11:{n:02d}:00")
+                ds = self.run_bot()
+                self.assertEqual(self.recs(ds), [])
+                self.assertIn(("escalate_orchestrator", "FAILCLOSED", "live.json"), self.acts(ds))
+                self.assertFalse(self.ack().exists())
+                self.clock.t += 3 * 3600  # a new episode for the next bad file
+
+    def test_never_live_actions_cannot_be_enabled(self):
+        self.live(ack=True, write_key1=True, queue_fix_slice=True)
+        self.attention("2026-10-15T11:30:00")
+        ds = self.run_bot()
+        self.assertEqual(self.recs(ds), [])
+        self.assertIn(("escalate_orchestrator", "FAILCLOSED", "live.json"), self.acts(ds))
+        self.assertFalse(self.ack().exists())  # one bad key makes the whole file shadow
+
+    def test_page_salih_never_goes_live(self):
+        self.live(hold_dispatch=False, page_salih=True)
+        self.events({"ts": "2026-10-15T11:00:00", "event": "error", "lane": "L1",
+                     "message": "API Error: 529 overloaded"})
+        ds = self.run_bot()
+        self.assertIn(("escalate_orchestrator", "LIVE", "live.json"), self.shadow_acts(ds))
+        self.assertEqual(self.recs(ds), [])
+        self.assertFalse((self.root / "build" / "bot" / "page.json").exists())
+        self.assertFalse(self.pause().exists())
+
+    def test_loop_guard_demotes_ack_to_shadow_until_reset(self):
+        self.live(ack=True)
+        for now, since in (("12:00", "11:30"), ("12:40", "12:05"), ("13:20", "12:45")):
+            self.clock.set(f"2026-10-15T{now}:00")
+            self.attention(f"2026-10-15T{since}:00")
+            ds = self.run_bot()
+        self.assertEqual(self.shadow_acts(ds), [("escalate_orchestrator", "LOOP", "L2")])
+        [r] = self.recs(ds)
+        self.assertEqual((r["did"], r["rule"], r["target"], r["after"]), ("demote", "LOOP", "ack", "shadow"))
+        self.assertEqual(r["undo"], "delete live.demoted.ack in build/bot/shadow.json")
+        self.assertIn("ack", self.shadow()["live"]["demoted"])
+        self.assertEqual(self.ack().stat().st_mtime, ts("2026-10-15T12:40:00"))  # the third ack never ran
+        self.clock.set("2026-10-15T13:30:00")
+        self.attention("2026-10-15T13:00:00")
+        ds = self.run_bot()
+        self.assertEqual(self.recs(ds), [])  # still demoted although live.json says ack
+        self.assertEqual(self.ack().stat().st_mtime, ts("2026-10-15T12:40:00"))
+
+    def test_pure_shadow_keeps_no_live_state(self):
+        self.attention("2026-10-15T11:30:00")
+        self.events(self.QUOTA)
+        self.assertEqual(self.recs(self.run_bot()), [])
+        self.assertNotIn("live", self.shadow())
+
+
 if __name__ == "__main__":
     unittest.main()
