@@ -12,10 +12,16 @@ target within MATCH_S, logs one "verdict" line per decided match and keeps shado
 BOTFACTS: each pass also writes build/bot/facts.md (atomic, <= FACTS_MAX bytes): the FACT part of an
 orchestrator handoff rendered by code from the files, every line naming its source; a missing or
 unreadable source prints "unknown (<file>)", never a guess.
+BOTASKS: each pass also writes build/bot/asks.json (atomic): what Salih WOULD be asked under
+"Sizden beklenen" (SALIH RULE O39) - key 1 for a CONVSAFE range, a conveyor restart after a pushed
+scripts/conveyor.py change, a T2 approval keeping the queue dry - in the build/pano/build.py ask shape.
+An ask closes when its condition clears; open/close log one decision each; unknown input gives no
+ask and one escalate. Ask text is redacted and never names a path outside the repo.
 
     python scripts/orchbot.py --shadow [--root DIR] [--once] [--quota-ceiling PCT]
 """
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -66,6 +72,14 @@ COMMIT_RE = re.compile(r"(?m)^[ \t]*COMMIT:?(.*)$")
 CI_RE = re.compile(r"(?m)^[ \t]*CI BRANCH:?[ \t]*(ci/[\w./-]+)")
 FACT_REPORTS = 8
 TRIM = ("reports", "attention", "slices", "approvals", "lanes")  # size cap: oldest report rows go first
+ASK_MAX = {"title": 60, "why": 140, "step": 90, "where": 80, "cmd": 300}
+OUTSIDE_RE = re.compile(r"(?i)(?<![\w\\/.])(?:[a-z]:[\\/]|~[\\/]|\\\\|%\w+%|\$env:|\$home\b|\.\.[\\/]"
+                        r"|[\\/](?:users|home|[a-z])[\\/])\S*")  # never outside the repo
+LANE_NAME_RE = re.compile(r"[A-Za-z0-9][\w.-]*")
+OTHER_HOLD = {"ready", "running", "ci_pending", "overlap", "same_name_busy", "int_busy", "breaker_open"}
+CONVEYOR_PY = "scripts/conveyor.py"
+RESTART_CMD = ("Stop-ScheduledTask -TaskName 'JARVIS Konveyor'; Start-Sleep 310; "
+               "Start-ScheduledTask -TaskName 'JARVIS Konveyor'")
 
 
 def clean(line):
@@ -74,6 +88,12 @@ def clean(line):
     for rx, repl in SECRET_RES:
         line = rx.sub(repl, line)
     return line
+
+
+def ask_text(s, cap):
+    """One ask string: no secret (clean), no path outside the repo, at most cap chars."""
+    s = OUTSIDE_RE.sub("[path]", clean(str(s)))
+    return s if len(s) <= cap else s[:cap - 1] + "…"
 
 
 def num(v):
@@ -141,6 +161,9 @@ SHAPES = {  # shadow.json keys; a present key of another shape resets the state 
     "respawns": lambda v: isinstance(v, dict) and all(isinstance(x, list) and all(num(t) for t in x)
                                                      for x in v.values()),
     "head": lambda v: isinstance(v, str),
+    "asks": lambda v: isinstance(v, dict) and all(isinstance(x, str) for x in v.values()),
+    "conv": lambda v: isinstance(v, dict) and all(num(v.get(k, 0)) for k in ("pid", "seen")),
+    "conv_push": lambda v: isinstance(v, dict) and num(v.get("at", 0)) and isinstance(v.get("sha", ""), str),
 }
 
 
@@ -227,12 +250,22 @@ class Bot:
             if self.fresh("bad:facts", self.now()):
                 self.decide(self.now(), "facts.md write failed", "escalate_orchestrator", "FAILCLOSED",
                             "facts.md", f"{e!r}"[:300])
+        try:
+            asks = self.asks()
+            if not self.retry(self.write_asks, asks):
+                raise OSError(f"write failed after {cv.REPLACE_TRIES} tries")
+            self.log_asks(asks)
+        except Exception as e:  # the old asks.json stays and so does the open set; the pass goes on
+            if self.fresh("bad:asks", self.now()):
+                self.decide(self.now(), "asks.json write failed", "escalate_orchestrator", "FAILCLOSED",
+                            "asks.json", f"{e!r}"[:300])
         self.save()
         return self.new
 
     def load_state(self):
         blank = {"cursor": None, "decisions": [], "counters": {}, "seen": {}, "history": [],
-                 "fixes": {}, "respawns": {}, "head": "", "agreement": agree_blank()}
+                 "fixes": {}, "respawns": {}, "head": "", "agreement": agree_blank(),
+                 "asks": {}, "conv": {}, "conv_push": {}}
         path = self.out / "shadow.json"
         if not path.exists():
             return blank
@@ -389,11 +422,164 @@ class Bot:
 
     def write_shadow(self):
         """shadow.json via tmp + os.replace."""
-        st = dict(self.st, decisions=(self.st["decisions"] + self.new)[-KEEP:], updated=cv.iso(self.now()))
+        st = dict(self.st, decisions=(self.st["decisions"] + self.new)[-KEEP:], updated=cv.iso(self.now()),
+                  asks_open=len(self.st["asks"]))
         path = self.out / "shadow.json"
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(st, indent=1, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
+
+    # ---- asks (BOTASKS) ----------------------------------------------------------------------
+    def write_asks(self, asks):
+        """asks.json via tmp + os.replace, the build/pano/build.py ask shape plus id/since/source."""
+        path = self.out / "asks.json"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps({"updated": cv.iso(self.now()), "asks": asks}, indent=1, ensure_ascii=False),
+                       encoding="utf-8")
+        try:
+            os.replace(tmp, path)
+        except OSError:
+            tmp.unlink(missing_ok=True)
+            raise
+
+    def log_asks(self, asks):
+        """One decision when an ask opens and one when it closes; st["asks"] is the open set."""
+        now, was = self.now(), self.st["asks"]
+        cur = {a["id"]: a["since"] for a in asks}
+        for i in sorted(cur.keys() - was.keys()):
+            self.decide(now, f"ask {i}", "none", "ASK", i, f"open {i}")
+        for i in sorted(was.keys() - cur.keys()):
+            self.decide(now, f"ask {i}", "none", "ASK", i, f"close {i}")
+        self.st["asks"] = cur
+
+    def asks(self):
+        """What Salih would be asked this pass (SALIH RULE O39), derived from files, never acted on.
+        A case whose input is unknown or malformed gives no ask and one escalate per episode."""
+        self.status = self.read_json(self.conv / "status.json", {})
+        out = []
+        for case in (self.ask_key1, self.ask_restart, self.ask_t2):
+            try:
+                out += case()
+            except Exception as e:
+                if self.fresh(f"bad:{case.__name__}", self.now()):
+                    self.decide(self.now(), case.__name__, "escalate_orchestrator", "FAILCLOSED", "asks.json",
+                                f"{e!r}"[:300])
+        return out
+
+    def ask(self, aid, rule, files, title, blocks, why, steps, cmds, then, time="1 dk",
+            where="PowerShell, JARVIS depo kökü"):
+        c = ASK_MAX
+        return {"id": aid, "title": ask_text(title, c["title"]), "blocks": ask_text(blocks, c["why"]),
+                "where": ask_text(where, c["where"]), "time": time, "why": ask_text(why, c["why"]),
+                "steps": [ask_text(s, c["step"]) for s in steps[:3]],
+                "cmds": [{"label": ask_text(lb, c["title"]), "text": ask_text(t, c["cmd"])} for lb, t in cmds],
+                "then": ask_text(then, c["why"]), "since": self.st["asks"].get(aid) or cv.iso(self.now()),
+                "source": {"rule": rule, "files": files}}
+
+    def ask_key1(self):
+        """Key 1: a GREEN / CI_PENDING candidate whose range touches CONVSAFE paths, no approval file."""
+        if not isinstance(self.lanes, dict):
+            raise ValueError("lanes.json is not an object")
+        out = []
+        for lane, ln in sorted(self.lanes.items()):
+            if not isinstance(ln, dict) or not LANE_NAME_RE.fullmatch(lane):  # lane goes into a pasted cmd
+                raise ValueError(f"lanes.json {lane!r}: not an object or not a plain lane name")
+            ci, status = ln.get("ci") or {}, str(ln.get("status") or "")
+            if status not in ("GREEN", cv.CI_PENDING) or not isinstance(ci, dict) or not ci.get("sha"):
+                continue
+            sha = str(ci["sha"])
+            if not cv.SHA_RE.fullmatch(sha):
+                raise ValueError(f"lanes.json {lane}: ci.sha is not a sha")
+            rep = self.report(lane, ln)
+            if not (ci.get("cand") or cv.CANDIDATE_RE.search(rep)) or self.approved(sha, done=True):
+                continue
+            files = self.changed(ln, rep)
+            if not files:
+                raise ValueError(f"{lane}: no changed-file list for the range")
+            why = protected(files)
+            if not why:
+                continue
+            out.append(self.ask(
+                f"key1:{lane}", "CONVSAFE",
+                ["build/conveyor/lanes.json", f"build/reports/{lane}.md", "build/approvals"],
+                f"Anahtar 1: {lane} push onayı", f"{lane} aralığının main'e push'u",
+                f"{lane} CI {status}; aralık korunan yola dokunuyor: {why}",
+                [f"Aralığı oku: build/reports/{lane}.md", "Uygunsa aşağıdaki komutla onay dosyasını oluştur",
+                 "Push'u konveyör kendi kapısından yapar"],
+                [("Anahtar 1", f"New-Item -ItemType File build\\approvals\\push-{sha}-{lane}")],
+                "Konveyör kontrolleri geçerse main'e push eder; bu istek kapanır."))
+        return out
+
+    def seen_push(self, ev, at, lane):
+        """A push whose lane's range changed scripts/conveyor.py: the running conveyor is now old."""
+        sha = str(ev.get("sha") or "")
+        m = cv.APPROVAL_RE.fullmatch(STAMP_RE.sub("", str(ev.get("approval") or "")))
+        lane = (m.group(2) if m else None) or lane
+        ln = self.lanes.get(lane) if isinstance(self.lanes, dict) else None
+        if not isinstance(ln, dict):
+            return self.decide(at, f"push {sha[:12]}", "escalate_orchestrator", "FAILCLOSED", "asks.json",
+                               f"push of unknown lane {lane!r}: cannot tell whether {CONVEYOR_PY} changed")
+        # ./ prefix, case, :line suffix and glob grants all count (fail closed: a needless ask, not a miss)
+        if any(fnmatch.fnmatchcase(CONVEYOR_PY, re.sub(r":\d+$", "", f.replace("\\", "/").lower()).removeprefix("./"))
+               for f in self.changed(ln, self.report(lane, ln))):
+            self.st["conv_push"] = {"sha": sha, "at": at, "lane": lane}
+
+    def ask_restart(self):
+        """Konveyör yeniden başlat: a pushed conveyor.py change and a conveyor process older than it.
+        DECISION TAKEN: status.json has no start time, so a new pid started after the last pass that
+        still saw the old one ("after"); only that bound proves a restart after the push. A pid first
+        seen by a fresh bot after the push is unknown, not new."""
+        pid, conv, push = self.status.get("pid"), self.st["conv"], self.st["conv_push"]
+        if num(pid) and conv.get("pid") != pid:
+            conv = self.st["conv"] = {"pid": pid, "seen": self.now(), "first": not conv,
+                                      "after": conv.get("last", conv.get("seen", 0))}
+        elif num(pid):
+            conv["last"] = self.now()
+        if not push:
+            return []
+        if not num(pid):
+            raise ValueError("status.json has no pid: the conveyor start is unknown")
+        if conv["seen"] > push["at"] and conv.get("first"):
+            self.st["conv_push"] = {}
+            raise ValueError("conveyor start unknown: its pid was first seen after the push")
+        if conv.get("after", 0) >= push["at"]:
+            self.st["conv_push"] = {}
+            return []
+        return [self.ask(
+            "restart", "O39", ["build/conveyor/events.jsonl", "build/conveyor/status.json",
+                               "build/conveyor/lanes.json"],
+            "Konveyörü yeniden başlat", "Yeni konveyör kodunun çalışması",
+            f"{push.get('lane', '?')} push'u {CONVEYOR_PY} dosyasını değiştirdi; çalışan konveyör "
+            f"o push'tan ({str(push.get('sha'))[:12]}) eski.",
+            ["Aşağıdaki komutu yönetici PowerShell'de çalıştır",
+             "310 sn bekleme kilidin bayatlaması içindir, kesme"],
+            [("Yeniden başlat", RESTART_CMD)],
+            "Konveyör yeni kodla açılır; yeni pid görülünce bu istek kapanır.", time="6 dk")]
+
+    def ask_t2(self):
+        """Onay: a T2 slice with approved=false that is the only thing keeping the queue dry."""
+        items, lanes = self.status.get("backlog"), self.status.get("lanes") or []
+        if items is None:
+            return []
+        if not isinstance(items, list) or not all(isinstance(i, dict) and isinstance(i.get("id"), str)
+                                                  for i in items) or not isinstance(lanes, list):
+            raise ValueError("status.json backlog/lanes malformed")
+        states = {str(i.get("state")) for i in items}
+        # anything else holding or busy (conveyor pick_slice states, pause, holds): T2 is not the only cause
+        if states & OTHER_HOLD or any(s.startswith("held: ") for s in states) or any(
+                self.status.get(k) for k in ("paused", "usage_hold", "memory_hold", "outage_hold")) or any(isinstance(x, dict) and x.get("state") == "working"
+                                                for x in lanes):
+            return []
+        return [self.ask(
+            f"t2:{i['id']}", "T2", ["build/conveyor/status.json", "build/conveyor/backlog.json"],
+            f"Onay: {i['id']} (T2)", "Kuyruk: başka hazır dilim yok",
+            f"{i['id']} T2 dilimi onaysız (approved=false); kuyrukta başka hazır iş yok, konveyör boşta.",
+            [f"{i['id']} kapsamını build/conveyor/backlog.json içinde oku",
+             "Uygunsa o dilimde approved: true yap ve kaydet",
+             "Uygun değilse kararı orkestratöre yaz"],
+            [("Backlog'u aç", "notepad build\\conveyor\\backlog.json")],
+            "Konveyör dilimi bir sonraki turda başlatır; bu istek kapanır.", time="5 dk")
+            for i in items if i.get("state") == "needs_t2_approval"]
 
     # ---- facts (BOTFACTS) --------------------------------------------------------------------
     def write_facts(self):
@@ -753,11 +939,13 @@ class Bot:
                     files.append(tok)
         return files
 
-    def approved(self, sha):
-        try:
-            names = os.listdir(self.root / "build" / "approvals")
-        except OSError:
-            return False
+    def approved(self, sha, done=False):
+        names = []
+        for d in ("approvals", "approvals/done")[:1 + done]:  # done: a pushed approval moved to done/
+            try:
+                names += os.listdir(self.root / "build" / d)
+            except OSError:
+                pass
         for n in names:
             m = cv.APPROVAL_RE.search(n)
             if m and sha.startswith(m.group(1)):
@@ -768,7 +956,8 @@ class Bot:
     def on_event(self, ev, at):
         handler = {"ci_result": self.ci_result, "finish": self.finish, "respawn": self.respawn,
                    "error": self.error, "push_blocked": self.push_blocked, "pace": self.pace,
-                   "page": self.seen_page, "ci_rerun": self.seen_rerun}.get(ev.get("event"))
+                   "page": self.seen_page, "ci_rerun": self.seen_rerun,
+                   "push": self.seen_push}.get(ev.get("event"))
         if handler:
             handler(ev, at, str(ev.get("lane") or ""))
 

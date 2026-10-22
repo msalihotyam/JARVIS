@@ -375,15 +375,17 @@ class FailClosedTest(BotCase):
         self.put("build/conveyor/lanes.json", {"L1": ["not", "a", "dict"]})
         self.events({"ts": "2026-10-15T11:00:00", "event": "ci_result", "lane": "L1", "sha": SHA,
                      "result": "success"})
-        self.assertEqual(self.acts(self.run_bot()), [("escalate_orchestrator", "FAILCLOSED", "orchbot")])
+        # the same bad lane also stops the key-1 ask (BOTASKS), which escalates on its own
+        self.assertEqual(self.acts(self.run_bot()), [("escalate_orchestrator", "FAILCLOSED", "orchbot"),
+                                                     ("escalate_orchestrator", "FAILCLOSED", "asks.json")])
 
 
 class ShadowWriteTest(BotCase):
     def test_permission_error_retried_5x_then_one_escalation(self):
         self.events({"ts": "2026-10-15T11:00:00", "event": "pace", "usage_pct": 99})
-        # facts.md is out of this test (FactsTest covers its own write failure)
+        # facts.md / asks.json are out of this test (FactsTest / AsksTest cover their own write failure)
         with mock.patch.object(orchbot.os, "replace", side_effect=PermissionError("held")) as rep, \
-                mock.patch.object(orchbot.Bot, "write_facts"):
+                mock.patch.object(orchbot.Bot, "write_facts"), mock.patch.object(orchbot.Bot, "write_asks"):
             ds = self.run_bot()
         self.assertEqual(rep.call_count, 5)
         self.assertEqual(self.sleeps, [0.2] * 4)
@@ -667,6 +669,181 @@ class FactsTest(BotCase):
         for bad in (topic, "ntfy.sh", "sk-ant", "ghp_", "hunter2", "abc123def", "AKIA", "Z9Z9Z9Z9"):
             self.assertNotIn(bad, text)
         self.assertLessEqual(len(text.encode("utf-8")), orchbot.FACTS_MAX)
+
+
+class AsksTest(BotCase):
+    KEYS = {"id", "title", "blocks", "where", "time", "why", "steps", "cmds", "then", "since", "source"}
+
+    def asks(self):
+        return json.loads((self.root / "build" / "bot" / "asks.json").read_text(encoding="utf-8"))["asks"]
+
+    def ask_log(self):
+        return [d["detail"] for d in self.logged() if d["rule"] == "ASK"]
+
+    def key1_lane(self, lane="INT63", files=(".github/workflows/tests.yml",)):
+        self.put("build/conveyor/lanes.json", {lane: {"files": list(files), "status": "GREEN",
+                                                      "ci": {"cand": True, "sha": SHA}}})
+
+    def test_key1_opens_then_closes_on_the_approval_file(self):
+        self.key1_lane()
+        self.run_bot()
+        a, = self.asks()
+        self.assertEqual(a["id"], "key1:INT63")
+        self.assertEqual(set(a), self.KEYS)
+        self.assertEqual(a["source"]["rule"], "CONVSAFE")
+        self.assertEqual(a["cmds"][0]["text"], f"New-Item -ItemType File build\\approvals\\push-{SHA}-INT63")
+        self.run_bot()  # still open: logged once, since kept
+        self.assertEqual(self.asks()[0]["since"], a["since"])
+        self.assertEqual(self.shadow()["asks_open"], 1)
+        self.put(f"build/approvals/push-{SHA}-INT63", "")
+        self.clock.set("2026-10-15T12:10:00")
+        self.run_bot()
+        self.assertEqual(self.asks(), [])
+        self.assertEqual(self.shadow()["asks_open"], 0)
+        self.assertEqual(self.ask_log(), ["open key1:INT63", "close key1:INT63"])
+
+    def test_key1_not_protected_or_not_green_is_no_ask(self):
+        self.key1_lane(files=["jarvis/a.py"])
+        self.run_bot()
+        self.assertEqual(self.asks(), [])
+        self.put("build/conveyor/lanes.json", {"L1": {"files": [".github/workflows/tests.yml"], "status": "BLOCKED",
+                                                      "ci": {"cand": True, "sha": SHA}}})
+        self.run_bot()
+        self.assertEqual(self.asks(), [])
+        self.assertEqual(self.ask_log(), [])
+
+    def push(self, lane_files):
+        self.put("build/conveyor/lanes.json", {"L2": {"files": lane_files}})
+        self.put("build/conveyor/status.json", {"pid": 100})
+        self.run_bot()
+        self.events({"ts": "2026-10-15T12:05:00", "event": "push", "sha": SHA,
+                     "approval": f"push-{SHA}-L2"})
+        self.clock.set("2026-10-15T12:10:00")
+        self.run_bot()
+
+    def test_restart_opens_after_a_conveyor_push_and_closes_on_a_new_pid(self):
+        self.push(["scripts/conveyor.py", "tests/test_conveyor.py"])
+        a, = self.asks()
+        self.assertEqual((a["id"], a["source"]["rule"], a["time"]), ("restart", "O39", "6 dk"))
+        self.assertEqual(a["cmds"][0]["text"], orchbot.RESTART_CMD)
+        self.clock.set("2026-10-15T12:20:00")
+        self.run_bot()  # same pid: still open
+        self.assertEqual(len(self.asks()), 1)
+        self.put("build/conveyor/status.json", {"pid": 200})
+        self.clock.set("2026-10-15T12:30:00")
+        self.run_bot()
+        self.assertEqual(self.asks(), [])
+        self.assertEqual(self.ask_log(), ["open restart", "close restart"])
+
+    def test_restart_not_asked_when_conveyor_py_unchanged(self):
+        self.push(["jarvis/a.py"])
+        self.assertEqual(self.asks(), [])
+
+    def test_restart_pid_first_seen_after_the_push_escalates_once(self):
+        self.put("build/conveyor/lanes.json", {"L2": {"files": ["scripts/conveyor.py"]}})
+        self.events({"ts": "2026-10-15T11:05:00", "event": "push", "sha": SHA, "approval": f"push-{SHA}-L2"})
+        self.put("build/conveyor/status.json", {"pid": 100})
+        ds = self.run_bot()
+        self.assertEqual(self.asks(), [])
+        self.assertEqual(self.acts(ds), [("escalate_orchestrator", "FAILCLOSED", "asks.json")])
+
+    def test_push_of_unknown_lane_escalates(self):
+        self.put("build/conveyor/lanes.json", {})
+        self.events({"ts": "2026-10-15T11:05:00", "event": "push", "sha": SHA, "approval": f"push-{SHA}-ZZ"})
+        self.assertEqual(self.acts(self.run_bot()), [("escalate_orchestrator", "FAILCLOSED", "asks.json")])
+
+    def test_t2_opens_when_it_alone_keeps_the_queue_dry_and_closes(self):
+        self.put("build/conveyor/status.json", {"backlog": [{"id": "T2X", "state": "needs_t2_approval"},
+                                                            {"id": "D1", "state": "done"}], "lanes": []})
+        self.run_bot()
+        a, = self.asks()
+        self.assertEqual((a["id"], a["source"]["rule"]), ("t2:T2X", "T2"))
+        self.put("build/conveyor/status.json", {"backlog": [{"id": "T2X", "state": "needs_t2_approval"},
+                                                            {"id": "R1", "state": "ready"}], "lanes": []})
+        self.run_bot()
+        self.assertEqual(self.asks(), [])
+        self.assertEqual(self.ask_log(), ["open t2:T2X", "close t2:T2X"])
+
+    def test_t2_not_asked_while_a_lane_works(self):
+        self.put("build/conveyor/status.json", {"backlog": [{"id": "T2X", "state": "needs_t2_approval"}],
+                                                "lanes": [{"id": "L1", "state": "working"}]})
+        self.run_bot()
+        self.assertEqual(self.asks(), [])
+
+    def test_text_limits_and_where(self):
+        long = "L" + "x" * 300
+        self.key1_lane(lane=long)
+        self.put("build/conveyor/status.json", {"backlog": [{"id": "T" * 300, "state": "needs_t2_approval"}]})
+        self.run_bot()
+        asks = self.asks()
+        self.assertEqual(len(asks), 2)
+        for a in asks:
+            self.assertLessEqual(len(a["title"]), 60)
+            self.assertLessEqual(len(a["why"]), 140)
+            self.assertLessEqual(len(a["blocks"]), 140)
+            self.assertLessEqual(len(a["steps"]), 3)
+            self.assertTrue(all(len(s) <= 90 for s in a["steps"]))
+            self.assertFalse(a["where"].startswith("Bilgi"))
+            self.assertTrue(a["cmds"] and all(set(c) == {"label", "text"} for c in a["cmds"]))
+
+    def test_no_secrets_or_outside_paths(self):
+        topic = "jarvis-topic-q9"
+        lane = "sk-ant-api03-AAAABBBBCCCC"
+        self.put("build/conveyor/lanes.json", {lane: {"files": ["C:\\Users\\x\\.jarvis\\k.pem", "~/.ssh/id",
+                                                                  ".github/workflows/tests.yml"],
+                                                      "status": "GREEN", "ci": {"cand": True, "sha": SHA}}})
+        self.put("build/conveyor/status.json", {"backlog": [
+            {"id": f"https://ntfy.sh/{topic} token=hunter2secret ghp_{'a1' * 18} AKIAABCDEFGHIJKL",
+             "state": "needs_t2_approval"}]})
+        with mock.patch.dict(os.environ, {"JARVIS_NTFY_TOPIC": topic}):
+            self.run_bot()
+        asks = self.asks()
+        self.assertEqual(len(asks), 2)
+        text = json.dumps([{k: v for k, v in a.items() if k not in ("id", "source")} for a in asks],
+                          ensure_ascii=False)
+        for bad in (topic, "ntfy.sh", "sk-ant", "ghp_", "hunter2", "AKIA", "C:\\\\Users", "~/", ".jarvis"):
+            self.assertNotIn(bad, text)
+
+    def test_atomic_write_old_file_kept_on_failure(self):
+        self.key1_lane()
+        self.run_bot()
+        p = self.root / "build" / "bot" / "asks.json"
+        old = p.read_text(encoding="utf-8")
+        real = orchbot.os.replace
+
+        def held(a, b):
+            if Path(b).name == "asks.json":
+                raise PermissionError("held")
+            return real(a, b)
+
+        self.put(f"build/approvals/push-{SHA}-INT63", "")
+        self.clock.set("2026-10-15T13:00:00")
+        with mock.patch.object(orchbot.os, "replace", side_effect=held):
+            ds = self.run_bot()
+            ds += self.run_bot()
+        self.assertEqual(p.read_text(encoding="utf-8"), old)
+        self.assertFalse(p.with_name("asks.json.tmp").exists())
+        self.assertEqual(self.acts([d for d in ds if d["rule"] != "ASK"]),
+                         [("escalate_orchestrator", "FAILCLOSED", "asks.json")])
+
+    def test_malformed_input_gives_no_ask_and_one_escalate(self):
+        for rel, data in (("build/conveyor/lanes.json", {"L1": "nope"}),
+                          ("build/conveyor/lanes.json", {"L1": {"files": ["a"], "status": "GREEN",
+                                                                "ci": {"cand": True, "sha": "zz"}}}),
+                          ("build/conveyor/lanes.json", {"L1; rm x": {"files": [".github/workflows/tests.yml"],
+                                                                      "status": "GREEN",
+                                                                      "ci": {"cand": True, "sha": SHA}}}),
+                          ("build/conveyor/status.json", {"backlog": "nope"}),
+                          ("build/conveyor/status.json", {"backlog": [{"state": "needs_t2_approval"}]})):
+            with self.subTest(data=data):
+                shutil.rmtree(self.root / "build" / "bot", ignore_errors=True)
+                for f in ("lanes.json", "status.json"):
+                    (self.conv / f).unlink(missing_ok=True)
+                self.put(rel, data)
+                ds = self.run_bot() + self.run_bot()
+                self.assertEqual(self.asks(), [])
+                self.assertEqual(self.acts(ds), [("escalate_orchestrator", "FAILCLOSED", "asks.json")])
+                self.assertEqual(self.ask_log(), [])
 
 
 class MainTest(BotCase):
