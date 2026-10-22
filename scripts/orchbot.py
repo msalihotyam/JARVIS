@@ -50,6 +50,8 @@ ROUTINE_RE = re.compile(r"^(reader needs_orchestrator|FINDINGS):")
 # remove after the clean+integrated checks, branch delete after the off-main check); any other is kept
 PROVEN_RE = re.compile(r"^cleanup refused \(git (?:worktree remove|update-ref -d \S+) rc=-?\d+: ")
 FILES_RE = re.compile(r"(?m)^[ \t]*(?:[A-Z]+ )*FILES:[ \t]*(.*)$")
+PICKS_RE = re.compile(r"(?m)^PICKS\b.*(?:\n|$)((?:(?:[ \t]*\n)*[ \t]+\S.*(?:\n|$))*)")  # an INT range
+PICK_TOK_RE = re.compile(r"\b[A-Z][A-Z0-9_-]{1,63}\b")  # no '.' or '/': a lane id, never a path
 TS_FMT = "%Y-%m-%dT%H:%M:%S"
 HEAD_N = 256  # events.jsonl rotation fingerprint: a hash of its first bytes
 MATCH_S = 3600  # BOTAGREE: a decision and an actual action on one target within 60 min are one match
@@ -927,11 +929,27 @@ class Bot:
             self.reports[lane] = text
         return self.reports[lane]
 
-    def changed(self, ln, rep):
+    def changed(self, ln, rep, seen=frozenset()):
         """The range's files as far as the bot can tell without git: the lane's grant plus the
         report's FILES / ADJACENT FILES paths. DECISION TAKEN: no git diff (alternative: git diff
         origin/main..sha, a process the shadow bot must not need)."""
         files = [str(f) for f in ln.get("files") or []]
+        # BOTREPLAY2: an integration report names its range as PICKS; each pick's own report holds
+        # its FILES (and maybe its own PICKS). DECISION TAKEN: an empty block, a line naming no
+        # lane with a report, a lane already on the path, or a pick adding no path empties the
+        # whole list, so key 1 is asked (alternative: trust the other picks' lists).
+        for block in PICKS_RE.findall(rep):
+            if not block.strip():
+                return []
+            for line in filter(str.strip, block.splitlines()):
+                subs = [t for t in PICK_TOK_RE.findall(line) if self.report(t, {})]  # every lane id
+                if not subs or seen & set(subs):
+                    return []
+                for t in subs:
+                    got = self.changed({}, self.report(t, {}), seen | {t})
+                    if not got:
+                        return []
+                    files += got
         for m in FILES_RE.finditer(rep):
             for tok in re.split(r"[,\s]+", m.group(1)):
                 tok = tok.lstrip("(`'\";:").rstrip(")`'\";:,.")  # never a leading '.': .claude, .env
@@ -1081,7 +1099,7 @@ class Bot:
             if not routine or since is None or now - since <= ACK_AGE_S:
                 continue
             ack = self.conv / "ack" / cv.ack_name(iid)
-            if ack.exists() and ack.stat().st_mtime >= since:
+            if ack.exists() and since <= ack.stat().st_mtime <= now:  # BOTREPLAY2: a future ack hides nothing
                 continue
             if iid.startswith("cleanup:") and not PROVEN_RE.match(reason):
                 # BOTV1: work not proven on main stays in front of a human (fail closed); logged once a day

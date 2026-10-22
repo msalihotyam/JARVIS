@@ -168,6 +168,52 @@ class ConvsafeTest(BotCase):
                       ["JARVIS_ACTIVE_STATE.md"]):
             self.assertIsNotNone(orchbot.protected(files), files)
 
+    def integration(self, picks, **reports):  # BOTREPLAY2: an INT report has PICKS, no FILES line
+        self.put("build/conveyor/lanes.json", {"INT9": {"files": [], "ci": {"cand": True}}})
+        self.put("build/reports/INT9.md", "STATUS: CI_PENDING\nCI BRANCH: ci/int9\n\nPICKS (a -> b):\n"
+                 + "".join(f"  {p}\n" if p else "\n" for p in picks) + "LOCAL TESTS: ok\n")
+        for lane, text in reports.items():
+            self.put(f"build/reports/{lane}.md", text)
+        self.events({"ts": "2026-10-15T11:00:00", "event": "ci_result", "lane": "INT9", "sha": SHA,
+                     "result": "success"})
+        return self.acts(self.run_bot())
+
+    def test_integration_picks_with_files_write_key1(self):
+        self.assertEqual(self.integration(["e3fc068 -> a89b825 DFTONE", "DFQUEUE 86a603f -> 04b050d"],
+                                          DFTONE="STATUS: PASS\nFILES: jarvis/a.py\n",
+                                          DFQUEUE="STATUS: PASS\nFILES: jarvis/b.py, tests/test_b.py\n"),
+                         [("write_key1", "O26", "INT9")])
+
+    def test_integration_pick_without_files_asks_salih(self):
+        for picks, reps in ((["DFTONE a -> b", "INT9 fix (new) -> 816d1a1"], {}),  # glue: no report
+                            (["DFTONE a -> b", "GLUE 1d1ae24"], {"GLUE": "STATUS: PASS\n"}),  # no FILES
+                            (["DFTONE a -> b", "../../X9 -> c"], {})):  # never a path read
+            with self.subTest(picks=picks):
+                self.assertEqual(self.integration(picks, DFTONE="FILES: jarvis/a.py\n", **reps),
+                                 [("ask_salih_key1", "CONVSAFE", "INT9")])
+                (self.conv / "events.jsonl").unlink()
+                shutil.rmtree(self.root / "build" / "bot", ignore_errors=True)
+
+    def test_integration_picks_the_bot_cannot_fully_resolve_ask_salih(self):
+        reps = {"DFTONE": "FILES: jarvis/a.py\n", "CONVPACE": "FILES: scripts/conveyor.py\n",
+                "INT8": "STATUS: PASS\nFILES: jarvis/c.py\nPICKS (a -> b):\n  CONVPACE x -> y\n",
+                "NOF": "FILES: none\n", "NOI": "FILES:\n  jarvis/x.py\n"}
+        for picks in (["DFTONE a, CONVPACE b"],  # two picks on one line
+                      ["DFTONE covers it; CONVPACE 1 -> 2"],  # a noted lane before the real pick
+                      ["DFTONE a -> b", "INT8 x -> y"],  # a nested INT with its own PICKS
+                      ["DFTONE a -> b", "NOF x"], ["DFTONE a -> b", "NOI x"],  # FILES with no path
+                      ["DFTONE a -> b", "", "CONVPACE c -> d"],  # a blank line inside the block
+                      []):  # a PICKS header with no pick lines
+            with self.subTest(picks=picks):
+                self.assertEqual(self.integration(picks, **reps), [("ask_salih_key1", "CONVSAFE", "INT9")])
+                (self.conv / "events.jsonl").unlink()
+                shutil.rmtree(self.root / "build" / "bot", ignore_errors=True)
+
+    def test_integration_pick_touching_conveyor_asks_salih(self):
+        self.assertEqual(self.integration(["e3f741a -> df463a5 CONVPACE"],
+                                          CONVPACE="FILES: scripts/conveyor.py, tests/test_conveyor.py\n"),
+                         [("ask_salih_key1", "CONVSAFE", "INT9")])
+
     def test_report_files_lines_are_parsed_loosely(self):
         for line in ("CHANGED FILES: `scripts/conveyor.py`:", "FILES: JARVIS_ACTIVE_STATE.md."):
             files = orchbot.Bot.changed(None, {"files": ["jarvis/a.py"]}, f"STATUS: PASS\n{line}\n")
@@ -220,6 +266,14 @@ class StateRulesTest(BotCase):
         self.assertGreaterEqual(ack.stat().st_mtime, ts(old))
         self.assertEqual(self.acts(self.run_bot()), [("ack", "O33", "cleanup:L1"), ("ack", "O33", "L2")])
         self.assertEqual(self.run_bot(), [])
+
+    def test_ack_from_the_future_hides_nothing(self):  # BOTREPLAY2: a replay's fake now < a real ack's mtime
+        old = "2026-10-15T11:30:00"
+        self.put("build/conveyor/status.json", {"attention": [
+            {"id": "L2", "reason": "FINDINGS: 3; reader needs_orchestrator: y", "since": old}]})
+        ack = self.put("build/conveyor/ack/" + orchbot.cv.ack_name("L2"), "")
+        os.utime(ack, (ts("2026-10-15T13:00:00"),) * 2)
+        self.assertEqual(self.acts(self.run_bot()), [("ack", "O33", "L2")])
 
     def test_cleanup_refusal_not_on_main_is_kept_and_logged_once_a_day(self):
         old = "2026-10-15T11:30:00"
