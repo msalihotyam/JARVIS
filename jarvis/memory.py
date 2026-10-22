@@ -961,7 +961,8 @@ CREATE TABLE IF NOT EXISTS skill_experiences (
 # are append-only - a record's status is its LATEST memory_record_events row
 # (highest event_id), a replacement is a memory_record_supersessions row -
 # and nothing here offers an UPDATE or DELETE of them, except the one hard
-# purge (I16, ``purge_records``). memory_purge_audit keeps only purge_id,
+# purge (I16, ``purge_records``) and ``undo`` deleting the one supersession
+# row it reverses (A3; its undo-restore event names the newer record). memory_purge_audit keeps only purge_id,
 # content hash and time; memory_owned_artifacts lists files that hold record
 # content (record_id NULL = a whole-DB backup). memory_legacy_migration is
 # the insert-only ledger of the one-time M1 migration: one row per legacy id,
@@ -1322,6 +1323,7 @@ _RESERVED_EVENT_STATUSES = frozenset({
 #: A supersession written by the user's approval; undo of the newer record
 #: reverses only these.
 _APPROVAL_SUPERSEDE_REASON = "user-approved-newer"
+_UNDO_RESTORE_REASON = "undo-restore"
 _APPROVAL_SUPERSEDE_KINDS = frozenset({
     MemoryRecordKind.DECISION.value,
     MemoryRecordKind.PREFERENCE.value,
@@ -7425,6 +7427,13 @@ class SQLiteMemoryStore:
                 connection, (stored.scope.conversation_id, stored.source_conversation_id)
             ):
                 raise MemoryRecordRefused("memory_off")
+            # MEMTRIGWIRE: delete wins over an in-flight capture - checked in
+            # the writer, so a capture finishing after the delete is dropped.
+            for conversation_id in {stored.scope.conversation_id, stored.source_conversation_id} - {None}:
+                if connection.execute(
+                    "SELECT 1 FROM conversation_deletions WHERE conversation_id = ?", (conversation_id,)
+                ).fetchone():
+                    raise MemoryRecordRefused("conversation_deleted")
             project_row = connection.execute(
                 "SELECT active FROM projects WHERE id = ?", (project_id,)
             ).fetchone()
@@ -7677,7 +7686,9 @@ class SQLiteMemoryStore:
 
         If approving it superseded an older record (``_supersede_on_approval``)
         that record is APPROVED again in the same transaction - the only
-        SUPERSEDED -> APPROVED move, reversing exactly that supersession.
+        SUPERSEDED -> APPROVED move, reversing exactly that supersession - and
+        the reversed supersession row is deleted so the restored record can be
+        superseded again; its ``undo-restore <new id>`` event keeps the link.
         """
         validate_memory_record_id(record_id)
         if type(actor) is not MemoryRecordActor:
@@ -7699,6 +7710,15 @@ class SQLiteMemoryStore:
                     (row["old_record_id"],),
                 ).fetchone()
                 if current["status"] == MemoryRecordStatus.SUPERSEDED.value:
+                    # A3: the reversed row would block every later supersede
+                    # of the restored record (one row per old id); the
+                    # restore event keeps the link for the purge chain.
+                    connection.execute(
+                        "DELETE FROM memory_record_supersessions WHERE old_record_id = ? "
+                        "AND new_record_id = ? AND actor = ? AND reason = ?",
+                        (row["old_record_id"], record_id, MemoryRecordActor.USER.value,
+                         _APPROVAL_SUPERSEDE_REASON),
+                    )
                     connection.execute(
                         "INSERT INTO memory_record_events (record_id, status, "
                         "actor, reason, at) VALUES (?, ?, ?, ?, ?)",
@@ -7706,7 +7726,7 @@ class SQLiteMemoryStore:
                             row["old_record_id"],
                             MemoryRecordStatus.APPROVED.value,
                             actor.value,
-                            "undo-restore",
+                            f"{_UNDO_RESTORE_REASON} {record_id}",
                             utc_now(),
                         ),
                     )
@@ -8153,8 +8173,8 @@ class SQLiteMemoryStore:
         connection: sqlite3.Connection, record_ids: frozenset[str]
     ) -> dict[str, sqlite3.Row]:
         """The purge set, to a fixed point: the named records, their
-        supersession chain in both directions (supersession rows and
-        ``supersedes`` links) and the consolidation-origin records whose
+        supersession chain in both directions (supersession rows,
+        ``supersedes`` links and the undo-restore event of a reversed one) and the consolidation-origin records whose
         events name one of them as a whole token. An unknown named id
         refuses the purge; a link to a non-record (legacy M1) is ignored."""
         rows: dict[str, sqlite3.Row] = {}
@@ -8178,8 +8198,19 @@ class SQLiteMemoryStore:
             frontier += [linked[0] for linked in connection.execute(
                 "SELECT old_record_id FROM memory_record_supersessions WHERE new_record_id = ? "
                 "UNION SELECT new_record_id FROM memory_record_supersessions WHERE old_record_id = ? "
-                "UNION SELECT record_id FROM memory_records WHERE supersedes = ?",
-                (record_id, record_id, record_id),
+                "UNION SELECT record_id FROM memory_records WHERE supersedes = ? "
+                "UNION SELECT record_id FROM memory_record_events WHERE reason = ? "
+                "UNION SELECT substr(reason, ?) FROM memory_record_events "
+                "WHERE record_id = ? AND reason LIKE ?",
+                (
+                    record_id,
+                    record_id,
+                    record_id,
+                    f"{_UNDO_RESTORE_REASON} {record_id}",
+                    len(_UNDO_RESTORE_REASON) + 2,
+                    record_id,
+                    f"{_UNDO_RESTORE_REASON} %",
+                ),
             )]
             frontier += [derived["record_id"] for derived in connection.execute(
                 "SELECT e.record_id, e.reason FROM memory_record_events e "
