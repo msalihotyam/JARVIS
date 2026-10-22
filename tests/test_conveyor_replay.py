@@ -3,7 +3,7 @@ replayed through pass_once with a fake clock, fake runner and fake git.
 
 Each test asserts TODAY's behaviour, bad outcomes included. Its docstring carries the
 incident window and a TARGET: line (EVTAUDIT "What the conveyor should have done"); the
-fix slice for that seed flips the assertions to the TARGET (R2 R3: BREAKERV2).
+fix slice for that seed flips the assertions to the TARGET (R2 R3: BREAKERV2; R4: CIRERUN).
 
 Fixtures are inline, anonymised and live in a tmp dir (tests.test_conveyor.Base).
 """
@@ -120,13 +120,11 @@ class TestR4CIRedFlaky(Replay):
         super().setUp()
         self.git = self.c.cmd = tc.StackGit([tc.ORIGIN, tc.SHA_A, tc.SHA_B])
 
-    def test_red_ci_shard_goes_straight_to_auto_fix_without_a_rerun(self):
+    def test_red_ci_shard_reruns_once_then_a_second_red_goes_to_auto_fix(self):
         """R4 INT45 2026-10-13T23:24:46, INT50 2026-10-14T04:56:01: a CI shard went red on
         a load-sensitive test and the conveyor queued an AFX fix lane instead of a rerun.
 
-        TODAY: a CI failure marks the lane BLOCKED, never reruns the run, and queues
-        INT1-AFX then INT1-R.
-        TARGET: rerun the CI shard once (R16), then decide GREEN or AFX.
+        TODAY = TARGET (CIRERUN): rerun the CI shard once (R16), then decide GREEN or AFX.
         """
         self.drop("INT1.md", tc.INT_HDR.format("INT1") + "INTEGRATE\n")
         self.c.pass_once()
@@ -135,10 +133,18 @@ class TestR4CIRedFlaky(Replay):
         self.t += 60
         self.finish("INT1", "CI_PENDING", f"NEW MAIN SHA: {tc.SHA_A}\nCI: pushed ci/int1, run in progress\n")
         self.git.ci(tc.SHA_A, "failure")
+        self.git.fail[("gh", "run", "rerun")] = (0, "")
+        self.c.pass_once()
+        reruns = [c for c in self.git.calls if c[:3] == ["gh", "run", "rerun"]]
+        self.assertEqual(self.lanes()["INT1"]["status"], "CI_PENDING")
+        self.assertEqual([e["reason"] for e in self.ev("ci_rerun")], ["first failure"])
+        self.assertEqual(reruns, [["gh", "run", "rerun", "10", "--failed"]])
+        self.assertEqual(self.ev("auto_fix"), [])
+        self.t += 60
+        self.git.ci(tc.SHA_A, "failure")  # the shard is red again: a result, not a flake
         self.c.pass_once()
         self.assertEqual(self.lanes()["INT1"]["status"], "BLOCKED")
-        self.assertEqual(self.ev("ci_rerun"), [])
-        self.assertFalse([c for c in self.git.calls if c[:3] == ["gh", "run", "rerun"]])
+        self.assertEqual(len([c for c in self.git.calls if c[:3] == ["gh", "run", "rerun"]]), 1)
         (afx,) = self.ev("auto_fix")
         self.assertEqual((afx["lane"], afx["fix"], afx["rerun"]), ("INT1", "INT1-AFX", "INT1-R"))
 
