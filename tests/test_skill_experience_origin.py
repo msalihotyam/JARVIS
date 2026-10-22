@@ -16,6 +16,8 @@ from unittest import mock
 from jarvis import experience
 from jarvis.connectors.project_folder import PROJECT_FOLDER_CAPABILITY
 from jarvis.contracts import LOCAL_WRITE_CAPABILITY, RunStatus
+from jarvis.skill_filter import check_fields
+from jarvis.skill_store import _text_fields
 from jarvis.skill_types import ExperienceKind, RunOutcome, RunStep, RunSummary
 from tests import test_skill_learn as base
 from tests.helpers import DUMMY_CAPABILITY, DummyConnector
@@ -172,6 +174,88 @@ class ExperienceOriginTests(unittest.TestCase):
                                                   d.reason.replace(run.task.id, "<run>"))
                                                  for d in drafts]))
         self.assertEqual(seen[0], seen[1])
+
+
+# SKORIGINFIX: a uuid4 run id the S7 filter reads as a card number (the
+# 2026-10-19 CI flake of the test above: that run silently offered nothing).
+CARD_LIKE_RUN_ID = "ce7b56e4-88db-4464-9845-9910301b3d28"
+CARD = "4111 1111 1111 1111"
+
+
+class MintedRunIdTests(unittest.TestCase):
+    setUp = base.SkillLearnTests.setUp
+    core = base.SkillLearnTests.core
+    pending = base.SkillLearnTests.pending
+    learn = ExperienceOriginTests.learn
+    local_writes = ExperienceOriginTests.local_writes
+
+    def run_of(self, run_id: str, task_text: str) -> RunSummary:
+        return RunSummary(
+            run_id=run_id, task_text=task_text, project_id=None, status=RunOutcome.COMPLETED,
+            steps=(step("Raporu hazirla", DUMMY_CAPABILITY), step("Raporu kaydet", DUMMY_CAPABILITY)),
+            user_correction=None, matched_skill=None,
+        )
+
+    def test_precondition_the_filter_refuses_the_bare_run_id(self) -> None:
+        verdict = check_fields([("run_id", CARD_LIKE_RUN_ID)])
+        self.assertFalse(verdict.allowed)
+        self.assertEqual(verdict.category, "payment_card")
+
+    def test_a_card_like_minted_run_id_still_offers_a_draft(self) -> None:
+        learned = self.learn(self.run_of(CARD_LIKE_RUN_ID, summary().task_text))
+        self.assertTrue(learned["draft_ids"])
+        self.assertEqual(sorted(learned["draft_ids"]), sorted(self.pending()))
+        for draft in self.store.pending_drafts(None):
+            self.assertEqual(draft.provenance.source_run_id, CARD_LIKE_RUN_ID)
+            self.assertNotIn(CARD_LIKE_RUN_ID, draft.reason)
+            self.assertTrue(draft.reason.startswith("Taught from a finished run"))
+
+    def test_a_card_in_user_text_is_still_refused(self) -> None:
+        # The same run with plain text does offer (test above), so [] here is S7.
+        learned = self.learn(self.run_of(CARD_LIKE_RUN_ID, f"Kart {CARD} ile odeme yap"))
+        self.assertEqual(learned["draft_ids"], [])
+        self.assertEqual(self.pending(), [])
+
+    def test_a_minted_run_id_in_user_text_is_still_scanned(self) -> None:
+        text = f"Kaydi {CARD_LIKE_RUN_ID} dosyasina yaz"
+        self.assertFalse(check_fields([("task_text", text)]).allowed)
+        self.assertEqual(self.learn(self.run_of(CARD_LIKE_RUN_ID, text))["draft_ids"], [])
+
+    def test_a_run_id_not_in_the_minted_form_is_still_scanned(self) -> None:
+        for run_id in ("4111-1111-1111-1111", "run-4111111111111111"):
+            with self.subTest(run_id=run_id):
+                self.setUp()
+                self.assertFalse(check_fields([("run_id", run_id)]).allowed)
+                learned = self.learn(self.run_of(run_id, summary().task_text))
+                self.assertEqual(learned["draft_ids"], [])
+
+    def test_only_the_exact_minted_form_of_the_top_level_run_id_is_not_text(self) -> None:
+        u = CARD_LIKE_RUN_ID
+        self.assertEqual(_text_fields({"run_id": u}), [])
+        self.assertEqual(_text_fields({"task_text": "a", "run_id": u}), [("task_text", "a")])
+        variants = {
+            "uppercase": u.upper(),
+            "braces": "{" + u + "}",
+            "no hyphens": u.replace("-", ""),
+            "urn prefix": "urn:uuid:" + u,
+            "trailing newline": u + "\n",
+            "leading space": " " + u,
+            "fullwidth digit": u.replace("7", "７", 1),
+            "arabic-indic digit": u.replace("4", "٤", 1),
+            "cyrillic homoglyph": u.replace("e", "е", 1),
+            "version 1 nibble": u[:14] + "1" + u[15:],
+            "variant nibble": u[:19] + "c" + u[20:],
+            "truncated": u[:-1],
+            "extended": u + "0",
+            "empty": "",
+        }
+        for label, value in variants.items():
+            with self.subTest(variant=label):
+                self.assertEqual(_text_fields({"run_id": value}), [("run_id", value)])
+        # Not the record's own run id: any other key, or a nested run_id.
+        self.assertEqual(_text_fields({"task_text": u}), [("task_text", u)])
+        self.assertEqual(_text_fields({"steps": [{"run_id": u}]}), [("steps-1-run_id", u)])
+        self.assertEqual(_text_fields({"source": {"run_id": u}}), [("source-run_id", u)])
 
 
 if __name__ == "__main__":

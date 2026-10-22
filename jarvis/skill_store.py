@@ -79,6 +79,11 @@ _NOT_TEXT = frozenset(
         "target_skill_id", "project_id", "created_at", "kind", "origin",
     }
 )
+#: A run id as contracts mints it (str(uuid4())): random hex the filter can
+#: misread as a phone or card number. Only this exact form is not text.
+_MINTED_RUN_ID = re.compile(
+    r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
+)
 
 _Columns = tuple[tuple[str, Callable[[Any], Any]], ...]
 _SCOPE: _Columns = (
@@ -153,13 +158,25 @@ def _renormalized(data: Any) -> Any:
     return data
 
 
+def _minted_run_id(key: str, value: Any, name: str) -> bool:
+    """A record's own top-level run id in the minted uuid4 form: a system id,
+    not user text. Any other value of it stays scanned (fail closed)."""
+    return (
+        not name
+        and type(key) is str
+        and key == "run_id"
+        and type(value) is str
+        and _MINTED_RUN_ID.fullmatch(value) is not None
+    )
+
+
 def _text_fields(data: Any, name: str = "") -> list[tuple[str, str]]:
     """Every free-text value of a to_dict tree, named in skill_filter's grammar."""
     if isinstance(data, dict):
         return [
             pair
             for key, value in data.items()
-            if key not in _NOT_TEXT
+            if key not in _NOT_TEXT and not _minted_run_id(key, value, name)
             for pair in _text_fields(value, f"{name}-{key}" if name else key)
         ]
     if isinstance(data, list):
