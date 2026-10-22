@@ -612,7 +612,8 @@ def _now() -> datetime:
 
 
 def _held_for(started_at: object) -> str:
-    """TESTLOCK: ' for 1h40m' since a holder's ``started_at`` (naive = UTC); '' when unknown or in the future."""
+    """TESTLOCK: ' (held 1h40m)' since a holder's ``started_at`` (naive = UTC); '' when unknown or in the future.
+    TLMSGFIX: it goes AFTER the established '<holder> since <ts>' text, which readers match on."""
     try:
         start = datetime.fromisoformat(started_at.replace("Z", "+00:00"))
         if start.tzinfo is None:
@@ -622,7 +623,7 @@ def _held_for(started_at: object) -> str:
         return ""
     if minutes < 0:
         return ""
-    return f" for {minutes // 60}h{minutes % 60:02d}m" if minutes >= 60 else f" for {minutes}m"
+    return f" (held {minutes // 60}h{minutes % 60:02d}m)" if minutes >= 60 else f" (held {minutes}m)"
 
 
 class UiLock:
@@ -657,7 +658,7 @@ class UiLock:
             return None  # no file, free (empty), mid-write or garbage: not a holder
         if not -_FUTURE_SKEW <= age <= _SUITE_STALE:
             return None
-        return f"{_plain(rec['lane'])} (full suite){_held_for(rec['started_at'])} since {_plain(rec['started_at'])}"
+        return f"{_plain(rec['lane'])} (full suite) since {_plain(rec['started_at'])}{_held_for(rec['started_at'])}"
 
     def _take(self, text: str):
         if text.strip() and text != self.record:
@@ -667,7 +668,7 @@ class UiLock:
             except (ValueError, KeyError, TypeError):
                 pid = 0  # garbage: stale
             if pid > 0 and _same_process(pid, rec.get("created")):  # pid reuse: another process is no holder
-                return f"{_plain(rec.get('lane'))}/{pid}{_held_for(rec.get('started_at'))} since {_plain(rec.get('started_at'))}", None
+                return f"{_plain(rec.get('lane'))}/{pid} since {_plain(rec.get('started_at'))}{_held_for(rec.get('started_at'))}", None
         return None, self.record
 
     def _enqueue(self, text: str):

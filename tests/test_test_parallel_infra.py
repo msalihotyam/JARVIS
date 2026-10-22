@@ -132,7 +132,7 @@ class UiQueueTests(Temp):
     def test_a_waiter_is_told_who_holds_the_lock_and_for_how_long(self):
         """TESTLOCK: GMAILMOVE waited 1h40m behind FGT without being told how long."""
         rec = {"lane": "FGT", "pid": os.getpid(), "created": None, "started_at": "2026-10-18T14:56:00+00:00"}
-        cases = [("2026-10-18T14:56:00+00:00", " for 1h40m since 2026-10-18T14:56:00+00:00"),
+        cases = [("2026-10-18T14:56:00+00:00", " since 2026-10-18T14:56:00+00:00 (held 1h40m)"),
                  ("2026-10-18T17:00:00+00:00", " since 2026-10-18T17:00:00+00:00"),  # ahead of the clock: no length
                  ("x", " since x"), ("", " since \n"), (None, " since None"), (5, " since 5"), ("missing", " since None")]
         lock = self.lock("GMAILMOVE")
@@ -148,8 +148,8 @@ class UiQueueTests(Temp):
 
     def test_held_for(self):
         with mock.patch.object(tp, "_now", lambda: NOW):
-            for started_at, want in (("2026-10-18T16:00:00Z", " for 36m"), ("2026-10-18T14:56:00", " for 1h40m"),
-                                     ("2026-10-18T18:36:00+02:00", " for 0m"), ("2026-10-17T16:36:00Z", " for 24h00m"),
+            for started_at, want in (("2026-10-18T16:00:00Z", " (held 36m)"), ("2026-10-18T14:56:00", " (held 1h40m)"),
+                                     ("2026-10-18T18:36:00+02:00", " (held 0m)"), ("2026-10-17T16:36:00Z", " (held 24h00m)"),
                                      ("2026-10-18T16:37:00+00:00", ""), ("9999-12-31T23:59:59", ""),
                                      ("", ""), (None, ""), (1.5, ""), (b"2026-10-18", ""), ({}, "")):
                 self.assertEqual(tp._held_for(started_at), want, started_at)
@@ -159,7 +159,7 @@ class UiQueueTests(Temp):
                  "command": "x", "heartbeat": "2026-10-18T16:35:00+00:00"}
         (self.dir / "suite.json").write_text(json.dumps(suite), encoding="utf-8")
         with mock.patch.object(tp, "_now", lambda: NOW):
-            self.assertEqual(self.lock("FOO")._suite_holder(), "FGT (full suite) for 1h00m since 2026-10-18T15:36:00+00:00")
+            self.assertEqual(self.lock("FOO")._suite_holder(), "FGT (full suite) since 2026-10-18T15:36:00+00:00 (held 1h00m)")
 
 
 #: TESTLOCK: the frozen clock of the lock message tests (FGT's run had held the lock 1h40m by then).
