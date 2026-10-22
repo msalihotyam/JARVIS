@@ -498,7 +498,7 @@ class AgreementTest(BotCase):
         self.assertEqual(self.kinds(), ["agree"])
         v = self.verdicts()[0]
         self.assertEqual((v["key"], v["bot"]["would_do"], v["orchestrator"]["did"], v["orchestrator"]["side"]),
-                         ("key1:l1", "write_key1", "write_key1", "orchestrator"))
+                         (f"key1:l1@{SHA[:7]}", "write_key1", "write_key1", "orchestrator"))
         ag = self.shadow()["agreement"]
         self.assertEqual(ag["key1"], {"agree": 1, "total": 1})
         self.assertEqual(ag["totals"], {"write_key1": {"agree": 1}})
@@ -545,10 +545,16 @@ class AgreementTest(BotCase):
         self.run_bot()
         self.assertEqual(self.kinds(), ["unmatched", "missed"])
         v = self.verdicts()[1]
-        self.assertEqual((v["key"], v["bot"], v["orchestrator"]["did"]), ("key1:l2", None, "write_key1"))
+        self.assertEqual((v["key"], v["bot"], v["orchestrator"]["did"]), (f"key1:l2@{SHA2[:7]}", None, "write_key1"))
         ag = self.shadow()["agreement"]
         self.assertEqual(ag["key1"], {"agree": 0, "total": 2})
         self.assertEqual([r["verdict"] for r in ag["recent"]], ["unmatched", "missed"])
+
+    def test_key1_agree_key_keeps_sha(self):
+        k = orchbot.agree_key
+        self.assertNotEqual(k("write_key1", f"push-{SHA}-l"), k("write_key1", f"push-{SHA2}-l"))
+        self.assertEqual(k("write_key1", f"push-{SHA}-L"), f"key1:l@{SHA[:7]}")
+        self.assertEqual(k("write_key1", "L"), "key1:l")
 
     def test_window_edge_3600_matches(self):
         self.approve("2026-10-15T12:00:00")
@@ -608,6 +614,36 @@ class FactsTest(BotCase):
                     "2026-10-15T10:00:00")
         self.put(f"build/approvals/push-{SHA}-botfacts", "ok")
         self.put(f"build/approvals/done/push-{SHA2[:12]}", "ok")
+        self.put(".git/refs/heads/main", SHA + "\n")
+        self.put(".git/packed-refs", f"# pack-refs with: peeled\n{SHA2} refs/remotes/origin/main\n")
+
+    def test_main_from_git_refs_without_git(self):
+        self.fixtures()
+        self.put(".git/refs/remotes/origin/main", SHA + "\n")  # loose ref wins over packed-refs
+        self.assertEqual((orchbot.git_ref(self.root, "refs/heads/main"),
+                          orchbot.git_ref(self.root, "refs/remotes/origin/main")), (SHA, SHA))
+        (self.root / ".git" / "refs" / "remotes" / "origin" / "main").unlink()
+        self.assertEqual(orchbot.git_ref(self.root, "refs/remotes/origin/main"), SHA2)  # packed-refs
+        self.put(".git/refs/heads/main", "not a sha\n")
+        self.assertIsNone(orchbot.git_ref(self.root, "refs/heads/main"))
+        shutil.rmtree(self.root / ".git")
+        self.put(".git", "gitdir: elsewhere")  # a worktree .git file: not read
+        self.assertIsNone(orchbot.git_ref(self.root, "refs/heads/main"))
+        self.run_bot()
+        self.assertIn("- local: unknown (.git)\n", self.facts())
+
+    def test_running_lanes_live_only_capped(self):
+        self.fixtures()
+        hist = [{"id": f"H{i}", "model": "opus", "effort": "x", "state": s, "started_at": "2026-10-01T00:00:00"}
+                for i, s in enumerate(["done", "failed", None, "missing", "reported", ["working"]])]
+        live = [{"id": f"W{i:02}", "model": "opus", "effort": "x", "state": s, "started_at": "2026-10-15T11:50:00"}
+                for i, s in enumerate(["working", "running", "starting", "blocked"] * 3)]
+        self.put("build/conveyor/status.json", {"lanes": hist + live})
+        self.run_bot()
+        text = self.facts()
+        self.assertFalse(any(f"- H{i}:" in text for i in range(6)))
+        self.assertEqual(sum(x.startswith("- W") for x in text.splitlines()), orchbot.LANES_MAX)
+        self.assertIn("- +2 more (status.json)\n", text)
 
     def report(self, name, text, at):
         p = self.put(f"build/reports/{name}.md", text)
@@ -624,7 +660,7 @@ class FactsTest(BotCase):
         for x in text.splitlines():
             if x.startswith("- ") or x.startswith("# "):
                 self.assertRegex(x, r"\([\w./ +-]+\)$")
-        for want in [f"- local: {SHA[:10]} (status.json)", f"- origin: {SHA2[:10]} (status.json)",
+        for want in [f"- local: {SHA[:10]} (.git)", f"- origin: {SHA2[:10]} (.git)",
                      "- alive: yes, status written 2 min ago (status.json)", "- paused: no (status.json)",
                      "- band: day (status.json)", "- usage: 42.5% (status.json)", "- usage hold: no (status.json)",
                      f"- window reset: {orchbot.cv.iso(ts('2026-10-13T09:00:00') + 7 * 86400)} (pace.json)",
@@ -642,7 +678,8 @@ class FactsTest(BotCase):
 
     def test_each_missing_source_prints_unknown(self):
         self.fixtures()
-        cases = {"build/conveyor/status.json": ["- local: unknown (status.json)", "- alive: unknown (status.json)",
+        cases = {".git": ["- local: unknown (.git)", "- origin: unknown (.git)"],
+                 "build/conveyor/status.json": ["- alive: unknown (status.json)",
                                                 "- usage: unknown (status.json)", "- push gate breaker: unknown"],
                  "build/conveyor/pace.json": ["- window reset: unknown (pace.json)"],
                  "pace.json days": ["- window reset: unknown (pace.json)"],
@@ -724,6 +761,14 @@ class FactsTest(BotCase):
             self.assertNotIn(bad, text)
         self.assertLessEqual(len(text.encode("utf-8")), orchbot.FACTS_MAX)
 
+    def test_quoted_key_secret_redacted(self):
+        for raw in ('"token": "hunter2secret"', "'key'='hunter2secret'", '{"password":"hunter2secret"}',
+                    "api_key=hunter2secret", "access_token=hunter2secret", "Authorization: Bearer hunter2secret",
+                    "token => hunter2secret", '"token" : "a hunter2secret"'):
+            with self.subTest(raw=raw):
+                self.assertNotIn("hunter2", orchbot.clean(raw))
+                self.assertNotIn("hunter2", orchbot.ask_text(raw, 300))
+
 
 class AsksTest(BotCase):
     KEYS = {"id", "title", "blocks", "where", "time", "why", "steps", "cmds", "then", "since", "source"}
@@ -766,14 +811,16 @@ class AsksTest(BotCase):
         self.assertEqual(self.asks(), [])
         self.assertEqual(self.ask_log(), [])
 
-    def push(self, lane_files):
-        self.put("build/conveyor/lanes.json", {"L2": {"files": lane_files}})
+    STARTS = {100: ts("2026-10-15T11:00:00"), 200: ts("2026-10-15T12:25:00")}
+
+    def push(self, lane_files, lane="L2", approval="L2"):
+        self.put("build/conveyor/lanes.json", {lane: {"files": lane_files}})
         self.put("build/conveyor/status.json", {"pid": 100})
-        self.run_bot()
+        self.run_bot(started=self.STARTS.get)
         self.events({"ts": "2026-10-15T12:05:00", "event": "push", "sha": SHA,
-                     "approval": f"push-{SHA}-L2"})
+                     "approval": f"push-{SHA}-{approval}"})
         self.clock.set("2026-10-15T12:10:00")
-        self.run_bot()
+        self.run_bot(started=self.STARTS.get)
 
     def test_restart_opens_after_a_conveyor_push_and_closes_on_a_new_pid(self):
         self.push(["scripts/conveyor.py", "tests/test_conveyor.py"])
@@ -781,25 +828,46 @@ class AsksTest(BotCase):
         self.assertEqual((a["id"], a["source"]["rule"], a["time"]), ("restart", "O39", "6 dk"))
         self.assertEqual(a["cmds"][0]["text"], orchbot.RESTART_CMD)
         self.clock.set("2026-10-15T12:20:00")
-        self.run_bot()  # same pid: still open
+        self.run_bot(started=self.STARTS.get)  # same pid: still open
         self.assertEqual(len(self.asks()), 1)
         self.put("build/conveyor/status.json", {"pid": 200})
         self.clock.set("2026-10-15T12:30:00")
-        self.run_bot()
+        self.run_bot(started=self.STARTS.get)
         self.assertEqual(self.asks(), [])
         self.assertEqual(self.ask_log(), ["open restart", "close restart"])
+
+    def test_restart_live_int63b_push_while_old_conveyor_runs(self):
+        # live case (c): INT63B pushed scripts/conveyor.py, approval name is lowercase, conveyor started before
+        self.push(["scripts/conveyor.py"], lane="INT63B", approval="int63b")
+        a, = self.asks()
+        self.assertEqual(a["id"], "restart")
+        self.assertIn("INT63B", a["why"])
+
+    def test_restart_conveyor_started_after_the_push_is_no_ask(self):
+        self.STARTS = {100: ts("2026-10-15T12:06:00")}
+        self.push(["scripts/conveyor.py"])
+        self.assertEqual(self.asks(), [])
+        self.assertEqual(self.ask_log(), [])
 
     def test_restart_not_asked_when_conveyor_py_unchanged(self):
         self.push(["jarvis/a.py"])
         self.assertEqual(self.asks(), [])
 
-    def test_restart_pid_first_seen_after_the_push_escalates_once(self):
-        self.put("build/conveyor/lanes.json", {"L2": {"files": ["scripts/conveyor.py"]}})
-        self.events({"ts": "2026-10-15T11:05:00", "event": "push", "sha": SHA, "approval": f"push-{SHA}-L2"})
-        self.put("build/conveyor/status.json", {"pid": 100})
-        ds = self.run_bot()
-        self.assertEqual(self.asks(), [])
-        self.assertEqual(self.acts(ds), [("escalate_orchestrator", "FAILCLOSED", "asks.json")])
+    def test_restart_unreadable_start_escalates_once(self):
+        def gone(pid):
+            raise OSError("no such process")
+
+        for started in (gone, lambda pid: None):
+            with self.subTest(started=started):
+                shutil.rmtree(self.root / "build" / "bot", ignore_errors=True)
+                (self.conv / "events.jsonl").unlink(missing_ok=True)
+                self.put("build/conveyor/lanes.json", {"L2": {"files": ["scripts/conveyor.py"]}})
+                self.events({"ts": "2026-10-15T11:05:00", "event": "push", "sha": SHA,
+                             "approval": f"push-{SHA}-L2"})
+                self.put("build/conveyor/status.json", {"pid": 100})
+                ds = self.run_bot(started=started) + self.run_bot(started=started)
+                self.assertEqual(self.asks(), [])
+                self.assertEqual(self.acts(ds), [("escalate_orchestrator", "FAILCLOSED", "asks.json")])
 
     def test_push_of_unknown_lane_escalates(self):
         self.put("build/conveyor/lanes.json", {})
@@ -824,10 +892,60 @@ class AsksTest(BotCase):
         self.run_bot()
         self.assertEqual(self.asks(), [])
 
+    def test_t2_lanes_missing_or_not_list_is_unknown_not_idle(self):
+        for lanes in ({}, {"lanes": None}, {"lanes": {"L1": "working"}}):
+            with self.subTest(lanes=lanes):
+                shutil.rmtree(self.root / "build" / "bot", ignore_errors=True)
+                self.put("build/conveyor/status.json",
+                         {"backlog": [{"id": "T2X", "state": "needs_t2_approval"}], **lanes})
+                ds = self.run_bot() + self.run_bot()
+                self.assertEqual(self.asks(), [])
+                self.assertEqual(self.acts(ds), [("escalate_orchestrator", "FAILCLOSED", "asks.json")])
+
+    def test_key1_cmd_too_long_fails_closed(self):
+        self.key1_lane(lane="L" + "x" * 300)  # cmd naming the approval file would pass the 300 cap
+        ds = self.run_bot() + self.run_bot()
+        self.assertEqual(self.asks(), [])
+        self.assertEqual(self.acts(ds), [("escalate_orchestrator", "FAILCLOSED", "asks.json")])
+
+    def test_ask_id_and_source_sanitized(self):
+        topic = "jarvis-topic-q9"
+        self.put("build/conveyor/status.json", {"lanes": [], "backlog": [
+            {"id": f"https://ntfy.sh/{topic} token=hunter2secret C:\\Users\\x\\.jarvis\\k " + "T" * 200,
+             "state": "needs_t2_approval"}]})
+        with mock.patch.dict(os.environ, {"JARVIS_NTFY_TOPIC": topic}):
+            self.run_bot()
+        a, = self.asks()
+        text = json.dumps([a["id"], a["source"]], ensure_ascii=False)
+        for bad in (topic, "ntfy.sh", "hunter2", "C:\\\\Users", ".jarvis"):
+            self.assertNotIn(bad, text)
+        self.assertLessEqual(len(a["id"]), orchbot.ASK_MAX["where"])
+        self.assertEqual(a["source"]["rule"], "T2")
+
+    def test_ask_id_prefix_smuggled_path_and_collisions(self):
+        ids = ["t2:aC:\\ProgramData\\x", "t2:a\\\\srv\\share", "t2:a~\\.jarvis\\k", "T" * 90 + "a", "T" * 90 + "b"]
+        self.put("build/conveyor/status.json", {"lanes": [], "backlog": [
+            {"id": i, "state": "needs_t2_approval"} for i in ids]})
+        self.run_bot()
+        got = [a["id"] for a in self.asks()]
+        self.assertEqual(len(set(got)), len(ids))
+        for bad in ("ProgramData", "srv", ".jarvis"):
+            self.assertFalse(any(bad in g for g in got), bad)
+
+    def test_t2_unreadable_or_live_non_working_lane_is_busy(self):
+        for lane in ("L1", {"state": "blocked"}, {"state": "Starting"}, {"state": ["working"]}):
+            with self.subTest(lane=lane):
+                shutil.rmtree(self.root / "build" / "bot", ignore_errors=True)
+                self.put("build/conveyor/status.json",
+                         {"backlog": [{"id": "T2X", "state": "needs_t2_approval"}], "lanes": [lane]})
+                self.run_bot()
+                self.assertEqual(self.asks(), [])
+
     def test_text_limits_and_where(self):
-        long = "L" + "x" * 300
+        long = "L" + "x" * 200  # longest lane whose key-1 cmd still fits uncut (m6)
         self.key1_lane(lane=long)
-        self.put("build/conveyor/status.json", {"backlog": [{"id": "T" * 300, "state": "needs_t2_approval"}]})
+        self.put("build/conveyor/status.json", {"backlog": [{"id": "T" * 300, "state": "needs_t2_approval"}],
+                                                "lanes": []})
         self.run_bot()
         asks = self.asks()
         self.assertEqual(len(asks), 2)
@@ -848,13 +966,15 @@ class AsksTest(BotCase):
                                                       "status": "GREEN", "ci": {"cand": True, "sha": SHA}}})
         self.put("build/conveyor/status.json", {"backlog": [
             {"id": f"https://ntfy.sh/{topic} token=hunter2secret ghp_{'a1' * 18} AKIAABCDEFGHIJKL",
-             "state": "needs_t2_approval"}]})
+             "state": "needs_t2_approval"}], "lanes": []})
         with mock.patch.dict(os.environ, {"JARVIS_NTFY_TOPIC": topic}):
-            self.run_bot()
+            ds = self.run_bot()
         asks = self.asks()
-        self.assertEqual(len(asks), 2)
-        text = json.dumps([{k: v for k, v in a.items() if k not in ("id", "source")} for a in asks],
-                          ensure_ascii=False)
+        # m6: the key-1 cmd would carry the sk-ant lane, so it is refused (fail closed), never rewritten
+        self.assertEqual([a["id"] for a in asks], [asks[0]["id"]])
+        self.assertEqual(asks[0]["source"]["rule"], "T2")
+        self.assertIn(("escalate_orchestrator", "FAILCLOSED", "asks.json"), self.acts(ds))
+        text = json.dumps(asks, ensure_ascii=False)  # M2: id and source checked too
         for bad in (topic, "ntfy.sh", "sk-ant", "ghp_", "hunter2", "AKIA", "C:\\\\Users", "~/", ".jarvis"):
             self.assertNotIn(bad, text)
 

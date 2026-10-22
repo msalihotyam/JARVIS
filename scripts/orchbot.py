@@ -65,7 +65,9 @@ ALIVE_S = 10 * 60  # status.json older than this = the conveyor is not writing (
 SECRET_RES = (  # facts.md never carries a URL (ntfy topic), a key or a key=value secret
     (re.compile(r"https?://\S+"), "[url]"),
     (re.compile(r"\b(?:sk-|ghp_|gho_|github_pat_|xox[abp]-|AKIA)[\w-]{6,}"), "[key]"),
-    (re.compile(r"(?i)\b(token|key|secret|password|passwd|topic|bearer|auth\w*)(\s*[:=]\s*)\S+"), r"\1\2[redacted]"),
+    (re.compile(r"(?i)\b(bearer\s+)\S+"), r"\1[redacted]"),
+    (re.compile(r"""(?i)(?<![a-z0-9])(token|key|secret|password|passwd|topic|bearer|auth\w*)(["']?\s*=?[:=>]\s*)"""
+                r"""(?:"[^"]*"|'[^']*'|\S+)"""), r"\1\2[redacted]"),
     # long token between dashes, so push-<40 hex>-lane (approval names) and a hex sha never match
     (re.compile(r"(?=[\w+]*[g-zG-Z])(?=[\w+]*\d)[\w+]{32,}"), "[redacted]"),
 )
@@ -75,10 +77,12 @@ CI_RE = re.compile(r"(?m)^[ \t]*CI BRANCH:?[ \t]*(ci/[\w./-]+)")
 FACT_REPORTS = 8
 TRIM = ("reports", "attention", "slices", "approvals", "lanes")  # size cap: oldest report rows go first
 ASK_MAX = {"title": 60, "why": 140, "step": 90, "where": 80, "cmd": 300}
-OUTSIDE_RE = re.compile(r"(?i)(?<![\w\\/.])(?:[a-z]:[\\/]|~[\\/]|\\\\|%\w+%|\$env:|\$home\b|\.\.[\\/]"
-                        r"|[\\/](?:users|home|[a-z])[\\/])\S*")  # never outside the repo
+OUTSIDE_RE = re.compile(r"(?i)(?:[a-z]:[\\/]|~[\\/]|\\\\|%\w+%|\$env:|\$home\b|\.jarvis\b"
+                        r"|(?<![\w\\/.])(?:\.\.[\\/]|[\\/](?:users|home|[a-z])[\\/]))\S*")  # never outside the repo
 LANE_NAME_RE = re.compile(r"[A-Za-z0-9][\w.-]*")
 OTHER_HOLD = {"ready", "running", "ci_pending", "overlap", "same_name_busy", "int_busy", "breaker_open"}
+LIVE_STATES = {"working", "running", "starting", "blocked"}  # facts "running lanes": others are history
+LANES_MAX = 10
 CONVEYOR_PY = "scripts/conveyor.py"
 RESTART_CMD = ("Stop-ScheduledTask -TaskName 'JARVIS Konveyor'; Start-Sleep 310; "
                "Start-ScheduledTask -TaskName 'JARVIS Konveyor'")
@@ -98,6 +102,32 @@ def ask_text(s, cap):
     return s if len(s) <= cap else s[:cap - 1] + "…"
 
 
+def git_ref(root, name):
+    """A ref's sha read from <root>/.git without a git process (loose ref, then packed-refs), else None."""
+    git = Path(root) / ".git"
+    if not git.is_dir():
+        return None
+    try:
+        loose = git / name
+        if loose.is_file():
+            sha = loose.read_text(encoding="utf-8").strip()
+            return sha if cv.SHA_RE.fullmatch(sha) else None
+        packed = git / "packed-refs"
+        if packed.is_file():
+            for line in packed.read_text(encoding="utf-8").splitlines():
+                parts = line.split()
+                if len(parts) == 2 and parts[1] == name and cv.SHA_RE.fullmatch(parts[0]):
+                    return parts[0]
+    except (OSError, UnicodeDecodeError):
+        return None
+    return None
+
+
+def proc_started(pid):
+    """A process start time (epoch seconds) from its Windows FILETIME; OSError when unreadable."""
+    return cv.WinProcs().created(pid) / 1e7 - 11644473600
+
+
 def num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
 
@@ -109,7 +139,8 @@ def agree_key(action, target):
         return "ack:" + cv.ack_name(t).lower()
     if action in KEY1:  # a lane, or a push_blocked approval name: its ci suffix is the lane
         m = cv.APPROVAL_RE.fullmatch(STAMP_RE.sub("", t))
-        return "key1:" + ((m.group(2) or m.group(1)) if m else t).lower()
+        # the sha stays in the key: two pushes of one lane are two decisions, never one match
+        return "key1:" + (f"{m.group(2) or ''}@{m.group(1)[:7]}" if m else t).lower()
     return {"queue_fix_slice": "fix:" + t.lower(), "rerun_ci_once": "rerun:" + t.lower(),
             "hold_dispatch": "dispatch", "page_salih": "salih"}.get(action)
 
@@ -205,8 +236,10 @@ def protected(files):
 
 
 class Bot:
-    def __init__(self, root, now=time.time, sleep=time.sleep, quota_ceiling=90, from_start=False):
+    def __init__(self, root, now=time.time, sleep=time.sleep, quota_ceiling=90, from_start=False,
+                 started=proc_started):
         self.root = Path(root)
+        self.started = started  # pid -> process start epoch (OSError when unreadable)
         self.conv = self.root / "build" / "conveyor"
         self.out = self.root / "build" / "bot"
         self.now, self.sleep, self.ceiling, self.from_start = now, sleep, quota_ceiling, from_start
@@ -371,7 +404,7 @@ class Bot:
         self.st["seen"][key] = at
         return True
 
-    def decide(self, at, saw, action, rule, target, detail=""):
+    def decide(self, at, saw, action, rule, target, detail="", key=None):
         assert action in ACTIONS, action  # nosec B101 - a programming error, the closed enum
         hist = [h for h in self.st["history"] if at - h[0] < LOOP_S]
         if action not in ("none", "escalate_orchestrator") and \
@@ -384,7 +417,7 @@ class Bot:
                "rule": rule, "target": target, "detail": str(detail).replace("\n", " ")[:500]}
         self.new.append(rec)
         self.st["counters"][action] = self.st["counters"].get(action, 0) + 1
-        key = agree_key(action, target)
+        key = key or agree_key(action, target)
         if key:
             self.st["agreement"]["pending"].append({"at": at, "action": action, "rule": rule, "target": target,
                                                     "key": key, "detail": rec["detail"]})
@@ -471,12 +504,19 @@ class Bot:
     def ask(self, aid, rule, files, title, blocks, why, steps, cmds, then, time="1 dk",
             where="PowerShell, JARVIS depo kökü"):
         c = ASK_MAX
+        for _, t in cmds:  # a pasted cmd names the approval file: a cut or rewritten one is wrong
+            if ask_text(t, c["cmd"]) != t:
+                raise ValueError(f"{aid}: cmd would be truncated or rewritten, no ask (fail closed)")
+        safe = ask_text(aid, c["where"])
+        if safe != aid:  # two raw ids must never collapse into one sanitized id
+            safe = ask_text(aid, c["where"] - 9) + "-" + hashlib.sha1(str(aid).encode()).hexdigest()[:8]
+        aid = safe
         return {"id": aid, "title": ask_text(title, c["title"]), "blocks": ask_text(blocks, c["why"]),
                 "where": ask_text(where, c["where"]), "time": time, "why": ask_text(why, c["why"]),
                 "steps": [ask_text(s, c["step"]) for s in steps[:3]],
                 "cmds": [{"label": ask_text(lb, c["title"]), "text": ask_text(t, c["cmd"])} for lb, t in cmds],
                 "then": ask_text(then, c["why"]), "since": self.st["asks"].get(aid) or cv.iso(self.now()),
-                "source": {"rule": rule, "files": files}}
+                "source": {"rule": ask_text(rule, c["title"]), "files": [ask_text(f, c["where"]) for f in files]}}
 
     def ask_key1(self):
         """Key 1: a GREEN / CI_PENDING candidate whose range touches CONVSAFE paths, no approval file."""
@@ -517,6 +557,8 @@ class Bot:
         sha = str(ev.get("sha") or "")
         m = cv.APPROVAL_RE.fullmatch(STAMP_RE.sub("", str(ev.get("approval") or "")))
         lane = (m.group(2) if m else None) or lane
+        # approval names are lowercase (push-<sha>-int63b), lanes.json keys are not (INT63B)
+        lane = next((k for k in self.lanes if k.lower() == lane.lower()), lane) if isinstance(self.lanes, dict) else lane
         ln = self.lanes.get(lane) if isinstance(self.lanes, dict) else None
         if not isinstance(ln, dict):
             return self.decide(at, f"push {sha[:12]}", "escalate_orchestrator", "FAILCLOSED", "asks.json",
@@ -528,23 +570,18 @@ class Bot:
 
     def ask_restart(self):
         """Konveyör yeniden başlat: a pushed conveyor.py change and a conveyor process older than it.
-        DECISION TAKEN: status.json has no start time, so a new pid started after the last pass that
-        still saw the old one ("after"); only that bound proves a restart after the push. A pid first
-        seen by a fresh bot after the push is unknown, not new."""
-        pid, conv, push = self.status.get("pid"), self.st["conv"], self.st["conv_push"]
-        if num(pid) and conv.get("pid") != pid:
-            conv = self.st["conv"] = {"pid": pid, "seen": self.now(), "first": not conv,
-                                      "after": conv.get("last", conv.get("seen", 0))}
-        elif num(pid):
-            conv["last"] = self.now()
+        DECISION TAKEN: the start is the OS creation time of status.json's pid (the lock carries only
+        a heartbeat); a start at/after the push event closes the ask, an unreadable start keeps the
+        push pending and escalates once (fail closed: never assume a restart)."""
+        pid, push = self.status.get("pid"), self.st["conv_push"]
         if not push:
             return []
-        if not num(pid):
+        if type(pid) is not int or not 0 < pid < 2 ** 32:
             raise ValueError("status.json has no pid: the conveyor start is unknown")
-        if conv["seen"] > push["at"] and conv.get("first"):
-            self.st["conv_push"] = {}
-            raise ValueError("conveyor start unknown: its pid was first seen after the push")
-        if conv.get("after", 0) >= push["at"]:
+        start = self.started(int(pid))
+        if not num(start):
+            raise ValueError(f"conveyor pid {pid}: start time unreadable")
+        if start >= push["at"]:
             self.st["conv_push"] = {}
             return []
         return [self.ask(
@@ -560,7 +597,7 @@ class Bot:
 
     def ask_t2(self):
         """Onay: a T2 slice with approved=false that is the only thing keeping the queue dry."""
-        items, lanes = self.status.get("backlog"), self.status.get("lanes") or []
+        items, lanes = self.status.get("backlog"), self.status.get("lanes")  # missing lanes = unknown, not idle
         if items is None:
             return []
         if not isinstance(items, list) or not all(isinstance(i, dict) and isinstance(i.get("id"), str)
@@ -569,8 +606,9 @@ class Bot:
         states = {str(i.get("state")) for i in items}
         # anything else holding or busy (conveyor pick_slice states, pause, holds): T2 is not the only cause
         if states & OTHER_HOLD or any(s.startswith("held: ") for s in states) or any(
-                self.status.get(k) for k in ("paused", "usage_hold", "memory_hold", "outage_hold")) or any(isinstance(x, dict) and x.get("state") == "working"
-                                                for x in lanes):
+                self.status.get(k) for k in ("paused", "usage_hold", "memory_hold", "outage_hold")) or any(not isinstance(x, dict) or not isinstance(x.get("state"), (str, type(None)))
+                                                    or str(x.get("state")).lower() in LIVE_STATES
+                                                for x in lanes):  # an unreadable lane is never idle
             return []
         return [self.ask(
             f"t2:{i['id']}", "T2", ["build/conveyor/status.json", "build/conveyor/backlog.json"],
@@ -618,12 +656,10 @@ class Bot:
         def get(k, ok):
             return st[k] if st is not None and ok(st.get(k)) else None
 
-        # DECISION TAKEN: status.json publishes no main sha today, so main prints unknown until the
-        # conveyor writes status["main"] = {"local": sha, "origin": sha} (alternative: run git, a
-        # process the shadow bot must not need)
-        main = get("main", lambda v: isinstance(v, dict))
-        main_lines = [f"{k}: {v[:10]} ({S})" if isinstance(v, str) and HEX_RE.fullmatch(v) else f"{k}: {unk(S)}"
-                      for k, v in (("local", (main or {}).get("local")), ("origin", (main or {}).get("origin")))]
+        # status.json publishes no main sha: read the refs from .git files (no git process)
+        main_lines = [f"{k}: {v[:10]} (.git)" if v else f"{k}: {unk('.git')}"
+                      for k, v in (("local", git_ref(self.root, "refs/heads/main")),
+                                   ("origin", git_ref(self.root, "refs/remotes/origin/main")))]
 
         conv = []
         upd = parse_ts(get("updated_at", lambda v: isinstance(v, str)))
@@ -656,13 +692,14 @@ class Bot:
 
         lanes = get("lanes", lambda v: isinstance(v, list))
         lane_rows = []
-        for ln in lanes or []:
-            if not isinstance(ln, dict):
-                continue
+        live = [ln for ln in lanes or [] if isinstance(ln, dict) and str(ln.get("state")).lower() in LIVE_STATES]
+        for ln in live[:LANES_MAX]:
             t = parse_ts(ln.get("started_at"))
             mins = f"{int(now - t) // 60} min" if t is not None else "unknown min"
             lane_rows.append(f"{ln.get('id') or ln.get('name')}: {ln.get('model')}/{ln.get('effort')}, "
                              f"running {mins}, state {ln.get('state')} ({S})")
+        if len(live) > LANES_MAX:
+            lane_rows.append(f"+{len(live) - LANES_MAX} more ({S})")
 
         raw = backlog.get("slices") if isinstance(backlog, dict) else backlog
         slices = {str(s.get("id")): s for s in raw if isinstance(s, dict)} if isinstance(raw, list) else None
@@ -1018,11 +1055,11 @@ class Bot:
             return self.decide(at, saw, "none", "O26", lane, "not a candidate flow; the conveyor gate decides")
         if self.approved(sha):
             return self.decide(at, saw, "none", "O26", lane, "key 1 already in build/approvals")
-        why = protected(self.changed(ln, rep))
+        why, key = protected(self.changed(ln, rep)), agree_key("write_key1", f"push-{sha}-{lane}")
         if why:
-            self.decide(at, saw, "ask_salih_key1", "CONVSAFE", lane, why)
+            self.decide(at, saw, "ask_salih_key1", "CONVSAFE", lane, why, key=key)
         else:
-            self.decide(at, saw, "write_key1", "O26", lane, f"build/approvals/push-{sha}-{lane}")
+            self.decide(at, saw, "write_key1", "O26", lane, f"build/approvals/push-{sha}-{lane}", key=key)
 
     def finish(self, ev, at, lane):
         status = str(ev.get("status") or "").upper()
