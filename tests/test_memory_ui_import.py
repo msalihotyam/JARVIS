@@ -20,7 +20,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from PySide6.QtCore import QPointF, Qt
+from PySide6.QtCore import QMetaObject, QPointF, Qt
 from PySide6.QtTest import QTest
 
 from jarvis.app import JarvisApp
@@ -122,6 +122,82 @@ class MemoryImportTests(K6Case):
 
     def texts(self, root, name):
         return [i.property("text") for i in self.named(root, name)]
+
+    # -- V21HARD2C: a preview answer landing while a run is in flight ---------
+    #
+    # The person picked another file before pressing Import; its preview lands
+    # mid-run. The run must still reach a terminal state for the plan it runs.
+
+    def confirmed_plan(self):
+        root = self.open_dialog()
+        self.ui.importHistoryPreview(self.export.as_uri())
+        settled(500, lambda: self.assertEqual(2, len(self.named(root, "memoryImportGroup"))))
+        first = min(self.named(root, "memoryImportGroup"), key=lambda i: self.box(i)[1])
+        chips = [c for c in self.named(root, "memoryImportScope") if first.isAncestorOf(c)]
+        self.press(root, next(c for c in chips if c.property("label") == "Beta"))
+        settled(300, lambda: self.assertTrue(self.item(root, "memoryImportRun").property("enabled")))
+        return root, self.answers["preview"][-1]["plan_id"]
+
+    def run_while_preview_lands(self, root, plan_id, path, answer, during=None):
+        def run(_app, plan, _scopes):
+            self.ui.importHistoryPreview(path)
+            if during is not None:
+                during()
+            return {"plan_id": plan, "runs": [], **answer}
+        with mock.patch.object(JarvisApp, "import_history_run", autospec=True, side_effect=run) as call:
+            self.click(root, "memoryImportRun", until=lambda: call.called)
+        self.assertEqual(1, call.call_count)                       # no double import
+        self.assertEqual((plan_id, {"0": self.beta}), call.call_args.args[1:])
+        self.assertNotEqual(plan_id, self.answers["preview"][-1].get("plan_id"))
+        settled(500, lambda: self.assertFalse(self.item(root, "memoryImportStop").property("visible")))
+        self.assertTrue(self.item(root, "memoryImportPick").property("enabled"))
+
+    def other_export(self) -> str:
+        other = Path(self.export.parent) / "gamma.json"
+        other.write_text(json.dumps([{"name": "Gamma notes", "chat_messages": [
+            {"sender": "human", "text": "We deploy on Fridays."}]}]), encoding="utf-8")
+        return other.as_uri()
+
+    def test_run_finishes_when_a_preview_lands_during_it(self) -> None:
+        root, plan_id = self.confirmed_plan()
+        self.run_while_preview_lands(root, plan_id, self.other_export(),
+                                     {"ok": True, "pending": 2, "cancelled": False})
+        settled(500, lambda: self.assertEqual(["Memory records waiting for your approval in the Memory list: 2"],
+                                              self.texts(root, "memoryImportResult")))
+        self.assertEqual(["Gamma notes"], self.texts(root, "memoryImportGroupTitle"))   # the new plan is shown
+        self.assertFalse(self.item(root, "memoryImportRun").property("enabled"))      # nothing confirmed in it
+
+    def test_run_finishes_when_a_refused_preview_lands_during_it(self) -> None:
+        root, plan_id = self.confirmed_plan()
+        inside = self.root / "export.json"                          # protected: the preview is refused
+        inside.write_text(self.export.read_text(encoding="utf-8"), encoding="utf-8")
+        self.run_while_preview_lands(root, plan_id, str(inside), {"ok": True, "pending": 1, "cancelled": False})
+        settled(500, lambda: self.assertEqual(["Memory records waiting for your approval in the Memory list: 1"],
+                                              self.texts(root, "memoryImportResult")))
+        self.assertIn("protected", self.item(root, "memoryImportNotice").property("text"))
+
+    def test_refused_run_ends_when_a_preview_lands_during_it(self) -> None:
+        root, plan_id = self.confirmed_plan()
+        self.run_while_preview_lands(root, plan_id, self.other_export(), {"ok": False, "error": "plan expired"})
+        settled(500, lambda: self.assertNotEqual("", self.item(root, "memoryImportNotice").property("text")))
+        self.assertEqual("", self.item(root, "memoryImportResult").property("text"))
+
+    def test_cancelled_run_ends_when_a_preview_lands_during_it(self) -> None:
+        root, plan_id = self.confirmed_plan()
+        self.run_while_preview_lands(root, plan_id, self.other_export(),
+                                     {"ok": True, "pending": 0, "cancelled": True})
+        settled(500, lambda: self.assertEqual(
+            ["Import stopped. Memory records waiting for your approval in the Memory list: 0"],
+            self.texts(root, "memoryImportResult")))
+
+    def test_stop_targets_the_running_plan_after_a_preview_lands(self) -> None:
+        root, plan_id = self.confirmed_plan()
+        stop = lambda: QMetaObject.invokeMethod(self.item(root, "memoryImportStop"), "clicked")   # noqa: E731
+        with mock.patch.object(JarvisApp, "import_history_cancel", autospec=True,
+                               return_value={"ok": True}) as cancel:
+            self.run_while_preview_lands(root, plan_id, self.other_export(),
+                                         {"ok": True, "pending": 0, "cancelled": True}, during=stop)
+        self.assertEqual([plan_id], [c.args[1] for c in cancel.call_args_list])
 
 
 if __name__ == "__main__":

@@ -14,6 +14,9 @@ JarvisDialog {
     property var groups: []
     property var chosen: ({})                 // group_id -> project_id, set only by the person's click
     property bool running: false
+    // The plan the in-flight run was started for: a preview answer landing
+    // mid-run replaces planId, but the run still ends (and stops) by this one.
+    property string runningPlanId: ""
     property string notice: ""                // the last refusal, as returned
     property string result: ""
     readonly property int confirmedCount: Object.keys(chosen).length
@@ -38,16 +41,17 @@ JarvisDialog {
             importDialog.notice = answer.ok === true ? "" : String(answer.error || "")
         }
         function onImportRunDone(answer) {
-            if (answer.plan_id !== importDialog.planId) return
-            importDialog.running = false
-            importDialog.notice = answer.ok === true ? "" : String(answer.error || "")
-            if (answer.ok !== true) return
+            if (!importDialog.running || answer.plan_id !== importDialog.runningPlanId) return
+            importDialog.running = false; importDialog.runningPlanId = ""
+            // A preview refusal that landed mid-run stays shown when the run succeeds.
+            if (answer.ok !== true) { importDialog.notice = String(answer.error || ""); return }
             importDialog.result = (answer.cancelled ? qsTr("Import stopped. ") : "")
                 + qsTr("Memory records waiting for your approval in the Memory list: %1").arg(answer.pending || 0)
             importDialog.chosen = ({})
         }
         function onImportCancelDone(answer) {
-            if (answer.plan_id === importDialog.planId && answer.ok !== true) importDialog.notice = String(answer.error || "")
+            if (answer.plan_id === (importDialog.runningPlanId || importDialog.planId) && answer.ok !== true)
+                importDialog.notice = String(answer.error || "")
         }
     }
 
@@ -97,11 +101,12 @@ JarvisDialog {
     buttons: [
         ActionButton { objectName: "memoryImportClose"; label: qsTr("Close"); height: 36; onClicked: importDialog.close() },
         ActionButton { objectName: "memoryImportStop"; label: qsTr("Stop import"); height: 36; visible: importDialog.running
-                       onClicked: bridge.cancelImport(importDialog.planId) },
+                       onClicked: bridge.cancelImport(importDialog.runningPlanId) },
         ActionButton { objectName: "memoryImportRun"; primary: true; height: 36
                        label: qsTr("Import (%1)").arg(importDialog.confirmedCount)
                        enabled: importDialog.planId !== "" && importDialog.confirmedCount > 0 && !importDialog.running
-                       onClicked: { importDialog.running = true; importDialog.result = ""; importDialog.notice = ""
+                       onClicked: { importDialog.running = true; importDialog.runningPlanId = importDialog.planId
+                                    importDialog.result = ""; importDialog.notice = ""
                                     bridge.importHistoryRun(importDialog.planId, importDialog.chosen) } }
     ]
 
