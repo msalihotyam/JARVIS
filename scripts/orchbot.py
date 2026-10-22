@@ -6,6 +6,9 @@ and appends what it WOULD do to build/bot/decisions.jsonl; build/bot/shadow.json
 cursor, counters, rule memory and the last 50 decisions for the pano. It never acts: no git, no
 network, no model calls, never data/jarvis.db. Rules: ORCH_RULES O5 O10 O15 O19 O23 O26 O33 and
 EVTAUDIT (R4, R7, #1). A bad input logs one escalate_orchestrator decision; a pass never crashes.
+BOTAGREE: each pass also observes what the orchestrator/conveyor actually did (ack files, approvals,
+new backlog ids, pace.json, page / ci_rerun events), matches it to the bot's decisions on the same
+target within MATCH_S, logs one "verdict" line per decided match and keeps shadow.json "agreement".
 
     python scripts/orchbot.py --shadow [--root DIR] [--once] [--quota-ceiling PCT]
 """
@@ -39,10 +42,66 @@ PROVEN_RE = re.compile(r"^cleanup refused \(git (?:worktree remove|update-ref -d
 FILES_RE = re.compile(r"(?m)^[ \t]*(?:[A-Z]+ )*FILES:[ \t]*(.*)$")
 TS_FMT = "%Y-%m-%dT%H:%M:%S"
 HEAD_N = 256  # events.jsonl rotation fingerprint: a hash of its first bytes
+MATCH_S = 3600  # BOTAGREE: a decision and an actual action on one target within 60 min are one match
+RECENT_N = 10
+GRAD_DAYS, GRAD_PUSHES = 7, 10  # stage 4 exit: >= 1 week, >= 10 key-1 decisions, 100% agree
+KEY1 = {"write_key1", "ask_salih_key1"}
+STAMP_RE = re.compile(r"\.\d{8}-\d{6}$")  # approvals/done/<name>.<YYYYmmdd-HHMMSS> on a name clash
+PACE_KEYS = ("max_lanes", "min_lanes", "lanes_present", "lanes_away")  # a decrease = dispatch held
 
 
 def num(v):
     return isinstance(v, (int, float)) and not isinstance(v, bool)
+
+
+def agree_key(action, target):
+    """The target both sides name (lowercase), None for an action that is never matched."""
+    t = str(target)
+    if action == "ack":
+        return "ack:" + cv.ack_name(t).lower()
+    if action in KEY1:  # a lane, or a push_blocked approval name: its ci suffix is the lane
+        m = cv.APPROVAL_RE.fullmatch(STAMP_RE.sub("", t))
+        return "key1:" + ((m.group(2) or m.group(1)) if m else t).lower()
+    return {"queue_fix_slice": "fix:" + t.lower(), "rerun_ci_once": "rerun:" + t.lower(),
+            "hold_dispatch": "dispatch", "page_salih": "salih"}.get(action)
+
+
+def agree_blank():
+    return {"start": None, "since": None, "pending": [], "actual": [], "known": None, "totals": {},
+            "rules": {}, "key1": {"agree": 0, "total": 0}, "recent": [],
+            "graduation": {"days": 0, "pushes": 0, "agree_pct": 0.0, "ready": False}}
+
+
+def entries(v):
+    return isinstance(v, list) and all(
+        isinstance(e, dict) and num(e.get("at")) and isinstance(e.get("key"), str) and e.get("action") in ACTIONS
+        for e in v)
+
+
+def counts(v):
+    return isinstance(v, dict) and all(isinstance(c, dict) and all(type(n) is int for n in c.values())
+                                       for c in v.values())
+
+
+def known_ok(v):
+    return v is None or isinstance(v, dict) and isinstance(v.get("acks"), dict) and \
+        all(num(t) for t in v["acks"].values()) and \
+        all(isinstance(v.get(k), list) and all(isinstance(x, str) for x in v[k]) for k in ("approvals", "backlog")) \
+        and isinstance(v.get("pace"), dict) and all(num(x) or isinstance(x, bool) for x in v["pace"].values())
+
+
+AGREE_SHAPES = {  # shadow.json "agreement"; a present key of another shape resets the block (fail closed)
+    "start": lambda v: v is None or num(v),
+    "since": lambda v: v is None or isinstance(v, str),
+    "pending": lambda v: entries(v) and all(isinstance(e.get("rule"), str) for e in v),
+    "actual": lambda v: entries(v) and all(e.get("side") in ("orchestrator", "conveyor") for e in v),
+    "known": known_ok,
+    "totals": counts,
+    "rules": counts,
+    "key1": lambda v: isinstance(v, dict) and all(type(v.get(k)) is int for k in ("agree", "total")),
+    "recent": lambda v: isinstance(v, list) and all(isinstance(r, dict) for r in v),
+    "graduation": lambda v: isinstance(v, dict),
+}
 
 
 SHAPES = {  # shadow.json keys; a present key of another shape resets the state (fail closed)
@@ -105,8 +164,9 @@ class Bot:
     def run(self):
         """One pass; returns the decisions it appended."""
         self.out.mkdir(parents=True, exist_ok=True)
-        self.new, self.reports = [], {}
+        self.new, self.reports, self.verdicts, self.observed = [], {}, [], []
         self.st = self.load_state()
+        self.check_agreement()
         self.lanes = self.read_json(self.conv / "lanes.json", {})
         self.backlog = self.read_json(self.conv / "backlog.json", {})
         try:
@@ -125,12 +185,21 @@ class Bot:
             except Exception as e:
                 self.decide(self.now(), check.__name__, "escalate_orchestrator", "FAILCLOSED", "orchbot",
                             f"check error: {e!r}")
+        saved = json.loads(json.dumps(self.st["agreement"]))
+        try:
+            self.agree()
+        except Exception as e:  # fail closed: the block stays as it was, the decisions still land
+            saved["actual"] += self.observed  # the event cursor already moved past them
+            self.st["agreement"], self.verdicts = saved, []
+            if self.fresh("bad:agreement", self.now()):
+                self.decide(self.now(), "agreement", "escalate_orchestrator", "FAILCLOSED", "orchbot",
+                            f"agreement error: {e!r}"[:300])
         self.save()
         return self.new
 
     def load_state(self):
         blank = {"cursor": None, "decisions": [], "counters": {}, "seen": {}, "history": [],
-                 "fixes": {}, "respawns": {}, "head": ""}
+                 "fixes": {}, "respawns": {}, "head": "", "agreement": agree_blank()}
         path = self.out / "shadow.json"
         if not path.exists():
             return blank
@@ -247,6 +316,10 @@ class Bot:
                "rule": rule, "target": target, "detail": str(detail).replace("\n", " ")[:500]}
         self.new.append(rec)
         self.st["counters"][action] = self.st["counters"].get(action, 0) + 1
+        key = agree_key(action, target)
+        if key:
+            self.st["agreement"]["pending"].append({"at": at, "action": action, "rule": rule, "target": target,
+                                                    "key": key, "detail": rec["detail"]})
 
     def save(self):
         now = self.now()
@@ -255,7 +328,7 @@ class Bot:
         st["respawns"] = {n: ts for n, ts in st["respawns"].items() if ts and ts[-1] >= now - RESPAWN_S}
         st["history"] = [h for h in st["history"] if h[0] >= now - LOOP_S]
         st["counters"]["passes"] = st["counters"].get("passes", 0) + 1
-        if self.new and not self.retry(self.append, self.new):  # the decisions still land in shadow.json
+        if (self.new or self.verdicts) and not self.retry(self.append, self.new + self.verdicts):
             self.decide(now, "decisions.jsonl write failed", "escalate_orchestrator", "FAILCLOSED",
                         "decisions.jsonl", "this pass's decisions are only in shadow.json")
         if not self.retry(self.write_shadow):  # the decisions of this pass still land in decisions.jsonl
@@ -288,6 +361,143 @@ class Bot:
         tmp = path.with_name(path.name + ".tmp")
         tmp.write_text(json.dumps(st, indent=1, ensure_ascii=False), encoding="utf-8")
         os.replace(tmp, path)
+
+    # ---- agreement (BOTAGREE) ----------------------------------------------------------------
+    def check_agreement(self):
+        ag = self.st.get("agreement")
+        bad = ["not an object"] if not isinstance(ag, dict) else \
+            [k for k, ok in AGREE_SHAPES.items() if k in ag and not ok(ag[k])]
+        if bad:
+            # DECISION TAKEN: reset only the agreement block (alternative: reset the whole state)
+            self.st["agreement"] = agree_blank()
+            self.decide(self.now(), "shadow.json agreement malformed", "escalate_orchestrator", "FAILCLOSED",
+                        "shadow.json agreement", f"bad: {', '.join(bad)}; agreement reset")
+        else:
+            self.st["agreement"] = dict(agree_blank(), **ag)
+
+    def observe(self, known):
+        """(actuals, known): what the orchestrator/conveyor did since the last pass, read from files only.
+        DECISION TAKEN: the first pass (or one after a reset) only records a baseline (alternative:
+        count every file already there as an actual)."""
+        now, out = self.now(), []
+        first, known = known is None, known or {"acks": {}, "approvals": [], "backlog": [], "pace": {}}
+
+        def act(at, action, key, side, what):
+            if not first:
+                out.append({"at": at, "action": action, "key": key, "side": side, "what": what[:200]})
+
+        def files(d):  # (name, path, mtime); a file that vanishes mid-scan is skipped, not the whole dir
+            found = []
+            try:
+                with os.scandir(d) as it:
+                    for e in it:
+                        try:
+                            if e.is_file():
+                                found.append((e.name, e.path, e.stat().st_mtime))
+                        except FileNotFoundError:
+                            pass
+            except FileNotFoundError:
+                pass
+            return sorted(found)
+
+        acks = {}
+        for name, _, mt in files(self.conv / "ack"):
+            acks[name] = mt
+            if mt > known["acks"].get(name, -1):
+                act(mt, "ack", "ack:" + name.lower(), "orchestrator", f"ack/{name}")
+        approvals = set()
+        for d in (self.root / "build" / "approvals", self.root / "build" / "approvals" / "done"):
+            for raw, path, mt in files(d):
+                name = STAMP_RE.sub("", raw)
+                ident = f"{name}@{int(mt)}"  # a push renames it into done/, keeping its mtime
+                if not cv.APPROVAL_RE.fullmatch(name) or ident in approvals:
+                    continue
+                approvals.add(ident)
+                if ident in known["approvals"] or first:
+                    continue
+                try:
+                    with open(path, encoding="utf-8", errors="replace") as f:
+                        text = f.read(512)
+                except FileNotFoundError:  # moved into done/ mid-pass: seen there, or next pass
+                    approvals.discard(ident)
+                    continue
+                key = agree_key("write_key1", name)
+                if text.startswith("auto-approved by the conveyor"):
+                    act(mt, "write_key1", key, "conveyor", f"{raw}: {text}")
+                elif re.search(r"\bby salih\b", text, re.I):
+                    act(mt, "ask_salih_key1", key, "orchestrator", f"{raw}: {text}")
+                else:
+                    act(mt, "write_key1", key, "orchestrator", f"{raw}: {text}")
+        slices = self.backlog.get("slices")
+        ids = sorted({str(s.get("id")) for s in slices if isinstance(s, dict) and s.get("id")}) \
+            if isinstance(slices, list) else known["backlog"]
+        for i in ids:
+            if i not in known["backlog"]:
+                act(now, "queue_fix_slice", agree_key("queue_fix_slice", i.split("-")[0]), "orchestrator",
+                    f"backlog id {i}")
+        p, old = self.read_json(self.conv / "pace.json", {}), known["pace"]
+        pace = dict({k: p[k] for k in PACE_KEYS if num(p.get(k))}, paused=bool(p.get("pause") or p.get("paused"))) \
+            if p else old
+        cut = [k for k in PACE_KEYS if num(pace.get(k)) and num(old.get(k)) and pace[k] < old[k]]
+        if pace.get("paused") and not old.get("paused"):
+            cut.append("paused")
+        if cut:  # ponytail: one hold per pass whatever changed; per-key holds if they are ever told apart
+            act(now, "hold_dispatch", "dispatch", "orchestrator", f"pace.json {', '.join(cut)}")
+        return out, {"acks": acks, "approvals": sorted(approvals), "backlog": ids, "pace": pace}
+
+    def agree(self):
+        """Match each pending decision to an actual action on the same key within MATCH_S. Every
+        decided match is one verdict; a pass that decides nothing changes nothing (idempotent)."""
+        now, ag = self.now(), self.st["agreement"]
+        if ag["start"] is None:  # DECISION TAKEN: the first measuring pass (alternative: the first shadow pass)
+            ag["start"] = now
+        ag["since"] = cv.iso(ag["start"])[:10]
+        actual, ag["known"] = self.observe(ag["known"])
+        pend = sorted(ag["pending"], key=lambda e: e["at"])
+        acts = sorted(ag["actual"] + actual + self.observed, key=lambda e: e["at"])
+        used, keep = set(), []
+        for a in acts:
+            i = next((i for i, p in enumerate(pend) if i not in used and p["key"] == a["key"]
+                      and abs(p["at"] - a["at"]) <= MATCH_S), None)
+            if i is not None:
+                used.add(i)
+                self.verdict("agree" if pend[i]["action"] == a["action"] else "disagree", pend[i], a)
+            elif now - a["at"] <= MATCH_S:
+                keep.append(a)
+            elif a["side"] == "orchestrator":  # DECISION TAKEN: a conveyor action is never missed
+                self.verdict("missed", None, a)  # (alternative: count it missed too)
+        ag["actual"] = keep
+        ag["pending"] = []
+        for i, p in enumerate(pend):
+            if i in used:
+                continue
+            if now - p["at"] > MATCH_S:
+                self.verdict("unmatched", p, None)
+            else:
+                ag["pending"].append(p)
+        k1 = ag["key1"]
+        ag["graduation"] = {"days": int((now - ag["start"]) // 86400), "pushes": k1["total"],
+                            "agree_pct": round(100 * k1["agree"] / k1["total"], 1) if k1["total"] else 0.0}
+        ag["graduation"]["ready"] = ag["graduation"]["days"] >= GRAD_DAYS and k1["total"] >= GRAD_PUSHES \
+            and k1["agree"] == k1["total"]
+
+    def verdict(self, kind, p, a):
+        ag = self.st["agreement"]
+        rec = {"ts": cv.iso(self.now()), "verdict": kind, "key": (p or a)["key"], "rule": p and p["rule"],
+               "bot": p and {"at": cv.iso(p["at"]), "would_do": p["action"], "rule": p["rule"],
+                             "target": p.get("target"), "detail": p.get("detail")},
+               "orchestrator": a and {"at": cv.iso(a["at"]), "did": a["action"], "side": a["side"],
+                                      "what": a.get("what")}}
+        self.verdicts.append(rec)
+        for book, name in ((ag["totals"], (p or a)["action"]), (ag["rules"], p and p["rule"])):
+            if name:
+                book.setdefault(name, {}).setdefault(kind, 0)
+                book[name][kind] += 1
+        if (p and p["action"] in KEY1) or (a and a["action"] in KEY1):
+            ag["key1"]["total"] += 1
+            ag["key1"]["agree"] += kind == "agree"
+        if kind != "agree":
+            ag["recent"] = (ag["recent"] + [rec])[-RECENT_N:]
 
     # ---- inputs ------------------------------------------------------------------------------
     def report(self, lane, ln):
@@ -332,9 +542,18 @@ class Bot:
     # ---- event rules -------------------------------------------------------------------------
     def on_event(self, ev, at):
         handler = {"ci_result": self.ci_result, "finish": self.finish, "respawn": self.respawn,
-                   "error": self.error, "push_blocked": self.push_blocked, "pace": self.pace}.get(ev.get("event"))
+                   "error": self.error, "push_blocked": self.push_blocked, "pace": self.pace,
+                   "page": self.seen_page, "ci_rerun": self.seen_rerun}.get(ev.get("event"))
         if handler:
             handler(ev, at, str(ev.get("lane") or ""))
+
+    def seen_page(self, ev, at, lane):
+        self.observed.append({"at": at, "action": "page_salih", "key": "salih", "side": "conveyor",
+                              "what": f"page {ev.get('result')} lines={ev.get('lines')}"[:200]})
+
+    def seen_rerun(self, ev, at, lane):
+        self.observed.append({"at": at, "action": "rerun_ci_once", "key": agree_key("rerun_ci_once", lane),
+                              "side": "conveyor", "what": f"ci_rerun {lane} {str(ev.get('sha'))[:12]} rc={ev.get('rc')}"})
 
     def ci_result(self, ev, at, lane):
         ln = self.lanes.get(lane) or {}
