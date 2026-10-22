@@ -429,7 +429,7 @@ class BuildDraftTests(unittest.TestCase):
                     "created_at": CREATED_AT,
                 },
                 "reason": (
-                    "Taught from run run-1: 3 executed steps. "
+                    "Taught from a finished run: 3 executed steps. "
                     "Saved only if you approve this draft."
                 ),
                 "target_skill_id": None,

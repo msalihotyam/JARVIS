@@ -7596,7 +7596,7 @@ class AgentCore:
             checks=version.checks,
             provenance=version.provenance,
             reason=(
-                f"Proposed after run {run.run_id} of version {skill.version}. "
+                f"Proposed after a finished run of version {skill.version}. "
                 "Saved only if you approve this draft."
             ),
             target_skill_id=skill.skill_id,
@@ -7683,10 +7683,10 @@ class AgentCore:
                     provenance=made.provenance,
                     reason=(
                         f"Same steps as skill version {parent.version}; proposed as its "
-                        f"next version from run {run.run_id}. "
+                        "next version from a finished run. "
                         if same
                         else f"Adapted from skill version {parent.version} (same kind of "
-                        f"work, other steps) from run {run.run_id}. "
+                        "work, other steps) from a finished run. "
                     )
                     + "Saved only if you approve this draft.",
                     target_skill_id=parent.skill_id if same else None,

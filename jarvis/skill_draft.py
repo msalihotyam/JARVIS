@@ -575,14 +575,14 @@ def _make_draft(
     if total == 1:
         name = _clip(summary, NAME_MAX)
         reason = (
-            f"Taught from run {run.run_id}: {_steps_text(segment)}. "
+            f"Taught from a finished run: {_steps_text(segment)}. "
             "Saved only if you approve this draft."
         )
     else:
         name = _clip(_one_line(segment.steps[0].action), NAME_MAX)
         summary = f"Part {part} of {total}: {summary}"
         reason = (
-            f"Taught from run {run.run_id}, independent part {part} of {total}: "
+            f"Taught from a finished run, independent part {part} of {total}: "
             f"{_steps_text(segment)}. Saved only if you approve this draft."
         )
     if len(summary) > TEXT_MAX:
