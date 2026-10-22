@@ -437,9 +437,10 @@ class FailClosedTest(BotCase):
 class ShadowWriteTest(BotCase):
     def test_permission_error_retried_5x_then_one_escalation(self):
         self.events({"ts": "2026-10-15T11:00:00", "event": "pace", "usage_pct": 99})
-        # facts.md / asks.json are out of this test (FactsTest / AsksTest cover their own write failure)
+        # facts.md / asks.json / digest.md are out of this test (their own tests cover their write failure)
         with mock.patch.object(orchbot.os, "replace", side_effect=PermissionError("held")) as rep, \
-                mock.patch.object(orchbot.Bot, "write_facts"), mock.patch.object(orchbot.Bot, "write_asks"):
+                mock.patch.object(orchbot.Bot, "write_facts"), mock.patch.object(orchbot.Bot, "write_asks"), \
+                mock.patch.object(orchbot.Bot, "write_digest"):
             ds = self.run_bot()
         self.assertEqual(rep.call_count, 5)
         self.assertEqual(self.sleeps, [0.2] * 4)
@@ -1222,6 +1223,134 @@ class LiveTest(BotCase):
         self.events(self.QUOTA)
         self.assertEqual(self.recs(self.run_bot()), [])
         self.assertNotIn("live", self.shadow())
+
+
+class DigestTest(BotCase):
+    def digest(self):
+        return (self.root / "build" / "bot" / "digest.md").read_text(encoding="utf-8")
+
+    def read_at(self, at):
+        p = self.put("build/bot/digest.read", "")
+        os.utime(p, (ts(at), ts(at)))
+
+    def test_window_starts_at_digest_read(self):
+        self.read_at("2026-10-15T11:00:00")
+        self.events({"ts": "2026-10-15T10:59:00", "event": "dispatch", "lane": "OLD", "id": "OLD"},
+                    {"ts": "2026-10-15T11:10:00", "event": "dispatch", "lane": "NEW", "id": "NEW",
+                     "model": "opus", "effort": "medium"},
+                    {"ts": "2026-10-15T11:20:00", "event": "ci_result", "lane": "NEW", "sha": SHA,
+                     "result": "success"},
+                    {"ts": "2026-10-15T11:21:00", "event": "page", "result": "skipped"},
+                    {"ts": "2026-10-15T11:22:00", "event": "page", "result": "sent"},
+                    {"ts": "2026-10-15T11:23:00", "event": "unrelated", "lane": "X"})
+        self.run_bot()
+        text = self.digest()
+        lines = text.splitlines()
+        self.assertEqual(lines[0], "# JARVIS digest at 2026-10-15T12:00:00 (scripts/orchbot.py)")
+        self.assertEqual(lines[1], "since 2026-10-15T11:00:00 (build/bot/digest.read)")
+        self.assertNotIn("OLD", text)
+        self.assertIn("- 2026-10-15T11:10:00 dispatch lane=NEW id=NEW model=opus effort=medium (events.jsonl)\n",
+                      text)
+        self.assertIn(f"- 2026-10-15T11:20:00 ci_result lane=NEW sha={SHA[:10]} result=success (events.jsonl)\n",
+                      text)
+        self.assertIn("- 2026-10-15T11:22:00 page result=sent (events.jsonl)\n", text)
+        self.assertNotIn("skipped", text)
+        self.assertNotIn("unrelated", text)
+        self.assertLess(text.index("dispatch"), text.index("ci_result"))
+        self.assertTrue(all(x.endswith(")") for x in lines if x))
+
+    def test_no_or_future_digest_read_means_the_last_2_h(self):
+        self.events({"ts": "2026-10-15T09:00:00", "event": "push", "sha": SHA2, "ci_run": "1"},
+                    {"ts": "2026-10-15T11:00:00", "event": "push", "sha": SHA, "ci_run": "2"})
+        for future in (False, True):
+            with self.subTest(future=future):
+                if future:
+                    self.read_at("2026-10-15T13:00:00")
+                self.run_bot()
+                text = self.digest()
+                self.assertIn("since 2026-10-15T10:00:00 (last 2 h, no digest.read, scripts/orchbot.py)\n", text)
+                self.assertIn(f"push sha={SHA[:10]} ci_run=2 (events.jsonl)", text)
+                self.assertNotIn(f"push sha={SHA2[:10]}", text)
+
+    def test_empty_case(self):
+        self.read_at("2026-10-15T11:30:00")
+        self.events({"ts": "2026-10-15T11:00:00", "event": "dispatch", "lane": "L", "id": "L"})
+        self.run_bot()
+        self.assertEqual(self.digest(), "# JARVIS digest at 2026-10-15T12:00:00 (scripts/orchbot.py)\n"
+                                        "since 2026-10-15T11:30:00 (build/bot/digest.read)\n\n"
+                                        "- nothing changed since 2026-10-15T11:30:00 (scripts/orchbot.py)\n\n"
+                                        "needs orchestrator: none (status.json)\n")
+
+    def test_size_cap_drops_the_oldest_rows(self):
+        self.events(*({"ts": f"2026-10-15T11:{i:02d}:00", "event": "dispatch", "lane": f"L{i}", "id": "x" * 60}
+                      for i in range(60)))
+        self.run_bot()
+        text = self.digest()
+        self.assertLessEqual(len(text.encode("utf-8")), orchbot.DIGEST_MAX)
+        self.assertRegex(text, r"- \.\.\. \d+ older rows not shown \(size cap, scripts/orchbot.py\)\n")
+        self.assertIn("lane=L59 ", text)
+        self.assertNotIn("lane=L0 ", text)
+        self.assertTrue(text.endswith("needs orchestrator: none (status.json)\n"))
+
+    def test_finish_attention_needs_and_bot_rows(self):
+        self.read_at("2026-10-15T11:00:00")
+        self.put("build/reports/DONE.md", f"STATUS: PASS\nCOMMIT: {SHA}\n")
+        self.events({"ts": "2026-10-15T11:10:00", "event": "finish", "lane": "DONE", "id": "DONE",
+                     "status": "PASS"},
+                    {"ts": "2026-10-15T11:11:00", "event": "finish", "lane": "GONE", "id": "GONE",
+                     "status": "DEAD"},
+                    {"ts": "2026-10-15T11:12:00", "event": "pace", "band": "day", "usage_pct": 40},
+                    {"ts": "2026-10-15T11:13:00", "event": "pace", "band": "day", "usage_pct": 41},
+                    {"ts": "2026-10-15T11:14:00", "event": "pace", "band": "night", "usage_pct": 42})
+        self.put("build/conveyor/status.json", {"attention": [
+            {"id": "L3", "reason": "BLOCKED: tests", "since": "2026-10-15T11:30:00"},
+            {"id": "L4", "reason": "reader needs_orchestrator: y", "since": "2026-10-15T10:00:00"},
+            {"id": "L5", "reason": "BLOCKED: acked", "since": "2026-10-15T10:00:00"},
+            {"id": "L6", "reason": "report missing", "since": "2026-10-15T10:00:00"}]})
+        ack = self.put("build/conveyor/ack/" + orchbot.cv.ack_name("L5"), "")
+        os.utime(ack, (ts("2026-10-15T11:00:00"),) * 2)
+        self.run_bot()
+        text = self.digest()
+        self.assertIn(f"- 2026-10-15T11:10:00 finish lane=DONE id=DONE status=PASS commit={SHA[:10]} "
+                      "(events.jsonl + build/reports/DONE.md)\n", text)
+        self.assertIn("- 2026-10-15T11:11:00 finish lane=GONE id=GONE status=DEAD commit=unknown (events.jsonl)\n",
+                      text)
+        self.assertIn("pace band=day usage_pct=40 (events.jsonl)", text)
+        self.assertNotIn("usage_pct=41", text)
+        self.assertIn("pace band=night usage_pct=42 (events.jsonl)", text)
+        self.assertIn("- 2026-10-15T11:30:00 attention L3: BLOCKED: tests (status.json)\n", text)
+        self.assertNotIn("attention L4:", text)  # older than the window
+        self.assertTrue(text.endswith("needs orchestrator: L3, L4 (status.json)\n"))
+        bot = [x for x in text.splitlines() if " bot " in x]
+        self.assertTrue(bot)
+        self.assertTrue(all(x.endswith("(decisions.jsonl)") for x in bot))
+        self.assertFalse(any(" bot none " in x for x in bot))
+
+    def test_write_failure_keeps_the_old_file_and_escalates_once(self):
+        self.run_bot()
+        old = self.digest()
+        real = orchbot.os.replace
+
+        def held(a, b):
+            if str(b).endswith("digest.md"):
+                raise PermissionError("held")
+            return real(a, b)
+
+        self.clock.set("2026-10-15T13:00:00")
+        with mock.patch.object(orchbot.os, "replace", side_effect=held):
+            ds = self.run_bot()
+            ds += self.run_bot()
+        self.assertEqual(self.digest(), old)
+        self.assertEqual(self.acts(ds), [("escalate_orchestrator", "FAILCLOSED", "digest.md")])
+
+    def test_no_secrets(self):
+        self.events({"ts": "2026-10-15T11:30:00", "event": "outage_hold",
+                     "why": "token=hunter2secret ghp_" + "a1" * 18})
+        self.run_bot()
+        text = self.digest()
+        self.assertIn("outage_hold", text)
+        self.assertNotIn("hunter2secret", text)
+        self.assertNotIn("a1" * 18, text)
 
 
 if __name__ == "__main__":

@@ -68,6 +68,23 @@ KEY1 = {"write_key1", "ask_salih_key1"}
 STAMP_RE = re.compile(r"\.\d{8}-\d{6}$")  # approvals/done/<name>.<YYYYmmdd-HHMMSS> on a name clash
 PACE_KEYS = ("max_lanes", "min_lanes", "lanes_present", "lanes_away")  # a decrease = dispatch held
 FACTS_MAX = 6 * 1024
+DIGEST_MAX = 3 * 1024
+DIGEST_S = 2 * 3600  # BOTDIGEST: no (or a future) digest.read -> the last 2 h
+NEEDS_RE = re.compile(r"BLOCKED|needs[ _]orchestrator", re.I)
+REPORT_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,80}")
+# BOTDIGEST: event kind -> the fields its digest row prints (sha fields cut to 10)
+DIGEST_EVENTS = {
+    "dispatch": ("lane", "id", "model", "effort"),
+    "nudge": ("lane", "n"), "outage_nudge": ("lane", "n"), "budget_nudge": ("lane", "n"),
+    "idle_nudge": ("lane", "n"),
+    "respawn": ("lane", "id", "rc"), "redispatch": ("lane", "old_id", "id"),
+    "blocked_attention": ("lane", "id", "nudges"), "resume_in_place": ("lane", "id"),
+    "heal": ("lane", "was", "status"),
+    "ci_result": ("lane", "sha", "result"), "ci_rerun": ("lane", "sha", "rc"),
+    "push": ("sha", "ci_run"), "push_blocked": ("approval", "reason"), "fast_forward": ("sha",),
+    "page": ("result",), "pace": ("band", "mode", "usage_pct"), "disk_hold": ("free_gb",),
+    "outage_hold": ("why",), "outage_clear": (), "quota_reset": (), "breaker": ("state", "reason"),
+}
 ALIVE_S = 10 * 60  # status.json older than this = the conveyor is not writing (stale)
 SECRET_RES = (  # facts.md never carries a URL (ntfy topic), a key or a key=value secret
     (re.compile(r"https?://\S+"), "[url]"),
@@ -342,6 +359,13 @@ class Bot:
             if self.fresh("bad:asks", self.now()):
                 self.decide(self.now(), "asks.json write failed", "escalate_orchestrator", "FAILCLOSED",
                             "asks.json", f"{e!r}"[:300])
+        try:  # last, so it lists this pass's decisions too
+            if not self.retry(self.write_digest):
+                raise OSError(f"write failed after {cv.REPLACE_TRIES} tries")
+        except Exception as e:  # the old digest.md stays; one decision per episode, the pass goes on
+            if self.fresh("bad:digest", self.now()):
+                self.decide(self.now(), "digest.md write failed", "escalate_orchestrator", "FAILCLOSED",
+                            "digest.md", f"{e!r}"[:300])
         self.save()
         return self.new
 
@@ -962,6 +986,129 @@ class Bot:
         except OSError:
             return None
         return [f"{n} pending (build/approvals)" for n in names]
+
+    # ---- digest (BOTDIGEST) ------------------------------------------------------------------
+    def write_digest(self):
+        """digest.md via tmp + os.replace, like facts.md."""
+        path = self.out / "digest.md"
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(self.digest(), encoding="utf-8")
+        os.replace(tmp, path)
+
+    @staticmethod
+    def jsonl_tail(path):
+        """The JSON-object lines of the last REPORT_MAX bytes of path; [] when unreadable."""
+        try:
+            with open(path, "rb") as f:
+                start = max(0, f.seek(0, 2) - REPORT_MAX)
+                f.seek(start)
+                raw = f.read().split(b"\n")
+        except OSError:
+            return []
+        out = []
+        for b in raw[1:] if start else raw:
+            try:
+                rec = json.loads(b)
+            except (ValueError, RecursionError):  # the cursor reader already escalates these lines
+                continue
+            if isinstance(rec, dict):
+                out.append(rec)
+        return out
+
+    def digest(self):
+        """The digest.md text: what changed since the orchestrator touched build/bot/digest.read
+        (else the last 2 h), oldest first, every line names its source. Over DIGEST_MAX the oldest
+        rows go first."""
+        now = self.now()
+        try:
+            read_at = (self.out / "digest.read").stat().st_mtime
+        except OSError:
+            read_at = None
+        if read_at is not None and read_at <= now:
+            since, src = read_at, "(build/bot/digest.read)"
+        else:  # DECISION TAKEN: a future digest.read counts as absent -> the last 2 h
+            since, src = now - DIGEST_S, "(last 2 h, no digest.read, scripts/orchbot.py)"
+
+        def short(k, v):
+            v = str(v)
+            return v[:10] if k == "sha" else v[:80]
+
+        rows, band = [], None
+        for ev in self.jsonl_tail(self.conv / "events.jsonl"):
+            kind, t = str(ev.get("event")), parse_ts(ev.get("ts"))
+            if kind == "pace":
+                prev, band = band, ev.get("band")
+                if prev == band:
+                    continue
+            if t is None or t <= since:
+                continue
+            if kind == "finish":
+                rid = str(ev.get("id"))
+                commit = None
+                if REPORT_ID_RE.fullmatch(rid):
+                    try:
+                        with open(self.root / "build" / "reports" / f"{rid}.md", encoding="utf-8",
+                                  errors="replace") as f:
+                            m = COMMIT_RE.search(f.read(REPORT_MAX))
+                        h = HEX_RE.search(m.group(1)) if m else None
+                        commit = h.group(0)[:10] if h else None
+                    except OSError:
+                        pass
+                rsrc = f"events.jsonl + build/reports/{rid}.md" if commit else "events.jsonl"
+                rows.append((t, f"{ev.get('ts')} finish lane={short('lane', ev.get('lane'))} id={rid[:80]} "
+                                f"status={short('status', ev.get('status'))} commit={commit or 'unknown'} ({rsrc})"))
+            elif kind in DIGEST_EVENTS and (kind != "page" or ev.get("result") == "sent"):
+                kv = " ".join(f"{k}={short(k, ev[k])}" for k in DIGEST_EVENTS[kind] if k in ev)
+                rows.append((t, f"{ev.get('ts')} {kind}{' ' + kv if kv else ''} (events.jsonl)"))
+
+        st = self.quiet(self.conv / "status.json") or {}
+        att = [a for a in st.get("attention") or [] if isinstance(a, dict)] \
+            if isinstance(st.get("attention"), list) else []
+        needs = []
+        for a in att:
+            iid, reason, t = str(a.get("id")), str(a.get("reason") or ""), parse_ts(a.get("since"))
+            if t is not None and t > since:
+                rows.append((t, f"{a.get('since')} attention {iid[:80]}: {reason[:120]} (status.json)"))
+            if NEEDS_RE.search(reason) or NEEDS_RE.search(iid):
+                try:
+                    m = (self.conv / "ack" / cv.ack_name(iid)).stat().st_mtime
+                    acked = t is not None and t <= m <= now
+                except (OSError, ValueError):
+                    acked = False
+                if not acked:
+                    needs.append(iid[:80])
+
+        for d in self.jsonl_tail(self.out / "decisions.jsonl") + self.new:
+            t = parse_ts(d.get("ts"))
+            if t is None or t <= since:
+                continue
+            if d.get("mode") == "live":
+                rows.append((t, f"{d['ts']} bot live {d.get('did')} {d.get('target')}: "
+                                f"{str(d.get('saw'))[:120]} (decisions.jsonl)"))
+            elif d.get("would_do") not in (None, "none"):
+                rows.append((t, f"{d['ts']} bot {d['would_do']} {d.get('target')}: {str(d.get('saw'))[:120]} "
+                                f"[{d.get('rule')}] (decisions.jsonl)"))
+        rows = [r for _, r in sorted(rows, key=lambda r: r[0])]
+
+        cut = 0
+
+        def render():
+            out = [f"# JARVIS digest at {cv.iso(now)} (scripts/orchbot.py)", f"since {cv.iso(since)} {src}", ""]
+            if cut:
+                out.append(f"- ... {cut} older rows not shown (size cap, scripts/orchbot.py)")
+            out += [f"- {r}" for r in rows] if rows or cut else \
+                [f"- nothing changed since {cv.iso(since)} (scripts/orchbot.py)"]
+            out += ["", f"needs orchestrator: {', '.join(needs) or 'none'} (status.json)"]
+            return "\n".join(clean(x) for x in out) + "\n"
+
+        text = render()
+        while rows and len(text.encode("utf-8")) > DIGEST_MAX:
+            rows.pop(0)
+            cut += 1
+            text = render()
+        # ponytail: byte cut as the last resort, only reachable with a huge needs list
+        return text if len(text.encode("utf-8")) <= DIGEST_MAX else \
+            text.encode("utf-8")[:DIGEST_MAX - 1].decode("utf-8", "ignore") + "\n"
 
     # ---- agreement (BOTAGREE) ----------------------------------------------------------------
     def check_agreement(self):
