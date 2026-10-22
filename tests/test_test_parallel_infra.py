@@ -11,7 +11,6 @@ import shutil
 import sys
 import tempfile
 import threading
-import time
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -178,6 +177,8 @@ class LockScopeTests(Temp):
     def setUp(self):
         super().setUp()
         self.locks, self.seen, self.guard, self.plain_done = {}, [], threading.Lock(), threading.Event()
+        # TESTLOCKFIX m7: no sleeps; a refused UI worker signals `refused` and waits for a release, not for time to pass.
+        self.refused, self.released = threading.Event(), threading.Event()
         for patch in (mock.patch.object(tp, "run_unit", self.fake), mock.patch.object(tp, "worker_env", lambda i, bases: {})):
             patch.start()
             self.addCleanup(patch.stop)
@@ -185,10 +186,17 @@ class LockScopeTests(Temp):
     def lock(self, lane):
         with mock.patch.dict(os.environ, {"CONV_LANE": lane}):
             lock = tp.UiLock(self.dir, "test")
-        lock.poll = 0.01
         self.locks[lane] = lock
         self.addCleanup(lock.release)
+        release = lock.release
+        lock.release = lambda: (release(), self.released.set())[0]
+        lock.wait = self.wait
         return lock
+
+    def wait(self):
+        self.refused.set()
+        self.released.wait(10)
+        self.released.clear()  # the next poll still sees a release made before this clear
 
     def ui_json(self):
         path = self.dir / "ui.json"
@@ -198,7 +206,6 @@ class LockScopeTests(Temp):
         lock = self.locks[unit.module.split("_")[0]]
         with self.guard:
             self.seen.append(("start", unit.module, lock.held, self.ui_json()))
-        time.sleep(0.01)
         with self.guard:
             self.seen.append(("end", unit.module, lock.held, self.ui_json()))
             if sum(e[0] == "end" and "plain" in e[1] for e in self.seen) == 3:
@@ -221,7 +228,7 @@ class LockScopeTests(Temp):
         with contextlib.redirect_stdout(out):
             thread, done = self.start("A", 1, 1)
             self.assertTrue(self.plain_done.wait(10))
-            time.sleep(0.1)  # time enough to start a UI unit under HOLD's lock, were that possible
+            self.assertTrue(self.refused.wait(10))  # A's UI worker asked for the lock and was refused
             self.assertEqual(self.ui_events("A"), [])
             holder.release()
             thread.join(10)
@@ -318,6 +325,82 @@ class PoolShareTests(Temp):
             pool, ui_workers, workers = tp.pool_for(4, 6)
         self.assertEqual((pool.held, ui_workers, workers), (4, 1, 3))
         pool.release()
+
+    # TESTLOCKFIX m2: other runs are pools in this process with another pid; every interleaving is one
+    # try_acquire() poll, called in a fixed order, so no thread, sleep or clock decides who goes first.
+    def run_(self, n, budget=8):
+        pool = tp.TestPool(self.dir, budget)
+        pool.key = str(self.OTHER + n)
+        pool.entry.update(pid=self.OTHER + n, created=None)
+        self.addCleanup(pool.release)
+        return pool
+
+    def line(self):
+        return json.loads((self.dir / "pool-queue.json").read_text(encoding="utf-8"))
+
+    def test_a_waiting_run_is_served_before_newcomers(self):
+        self.others(8)  # run A holds the whole budget
+        b, c, out = self.run_(1), self.run_(2), io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(b.try_acquire(8), 0)  # none free: B lines up
+            self.others(3)  # A gives 5 back
+            self.assertEqual(c.try_acquire(8), 0)  # 5 free, but newcomer C queues behind B
+            self.assertEqual(b.try_acquire(8), 3)  # ceil(8 / (A + B + C waiting)) = 3, not ceil(8 / 2) = 4
+            self.assertEqual(c.try_acquire(8), 2)  # C next, the rest
+        self.assertEqual(self.line(), [])  # a served run leaves the line
+        self.assertEqual(self.held(), {str(self.OTHER): 3, str(self.OTHER + 1): 3, str(self.OTHER + 2): 2})
+        self.assertIn("(machine budget 8, all held)", out.getvalue())
+        self.assertIn(f"(machine budget 8, queued behind pid {self.OTHER + 1})", out.getvalue())
+
+    def test_a_dead_or_reused_waiter_leaves_the_line(self):
+        dead = {"id": "dead", "pid": 12345, "created": None}  # 12345 is not alive under the patch
+        reused = {"id": "reused", "pid": self.OTHER + 5, "created": 1}  # alive, but another process now
+        (self.dir / "pool-queue.json").write_text(json.dumps([dead, reused]), encoding="utf-8")
+        with mock.patch.object(tp, "_created", lambda pid: 2):
+            self.assertEqual(self.run_(1).try_acquire(8), 8)
+        self.assertEqual(self.line(), [])
+
+    def test_a_bad_entry_costs_no_waiter_its_place(self):
+        self.others(8)
+        b, c = self.run_(1), self.run_(2)
+        with contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(b.try_acquire(8), 0)
+            bad = [1, {"id": "x"}, *self.line(), {"id": "y", "pid": "abc"}]
+            (self.dir / "pool-queue.json").write_text(json.dumps(bad), encoding="utf-8")
+            self.others(3)
+            self.assertEqual(c.try_acquire(8), 0)  # B keeps the head
+        self.assertEqual([e["id"] for e in self.line()], [b.entry["id"], c.entry["id"]])
+
+    def test_a_garbage_line_starts_afresh(self):
+        for text in ("{not json", '{"a": 1}', "[1]", '[{"id": "x"}]', '[{"id": "x", "pid": "abc"}]', "null"):
+            (self.dir / "pool-queue.json").write_text(text, encoding="utf-8")
+            pool = self.run_(1)
+            self.assertEqual(pool.try_acquire(8), 8, text)
+            self.assertEqual(self.line(), [], text)
+            pool.release()
+            (self.dir / "pool-queue.json").write_text(text, encoding="utf-8")
+            pool.release()  # leaving a garbage line is a no-op, not a crash
+            self.assertEqual((self.dir / "pool-queue.json").read_text(encoding="utf-8"), text)
+
+    def test_a_waiter_leaves_the_line_when_it_gives_up(self):
+        self.others(8)
+        b, c = self.run_(1), self.run_(2)
+        polls, poll = [], b.try_acquire
+
+        def ctrl_c_on_second_poll(want):
+            polls.append(want)
+            if len(polls) == 2:
+                raise KeyboardInterrupt
+            return poll(want)
+        b.try_acquire, b.poll = ctrl_c_on_second_poll, 0
+        with contextlib.redirect_stdout(io.StringIO()):
+            with self.assertRaises(KeyboardInterrupt):
+                b.acquire(8)
+            self.assertEqual(self.line(), [])  # out of the line, so C is not stuck behind it
+            self.assertEqual(c.try_acquire(8), 0)
+            self.assertEqual([e["id"] for e in self.line()], [c.entry["id"]])
+        c.release()  # a waiter that releases leaves too
+        self.assertEqual(self.line(), [])
 
 
 class PlanningTests(unittest.TestCase):
