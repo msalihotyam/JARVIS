@@ -321,6 +321,7 @@ MEM_GAP_S = 10 * 60  # after a memory hold at most one start per MEM_GAP_S for M
 MEM_RELEASE_S = 60 * 60
 FINDINGS_RE = re.compile(r"(?m)^[\s>#*`-]*FINDINGS:\s*(.*)$")
 CDX_DRY_RE = re.compile(r"(CDX|DRY)")  # audit lanes: BLOCKED is a finding, not a breaker failure
+CHAIN_SUFFIX_RE = re.compile(r"(?i)(-\d+)?-AFX$|-R$|-S$")  # auto-fix chain lanes: same root (BREAKERV2)
 TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -654,6 +655,19 @@ def files_overlap(a, b):
     return any(x.startswith(y) or y.startswith(x) for x in pa for y in pb)
 
 
+def root_id(name):
+    """A lane's root for the breaker count: INT5, INT5-AFX, INT5-2-AFX, INT5-S and INT5-R are
+    all INT5 (case-insensitive). Any other name is its own root."""
+    while (r := CHAIN_SUFFIX_RE.sub("", name, count=1)) != name and r:
+        name = r
+    return name.upper()
+
+
+def chain_ids(c):
+    """Every slice id of an autopilot.json auto-fix chain entry (split, fix lanes, rerun)."""
+    return [x for x in (c.get("s"), c.get("afx"), *c.get("afxs", ()), c.get("r")) if x]
+
+
 def utc_ts(s):
     """Epoch of an ISO UTC time such as 2026-10-09T10:24:35.107Z."""
     return calendar.timegm(time.strptime(s[:19], "%Y-%m-%dT%H:%M:%S"))
@@ -766,6 +780,7 @@ class Conveyor:
         self.cc_ok = None  # version gate result, decided once per pass (None: not yet)
         self.auto_file = self.base / "autopilot.json"
         self.breaker = None  # {"reason", "since"} while open (autopilot.json), else None
+        self.chain_dead = set()  # slice ids of failed auto-fix chains: never dispatched (BREAKERV2)
         self.band = []  # status.json "band" lines (breaker, auto-approval)
         self.lanes_bad = None  # why lanes.json could not be read this pass: nothing saves over it
         self.quiet = set()  # attention ids that never page (attention() refills it)
@@ -2036,6 +2051,8 @@ class Conveyor:
             elif sid.endswith("-R") and (x := lanes.get(sid[:-2] + "-AFX")) and x.get("finished") \
                     and x.get("status") not in GOOD | {CI_PENDING}:
                 view[sid] = "dead"  # CONVHEAL: its -AFX ended non-GOOD; never waits forever
+            elif sid in self.chain_dead:
+                view[sid] = "dead"  # BREAKERV2: a lane of its auto-fix chain failed, the chain stops
             elif not all(self.slice_done(d, lanes, bool(INT_RE.match(sid))) for d in s.get("depends_on", [])):
                 view[sid] = "waiting_deps"
             elif any(files_overlap(s.get("files", []), rf) for rf in run_files):
@@ -2184,7 +2201,8 @@ class Conveyor:
             if ln.get("findings"):  # CONVHEAL: a PASS with findings -> fix lanes (no page, no breaker)
                 why.append(f"FINDINGS: {ln['findings']}")
             if why:
-                items.append((n, "; ".join(why), self.since(ln)))
+                # BREAKERV2: a failed auto-fix chain re-raises its lane, an older ack hides nothing
+                items.append((n, "; ".join(why), max(self.since(ln) or 0, ln.get("chain_failed") or 0)))
                 if not loud:
                     self.quiet.add(n)
         for n, ln in lanes.items():  # CONV11: one item per preserved lane, until acked
@@ -2358,10 +2376,12 @@ class Conveyor:
     # ---- autopilot (CONV7): the three routine orchestrator decisions -----
     def autopilot(self, lanes):
         """Every pass, for each lane that reached a terminal status since the autopilot began:
-        count BAD finishes for the breaker, open it when an auto-fix chain lane fails, write
-        key 1 for a GREEN integration report (auto_approve) and queue one fix-forward chain
-        for a BLOCKED one (auto_fix). Only a breaker-reset touched after the breaker opened
-        closes it. Unreadable state: no action and the breaker counts as open (fail closed)."""
+        count BAD finishes for the breaker (one per root_id, review lanes never), write key 1
+        for a GREEN integration report (auto_approve) and queue one fix-forward chain for a
+        BLOCKED one (auto_fix). A chain lane that fails stops its chain (chain_dead) and
+        re-raises its lane as an attention item; it never opens the breaker (BREAKERV2). A
+        GOOD finish after the breaker opened, or a breaker-reset touched after it, closes it.
+        Unreadable state: no action and the breaker counts as open (fail closed)."""
         ap = self.auto_state()
         if ap is None:
             self.breaker = {"reason": "build/conveyor/autopilot.json unreadable (fix it by hand)",
@@ -2383,10 +2403,15 @@ class Conveyor:
                 continue  # not terminal: ci_wait sets GREEN/BLOCKED with a new finished_ts
             role = next((r for c in chains.values() for r in ("afx", "r", "s")
                          if c.get(r) == name or r == "afx" and name in c.get("afxs", ())), None)
-            if st in BAD and not (st == "BLOCKED" and CDX_DRY_RE.match(name)):
-                ap.setdefault("bad", []).append([name, fin])  # an audit lane's BLOCKED: attention only
+            if (b := ap.get("breaker")) and st in GOOD and fin > b["since"]:
+                ap["breaker"] = None  # a BAD finishing after this GOOD (same pass) still counts
+                ap["bad"] = [x for x in ap.get("bad", []) if x[1] > fin]
+                self.event("breaker", state="closed", reason=f"auto: {name} {st}")
+            if st in BAD and not (st == "BLOCKED" and CDX_DRY_RE.match(name)):  # audit finding
+                root = root_id(name)  # a lane, its -AFX/-R and its reruns are one failure
+                ap["bad"] = [x for x in ap.get("bad", []) if root_id(x[0]) != root] + [[name, fin]]
             if role and st not in GOOD:
-                self.open_breaker(ap, f"auto-fix chain failed: {name} {st}")
+                self.chain_failed(name, st, fin, chains, lanes)
             if not INT_RE.match(name) or role == "afx" or name.endswith("-AFX"):
                 continue  # a fix lane (also one started by hand) never gets key 1 or a chain
             if st == "GREEN":
@@ -2398,6 +2423,10 @@ class Conveyor:
             self.open_breaker(ap, f"{len(ap['bad'])} lanes finished BLOCKED/STOP/FAIL within 2 h: "
                                   + ", ".join(x[0] for x in ap["bad"]))
         self.breaker = ap.get("breaker")
+        self.chain_dead = {s for c in chains.values()
+                           if any(lanes.get(x, {}).get("finished") and lanes[x].get("status")
+                                  not in GOOD | {CI_PENDING} for x in chain_ids(c))
+                           for s in chain_ids(c)}
         last = ap.get("last_auto")
         self.band = (["breaker: open"] if self.breaker else []) + \
             ([f"auto-approved {last[0][:7]}"] if last and self.now() - last[1] < AUTO_LINE_S else [])
@@ -2430,6 +2459,18 @@ class Conveyor:
         if not ap.get("breaker"):
             ap["breaker"] = {"reason": reason[:300], "since": self.now()}
             self.event("breaker", state="open", reason=reason[:300])
+
+    def chain_failed(self, name, st, fin, chains, lanes):
+        """Fix lane `name` of an auto-fix chain ended non-GOOD: the chain stops (chain_dead,
+        set at the end of the pass) and the lane it was fixing is raised again as an attention
+        item with the files the fix lane touched; the orchestrator decides, other lanes run on."""
+        owner = next((k for k, c in chains.items() if name in chain_ids(c)), None)
+        files = (lanes.get(name) or {}).get("files") or []
+        self.event("auto_fix_failed", lane=owner, fix=name, status=st, files=files)
+        if owner in lanes:
+            lanes[owner]["auto_fix"] = (f"auto-fix failed: {name} {st}; chain stopped, files: "
+                                        f"{', '.join(files) or '?'}; orchestrator decides")
+            lanes[owner]["chain_failed"] = fin
 
     def auto_approve(self, name, ln, lanes, ap):
         """Key 1 written by the conveyor for a GREEN integration report: the approval file
