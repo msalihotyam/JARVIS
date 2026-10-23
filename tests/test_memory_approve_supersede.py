@@ -7,8 +7,10 @@ Every database is a throwaway in TEMP; nothing opens the operator's database.
 
 from __future__ import annotations
 
+import sqlite3
 import tempfile
 import unittest
+from contextlib import closing
 from pathlib import Path
 
 from jarvis.contracts import (
@@ -33,7 +35,8 @@ class ApproveSupersedeTests(unittest.TestCase):
     def setUp(self) -> None:
         temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(safe_cleanup, temp)
-        self.store = SQLiteMemoryStore(Path(temp.name) / "memory.db")
+        self.db_path = Path(temp.name) / "memory.db"
+        self.store = SQLiteMemoryStore(self.db_path)
         self.alpha = self.store.create_project("Alpha").id
         self.beta = self.store.create_project("Beta").id
 
@@ -137,24 +140,37 @@ class ApproveSupersedeTests(unittest.TestCase):
         self.store.undo(old, MemoryRecordActor.USER)
         self.assertIs(S.RETRACTED, self.status(old))
 
-    def test_a_restored_record_can_be_superseded_again(self) -> None:
-        # A3: the reversed supersession row must not block a later one.
+    def test_a_restored_record_is_never_superseded_again(self) -> None:
+        # Decision B (Salih 2026-10-23): undo keeps the append-only
+        # supersession row, so every later supersede is refused, not dropped.
         for path in ("approval", "explicit"):
             with self.subTest(path=path):
-                subject = f"a3-{path}"
+                subject = f"b-{path}"
                 old = self.approved("Fridays", day=1, subject=subject)
                 new = self.approved("Thursdays", day=2, subject=subject)
                 self.store.undo(new, MemoryRecordActor.USER)
                 if path == "approval":
-                    later = self.approved("Wednesdays", day=3, subject=subject)
+                    later = self.insert("Wednesdays", day=3, subject=subject)
+                    with self.assertRaisesRegex(ValueError, "brought back by Undo"):
+                        self.approve(later)
+                    self.assertIs(S.PENDING, self.status(later))
                 else:
                     # Older than `old`, so approving it supersedes nothing by itself.
                     later = self.approved("Wednesdays", day=1, subject=subject, supersedes=old,
                                           at="2026-09-30T00:00:00+00:00")
                     self.assertIs(S.APPROVED, self.status(old))
-                    self.store.supersede(old, later, MemoryRecordActor.MODEL)
-                self.assertIs(S.SUPERSEDED, self.status(old))
+                    with self.assertRaisesRegex(ValueError, "brought back by Undo"):
+                        self.store.supersede(old, later, MemoryRecordActor.MODEL)
+                    self.assertIs(S.APPROVED, self.status(later))
+                self.assertIs(S.APPROVED, self.status(old))
                 self.assertIs(S.RETRACTED, self.status(new))
+                with closing(sqlite3.connect(self.db_path)) as db:
+                    self.assertEqual([(old, new)], db.execute(
+                        "SELECT old_record_id, new_record_id FROM memory_record_supersessions "
+                        "WHERE old_record_id = ?", (old,)).fetchall())
+                    self.assertEqual(("approved", f"undo-restore {new}"), db.execute(
+                        "SELECT status, reason FROM memory_record_events WHERE record_id = ? "
+                        "ORDER BY event_id DESC LIMIT 1", (old,)).fetchone())
                 # The purge chain still reaches the retracted newer record both ways.
                 for start in (old, new):
                     self.assertIn(new, self.store.purge_preview([start])["record_ids"])

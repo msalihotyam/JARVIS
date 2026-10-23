@@ -961,8 +961,7 @@ CREATE TABLE IF NOT EXISTS skill_experiences (
 # are append-only - a record's status is its LATEST memory_record_events row
 # (highest event_id), a replacement is a memory_record_supersessions row -
 # and nothing here offers an UPDATE or DELETE of them, except the one hard
-# purge (I16, ``purge_records``) and ``undo`` deleting the one supersession
-# row it reverses (A3; its undo-restore event names the newer record). memory_purge_audit keeps only purge_id,
+# purge (I16, ``purge_records``). memory_purge_audit keeps only purge_id,
 # content hash and time; memory_owned_artifacts lists files that hold record
 # content (record_id NULL = a whole-DB backup). memory_legacy_migration is
 # the insert-only ledger of the one-time M1 migration: one row per legacy id,
@@ -1324,6 +1323,12 @@ _RESERVED_EVENT_STATUSES = frozenset({
 #: reverses only these.
 _APPROVAL_SUPERSEDE_REASON = "user-approved-newer"
 _UNDO_RESTORE_REASON = "undo-restore"
+#: Decision B (Salih 2026-10-23): undo keeps the reversed supersession row
+#: (append-only), so a restored record can never be superseded again.
+_RESTORED_REFUSAL = (
+    "A memory brought back by Undo can't be replaced again. Remove the "
+    "restored memory first if the new one should take its place."
+)
 _APPROVAL_SUPERSEDE_KINDS = frozenset({
     MemoryRecordKind.DECISION.value,
     MemoryRecordKind.PREFERENCE.value,
@@ -7586,10 +7591,12 @@ class SQLiteMemoryStore:
         the PERMANENT record from other conversations, nor the reverse.
 
         No match or several, an explicit-user older record (superseding it
-        needs proof naming it, see ``supersede``), an older record already
-        holding a supersession row, or a ``supersedes`` pointer at another
-        record: nothing is written and consolidation keeps proposing the
-        conflict. RULE is left out for the same proof reason.
+        needs proof naming it, see ``supersede``), or a ``supersedes``
+        pointer at another record: nothing is written and consolidation keeps
+        proposing the conflict. RULE is left out for the same proof reason.
+        An older record already holding a supersession row was restored by
+        undo and can't be superseded again (Decision B): the approval is
+        refused and rolled back, so the newer record stays PENDING.
         """
         new = connection.execute(
             f"{_RECORD_CURRENT_SQL} WHERE r.record_id = ?", (record_id,)
@@ -7630,12 +7637,13 @@ class SQLiteMemoryStore:
         if (
             matches[0]["origin"] == MemoryRecordOrigin.EXPLICIT_USER.value
             or new["supersedes"] not in (None, old_id)
-            or connection.execute(
-                "SELECT 1 FROM memory_record_supersessions WHERE old_record_id = ?",
-                (old_id,),
-            ).fetchone()
         ):
             return
+        if connection.execute(
+            "SELECT 1 FROM memory_record_supersessions WHERE old_record_id = ?",
+            (old_id,),
+        ).fetchone():
+            raise ValueError(_RESTORED_REFUSAL)
         connection.execute(
             "INSERT INTO memory_record_supersessions (old_record_id, "
             "new_record_id, actor, reason, at) VALUES (?, ?, ?, ?, ?)",
@@ -7687,9 +7695,9 @@ class SQLiteMemoryStore:
 
         If approving it superseded an older record (``_supersede_on_approval``)
         that record is APPROVED again in the same transaction - the only
-        SUPERSEDED -> APPROVED move, reversing exactly that supersession - and
-        the reversed supersession row is deleted so the restored record can be
-        superseded again; its ``undo-restore <new id>`` event keeps the link.
+        SUPERSEDED -> APPROVED move, reversing exactly that supersession. The
+        supersession row stays (append-only, Decision B), so the restored
+        record can't be superseded again; every path refuses that.
         """
         validate_memory_record_id(record_id)
         if type(actor) is not MemoryRecordActor:
@@ -7711,15 +7719,6 @@ class SQLiteMemoryStore:
                     (row["old_record_id"],),
                 ).fetchone()
                 if current["status"] == MemoryRecordStatus.SUPERSEDED.value:
-                    # A3: the reversed row would block every later supersede
-                    # of the restored record (one row per old id); the
-                    # restore event keeps the link for the purge chain.
-                    connection.execute(
-                        "DELETE FROM memory_record_supersessions WHERE old_record_id = ? "
-                        "AND new_record_id = ? AND actor = ? AND reason = ?",
-                        (row["old_record_id"], record_id, MemoryRecordActor.USER.value,
-                         _APPROVAL_SUPERSEDE_REASON),
-                    )
                     connection.execute(
                         "INSERT INTO memory_record_events (record_id, status, "
                         "actor, reason, at) VALUES (?, ?, ?, ?, ?)",
@@ -8070,9 +8069,8 @@ class SQLiteMemoryStore:
                     (old_record_id, new_record_id, actor.value, reason, utc_now()),
                 )
             except sqlite3.IntegrityError as exc:
-                raise ValueError(
-                    f"Memory record already superseded: {old_record_id}"
-                ) from exc
+                # ``old`` is APPROVED, so its row is the one undo kept.
+                raise ValueError(_RESTORED_REFUSAL) from exc
             self._append_record_event(
                 connection,
                 old_record_id,
