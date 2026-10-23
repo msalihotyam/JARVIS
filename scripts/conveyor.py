@@ -3493,12 +3493,12 @@ class Conveyor:
                     except Exception as e:  # e.g. a timeout: an error, the session is left
                         rc, out = type(e).__name__, ""
                     steps.append({"cmd": cmd, "id": a["id"], "rc": rc, "output": out[-300:]})
-                    found = self.rm_discard(a, out) if cmd == "rm" and rc != 0 else None
+                    found = self.rm_discard(a, out, ln) if cmd == "rm" and rc != 0 else None
                     if found:  # CLEANPATCH: the unpushed commits are on origin/main under other shas
                         self.event("cleanup_equivalent", lane=name, session=a["id"], pairs=found[1])
                         self.beat()
                         try:
-                            rc, out = self.run(["rm", a["id"], "--discard-unpushed", found[0]])
+                            rc, out = self.run(["rm", a["id"], "--discard-unpushed", *found[0]])
                         except Exception as e:
                             rc, out = type(e).__name__, ""
                         steps.append({"cmd": cmd, "id": a["id"], "rc": rc, "output": out[-300:], "discard": True})
@@ -3520,7 +3520,7 @@ class Conveyor:
                     # would also drop uncommitted changes: passed only on rm_discard's proof): retried
                     # the next day
                     self.retry_cleanup(name, ln, "rm", f"claude rm refused: {steps[-1]['output'][-150:]}",
-                                       self.rm_in_main(steps[-1]["output"]))
+                                       self.rm_in_main(out))  # the full text, not the 300-char tail
 
     def archive_sessions(self, lanes, agents, attention_ids=(), dry_run=False, limit=None):
         """SESSIONSWEEP: move (never delete) the transcripts (<projects>/<slug>/<id>-*.jsonl and
@@ -3606,32 +3606,57 @@ class Conveyor:
             out.append((name, [str(e) for e in files]))
         return out
 
+    @staticmethod
+    def rm_refusal(out):
+        """(session id, the --discard-unpushed args as the CLI printed them, their shas) from the
+        last line of a claude rm refusal, e.g. `... discard the worktree and its commits: claude
+        rm <id> --discard-unpushed <40-hex sha>@<hex>`; None for anything else, uncommitted
+        changes ("commit or stash") or a token that is not exactly <40 lowercase hex>@<hex>."""
+        m = re.search(r"discard the worktree and its commits: claude rm (\S+) --discard-unpushed "
+                      r"([^\r\n]+?)\s*\Z", out)
+        low = out.lower()
+        if not m or "uncommitted" in low or "commit or stash" in low:
+            return None
+        toks = m[2].split()
+        if not toks or not all(re.fullmatch(r"[0-9a-f]{40}@[0-9a-f]+", t) for t in toks):
+            return None
+        return m[1], toks, [t[:40] for t in toks]
+
     def rm_in_main(self, out):
-        """True when a claude rm refusal names only unpushed commits whose tip is provably on
+        """True when a claude rm refusal names only unpushed commits whose tips are provably on
         local main (off_main): they wait for the next push, nothing for the orchestrator.
         Fail closed: another text, uncommitted changes or any doubt is False."""
-        m = re.search(r"discard the worktree and its commits: claude rm (\S+) --discard-unpushed "
-                      r"([0-9a-f]{40})@[0-9a-f]+\s*\Z", out)
-        if not m or "uncommitted" in out.lower():
+        r = self.rm_refusal(out)
+        if not r:
             return False
         try:
-            return self.off_main(f"session {m[1]}", m[2]) is None
+            return all(self.off_main(f"session {r[0]}", s) is None for s in r[2])
         except Exception:
             return False
 
-    def rm_discard(self, a, out):
-        """(token, pairs) for `claude rm <id> --discard-unpushed <token>` when a claude rm refusal
-        names only unpushed commits that merged_equivalent proves are on origin/main, and the
-        session's worktree is clean (status and skip/assume entries) with HEAD at that sha.
-        Fail closed: another text, uncommitted changes, no worktree or any doubt is None."""
-        m = re.search(r"discard the worktree and its commits: claude rm (\S+) --discard-unpushed "
-                      r"(([0-9a-f]{40})@[0-9a-f]+)\s*\Z", out)
+    def rm_discard(self, a, out, ln=None):
+        """(args, pairs) for `claude rm <id> --discard-unpushed <args>` when a claude rm refusal for
+        this session names only unpushed commits that merged_equivalent proves are on origin/main
+        (CLEANRM: integrations cherry-pick, so the shas differ), and the session's worktree (its
+        cwd, else, for a session in the root, the lane's ln["worktree"]: a lane spawns in the
+        root and enters it) is clean (status and skip/assume entries) with HEAD at every listed
+        sha (one commit, one worktree). Only the args the CLI listed. Fail closed: another text
+        or id, uncommitted changes, no worktree or any doubt is None."""
+        r = self.rm_refusal(out)
         wt = self.worktree_of(a)
-        if not m or "uncommitted" in out.lower() or wt is None:
+        if wt is None and a.get("cwd") and (os.path.normcase(os.path.abspath(a["cwd"]))
+                                            == os.path.normcase(os.path.abspath(self.root))):
+            wt = self.worktree_of({"cwd": (ln or {}).get("worktree")})
+        if not r or r[0] != a["id"] or wt is None:
             return None
         try:
-            same, pairs = self.merged_equivalent(f"session {m[1]}", m[3])
-            if not same or not wt.exists():
+            pairs = []
+            for s in r[2]:
+                same, p = self.merged_equivalent(f"session {r[0]}", s)
+                if not same:
+                    return None
+                pairs += p
+            if not wt.exists():
                 return None
             rc, st = self.cmd([*GIT_PIN, "-C", str(wt), "status", "--porcelain", "--untracked-files=all",
                                "--ignore-submodules=none"])
@@ -3641,11 +3666,11 @@ class Conveyor:
             if rc != 0 or any(not ln_.startswith("H ") for ln_ in st.splitlines()):
                 return None
             rc, head = self.cmd([*GIT_PIN, "-C", str(wt), "rev-parse", "--verify", "HEAD"])
-            if rc != 0 or head.strip() != m[3]:
+            if rc != 0 or set(r[2]) != {head.strip()}:
                 return None
         except Exception:
             return None
-        return m[2], pairs
+        return r[1], pairs
 
     def retry_cleanup(self, name, ln, step, reason, in_main=False):
         """An event and an attention item (cleanup:<lane>, none when in_main: the refused commits

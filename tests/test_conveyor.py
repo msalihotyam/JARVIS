@@ -3552,6 +3552,127 @@ class TestPreserved(Base):
         self.assertEqual([c for c in self.cli("rm") if "--discard-unpushed" in c], [])
         self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "error")
 
+    @staticmethod
+    def cli_refusal(*toks):
+        """CLEANRM: the claude CLI's refusal as production logged it (quotes mangled to U+FFFD)."""
+        return ("Worktree .claude/worktrees/A has 1 commit: �work�. It exists on no remote, so "
+                "deleting the worktree would lose it.\n  push it and run �claude rm {sid}� again, or "
+                "discard the worktree and its commits: claude rm {sid} --discard-unpushed " + " ".join(toks) + "\n")
+
+    def root_cleanup(self):
+        """A lane spawned in the root that entered its worktree: `claude agents` cwd is the root."""
+        sid = self.finished(agent={"cwd": str(self.root)})
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        return sid
+
+    def assert_refused(self):
+        self.assertEqual([c for c in self.cli("rm") if "--discard-unpushed" in c], [])
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "error")
+        self.assertEqual(self.equivalent_pairs(), [])
+        self.assertEqual(self.cleanup_ids(), ["cleanup:A"])
+        self.assertTrue(self.wt.exists())
+
+    def test_rm_refusal_root_cwd_discards_exactly_the_listed_token(self):
+        sha = self.discard_setup()
+        tok = f"{sha}@24a6741462c516b8ec8cb6dd21c20030"
+        self.fake.rm_out = self.cli_refusal(tok)
+        sid = self.root_cleanup()
+        self.assertEqual(self.cli("rm"), [["rm", sid], ["rm", sid, "--discard-unpushed", tok]])
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
+        ev = [e for e in self.events() if e["event"] == "cleanup_equivalent" and e.get("session") == sid]
+        self.assertEqual([(p["commit"], p["how"]) for p in ev[0]["pairs"]], [(sha, "patch-id")])
+        self.assertEqual(self.cleanup_ids(), [])
+        self.assertFalse(self.wt.exists())
+
+    def test_rm_refusal_with_one_non_equivalent_sha_is_refused(self):
+        sha = self.discard_setup()
+        self.g("checkout", "-q", "-b", "other")
+        (self.root / "o.txt").write_text("other\n")
+        self.g("add", "o.txt")
+        self.g("commit", "-q", "-m", "other")
+        other = self.g("rev-parse", "HEAD")
+        self.g("checkout", "-q", "main")
+        for toks in ([f"{sha}@abc", f"{other}@abc"], [f"{other}@abc", f"{sha}@abc"]):  # either order
+            with self.subTest(toks=toks):
+                self.fake.rm_out = self.cli_refusal(*toks)
+                self.assertIsNone(self.c.rm_discard({"id": "x", "cwd": str(self.wt)},
+                                                    self.fake.rm_out.format(sid="x")))
+        self.fake.rm_out = self.cli_refusal(f"{sha}@abc", f"{other}@abc")
+        self.root_cleanup()
+        self.assert_refused()
+
+    def test_rm_refusal_uncommitted_changes_is_refused(self):
+        self.discard_setup()
+        self.fake.rm_out = ("Worktree .claude/worktrees/A has uncommitted changes, so deleting the worktree "
+                            "would lose them.\n  commit or stash them and run �claude rm {sid}� again, or "
+                            "delete the session from �claude agents� (ctrl+x twice) to discard them\n")
+        self.root_cleanup()
+        self.assert_refused()
+
+    def test_rm_refusal_unparseable_is_refused(self):
+        sha = self.discard_setup()
+        self.fake.rm_out = self.cli_refusal(f"{sha}@abc")[:-30]  # truncated mid-token
+        self.root_cleanup()
+        self.assert_refused()
+
+    def test_rm_refusal_parse_variants(self):
+        """CLEANRM F1: only an exact `<40 lowercase hex>@<hex>` token list on the last line parses."""
+        s, t = "a" * 40, "b" * 40
+        ok = {"one": (f"{s}@ab", [s]), "two, any order": (f"{t}@1 {s}@2", [t, s]),
+              "tab separated": (f"{s}@1\t{t}@2", [s, t]), "CRLF": (f"{s}@1\r\n", [s])}
+        for k, (toks, shas) in ok.items():
+            with self.subTest(k):
+                r = conveyor.Conveyor.rm_refusal(self.cli_refusal(toks).format(sid="x"))
+                self.assertEqual((r[0], r[2]), ("x", shas))
+        bad = {"uppercase": f"{s.upper()}@ab", "short sha": f"{s[:39]}@ab", "long sha": f"{s}a@ab",
+               "abbreviated": f"{s[:12]}@ab", "no @": s, "empty @": f"{s}@", "two @": f"{s}@a@b",
+               "comma": f"{s}@1,{t}@2", "quoted": f"'{s}@1'", "trailing text": f"{s}@1 again",
+               "unicode digit": f"{s[:39]}١@1", "fullwidth": f"{s[:39]}ａ@1", "empty": "",
+               "ellipsis": f"{s}@1 …", "nul": f"{s}@1\x00"}
+        for k, toks in bad.items():
+            with self.subTest(k):
+                self.assertIsNone(conveyor.Conveyor.rm_refusal(self.cli_refusal(toks).format(sid="x")))
+        out = self.cli_refusal(f"{s}@1").format(sid="x")
+        for k, text in {"line after": out + "more\n", "no prefix": out.replace("its commits: ", ""),
+                        "uncommitted": out.replace("1 commit", "uncommitted changes"), "plain": "error\n",
+                        "empty output": ""}.items():
+            with self.subTest(k):
+                self.assertIsNone(conveyor.Conveyor.rm_refusal(text))
+
+    def test_rm_discard_needs_the_listed_id_and_a_worktree(self):
+        sha = self.discard_setup()
+        out = self.cli_refusal(f"{sha}@abc").format(sid="x")
+        ln = {"worktree": str(self.wt)}
+        self.assertEqual(self.c.rm_discard({"id": "x", "cwd": str(self.root)}, out, ln)[0], [f"{sha}@abc"])
+        self.assertIsNone(self.c.rm_discard({"id": "y", "cwd": str(self.root)}, out, ln))  # another session
+        self.assertIsNone(self.c.rm_discard({"id": "x", "cwd": str(self.root)}, out, {}))  # no worktree
+        self.assertIsNone(self.c.rm_discard({"id": "x", "cwd": str(self.root)}, out,
+                                            {"worktree": str(self.root)}))  # the root is not a worktree
+        for cwd in (self.root.parent, self.root / "sub"):  # only a root cwd falls back to ln["worktree"]
+            with self.subTest(cwd=cwd):
+                self.assertIsNone(self.c.rm_discard({"id": "x", "cwd": str(cwd)}, out, ln))
+
+    def test_rm_refusal_with_two_equivalent_shas_is_refused(self):
+        """CLEANRM: one worktree has one HEAD; a second listed sha (here main's, equivalent) is not it."""
+        sha = self.discard_setup()
+        self.fake.rm_out = self.cli_refusal(f"{sha}@abc", f"{self.g('rev-parse', 'main')}@abc")
+        self.root_cleanup()
+        self.assertEqual([c for c in self.cli("rm") if "--discard-unpushed" in c], [])
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "error")
+        self.assertEqual(self.equivalent_pairs(), [])
+        self.assertTrue(self.lanes()["A"]["cleanup"]["in_main"])  # both on local main: waits for the push
+        self.assertTrue(self.wt.exists())
+
+    def test_rm_refusal_early_uncommitted_line_keeps_attention(self):
+        """CLEANRM: in_main reads the whole refusal; an uncommitted line before the 300-char tail counts."""
+        self.discard_setup()
+        self.fake.rm_out = ("Worktree has uncommitted changes, so deleting it would lose them.\n" + "x" * 400 + "\n"
+                            + self.cli_refusal(f"{self.g('rev-parse', 'main')}@abc"))
+        self.root_cleanup()
+        self.assert_refused()
+        self.assertFalse(self.lanes()["A"]["cleanup"]["in_main"])
+
     def merge_side(self, extra):
         """lane-a: a --no-ff merge of side branch work that main cherry-picks, own file if extra."""
         self.g("checkout", "-q", "-b", "side", cwd=self.wt)
