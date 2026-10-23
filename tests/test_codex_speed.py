@@ -8,8 +8,11 @@ from __future__ import annotations
 
 import io
 import json
+import os
+import tempfile
 import threading
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -99,7 +102,11 @@ class Base(unittest.TestCase):
         self.addCleanup(codex.forget_codex_state)
         self.addCleanup(codex.forget_codex_catalog)
         self.clock = Clock()
-        for patcher in (patch.object(codex, "time", SimpleNamespace(monotonic=self.clock.monotonic, time=lambda: 0)),
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        self.home = Path(home.name)                           # CODEX_HOME: never the real ~/.codex
+        for patcher in (patch.dict(os.environ, {"CODEX_HOME": home.name}),
+                        patch.object(codex, "time", SimpleNamespace(monotonic=self.clock.monotonic, time=lambda: 0)),
                         patch.object(codex, "codex_executable", return_value="codex.exe"),
                         patch.object(codex, "prohibited_env_present", return_value=False)):
             patcher.start()
@@ -244,7 +251,7 @@ class StateReuseTests(Base):
 
     def test_any_refusal_drops_the_reused_state_and_the_catalogue(self) -> None:
         self.read_twice({**STATE, "quota": {"has_credits": False}})
-        codex._catalog_cache["codex.exe"] = (self.clock.now, [{"slug": "x"}])
+        codex._catalog_cache["codex.exe"] = (self.clock.now, codex._codex_auth_fingerprint("codex.exe"), [{"slug": "x"}])
         limited = {**STATE, "quota": {"has_credits": True, "limit_reached": True}}
         adapter = codex.CodexIntentAdapter("system", "gpt-5.6-luna", "low", state=lambda: limited)
         result = adapter.complete(self.task, SessionState(objective="hi"))
@@ -296,6 +303,120 @@ class CatalogCacheTests(Base):
             codex.codex_state(cached_catalog=True)
         self.assertEqual(2, app_server.call_count)
         self.assertEqual(1, self.catalog.call_count)
+
+
+class FingerprintTests(StateReuseTests):
+    """SPEEDCODEXFIX2: a cached state or catalogue is bound to the Codex login
+    and config it was read under; a change or an unreadable stat re-reads."""
+
+    NO_CREDITS = {**STATE, "quota": {"has_credits": False}}
+
+    def write(self, name: str, text: str, ns: int) -> None:
+        path = self.home / name
+        path.write_text(text, encoding="utf-8")
+        os.utime(path, ns=(ns, ns))                           # fixed stamps, no wall clock
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.write("auth.json", '{"account": "a"}', 1_000_000_000)
+        self.write("config.toml", "model = 'x'\n", 1_000_000_000)
+
+    def cached_then(self, change) -> int:
+        self.assertEqual(1, self.read_twice(self.NO_CREDITS))
+        change()
+        codex.reusable_codex_state()
+        return self.reads
+
+    def test_a_login_as_another_account_inside_the_ttl_re_reads(self) -> None:
+        self.assertEqual(2, self.cached_then(lambda: self.write("auth.json", '{"account": "bb"}', 2_000_000_000)))
+        codex.reusable_codex_state()                          # rebound to the new login
+        self.assertEqual(2, self.reads)
+
+    def test_a_same_size_rewrite_with_a_new_stamp_re_reads(self) -> None:
+        self.assertEqual(2, self.cached_then(lambda: self.write("auth.json", '{"account": "b"}', 2_000_000_000)))
+
+    def test_a_config_change_re_reads(self) -> None:
+        self.assertEqual(2, self.cached_then(lambda: self.write("config.toml", "model = 'y'\n", 2_000_000_000)))
+
+    def test_a_removed_auth_file_re_reads(self) -> None:
+        self.assertEqual(2, self.cached_then(lambda: (self.home / "auth.json").unlink()))
+
+    def test_another_codex_home_re_reads(self) -> None:
+        other = tempfile.TemporaryDirectory()
+        self.addCleanup(other.cleanup)
+        self.assertEqual(1, self.read_twice(self.NO_CREDITS))
+        with patch.dict(os.environ, {"CODEX_HOME": other.name}):
+            codex.reusable_codex_state()
+        self.assertEqual(2, self.reads)
+
+    def test_another_executable_re_reads(self) -> None:
+        with patch.object(codex, "codex_executable", return_value="codex.exe"):
+            self.assertEqual(1, self.read_twice(self.NO_CREDITS))
+        with patch.object(codex, "codex_executable", return_value="other\\codex.exe"):
+            codex.reusable_codex_state()
+        self.assertEqual(2, self.reads)
+
+    def test_an_unreadable_fingerprint_re_reads_every_call_and_keeps_nothing(self) -> None:
+        real_stat = Path.stat
+
+        def stat(path, *args, **kwargs):
+            if path.name == "auth.json":
+                raise PermissionError("denied")
+            return real_stat(path, *args, **kwargs)
+        self.assertEqual(1, self.read_twice(self.NO_CREDITS))
+        with patch.object(Path, "stat", stat):
+            self.assertIsNone(codex._codex_auth_fingerprint("codex.exe"))
+            codex.reusable_codex_state()
+            codex.reusable_codex_state()
+            self.assertEqual(3, self.reads)
+            self.assertEqual({}, codex._state_cache)
+            codex.remember_codex_state(self.NO_CREDITS)       # the panel path: kept unbound, never served
+            self.assertIsNone(codex._state_cache["fp"])
+        codex.reusable_codex_state()                          # readable again: a fresh read, then cached
+        codex.reusable_codex_state()
+        self.assertEqual(4, self.reads)
+
+    def test_credits_are_still_never_reused_under_a_matching_fingerprint(self) -> None:
+        self.assertEqual(2, self.read_twice({**STATE, "quota": {"has_credits": True}}))
+        self.assertEqual(codex._codex_auth_fingerprint("codex.exe"), codex._state_cache["fp"])
+
+    def test_a_store_without_a_pre_read_fingerprint_is_never_served(self) -> None:
+        self.assertEqual(1, self.read_twice(self.NO_CREDITS))
+        self.write("auth.json", '{"account": "bb"}', 2_000_000_000)   # login during the panel's read
+        codex.remember_codex_state(self.NO_CREDITS)           # backend panel: no fingerprint passed
+        self.assertIsNone(codex._state_cache["fp"])
+        codex.reusable_codex_state()
+        self.assertEqual(2, self.reads)
+        fingerprint = codex._codex_auth_fingerprint(codex.codex_executable())
+        codex.remember_codex_state(self.NO_CREDITS, fingerprint=fingerprint)
+        codex.reusable_codex_state()                          # a pre-read fingerprint is kept
+        self.assertEqual(2, self.reads)
+
+    def test_a_login_during_the_read_misses_next_time(self) -> None:
+        def login_meanwhile(**_):
+            self.reads += 1
+            self.write("auth.json", '{"account": "bb"}', 2_000_000_000)
+            return self.NO_CREDITS
+        self.reads = 0
+        with patch.object(codex, "codex_state", side_effect=login_meanwhile):
+            codex.reusable_codex_state()
+        self.answer = self.NO_CREDITS
+        codex.reusable_codex_state()
+        self.assertEqual(2, self.reads)
+
+    def test_the_catalogue_is_rebound_to_the_login_and_never_kept_unreadable(self) -> None:
+        with patch.object(codex, "_catalog", return_value=[{"slug": "gpt-5.6-luna"}]) as catalog:
+            codex._cached_catalog("codex.exe")
+            codex._cached_catalog("codex.exe")
+            self.assertEqual(1, catalog.call_count)
+            self.write("auth.json", '{"account": "bb"}', 2_000_000_000)
+            codex._cached_catalog("codex.exe")
+            self.assertEqual(2, catalog.call_count)
+            with patch.object(codex, "_codex_auth_fingerprint", return_value=None):
+                codex._cached_catalog("codex.exe")
+                codex._cached_catalog("codex.exe")
+                self.assertEqual(4, catalog.call_count)
+                self.assertEqual({}, codex._catalog_cache)
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -183,21 +183,46 @@ def _catalog(executable: str) -> list[dict[str, Any]]:
 #: How long the model catalogue (a separate ``codex debug models`` process) is
 #: reused for chat. Any refusal drops it, so an unknown model re-reads it at once.
 CODEX_CATALOG_TTL_SECONDS = 300.0
-_catalog_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_catalog_cache: dict[str, tuple[float, tuple, list[dict[str, Any]]]] = {}
 _catalog_lock = threading.Lock()
 
 
+def _codex_auth_fingerprint(executable: str | None) -> tuple | None:
+    """Stat-only identity of the Codex login and config a cached answer was
+    read under: the executable, CODEX_HOME (default ~/.codex) and its
+    auth.json / config.toml (path, mtime_ns, size). A ``codex login`` as
+    another account rewrites auth.json, so a cache bound to this misses.
+    None (unreadable) means nothing may be cached or served."""
+    try:
+        home = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
+        entries: list[Any] = [str(executable), str(home)]
+        for name in ("auth.json", "config.toml"):
+            path = home / name
+            try:
+                info = path.stat()
+            except FileNotFoundError:
+                entries.append((str(path), None))
+                continue
+            entries.append((str(path), info.st_mtime_ns, info.st_size))
+    except (OSError, RuntimeError):      # unreadable file or home: fail closed
+        return None
+    return tuple(entries)
+
+
 def _cached_catalog(executable: str) -> list[dict[str, Any]]:
-    """``_catalog`` read at most once per TTL per executable. An empty (failed)
-    read is never kept."""
+    """``_catalog`` read at most once per TTL per executable and login/config
+    fingerprint. An empty (failed) read, or one whose fingerprint is
+    unreadable, is never kept."""
+    fingerprint = _codex_auth_fingerprint(executable)
     with _catalog_lock:
         hit = _catalog_cache.get(executable)
-        if hit is not None and time.monotonic() - hit[0] < CODEX_CATALOG_TTL_SECONDS:
-            return hit[1]
+        if (fingerprint is not None and hit is not None and hit[1] == fingerprint
+                and time.monotonic() - hit[0] < CODEX_CATALOG_TTL_SECONDS):
+            return hit[2]
     models = _catalog(executable)
     with _catalog_lock:
-        if models:
-            _catalog_cache[executable] = (time.monotonic(), models)
+        if models and fingerprint is not None:
+            _catalog_cache[executable] = (time.monotonic(), fingerprint, models)
         else:
             _catalog_cache.pop(executable, None)
     return models
@@ -302,12 +327,16 @@ _state_lock = threading.Lock()
 _state_generation = 0
 
 
-def remember_codex_state(state: dict[str, Any], *, since: int | None = None) -> dict[str, Any]:
+def remember_codex_state(state: dict[str, Any], *, since: int | None = None,
+                         fingerprint: tuple | None = None) -> dict[str, Any]:
     """Keep a state for reuse only when its account and limits were really
     read: a verified ChatGPT route, the limit not reached and the credits flag
     known (no credits: the full window; credits: never reused). Anything
     unknown or failed is never kept. With ``since``, nothing is kept when
-    another store or forget landed after that generation was read."""
+    another store or forget landed after that generation was read. The state
+    is bound to the login/config ``fingerprint`` taken BEFORE the read; one
+    stored without it (one taken after could already be another login's) or
+    with an unreadable one is never served."""
     global _state_generation
     with _state_lock:
         if since is not None and since != _state_generation:
@@ -315,9 +344,10 @@ def remember_codex_state(state: dict[str, Any], *, since: int | None = None) -> 
         _state_generation += 1
         _state_cache.clear()
         quota = state.get("quota") if isinstance(state.get("quota"), dict) else {}
-        if state.get("status") == "available" and type(quota.get("has_credits")) is bool and not quota.get("limit_reached"):
+        if (state.get("status") == "available"
+                and type(quota.get("has_credits")) is bool and not quota.get("limit_reached")):
             ttl = CODEX_CREDITS_STATE_REUSE_SECONDS if quota["has_credits"] else CODEX_STATE_REUSE_SECONDS
-            _state_cache.update(state=state, at=time.monotonic(), ttl=ttl)
+            _state_cache.update(state=state, at=time.monotonic(), ttl=ttl, fp=fingerprint)
     return state
 
 
@@ -330,16 +360,22 @@ def forget_codex_state() -> None:
 
 def reusable_codex_state() -> dict[str, Any]:
     """A recently verified state, or a fresh check. Never reused when an
-    API-key variable has appeared since."""
+    API-key variable has appeared since, or when the Codex login/config
+    fingerprint changed or cannot be read."""
     if prohibited_env_present():
         forget_codex_state()
         return codex_state()
+    fingerprint = _codex_auth_fingerprint(codex_executable())     # before the read: a login during it misses next time
     with _state_lock:
         cached = _state_cache.get("state")
-        if cached is not None and _state_cache["ttl"] > 0 and time.monotonic() - _state_cache["at"] < _state_cache["ttl"]:
+        if (cached is not None and fingerprint is not None and _state_cache.get("fp") == fingerprint
+                and _state_cache["ttl"] > 0 and time.monotonic() - _state_cache["at"] < _state_cache["ttl"]):
             return cached
         generation = _state_generation
-    return remember_codex_state(codex_state(cached_catalog=True), since=generation)
+    if fingerprint is None:
+        forget_codex_state()
+        return codex_state(cached_catalog=True)
+    return remember_codex_state(codex_state(cached_catalog=True), since=generation, fingerprint=fingerprint)
 
 
 class CodexIntentAdapter:
