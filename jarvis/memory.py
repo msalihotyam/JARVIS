@@ -7427,8 +7427,9 @@ class SQLiteMemoryStore:
                 connection, (stored.scope.conversation_id, stored.source_conversation_id)
             ):
                 raise MemoryRecordRefused("memory_off")
-            # MEMTRIGWIRE: delete wins over an in-flight capture - checked in
-            # the writer, so a capture finishing after the delete is dropped.
+            # MEMTRIGWIRE: a conversation's removal wins over an in-flight
+            # capture - checked in the writer, so a capture finishing after
+            # the conversation is gone is dropped.
             for conversation_id in {stored.scope.conversation_id, stored.source_conversation_id} - {None}:
                 if connection.execute(
                     "SELECT 1 FROM conversation_deletions WHERE conversation_id = ?", (conversation_id,)
