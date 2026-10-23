@@ -216,15 +216,34 @@ class StateReuseTests(Base):
         codex.reusable_codex_state()
         self.assertEqual(2, self.reads)
 
-    def test_a_state_with_credits_is_reused_only_for_the_short_window(self) -> None:
-        self.assertLessEqual(codex.CODEX_CREDITS_STATE_REUSE_SECONDS, codex.CODEX_STATE_REUSE_SECONDS)
-        self.assertEqual(1, self.read_twice({**STATE, "quota": {"has_credits": True}}))
-        self.clock.now += codex.CODEX_CREDITS_STATE_REUSE_SECONDS + 1
+    def test_a_state_with_credits_is_re_read_on_every_call(self) -> None:
+        self.assertEqual(0.0, codex.CODEX_CREDITS_STATE_REUSE_SECONDS)
+        self.assertEqual(2, self.read_twice({**STATE, "quota": {"has_credits": True}}))
+        codex.reusable_codex_state()                          # same instant
+        self.assertEqual(3, self.reads)
+        self.clock.now -= 1                                   # a clock behind the stamp
         codex.reusable_codex_state()
+        self.assertEqual(4, self.reads)
+
+    def test_a_slow_read_never_overwrites_a_newer_store(self) -> None:
+        newer = {**STATE, "quota": {"has_credits": True}}
+        stale = {**STATE, "quota": {"has_credits": False}}
+
+        def slow_read(**_):
+            self.reads += 1
+            codex.remember_codex_state(newer)                 # the panel stores meanwhile
+            return stale
+        self.reads = 0
+        codex.forget_codex_state()
+        with patch.object(codex, "codex_state", side_effect=slow_read):
+            codex.reusable_codex_state()
+        self.assertIs(newer, codex._state_cache["state"])
+        self.answer = stale
+        codex.reusable_codex_state()                          # credits: re-read, not the stale False
         self.assertEqual(2, self.reads)
 
     def test_any_refusal_drops_the_reused_state_and_the_catalogue(self) -> None:
-        self.read_twice({**STATE, "quota": {"has_credits": True}})
+        self.read_twice({**STATE, "quota": {"has_credits": False}})
         codex._catalog_cache["codex.exe"] = (self.clock.now, [{"slug": "x"}])
         limited = {**STATE, "quota": {"has_credits": True, "limit_reached": True}}
         adapter = codex.CodexIntentAdapter("system", "gpt-5.6-luna", "low", state=lambda: limited)

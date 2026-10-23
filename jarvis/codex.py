@@ -291,19 +291,28 @@ def codex_state(cached_catalog: bool = False) -> dict[str, Any]:
 #: forced, API-key variables stripped), so a reused state can never open a
 #: metered route.
 CODEX_STATE_REUSE_SECONDS = 300.0
-#: The shorter reuse when the plan HAS purchased credits: a stale 'limit not
-#: reached' could let credits be spent, so the window stays small.
-CODEX_CREDITS_STATE_REUSE_SECONDS = min(60.0, CODEX_STATE_REUSE_SECONDS)
+#: No reuse when the plan HAS purchased credits: a stale 'limit not reached'
+#: could let credits be spent (no paid usage, fail closed), so every call
+#: re-reads the account exactly as before SPEEDCODEX.
+CODEX_CREDITS_STATE_REUSE_SECONDS = 0.0
 _state_cache: dict[str, Any] = {}
 _state_lock = threading.Lock()
+#: Bumped by every remember/forget, so a slow read that began before a newer
+#: store (or a refusal) can never overwrite it with an older answer.
+_state_generation = 0
 
 
-def remember_codex_state(state: dict[str, Any]) -> dict[str, Any]:
+def remember_codex_state(state: dict[str, Any], *, since: int | None = None) -> dict[str, Any]:
     """Keep a state for reuse only when its account and limits were really
     read: a verified ChatGPT route, the limit not reached and the credits flag
-    known (no credits: the full window; credits: the short one). Anything
-    unknown or failed is never kept."""
+    known (no credits: the full window; credits: never reused). Anything
+    unknown or failed is never kept. With ``since``, nothing is kept when
+    another store or forget landed after that generation was read."""
+    global _state_generation
     with _state_lock:
+        if since is not None and since != _state_generation:
+            return state
+        _state_generation += 1
         _state_cache.clear()
         quota = state.get("quota") if isinstance(state.get("quota"), dict) else {}
         if state.get("status") == "available" and type(quota.get("has_credits")) is bool and not quota.get("limit_reached"):
@@ -313,7 +322,9 @@ def remember_codex_state(state: dict[str, Any]) -> dict[str, Any]:
 
 
 def forget_codex_state() -> None:
+    global _state_generation
     with _state_lock:
+        _state_generation += 1
         _state_cache.clear()
 
 
@@ -325,9 +336,10 @@ def reusable_codex_state() -> dict[str, Any]:
         return codex_state()
     with _state_lock:
         cached = _state_cache.get("state")
-        if cached is not None and time.monotonic() - _state_cache["at"] < _state_cache["ttl"]:
+        if cached is not None and _state_cache["ttl"] > 0 and time.monotonic() - _state_cache["at"] < _state_cache["ttl"]:
             return cached
-    return remember_codex_state(codex_state(cached_catalog=True))
+        generation = _state_generation
+    return remember_codex_state(codex_state(cached_catalog=True), since=generation)
 
 
 class CodexIntentAdapter:
