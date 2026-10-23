@@ -557,6 +557,28 @@ class AgreementTest(BotCase):
         self.assertEqual(k("write_key1", f"push-{SHA}-L"), f"key1:l@{SHA[:7]}")
         self.assertEqual(k("write_key1", "L"), "key1:l")
 
+    def test_laneless_approval_agrees_with_its_lane(self):
+        self.approve("2026-10-15T11:30:00", name=f"push-{SHA}")  # key1:@sha7, the bot's is key1:l1@sha7
+        self.clock.set("2026-10-15T12:05:00")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["agree"])
+        self.assertEqual(self.verdicts()[0]["key"], f"key1:l1@{SHA[:7]}")
+
+    def test_laneless_approval_of_another_sha_never_matches(self):
+        self.approve("2026-10-15T11:30:00", name=f"push-{SHA2}")
+        self.clock.set("2026-10-15T12:30:01")
+        self.run_bot()
+        self.assertEqual(sorted(self.kinds()), ["missed", "unmatched"])
+
+    def test_same_key(self):
+        s, k7 = orchbot.same_key, SHA[:7]
+        self.assertTrue(s(f"key1:@{k7}", f"key1:l1@{k7}"))
+        self.assertTrue(s(f"key1:1x@{k7}", f"key1:@{k7}"))  # a digit lane sorts before "@": both orders
+        self.assertFalse(s(f"key1:@{k7}", f"key1:l1@{SHA2[:7]}"))
+        self.assertFalse(s("key1:@", "key1:l1@"))
+        self.assertFalse(s(f"key1:@{k7}", f"fix:@{k7}"))
+        self.assertFalse(s(None, "dispatch"))
+
     def test_window_edge_3600_matches(self):
         self.approve("2026-10-15T12:00:00")
         self.clock.set("2026-10-15T12:00:00")
@@ -770,6 +792,35 @@ class FactsTest(BotCase):
                 self.assertNotIn("hunter2", orchbot.clean(raw))
                 self.assertNotIn("hunter2", orchbot.ask_text(raw, 300))
 
+    def test_escaped_quote_secret_redacted(self):
+        long = "hunter2" + "Q7" * 40
+        for secret in ("hunter2", long):
+            for raw in ('{"token":"prefix\\"' + secret + '"}', '{"token":"a\\\\\\"' + secret + '"}',
+                        "'token'='it\\'s " + secret + "'", '"Password" = "\\"' + secret + '\\""',
+                        'TOKEN="\\"' + secret + '"', 'token="' + secret, 'secret="\\"\\"' + secret + ' x"',
+                        'token="ç\\"' + secret + '"'):
+                with self.subTest(raw=raw[:40]):
+                    self.assertNotIn("hunter2", orchbot.clean(raw))
+                    self.assertNotIn("hunter2", orchbot.ask_text(raw, 300))
+        self.assertEqual(orchbot.clean('token="" next'), "token=[redacted] next")
+        # a quote cut by the stamp head or the clean cap never closes: redact to the end
+        self.assertEqual(orchbot.clean('{"password": "correct horse hunter2'), '{"password": [redacted]')
+        self.assertNotIn("hunter2", orchbot.clean("token='a b hunter2"))
+
+    def test_stamp_text_is_cleaned(self):
+        p = self.root / "PAUSE"
+        p.write_text("token=hunter2secret paused by " + str(self.root), encoding="utf-8")
+        text = orchbot.stamp(p)["text"]
+        self.assertNotIn("hunter2", text)
+        self.assertIn("[redacted]", text)
+        self.assertEqual(orchbot.stamp(self.root / "nope"), "absent")
+
+    def test_leftover_conv_key_is_no_state(self):
+        self.assertNotIn("conv", orchbot.SHAPES)
+        self.put("build/bot/shadow.json", {"conv": "not a dict", "fixes": {"L1": 2}})
+        self.run_bot()
+        self.assertEqual(self.shadow()["fixes"], {"L1": 2})
+
 
 class AsksTest(BotCase):
     KEYS = {"id", "title", "blocks", "where", "time", "why", "steps", "cmds", "then", "since", "source"}
@@ -816,7 +867,7 @@ class AsksTest(BotCase):
 
     def push(self, lane_files, lane="L2", approval="L2"):
         self.put("build/conveyor/lanes.json", {lane: {"files": lane_files}})
-        self.put("build/conveyor/status.json", {"pid": 100})
+        self.put("build/conveyor/status.json", {"pid": 100, "updated_at": "2026-10-15T12:10:00"})
         self.run_bot(started=self.STARTS.get)
         self.events({"ts": "2026-10-15T12:05:00", "event": "push", "sha": SHA,
                      "approval": f"push-{SHA}-{approval}"})
@@ -831,11 +882,28 @@ class AsksTest(BotCase):
         self.clock.set("2026-10-15T12:20:00")
         self.run_bot(started=self.STARTS.get)  # same pid: still open
         self.assertEqual(len(self.asks()), 1)
-        self.put("build/conveyor/status.json", {"pid": 200})
+        self.put("build/conveyor/status.json", {"pid": 200, "updated_at": "2026-10-15T12:30:00"})
         self.clock.set("2026-10-15T12:30:00")
         self.run_bot(started=self.STARTS.get)
         self.assertEqual(self.asks(), [])
         self.assertEqual(self.ask_log(), ["open restart", "close restart"])
+
+    def test_restart_stale_status_never_clears_the_push(self):
+        # a reused pid 200 started after the push, but status.json is not being written: the push stays pending
+        for status in ({"pid": 200}, {"pid": 200, "updated_at": "2026-10-15T12:05:00"},
+                       {"pid": 200, "updated_at": "2026-10-15T12:40:00"}):
+            with self.subTest(status=status):
+                shutil.rmtree(self.root / "build" / "bot", ignore_errors=True)
+                (self.conv / "events.jsonl").unlink(missing_ok=True)
+                self.clock.set("2026-10-15T12:00:00")
+                self.push(["scripts/conveyor.py"])
+                self.put("build/conveyor/status.json", status)
+                self.clock.set("2026-10-15T12:30:00")
+                ds = self.run_bot(started=self.STARTS.get) + self.run_bot(started=self.STARTS.get)
+                # unknown input = no ask (closed once) and one escalate; the push itself is kept
+                self.assertEqual(self.acts(ds), [("escalate_orchestrator", "FAILCLOSED", "asks.json"),
+                                                 ("none", "ASK", "restart")])
+                self.assertEqual(self.shadow()["conv_push"]["sha"], SHA)
 
     def test_restart_live_int63b_push_while_old_conveyor_runs(self):
         # live case (c): INT63B pushed scripts/conveyor.py, approval name is lowercase, conveyor started before

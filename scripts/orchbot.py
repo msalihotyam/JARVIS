@@ -91,7 +91,8 @@ SECRET_RES = (  # facts.md never carries a URL (ntfy topic), a key or a key=valu
     (re.compile(r"\b(?:sk-|ghp_|gho_|github_pat_|xox[abp]-|AKIA)[\w-]{6,}"), "[key]"),
     (re.compile(r"(?i)\b(bearer\s+)\S+"), r"\1[redacted]"),
     (re.compile(r"""(?i)(?<![a-z0-9])(token|key|secret|password|passwd|topic|bearer|auth\w*)(["']?\s*=?[:=>]\s*)"""
-                r"""(?:"[^"]*"|'[^']*'|\S+)"""), r"\1\2[redacted]"),
+                r"""(?:"(?:\\.|[^"\\])*(?:"|$)|'(?:\\.|[^'\\])*(?:'|$)|\S+)"""), r"\1\2[redacted]"),
+    # escape-aware; an unclosed quote (cut head/cap) redacts to the end
     # long token between dashes, so push-<40 hex>-lane (approval names) and a hex sha never match
     (re.compile(r"(?=[\w+]*[g-zG-Z])(?=[\w+]*\d)[\w+]{32,}"), "[redacted]"),
 )
@@ -168,7 +169,7 @@ def stamp(p):
         head = p.read_bytes()[:80].decode("utf-8", errors="replace")
     except OSError:
         return "absent"
-    return {"mtime": cv.iso(s.st_mtime), "bytes": s.st_size, "text": head}
+    return {"mtime": cv.iso(s.st_mtime), "bytes": s.st_size, "text": clean(head)}
 
 
 def agree_key(action, target):
@@ -182,6 +183,16 @@ def agree_key(action, target):
         return "key1:" + (f"{m.group(2) or ''}@{m.group(1)[:7]}" if m else t).lower()
     return {"queue_fix_slice": "fix:" + t.lower(), "rerun_ci_once": "rerun:" + t.lower(),
             "hold_dispatch": "dispatch", "page_salih": "salih"}.get(action)
+
+
+def same_key(a, b):
+    """Two agree keys name one target; a lane-less approval (push-<sha>, "key1:@sha7") matches its sha's lane."""
+    if a == b:
+        return True
+    if not (isinstance(a, str) and isinstance(b, str)):
+        return False
+    return any(x.startswith("key1:@") and len(x) > 6 and y.startswith("key1:") and y.endswith(x[5:])
+               for x, y in ((a, b), (b, a)))
 
 
 def agree_blank():
@@ -234,7 +245,6 @@ SHAPES = {  # shadow.json keys; a present key of another shape resets the state 
                                                      for x in v.values()),
     "head": lambda v: isinstance(v, str),
     "asks": lambda v: isinstance(v, dict) and all(isinstance(x, str) for x in v.values()),
-    "conv": lambda v: isinstance(v, dict) and all(num(v.get(k, 0)) for k in ("pid", "seen")),
     "conv_push": lambda v: isinstance(v, dict) and num(v.get("at", 0)) and isinstance(v.get("sha", ""), str),
     "live": lambda v: isinstance(v, dict) and all(isinstance(v.get(k, {}), dict) and all(num(x) for x in v.get(k, {}).values())
                                                   for k in ("demoted", "acks"))
@@ -372,7 +382,7 @@ class Bot:
     def load_state(self):
         blank = {"cursor": None, "decisions": [], "counters": {}, "seen": {}, "history": [],
                  "fixes": {}, "respawns": {}, "head": "", "agreement": agree_blank(),
-                 "asks": {}, "conv": {}, "conv_push": {}, "live": {}}
+                 "asks": {}, "conv_push": {}, "live": {}}
         path = self.out / "shadow.json"
         if not path.exists():
             return blank
@@ -757,6 +767,11 @@ class Bot:
         if not num(start):
             raise ValueError(f"conveyor pid {pid}: start time unreadable")
         if start >= push["at"]:
+            # a stale status.json may name a dead pid that the OS reused: only a fresh one closes the ask
+            upd = parse_ts(self.status.get("updated_at"))
+            if upd is None or not 0 <= self.now() - upd <= ALIVE_S:
+                raise ValueError(f"status.json not fresh (updated_at {self.status.get('updated_at')!r}): "
+                                 f"pid {pid} may be reused; the push stays pending")
             self.st["conv_push"] = {}
             return []
         return [self.ask(
@@ -1205,7 +1220,7 @@ class Bot:
         acts = sorted(ag["actual"] + actual + self.observed, key=lambda e: e["at"])
         used, keep = set(), []
         for a in acts:
-            i = next((i for i, p in enumerate(pend) if i not in used and p["key"] == a["key"]
+            i = next((i for i, p in enumerate(pend) if i not in used and same_key(p["key"], a["key"])
                       and abs(p["at"] - a["at"]) <= MATCH_S), None)
             if i is not None:
                 used.add(i)
