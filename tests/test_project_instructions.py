@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import io
 import json
 import re
 import sqlite3
@@ -233,13 +234,13 @@ class IntentInstructionTests(IntentTestCase):
     def codex_prompt(self, conversation_id: str | None, text: str = "Merhaba") -> str:
         import jarvis.codex as codex
         process = mock.MagicMock(returncode=0)
-        process.communicate.return_value = (json.dumps(
-            {"type": "item.completed", "item": {"type": "agent_message", "text": chat_proposal("ok")}}), "")
+        process.stdout, process.stderr = io.StringIO(json.dumps(
+            {"type": "item.completed", "item": {"type": "agent_message", "text": chat_proposal("ok")}})), io.StringIO()
         with mock.patch.object(codex, "codex_executable", return_value="codex.exe"), \
                 mock.patch.object(codex.subprocess, "Popen", return_value=process):
             adapter = codex.CodexIntentAdapter(INTENT_SYSTEM_PROMPT, "gpt-5.6-luna", "low", state=lambda: self.STATE)
             self.build(adapter).submit_text(text, conversation_id=conversation_id)
-        return process.communicate.call_args[0][0]
+        return process.stdin.write.call_args[0][0]
 
     CODEX_PREFIX = INTENT_SYSTEM_PROMPT + "\n\nJARVIS intent understanding request. Reply with exactly one JSON object.\n"
 

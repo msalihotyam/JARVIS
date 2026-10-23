@@ -180,6 +180,44 @@ def _catalog(executable: str) -> list[dict[str, Any]]:
     return [m for m in models if isinstance(m, dict)] if isinstance(models, list) else []
 
 
+#: How long the model catalogue (a separate ``codex debug models`` process) is
+#: reused for chat. Any refusal drops it, so an unknown model re-reads it at once.
+CODEX_CATALOG_TTL_SECONDS = 300.0
+_catalog_cache: dict[str, tuple[float, list[dict[str, Any]]]] = {}
+_catalog_lock = threading.Lock()
+
+
+def _cached_catalog(executable: str) -> list[dict[str, Any]]:
+    """``_catalog`` read at most once per TTL per executable. An empty (failed)
+    read is never kept."""
+    with _catalog_lock:
+        hit = _catalog_cache.get(executable)
+        if hit is not None and time.monotonic() - hit[0] < CODEX_CATALOG_TTL_SECONDS:
+            return hit[1]
+    models = _catalog(executable)
+    with _catalog_lock:
+        if models:
+            _catalog_cache[executable] = (time.monotonic(), models)
+        else:
+            _catalog_cache.pop(executable, None)
+    return models
+
+
+def forget_codex_catalog() -> None:
+    with _catalog_lock:
+        _catalog_cache.clear()
+
+
+def _agent_text(line: str) -> str | None:
+    """The text of an ``agent_message`` item on one JSONL line, else None."""
+    try:
+        event = json.loads(line)
+    except ValueError:
+        return None
+    item = event.get("item") if isinstance(event, dict) and isinstance(event.get("item"), dict) else {}
+    return item["text"] if item.get("type") == "agent_message" and type(item.get("text")) is str else None
+
+
 def _window(value: Any) -> dict[str, Any] | None:
     if not isinstance(value, dict):
         return None
@@ -189,7 +227,7 @@ def _window(value: Any) -> dict[str, Any] | None:
     return {"used_percent": float(used), "window_minutes": minutes, "resets_at": resets}
 
 
-def codex_state() -> dict[str, Any]:
+def codex_state(cached_catalog: bool = False) -> dict[str, Any]:
     """What is REALLY known about the Codex route, from local non-model calls.
 
     ``status``: available / not_installed / not_logged_in / api_key_route /
@@ -198,7 +236,9 @@ def codex_state() -> dict[str, Any]:
     Codex's own priority order. ``upgrades``: what Codex declares about
     replacing ANY model it returned, listed or not - ``{id: {"model",
     "retirement_at", "specialty"}}``. ``quota``: the plan's usage windows as
-    the service reported them, or absent."""
+    the service reported them, or absent. ``cached_catalog`` takes the model
+    catalogue from the per-process cache (the chat path); account and limits
+    are always read fresh."""
     executable = codex_executable()
     if executable is None:
         return {"status": "not_installed", "models": []}
@@ -222,7 +262,7 @@ def codex_state() -> dict[str, Any]:
         if quota:
             quota["checked_at"] = int(time.time())       # when Codex reported it (a reused state keeps this time)
             state["quota"] = quota
-    for model in _catalog(executable):
+    for model in (_cached_catalog if cached_catalog else _catalog)(executable):
         slug = model.get("slug")
         if type(slug) is not str or not CODEX_MODEL_PATTERN.match(slug):
             continue
@@ -251,19 +291,24 @@ def codex_state() -> dict[str, Any]:
 #: forced, API-key variables stripped), so a reused state can never open a
 #: metered route.
 CODEX_STATE_REUSE_SECONDS = 300.0
+#: The shorter reuse when the plan HAS purchased credits: a stale 'limit not
+#: reached' could let credits be spent, so the window stays small.
+CODEX_CREDITS_STATE_REUSE_SECONDS = min(60.0, CODEX_STATE_REUSE_SECONDS)
 _state_cache: dict[str, Any] = {}
 _state_lock = threading.Lock()
 
 
 def remember_codex_state(state: dict[str, Any]) -> dict[str, Any]:
-    """Keep a state for reuse only when it is fully safe to reuse: a verified
-    ChatGPT route whose plan has NO purchased credits (so a stale 'limit not
-    reached' can never let credits be spent)."""
+    """Keep a state for reuse only when its account and limits were really
+    read: a verified ChatGPT route, the limit not reached and the credits flag
+    known (no credits: the full window; credits: the short one). Anything
+    unknown or failed is never kept."""
     with _state_lock:
         _state_cache.clear()
         quota = state.get("quota") if isinstance(state.get("quota"), dict) else {}
-        if state.get("status") == "available" and quota.get("has_credits") is False and not quota.get("limit_reached"):
-            _state_cache.update(state=state, at=time.monotonic())
+        if state.get("status") == "available" and type(quota.get("has_credits")) is bool and not quota.get("limit_reached"):
+            ttl = CODEX_CREDITS_STATE_REUSE_SECONDS if quota["has_credits"] else CODEX_STATE_REUSE_SECONDS
+            _state_cache.update(state=state, at=time.monotonic(), ttl=ttl)
     return state
 
 
@@ -280,9 +325,9 @@ def reusable_codex_state() -> dict[str, Any]:
         return codex_state()
     with _state_lock:
         cached = _state_cache.get("state")
-        if cached is not None and time.monotonic() - _state_cache["at"] < CODEX_STATE_REUSE_SECONDS:
+        if cached is not None and time.monotonic() - _state_cache["at"] < _state_cache["ttl"]:
             return cached
-    return remember_codex_state(codex_state())
+    return remember_codex_state(codex_state(cached_catalog=True))
 
 
 class CodexIntentAdapter:
@@ -302,6 +347,13 @@ class CodexIntentAdapter:
         self._lock = threading.Lock()
         #: Task ids cancelled before their CLI spawned; ``complete`` refuses them.
         self._cancelled: set[str] = set()
+        #: Called with the General Chat reply visible so far while it streams
+        #: (see ``jarvis.intent.ChatReplyStream``). Display only; ``None`` streams nothing.
+        self.stream_listener: Any = None
+        #: DFSPEED: task id -> the ``time.monotonic()`` marks of that call (start,
+        #: spawn, first and last agent text, end) and the agent text characters.
+        #: Measured only; nothing reads them to decide anything.
+        self.timings: dict[str, dict[str, Any]] = {}
 
     def context_profile(self) -> ContextProfile:
         """What one call can carry, REPORTED to the Conversation Context Core,
@@ -327,14 +379,84 @@ class CodexIntentAdapter:
         return True
 
     def _refused(self, message: str, code: ErrorCode = ErrorCode.BILLING_ROUTE_UNKNOWN, reason: str = "") -> ToolResult:
-        # Any refusal or failure re-verifies the route next time: nothing stale is trusted after a problem.
+        # Any refusal or failure re-verifies the route and re-reads the model
+        # catalogue next time: nothing stale is trusted after a problem.
         forget_codex_state()
+        forget_codex_catalog()
         # Every failure names the provider and the model the person chose.
         message = f"Codex · {self.model or 'no model'}: {message}"
         details = {"billing_evidence": reason} if reason else {}
         return ToolResult(outcome=OutcomeStatus.ERROR, summary=message, error=StructuredError(code, message, details))
 
     def complete(self, task: Task, session: SessionState) -> ToolResult:
+        marks: dict[str, Any] = {"started": time.monotonic()}
+        try:
+            return self._complete(task, marks)
+        finally:
+            marks["ended"] = time.monotonic()
+            self.timings[task.id] = marks
+
+    def _read_output(self, process: subprocess.Popen[str], prompt: str, marks: dict[str, Any]) -> str:
+        """The CLI's JSONL stdout, read line by line as it arrives so an agent
+        message reaches ``stream_listener`` before the process ends. The
+        timeout still bounds the whole call: the process is killed and
+        ``subprocess.TimeoutExpired`` raised."""
+        # Lazy: jarvis.intent is the heavier module and never imports this one.
+        from jarvis.intent import STREAM_PREVIEW_INTERVAL_SECONDS, ChatReplyStream, _notify
+        listener = self.stream_listener
+        timed_out = threading.Event()
+
+        def expire() -> None:
+            timed_out.set()
+            process.kill()
+
+        def send() -> None:
+            # On its own thread, as communicate() does: a large request never stalls the reader.
+            try:
+                process.stdin.write(prompt)
+                process.stdin.close()
+            except (OSError, ValueError):
+                pass                                   # the CLI exited early; its exit code says so
+
+        timer = threading.Timer(CODEX_TIMEOUT_SECONDS, expire)
+        writer = threading.Thread(target=send, daemon=True)
+        drain = threading.Thread(target=process.stderr.read, daemon=True)   # stderr is drained and dropped, as before
+        timer.start()
+        writer.start()
+        drain.start()
+        lines: list[str] = []
+        reply, seen, shown, last = ChatReplyStream(), "", 0, 0.0
+        try:
+            for line in process.stdout:
+                lines.append(line)
+                text = _agent_text(line)
+                if text is None:
+                    continue
+                if not text.startswith(seen):         # a new message, not a longer one
+                    reply, seen, shown = ChatReplyStream(), "", 0
+                chunk, seen = text[len(seen):], text
+                if not chunk:
+                    continue
+                marks.setdefault("first_text", time.monotonic())
+                marks["last_text"] = time.monotonic()
+                marks["output_chars"] = marks.get("output_chars", 0) + len(chunk)
+                if listener is not None and reply.feed(chunk):
+                    now = time.monotonic()
+                    if shown == 0 or now - last >= STREAM_PREVIEW_INTERVAL_SECONDS or reply.state == "done":
+                        shown, last = len(reply.text), now
+                        _notify(listener, reply.text)
+            process.wait()
+        finally:
+            timer.cancel()
+            writer.join(5)
+            drain.join(5)
+        if listener is not None and reply.text and len(reply.text) != shown:
+            _notify(listener, reply.text)
+        if timed_out.is_set():
+            raise subprocess.TimeoutExpired(process.args, CODEX_TIMEOUT_SECONDS)
+        return "".join(lines)
+
+    def _complete(self, task: Task, marks: dict[str, Any]) -> ToolResult:
         executable = codex_executable()
         if executable is None:
             return self._refused("The Codex CLI is not installed.", ErrorCode.CONNECTOR_UNAVAILABLE)
@@ -393,11 +515,10 @@ class CodexIntentAdapter:
             except OSError:
                 return self._refused("The Codex CLI could not be started.", ErrorCode.CONNECTOR_UNAVAILABLE)
             self._processes[task.id] = process
+        marks["spawned"] = time.monotonic()
         try:
-            stdout, _ = process.communicate(prompt, timeout=CODEX_TIMEOUT_SECONDS)
+            stdout = self._read_output(process, prompt, marks)
         except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
             return self._refused("Codex did not finish before the timeout.", ErrorCode.CONNECTOR_FAILED)
         finally:
             with self._lock:

@@ -1522,9 +1522,9 @@ class CodexProviderTests(IntentTestCase):
         from unittest.mock import patch, MagicMock
         import jarvis.codex as codex
         process = MagicMock(returncode=0)
-        process.communicate.return_value = ("\n".join(json.dumps(e) for e in (
+        process.stdout, process.stderr = io.StringIO("\n".join(json.dumps(e) for e in (
             {"type": "item.completed", "item": {"type": "agent_message", "text": chat_proposal("merhaba")}},
-            {"type": "turn.completed", "usage": {"input_tokens": 7, "output_tokens": 2}})), "")
+            {"type": "turn.completed", "usage": {"input_tokens": 7, "output_tokens": 2}}))), io.StringIO()
         with patch.dict(os.environ, {"OPENAI_API_KEY": "x"}), patch.object(codex, "codex_executable", return_value="codex.exe"), \
                 patch.object(codex.subprocess, "Popen", return_value=process) as popen:
             app = self.build(self.adapter(self.STATE))
@@ -1550,7 +1550,7 @@ class CodexProviderTests(IntentTestCase):
         from unittest.mock import patch, MagicMock
         import jarvis.codex as codex
         process = MagicMock(returncode=returncode)
-        process.communicate.return_value = ("\n".join(json.dumps(e) for e in events), "")
+        process.stdout, process.stderr = io.StringIO("\n".join(json.dumps(e) for e in events)), io.StringIO()
         with patch.object(codex, "codex_executable", return_value="codex.exe"), \
                 patch.object(codex.subprocess, "Popen", return_value=process) as popen:
             app = self.build(self.adapter(self.SOL, "gpt-5.6-sol", effort))
@@ -1763,7 +1763,7 @@ class DailyUseStreamingTests(IntentTestCase):
         import jarvis.codex as codex
         fresh = {"status": "available", "models": [], "quota": {"has_credits": False, "checked_at": 1}}
         calls = []
-        with patch.object(codex, "codex_state", side_effect=lambda: calls.append(1) or dict(fresh)), \
+        with patch.object(codex, "codex_state", side_effect=lambda **_: calls.append(1) or dict(fresh)), \
                 patch.object(codex, "prohibited_env_present", return_value=False):
             codex.forget_codex_state()
             codex.reusable_codex_state()
@@ -1775,11 +1775,13 @@ class DailyUseStreamingTests(IntentTestCase):
             with patch.object(codex.time, "monotonic", return_value=time.monotonic() + codex.CODEX_STATE_REUSE_SECONDS + 1):
                 codex.reusable_codex_state()
             self.assertEqual(3, len(calls))                                              # expired
-            for unsafe in ({**fresh, "quota": {"has_credits": True}}, {**fresh, "quota": {"has_credits": False, "limit_reached": True}},
+            for unsafe in ({**fresh, "quota": {"has_credits": None}}, {**fresh, "quota": {"has_credits": False, "limit_reached": True}},
                            {"status": "not_logged_in", "models": []}):
                 codex.forget_codex_state()
                 codex.remember_codex_state(unsafe)
                 self.assertEqual({}, codex._state_cache)                                 # never kept
+            codex.remember_codex_state({**fresh, "quota": {"has_credits": True}})
+            self.assertEqual(codex.CODEX_CREDITS_STATE_REUSE_SECONDS, codex._state_cache["ttl"])  # credits: only the short window
             codex.remember_codex_state(dict(fresh))
             adapter = codex.CodexIntentAdapter(INTENT_SYSTEM_PROMPT, "gpt-x", "")        # not offered -> refused
             with patch.object(codex, "codex_executable", return_value="codex.exe"):
@@ -1975,8 +1977,8 @@ class ContextItemsTests(IntentTestCase):
         groups, extra = self.groups()
         window = context_window(groups, extra)
         process = MagicMock(returncode=0)
-        process.communicate.return_value = (json.dumps(
-            {"type": "item.completed", "item": {"type": "agent_message", "text": chat_proposal("A: ... B: ... C: ...")}}), "")
+        process.stdout, process.stderr = io.StringIO(json.dumps(
+            {"type": "item.completed", "item": {"type": "agent_message", "text": chat_proposal("A: ... B: ... C: ...")}})), io.StringIO()
         state = {"status": "available", "plan": "plus",
                  "models": [{"id": "gpt-5.6-luna", "name": "L", "efforts": ["low"], "default_effort": "low"}]}
         adapter = codex.CodexIntentAdapter(INTENT_SYSTEM_PROMPT, "gpt-5.6-luna", "low", state=lambda: state)
@@ -1992,7 +1994,7 @@ class ContextItemsTests(IntentTestCase):
         self.assertEqual(["-i", files[0][2], files[1][2], files[2][2], "--", "-"], argv[-6:])
         for flag in ("--ephemeral", "--ignore-user-config", "--ignore-rules", "read-only", "web_search_mode=disabled"):
             self.assertIn(flag, argv)
-        sent = process.communicate.call_args[0][0]
+        sent = process.stdin.write.call_args[0][0]
         self.assertTrue(all(path not in sent for _, _, path in files))
 
     def test_the_turn_carries_groups_as_data_with_zero_authority_and_both_modes_are_explained(self) -> None:
