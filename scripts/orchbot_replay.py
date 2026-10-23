@@ -42,17 +42,17 @@ def files(d):
 def load_events(conv, since, until):
     out = []
     try:
-        lines = (conv / "events.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
+        with open(conv / "events.jsonl", encoding="utf-8", errors="replace") as f:
+            for line in f:  # streamed: the log is never held whole in memory
+                try:
+                    ev = json.loads(line)
+                except ValueError:
+                    continue
+                at = ob.parse_ts(ev.get("ts")) if isinstance(ev, dict) else None
+                if at is not None and since <= at <= until:
+                    out.append((at, ev))
     except OSError:
-        return out  # no history: 0 events in the summary, never a crash
-    for line in lines:
-        try:
-            ev = json.loads(line)
-        except ValueError:
-            continue
-        at = ob.parse_ts(ev.get("ts")) if isinstance(ev, dict) else None
-        if at is not None and since <= at <= until:
-            out.append((at, ev))
+        return []  # no history: 0 events in the summary, never a crash
     return out  # file order: the conveyor appends in time order
 
 
@@ -213,13 +213,14 @@ def replay(root, since, until):
 def notebook(root):
     out = []
     try:
-        lines = (root / "build" / "orch" / "ORCH_NOTEBOOK.md").read_text(encoding="utf-8").splitlines()
+        with open(root / "build" / "orch" / "ORCH_NOTEBOOK.md", encoding="utf-8") as f:
+            for line in f:
+                line = line.rstrip("\r\n")
+                m = NOTE_RE.match(line)
+                if m and ob.parse_ts(m.group(1).replace(" ", "T") + ":00") is not None:
+                    out.append((ob.parse_ts(m.group(1).replace(" ", "T") + ":00"), line))
     except FileNotFoundError:
-        return out
-    for line in lines:
-        m = NOTE_RE.match(line)
-        if m and ob.parse_ts(m.group(1).replace(" ", "T") + ":00") is not None:
-            out.append((ob.parse_ts(m.group(1).replace(" ", "T") + ":00"), line))
+        return []
     return out
 
 

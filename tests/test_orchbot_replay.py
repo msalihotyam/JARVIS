@@ -93,5 +93,93 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(json.loads(self.run_replay()[1])["events"], 0)
 
 
+LOGS = ("events.jsonl", "ORCH_NOTEBOOK.md")
+
+
+def old_load_events(conv, since, until):
+    """The pre-REPLAYSTREAM whole-file reader, kept as the reference the streamed one must match."""
+    out = []
+    try:
+        lines = (conv / "events.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return out
+    for line in lines:
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        at = orchbot.parse_ts(ev.get("ts")) if isinstance(ev, dict) else None
+        if at is not None and since <= at <= until:
+            out.append((at, ev))
+    return out
+
+
+class StreamTest(unittest.TestCase):
+    """REPLAYSTREAM (CDXINT65 F6): logs are streamed line by line, never read whole, with unchanged results."""
+
+    setUp, put, run_replay = ReplayTest.setUp, ReplayTest.put, ReplayTest.run_replay
+
+    def no_whole_reads(self):
+        real_text, real_bytes = Path.read_text, Path.read_bytes
+
+        def guard(real):
+            def read(p, *a, **k):
+                if p.name in LOGS:
+                    raise AssertionError(f"whole-file read of {p.name}")
+                return real(p, *a, **k)
+            return read
+        return mock.patch.multiple(Path, read_text=guard(real_text), read_bytes=guard(real_bytes))
+
+    def test_replay_never_reads_a_log_whole_and_gives_the_same_summary(self):
+        _, plain = self.run_replay()
+        with self.no_whole_reads():
+            _, guarded = self.run_replay()
+        self.assertEqual(guarded, plain)
+        conv = self.root / "build" / "conveyor"
+        self.assertEqual(orchbot_replay.load_events(conv, 0, float("inf")), old_load_events(conv, 0, float("inf")))
+        self.assertEqual(json.loads(guarded)["events"], 5)
+
+    def test_line_variants_match_the_old_reader(self):
+        good = [json.dumps({"ts": f"2026-10-15T1{i}:00:00", "event": "dispatch", "lane": f"L{i}"}) for i in range(6)]
+        raw = (good[0] + "\n" + good[1] + "\r\n" + good[2] + "\r" + "\n\n   \n{not json\n[1, 2]\n\"s\"\n"
+               + json.dumps({"event": "no ts"}) + "\n" + json.dumps({"ts": "2026-10-17T10:00:00"}) + "\n"
+               + good[3] + "\n").encode() + b"\xff\xfe garbage\n" + good[4].encode() + b"\n" + good[5].encode()
+        conv = self.root / "build" / "conveyor"
+        (conv / "events.jsonl").write_bytes(raw)
+        since, until = ts("2026-10-15T00:00:00"), ts("2026-10-15T23:00:00")
+        new = orchbot_replay.load_events(conv, since, until)
+        self.assertEqual(new, old_load_events(conv, since, until))
+        self.assertEqual([ev["lane"] for _, ev in new], [f"L{i}" for i in range(6)])
+        with self.no_whole_reads():
+            self.assertEqual(orchbot_replay.load_events(conv, since, until), new)
+
+    def test_unicode_line_separators_inside_a_string_no_longer_drop_the_event(self):
+        conv = self.root / "build" / "conveyor"
+        evs = [{"ts": "2026-10-15T10:00:00", "event": "reader", "lane": "L1", "note": f"a{sep}b"}
+               for sep in (" ", " ", "\x85")]  # json.dumps escapes \x0c/\x1c-\x1e itself
+        (conv / "events.jsonl").write_text("".join(json.dumps(e, ensure_ascii=False) + "\n" for e in evs),
+                                           encoding="utf-8")
+        got = orchbot_replay.load_events(conv, 0, float("inf"))
+        self.assertEqual([ev for _, ev in got], evs)  # splitlines() split these lines and lost every event
+        self.assertEqual(old_load_events(conv, 0, float("inf")), [])
+
+    def test_missing_logs_give_empty_results_without_reading_whole(self):
+        (self.root / "build/conveyor/events.jsonl").unlink()
+        (self.root / "build/orch/ORCH_NOTEBOOK.md").unlink()
+        with self.no_whole_reads():
+            self.assertEqual(orchbot_replay.load_events(self.root / "build" / "conveyor", 0, float("inf")), [])
+            self.assertEqual(orchbot_replay.notebook(self.root), [])
+
+    def test_notebook_streams_crlf_lines_and_keeps_the_line_text(self):
+        p = self.root / "build/orch/ORCH_NOTEBOOK.md"
+        p.write_bytes(b"# notes\r\n- 2026-10-15 11:05 L1 key 1 written\r\n- 2026-10-15 11:06: L2 ok\n- bad line\n"
+                      b"- 2026-13-15 11:07 bad date\n- 2026-10-15 11:08 last")
+        with self.no_whole_reads():
+            got = orchbot_replay.notebook(self.root)
+        self.assertEqual([line for _, line in got], ["- 2026-10-15 11:05 L1 key 1 written",
+                                                      "- 2026-10-15 11:06: L2 ok", "- 2026-10-15 11:08 last"])
+        self.assertEqual(got[0][0], ts("2026-10-15T11:05:00"))
+
+
 if __name__ == "__main__":
     unittest.main()
