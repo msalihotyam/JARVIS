@@ -28,7 +28,10 @@ import urllib.request
 from datetime import datetime
 from pathlib import Path
 
-ROOT = Path(__file__).resolve().parents[1]  # repo root (scripts/ -> repo)
+sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests load this file by path
+from conveyor_workers import CODEX_MIN_HEADROOM, WORKERS, CodexWorker  # noqa: E402
+
+ROOT =Path(__file__).resolve().parents[1]  # repo root (scripts/ -> repo)
 SETTINGS = "build/conveyor/lanes.settings.json"
 MAX_LANES = 3
 STALE_LOCK_S = 300
@@ -779,6 +782,8 @@ def validate_slice(s):
     for k in ("files", "depends_on"):
         if not isinstance(s.get(k, []), list) or not all(isinstance(x, str) for x in s.get(k, [])):
             return f"bad {k}"
+    if s.get("worker", "claude") not in WORKERS:  # absent = claude; no automatic routing
+        return "bad worker"
     return None
 
 
@@ -834,8 +839,9 @@ class Conveyor:
     def __init__(self, root=ROOT, runner=real_runner, now=time.time, send=ntfy_send,
                  post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage,
                  projects=None, mem=real_mem, idle=real_idle, procs=None, net=real_net,
-                 popen=subprocess.Popen):
+                 popen=subprocess.Popen, codex=None):
         self.root = Path(root)
+        self.codex = codex if codex is not None else CodexWorker(self.root, popen=popen, now=now)
         # session transcripts: <claude config dir>/projects/<project slug>/<sessionId>.jsonl
         self.projects = Path(projects) if projects else \
             Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
@@ -1098,6 +1104,7 @@ class Conveyor:
         self.free_gb = self.disk_free_gb()
         if agents is not None:
             self.track(lanes, agents)
+        self.codex_track(lanes)
         self.ci_wait(lanes)  # before the autopilot: a CI result is acted on in the same pass
         self.autopilot(lanes)  # before dispatch: a new fix lane or an open breaker counts now
         self.beat()
@@ -1239,10 +1246,38 @@ class Conveyor:
         except Exception as e:  # advisory: the conveyor goes on
             self.event("reader_error", lane=name, status=type(e).__name__)
 
+    def codex_track(self, lanes):
+        """Codex lanes: the report file finishes them; an exited (or, after a conveyor
+        restart, unknown) session without one is MISSING, and a late report still wins."""
+        for name, ln in lanes.items():
+            if ln.get("worker") != "codex":
+                continue
+            if ln.get("finished") and ln.get("status") and ln["status"] not in ("DEAD", "MISSING"):
+                continue
+            ln["updated_at"] = iso(self.now())
+            found = self.find_report(name, ln.get("report_since") or self.started_ts(ln), ln.get("worktree"))
+            if found and found[1] == INTERIM:
+                if self.codex.status(ln["id"]) == "running":
+                    continue  # ponytail: no INTERIM_TIMEOUT_S for a running codex lane; add if they write interims
+                found = None  # an interim from a gone session is no finish: MISSING below
+            if found:
+                self.finish(name, ln, *found)
+                continue
+            if ln.get("finished"):
+                continue
+            st = self.codex.status(ln["id"])
+            if st == "running":
+                ln["state"] = "working"
+                continue
+            ln.update(state=st, finished=True, status="MISSING", finished_ts=self.now())
+            self.event("finish", lane=name, id=ln["id"], state=st, status="MISSING")
+
     def track(self, lanes, agents):
         by_id = {a.get("id"): a for a in agents}
         held = bool(self.pager_flag("outage"))
         for name, ln in lanes.items():
+            if ln.get("worker") == "codex":
+                continue  # codex_track
             a = by_id.get(ln["id"])
             state = "missing" if a is None else a.get("state") or a.get("status") or "unknown"
             alive = a is not None and "pid" in a
@@ -1720,7 +1755,36 @@ class Conveyor:
             return None
         return m.group(1)
 
-    def record(self, lanes, name, sid, model, effort, base, prompt, files=None, slice_=False):
+    def start_codex(self, name, base, text):
+        """`codex exec` one lane in a worktree the conveyor creates; returns its session id
+        or None. Unknown or low live headroom holds the lane (fail closed, never credits)."""
+        h = self.codex.usage()
+        if h is None or h < CODEX_MIN_HEADROOM:
+            self.event("codex_hold", lane=name, headroom=h)
+            return None
+        wt = self.root / ".claude" / "worktrees" / name
+        try:
+            rc, out = self.cmd(["git", "worktree", "add", "-b", f"worktree-{name}", str(wt), base])
+        except Exception as e:
+            self.error(f"dispatch {name}: {type(e).__name__}")
+            return None
+        if rc != 0:
+            self.error(f"dispatch {name} rc={rc}", output=out[-300:])
+            return None
+        try:
+            return self.codex.start(name, wt, text)
+        except Exception as e:  # no codex on PATH, a refused argv, an OSError
+            self.error(f"dispatch {name}: {type(e).__name__}: {e}")
+            # the worktree is fresh and clean: drop it (never --force) so the next pass re-adds
+            for argv in (["git", "worktree", "remove", str(wt)], ["git", "branch", "-D", f"worktree-{name}"]):
+                try:
+                    self.cmd(argv)
+                except Exception:
+                    pass
+            return None
+
+    def record(self, lanes, name, sid, model, effort, base, prompt, files=None, slice_=False,
+               worker=None):
         old = lanes.get(name)  # a same-name earlier lane: its sessions stay known for cleanup
         prev = [*old.get("prev_ids", []), old["id"]] if old and "cleanup" not in old and "preserved" not in old else []
         lanes[name] = {"id": sid, "prev_ids": prev, "model": model, "effort": effort, "base": base,
@@ -1731,6 +1795,8 @@ class Conveyor:
         self.last_start = self.now()  # the post-memory-hold dispatch throttle (hold())
         if INT_RE.match(name):  # auto-fix owns the files of the commits this lane picks
             lanes[name]["main_at_start"] = self.main_head()
+        if worker:
+            lanes[name]["worker"] = worker
         self.save_lanes(lanes)  # a started session is never lost to a later crash
 
     def usage_pct(self):
@@ -2281,14 +2347,16 @@ class Conveyor:
                 self.error(f"backlog {name}: prompt: {e}", lane=name)
                 slices = [x for x in slices if x is not s]
                 continue
-            sid = self.start(name, s["model"], s["effort"], text)
+            codex = s.get("worker") == "codex"
+            sid = self.start_codex(name, base, text) if codex else \
+                self.start(name, s["model"], s["effort"], text)
             if not sid:
                 slices = [x for x in slices if x is not s]  # retry next pass
                 continue
             dest = self.started_path(name)
             dest.write_text(text, encoding="utf-8")
             self.record(lanes, name, sid, s["model"], s["effort"], base, dest,
-                        files=s.get("files", []), slice_=True)
+                        files=s.get("files", []), slice_=True, worker="codex" if codex else None)
             busy.add(name)
             started = True
             self.event("dispatch", lane=name, id=sid, model=s["model"], effort=s["effort"],
@@ -3319,7 +3387,7 @@ class Conveyor:
                 return
             t = self.collected_ts(ln)
             if (not ln.get("finished") or "stopped" in ln or "cleanup" in ln
-                    or ln.get("status") == "STUCK" or t is None):
+                    or ln.get("status") == "STUCK" or t is None or ln.get("worker") == "codex"):
                 continue
             ids = ln.get("prev_ids", []) + [ln["id"]]
             aged = self.now() - t >= STOP_WORKING_S
@@ -3361,6 +3429,7 @@ class Conveyor:
                 return
             c = ln.get("cleanup") or {}
             if (not ln.get("finished") or "preserved" in ln or name in attention_ids
+                    or ln.get("worker") == "codex"  # no claude session; worktree kept for the orchestrator
                     or (c and self.now() < c.get("retry_ts", float("inf")))):
                 continue
             self.beat()  # each removal is several slow CLI calls
