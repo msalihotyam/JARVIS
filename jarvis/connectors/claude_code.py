@@ -9,6 +9,7 @@ import re
 import stat
 import subprocess
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -318,6 +319,13 @@ class ClaudeCodeConnector(BaseConnector):
         "JARVIS read-only planning request. Return analysis and a proposed plan only.\n"
     )
 
+    #: How long a POSITIVELY verified billing route is reused before
+    #: ``claude auth status`` is spawned again (mirrors Codex's 300 s state
+    #: reuse). Only SUBSCRIPTION_INCLUDED is ever kept; see ``billing_route``.
+    billing_route_reuse_seconds = 300.0
+    #: Monotonic clock for that reuse window; tests inject a fake one.
+    _clock = staticmethod(time.monotonic)
+
     def __init__(
         self,
         command: str = "claude",
@@ -379,6 +387,10 @@ class ClaudeCodeConnector(BaseConnector):
         self._cancelled: set[str] = set()
         #: The located CLI, resolved on first use and then reused (DB-001).
         self._executable: TrustedExecutable | None = None
+        #: (verified_at, auth-config fingerprint, route) of the last positive
+        #: verification.
+        self._verified_route: tuple[float, tuple[Any, ...], tuple[BillingClass, str]] | None = None
+        self._route_lock = threading.Lock()
 
     def _trusted_executable(self) -> TrustedExecutable | None:
         """The CLI's absolute, canonical path - resolved once, then reused.
@@ -439,12 +451,66 @@ class ClaudeCodeConnector(BaseConnector):
 
         Returns a provider-neutral class and a safe, non-secret evidence tag.
         Absence of an API key alone is never sufficient evidence.
+
+        A positive verification is reused for ``billing_route_reuse_seconds``
+        so one task's ``estimate_cost`` and ``execute`` (and quick successive
+        turns) share one ``auth status`` spawn. Fail-closed: the environment
+        check runs on EVERY call; only SUBSCRIPTION_INCLUDED is kept, never
+        UNKNOWN or a failed probe; a changed login/settings file (re-login,
+        account switch, an added ``apiKeyHelper``) re-verifies at once; the
+        CLI's provenance (``_argv0``) is still re-checked at every spawn, and
+        a refused argv0 or a failed model call drops the route
+        (``forget_billing_route``).
         """
         if self.prohibited_billing_env_vars():
+            self.forget_billing_route()
             return (
                 BillingClass.UNKNOWN,
                 "claude_env:prohibited_metered_credential_present",
             )
+        with self._route_lock:
+            fingerprint = self._auth_config_fingerprint()
+            cached = self._verified_route
+            if cached is not None and cached[1] == fingerprint:
+                age = self._clock() - cached[0]
+                if 0.0 <= age < self.billing_route_reuse_seconds:
+                    return cached[2]
+            self._verified_route = None
+            route = self._verify_billing_route()
+            if route[0] is BillingClass.SUBSCRIPTION_INCLUDED:
+                self._verified_route = (self._clock(), fingerprint, route)
+            return route
+
+    @staticmethod
+    def _auth_config_fingerprint() -> tuple[Any, ...]:
+        """(mtime, size) of each file the CLI reads its login and user
+        settings from; any rewrite drops a reused route. stat() only - the
+        contents are never opened."""
+        home = Path.home()
+        config = Path(os.environ.get("CLAUDE_CONFIG_DIR") or home / ".claude")
+        prints: list[Any] = []
+        for path in (
+            home / ".claude.json",
+            config / ".claude.json",
+            config / ".credentials.json",
+            config / "settings.json",
+            config / "settings.local.json",
+        ):
+            try:
+                info = path.stat()
+            except OSError:
+                prints.append(None)
+            else:
+                prints.append((info.st_mtime_ns, info.st_size))
+        return tuple(prints)
+
+    def forget_billing_route(self) -> None:
+        """Drop the reused route; the next ``billing_route`` re-verifies."""
+        with self._route_lock:
+            self._verified_route = None
+
+    def _verify_billing_route(self) -> tuple[BillingClass, str]:
+        """One ``auth status`` probe, classified; ``billing_route`` gates it."""
         status = self._auth_status()
         if status is None:
             return BillingClass.UNKNOWN, "claude_auth_status:unavailable"
@@ -651,6 +717,7 @@ class ClaudeCodeConnector(BaseConnector):
         # against THIS task's working directory, which is only known here.
         argv0 = self._argv0()
         if argv0 is None:
+            self.forget_billing_route()
             return self._error_result(
                 task,
                 ErrorCode.CONNECTOR_UNAVAILABLE,
@@ -698,6 +765,7 @@ class ClaudeCodeConnector(BaseConnector):
                     creationflags=NO_CONSOLE_WINDOW,
                 )
             except FileNotFoundError:
+                self.forget_billing_route()
                 return self._error_result(
                     task,
                     ErrorCode.CONNECTOR_UNAVAILABLE,
@@ -744,6 +812,9 @@ class ClaudeCodeConnector(BaseConnector):
 
         payload = self._parse_payload(stdout)
         if payload is None:
+            # A failure that cannot be told apart from an auth/billing one:
+            # the next turn re-verifies the route.
+            self.forget_billing_route()
             # Raw stream text, not JSON-decoded: the streams are decoded with
             # ``errors="replace"``, which can never yield a lone surrogate,
             # so this diagnostic needs no ``provider_safe_text`` gate.
@@ -818,6 +889,9 @@ class ClaudeCodeConnector(BaseConnector):
             "api_error_status": api_error_status,
         }
         if failed:
+            # Any failed model call (401/402/403 included) drops the reused
+            # billing route, so the next call re-verifies it.
+            self.forget_billing_route()
             return ToolResult(
                 outcome=OutcomeStatus.ERROR,
                 summary=result_text or "Claude Code request failed.",

@@ -1204,7 +1204,10 @@ class ClaudeAuthUxTests(IntentTestCase):
         clean = {k: v for k, v in os.environ.items()
                  if k.upper() not in {n.upper() for n in PROHIBITED_BILLING_ENV_VARS}}
         self.enterContext(patch.dict("os.environ", clean, clear=True))
-        connector = ClaudeIntentAdapter(allowed_roots=(Path.cwd(),), default_working_directory=Path.cwd())
+        def fresh() -> ClaudeIntentAdapter:
+            # One connector per case: a verified route is reused for 300 s
+            # (SPEEDAUTH), so each case must start unverified.
+            return ClaudeIntentAdapter(allowed_roots=(Path.cwd(),), default_working_directory=Path.cwd())
         logged_in = {"loggedIn": True, "authMethod": "claude.ai", "apiProvider": "firstParty", "subscriptionType": "max"}
         cases = (
             (logged_in, BillingClass.SUBSCRIPTION_INCLUDED, "claude_auth_status:oauth_subscription"),
@@ -1217,8 +1220,9 @@ class ClaudeAuthUxTests(IntentTestCase):
         for status, expected_class, expected_evidence in cases:
             with self.subTest(evidence=expected_evidence):
                 with patch.object(ClaudeCodeConnector, "_auth_status", return_value=status):
-                    self.assertEqual((expected_class, expected_evidence), connector.billing_route())
+                    self.assertEqual((expected_class, expected_evidence), fresh().billing_route())
         # An unestablished route never starts the model process.
+        connector = fresh()
         task = Task(objective="hi", capability=INTENT_CAPABILITY, scope=ActionScope(action="understand", target=""))
         with patch.object(ClaudeCodeConnector, "_auth_status", return_value=None):
             with patch("jarvis.connectors.claude_code.subprocess.Popen") as popen:

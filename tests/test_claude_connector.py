@@ -1380,5 +1380,164 @@ class ClaudeModelSelectionTests(unittest.TestCase):
         )
 
 
+class BillingRouteReuseTests(unittest.TestCase):
+    """SPEEDAUTH: a verified route is reused for 300 s, and only while safe.
+
+    The ``auth status`` probe, the CLI path and the clock are all fakes, so
+    no process is ever spawned and no wall clock is read.
+    """
+
+    ARGV0 = "C:/fake/bin/claude.exe"
+    SUCCESS = json.dumps(
+        {
+            "type": "result",
+            "subtype": "success",
+            "is_error": False,
+            "result": "Plan ready",
+            "total_cost_usd": 0,
+            "usage": {"input_tokens": 10, "output_tokens": 4},
+            "modelUsage": {"claude-test": {}},
+        }
+    )
+
+    def setUp(self) -> None:
+        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, self.temp)
+        self.root = Path(self.temp.name).resolve()
+        self.connector = ClaudeCodeConnector(
+            allowed_roots=(self.root,),
+            default_working_directory=self.root,
+            max_budget_usd=0.15,
+        )
+        self.now = [1000.0]
+        self.connector._clock = lambda: self.now[0]
+        environment = patch_oauth_environment()
+        environment.start()
+        self.addCleanup(environment.stop)
+        auth = patch.object(
+            ClaudeCodeConnector, "_auth_status", return_value=OAUTH_MAX_AUTH_STATUS
+        )
+        self.auth = auth.start()
+        self.addCleanup(auth.stop)
+        argv0 = patch.object(ClaudeCodeConnector, "_argv0", return_value=self.ARGV0)
+        self.argv0 = argv0.start()
+        self.addCleanup(argv0.stop)
+        self.auth_files = [(1, 100)]
+        fingerprint = patch.object(
+            ClaudeCodeConnector,
+            "_auth_config_fingerprint",
+            side_effect=lambda: tuple(self.auth_files),
+        )
+        fingerprint.start()
+        self.addCleanup(fingerprint.stop)
+        popen = patch("jarvis.connectors.claude_code.subprocess.Popen")
+        self.popen = popen.start()
+        self.addCleanup(popen.stop)
+        self.popen.return_value = FakeProcess(self.SUCCESS)
+
+    def task(self) -> Task:
+        return Task(
+            objective="Analyze without changing files",
+            capability="code_planning",
+            scope=ActionScope(
+                action="analyze",
+                target=str(self.root),
+                destination="anthropic/claude-code",
+                data_classification=DataClassification.SENSITIVE,
+            ),
+            context={},
+        )
+
+    def test_two_turns_within_the_ttl_probe_auth_status_once(self) -> None:
+        first = self.connector.billing_route()
+        self.now[0] += 299.0
+        second = self.connector.billing_route()
+        self.assertEqual(1, self.auth.call_count)
+        self.assertIs(first, second)
+        self.assertIs(BillingClass.SUBSCRIPTION_INCLUDED, second[0])
+
+    def test_a_changed_login_or_settings_file_re_verifies(self) -> None:
+        self.connector.billing_route()
+        self.auth_files[0] = (2, 100)
+        self.connector.billing_route()
+        self.assertEqual(2, self.auth.call_count)
+
+    def test_after_the_ttl_the_route_is_verified_again(self) -> None:
+        self.connector.billing_route()
+        self.now[0] += 300.0
+        self.connector.billing_route()
+        self.assertEqual(2, self.auth.call_count)
+
+    def test_a_failed_probe_is_not_cached_and_the_turn_is_refused(self) -> None:
+        self.auth.return_value = None
+        estimate = self.connector.estimate_cost(self.task())
+        self.assertIs(BillingClass.UNKNOWN, estimate.billing_class)
+        result = self.connector.execute(self.task(), SessionState())
+        self.assertEqual(ErrorCode.BILLING_ROUTE_UNKNOWN, result.error.code)
+        self.popen.assert_not_called()
+        self.assertEqual(2, self.auth.call_count)
+        # Recovery is verified afresh, never assumed.
+        self.auth.return_value = OAUTH_MAX_AUTH_STATUS
+        self.assertIs(
+            BillingClass.SUBSCRIPTION_INCLUDED, self.connector.billing_route()[0]
+        )
+        self.assertEqual(3, self.auth.call_count)
+
+    def test_an_auth_or_billing_error_from_the_model_call_invalidates(self) -> None:
+        for status in (401, 402, 403):
+            with self.subTest(status=status):
+                self.connector.billing_route()
+                probes = self.auth.call_count
+                self.popen.return_value = FakeProcess(
+                    json.dumps(
+                        {
+                            "type": "result",
+                            "subtype": "error",
+                            "is_error": True,
+                            "result": "Not authorized.",
+                            "api_error_status": status,
+                        }
+                    ),
+                    returncode=1,
+                )
+                result = self.connector.execute(self.task(), SessionState())
+                self.assertEqual(OutcomeStatus.ERROR, result.outcome)
+                self.assertEqual(probes, self.auth.call_count)
+                self.connector.billing_route()
+                self.assertEqual(probes + 1, self.auth.call_count)
+
+    def test_an_unreadable_model_response_invalidates(self) -> None:
+        self.connector.billing_route()
+        self.popen.return_value = FakeProcess("not-json", returncode=1)
+        self.connector.execute(self.task(), SessionState())
+        self.connector.billing_route()
+        self.assertEqual(2, self.auth.call_count)
+
+    def test_estimate_cost_and_execute_of_one_task_share_one_check(self) -> None:
+        task = self.task()
+        estimate = self.connector.estimate_cost(task)
+        result = self.connector.execute(task, SessionState())
+        self.assertIs(BillingClass.SUBSCRIPTION_INCLUDED, estimate.billing_class)
+        self.assertEqual(OutcomeStatus.SUCCESS, result.outcome)
+        self.assertEqual(1, self.auth.call_count)
+        self.popen.assert_called_once()
+
+    def test_a_refused_cli_or_metered_env_re_verifies(self) -> None:
+        self.connector.billing_route()
+        # Provenance is still checked at the spawn of a cached-route task;
+        # a refusal drops the route.
+        self.argv0.return_value = None
+        result = self.connector.execute(self.task(), SessionState())
+        self.assertEqual(ErrorCode.CONNECTOR_UNAVAILABLE, result.error.code)
+        self.assertEqual(1, self.argv0.call_count)
+        self.popen.assert_not_called()
+        self.connector.billing_route()
+        self.assertEqual(2, self.auth.call_count)
+        with patch.dict(os.environ, {PROHIBITED_BILLING_ENV_VARS[0]: "x"}):
+            self.assertIs(BillingClass.UNKNOWN, self.connector.billing_route()[0])
+        self.connector.billing_route()
+        self.assertEqual(3, self.auth.call_count)
+
+
 if __name__ == "__main__":
     unittest.main()
