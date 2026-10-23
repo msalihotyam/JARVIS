@@ -44,7 +44,7 @@ from jarvis.contracts import (
     RunStatus,
     Task,
 )
-from jarvis.intent import INTENT_SYSTEM_PROMPT, ClaudeIntentAdapter, IntentStatus
+from jarvis.intent import CATALOG_SECTION, INTENT_SYSTEM_PROMPT, ClaudeIntentAdapter, IntentStatus
 from jarvis.memory import COMPATIBILITY_SCHEMA_OBJECTS, SCHEMA_VERSION, SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.settings import Settings
@@ -242,11 +242,16 @@ class IntentInstructionTests(IntentTestCase):
             self.build(adapter).submit_text(text, conversation_id=conversation_id)
         return process.stdin.write.call_args[0][0]
 
-    CODEX_PREFIX = INTENT_SYSTEM_PROMPT + "\n\nJARVIS intent understanding request. Reply with exactly one JSON object.\n"
+    CODEX_HEADER = "\n\nJARVIS intent understanding request. Reply with exactly one JSON object.\n"
+
+    def codex_head(self, prompt: str) -> str:
+        # SPEEDCACHE: system prompt + stable catalog section + header precede the payload.
+        self.assertTrue(prompt.startswith(INTENT_SYSTEM_PROMPT + CATALOG_SECTION))
+        self.assertEqual(1, prompt.count(self.CODEX_HEADER))
+        return prompt[:prompt.index(self.CODEX_HEADER) + len(self.CODEX_HEADER)]
 
     def codex_payload(self, prompt: str) -> dict:
-        self.assertTrue(prompt.startswith(self.CODEX_PREFIX))
-        return json.loads(prompt[len(self.CODEX_PREFIX):])
+        return json.loads(prompt[len(self.codex_head(prompt)):])
 
     def test_b_current_instruction_reaches_both_adapters_unchanged_across_a_switch(self) -> None:
         self.instruct("an old version")
@@ -306,9 +311,10 @@ class IntentInstructionTests(IntentTestCase):
         self.assertEqual(none_claude[0], benign_claude[0])
         self.assertEqual(none_claude[0], hostile_claude[0])
         self.assertIn(PROJECT_INSTRUCTION_PRECEDENCE, none_claude[0])
+        codex_head = self.codex_head(none_codex)
+        self.assertIn(PROJECT_INSTRUCTION_PRECEDENCE, codex_head)
         for prompt in (none_codex, benign_codex, hostile_codex):
-            self.assertTrue(prompt.startswith(self.CODEX_PREFIX))
-            self.assertIn(PROJECT_INSTRUCTION_PRECEDENCE, self.CODEX_PREFIX)
+            self.assertEqual(codex_head, self.codex_head(prompt))
         for (_, prompt, payload), raw in ((hostile_claude, None), ((None, hostile_codex, self.codex_payload(hostile_codex)), None)):
             self.assertEqual(request, payload["request"])                            # request byte-identical
             self.assertEqual(hostile, payload[PROJECT_INSTRUCTION_KEY]["text"])
@@ -319,7 +325,7 @@ class IntentInstructionTests(IntentTestCase):
         # Only the field value differs from the benign case, byte for byte.
         self.assertEqual(benign_claude[1], hostile_claude[1].replace(escaped(hostile), escaped(INSTRUCTION)))
         self.assertEqual(benign_codex, hostile_codex.replace(escaped(hostile), escaped(INSTRUCTION)))
-        self.assertGreater(hostile_codex.index(escaped(hostile)), len(self.CODEX_PREFIX))
+        self.assertGreater(hostile_codex.index(escaped(hostile)), len(codex_head))
         # Removing the field reproduces the no-instruction payload exactly.
         self.assertEqual(without_instruction(none_claude[2]), without_instruction(hostile_claude[2]))
         self.assertEqual(self.codex_payload(none_codex), without_instruction(self.codex_payload(hostile_codex)))

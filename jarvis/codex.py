@@ -525,16 +525,32 @@ class CodexIntentAdapter:
                                  ErrorCode.CONNECTOR_UNAVAILABLE)
         # JARVIS's own snapshots of the images the person attached: a local file
         # handle for `-i`, never model context, so they leave the payload here.
+        from jarvis.intent import CATALOG_SECTION, cache_ordered_json
+
         context = dict(task.context)
         images = [str(path) for _, _, path in (context.pop("attachment_files", None) or [])]
+        # The catalog changes only when the installation does: it follows the
+        # system prompt, as in the Claude adapter, so the prompt's head is a
+        # stable prefix the provider can serve from its cache. Its local_time
+        # stays in the context, which closes the prompt with the per-turn keys.
+        catalog = context.pop("catalog", None)
+        catalog_text = ""
+        if isinstance(catalog, dict):
+            if "local_time" in catalog:
+                context.setdefault("local_time", catalog["local_time"])
+            stable, _ = ClaudeCodeConnector._redact({k: v for k, v in catalog.items() if k != "local_time"})
+            catalog_text = CATALOG_SECTION + json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        elif catalog is not None:
+            context["catalog"] = catalog
         payload, _ = ClaudeCodeConnector._redact({"request": task.objective, "context": context})
         # Gate 4: one concatenated prompt (no system role): the fixed prefix,
         # then the payload, whose own key carries the project instruction.
         instruction, _ = ClaudeCodeConnector._project_instruction(task)
         if instruction is not None:
             payload[PROJECT_INSTRUCTION_KEY] = instruction
-        prompt = (self.system_prompt + "\n\nJARVIS intent understanding request. Reply with exactly one JSON object.\n"
-                  + json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str, separators=(",", ":")))
+        prompt = (self.system_prompt + catalog_text
+                  + "\n\nJARVIS intent understanding request. Reply with exactly one JSON object.\n"
+                  + cache_ordered_json(payload))
         workdir = tempfile.mkdtemp(prefix="jarvis-codex-")
         command = [executable, "exec", "--json", "--ephemeral", "--ignore-user-config", "--ignore-rules",
                    "--skip-git-repo-check", "-s", "read-only", "-C", workdir, "-m", self.model,
