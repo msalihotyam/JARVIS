@@ -241,6 +241,61 @@ class CodexWorkerTest(unittest.TestCase):
         self.w.start("CDXA", self.wt, "again\n")  # a restart reuses the dirs
         self.assertEqual(self.procs[1].kw["env"], env)
 
+    def assert_ignore_refused(self, plant):
+        # CODEXENVFIX: a .gitignore the lane swapped for a link is refused (codex start
+        # fails closed) and the outside target is never written
+        ignore = self.wt / ".codex-tmp" / ".gitignore"
+        workers.sandbox_env({}, self.wt)
+        ignore.unlink()
+        outside = self.root / "outside.txt"
+        outside.write_text("keep\n", encoding="utf-8")
+        plant(ignore, outside)
+        with self.assertRaises(OSError):
+            self.w.start("CDXA", self.wt, "@jarvis lane=CDXA\nDo it.\n")
+        self.assertEqual(self.procs, [])
+        self.assertEqual(outside.read_text(encoding="utf-8"), "keep\n")
+        self.assertEqual(sorted(p.name for p in ignore.parent.iterdir()), [".gitignore", "pip", "ruff", "tmp", "uv"])
+        return outside
+
+    def symlink(self, src, dst, **kw):
+        try:
+            os.symlink(dst, src, **kw)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"no symlink right: {e}")
+
+    def test_start_refuses_symlinked_gitignore(self):
+        self.assert_ignore_refused(self.symlink)
+
+    def test_start_refuses_dangling_symlinked_gitignore(self):
+        gone = self.root / "gone.txt"
+        self.assert_ignore_refused(lambda ignore, outside: self.symlink(ignore, gone))
+        self.assertFalse(gone.exists())
+
+    def test_start_refuses_hard_linked_gitignore(self):
+        self.assert_ignore_refused(lambda ignore, outside: os.link(outside, ignore))
+
+    def test_start_refuses_directory_or_junction_gitignore(self):
+        out_dir = self.root / "outdir"
+        out_dir.mkdir()
+        plants = [lambda ignore, outside: ignore.mkdir()]
+        if sys.platform == "win32":
+            import _winapi
+            plants.append(lambda ignore, outside: _winapi.CreateJunction(str(out_dir), str(ignore)))
+        plants.append(lambda ignore, outside: self.symlink(ignore, out_dir, target_is_directory=True))
+        for plant in plants:  # the symlink last: no symlink right skips only it
+            self.assert_ignore_refused(plant)
+            self.assertEqual(list(out_dir.iterdir()), [])
+            ignore = self.wt / ".codex-tmp" / ".gitignore"
+            ignore.unlink() if ignore.is_symlink() else ignore.rmdir()
+
+    def test_start_rewrites_a_plain_gitignore_by_rename(self):
+        ignore = self.wt / ".codex-tmp" / ".gitignore"
+        workers.sandbox_env({}, self.wt)
+        ignore.write_text("!*\n", encoding="utf-8")  # a lane-edited plain file is reset, not refused
+        self.w.start("CDXA", self.wt, "@jarvis lane=CDXA\nDo it.\n")
+        self.assertEqual(ignore.read_text(encoding="utf-8"), "*\n")
+        self.assertEqual(sorted(p.name for p in ignore.parent.iterdir()), [".gitignore", "pip", "ruff", "tmp", "uv"])
+
     def test_start_missing_worktree_creates_nothing(self):
         missing = self.wt.parent / "gone"
         with self.assertRaises(OSError):
@@ -840,6 +895,19 @@ class CodexCommitTest(Base):
                 (self.wt / "a.txt").write_text(msg + "\n", encoding="utf-8")
                 self.assertIsNone(self.run_(msg))
                 self.assertEqual(self.git_("log", "-1", "--format=%s")[1].strip(), want)
+
+    def test_removed_codex_tmp_gitignore_is_refused(self):
+        # CODEXENVFIX F2: if a lane deletes .codex-tmp/.gitignore its cache files show as
+        # ungranted and nothing is committed
+        workers.sandbox_env({}, self.wt)
+        (self.wt / ".codex-tmp" / "tmp" / "t.bin").write_text("x", encoding="utf-8")
+        (self.wt / "a.txt").write_text("a2\n", encoding="utf-8")
+        (self.wt / ".codex-tmp" / ".gitignore").unlink()
+        self.assertEqual(self.run_(), "ungranted files changed: .codex-tmp/tmp/t.bin")
+        self.assertEqual(self.git_("rev-parse", "HEAD")[1].strip(), self.head)
+        workers.sandbox_env({}, self.wt)  # the next start restores it: ignored again
+        self.assertIsNone(self.run_())
+        self.assertEqual(self.git_("show", "--name-only", "--format=", "HEAD")[1].split(), ["a.txt"])
 
     def test_nothing_changed_is_refused(self):
         self.assertEqual(self.run_(), "no changes to commit")

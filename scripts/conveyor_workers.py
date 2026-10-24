@@ -19,8 +19,10 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -138,7 +140,24 @@ def sandbox_env(env, worktree):
         path.mkdir(exist_ok=True)
         if path.resolve() != path:  # a link planted in the worktree must not lead out of it
             raise OSError("codex sandbox dir is a link")
-    (base / ".gitignore").write_text("*\n", encoding="utf-8")
+    # CODEXENVFIX: a lane may replace .gitignore between runs; never write through a
+    # symlink, junction/reparse point or hard link, and swap a fresh file in by rename
+    ignore = base / ".gitignore"
+    try:
+        st = os.lstat(ignore)
+    except FileNotFoundError:
+        st = None
+    if st is not None and (not stat.S_ISREG(st.st_mode) or st.st_nlink > 1
+                           or getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT):
+        raise OSError("codex sandbox .gitignore is a link or not a plain file")
+    fd, tmp = tempfile.mkstemp(dir=base, prefix=".gitignore.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("*\n")
+        os.replace(tmp, ignore)
+    except BaseException:
+        Path(tmp).unlink(missing_ok=True)
+        raise
     out = {k: v for k, v in env.items() if k.upper() not in SANDBOX_DIRS}
     out.update({k: str(base / sub) for k, sub in SANDBOX_DIRS.items()})
     return out
