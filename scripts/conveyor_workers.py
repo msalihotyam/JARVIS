@@ -10,16 +10,34 @@ Its interface is admit() / start() / status() / violation() / stop() / collect()
 conveyor trusts only build/reports/<ID>.md, the diff and its own test gate. Nothing
 here calls a model; admit()'s default reader is jarvis.codex.codex_state (the local
 app-server account/limits read).
+"jules" (JULESADAPT) is Google AI Pro through Jules only (never Antigravity automation):
+a REST session on the GitHub repo in Google's Linux VM that ends in a PR. Only slices
+flagged `linux_ok` (no UI/Windows tests) go there; collect() fetches the PR head and
+checks base and files itself, Jules' own claims are never read.
 """
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
 import time
+import urllib.error
+import urllib.request
 from pathlib import Path
 
-WORKERS = ("claude", "codex")
+WORKERS = ("claude", "codex", "jules")
+JULES_API = "https://jules.googleapis.com/v1alpha"
+JULES_DAILY_LIMIT = 100  # Google AI Pro: tasks per rolling 24 h
+JULES_CONCURRENT_LIMIT = 15  # Google AI Pro: concurrent tasks
+JULES_WINDOW_S = 86400
+JULES_MAX_S = 4 * 3600  # a session not done after this is stopped (MISSING)
+JULES_LEDGER = "build/conveyor/jules/usage.json"
+JULES_RUNNING = ("QUEUED", "PLANNING", "IN_PROGRESS")
+JULES_WAITING = ("AWAITING_PLAN_APPROVAL", "AWAITING_USER_FEEDBACK", "PAUSED")  # nobody answers
+JULES_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+GITHUB_RE = re.compile(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
+SHA40_RE = re.compile(r"[0-9a-f]{40}")
 CODEX_MIN_HEADROOM = 10  # % left in the tighter window; less (or unknown) = no dispatch
 CODEX_STATE_MAX_AGE_S = 60  # an account/limits reading older than this is stale = refused
 CODEX_LOG_DIR = "build/conveyor/codex"
@@ -384,3 +402,249 @@ class CodexWorker:
             if f.is_file():
                 return f
         return None
+
+
+def _http(method, url, headers, body=None):
+    """One HTTPS JSON call -> (status, dict); an HTTP error is (code, {})."""
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url, data=data, method=method,
+                                 headers={**headers, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:  # nosec B310 - url is JULES_API + a fixed path
+            raw = r.read()
+            return r.status, (json.loads(raw) if raw.strip() else {})
+    except urllib.error.HTTPError as e:
+        return e.code, {}
+
+
+def _git(argv):
+    """(returncode, stdout); stderr is dropped so -z output stays clean."""
+    p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    return p.returncode, p.stdout or ""
+
+
+class JulesWorker:
+    """Jules REST worker. The API key file is read per call, sent only as the
+    X-Goog-Api-Key header and never stored, logged, echoed or put in a prompt;
+    no key file = disabled (fail closed). Usage is a local ledger (rolling 24 h
+    task count vs 100, open sessions vs 15); an unreadable ledger = no headroom."""
+
+    def __init__(self, root, http=_http, now=time.time, key_path=None, git=None, git_cmd=("git",)):
+        self.root = Path(root)
+        self.http = http
+        self.now = now
+        self.git = git or (lambda a: _git([*git_cmd, *a]))
+        self.key_path = Path(key_path) if key_path else Path.home() / ".jarvis" / "jules.key"
+        self.ledger = self.root / JULES_LEDGER
+        self.info = {}  # sid -> {"session", "base", "branch"}; the conveyor persists it in lanes.json
+
+    def _key(self):
+        try:
+            k = self.key_path.read_text(encoding="utf-8").strip()
+        except (OSError, UnicodeError):
+            return None
+        return k if k and not any(c.isspace() for c in k) else None
+
+    def _call(self, method, path, body=None):
+        key = self._key()
+        if key is None:
+            raise RuntimeError("jules disabled: no key file")
+        err = None
+        try:
+            code, data = self.http(method, f"{JULES_API}/{path}", {"X-Goog-Api-Key": key}, body)
+        except Exception as e:  # its text may echo the request: keep only the type, chain nothing
+            err = type(e).__name__
+        if err is not None:
+            raise RuntimeError(f"jules {method} {path}: {err}")
+        if not isinstance(code, int) or not 200 <= code < 300:
+            raise RuntimeError(f"jules {method} {path}: HTTP {code}")
+        return data if isinstance(data, dict) else {}
+
+    @staticmethod
+    def _jid(sid):
+        jid = str(sid).removeprefix("jules-")
+        if not JULES_ID_RE.fullmatch(jid):
+            raise RuntimeError("bad jules session id")
+        return jid
+
+    def _entries(self):
+        try:
+            raw = self.ledger.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return []
+        rows = json.loads(raw)  # corrupt -> ValueError; callers fail closed
+        if not isinstance(rows, list) or not all(
+                isinstance(r, dict) and isinstance(r.get("ts"), (int, float)) for r in rows):
+            raise ValueError("bad jules ledger")
+        return rows
+
+    def _save(self, rows):
+        cut = self.now() - JULES_WINDOW_S
+        rows = [r for r in rows if r["ts"] >= cut or not r.get("done")]  # open sessions always count
+        self.ledger.parent.mkdir(parents=True, exist_ok=True)
+        tmp = self.ledger.with_suffix(".tmp")
+        tmp.write_text(json.dumps(rows), encoding="utf-8")
+        os.replace(tmp, self.ledger)
+
+    def _done(self, sid):
+        try:
+            rows = self._entries()
+            for r in rows:
+                if r.get("sid") == sid:
+                    r["done"] = True
+            self._save(rows)
+        except (OSError, ValueError):  # nosec B110 - a broken ledger already holds every admission
+            pass
+
+    def usage(self):
+        """(tasks started in the rolling 24 h, open sessions), or None when unknown."""
+        try:
+            rows = self._entries()
+        except (OSError, ValueError):
+            return None
+        cut = self.now() - JULES_WINDOW_S
+        return sum(r["ts"] >= cut for r in rows), sum(not r.get("done") for r in rows)
+
+    def _origin(self):
+        rc, out = self.git(["-C", str(self.root), "remote", "get-url", "origin"])
+        m = GITHUB_RE.search(out.strip()) if rc == 0 else None
+        return (m.group(1), m.group(2)) if m else None
+
+    def admit(self, base):
+        """(headroom, None) to start, else (headroom or None, reason). No HTTP call."""
+        if self._key() is None:
+            return None, "disabled: no key file"
+        u = self.usage()
+        if u is None:
+            return None, "usage ledger unreadable"
+        h = min(JULES_DAILY_LIMIT - u[0], JULES_CONCURRENT_LIMIT - u[1])
+        if u[0] >= JULES_DAILY_LIMIT:
+            return h, f"daily limit {u[0]}/{JULES_DAILY_LIMIT} in 24 h"
+        if u[1] >= JULES_CONCURRENT_LIMIT:
+            return h, f"concurrent limit {u[1]}/{JULES_CONCURRENT_LIMIT}"
+        if not SHA40_RE.fullmatch(str(base)):
+            return h, "base is not a commit sha"
+        if self._origin() is None:
+            return h, "origin is not a GitHub repo"
+        rc, out = self.git(["-C", str(self.root), "rev-parse", "--verify", "-q", "refs/remotes/origin/main"])
+        if rc != 0 or out.strip() != base:  # Jules starts from GitHub main, so it must be the base
+            return h, "origin/main is not the slice base"
+        return h, None
+
+    def start(self, name, base, text, files=()):
+        """Create the session (auto PR, no plan approval: nobody answers); returns "jules-<id>"."""
+        origin = self._origin()
+        if origin is None:
+            raise RuntimeError("origin is not a GitHub repo")
+        prompt = (f"{text}\n\nWork on a branch named jules/{name} starting at commit {base}. "
+                  f"Change only these files: {', '.join(files) or '(none)'}. Open a pull request when done.")
+        # counted before the POST: a lost reply may still have made a session (daily quota stays honest)
+        pending = f"pending-{name}-{self.now()}"
+        try:
+            self._save([*self._entries(), {"sid": pending, "ts": self.now(), "done": True}])
+        except (OSError, ValueError):
+            raise RuntimeError("jules usage ledger write failed") from None
+        data = self._call("POST", "sessions", {
+            "prompt": prompt, "title": name,
+            "sourceContext": {"source": f"sources/github/{origin[0]}/{origin[1]}",
+                              "githubRepoContext": {"startingBranch": "main"}},
+            "requirePlanApproval": False, "automationMode": "AUTO_CREATE_PR"})
+        jid = str(data.get("id") or str(data.get("name", "")).rsplit("/", 1)[-1])
+        if not JULES_ID_RE.fullmatch(jid):
+            raise RuntimeError("jules POST sessions: no session id")
+        sid = f"jules-{jid}"
+        try:
+            rows = self._entries()
+            for r in rows:
+                if r.get("sid") == pending:
+                    r.update(sid=sid, done=False)
+            self._save(rows)
+        except (OSError, ValueError):
+            self.stop(sid)  # an uncounted session would overrun the limits
+            raise RuntimeError("jules usage ledger write failed; session stopped") from None
+        self.info[sid] = {"session": jid, "base": base, "branch": f"jules/{name}"}
+        return sid
+
+    def status(self, sid):
+        """running / waiting / completed / failed / unknown (unknown is never done)."""
+        try:
+            st = self._call("GET", f"sessions/{self._jid(sid)}").get("state")
+        except RuntimeError:
+            return "unknown"
+        if st in JULES_RUNNING:
+            return "running"
+        if st in JULES_WAITING:
+            return "waiting"
+        if st in ("COMPLETED", "FAILED"):
+            self._done(sid)
+            return st.lower()
+        return "unknown"
+
+    def stop(self, sid):
+        try:
+            self._call("DELETE", f"sessions/{self._jid(sid)}")
+        except RuntimeError:
+            return False
+        self._done(sid)
+        return True
+
+    def collect(self, sid, name, worktree, base, files, protected=lambda p: False):
+        """Fetch the session's PR head, check base and files, fast-forward the lane
+        worktree and write the report -> (path, "PASS"|"BLOCKED"). PASS only lets
+        the conveyor's own test gate run; nothing Jules says is read."""
+        why, head = self._verify(sid, name, Path(worktree), base, files, protected)
+        f = Path(worktree) / "build" / "reports" / f"{name}.md"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        status = "BLOCKED" if why else "PASS"
+        lines = [f"STATUS: {status}", f"COMMIT: {head or '-'}", f"BRANCH: jules/{name}",
+                 "Worker: jules (its own claims untrusted; the conveyor's test gate decides)"]
+        if why:
+            lines.append(f"BLOCKED: {why}")
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        return f, status
+
+    def _verify(self, sid, name, wt, base, files, protected):
+        if not isinstance(base, str) or not SHA40_RE.fullmatch(base):
+            return "slice base is not a commit sha", None
+        try:
+            data = self._call("GET", f"sessions/{self._jid(sid)}")
+        except RuntimeError as e:
+            return str(e), None
+        urls = []
+        for o in data.get("outputs") if isinstance(data.get("outputs"), list) else []:
+            pr = o.get("pullRequest") if isinstance(o, dict) else None
+            if isinstance(pr, dict) and pr.get("url"):
+                urls.append(str(pr["url"]))
+        origin = self._origin()
+        if origin is None or len(urls) != 1:
+            return "expected exactly one pull request on a GitHub origin", None
+        m = re.fullmatch(rf"https://github\.com/{re.escape(origin[0])}/{re.escape(origin[1])}/pull/(\d+)", urls[0])
+        if not m:
+            return "pull request is not on our origin", None
+        ref = f"refs/heads/jules/{name}"
+        root = ["-C", str(self.root)]
+        if self.git([*root, "fetch", "--no-tags", "origin", f"+refs/pull/{m.group(1)}/head:{ref}"])[0] != 0:
+            return "fetch of the pull request head failed", None
+        rc, head = self.git([*root, "rev-parse", "--verify", "-q", f"{ref}^{{commit}}"])
+        head = head.strip()
+        if rc != 0 or not SHA40_RE.fullmatch(head):
+            return "no result commit", None
+        if head == base:
+            return "no commits on the result branch", head
+        if self.git([*root, "merge-base", "--is-ancestor", base, head])[0] != 0:
+            return "result is not based on the slice base", head
+        rc, out = self.git([*root, "diff", "--name-only", "--no-renames", "-z", base, head])
+        changed = [p for p in out.split("\0") if p]
+        if rc != 0 or not changed:
+            return "empty or unreadable diff", head
+        bad = sorted(p for p in changed if protected(p))
+        if bad:
+            return f"protected files: {', '.join(bad[:5])}", head
+        bad = sorted(set(changed) - set(files))
+        if bad:
+            return f"ungranted files: {', '.join(bad[:5])}", head
+        if self.git(["-C", str(wt), "merge", "--ff-only", head])[0] != 0:
+            return "fast-forward of the lane worktree failed", head
+        if self.git(["-C", str(wt), "rev-parse", "HEAD"])[1].strip() != head:
+            return "lane worktree HEAD is not the result", head
+        return None, head

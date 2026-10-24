@@ -368,6 +368,11 @@ class WorkerFieldTest(unittest.TestCase):
             with self.subTest(worker=bad):
                 self.assertEqual(conveyor.validate_slice({**s, "worker": bad}), "bad worker")
         self.assertIsNone(conveyor.validate_slice({**s, "worker": "auto"}))  # ROUTE1
+        self.assertIsNone(conveyor.validate_slice({**s, "worker": "jules", "linux_ok": True}))
+        for flag in ({}, {"linux_ok": False}, {"linux_ok": "true"}, {"linux_ok": 1}):
+            with self.subTest(flag=flag):  # no explicit flag = may need UI/Windows tests = refused
+                self.assertEqual(conveyor.validate_slice({**s, "worker": "jules", **flag}),
+                                 "jules needs linux_ok: true (no UI/Windows tests)")
 
     def test_class_validation(self):  # ROUTE1
         s = {"id": "WA1", "model": "opus", "effort": "high", "tier": "T1", "prompt": "x.md"}
@@ -806,6 +811,348 @@ class CodexCommitTest(Base):
     def test_nothing_changed_is_refused(self):
         self.assertEqual(self.run_(), "no changes to commit")
         self.assertEqual(self.c.codex_commit("CDXA", {"id": "x"}, self.report), "no lane worktree")
+
+
+JulesWorker, JULES_API = workers.JulesWorker, workers.JULES_API
+BASE, HEAD = "b" * 40, "c" * 40
+KEY = "AQ.secret-jules-key-123"
+PR = "https://github.com/salih/JARVIS/pull/7"
+
+
+class JulesWorkerTest(unittest.TestCase):
+    """JULESADAPT: fake HTTP + fake git only; never the Jules API, never the real key."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.root = Path(self.tmp.name)
+        self.keyf = self.root / "key" / "jules.key"
+        self.keyf.parent.mkdir()
+        self.keyf.write_text(KEY + "\n", encoding="utf-8")
+        self.t = T0
+        self.http_calls, self.replies = [], {}
+        self.git_calls, self.g = [], {}
+        self.revs = {"refs/remotes/origin/main": BASE, "refs/heads/jules/JX^{commit}": HEAD, "HEAD": HEAD}
+        self.diff = "scripts/a.py\0"
+        self.w = JulesWorker(self.root, http=self.http, now=lambda: self.t, key_path=self.keyf, git=self.fgit)
+        self.wt = self.root / "wt"
+
+    def http(self, method, url, headers, body=None):
+        self.http_calls.append((method, url, headers, body))
+        r = self.replies.get(method, (200, {}))
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+    def fgit(self, a):
+        self.git_calls.append(list(a))
+        sub = a[2]
+        if sub == "remote":
+            return self.g.get("remote", (0, "git@github.com:salih/JARVIS.git\n"))
+        if sub == "rev-parse":
+            v = self.revs.get(a[-1])
+            return (0, v + "\n") if v else (1, "")
+        if sub == "diff":
+            return 0, self.diff
+        return self.g.get(sub, (0, ""))
+
+    def ledger(self, rows):
+        p = self.root / workers.JULES_LEDGER
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(rows if isinstance(rows, str) else json.dumps(rows), encoding="utf-8")
+
+    def test_missing_or_bad_key_disables_without_http(self):
+        for text in (None, "", "  \n", "two words"):
+            with self.subTest(key=text):
+                if text is None:
+                    self.keyf.unlink(missing_ok=True)
+                else:
+                    self.keyf.write_text(text, encoding="utf-8")
+                self.assertEqual(self.w.admit(BASE), (None, "disabled: no key file"))
+                self.assertEqual(self.w.status("jules-abc"), "unknown")
+                self.assertFalse(self.w.stop("jules-abc"))
+                with self.assertRaises(RuntimeError):
+                    self.w.start("JX", BASE, "task")
+        self.assertEqual(self.http_calls, [])
+
+    def test_admit_ok_makes_no_http_call(self):
+        self.assertEqual(self.w.admit(BASE), (15, None))
+        self.assertEqual(self.http_calls, [])
+
+    def test_daily_limit_holds_until_rows_age_out(self):
+        self.ledger([{"sid": f"jules-{i}", "ts": T0 - 100, "done": True} for i in range(100)])
+        self.assertEqual(self.w.admit(BASE), (0, "daily limit 100/100 in 24 h"))
+        self.t = T0 - 100 + workers.JULES_WINDOW_S + 1
+        self.assertEqual(self.w.usage(), (0, 0))
+        self.assertEqual(self.w.admit(BASE), (15, None))
+
+    def test_concurrent_limit_holds_and_open_sessions_never_age_out(self):
+        self.ledger([{"sid": f"jules-{i}", "ts": T0 - 3 * 86400, "done": False} for i in range(15)])
+        self.assertEqual(self.w.admit(BASE), (0, "concurrent limit 15/15"))
+        self.w._done("jules-0")
+        self.assertEqual(self.w.usage(), (0, 14))
+        self.assertEqual(self.w.admit(BASE), (1, None))
+
+    def test_unreadable_ledger_is_no_headroom(self):
+        for raw in ("{", "{}", '[{"ts": "x"}]', "[1]"):
+            with self.subTest(raw=raw):
+                self.ledger(raw)
+                self.assertIsNone(self.w.usage())
+                self.assertEqual(self.w.admit(BASE), (None, "usage ledger unreadable"))
+
+    def test_base_and_origin_checks(self):
+        self.assertEqual(self.w.admit("main"), (15, "base is not a commit sha"))
+        self.assertEqual(self.w.admit("b" * 7), (15, "base is not a commit sha"))
+        self.revs["refs/remotes/origin/main"] = "d" * 40
+        self.assertEqual(self.w.admit(BASE), (15, "origin/main is not the slice base"))
+        del self.revs["refs/remotes/origin/main"]
+        self.assertEqual(self.w.admit(BASE), (15, "origin/main is not the slice base"))
+        self.g["remote"] = (0, "https://gitlab.com/salih/JARVIS.git\n")
+        self.assertEqual(self.w.admit(BASE), (15, "origin is not a GitHub repo"))
+        self.assertEqual(self.http_calls, [])
+
+    def test_start_posts_the_session_with_the_key_header_only(self):
+        self.replies["POST"] = (200, {"name": "sessions/abc123", "id": "abc123"})
+        self.assertEqual(self.w.start("JX", BASE, "do the slice", ["scripts/a.py"]), "jules-abc123")
+        [(method, url, headers, body)] = self.http_calls
+        self.assertEqual((method, url, headers), ("POST", f"{JULES_API}/sessions", {"X-Goog-Api-Key": KEY}))
+        self.assertEqual(body["sourceContext"], {"source": "sources/github/salih/JARVIS",
+                                                 "githubRepoContext": {"startingBranch": "main"}})
+        self.assertEqual((body["automationMode"], body["requirePlanApproval"], body["title"]),
+                         ("AUTO_CREATE_PR", False, "JX"))
+        self.assertIn("jules/JX", body["prompt"])
+        self.assertIn(BASE, body["prompt"])
+        self.assertIn("scripts/a.py", body["prompt"])
+        self.assertNotIn(KEY, json.dumps(body))
+        self.assertEqual(self.w.usage(), (1, 1))
+        self.assertEqual(self.w.info["jules-abc123"], {"session": "abc123", "base": BASE, "branch": "jules/JX"})
+        ledger = (self.root / workers.JULES_LEDGER).read_text(encoding="utf-8")
+        self.assertNotIn(KEY, ledger)
+
+    def test_start_without_a_session_id_fails(self):
+        for reply in ((200, {}), (200, {"id": "a/b"}), (200, ["x"])):
+            with self.subTest(reply=reply):
+                self.replies["POST"] = reply
+                with self.assertRaises(RuntimeError):
+                    self.w.start("JX", BASE, "t")
+                self.t += 1
+        self.assertEqual(self.w.usage(), (3, 0))  # a lost reply may have made a session: counted daily
+
+    def test_unwritable_ledger_never_posts(self):
+        self.ledger("{")
+        with self.assertRaises(RuntimeError):
+            self.w.start("JX", BASE, "t")
+        self.assertEqual(self.http_calls, [])
+
+    def test_key_never_in_errors(self):
+        import traceback
+        for reply in ((500, {}), (403, {"error": KEY}), RuntimeError(f"boom {KEY}"),
+                      OSError(f"X-Goog-Api-Key: {KEY}"), (None, {})):
+            with self.subTest(reply=type(reply).__name__):
+                self.replies["POST"] = reply
+                with self.assertRaises(RuntimeError) as cm:
+                    self.w.start("JX", BASE, "t")
+                e = cm.exception
+                self.assertNotIn(KEY, "".join(traceback.format_exception(e)))
+                self.assertIsNone(e.__context__)
+                self.assertIsNone(e.__cause__)
+        self.replies["POST"] = (500, {})
+        with self.assertRaises(RuntimeError) as cm:
+            self.w.start("JX", BASE, "t")
+        self.assertEqual(str(cm.exception), "jules POST sessions: HTTP 500")
+
+    def test_status_mapping(self):
+        self.ledger([{"sid": "jules-abc", "ts": T0, "done": False}])
+        for state, want in (("QUEUED", "running"), ("IN_PROGRESS", "running"),
+                            ("AWAITING_PLAN_APPROVAL", "waiting"), ("PAUSED", "waiting"),
+                            ("STRANGE", "unknown"), (None, "unknown")):
+            with self.subTest(state=state):
+                self.replies["GET"] = (200, {"state": state})
+                self.assertEqual(self.w.status("jules-abc"), want)
+        self.assertEqual(self.w.usage(), (1, 1))
+        self.replies["GET"] = (500, {})
+        self.assertEqual(self.w.status("jules-abc"), "unknown")
+        self.replies["GET"] = (200, {"state": "FAILED"})
+        self.assertEqual(self.w.status("jules-abc"), "failed")
+        self.assertEqual(self.w.usage(), (1, 0))
+        self.replies["GET"] = (200, {"state": "COMPLETED"})
+        self.assertEqual(self.w.status("jules-abc"), "completed")
+        self.assertEqual(self.http_calls[0][:2], ("GET", f"{JULES_API}/sessions/abc"))
+        n = len(self.http_calls)
+        self.assertEqual(self.w.status("jules-a/../b"), "unknown")  # never a crafted path
+        self.assertEqual(len(self.http_calls), n)
+
+    def test_stop_deletes_the_session(self):
+        self.ledger([{"sid": "jules-abc", "ts": T0, "done": False}])
+        self.assertTrue(self.w.stop("jules-abc"))
+        self.assertEqual(self.http_calls[-1][:2], ("DELETE", f"{JULES_API}/sessions/abc"))
+        self.assertEqual(self.w.usage(), (1, 0))
+        self.replies["DELETE"] = (404, {})
+        self.assertFalse(self.w.stop("jules-abc"))
+
+    def collect(self, protected=lambda p: False):
+        return self.w.collect("jules-abc", "JX", self.wt, BASE, ["scripts/a.py"], protected)
+
+    def test_collect_passes_a_verified_result(self):
+        self.replies["GET"] = (200, {"state": "COMPLETED", "outputs": [{"pullRequest": {"url": PR}}]})
+        report, status = self.collect()
+        self.assertEqual(status, "PASS")
+        self.assertEqual(report, self.wt / "build" / "reports" / "JX.md")
+        lines = report.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[:3], ["STATUS: PASS", f"COMMIT: {HEAD}", "BRANCH: jules/JX"])
+        root = ["-C", str(self.root)]
+        self.assertIn([*root, "fetch", "--no-tags", "origin", "+refs/pull/7/head:refs/heads/jules/JX"], self.git_calls)
+        self.assertIn([*root, "merge-base", "--is-ancestor", BASE, HEAD], self.git_calls)
+        self.assertIn(["-C", str(self.wt), "merge", "--ff-only", HEAD], self.git_calls)
+        self.assertFalse(any("push" in c for c in self.git_calls))
+
+    def test_collect_blocks_untrusted_results(self):
+        good = {"state": "COMPLETED", "outputs": [{"pullRequest": {"url": PR}}]}
+        cases = (
+            ("no PR", {"outputs": []}, {}, "expected exactly one pull request"),
+            ("two PRs", {"outputs": [{"pullRequest": {"url": PR}}] * 2}, {}, "expected exactly one pull request"),
+            ("foreign PR", {"outputs": [{"pullRequest": {"url": "https://github.com/evil/JARVIS/pull/7"}}]}, {},
+             "pull request is not on our origin"),
+            ("fetch fails", good, {"fetch": (128, "")}, "fetch of the pull request head failed"),
+            ("wrong base", good, {"merge-base": (1, "")}, "result is not based on the slice base"),
+            ("ungranted", good, {"diff": "scripts/a.py\0uv.lock\0"}, "ungranted files: uv.lock"),
+            ("protected", good, {"diff": "scripts/a.py\0data/jarvis.db\0"}, "protected files: data/jarvis.db"),
+            ("empty diff", good, {"diff": ""}, "empty or unreadable diff"),
+            ("no commits", good, {"head": BASE}, "no commits on the result branch"),
+            ("ff fails", good, {"merge": (1, "")}, "fast-forward of the lane worktree failed"),
+        )
+        for base in (None, "-x", "main"):
+            with self.subTest(base=base):
+                self.git_calls.clear()
+                report, status = self.w.collect("jules-abc", "JX", self.wt, base, ["scripts/a.py"], lambda p: False)
+                self.assertEqual(status, "BLOCKED")
+                self.assertIn("BLOCKED: slice base is not a commit sha", report.read_text(encoding="utf-8"))
+                self.assertEqual(self.git_calls, [])
+        for label, data, tweak, why in cases:
+            with self.subTest(case=label):
+                self.git_calls.clear()
+                self.replies["GET"] = (200, data)
+                self.g = {k: v for k, v in tweak.items() if k in ("fetch", "merge-base", "merge")}
+                self.diff = tweak.get("diff", "scripts/a.py\0")
+                self.revs["refs/heads/jules/JX^{commit}"] = tweak.get("head", HEAD)
+                report, status = self.collect(protected=lambda p: p.startswith("data/"))
+                self.assertEqual(status, "BLOCKED")
+                text = report.read_text(encoding="utf-8")
+                self.assertTrue(text.startswith("STATUS: BLOCKED\n"))
+                self.assertIn(f"BLOCKED: {why}", text)
+                if label != "ff fails":
+                    self.assertFalse(any("merge" in c and "--ff-only" in c for c in self.git_calls))
+
+
+class FakeJules:
+    def __init__(self, headroom=15, why=None):
+        self.headroom, self.why, self.state = headroom, why, "running"
+        self.started, self.stopped, self.collected, self.info = [], [], [], {}
+
+    def admit(self, base):
+        return self.headroom, self.why
+
+    def start(self, name, base, text, files):
+        self.started.append((name, base, text, files))
+        self.info["jules-abc"] = {"session": "abc", "base": base, "branch": f"jules/{name}"}
+        return "jules-abc"
+
+    def status(self, sid):
+        return self.state
+
+    def stop(self, sid):
+        self.stopped.append(sid)
+        return True
+
+    def collect(self, sid, name, worktree, base, files, protected):
+        self.collected.append((sid, name, worktree, base, files, protected))
+        return Path(worktree) / "build" / "reports" / f"{name}.md", "PASS"
+
+
+class ConveyorJulesTest(Base):
+    def setUp(self):
+        super().setUp()
+        self.events = []
+        self.c.event = lambda kind, **kw: self.events.append((kind, kw))
+        self.git.fail[("git", "worktree", "add")] = (0, "")
+        self.c.jules = FakeJules()
+
+    def test_refused_admission_holds_without_worktree(self):
+        self.c.jules = FakeJules(None, "disabled: no key file")
+        self.assertIsNone(self.c.start_jules("JX", BASE, "p", ["scripts/a.py"]))
+        self.assertEqual(self.events[-1], ("jules_hold", {"lane": "JX", "headroom": None,
+                                                          "reason": "disabled: no key file"}))
+        self.assertEqual(self.c.jules.started, [])
+        self.assertFalse(any(c[:3] == ["git", "worktree", "add"] for c in self.git.calls))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_start_makes_the_worktree_at_the_base_and_never_runs_claude(self):
+        self.assertEqual(self.c.start_jules("JX", BASE, "p", ["scripts/a.py"]), "jules-abc")
+        wt = self.root / ".claude" / "worktrees" / "JX"
+        self.assertIn(["git", "worktree", "add", "-b", "worktree-JX", str(wt), BASE], self.git.calls)
+        self.assertEqual(self.c.jules.started, [("JX", BASE, "p", ["scripts/a.py"])])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_failed_start_drops_the_fresh_worktree(self):
+        self.c.jules.start = lambda *a: (_ for _ in ()).throw(RuntimeError("jules POST sessions: HTTP 500"))
+        self.assertIsNone(self.c.start_jules("JX", BASE, "p", []))
+        wt = self.root / ".claude" / "worktrees" / "JX"
+        self.assertIn(["git", "worktree", "remove", str(wt)], self.git.calls)
+        self.assertIn(["git", "branch", "-D", "worktree-JX"], self.git.calls)
+        self.assertFalse(any("--force" in c for c in self.git.calls))
+
+    def lane(self):
+        prompt = self.base / "prompts" / "JX.md"
+        prompt.parent.mkdir(parents=True, exist_ok=True)
+        prompt.write_text(HDR.format("JX"), encoding="utf-8")
+        lanes = {}
+        self.c.record(lanes, "JX", "jules-abc", "opus", "high", BASE, prompt, ["scripts/a.py"], worker="jules")
+        lanes["JX"]["jules"] = {"session": "abc", "base": BASE, "branch": "jules/JX"}
+        return lanes
+
+    def test_track_running_then_completed_collects_and_finishes(self):
+        lanes = self.lane()
+        finished = []
+        self.c.finish = lambda name, ln, report, status, **kw: finished.append((name, report, status))
+        self.c.jules_track(lanes)
+        self.assertEqual((lanes["JX"]["state"], lanes["JX"].get("finished")), ("working", None))
+        self.c.jules.state = "completed"
+        self.c.jules_track(lanes)
+        wt = lanes["JX"]["worktree"]
+        self.assertEqual(self.c.jules.collected,
+                         [("jules-abc", "JX", wt, BASE, ["scripts/a.py"], conveyor.protected_path)])
+        self.assertEqual(finished, [("JX", Path(wt) / "build" / "reports" / "JX.md", "PASS")])
+        self.assertEqual(self.events[-1], ("jules_collect", {"lane": "JX", "id": "jules-abc", "status": "PASS"}))
+        self.assertEqual(self.fake.calls, [])
+
+    def test_track_collect_error_is_missing_not_a_crash(self):
+        lanes = self.lane()
+        self.c.jules.state = "completed"
+        self.c.jules.collect = lambda *a: (_ for _ in ()).throw(OSError("disk"))
+        self.c.jules_track(lanes)
+        ln = lanes["JX"]
+        self.assertEqual((ln["finished"], ln["status"], ln["jules_why"]),
+                         (True, "MISSING", "jules collect error OSError"))
+        self.assertEqual(self.c.jules.stopped, ["jules-abc"])
+
+    def test_track_failed_waiting_or_late_is_missing(self):
+        for st, late, stopped in (("failed", False, []), ("waiting", False, ["jules-abc"]),
+                                  ("running", True, ["jules-abc"]), ("unknown", True, ["jules-abc"])):
+            with self.subTest(state=st, late=late):
+                self.c.jules = FakeJules()
+                self.c.jules.state = st
+                lanes = self.lane()
+                t0 = self.t
+                if late:
+                    self.t += workers.JULES_MAX_S + 1
+                self.c.jules_track(lanes)
+                self.t = t0
+                ln = lanes["JX"]
+                self.assertEqual((ln["finished"], ln["status"], ln["state"]), (True, "MISSING", st))
+                self.assertEqual(ln["jules_why"], f"jules {st}" + (" past the time limit" if late else ""))
+                self.assertEqual(self.c.jules.stopped, stopped)
+                self.c.jules_track(lanes)  # a finished lane is never polled or stopped again
+                self.assertEqual(self.c.jules.stopped, stopped)
 
 
 if __name__ == "__main__":

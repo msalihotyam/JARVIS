@@ -30,7 +30,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests load this file by path
-from conveyor_workers import WORKERS, CodexWorker  # noqa: E402
+from conveyor_workers import JULES_MAX_S, WORKERS, CodexWorker, JulesWorker  # noqa: E402
 
 ROOT =Path(__file__).resolve().parents[1]  # repo root (scripts/ -> repo)
 SETTINGS = "build/conveyor/lanes.settings.json"
@@ -809,6 +809,8 @@ def validate_slice(s):
         return "bad worker"
     if "class" in s and s["class"] not in ("A", "B", "C"):  # absent = unmarked = never codex
         return "bad class"
+    if s.get("worker") == "jules" and s.get("linux_ok") is not True:
+        return "jules needs linux_ok: true (no UI/Windows tests)"
     return None
 
 
@@ -864,9 +866,10 @@ class Conveyor:
     def __init__(self, root=ROOT, runner=real_runner, now=time.time, send=ntfy_send,
                  post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage,
                  projects=None, mem=real_mem, idle=real_idle, procs=None, net=real_net,
-                 popen=subprocess.Popen, codex=None):
+                 popen=subprocess.Popen, codex=None, jules=None):
         self.root = Path(root)
         self.codex = codex if codex is not None else CodexWorker(self.root, popen=popen, now=now)
+        self.jules = jules if jules is not None else JulesWorker(self.root, now=now, git_cmd=GIT_PIN)
         # session transcripts: <claude config dir>/projects/<project slug>/<sessionId>.jsonl
         self.projects = Path(projects) if projects else \
             Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
@@ -1130,6 +1133,7 @@ class Conveyor:
         if agents is not None:
             self.track(lanes, agents)
         self.codex_track(lanes)
+        self.jules_track(lanes)
         self.ci_wait(lanes)  # before the autopilot: a CI result is acted on in the same pass
         self.autopilot(lanes)  # before dispatch: a new fix lane or an open breaker counts now
         self.beat()
@@ -1390,8 +1394,8 @@ class Conveyor:
         by_id = {a.get("id"): a for a in agents}
         held = bool(self.pager_flag("outage"))
         for name, ln in lanes.items():
-            if ln.get("worker") == "codex":
-                continue  # codex_track
+            if ln.get("worker") in ("codex", "jules"):
+                continue  # codex_track / jules_track
             a = by_id.get(ln["id"])
             state = "missing" if a is None else a.get("state") or a.get("status") or "unknown"
             alive = a is not None and "pid" in a
@@ -1926,6 +1930,63 @@ class Conveyor:
                 except Exception:
                     pass
             return None
+
+    def start_jules(self, name, base, text, files):
+        """One Jules session for a linux_ok slice, pinned to the base sha (= origin/main);
+        the lane worktree only receives the verified result. Refusal holds (fail closed)."""
+        sha = self.main_head() if base == "main" else base
+        h, why = self.jules.admit(sha)
+        if why:
+            self.event("jules_hold", lane=name, headroom=h, reason=why)
+            return None
+        wt = self.root / ".claude" / "worktrees" / name
+        try:
+            rc, out = self.cmd(["git", "worktree", "add", "-b", f"worktree-{name}", str(wt), sha])
+        except Exception as e:
+            self.error(f"dispatch {name}: {type(e).__name__}")
+            return None
+        if rc != 0:
+            self.error(f"dispatch {name} rc={rc}", output=out[-300:])
+            return None
+        try:
+            return self.jules.start(name, sha, text, files)
+        except Exception as e:  # its messages never carry the key (conveyor_workers._call)
+            self.error(f"dispatch {name}: {type(e).__name__}: {e}")
+            for argv in (["git", "worktree", "remove", str(wt)], ["git", "branch", "-D", f"worktree-{name}"]):
+                try:
+                    self.cmd(argv)
+                except Exception:
+                    pass
+            return None
+
+    def jules_track(self, lanes):
+        """Poll open Jules lanes: completed -> collect + finish (the normal gate decides);
+        failed, waiting, or past JULES_MAX_S -> stop and MISSING."""
+        for name, ln in lanes.items():
+            if ln.get("worker") != "jules" or ln.get("finished"):
+                continue
+            st = self.jules.status(ln["id"])
+            ln["updated_at"] = iso(self.now())
+            late = self.now() - (self.started_ts(ln) or self.now()) > JULES_MAX_S
+            if st == "completed":
+                info = ln.get("jules") or {}
+                try:
+                    report, status = self.jules.collect(ln["id"], name, ln["worktree"], info.get("base"),
+                                                        ln.get("files", []), protected_path)
+                except Exception as e:  # one broken lane must not stall the whole pass
+                    st, late = f"collect error {type(e).__name__}", False
+                else:
+                    self.event("jules_collect", lane=name, id=ln["id"], status=status)
+                    self.finish(name, ln, report, status)
+                    continue
+            if st in ("running", "unknown") and not late:
+                ln["state"] = "working"
+                continue
+            if st != "failed":
+                self.jules.stop(ln["id"])
+            ln["jules_why"] = f"jules {st}" + (" past the time limit" if late else "")
+            ln.update(state=st, finished=True, status="MISSING", finished_ts=self.now())
+            self.event("finish", lane=name, id=ln["id"], state=st, status="MISSING")
 
     def record(self, lanes, name, sid, model, effort, base, prompt, files=None, slice_=False,
                worker=None):
@@ -2495,17 +2556,21 @@ class Conveyor:
             if s.get("worker") == "auto":
                 self.event("route", lane=name, worker=worker, reason=why)
             codex = worker == "codex"
-            sid = self.start_codex(name, base, text) if codex else \
-                self.start(name, s["model"], s["effort"], text)
+            if worker == "jules":
+                sid = self.start_jules(name, base, text, s.get("files", []))
+            else:
+                sid = self.start_codex(name, base, text) if codex else \
+                    self.start(name, s["model"], s["effort"], text)
             if not sid:
                 slices = [x for x in slices if x is not s]  # retry next pass
                 continue
             dest = self.started_path(name)
             dest.write_text(text, encoding="utf-8")
             self.record(lanes, name, sid, s["model"], s["effort"], base, dest,
-                        files=s.get("files", []), slice_=True, worker="codex" if codex else None)
-            if codex:  # H4: pid + creation time + log survive a conveyor restart
-                lanes[name]["codex"] = getattr(self.codex, "info", {}).get(sid)
+                        files=s.get("files", []), slice_=True,
+                        worker=worker if worker in ("codex", "jules") else None)
+            if worker in ("codex", "jules"):  # H4: pid / session + base survive a conveyor restart
+                lanes[name][worker] = getattr(getattr(self, worker), "info", {}).get(sid)
                 self.save_lanes(lanes)
             busy.add(name)
             started = True
@@ -3538,7 +3603,7 @@ class Conveyor:
                 return
             t = self.collected_ts(ln)
             if (not ln.get("finished") or "stopped" in ln or "cleanup" in ln
-                    or ln.get("status") == "STUCK" or t is None or ln.get("worker") == "codex"):
+                    or ln.get("status") == "STUCK" or t is None or ln.get("worker") in ("codex", "jules")):
                 continue
             ids = ln.get("prev_ids", []) + [ln["id"]]
             aged = self.now() - t >= STOP_WORKING_S
@@ -3590,8 +3655,9 @@ class Conveyor:
             t = self.collected_ts(ln)
             if t is None or self.now() - t < CLEANUP_S:
                 continue
-            if ln.get("worker") == "codex":  # no claude session: only its worktree, same proof
-                if self.codex.status(ln["id"]) == "running":
+            if ln.get("worker") in ("codex", "jules"):  # no claude session: only its worktree, same proof
+                # jules never writes the local worktree; its lane is finished only once stopped/completed
+                if ln["worker"] == "codex" and self.codex.status(ln["id"]) == "running":
                     continue
                 kept = self.unintegrated({"cwd": ln.get("worktree")}, name)
                 if kept:
