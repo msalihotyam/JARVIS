@@ -994,6 +994,30 @@ the optional report reader below. One instance at a time
   `build/ledger/usage.json` and never drops a known session; an unreadable file
   is left untouched), else the older runtime `build/conveyor/usage_ledger.py`.
 
+### Workers (Claude / Codex)
+
+The backlog field `worker` accepts `"claude"` (the default when absent) or
+`"codex"`; there is no automatic routing yet (`scripts/conveyor.py` and
+`scripts/conveyor_workers.py`).
+
+Codex runs `codex exec --json` with a scrubbed allowlist environment,
+`--ignore-user-config`, forced ChatGPT login and `--sandbox workspace-write`.
+Admission fails closed on unknown or stale account/limit readings, an API-key
+route, a reached limit, `has_credits`, or low headroom (`codex_hold`). Readings
+must be at most 60 seconds old, explicitly show no credits, and leave at least
+10% in the tighter limit window. A mid-run limit or credit event stops the
+lane (`codex_stop`); unreadable or truncated event logs also stop it.
+
+After restart, re-attachment requires a live persisted pid with the same
+process creation time. Without a final report, an unverifiable process is
+stopped and flagged `codex_unverified` for attention; if stopping cannot be
+proved, the lane remains held. Cleanup requires the same integration /
+patch-equivalence proof before discarding the worktree; uncertain work is
+preserved.
+
+`AGENTS.md` is the Codex instruction file and must carry the same hard rules
+as `CLAUDE.md`.
+
 ### Lane process (2026-10-12)
 
 Rules live in `build/conveyor/notes/LANE_RULES.md` (R1-R10); this is the map.
