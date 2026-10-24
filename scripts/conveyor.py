@@ -1965,12 +1965,18 @@ class Conveyor:
 
     def jules_track(self, lanes):
         """Poll open Jules lanes: completed -> collect + finish (the normal gate decides);
-        failed, waiting, or past JULES_MAX_S -> stop and MISSING."""
+        failed or past JULES_MAX_S -> save why, stop and MISSING; waiting -> save why, leave the
+        session open for Salih in the Jules UI, release it from our cap and finish BLOCKED.
+        Every Jules state change is one jules_state event (JULESWAIT)."""
         for name, ln in lanes.items():
             if ln.get("worker") != "jules" or ln.get("finished"):
                 continue
             st = self.jules.status(ln["id"])
             ln["updated_at"] = iso(self.now())
+            raw = getattr(self.jules, "raw", {}).get(ln["id"])
+            if raw is not None and raw != ln.get("jules_state"):
+                self.event("jules_state", lane=name, old=ln.get("jules_state"), new=raw)
+                ln["jules_state"] = raw
             late = self.now() - (self.started_ts(ln) or self.now()) > JULES_MAX_S
             if st == "completed":
                 info = ln.get("jules") or {}
@@ -1986,9 +1992,29 @@ class Conveyor:
             if st in ("running", "unknown") and not late:
                 ln["state"] = "working"
                 continue
-            if st != "failed":
+            why = f"jules {st}" + (" past the time limit" if late else "")
+            if not st.startswith("collect error"):  # read why BEFORE anything else
+                try:
+                    text = self.jules.why(ln["id"], name)
+                except Exception as e:  # never let the summary stall the pass
+                    text = f"summary error {type(e).__name__}"
+                why += f": {text}" if text else ""
+            ln["jules_why"] = why[:200]
+            if st == "waiting":  # DECISION: never deleted, even past the time limit
+                self.jules.release(ln["id"])
+                report = Path(ln["worktree"]) / "build" / "reports" / f"{name}.md"
+                try:
+                    report.parent.mkdir(parents=True, exist_ok=True)
+                    report.write_text(f"STATUS: BLOCKED\nBRANCH: jules/{name}\nWorker: jules (session left open "
+                                      f"in the Jules UI)\nBLOCKED: {ln['jules_why']}\n", encoding="utf-8")
+                except OSError:
+                    pass  # no report -> MISSING below; the session still stays open
+                else:
+                    ln["state"] = "waiting"
+                    self.finish(name, ln, report, "BLOCKED")
+                    continue
+            elif st != "failed":
                 self.jules.stop(ln["id"])
-            ln["jules_why"] = f"jules {st}" + (" past the time limit" if late else "")
             ln.update(state=st, finished=True, status="MISSING", finished_ts=self.now())
             self.event("finish", lane=name, id=ln["id"], state=st, status="MISSING")
 

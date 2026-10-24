@@ -840,6 +840,8 @@ class JulesWorkerTest(unittest.TestCase):
     def http(self, method, url, headers, body=None):
         self.http_calls.append((method, url, headers, body))
         r = self.replies.get(method, (200, {}))
+        if callable(r) and not isinstance(r, Exception):
+            r = r(url)
         if isinstance(r, Exception):
             raise r
         return r
@@ -990,6 +992,109 @@ class JulesWorkerTest(unittest.TestCase):
         self.replies["DELETE"] = (404, {})
         self.assertFalse(self.w.stop("jules-abc"))
 
+    def test_waiting_states_and_raw_state_tracking(self):
+        for st in workers.JULES_WAITING:
+            with self.subTest(state=st):
+                self.replies["GET"] = (200, {"state": st})
+                self.assertEqual(self.w.status("jules-abc"), "waiting")
+                self.assertEqual(self.w.raw["jules-abc"], st)
+        self.replies["GET"] = (500, {})
+        self.assertEqual(self.w.status("jules-abc"), "unknown")
+        self.assertEqual(self.w.raw["jules-abc"], "PAUSED")  # a read blip keeps the last state
+        for data, raw in (({}, "none"), ({"state": 7}, "none"), ({"state": "X" * 99}, "X" * 64)):
+            self.replies["GET"] = (200, data)
+            self.w.status("jules-abc")
+            self.assertEqual(self.w.raw["jules-abc"], raw)
+
+    def test_release_frees_the_cap_without_delete(self):
+        self.ledger([{"sid": "jules-abc", "ts": T0, "done": False}])
+        self.assertEqual(self.w.usage(), (1, 1))
+        self.w.release("jules-abc")
+        self.assertEqual(self.w.usage(), (1, 0))
+        self.assertEqual(self.http_calls, [])
+
+    def reply(self, acts, state="AWAITING_USER_FEEDBACK"):
+        self.replies["GET"] = lambda url: (200, {"activities": acts} if "/activities" in url else {"state": state})
+
+    def summary(self):
+        f = self.root / workers.JULES_DIR / "JX.json"
+        self.assertLessEqual(f.stat().st_size, workers.JULES_WHY_MAX)
+        return f.read_text(encoding="utf-8")
+
+    def test_why_saves_newest_activities_first(self):
+        acts = [{"createTime": f"2026-10-24T21:{m:02d}:00Z", "originator": "agent",
+                 "agentMessaged": {"agentMessage": f"msg {m}"}} for m in range(15)]
+        acts += ["raw", None, {"createTime": "2026-10-24T20:00:00Z", "planGenerated": {"plan": {"steps": [
+            {"title": "a"}, {"title": "b"}, "x"]}}}]
+        self.reply(acts[::-1])
+        line = self.w.why("jules-abc", "JX")
+        self.assertEqual(line, "AWAITING_USER_FEEDBACK msg 14")
+        data = json.loads(self.summary())
+        self.assertEqual(data["state"], "AWAITING_USER_FEEDBACK")
+        self.assertEqual([a["agent"] for a in data["activities"]], [f"msg {m}" for m in range(14, 4, -1)])
+        self.assertEqual(data["errors"], [])
+        self.assertEqual([c[:2] for c in self.http_calls], [("GET", f"{JULES_API}/sessions/abc"),
+                                                            ("GET", f"{JULES_API}/sessions/abc/activities?pageSize=100")])
+        self.reply([acts[-1], {"sessionFailed": {"reason": {"code": 3}}, "description": ""}], state="FAILED")
+        self.assertEqual(self.w.why("jules-abc", "JX"), 'FAILED a; b')
+        self.assertEqual(json.loads(self.summary())["activities"],[{"plan": "a; b", "time": "2026-10-24T20:00:00Z"}, {"error": '{"code": 3}'}])
+
+    def test_why_truncates_fields_and_caps_the_file(self):
+        big = "ğ" * 2000
+        self.reply([{"createTime": f"t{i}", "agentMessaged": {"agentMessage": big}, "description": big}
+                    for i in range(10)], state=big)
+        line = self.w.why("jules-abc", "JX")
+        self.assertLessEqual(len(line), 200)
+        self.assertNotIn("\n", line)
+        data = json.loads(self.summary())
+        self.assertEqual(len(data["state"]), workers.JULES_TEXT_MAX)
+        self.assertTrue(data["activities"])
+        self.assertEqual(data["activities"][0]["time"], "t9")  # the oldest were dropped
+        self.assertTrue(all(len(v) <= workers.JULES_TEXT_MAX for a in data["activities"] for v in a.values()))
+
+    def test_why_records_read_errors_and_never_raises(self):
+        self.replies["GET"] = RuntimeError(KEY)
+        line = self.w.why("jules-abc", "JX")
+        data = json.loads(self.summary())
+        self.assertEqual(data["errors"], ["jules GET sessions/abc: RuntimeError",
+                                          "jules GET sessions/abc/activities?pageSize=100: RuntimeError"])
+        self.assertEqual(line, "jules GET sessions/abc: RuntimeError")
+        self.replies["GET"] = lambda url: (500, {}) if "/activities" in url else (200, ["not", "a", "dict"])
+        self.w.why("jules-abc", "JX")
+        self.assertEqual(json.loads(self.summary())["errors"],
+                         ["jules GET sessions/abc/activities?pageSize=100: HTTP 500"])
+        n = len(self.http_calls)
+        self.assertIn("bad jules session id", self.w.why("jules-a/../b", "JX"))
+        self.assertEqual(len(self.http_calls), n)
+        self.keyf.unlink()
+        self.assertIn("no key file", self.w.why("jules-abc", "JX"))
+
+    def test_why_never_echoes_the_key_or_headers(self):
+        self.reply([{"agentMessaged": {"agentMessage": f"your key is {KEY}"}, "description": {"k": KEY}}],
+                   state=KEY)
+        line = self.w.why("jules-abc", "JX")
+        text = self.summary()
+        for s in (text, line):
+            self.assertNotIn(KEY, s)
+            self.assertNotIn("X-Goog-Api-Key", s)
+        self.assertIn("your key is [key]", text)
+        self.reply([{"agentMessaged": {"agentMessage": "x" * 490 + KEY}}], state="\x1b[2J" + "x" * 491 + KEY)
+        line = self.w.why("jules-abc", "JX")  # a key straddling the 500-char clip leaves no prefix behind
+        self.assertNotIn(KEY[:5], self.summary() + line)
+        self.assertTrue(line.isprintable())
+        self.keyf.write_text("e", encoding="utf-8")  # a tiny key rewrites values only, never the summary's own fields
+        self.reply([{"agentMessaged": {"agentMessage": "hello"}}], state="e")
+        self.assertEqual(self.w.why("jules-abc", "JX"), "[key] h[key]llo")
+        self.assertEqual(sorted(json.loads(self.summary())), ["activities", "errors", "lane", "sid", "state"])
+
+    def test_why_bad_lane_name_saves_nothing(self):
+        self.reply([])
+        for name in ("../x", "a b", "", "x" * 129):
+            with self.subTest(name=name):
+                self.assertIn("(summary not saved: OSError)", self.w.why("jules-abc", name))
+        self.assertFalse((self.root / workers.JULES_DIR).exists())
+        self.assertFalse((self.root / "build" / "conveyor" / "x.json").exists())
+
     def collect(self, protected=lambda p: False):
         return self.w.collect("jules-abc", "JX", self.wt, BASE, ["scripts/a.py"], protected)
 
@@ -1046,11 +1151,21 @@ class JulesWorkerTest(unittest.TestCase):
 
 class FakeJules:
     def __init__(self, headroom=15, why=None):
-        self.headroom, self.why, self.state = headroom, why, "running"
+        self.headroom, self.hold_why, self.state = headroom, why, "running"
         self.started, self.stopped, self.collected, self.info = [], [], [], {}
+        self.raw, self.released, self.calls, self.text = {}, [], [], "asked a question"
 
     def admit(self, base):
-        return self.headroom, self.why
+        return self.headroom, self.hold_why
+
+    def why(self, sid, name):
+        self.calls.append(("why", sid, name))
+        if isinstance(self.text, Exception):
+            raise self.text
+        return self.text
+
+    def release(self, sid):
+        self.released.append(sid)
 
     def start(self, name, base, text, files):
         self.started.append((name, base, text, files))
@@ -1062,6 +1177,7 @@ class FakeJules:
 
     def stop(self, sid):
         self.stopped.append(sid)
+        self.calls.append(("stop", sid))
         return True
 
     def collect(self, sid, name, worktree, base, files, protected):
@@ -1134,10 +1250,11 @@ class ConveyorJulesTest(Base):
         self.assertEqual((ln["finished"], ln["status"], ln["jules_why"]),
                          (True, "MISSING", "jules collect error OSError"))
         self.assertEqual(self.c.jules.stopped, ["jules-abc"])
+        self.assertEqual(self.c.jules.calls, [("stop", "jules-abc")])  # no summary read for a collect error
 
-    def test_track_failed_waiting_or_late_is_missing(self):
-        for st, late, stopped in (("failed", False, []), ("waiting", False, ["jules-abc"]),
-                                  ("running", True, ["jules-abc"]), ("unknown", True, ["jules-abc"])):
+    def test_track_failed_or_late_saves_why_then_missing(self):
+        for st, late, stopped in (("failed", False, []), ("running", True, ["jules-abc"]),
+                                  ("unknown", True, ["jules-abc"])):
             with self.subTest(state=st, late=late):
                 self.c.jules = FakeJules()
                 self.c.jules.state = st
@@ -1149,10 +1266,67 @@ class ConveyorJulesTest(Base):
                 self.t = t0
                 ln = lanes["JX"]
                 self.assertEqual((ln["finished"], ln["status"], ln["state"]), (True, "MISSING", st))
-                self.assertEqual(ln["jules_why"], f"jules {st}" + (" past the time limit" if late else ""))
+                self.assertEqual(ln["jules_why"],
+                                 f"jules {st}" + (" past the time limit" if late else "") + ": asked a question")
                 self.assertEqual(self.c.jules.stopped, stopped)
+                self.assertEqual(self.c.jules.calls[0], ("why", "jules-abc", "JX"))  # why BEFORE stop
+                self.assertEqual(self.c.jules.released, [])
                 self.c.jules_track(lanes)  # a finished lane is never polled or stopped again
                 self.assertEqual(self.c.jules.stopped, stopped)
+                self.assertEqual(len(self.c.jules.calls), 1 + len(stopped))
+
+    def test_track_waiting_leaves_the_session_open_and_blocks(self):
+        for late in (False, True):  # DECISION: waiting past the time limit is not deleted either
+            with self.subTest(late=late):
+                self.c.jules = FakeJules()
+                self.c.jules.state = "waiting"
+                lanes = self.lane()
+                finished = []
+
+                def finish(name, ln, report, status, **kw):
+                    finished.append((name, report, status))
+                    ln.update(finished=True, status=status)
+                self.c.finish = finish
+                t0 = self.t
+                if late:
+                    self.t += workers.JULES_MAX_S + 1
+                self.c.jules_track(lanes)
+                self.t = t0
+                ln = lanes["JX"]
+                why = "jules waiting" + (" past the time limit" if late else "") + ": asked a question"
+                self.assertEqual((ln["state"], ln["status"], ln["jules_why"]), ("waiting", "BLOCKED", why))
+                self.assertEqual(self.c.jules.stopped, [])
+                self.assertEqual(self.c.jules.released, ["jules-abc"])
+                report = Path(ln["worktree"]) / "build" / "reports" / "JX.md"
+                self.assertEqual(finished, [("JX", report, "BLOCKED")])
+                text = report.read_text(encoding="utf-8")
+                self.assertTrue(text.startswith("STATUS: BLOCKED\n"))
+                self.assertIn(f"BLOCKED: {why}\n", text)
+                self.c.jules_track(lanes)
+                self.assertEqual((self.c.jules.stopped, self.c.jules.released, len(finished)), ([], ["jules-abc"], 1))
+
+    def test_track_summary_error_never_stalls_the_pass(self):
+        lanes = self.lane()
+        self.c.jules.state = "failed"
+        self.c.jules.text = ValueError("boom")
+        self.c.jules_track(lanes)
+        self.assertEqual((lanes["JX"]["status"], lanes["JX"]["jules_why"]), ("MISSING", "jules failed: summary error ValueError"))
+        self.c.jules = FakeJules()
+        self.c.jules.state, self.c.jules.text = "failed", "x" * 500
+        lanes = self.lane()
+        self.c.jules_track(lanes)
+        self.assertEqual(len(lanes["JX"]["jules_why"]), 200)
+
+    def test_track_emits_jules_state_only_on_change(self):
+        lanes = self.lane()
+        for raw in (None, "QUEUED", "QUEUED", None, "IN_PROGRESS", "IN_PROGRESS"):
+            if raw is not None:
+                self.c.jules.raw["jules-abc"] = raw
+            self.c.jules_track(lanes)
+        states = [kw for kind, kw in self.events if kind == "jules_state"]
+        self.assertEqual(states, [{"lane": "JX", "old": None, "new": "QUEUED"},
+                                  {"lane": "JX", "old": "QUEUED", "new": "IN_PROGRESS"}])
+        self.assertEqual(lanes["JX"]["jules_state"], "IN_PROGRESS")
 
 
 if __name__ == "__main__":

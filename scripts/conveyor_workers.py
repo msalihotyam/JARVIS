@@ -36,6 +36,9 @@ JULES_LEDGER = "build/conveyor/jules/usage.json"
 JULES_RUNNING = ("QUEUED", "PLANNING", "IN_PROGRESS")
 JULES_WAITING = ("AWAITING_PLAN_APPROVAL", "AWAITING_USER_FEEDBACK", "PAUSED")  # nobody answers
 JULES_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+JULES_DIR = "build/conveyor/jules"  # <lane>.json: why a session stopped (JULESWAIT)
+JULES_WHY_MAX = 4096  # bytes of one summary file
+JULES_TEXT_MAX = 500  # chars of one summary field
 GITHUB_RE = re.compile(r"github\.com[:/]([\w.-]+)/([\w.-]+?)(?:\.git)?/?$")
 SHA40_RE = re.compile(r"[0-9a-f]{40}")
 CODEX_MIN_HEADROOM = 10  # % left in the tighter window; less (or unknown) = no dispatch
@@ -417,6 +420,34 @@ def _http(method, url, headers, body=None):
         return e.code, {}
 
 
+def _clip(v, n=JULES_TEXT_MAX):
+    """A Jules value as text of at most n chars; None stays None."""
+    if v is None:
+        return None
+    return (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str))[:n]
+
+
+def _activity(a):
+    """One Jules activity -> the few fields a human needs (each clipped)."""
+    def sub(k):
+        v = a.get(k)
+        return v if isinstance(v, dict) else {}
+    plan = sub("planGenerated").get("plan")
+    steps = plan.get("steps") if isinstance(plan, dict) else None
+    titles = [s.get("title") for s in steps if isinstance(s, dict)] if isinstance(steps, list) else []
+    fields = {
+        "time": a.get("createTime"),
+        "type": a.get("originator"),
+        "agent": sub("agentMessaged").get("agentMessage"),
+        "user": sub("userMessaged").get("userMessage"),
+        "plan": "; ".join(str(t) for t in titles if t) or None,
+        "progress": sub("progressUpdated").get("title") or sub("progressUpdated").get("description"),
+        "error": sub("sessionFailed").get("reason"),
+        "text": a.get("description"),
+    }
+    return {k: _clip(v) for k, v in fields.items() if v not in (None, "", {}, [])}
+
+
 def _git(argv):
     """(returncode, stdout); stderr is dropped so -z output stays clean."""
     p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
@@ -436,6 +467,7 @@ class JulesWorker:
         self.git = git or (lambda a: _git([*git_cmd, *a]))
         self.key_path = Path(key_path) if key_path else Path.home() / ".jarvis" / "jules.key"
         self.ledger = self.root / JULES_LEDGER
+        self.raw = {}  # sid -> last Jules state read (JULESWAIT state-change events)
         self.info = {}  # sid -> {"session", "base", "branch"}; the conveyor persists it in lanes.json
 
     def _key(self):
@@ -570,7 +602,8 @@ class JulesWorker:
         try:
             st = self._call("GET", f"sessions/{self._jid(sid)}").get("state")
         except RuntimeError:
-            return "unknown"
+            return "unknown"  # a read blip is not a state change: self.raw keeps the last one
+        self.raw[sid] = _clip(st, 64) if isinstance(st, str) and st else "none"
         if st in JULES_RUNNING:
             return "running"
         if st in JULES_WAITING:
@@ -587,6 +620,63 @@ class JulesWorker:
             return False
         self._done(sid)
         return True
+
+    def release(self, sid):
+        """A session left open (waiting) no longer counts as running for our cap."""
+        self._done(sid)
+
+    def why(self, sid, name):
+        """JULESWAIT: read the session and its newest activities (at most 10) and save a
+        sanitized summary to build/conveyor/jules/<name>.json (each text <= 500 chars, the
+        file <= 4 KB, never a header or the key) -> one short line. Never raises."""
+        out = {"lane": str(name)[:64], "sid": str(sid)[:140], "state": None, "activities": [], "errors": []}
+        try:
+            jid = self._jid(sid)
+        except RuntimeError as e:
+            out["errors"].append(str(e))
+            jid = None
+        key = self._key()
+
+        def scrub(v):  # never echo the key, even if Jules quoted it back; values only, before any clip
+            if isinstance(v, str):
+                return v.replace(key, "[key]") if key else v
+            if isinstance(v, dict):
+                return {k: scrub(x) for k, x in v.items()}
+            return [scrub(x) for x in v] if isinstance(v, list) else v
+
+        def get(path, field):
+            r = self._call("GET", path)
+            return scrub(r.get(field)) if isinstance(r, dict) else None
+        if jid:
+            try:
+                out["state"] = _clip(get(f"sessions/{jid}", "state"))
+            except Exception as e:  # a read error is recorded, never fatal
+                out["errors"].append(_clip(str(e)))
+            try:  # ponytail: one page of 100; the newest 10 of a longer session need paging
+                acts = get(f"sessions/{jid}/activities?pageSize=100", "activities")
+                acts = [a for a in acts if isinstance(a, dict)] if isinstance(acts, list) else []
+                acts.sort(key=lambda a: str(a.get("createTime") or ""), reverse=True)
+                out["activities"] = [_activity(a) for a in acts[:10]]
+            except Exception as e:
+                out["errors"].append(_clip(scrub(str(e))))
+        blob = json.dumps(out, ensure_ascii=False, indent=1)
+        while len(blob.encode("utf-8")) > JULES_WHY_MAX and out["activities"]:
+            out["activities"].pop()  # the oldest goes first
+            blob = json.dumps(out, ensure_ascii=False, indent=1)
+        texts = [t for a in out["activities"] for k, t in a.items() if k not in ("type", "time") and t]
+        line = " ".join(" ".join(str(x).split()) for x in [out["state"] or "", *texts[:1], *out["errors"][:1]] if x)
+        line = "".join(c for c in line if c.isprintable())  # one clean line for the BLOCKED report
+        try:
+            if not JULES_ID_RE.fullmatch(str(name)):
+                raise OSError("bad lane name")
+            f = self.root / JULES_DIR / f"{name}.json"
+            f.parent.mkdir(parents=True, exist_ok=True)
+            tmp = f.with_suffix(".tmp")
+            tmp.write_text(blob, encoding="utf-8")
+            os.replace(tmp, f)
+        except OSError as e:
+            line += f" (summary not saved: {type(e).__name__})"
+        return line[:200]
 
     def collect(self, sid, name, worktree, base, files, protected=lambda p: False):
         """Fetch the session's PR head, check base and files, fast-forward the lane
