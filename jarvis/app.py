@@ -3774,7 +3774,7 @@ def _turn_timing(turn: Mapping[str, Any], now: float) -> dict[str, Any]:
     # SPEEDBASE: the same marks as offsets from the turn's start, plus what was
     # asked and what the CLI reported. The connector writes the request to stdin
     # right after the spawn and before ``spawned`` is marked, so both read it.
-    timing["lane"] = "current"
+    timing["lane"] = call.get("lane", "current")
     for key, name in (("model", "model"), ("effort", "effort")):
         value = getattr(turn["model"], name, None)
         if isinstance(value, str):
@@ -4533,6 +4533,11 @@ class JarvisApp:
         streams = on_reply_preview is not None and hasattr(model, "stream_listener")
         if streams:
             model.stream_listener = on_reply_preview
+        # SPEEDWARM2: the conversation is the warm-session lane for this turn
+        # only; the adapter ignores it while ``warm_claude`` is off.
+        warm = hasattr(model, "warm_lane")
+        if warm:
+            model.warm_lane = conversation_id
         try:
             result = model.complete(intent_task, SessionState(objective=text))
         except Exception as exc:  # noqa: BLE001 - adapter boundary; type only
@@ -4544,6 +4549,8 @@ class JarvisApp:
         finally:
             if streams:
                 model.stream_listener = None
+            if warm:
+                model.warm_lane = None
         turn["returned"] = time.monotonic()
         cancelled = request_id in self._cancelled_text
         self._cancelled_text.discard(request_id)

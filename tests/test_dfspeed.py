@@ -166,6 +166,91 @@ class TurnTimingTests(IntentTestCase):
                          (payload["intent"]["status"], payload["intent"]["usage"]["timing"]))
 
 
+class WarmLaneWiringTests(IntentTestCase):
+    """SPEEDWARM2D: the chat turn names its conversation as the adapter's warm lane
+    for the call only, and the timing records the lane the adapter reported."""
+
+    def test_the_timing_records_the_lane_the_adapter_marked(self) -> None:
+        marks = {"started": 0.1, "spawned": 0.5, "lane": "warm"}
+        with app_clock(0.0, 0.05, 2.5, 2.6, 2.7):
+            timing = self.build(MarkedModel(marks, proposal(kind="chat", reply=REPLY))).submit_text(
+                "Selam").payload["intent"]["usage"]["timing"]
+        self.assertEqual("warm", timing["lane"])
+
+    def lane_model(self, *answers, **kwargs):
+        model = ScriptedModel(*answers, **kwargs)
+        model.warm_lane, model.seen = None, []
+        previous = model.on_complete
+        model.on_complete = lambda task: (model.seen.append(model.warm_lane), previous and previous(task))
+        return model
+
+    def test_the_lane_is_the_conversation_during_the_call_and_cleared_after_success(self) -> None:
+        conversation = self.memory.create_conversation()
+        model = self.lane_model(proposal(kind="chat", reply=REPLY))
+        payload = self.build(model).submit_text("Selam", conversation_id=conversation.id).payload
+        self.assertEqual("conversation", payload["intent"]["status"])
+        self.assertEqual(([conversation.id], None), (model.seen, model.warm_lane))
+
+    def test_the_lane_is_cleared_after_a_failed_and_a_raising_call(self) -> None:
+        conversation = self.memory.create_conversation()
+        failing = self.lane_model(error=StructuredError(code=ErrorCode.CONNECTOR_FAILED, message="boom"))
+        payload = self.build(failing).submit_text("Selam", conversation_id=conversation.id).payload
+        self.assertEqual(("model_failed", [conversation.id], None),
+                         (payload["intent"]["status"], failing.seen, failing.warm_lane))
+        raising = self.lane_model()
+        record = raising.on_complete
+        raising.on_complete = lambda task: (record(task), (_ for _ in ()).throw(RuntimeError("x")))
+        payload = self.build(raising).submit_text("Selam", conversation_id=conversation.id).payload
+        self.assertEqual(("model_failed", [conversation.id], None),
+                         (payload["intent"]["status"], raising.seen, raising.warm_lane))
+
+    def test_the_lane_is_cleared_after_a_cancelled_call(self) -> None:
+        conversation = self.memory.create_conversation()
+        model = self.lane_model(proposal(kind="chat", reply=REPLY))
+        app = self.build(model)
+        inner = model.on_complete
+        model.on_complete = lambda task: (inner(task), app.cancel_text(task.id))
+        payload = app.submit_text("Selam", conversation_id=conversation.id, request_id="r-cancel").payload
+        self.assertEqual("model_cancelled", payload["intent"]["status"])
+        self.assertEqual((["r-cancel"], [conversation.id], None), (model.cancelled, model.seen, model.warm_lane))
+
+    def test_a_model_without_a_warm_lane_is_left_alone(self) -> None:
+        model = ScriptedModel(proposal(kind="chat", reply=REPLY))
+        self.build(model).submit_text("Selam", conversation_id=self.memory.create_conversation().id)
+        self.assertFalse(hasattr(model, "warm_lane"))
+
+    def test_flag_off_the_real_adapter_spawns_the_same_argv_with_or_without_a_lane(self) -> None:
+        """warm_claude off (the default): the lane is set for the call, yet the adapter
+        takes the one-shot path - same argv, no warm session kept."""
+        adapter = ClaudeIntentAdapter(allowed_roots=(Path.cwd(),), default_working_directory=Path.cwd())
+        self.assertFalse(adapter.warm_claude)
+        answer = json.dumps({"kind": "chat", "reply": REPLY})
+        spawned = []
+
+        def popen(argv, *args, **kwargs):
+            spawned.append((list(argv), adapter.warm_lane))
+            return FakeCliProcess([stream_line(answer[:20]), stream_line(answer[20:]), json.dumps(
+                {"type": "result", "result": answer, "usage": {"output_tokens": 12}}) + "\n"])
+
+        tick = itertools.count(100.0, 0.5)
+        app = self.build(adapter)
+        conversation = self.memory.create_conversation()
+        with patch.object(ClaudeCodeConnector, "_auth_status", return_value=LOGGED_IN), \
+                patch.object(ClaudeCodeConnector, "prohibited_billing_env_vars", return_value=()), \
+                patch.object(ClaudeCodeConnector, "_argv0", return_value="claude"), \
+                patch("jarvis.connectors.claude_code.subprocess.Popen", side_effect=popen), \
+                patch("time.monotonic", side_effect=lambda: next(tick)):
+            plain = app.submit_text("Selam", on_reply_preview=[].append).payload
+            laned = app.submit_text("Selam", conversation_id=conversation.id, on_reply_preview=[].append).payload
+        self.assertEqual(["conversation", "conversation"], [plain["intent"]["status"], laned["intent"]["status"]],
+                         (plain.get("error"), spawned))
+        (plain_argv, plain_lane), (laned_argv, laned_lane) = spawned
+        self.assertEqual((None, conversation.id), (plain_lane, laned_lane))
+        self.assertEqual(plain_argv, laned_argv)
+        self.assertEqual(({}, None), (adapter._warm, adapter.warm_lane))
+        self.assertEqual("current", laned["intent"]["usage"]["timing"]["lane"])
+
+
 class SpeedBaselineScriptTests(unittest.TestCase):
     def test_the_script_refuses_the_live_data_dir(self) -> None:
         import importlib.util
