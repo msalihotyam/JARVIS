@@ -24,6 +24,7 @@ document. It never executes, persists or approves anything.
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import re
 import subprocess
@@ -1312,6 +1313,87 @@ def cache_ordered_json(payload: dict[str, Any]) -> str:
 
 
 
+#: A warm lane idle this long is killed; its next turn respawns with the window.
+WARM_IDLE_SECONDS = 600.0
+#: A warm lane whose cumulative cost reaches this share of ``--max-budget-usd``
+#: (a whole-process cap in the CLI) is recycled before the CLI would stop it.
+WARM_LANE_CAP_FRACTION = 0.8
+WARM_INIT_ID = "jarvis-init"
+#: Registered once per warm process: every tool use asks JARVIS (deny unless
+#: granted) and every turn proves the hooks still run (UserPromptSubmit).
+WARM_HOOKS = {
+    "PreToolUse": [{"matcher": None, "hookCallbackIds": ["jarvis-deny"]}],
+    "UserPromptSubmit": [{"matcher": None, "hookCallbackIds": ["jarvis-proof"]}],
+}
+WARM_NO_TOOL = "JARVIS grants no tool on this turn."
+
+
+@dataclass
+class WarmClaudeSession:
+    """One long-lived Claude Code process for one conversation lane (opt-in).
+
+    ``cost`` is the CLI's last cumulative ``total_cost_usd``, so a turn is
+    charged only its delta; ``digests`` hold the sha256 of every exact stdin
+    line the process received."""
+
+    process: Any
+    command: list[str]
+    last_used: float
+    cost: float = 0.0
+    digests: list[str] = field(default_factory=list)
+    proven: bool = False
+
+
+class _WarmRefusal(Exception):
+    """The warm process drifted from the hardened setup it was attested with."""
+
+
+class _WarmTurn:
+    """One turn of a warm process, shaped like a finished process for the
+    reply reader: ``stdout`` ends at the turn's result, control lines removed."""
+
+    def __init__(self, process: Any, lines: Any) -> None:
+        self.args, self.stdout, self.stderr, self._process = process.args, lines, self, process
+
+    def kill(self) -> None:
+        self._process.kill()
+
+    def wait(self, timeout: float | None = None) -> int:
+        return 0
+
+    def read(self) -> str:
+        return ""                           # stderr is not kept for a warm process
+
+    def communicate(self, timeout: float | None = None) -> tuple[str, str]:
+        return "".join(self.stdout), ""
+
+
+def _json_object(line: str) -> dict[str, Any]:
+    try:
+        value = json.loads(line)
+    except ValueError:
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _warm_drift(command: list[str], granted: set[str], init: dict[str, Any]) -> str:
+    """What in a ``system/init`` event differs from the hardened argv, or ''."""
+    if init.get("apiKeySource") != "none":
+        return "credential source"
+    tools = init.get("tools")
+    if not isinstance(tools, list) or not set(tools) <= granted:
+        return "tools"
+    if init.get("mcp_servers") != []:
+        return "MCP servers"
+    if init.get("permissionMode") != "plan":
+        return "permission mode"
+    # ponytail: the CLI may report a resolved id (alias -> dated id); a substring
+    # match until part B records the real form.
+    if "--model" in command and command[command.index("--model") + 1] not in str(init.get("model", "")):
+        return "model"
+    return ""
+
+
 class ClaudeIntentAdapter(ClaudeCodeConnector):
     """The ONE understanding model call, over the existing hardened CLI seam.
 
@@ -1375,6 +1457,16 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         #: streamed characters. Measured only; nothing reads them to decide anything.
         self.timings: dict[str, dict[str, Any]] = {}
         self._marks: dict[str, Any] | None = None
+        #: Settings ``warm_claude`` (default off = one process per turn,
+        #: unchanged). ``warm_lane`` is the conversation of the next call; the
+        #: caller sets it per turn, and ``None`` also keeps the per-turn path.
+        # ponytail: one adapter call at a time (the chat path is serial) and no
+        # close on app exit (the OS reaps the children); lock + atexit if either changes.
+        self.warm_claude = False
+        self.warm_lane: str | None = None
+        self._clock = time.monotonic
+        self._warm: dict[str, WarmClaudeSession] = {}
+        self._warm_dropped = False
 
     def complete(self, task: Task, session: SessionState) -> ToolResult:
         return self.execute(task, session)
@@ -1579,17 +1671,220 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         # JARVIS's own snapshot paths are a local file handle, not model context:
         # they never reach the payload, and only these files are ever attached.
         self._images = [(str(a), str(b), str(c)) for a, b, c in (context.pop("attachment_files", None) or [])]
+        self._catalog_text, catalog_redactions = "", None
+        if isinstance(catalog, dict):
+            stable, catalog_redactions = self._redact({k: v for k, v in catalog.items() if k != "local_time"})
+            self._catalog_text = json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        # A live warm process for this lane already holds the window, so turns
+        # 2+ send only the new request. The catalog is argv: a changed one is a
+        # new process, which gets the full window again.
+        self._warm_dropped = self._warm_alive()
+        if self._warm_dropped:
+            context.pop("conversation", None)
         payload, redactions = self._redact({"request": task.objective, "context": context})
         instruction, more = self._project_instruction(task)
         if instruction is not None:
             payload[PROJECT_INSTRUCTION_KEY] = instruction
             redactions += more
-        self._catalog_text = ""
-        if isinstance(catalog, dict):
-            stable, more = self._redact({k: v for k, v in catalog.items() if k != "local_time"})
-            self._catalog_text = json.dumps(stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-            redactions += more
+        if catalog_redactions is not None:
+            redactions += catalog_redactions
         return payload, redactions
+
+    def _warm_alive(self) -> bool:
+        if not self.warm_claude or self.warm_lane is None:
+            return False
+        session = self._warm.get(self.warm_lane)
+        return (
+            session is not None
+            and session.process.poll() is None
+            and self._clock() - session.last_used <= WARM_IDLE_SECONDS
+            and session.command[1:] == self._command("")[1:]
+        )
+
+    def _drop_warm(self, lane: str) -> None:
+        session = self._warm.pop(lane, None)
+        if session is not None and session.process.poll() is None:
+            session.process.kill()
+
+    @staticmethod
+    def _warm_write(session: WarmClaudeSession, message: str | dict[str, Any]) -> None:
+        text = message if isinstance(message, str) else json.dumps(message, separators=(",", ":")) + "\n"
+        try:
+            session.process.stdin.write(text)
+            session.process.stdin.flush()
+        except (OSError, ValueError):
+            pass                            # the process is gone: its output ends and the turn fails
+
+    def _run_process(
+        self,
+        task: Task,
+        command: list[str],
+        working_directory: str,
+        stdin_text: str | None,
+        billing_class: Any,
+        evidence: str,
+    ) -> ToolResult | tuple[int, str, str]:
+        if not self.warm_claude or self.warm_lane is None or stdin_text is None:
+            return super()._run_process(task, command, working_directory, stdin_text, billing_class, evidence)
+        lane, reuse = self.warm_lane, self._warm_dropped
+        self._warm_dropped = False
+        now = self._clock()
+        for idle in [key for key, s in self._warm.items() if key != lane and now - s.last_used > WARM_IDLE_SECONDS]:
+            self._drop_warm(idle)       # ponytail: reaped on the next call, not by a timer
+
+        def refuse(code: ErrorCode, message: str, *, retryable: bool = False, call_count: int = 1) -> ToolResult:
+            self._drop_warm(lane)
+            return self._error_result(
+                task, code, message, retryable=retryable,
+                billing_class=billing_class, billing_evidence=evidence, call_count=call_count,
+            )
+
+        session = self._warm.get(lane)
+        if reuse and (session is None or session.process.poll() is not None or session.command[1:] != command[1:]):
+            # The window was left out for a process that is gone: never send a
+            # turn without it. The next turn respawns and sends the full window.
+            return refuse(ErrorCode.CONNECTOR_FAILED, "The warm Claude Code session ended; nothing was sent.",
+                          retryable=True, call_count=0)
+        with self._process_lock:
+            if task.id in self._cancelled:
+                self._cancelled.discard(task.id)
+                return self._error_result(
+                    task, ErrorCode.CANCELLED, "The call was cancelled before Claude Code started; nothing was sent.",
+                    retryable=False, billing_class=billing_class, billing_evidence=evidence,
+                )
+            if not reuse:
+                self._drop_warm(lane)
+                try:
+                    process = subprocess.Popen(
+                        command,
+                        cwd=working_directory,
+                        stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL,   # a long-lived pipe nobody drains would block the CLI
+                        text=True,
+                        encoding="utf-8",
+                        errors="replace",
+                        shell=False,
+                        env=self._sanitized_environment(),
+                        creationflags=NO_CONSOLE_WINDOW,
+                    )
+                except FileNotFoundError:
+                    self.forget_billing_route()
+                    return self._error_result(
+                        task, ErrorCode.CONNECTOR_UNAVAILABLE, "Claude Code CLI is not installed or is not on PATH.",
+                        retryable=True, billing_class=billing_class, billing_evidence=evidence,
+                    )
+                session = self._warm[lane] = WarmClaudeSession(process, list(command), now)
+            self._processes[task.id] = session.process
+        timed_out = threading.Event()
+
+        def expire() -> None:
+            timed_out.set()
+            session.process.kill()
+
+        timer = threading.Timer(self.timeout_seconds, expire)
+        timer.start()
+        granted = {name for name in command[command.index("--tools") + 1].split(",") if name}
+        state: dict[str, Any] = {}
+        try:
+            if not reuse and not self._warm_initialize(session):
+                if timed_out.is_set():
+                    return refuse(ErrorCode.CONNECTOR_FAILED, TIMEOUT_MESSAGE, retryable=True)
+                return refuse(ErrorCode.EGRESS_REFUSED,
+                              "Claude Code did not accept JARVIS's hooks; nothing was sent.", call_count=0)
+            digest = hashlib.sha256(stdin_text.encode("utf-8")).hexdigest()
+            session.digests.append(digest)
+            session.proven = False
+            if self._marks is not None:
+                self._marks.update(warm="reuse" if reuse else "spawn", stdin_sha256=digest)
+            self._warm_write(session, stdin_text)
+            stdout, _ = self._collect_output(_WarmTurn(session.process, self._warm_lines(session, granted, state)))
+        except _WarmRefusal as drift:
+            return refuse(ErrorCode.EGRESS_REFUSED,
+                          f"Claude Code's session drifted from JARVIS's hardened setup ({drift}); the call was refused.")
+        except subprocess.TimeoutExpired:
+            timed_out.set()
+        finally:
+            timer.cancel()
+            with self._process_lock:
+                self._processes.pop(task.id, None)
+                self._cancelled.discard(task.id)
+        if timed_out.is_set():
+            return refuse(ErrorCode.CONNECTOR_FAILED, TIMEOUT_MESSAGE, retryable=True)
+        result = state.get("result")
+        if result is None:                  # crashed, killed or cancelled: the next turn respawns
+            self._drop_warm(lane)
+            return 1, stdout, ""
+        if granted and not session.proven:
+            return refuse(ErrorCode.EGRESS_REFUSED, "Claude Code's hooks did not run for this turn; the call was refused.")
+        if state["delta"] > self.max_budget_usd:
+            self._warm_write(session, {"type": "control_request", "request_id": "jarvis-stop",
+                                       "request": {"subtype": "interrupt"}})
+            return refuse(ErrorCode.CONNECTOR_FAILED, "The turn went over its budget; the session was stopped.")
+        if result.get("is_error") or session.cost >= WARM_LANE_CAP_FRACTION * self.max_budget_usd:
+            self._drop_warm(lane)           # an error (execute forgets the route) or a lane near its cap
+        else:
+            session.last_used = self._clock()
+        return 0, stdout, ""
+
+    def _warm_initialize(self, session: WarmClaudeSession) -> bool:
+        self._warm_write(session, {"type": "control_request", "request_id": WARM_INIT_ID,
+                                   "request": {"subtype": "initialize", "hooks": WARM_HOOKS}})
+        for line in iter(session.process.stdout.readline, ""):
+            event = _json_object(line)
+            response = event.get("response") or {}
+            if event.get("type") == "control_response" and response.get("request_id") == WARM_INIT_ID:
+                return response.get("subtype") == "success"
+        return False
+
+    def _warm_lines(self, session: WarmClaudeSession, granted: set[str], state: dict[str, Any]) -> Any:
+        """The turn's output lines up to its result. Control requests are
+        answered here and never reach the reply; ``system/init`` is attested."""
+        for line in iter(session.process.stdout.readline, ""):
+            event = _json_object(line)
+            kind = event.get("type")
+            if kind == "control_request":
+                self._warm_answer(session, granted, event)
+                continue
+            if kind == "control_response":
+                continue
+            if kind == "system" and event.get("subtype") == "init":
+                drift = _warm_drift(session.command, granted, event)
+                if drift:
+                    raise _WarmRefusal(drift)
+            if kind == "result":
+                total = event.get("total_cost_usd", session.cost)
+                if not isinstance(total, (int, float)):
+                    total = float("inf")    # an unreadable cost is an overflow
+                state["delta"], session.cost = max(total - session.cost, 0.0), total
+                # The CLI reports the lane's running total; the turn is billed its share.
+                event["total_cost_usd"] = state["delta"]
+                state["result"] = event
+                yield json.dumps(event, ensure_ascii=False) + "\n"
+                return
+            yield line
+
+    def _warm_answer(self, session: WarmClaudeSession, granted: set[str], event: dict[str, Any]) -> None:
+        request = event.get("request") or {}
+        subtype, callback = request.get("subtype"), request.get("callback_id")
+        if subtype == "hook_callback" and callback == "jarvis-proof":
+            session.proven = True
+            body: dict[str, Any] = {"continue": True}
+        elif subtype == "hook_callback" and callback == "jarvis-deny":
+            tool = (request.get("input") or {}).get("tool_name")
+            body = {} if tool in granted else {"hookSpecificOutput": {
+                "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": WARM_NO_TOOL,
+            }}
+        elif subtype == "can_use_tool":
+            body = {"behavior": "deny", "message": WARM_NO_TOOL}
+        else:
+            self._warm_write(session, {"type": "control_response", "response": {
+                "subtype": "error", "request_id": event.get("request_id"), "error": "JARVIS does not answer this request.",
+            }})
+            return
+        self._warm_write(session, {"type": "control_response", "response": {
+            "subtype": "success", "request_id": event.get("request_id"), "response": body,
+        }})
 
     @staticmethod
     def _encode_payload(payload: dict[str, Any]) -> str:
