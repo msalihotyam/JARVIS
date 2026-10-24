@@ -735,72 +735,10 @@ class ClaudeCodeConnector(BaseConnector):
         # What the CLI reads on stdin, when the call does not carry its prompt
         # in argv (see ``_stdin_payload``). ``None`` keeps today's argv-only call.
         stdin_text = self._stdin_payload(prompt)
-        # Spawn and registration share the lock with ``cancel``: a cancel either
-        # finds the process or lands first and the CLI is never started.
-        with self._process_lock:
-            if task.id in self._cancelled:
-                self._cancelled.discard(task.id)
-                return self._error_result(
-                    task,
-                    ErrorCode.CANCELLED,
-                    "The call was cancelled before Claude Code started; nothing was sent.",
-                    retryable=False,
-                    billing_class=billing_class,
-                    billing_evidence=evidence,
-                )
-            try:
-                process = subprocess.Popen(
-                    command,
-                    cwd=working_directory,
-                    stdin=subprocess.PIPE if stdin_text is not None else None,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                    shell=False,
-                    # Defense in depth: metered credential routes are stripped
-                    # from the external model subprocess environment.
-                    env=self._sanitized_environment(),
-                    creationflags=NO_CONSOLE_WINDOW,
-                )
-            except FileNotFoundError:
-                self.forget_billing_route()
-                return self._error_result(
-                    task,
-                    ErrorCode.CONNECTOR_UNAVAILABLE,
-                    "Claude Code CLI is not installed or is not on PATH.",
-                    retryable=True,
-                    billing_class=billing_class,
-                    billing_evidence=evidence,
-                )
-            self._processes[task.id] = process
-        if stdin_text is not None:
-            try:
-                process.stdin.write(stdin_text)
-                process.stdin.close()
-            except OSError:
-                pass            # the CLI exited already; the outcome below is read from its output
-        try:
-            stdout, stderr = self._collect_output(process)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.communicate()
-            return self._error_result(
-                task,
-                ErrorCode.CONNECTOR_FAILED,
-                TIMEOUT_MESSAGE,
-                retryable=True,
-                billing_class=billing_class,
-                billing_evidence=evidence,
-                call_count=1,
-            )
-        finally:
-            with self._process_lock:
-                self._processes.pop(task.id, None)
-                # ponytail: a cancel after this pop (or before an early refusal)
-                # leaves one uuid in _cancelled; ids are never reused, so no false refusal.
-                self._cancelled.discard(task.id)
+        ran = self._run_process(task, command, working_directory, stdin_text, billing_class, evidence)
+        if isinstance(ran, ToolResult):
+            return ran
+        returncode, stdout, stderr = ran
 
         if task.cancellation_requested:
             return ToolResult(
@@ -872,7 +810,7 @@ class ClaudeCodeConnector(BaseConnector):
         # pipeline bounds it anyway.
         raw_result = payload.get("result")
         result_text = str(raw_result or "").strip()
-        failed = process.returncode != 0 or bool(payload.get("is_error"))
+        failed = returncode != 0 or bool(payload.get("is_error"))
         # Provider metadata is untrusted text on the ``is_error`` path it
         # persists through (``StructuredError.details``): each string field
         # passes the one shared rule and an invalid value becomes ``None``,
@@ -987,6 +925,89 @@ class ClaudeCodeConnector(BaseConnector):
             method="model_answer_integrity",
             evidence=tuple(evidence),
         )
+
+    def _run_process(
+        self,
+        task: Task,
+        command: list[str],
+        working_directory: str,
+        stdin_text: str | None,
+        billing_class: BillingClass,
+        evidence: str,
+    ) -> ToolResult | tuple[int, str, str]:
+        """Start the CLI for one call and return ``(returncode, stdout, stderr)``,
+        or the finished error result when it could not run.
+
+        ``command`` is the complete, provenance-checked argv and ``stdin_text``
+        the exact bytes for its stdin; an override may deliver them another
+        way (a long-lived process) but never changes either."""
+        # Spawn and registration share the lock with ``cancel``: a cancel
+        # either finds the process or lands first and the CLI is never started.
+        with self._process_lock:
+            if task.id in self._cancelled:
+                self._cancelled.discard(task.id)
+                return self._error_result(
+                    task,
+                    ErrorCode.CANCELLED,
+                    "The call was cancelled before Claude Code started; nothing was sent.",
+                    retryable=False,
+                    billing_class=billing_class,
+                    billing_evidence=evidence,
+                )
+            try:
+                process = subprocess.Popen(
+                    command,
+                    cwd=working_directory,
+                    stdin=subprocess.PIPE if stdin_text is not None else None,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                    shell=False,
+                    # Defense in depth: metered credential routes are stripped
+                    # from the external model subprocess environment.
+                    env=self._sanitized_environment(),
+                    creationflags=NO_CONSOLE_WINDOW,
+                )
+            except FileNotFoundError:
+                self.forget_billing_route()
+                return self._error_result(
+                    task,
+                    ErrorCode.CONNECTOR_UNAVAILABLE,
+                    "Claude Code CLI is not installed or is not on PATH.",
+                    retryable=True,
+                    billing_class=billing_class,
+                    billing_evidence=evidence,
+                )
+            self._processes[task.id] = process
+        if stdin_text is not None:
+            try:
+                process.stdin.write(stdin_text)
+                process.stdin.close()
+            except OSError:
+                pass            # the CLI exited already; the outcome below is read from its output
+        try:
+            stdout, stderr = self._collect_output(process)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+            return self._error_result(
+                task,
+                ErrorCode.CONNECTOR_FAILED,
+                TIMEOUT_MESSAGE,
+                retryable=True,
+                billing_class=billing_class,
+                billing_evidence=evidence,
+                call_count=1,
+            )
+        finally:
+            with self._process_lock:
+                self._processes.pop(task.id, None)
+                # ponytail: a cancel after this pop (or before an early refusal)
+                # leaves one uuid in _cancelled; ids are never reused, so no false refusal.
+                self._cancelled.discard(task.id)
+        return process.returncode, stdout, stderr
 
     def _stdin_payload(self, prompt: str) -> str | None:
         """Text to write to the CLI's stdin, or ``None`` when the prompt travels
