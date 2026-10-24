@@ -1255,6 +1255,29 @@ class Conveyor:
             if ln.get("finished") and ln.get("status") and ln["status"] not in ("DEAD", "MISSING"):
                 continue
             ln["updated_at"] = iso(self.now())
+            att = getattr(self.codex, "attach", None)
+            if (not ln.get("finished") and att and ln.get("codex")
+                    and self.codex.status(ln["id"]) == "unknown"):  # a conveyor restart: re-attach
+                found = None
+                if att(name, ln["id"], ln["codex"]) == "unverified":  # its report first: no kill on a guess
+                    found = self.find_report(name, ln.get("report_since") or self.started_ts(ln),
+                                             ln.get("worktree"))
+                    found = found if found and found[1] != INTERIM else "stop"
+                if found == "stop":
+                    self.codex.stop(ln["id"])  # fail closed: stop it, then prove it is gone
+                    pid = ln["codex"].get("pid")
+                    if att(name, ln["id"], ln["codex"]) != "gone":  # held: slot, attention, retried
+                        why = f"codex pid {pid} not verifiable after restart and not provably stopped"
+                        if ln.get("codex_unverified") != why:
+                            self.event("codex_unverified", lane=name, id=ln["id"], reason=why)
+                        ln.update(state="unverified", status="MISSING", codex_unverified=why)
+                        ln.setdefault("finished_ts", self.now())
+                        continue
+                    why = f"codex pid {pid} not verifiable after restart, stopped"
+                    ln.update(state="stopped", finished=True, status="MISSING", finished_ts=self.now(),
+                              codex_unverified=why)
+                    self.event("codex_unverified", lane=name, id=ln["id"], reason=why)
+                    continue
             if not ln.get("finished") and self.codex.status(ln["id"]) == "running":
                 why = self.codex.violation(name)
                 if why:  # limit reached or credits mid-run: stop it, credits are never spent
@@ -1277,6 +1300,8 @@ class Conveyor:
                 ln["state"] = "working"
                 continue
             ln.update(state=st, finished=True, status="MISSING", finished_ts=self.now())
+            if st == "unknown" and not ln.get("codex"):  # nothing persisted to verify or stop it by
+                ln["codex_unverified"] = f"no persisted pid/start time for {ln['id']}: check for a stray codex"
             self.event("finish", lane=name, id=ln["id"], state=st, status="MISSING")
 
     def track(self, lanes, agents):
@@ -2365,6 +2390,9 @@ class Conveyor:
             dest.write_text(text, encoding="utf-8")
             self.record(lanes, name, sid, s["model"], s["effort"], base, dest,
                         files=s.get("files", []), slice_=True, worker="codex" if codex else None)
+            if codex:  # H4: pid + creation time + log survive a conveyor restart
+                lanes[name]["codex"] = getattr(self.codex, "info", {}).get(sid)
+                self.save_lanes(lanes)
             busy.add(name)
             started = True
             self.event("dispatch", lane=name, id=sid, model=s["model"], effort=s["effort"],
@@ -2419,7 +2447,7 @@ class Conveyor:
             elif ln.get("status") in BAD or ln.get("status") in ("STUCK", "MISSING"):
                 why.append(f"STATUS {ln['status']}")
                 for k, lead in (("ci_why", ""), ("resume_refused", "resume in place refused: "),
-                                ("interim_timeout", "")):
+                                ("interim_timeout", ""), ("codex_unverified", "")):
                     if ln.get(k):
                         why.append(lead + ln[k])
             elif ln.get("status") not in GOOD | {CI_PENDING}:  # CONVFIX61: unknown status pages (fail-closed)
@@ -3437,7 +3465,6 @@ class Conveyor:
                 return
             c = ln.get("cleanup") or {}
             if (not ln.get("finished") or "preserved" in ln or name in attention_ids
-                    or ln.get("worker") == "codex"  # no claude session; worktree kept for the orchestrator
                     or (c and self.now() < c.get("retry_ts", float("inf")))):
                 continue
             self.beat()  # each removal is several slow CLI calls
@@ -3447,6 +3474,18 @@ class Conveyor:
                 continue
             t = self.collected_ts(ln)
             if t is None or self.now() - t < CLEANUP_S:
+                continue
+            if ln.get("worker") == "codex":  # no claude session: only its worktree, same proof
+                if self.codex.status(ln["id"]) == "running":
+                    continue
+                kept = self.unintegrated({"cwd": ln.get("worktree")}, name)
+                if kept:
+                    self.preserve(ln, name, *kept)
+                    continue
+                ln["cleanup"] = {"at": iso(self.now()), "result": "removed", "ids": []}
+                self.event("cleanup", lane=name, result="removed", steps=[])
+                done += 1
+                self.worktree_step(name, ln)
                 continue
             ids = ln.get("prev_ids", []) + [ln["id"]]
             # SESSIONSWEEP: a stopped prev copy is this lane's own replaced session, not a doubt

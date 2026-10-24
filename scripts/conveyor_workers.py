@@ -13,6 +13,7 @@ app-server account/limits read).
 """
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -78,8 +79,14 @@ def route_var(key):
 
 
 def scrubbed_env(environ=None):
-    """A copy of the environment without any route variable, for the codex child."""
-    return {k: v for k, v in (os.environ if environ is None else environ).items() if not route_var(k)}
+    """The codex child's environment as an ALLOWLIST (WORKERADAPT2 H5), mirroring
+    jarvis/codex.py _environment(): trusted_environment() with CODEX_ALLOWED_ENV_VARS /
+    _PREFIXES (sanitized PATH), then no route variable. An import failure raises: no start."""
+    jc = _jarvis_codex()
+    from jarvis.trusted_exec import trusted_environment
+    env = trusted_environment(allow=jc.CODEX_ALLOWED_ENV_VARS, prefixes=jc.CODEX_ALLOWED_ENV_PREFIXES,
+                              environ=os.environ if environ is None else environ)
+    return {k: v for k, v in env.items() if not route_var(k)}
 
 
 def headroom(rl):
@@ -97,31 +104,35 @@ def headroom(rl):
     return 100 - max(used) if used else None
 
 
+# The only keys _limit_hit descends into: codex's event / rate_limits structures. An "item"
+# (tool call, command output, agent message) is never read (WORKERADAPT2 H6).
+_LIMIT_PATH = ("rate_limits", "rateLimits", "primary", "secondary", "credits", "msg", "payload", "info")
+
+
 def _limit_hit(obj, top=True):
     """Why one --json event says the run hit its limit or reached credits, else None.
-    Only codex's own fields and error events count, never the agent's message text."""
-    if isinstance(obj, dict):
-        if top and obj.get("type") in ("error", "turn.failed"):
-            text = json.dumps(obj).lower()
-            if "credit" in text:
-                return "credits"
-            if any(w in text for w in ("usage_limit", "usage limit", "rate limit", "rate_limit", "429",
-                                       "quota", "billing")):
-                return "limit_reached"
-        for k, v in obj.items():
-            if k in ("rate_limit_reached_type", "rateLimitReachedType") and v is not None:
-                return "limit_reached"
-            if k in ("has_credits", "hasCredits") and v is True:
-                return "credits"
-            if k in ("used_percent", "usedPercent") and not isinstance(v, bool) \
-                    and isinstance(v, (int, float)) and v >= 100:
-                return "limit_reached"
-        obj = list(obj.values())
-    if isinstance(obj, list):
-        for v in obj:
-            why = _limit_hit(v, False)
-            if why:
-                return why
+    Only codex's own error text and rate_limits fields count, never a tool payload."""
+    if not isinstance(obj, dict):
+        return None
+    if top and obj.get("type") in ("error", "turn.failed"):
+        text = json.dumps([obj.get("message"), obj.get("error")]).lower()
+        if "credit" in text:
+            return "credits"
+        if any(w in text for w in ("usage_limit", "usage limit", "rate limit", "rate_limit", "429",
+                                   "quota", "billing")):
+            return "limit_reached"
+    for k, v in obj.items():
+        if k in ("rate_limit_reached_type", "rateLimitReachedType") and v is not None:
+            return "limit_reached"
+        if k in ("has_credits", "hasCredits") and v is True:
+            return "credits"
+        if k in ("used_percent", "usedPercent") and not isinstance(v, bool) \
+                and isinstance(v, (int, float)) and v >= 100:
+            return "limit_reached"
+    for k in _LIMIT_PATH:
+        why = _limit_hit(obj.get(k), False)
+        if why:
+            return why
     return None
 
 
@@ -144,12 +155,46 @@ def _codex_exe():
     return _jarvis_codex().codex_executable()
 
 
+def _proc_start(pid):
+    """The creation time (FILETIME ticks) of a LIVE process, None when no such process is
+    running; raises when it cannot be told (access denied, not Windows)."""
+    if os.name != "nt":
+        raise OSError("process start time is read on Windows only")
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.OpenProcess.argtypes = (wintypes.DWORD, wintypes.BOOL, wintypes.DWORD)
+    k32.OpenProcess.restype = wintypes.HANDLE
+    k32.GetExitCodeProcess.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    k32.GetProcessTimes.argtypes = (wintypes.HANDLE,) + (ctypes.POINTER(wintypes.FILETIME),) * 4
+    k32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    h = k32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+    if not h:
+        if ctypes.get_last_error() == 87:  # ERROR_INVALID_PARAMETER: no such pid
+            return None
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        code = wintypes.DWORD()
+        if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        if code.value != 259:  # STILL_ACTIVE
+            return None
+        t = [wintypes.FILETIME() for _ in range(4)]
+        if not k32.GetProcessTimes(h, *(ctypes.byref(x) for x in t)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        return (t[0].dwHighDateTime << 32) | t[0].dwLowDateTime
+    finally:
+        k32.CloseHandle(h)
+
+
 class CodexWorker:
     """`codex exec` lanes. Session ids are "codex-<pid>"; the Popen handles live in this
-    process only, so after a conveyor restart a session's status is "unknown"."""
+    process only. start() leaves pid + creation time + log in `info` for the conveyor to
+    persist; after a restart attach() re-attaches a session only when the pid is alive with
+    the same creation time (WORKERADAPT2 H4)."""
 
     def __init__(self, root, exe=None, popen=subprocess.Popen, now=time.time, reader=_codex_state,
-                 environ=None, run=subprocess.run):
+                 environ=None, run=subprocess.run, proc_start=_proc_start):
         self.root = Path(root)
         self.exe = exe
         self.popen = popen
@@ -157,8 +202,11 @@ class CodexWorker:
         self.now = now
         self.reader = reader
         self.environ = environ  # None = os.environ at start(), scrubbed
+        self.proc_start = proc_start
         self.log_dir = self.root / CODEX_LOG_DIR
         self.procs = {}
+        self.info = {}  # sid -> {pid, start, log, offset}: what lanes.json keeps
+        self.attached = {}  # sid -> (pid, start or None) re-attached after a restart
         self.offsets = {}  # lane -> byte offset of this run's first unread event
 
     def argv(self, worktree):
@@ -212,12 +260,55 @@ class CodexWorker:
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         sid = f"codex-{p.pid}"
         self.procs[sid] = p
+        try:
+            st = self.proc_start(p.pid)
+        except Exception:  # nosec B110 - no start time = unverifiable after a restart
+            st = None
+        if type(st) is not int:  # never run a session a restart could not verify (fail closed)
+            if p.poll() is None:  # our handle is open: the pid cannot have been reused
+                self._kill(p.pid)
+                p.terminate()
+            del self.procs[sid]
+            raise RuntimeError("codex start: no process creation time, a restart could not verify it")
+        self.info[sid] = {"pid": p.pid, "start": st, "log": str(self.log_dir / f"{name}.jsonl"),
+                          "offset": self.offsets[name]}
         return sid
+
+    def attach(self, name, sid, info):
+        """Re-attach a session after a conveyor restart from its persisted `info`:
+        "attached" (pid alive, same creation time), "gone" (no such live process: it
+        finished) or "unverified" (cannot be told: stop it, fail closed)."""
+        info = info if isinstance(info, dict) else {}
+        off, pid, start = info.get("offset"), info.get("pid"), info.get("start")
+        if type(off) is int and off >= 0:
+            self.offsets[name] = off  # the violation check rescans this whole run
+        if type(pid) is not int or pid <= 0:
+            return "unverified"
+        try:
+            now = self.proc_start(pid)
+        except Exception:  # nosec B110 - unreadable = unverified
+            self.attached[sid] = (pid, None)
+            return "unverified"
+        if now is None:
+            return "gone"
+        if type(start) is not int:
+            self.attached[sid] = (pid, None)
+            return "unverified"
+        if now != start:
+            return "gone"  # the pid was reused: ours has finished
+        self.attached[sid] = (pid, start)
+        return "attached"
 
     def status(self, sid):
         p = self.procs.get(sid)
         if p is None:
-            return "unknown"
+            a = self.attached.get(sid)
+            if a is None or a[1] is None:
+                return "unknown"
+            try:
+                return "running" if self.proc_start(a[0]) == a[1] else "exited:?"
+            except Exception:  # nosec B110 - a verified session briefly unreadable: still ours, alive
+                return "running"
         rc = p.poll()
         return "running" if rc is None else f"exited:{rc}"
 
@@ -248,13 +339,29 @@ class CodexWorker:
         """Terminate a running session and, on Windows, its whole process tree; True when
         one was running."""
         p = self.procs.get(sid)
-        if p is None or p.poll() is not None:
+        if p is None:
+            a = self.attached.get(sid)
+            if a is None or (a[1] is not None and self.status(sid) != "running"):
+                self.attached.pop(sid, None)
+                return False
+            self.attached.pop(sid)
+            self._kill(a[0])  # re-attached, or unverified: stopped all the same (fail closed)
+            return True
+        if p.poll() is not None:
             return False
-        if os.name == "nt":  # by full path: a taskkill.exe in the cwd is never run
-            taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe"
-            self.run([str(taskkill), "/PID", str(p.pid), "/T", "/F"], capture_output=True, check=False)
+        self._kill(p.pid)
         p.terminate()
         return True
+
+    def _kill(self, pid):
+        if os.name == "nt":  # by full path: a taskkill.exe in the cwd is never run
+            taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe"
+            self.run([str(taskkill), "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
+        else:
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
 
     def collect(self, name, worktree):
         """The lane's report file (worktree first, then the canonical checkout), else None."""

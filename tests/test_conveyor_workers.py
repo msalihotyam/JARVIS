@@ -2,12 +2,14 @@
 import importlib.util
 import json
 import os
+import shutil
 import sys
 import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
 
+from jarvis.trusted_exec import sanitized_path
 from tests.test_conveyor import HDR, Base, conveyor
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -121,9 +123,11 @@ class CodexWorkerTest(unittest.TestCase):
                         "openai_base_url": "http://proxy", "CODEX_API_KEY": "k", "OPENAI_ORG_ID": "o",
                         "AZURE_OPENAI_ENDPOINT": "e", "ANTHROPIC_BASE_URL": "u", "X_API_KEY": "k"}
         self.runs = []  # never the real taskkill: the fake pid could be a real process
+        self.pstart = {4242: 111}  # pid -> creation time; never the real process table
         self.w = CodexWorker(self.root, exe="fake-codex.exe", popen=self.popen, now=lambda: self.t,
                              reader=lambda: self.state, environ=self.environ,
-                             run=lambda argv, **kw: self.runs.append(argv))
+                             run=lambda argv, **kw: self.runs.append(argv),
+                             proc_start=lambda pid: self.pstart.get(pid))
 
     def popen(self, argv, **kw):
         self.procs.append(FakeCodexProc(argv, **kw))
@@ -177,7 +181,9 @@ class CodexWorkerTest(unittest.TestCase):
         self.assertEqual(p.argv, ["fake-codex.exe", "exec", "--json", *FLAGS, "-C", str(self.wt),
                                   "--sandbox", "workspace-write", "-"])
         # no key, base URL, org or provider override reaches the child; the login home stays
-        self.assertEqual(p.kw["env"], {"PATH": "C:/bin", "CODEX_HOME": "C:/codex-home"})
+        # allowlist (jarvis/codex.py route): PATH keeps only real, trusted directories
+        path = sanitized_path(self.environ)
+        self.assertEqual(p.kw["env"], {"CODEX_HOME": "C:/codex-home", **({"PATH": path} if path else {})})
         self.assertEqual(p.kw["cwd"], str(self.wt))
         self.assertEqual(p.stdin_text, "@jarvis lane=CDXA\nDo it.\n")
         log = self.root / "build" / "conveyor" / "codex" / "CDXA.jsonl"
@@ -242,6 +248,66 @@ class CodexWorkerTest(unittest.TestCase):
         log.write_text("", encoding="utf-8")  # shrunk below the read offset: blind = stop
         self.assertEqual(self.w.violation("CDXA"), "log_truncated")
 
+    def test_limit_words_inside_tool_payloads_never_count(self):
+        self.w.start("CDXA", self.wt, "x")
+        nested = {"rate_limits": {"primary": {"used_percent": 100}}, "credits": {"has_credits": True}}
+        for item in ({"type": "command_execution", "aggregated_output": "rate limit 429 credits quota"},
+                     {"type": "mcp_tool_call", "result": nested},
+                     {"type": "command_execution", "aggregated_output": json.dumps(nested), **nested}):
+            with self.subTest(item=item):
+                self.events({"type": "item.completed", "item": item})
+                self.assertIsNone(self.w.violation("CDXA"))
+
+    def test_start_records_pid_and_creation_time(self):
+        sid = self.w.start("CDXA", self.wt, "x")
+        info = self.w.info[sid]
+        self.assertEqual((info["pid"], info["start"], info["offset"]), (4242, 111, 0))
+        self.assertEqual(Path(info["log"]), self.root / workers.CODEX_LOG_DIR / "CDXA.jsonl")
+
+    def test_attach_after_restart(self):
+        info = {"pid": 4242, "start": 111, "log": "x", "offset": 0}
+        self.assertEqual(self.w.attach("CDXA", "codex-4242", info), "attached")
+        self.assertEqual(self.w.status("codex-4242"), "running")
+        self.pstart[4242] = 222  # the pid now belongs to another process: ours finished
+        self.assertEqual(self.w.status("codex-4242"), "exited:?")
+        self.assertFalse(self.w.stop("codex-4242"))
+        self.assertEqual(self.runs, [])
+        self.assertEqual(self.w.attach("CDXA", "codex-4242", info), "gone")
+        del self.pstart[4242]
+        self.assertEqual(self.w.attach("CDXA", "codex-4242", info), "gone")
+        for bad in ({**info, "pid": "x"}, {**info, "pid": 0}, None):
+            with self.subTest(info=bad):
+                self.assertEqual(self.w.attach("CDXA", "codex-4242", bad), "unverified")
+        self.pstart[4242] = 111
+        self.assertEqual(self.w.attach("CDXA", "codex-4242", {**info, "start": None}), "unverified")
+        self.assertEqual(self.w.status("codex-4242"), "unknown")
+
+    def test_unreadable_pid_is_unverified_and_stopped(self):
+        def boom(pid):
+            raise OSError("access denied")
+        self.w.proc_start = boom
+        info = {"pid": 4242, "start": 111, "log": "x", "offset": 0}
+        self.assertEqual(self.w.attach("CDXA", "codex-4242", info), "unverified")
+        self.assertEqual(self.w.status("codex-4242"), "unknown")
+        self.assertTrue(self.w.stop("codex-4242"))
+        if os.name == "nt":
+            self.assertEqual(self.runs[0][1:], ["/PID", "4242", "/T", "/F"])
+        self.assertFalse(self.w.stop("codex-4242"))
+
+    def test_start_without_a_creation_time_is_refused_and_killed(self):
+        def boom(pid):
+            raise OSError("access denied")
+        for proc_start in (lambda pid: None, boom):
+            with self.subTest(proc_start=proc_start):
+                self.runs.clear()
+                self.w.proc_start = proc_start
+                with self.assertRaises(RuntimeError):
+                    self.w.start("CDXA", self.wt, "x")
+                self.assertTrue(self.procs[-1].terminated)
+                self.assertEqual((self.w.procs, self.w.info), ({}, {}))
+                if os.name == "nt":
+                    self.assertEqual(self.runs[0][1:], ["/PID", "4242", "/T", "/F"])
+
     def test_no_codex_on_path_never_starts(self):
         w = CodexWorker(self.root, popen=self.popen, now=lambda: self.t)
         with mock.patch.object(workers, "_codex_exe", lambda: None):
@@ -265,6 +331,14 @@ class FakeCodex:
     def __init__(self, headroom, why=None):
         self.headroom, self.why, self.started, self.state = headroom, why, [], "running"
         self.vio, self.stopped = None, []
+        self.info = {"codex-7": {"pid": 4242, "start": 111, "log": "x", "offset": 0}}
+        self.attach_result, self.attach_calls, self.after_stop = "attached", [], "gone"
+
+    def attach(self, name, sid, info):
+        self.attach_calls.append((name, sid, info))
+        if self.attach_result == "attached":
+            self.state = "running"
+        return self.attach_result
 
     def admit(self):
         return self.headroom, self.why
@@ -274,6 +348,7 @@ class FakeCodex:
 
     def stop(self, sid):
         self.stopped.append(sid)
+        self.attach_result = self.after_stop
         return True
 
     def start(self, name, wt, text):
@@ -382,6 +457,118 @@ class ConveyorCodexTest(Base):
         self.c.codex.state = "exited:0"
         self.c.codex_track(lanes)
         self.assertEqual((lanes["CDXA"]["finished"], lanes["CDXA"]["status"]), (True, "MISSING"))
+
+    def restarted(self, result, after_stop="gone", report=False):
+        self.c.codex = FakeCodex(50)
+        lanes = self.lane()
+        lanes["CDXA"]["codex"] = dict(self.c.codex.info["codex-7"])
+        self.c.codex.state, self.c.codex.attach_result = "unknown", result
+        self.c.codex.after_stop = after_stop
+        if report:
+            f = Path(lanes["CDXA"]["worktree"]) / "build" / "reports" / "CDXA.md"
+            f.parent.mkdir(parents=True)
+            f.write_text("STATUS: PASS\n", encoding="utf-8")
+            os.utime(f, (self.t + 1, self.t + 1))
+        self.c.codex_track(lanes)
+        self.assertEqual(self.c.codex.attach_calls[0], ("CDXA", "codex-7", lanes["CDXA"]["codex"]))
+        return lanes
+
+    def test_restart_reattaches_a_verified_session(self):
+        lanes = self.restarted("attached")
+        self.assertFalse(lanes["CDXA"].get("finished"))
+        self.assertEqual(lanes["CDXA"]["state"], "working")
+        self.assertEqual(self.c.codex.stopped, [])
+
+    def test_restart_stops_an_unverified_session_with_one_attention(self):
+        lanes = self.restarted("unverified")
+        ln = lanes["CDXA"]
+        self.assertEqual(self.c.codex.stopped, ["codex-7"])
+        self.assertEqual((ln["finished"], ln["status"], ln["state"]), (True, "MISSING", "stopped"))
+        self.assertIn("not verifiable", ln["codex_unverified"])
+        self.assertEqual(self.events[-1][0], "codex_unverified")
+        items = [i for i in self.c.attention(lanes) if i[0] == "CDXA"]
+        self.assertEqual(len(items), 1)
+        self.assertIn("not verifiable", items[0][1])
+        self.assertEqual(len(self.c.codex.attach_calls), 2)  # stopped, then proven gone
+        self.c.codex_track(lanes)  # a stopped lane is not re-attached or stopped again
+        self.assertEqual((len(self.c.codex.attach_calls), self.c.codex.stopped), (2, ["codex-7"]))
+
+    def test_restart_holds_a_session_not_provably_stopped(self):
+        lanes = self.restarted("unverified", after_stop="unverified")
+        ln = lanes["CDXA"]
+        self.assertFalse(ln.get("finished"))
+        self.assertEqual((ln["status"], ln["state"]), ("MISSING", "unverified"))
+        self.assertIn("not provably stopped", ln["codex_unverified"])
+        self.assertEqual(len([i for i in self.c.attention(lanes) if i[0] == "CDXA"]), 1)
+        self.c.codex_track(lanes)  # retried every tick, one event
+        self.assertEqual(self.c.codex.stopped, ["codex-7", "codex-7"])
+        self.assertEqual([e[0] for e in self.events].count("codex_unverified"), 1)
+
+    def test_restart_with_an_unverified_session_and_its_report_finishes_without_a_kill(self):
+        lanes = self.restarted("unverified", report=True)
+        self.assertEqual((lanes["CDXA"]["finished"], lanes["CDXA"]["status"]), (True, "PASS"))
+        self.assertEqual(self.c.codex.stopped, [])
+
+    def test_restart_with_a_gone_session_is_missing(self):
+        lanes = self.restarted("gone")
+        self.assertEqual((lanes["CDXA"]["finished"], lanes["CDXA"]["status"]), (True, "MISSING"))
+        self.assertEqual(self.c.codex.stopped, [])
+
+    def test_restart_of_a_lane_without_persisted_info_raises_attention(self):
+        self.c.codex = FakeCodex(50)
+        lanes = self.lane()
+        self.c.codex.state = "unknown"
+        self.c.codex_track(lanes)
+        self.assertEqual((lanes["CDXA"]["finished"], lanes["CDXA"]["status"]), (True, "MISSING"))
+        self.assertIn("no persisted pid", lanes["CDXA"]["codex_unverified"])
+        self.assertEqual(self.c.codex.attach_calls, [])
+        self.assertEqual(len([i for i in self.c.attention(lanes) if i[0] == "CDXA"]), 1)
+
+    def finished_lane(self):
+        self.c.codex = FakeCodex(50)
+        lanes = self.lane()
+        report = Path(lanes["CDXA"]["worktree"]) / "build" / "reports" / "CDXA.md"
+        report.parent.mkdir(parents=True)
+        report.write_text("STATUS: PASS\n", encoding="utf-8")
+        lanes["CDXA"].update(finished=True, status="PASS", report=str(report),
+                             finished_ts=self.c.now() - conveyor.CLEANUP_S - 1)
+        self.c.codex.state = "exited:0"
+        return lanes
+
+    def test_codex_cleanup_preserves_unintegrated_work(self):
+        lanes = self.finished_lane()
+        with mock.patch.object(self.c, "unintegrated", return_value=("off_main", "worktree-CDXA", "abc")), \
+                mock.patch.object(self.c, "worktree_step") as step:
+            self.c.cleanup(lanes, [], set())
+        self.assertIn("preserved", lanes["CDXA"])
+        self.assertNotIn("cleanup", lanes["CDXA"])
+        step.assert_not_called()
+
+    def test_codex_cleanup_removes_an_integrated_worktree(self):
+        lanes = self.finished_lane()
+        with mock.patch.object(self.c, "unintegrated", return_value=None) as unint, \
+                mock.patch.object(self.c, "worktree_step") as step:
+            self.c.cleanup(lanes, [], set())
+        self.assertEqual(unint.call_args[0][0], {"cwd": lanes["CDXA"]["worktree"]})
+        self.assertEqual(lanes["CDXA"]["cleanup"]["result"], "removed")
+        step.assert_called_once_with("CDXA", lanes["CDXA"])
+        self.assertEqual(self.fake.calls, [])
+
+    def test_codex_cleanup_skips_running_young_or_attention_lanes(self):
+        for case in ("running", "young", "attention"):
+            with self.subTest(case=case):
+                lanes = self.finished_lane()
+                if case == "running":
+                    self.c.codex.state = "running"
+                if case == "young":
+                    lanes["CDXA"]["finished_ts"] = self.c.now()
+                with mock.patch.object(self.c, "unintegrated") as unint, \
+                        mock.patch.object(self.c, "worktree_step") as step:
+                    self.c.cleanup(lanes, [], {"CDXA"} if case == "attention" else set())
+                unint.assert_not_called()
+                step.assert_not_called()
+                self.assertNotIn("cleanup", lanes["CDXA"])
+                shutil.rmtree(Path(lanes["CDXA"]["worktree"]) / "build")
 
 
 if __name__ == "__main__":
