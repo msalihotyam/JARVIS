@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import subprocess
@@ -17,6 +18,7 @@ from tests.helpers import safe_cleanup
 from tests.test_claude_connector import OAUTH_MAX_AUTH_STATUS, patch_oauth_environment
 
 MARKER = "EARLIER-TURN-MARKER"
+MISSING = object()          # a result without total_cost_usd
 
 
 class WarmFake:
@@ -28,6 +30,8 @@ class WarmFake:
         self.written: list[str] = []
         self.out: list[str] = []
         self.stdin = self.stdout = self
+        self.closed = 0
+        self.waited = False
 
     def write(self, text: str) -> None:
         self.written.append(text)
@@ -38,7 +42,7 @@ class WarmFake:
         pass
 
     def close(self) -> None:
-        pass
+        self.closed += 1
 
     def readline(self) -> str:
         if self.returncode is not None or not self.out:
@@ -58,6 +62,7 @@ class WarmFake:
     terminate = kill
 
     def wait(self, timeout=None):
+        self.waited = True
         return self.returncode
 
     def user_lines(self) -> list[str]:
@@ -91,6 +96,12 @@ class WarmTest(unittest.TestCase):
         self.costs = [0.1, 0.2, 0.3, 0.4]
         self.is_error = False
         self.crash = False
+        self.send_init = True
+        self.proof = True
+        self.init_reply: dict | None = None     # replaces the initialize control_response
+        self.proof_input: dict | None = None    # replaces the proof's {"prompt": <this turn's text>}
+        self.after: list[dict] = []             # left in the pipe after the result
+        self.addCleanup(intent._WARM_PROCESSES.clear)
 
     def spawn(self, args, **kwargs) -> WarmFake:
         process = WarmFake(self, list(args), kwargs)
@@ -100,30 +111,56 @@ class WarmTest(unittest.TestCase):
     def respond(self, process: WarmFake, event: dict) -> None:
         kind = event.get("type")
         if kind == "control_request" and event["request"]["subtype"] == "initialize":
-            if self.init_ok:
+            if self.init_reply is not None:
+                process.emit(self.init_reply)
+            elif self.init_ok:
                 process.emit({"type": "control_response", "response": {
                     "subtype": "success", "request_id": event["request_id"], "response": {}}})
             return
         if kind in ("control_request", "control_response"):
             return
         model = process.args[process.args.index("--model") + 1] if "--model" in process.args else "claude"
-        process.emit({"type": "system", "subtype": "init", "apiKeySource": "none", "tools": [],
-                      "mcp_servers": [], "permissionMode": "plan", "model": model, **self.init})
+        if self.send_init:
+            process.emit({"type": "system", "subtype": "init", "apiKeySource": "none", "tools": [],
+                          "mcp_servers": [], "permissionMode": "plan", "model": model, **self.init})
         for index, request in enumerate(self.callbacks):
             process.emit({"type": "control_request", "request_id": f"cb{index}", "request": request})
+        if self.proof:
+            proof = self.proof_input
+            if proof is None:
+                proof = {"hook_event_name": "UserPromptSubmit", "prompt": event["message"]["content"][-1]["text"]}
+            process.emit({"type": "control_request", "request_id": "proof",
+                          "request": {"subtype": "hook_callback", "callback_id": "jarvis-proof", "input": proof}})
         if self.crash:
             return
-        process.emit({"type": "result", "subtype": "success", "is_error": self.is_error,
-                      "result": "ok", "total_cost_usd": self.costs.pop(0)})
+        result = {"type": "result", "subtype": "success", "is_error": self.is_error, "result": "ok"}
+        cost = self.costs.pop(0)
+        if cost is not MISSING:
+            result["total_cost_usd"] = cost
+        process.emit(result)
+        for extra in self.after:
+            process.emit(extra)
 
-    def turn(self, objective: str = "what time is it"):
-        task = Task(
+    def task(self, objective: str = "what time is it") -> Task:
+        return Task(
             objective=objective,
             capability=intent.INTENT_CAPABILITY,
             scope=ActionScope(action="understand", target=""),
             context={"conversation": [{"role": "user", "text": MARKER}]},
         )
-        return self.adapter.execute(task, SessionState())
+
+    def turn(self, objective: str = "what time is it"):
+        return self.adapter.execute(self.task(objective), SessionState())
+
+    def controls(self, process: WarmFake) -> list[str]:
+        return [json.loads(line)["request"]["subtype"] for line in process.written
+                if json.loads(line)["type"] == "control_request"]
+
+    def replies(self, process: WarmFake) -> dict:
+        return {
+            reply["response"]["request_id"]: reply["response"]
+            for reply in map(json.loads, process.written) if reply["type"] == "control_response"
+        }
 
     def code(self, result):
         return result.error.code if result.error is not None else None
@@ -269,6 +306,121 @@ class WarmSessionTest(WarmTest):
         self.turn()
         self.assertEqual(self.popen.call_count, 2)
         self.assertIn(MARKER, self.processes[1].user_lines()[0])
+
+
+class WarmFailClosedTest(WarmTest):
+    def assertDropped(self, result, code) -> None:
+        self.assertEqual(self.code(result), code)
+        self.assertEqual(self.processes[-1].returncode, -9)
+        self.assertNotIn("c1", self.adapter._warm)
+
+    def test_spawn_turn_without_init_is_refused(self) -> None:
+        self.send_init = False
+        self.assertDropped(self.turn(), intent.ErrorCode.EGRESS_REFUSED)
+
+    def test_unreadable_cost_is_an_overflow(self) -> None:
+        for cost in (MISSING, None, float("nan"), float("inf"), True, "0.1"):
+            with self.subTest(cost=cost):
+                self.costs = [cost]
+                self.assertDropped(self.turn(), intent.ErrorCode.CONNECTOR_FAILED)
+                self.assertEqual(self.controls(self.processes[-1])[-1], "interrupt")
+
+    def test_decreasing_cost_is_an_overflow(self) -> None:
+        self.costs = [0.2, 0.1]
+        self.assertIsNone(self.code(self.turn()))
+        self.assertDropped(self.turn(), intent.ErrorCode.CONNECTOR_FAILED)
+
+    def test_malformed_initialize_reply_is_refused(self) -> None:
+        self.init_reply = {"type": "control_response", "response": ["x"]}
+        self.assertDropped(self.turn(), intent.ErrorCode.EGRESS_REFUSED)
+        self.assertEqual(self.processes[0].user_lines(), [])
+
+    def test_malformed_control_requests_are_denied(self) -> None:
+        self.callbacks = [
+            "x",
+            {"subtype": "hook_callback", "callback_id": "jarvis-deny", "input": "Bash"},
+            {"subtype": "hook_callback", "callback_id": "jarvis-deny", "input": {"tool_name": ["Bash"]}},
+            {"subtype": "hook_callback", "callback_id": "jarvis-deny", "input": {"tool_name": {"a": 1}}},
+        ]
+        self.assertIsNone(self.code(self.turn()))
+        replies = self.replies(self.processes[0])
+        self.assertEqual(replies["cb0"]["subtype"], "error")
+        for key in ("cb1", "cb2", "cb3"):
+            self.assertEqual(replies[key]["response"]["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_malformed_init_tools_are_drift(self) -> None:
+        for tools in ([["Bash"]], [1], "Bash"):
+            with self.subTest(tools=tools):
+                self.init = {"tools": tools}
+                self.assertDropped(self.turn(), intent.ErrorCode.EGRESS_REFUSED)
+
+    def test_missing_proof_is_refused(self) -> None:
+        self.proof = False
+        self.assertDropped(self.turn(), intent.ErrorCode.EGRESS_REFUSED)
+
+    def test_proof_without_this_turns_prompt_is_refused(self) -> None:
+        for proof in ({}, {"prompt": "another request"}, {"prompt": 7}, ["what time is it"]):
+            with self.subTest(proof=proof):
+                self.proof_input = proof
+                self.assertDropped(self.turn(), intent.ErrorCode.EGRESS_REFUSED)
+
+    def test_stale_proof_and_result_from_an_earlier_turn_are_refused(self) -> None:
+        stale_proof = {"type": "control_request", "request_id": "late", "request": {
+            "subtype": "hook_callback", "callback_id": "jarvis-proof", "input": {"prompt": "first request"}}}
+        self.after = [stale_proof, {"type": "result", "subtype": "success", "is_error": False,
+                                    "result": "stale", "total_cost_usd": 0.15}]
+        self.assertIsNone(self.code(self.turn("first request")))
+        self.after = []
+        self.assertDropped(self.turn("second request"), intent.ErrorCode.EGRESS_REFUSED)
+        self.assertEqual(self.popen.call_count, 1)
+
+    def test_interrupted_turn_drops_the_session(self) -> None:
+        with patch.object(self.adapter, "_collect_output", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.turn()
+        self.assertEqual(self.processes[0].returncode, -9)
+        self.assertNotIn("c1", self.adapter._warm)
+
+    def test_exit_reaps_a_collected_adapters_processes(self) -> None:
+        self.turn()
+        self.adapter = None
+        gc.collect()
+        intent._close_warm_sessions()
+        process = self.processes[0]
+        self.assertEqual((process.returncode, process.waited, process.closed), (-9, True, 2))
+        self.assertEqual(intent._WARM_PROCESSES, set())
+
+    def test_dead_on_reuse_respawns_with_the_window(self) -> None:
+        first = self.turn()
+        original = self.adapter._warm_alive
+
+        def alive_then_die() -> bool:
+            alive = original()
+            self.processes[0].kill()
+            return alive
+
+        with patch.object(self.adapter, "_warm_alive", side_effect=alive_then_die):
+            second = self.turn()
+        self.assertEqual(self.code(second), self.code(first))
+        self.assertEqual(self.popen.call_count, 2)
+        self.assertEqual(len(self.processes[0].user_lines()), 1)
+        self.assertIn(MARKER, self.processes[1].user_lines()[0])
+
+    def test_dropped_window_state_is_per_task(self) -> None:
+        self.turn()
+        self.assertEqual(self.adapter._warm_dropped, set())
+        first, other = self.task(), self.task()
+        self.adapter._sanitized_payload(first)
+        self.adapter.warm_lane = "c9"
+        self.adapter._sanitized_payload(other)
+        self.assertEqual(self.adapter._warm_dropped, {first.id})
+
+    def test_exit_reaps_warm_processes(self) -> None:
+        self.turn()
+        intent._close_warm_sessions()
+        process = self.processes[0]
+        self.assertEqual((process.returncode, process.waited, process.closed), (-9, True, 2))
+        self.assertEqual(intent._WARM_PROCESSES, set())
 
 
 if __name__ == "__main__":

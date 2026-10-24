@@ -23,9 +23,11 @@ document. It never executes, persists or approves anything.
 
 from __future__ import annotations
 
+import atexit
 import base64
 import hashlib
 import json
+import math
 import re
 import subprocess
 import threading
@@ -1342,6 +1344,7 @@ class WarmClaudeSession:
     cost: float = 0.0
     digests: list[str] = field(default_factory=list)
     proven: bool = False
+    expected: str = ""                  # this turn's prompt text; only a proof carrying it counts
 
 
 class _WarmRefusal(Exception):
@@ -1376,12 +1379,16 @@ def _json_object(line: str) -> dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _mapping(value: Any) -> dict[str, Any]:
+    return value if isinstance(value, dict) else {}
+
+
 def _warm_drift(command: list[str], granted: set[str], init: dict[str, Any]) -> str:
     """What in a ``system/init`` event differs from the hardened argv, or ''."""
     if init.get("apiKeySource") != "none":
         return "credential source"
     tools = init.get("tools")
-    if not isinstance(tools, list) or not set(tools) <= granted:
+    if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools) or not set(tools) <= granted:
         return "tools"
     if init.get("mcp_servers") != []:
         return "MCP servers"
@@ -1392,6 +1399,33 @@ def _warm_drift(command: list[str], granted: set[str], init: dict[str, Any]) -> 
     if "--model" in command and command[command.index("--model") + 1] not in str(init.get("model", "")):
         return "model"
     return ""
+
+
+#: Every live warm process (held strongly), so app exit reaps each child even
+#: when its adapter was collected without ``close_warm``.
+_WARM_PROCESSES: set[Any] = set()
+
+
+def _reap_warm(process: Any) -> None:
+    _WARM_PROCESSES.discard(process)
+    try:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    for pipe in (process.stdin, process.stdout):
+        try:
+            if pipe is not None:
+                pipe.close()
+        except (OSError, ValueError):
+            pass
+
+
+@atexit.register
+def _close_warm_sessions() -> None:
+    for process in list(_WARM_PROCESSES):
+        _reap_warm(process)
 
 
 class ClaudeIntentAdapter(ClaudeCodeConnector):
@@ -1460,13 +1494,13 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         #: Settings ``warm_claude`` (default off = one process per turn,
         #: unchanged). ``warm_lane`` is the conversation of the next call; the
         #: caller sets it per turn, and ``None`` also keeps the per-turn path.
-        # ponytail: one adapter call at a time (the chat path is serial) and no
-        # close on app exit (the OS reaps the children); lock + atexit if either changes.
+        # ponytail: one adapter call at a time (the chat path is serial); a lock if that changes.
         self.warm_claude = False
         self.warm_lane: str | None = None
         self._clock = time.monotonic
         self._warm: dict[str, WarmClaudeSession] = {}
-        self._warm_dropped = False
+        #: Task ids whose payload left the conversation out for a live warm process.
+        self._warm_dropped: set[str] = set()
 
     def complete(self, task: Task, session: SessionState) -> ToolResult:
         return self.execute(task, session)
@@ -1478,6 +1512,7 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         finally:
             marks["ended"] = time.monotonic()
             self.timings[task.id], self._marks = marks, None
+            self._warm_dropped.discard(task.id)
 
     def _mark(self, name: str) -> None:
         if self._marks is not None:
@@ -1678,9 +1713,11 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         # A live warm process for this lane already holds the window, so turns
         # 2+ send only the new request. The catalog is argv: a changed one is a
         # new process, which gets the full window again.
-        self._warm_dropped = self._warm_alive()
-        if self._warm_dropped:
+        if self._warm_alive():
+            self._warm_dropped.add(task.id)
             context.pop("conversation", None)
+        else:
+            self._warm_dropped.discard(task.id)
         payload, redactions = self._redact({"request": task.objective, "context": context})
         instruction, more = self._project_instruction(task)
         if instruction is not None:
@@ -1703,8 +1740,13 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
 
     def _drop_warm(self, lane: str) -> None:
         session = self._warm.pop(lane, None)
-        if session is not None and session.process.poll() is None:
-            session.process.kill()
+        if session is not None:
+            _reap_warm(session.process)
+
+    def close_warm(self) -> None:
+        """Kill every warm process this adapter holds (also run at exit)."""
+        for lane in list(self._warm):
+            self._drop_warm(lane)
 
     @staticmethod
     def _warm_write(session: WarmClaudeSession, message: str | dict[str, Any]) -> None:
@@ -1726,8 +1768,9 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
     ) -> ToolResult | tuple[int, str, str]:
         if not self.warm_claude or self.warm_lane is None or stdin_text is None:
             return super()._run_process(task, command, working_directory, stdin_text, billing_class, evidence)
-        lane, reuse = self.warm_lane, self._warm_dropped
-        self._warm_dropped = False
+        lane, reuse = self.warm_lane, task.id in self._warm_dropped
+        self._warm_dropped.discard(task.id)
+        granted = {name for name in command[command.index("--tools") + 1].split(",") if name}
         now = self._clock()
         for idle in [key for key, s in self._warm.items() if key != lane and now - s.last_used > WARM_IDLE_SECONDS]:
             self._drop_warm(idle)       # ponytail: reaped on the next call, not by a timer
@@ -1742,9 +1785,15 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         session = self._warm.get(lane)
         if reuse and (session is None or session.process.poll() is not None or session.command[1:] != command[1:]):
             # The window was left out for a process that is gone: never send a
-            # turn without it. The next turn respawns and sends the full window.
-            return refuse(ErrorCode.CONNECTOR_FAILED, "The warm Claude Code session ended; nothing was sent.",
-                          retryable=True, call_count=0)
+            # turn without it. Respawn with the full window rebuilt instead.
+            self._drop_warm(lane)
+            reuse = False
+            try:
+                stdin_text = self._stdin_payload(self._build_prompt(task)[0])
+            except Exception as exc:        # the base refuses the same failures before any spawn
+                return refuse(ErrorCode.EGRESS_REFUSED, str(exc), call_count=0)
+            if stdin_text is None:
+                return refuse(ErrorCode.EGRESS_REFUSED, "The request could not be sent on stdin.", call_count=0)
         with self._process_lock:
             if task.id in self._cancelled:
                 self._cancelled.discard(task.id)
@@ -1775,6 +1824,7 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
                         retryable=True, billing_class=billing_class, billing_evidence=evidence,
                     )
                 session = self._warm[lane] = WarmClaudeSession(process, list(command), now)
+                _WARM_PROCESSES.add(process)
             self._processes[task.id] = session.process
         timed_out = threading.Event()
 
@@ -1784,7 +1834,6 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
 
         timer = threading.Timer(self.timeout_seconds, expire)
         timer.start()
-        granted = {name for name in command[command.index("--tools") + 1].split(",") if name}
         state: dict[str, Any] = {}
         try:
             if not reuse and not self._warm_initialize(session):
@@ -1792,6 +1841,9 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
                     return refuse(ErrorCode.CONNECTOR_FAILED, TIMEOUT_MESSAGE, retryable=True)
                 return refuse(ErrorCode.EGRESS_REFUSED,
                               "Claude Code did not accept JARVIS's hooks; nothing was sent.", call_count=0)
+            # A proof or result left in the pipe by an earlier turn never carries
+            # this turn's prompt, so it cannot vouch for this turn.
+            session.expected = json.loads(stdin_text)["message"]["content"][-1]["text"]
             digest = hashlib.sha256(stdin_text.encode("utf-8")).hexdigest()
             session.digests.append(digest)
             session.proven = False
@@ -1804,6 +1856,12 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
                           f"Claude Code's session drifted from JARVIS's hardened setup ({drift}); the call was refused.")
         except subprocess.TimeoutExpired:
             timed_out.set()
+        except Exception:                   # a malformed event fails closed, never through
+            return refuse(ErrorCode.EGRESS_REFUSED, "Claude Code sent JARVIS something it could not read; "
+                                                    "the call was refused.")
+        except BaseException:
+            self._drop_warm(lane)           # interrupted mid-turn: never reuse a half-read pipe
+            raise
         finally:
             timer.cancel()
             with self._process_lock:
@@ -1815,7 +1873,9 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         if result is None:                  # crashed, killed or cancelled: the next turn respawns
             self._drop_warm(lane)
             return 1, stdout, ""
-        if granted and not session.proven:
+        if not reuse and not state.get("init"):
+            return refuse(ErrorCode.EGRESS_REFUSED, "Claude Code did not attest its session setup; the call was refused.")
+        if not session.proven:
             return refuse(ErrorCode.EGRESS_REFUSED, "Claude Code's hooks did not run for this turn; the call was refused.")
         if state["delta"] > self.max_budget_usd:
             self._warm_write(session, {"type": "control_request", "request_id": "jarvis-stop",
@@ -1832,7 +1892,7 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
                                    "request": {"subtype": "initialize", "hooks": WARM_HOOKS}})
         for line in iter(session.process.stdout.readline, ""):
             event = _json_object(line)
-            response = event.get("response") or {}
+            response = _mapping(event.get("response"))
             if event.get("type") == "control_response" and response.get("request_id") == WARM_INIT_ID:
                 return response.get("subtype") == "success"
         return False
@@ -1852,11 +1912,15 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
                 drift = _warm_drift(session.command, granted, event)
                 if drift:
                     raise _WarmRefusal(drift)
+                # The CLI emits init only after the first user line, so the spawn
+                # line is attested after the fact (accepted; part B re-checks).
+                state["init"] = True
             if kind == "result":
-                total = event.get("total_cost_usd", session.cost)
-                if not isinstance(total, (int, float)):
-                    total = float("inf")    # an unreadable cost is an overflow
-                state["delta"], session.cost = max(total - session.cost, 0.0), total
+                total = event.get("total_cost_usd")
+                if type(total) not in (int, float) or not math.isfinite(total) or total < session.cost:
+                    state["delta"] = float("inf")   # missing, unreadable or decreasing: an overflow
+                else:
+                    state["delta"], session.cost = total - session.cost, float(total)
                 # The CLI reports the lane's running total; the turn is billed its share.
                 event["total_cost_usd"] = state["delta"]
                 state["result"] = event
@@ -1865,14 +1929,16 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
             yield line
 
     def _warm_answer(self, session: WarmClaudeSession, granted: set[str], event: dict[str, Any]) -> None:
-        request = event.get("request") or {}
+        request = _mapping(event.get("request"))
         subtype, callback = request.get("subtype"), request.get("callback_id")
         if subtype == "hook_callback" and callback == "jarvis-proof":
-            session.proven = True
+            prompt = _mapping(request.get("input")).get("prompt")
+            if isinstance(prompt, str) and session.expected and session.expected in prompt:
+                session.proven = True
             body: dict[str, Any] = {"continue": True}
         elif subtype == "hook_callback" and callback == "jarvis-deny":
-            tool = (request.get("input") or {}).get("tool_name")
-            body = {} if tool in granted else {"hookSpecificOutput": {
+            tool = _mapping(request.get("input")).get("tool_name")
+            body = {} if isinstance(tool, str) and tool in granted else {"hookSpecificOutput": {
                 "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": WARM_NO_TOOL,
             }}
         elif subtype == "can_use_tool":
