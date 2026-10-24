@@ -16,10 +16,19 @@ Hard rules:
   Tests never open `data/jarvis.db`.
 - `SCHEMA_VERSION` stays 10 (additive tables only; no ALTER) while schema-10 releases are a
   rollback target.
-- Tests only with `python -m unittest` (via `python scripts/test_parallel.py <modules>`); never `uv run`.
+- Tests only with `python -m unittest`; never `uv run` (see "Running checks as a Codex lane").
 - Never edit `CLAUDE.md`, `AGENTS.md` or anything under `.claude/`. Touch only the files your prompt owns.
 - `git diff --check` before the report. GREEN MEANS STOP: no extra tests, audits or refactors.
 - Fail closed: on uncertainty, an unowned file or a higher risk tier, stop and report BLOCKED.
+
+Running checks as a Codex lane (the sandbox writes only your worktree; the conveyor points TEMP,
+TMP, TMPDIR and the uv/ruff/pip caches at `<worktree>/.codex-tmp`, which is never committed):
+
+- Tests: `python -m unittest <modules>`. NOT `scripts/test_parallel.py` (it locks in the main checkout).
+- Lint: `python -m ruff check --select E4,E7,E9,F <files>` if ruff is installed, else
+  `uvx ruff@0.16.0 check --select E4,E7,E9,F <files>`.
+- Never write outside your worktree. Test data files go under `tests/fixtures/` (`tests/data/` is
+  git-ignored by the `data/` rule).
 
 Report: write `build/reports/<ID>.md` in your worktree ONCE, after every check. First line exactly
 `STATUS: PASS` or `STATUS: BLOCKED`, then `FILES`, one line

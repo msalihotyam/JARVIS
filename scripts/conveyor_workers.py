@@ -123,6 +123,27 @@ def scrubbed_env(environ=None):
     return {k: v for k, v in env.items() if not route_var(k)}
 
 
+# CODEXENV: temp and tool caches the workspace-write sandbox lets codex write (only the
+# worktree is writable); values are paths, never a route, key or provider.
+SANDBOX_DIRS = {"TEMP": "tmp", "TMP": "tmp", "TMPDIR": "tmp", "UV_CACHE_DIR": "uv",
+                "RUFF_CACHE_DIR": "ruff", "PIP_CACHE_DIR": "pip"}
+
+
+def sandbox_env(env, worktree):
+    """Make <worktree>/.codex-tmp/{tmp,uv,ruff,pip} (self-ignored by its own .gitignore,
+    so it never shows as untracked) and return env with SANDBOX_DIRS pointing there; an
+    inherited key of any case ("Temp", "tmp") is dropped so Windows sees one value."""
+    base = Path(worktree).resolve(strict=True) / ".codex-tmp"  # never create a missing worktree
+    for path in (base, *(base / sub for sub in sorted(set(SANDBOX_DIRS.values())))):
+        path.mkdir(exist_ok=True)
+        if path.resolve() != path:  # a link planted in the worktree must not lead out of it
+            raise OSError("codex sandbox dir is a link")
+    (base / ".gitignore").write_text("*\n", encoding="utf-8")
+    out = {k: v for k, v in env.items() if k.upper() not in SANDBOX_DIRS}
+    out.update({k: str(base / sub) for k, sub in SANDBOX_DIRS.items()})
+    return out
+
+
 def headroom(rl):
     """100 - the highest used_percent of the primary/secondary windows; None when either
     present window is not a number in 0..100 or no window is present (fail closed)."""
@@ -291,7 +312,7 @@ class CodexWorker:
                 open(self.log_dir / f"{name}.stderr.log", "ab") as ferr:
             self.offsets[name] = fout.tell()  # an earlier run's events are not this run's
             p = self.popen(argv, cwd=str(worktree), stdin=fin, stdout=fout, stderr=ferr,
-                           env=scrubbed_env(self.environ),
+                           env=sandbox_env(scrubbed_env(self.environ), worktree),
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         sid = f"codex-{p.pid}"
         self.procs[sid] = p

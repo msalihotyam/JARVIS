@@ -216,6 +216,38 @@ class CodexWorkerTest(unittest.TestCase):
         self.assertEqual(self.w.admit(), (None, "unknown"))
         self.assertEqual(self.procs, [])
 
+    def sandbox(self):
+        base = self.wt.resolve() / ".codex-tmp"
+        return {"TEMP": str(base / "tmp"), "TMP": str(base / "tmp"), "TMPDIR": str(base / "tmp"),
+                "UV_CACHE_DIR": str(base / "uv"), "RUFF_CACHE_DIR": str(base / "ruff"),
+                "PIP_CACHE_DIR": str(base / "pip")}
+
+    def test_start_sandbox_dirs_inside_worktree(self):
+        # CODEXENV: the workspace-write sandbox only lets codex write its worktree, so temp
+        # and the uv/ruff/pip caches point there; an inherited key of any case is replaced,
+        # never duplicated, and route/key variables stay scrubbed
+        self.environ.update({"Temp": "C:/Users/x/AppData/Local/Temp", "tmp": "C:/t", "TMPDIR": "/tmp",
+                             "uv_cache_dir": "C:/uv", "Pip_Cache_Dir": "C:/pip", "OPENAI_BASE_URL": "u",
+                             "CODEX_PROVIDER": "p", "Openai_Api_Key": "sk-y"})
+        self.w.start("CDXA", self.wt, "@jarvis lane=CDXA\nDo it.\n")
+        env = self.procs[0].kw["env"]
+        path = sanitized_path(self.environ)
+        self.assertEqual(env, {"CODEX_HOME": "C:/codex-home", **({"PATH": path} if path else {}),
+                               **self.sandbox()})
+        for v in self.sandbox().values():
+            self.assertTrue(Path(v).is_dir())
+            self.assertTrue(Path(v).is_relative_to(self.wt.resolve()))
+        self.assertEqual((self.wt / ".codex-tmp" / ".gitignore").read_text(encoding="utf-8"), "*\n")
+        self.w.start("CDXA", self.wt, "again\n")  # a restart reuses the dirs
+        self.assertEqual(self.procs[1].kw["env"], env)
+
+    def test_start_missing_worktree_creates_nothing(self):
+        missing = self.wt.parent / "gone"
+        with self.assertRaises(OSError):
+            self.w.start("CDXA", missing, "@jarvis lane=CDXA\nDo it.\n")
+        self.assertFalse(missing.exists())
+        self.assertEqual(self.procs, [])
+
     def test_start_status_stop_collect(self):
         sid = self.w.start("CDXA", self.wt, "@jarvis lane=CDXA\nDo it.\n")
         self.assertEqual(sid, "codex-4242")
@@ -225,7 +257,8 @@ class CodexWorkerTest(unittest.TestCase):
         # no key, base URL, org or provider override reaches the child; the login home stays
         # allowlist (jarvis/codex.py route): PATH keeps only real, trusted directories
         path = sanitized_path(self.environ)
-        self.assertEqual(p.kw["env"], {"CODEX_HOME": "C:/codex-home", **({"PATH": path} if path else {})})
+        self.assertEqual(p.kw["env"], {"CODEX_HOME": "C:/codex-home", **({"PATH": path} if path else {}),
+                                       **self.sandbox()})
         self.assertEqual(p.kw["cwd"], str(self.wt))
         self.assertEqual(p.stdin_text, "@jarvis lane=CDXA\nDo it.\n")
         log = self.root / "build" / "conveyor" / "codex" / "CDXA.jsonl"
