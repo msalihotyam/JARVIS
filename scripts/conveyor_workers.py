@@ -24,10 +24,15 @@ CODEX_MIN_HEADROOM = 10  # % left in the tighter window; less (or unknown) = no 
 CODEX_STATE_MAX_AGE_S = 60  # an account/limits reading older than this is stale = refused
 CODEX_LOG_DIR = "build/conveyor/codex"
 SANDBOXES = ("read-only", "workspace-write")  # never danger-full-access
-FORCED_LOGIN = "forced_login_method=chatgpt"  # the one value -c may carry (jarvis/codex.py)
+FORCED_LOGIN = "forced_login_method=chatgpt"  # jarvis/codex.py's route bar
+# CODEXSANDBOX: with --ignore-user-config no Windows sandbox is selected and every shell
+# command is "blocked by policy"; mxc needs no admin and confines writes to the worktree.
+WINDOWS_SANDBOX = "windows.sandbox=mxc"
+CONFIGS = (FORCED_LOGIN, WINDOWS_SANDBOX)  # the only values -c may carry, each exactly once
 # A flag that can widen the sandbox, skip approvals, load other config or buy credits.
 BANNED_FLAGS = ("--dangerously-bypass-approvals-and-sandbox", "--yolo", "--full-auto",
-                "-c", "--config", "-p", "--profile", "--add-dir", "--oss")
+                "-c", "--config", "-p", "--profile", "--add-dir", "--oss",
+                "--enable", "--disable", "--cd")  # --enable/--disable X = -c features.X=bool
 BANNED_WORDS = ("danger", "credit", "overage", "bypass")
 # jarvis/codex.py CODEX_PROHIBITED_ENV_VARS: any of these can move Codex off the
 # ChatGPT subscription onto a metered key or another provider.
@@ -37,11 +42,12 @@ PROHIBITED_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "OPENAI_
 
 def check_argv(argv):
     """Raise ValueError unless argv runs `codex exec` with exactly one sandbox no weaker
-    than workspace-write, `--ignore-user-config` and `-c forced_login_method=chatgpt`
-    exactly once each, and no other config or flag that widens it or buys credits."""
+    than workspace-write, `--ignore-user-config`, `-c forced_login_method=chatgpt` and
+    `-c windows.sandbox=mxc` exactly once each, and no other config or flag that widens
+    it or buys credits."""
     if len(argv) < 2 or argv[1] != "exec":
         raise ValueError("not codex exec")
-    sandboxes, logins, ignores, skip = [], 0, 0, False
+    sandboxes, configs, ignores, skip = [], [], 0, False
     for i, a in enumerate(argv[1:], 1):
         if skip:
             skip = False
@@ -49,9 +55,11 @@ def check_argv(argv):
         if argv[i - 1] == "-C" and not a.startswith("-"):
             continue  # the worktree path: a lane id like BYPASSFIX is no flag
         if a == "-c":  # exact-match allowlist: nothing else may ride on -c
-            if argv[i + 1:i + 2] != [FORCED_LOGIN]:
+            value = argv[i + 1] if i + 1 < len(argv) else None
+            if value not in CONFIGS:
                 raise ValueError(f"refused config: {argv[i + 1:i + 2]}")
-            logins, skip = logins + 1, True
+            configs.append(value)
+            skip = True
             continue
         if a == "--ignore-user-config":
             ignores += 1
@@ -63,8 +71,8 @@ def check_argv(argv):
             raise ValueError(f"refused argument: {a}")
         if flag in ("-s", "--sandbox"):
             sandboxes.append(a.split("=", 1)[1] if "=" in a else (argv[i + 1] if i + 1 < len(argv) else ""))
-    if logins != 1 or ignores != 1:
-        raise ValueError(f"needs --ignore-user-config and -c {FORCED_LOGIN} exactly once")
+    if sorted(configs) != sorted(CONFIGS) or ignores != 1:
+        raise ValueError(f"needs --ignore-user-config and -c {' -c '.join(CONFIGS)} exactly once")
     if len(sandboxes) != 1 or sandboxes[0] not in SANDBOXES:
         raise ValueError(f"sandbox must be one of {SANDBOXES}: {sandboxes}")
     return argv
@@ -214,7 +222,8 @@ class CodexWorker:
         if not exe:
             raise FileNotFoundError("no trusted native codex binary")
         return check_argv([exe, "exec", "--json", "--ignore-user-config", "-c", FORCED_LOGIN,
-                           "-C", str(worktree), "--sandbox", "workspace-write", "-"])  # prompt on stdin
+                           "-c", WINDOWS_SANDBOX, "-C", str(worktree), "--sandbox",
+                           "workspace-write", "-"])  # prompt on stdin
 
     def admit(self):
         """(headroom, None) when a FRESH account reading shows the ChatGPT subscription

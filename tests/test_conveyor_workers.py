@@ -34,7 +34,7 @@ class FakeCodexProc:
         self.rc = 1
 
 
-FLAGS = ["--ignore-user-config", "-c", "forced_login_method=chatgpt"]
+FLAGS = ["--ignore-user-config", "-c", "forced_login_method=chatgpt", "-c", "windows.sandbox=mxc"]
 
 
 class CheckArgvTest(unittest.TestCase):
@@ -63,6 +63,38 @@ class CheckArgvTest(unittest.TestCase):
             ["codex", "exec", "--ignore-user-config", "--config", "forced_login_method=chatgpt", *sb],
             ["codex", "exec", "--ignore-user-config", "--config=forced_login_method=chatgpt", *sb],
             ["codex", "exec", *sb[:-1], "--ignore-user-config", "-c"],  # -c with no value
+        ]
+        for argv in bad:
+            with self.subTest(argv=argv), self.assertRaises(ValueError):
+                check_argv(argv)
+
+    def test_windows_sandbox_is_mxc_exactly_once(self):
+        # CODEXSANDBOX: no -c windows.sandbox = no Windows sandbox = every command blocked
+        login, sb = ["--ignore-user-config", "-c", "forced_login_method=chatgpt"], ["--sandbox", "workspace-write", "-"]
+        check_argv(["codex", "exec", "-c", "windows.sandbox=mxc", *login, *sb])  # order is free
+        bad = [
+            ["codex", "exec", *login, *sb],  # missing
+            ["codex", "exec", *FLAGS, "-c", "windows.sandbox=mxc", *sb],  # twice
+            ["codex", "exec", *login, "-c", "windows.sandbox=elevated", *sb],
+            ["codex", "exec", *login, "-c", "windows.sandbox=unelevated", *sb],
+            ["codex", "exec", *login, "-c", "windows.sandbox=MXC", *sb],
+            ["codex", "exec", *login, "-c", 'windows.sandbox="mxc"', *sb],
+            ["codex", "exec", *login, "-c", "windows.sandbox = mxc", *sb],
+            ["codex", "exec", *login, "-c", "windows={sandbox='mxc'}", *sb],
+            ["codex", "exec", *login, "-cwindows.sandbox=mxc", *sb],
+            ["codex", "exec", *login, "--config", "windows.sandbox=mxc", *sb],
+            ["codex", "exec", *login, "--config=windows.sandbox=mxc", *sb],
+            ["codex", "exec", "--ignore-user-config", "-c", "windows.sandbox=mxc", "-c", "windows.sandbox=mxc", *sb],
+            ["codex", "exec", *FLAGS, "-c", "sandbox_mode=workspace-write", *sb],
+            ["codex", "exec", *FLAGS, "-c", "sandbox_workspace_write.writable_roots=['C:/']", *sb],
+            ["codex", "exec", *FLAGS, "-c", "sandbox_workspace_write.network_access=true", *sb],
+            ["codex", "exec", *FLAGS, "-c", "approval_policy=never", *sb],
+            ["codex", "exec", "-c", "windows.sandbox=mxc", "-c", "forced_login_method=chatgpt", *sb],  # user config
+            # --enable/--disable are -c features.<name>=bool: config outside the allowlist
+            ["codex", "exec", *FLAGS, "--enable", "elevated_windows_sandbox", *sb],
+            ["codex", "exec", *FLAGS, "--enable=experimental_windows_sandbox", *sb],
+            ["codex", "exec", *FLAGS, "--disable", "windows_sandbox", *sb],
+            ["codex", "exec", *FLAGS, "--cd", "C:/", *sb],  # the worker's root is only ever -C
         ]
         for argv in bad:
             with self.subTest(argv=argv), self.assertRaises(ValueError):
