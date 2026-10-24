@@ -13,7 +13,8 @@ Hard rules:
 - No live connector, model, auth or network call; never start or reinstall the packaged app.
 - Protected paths: `data/**`, `~/.jarvis/`, `.env*`, key/certificate/database files.
   Tests never open `data/jarvis.db`.
-- `SCHEMA_VERSION` stays 10.
+- `SCHEMA_VERSION` stays 10 (additive tables only; no ALTER) while schema-10 releases are a
+  rollback target.
 - Tests only with `python -m unittest` (via `python scripts/test_parallel.py <modules>`); never `uv run`.
 - Never edit `CLAUDE.md`, `AGENTS.md` or anything under `.claude/`. Touch only the files your prompt owns.
 - `git diff --check` before the commit. GREEN MEANS STOP: no extra tests, audits or refactors.

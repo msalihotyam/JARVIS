@@ -29,7 +29,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests load this file by path
-from conveyor_workers import CODEX_MIN_HEADROOM, WORKERS, CodexWorker  # noqa: E402
+from conveyor_workers import WORKERS, CodexWorker  # noqa: E402
 
 ROOT =Path(__file__).resolve().parents[1]  # repo root (scripts/ -> repo)
 SETTINGS = "build/conveyor/lanes.settings.json"
@@ -1255,6 +1255,13 @@ class Conveyor:
             if ln.get("finished") and ln.get("status") and ln["status"] not in ("DEAD", "MISSING"):
                 continue
             ln["updated_at"] = iso(self.now())
+            if not ln.get("finished") and self.codex.status(ln["id"]) == "running":
+                why = self.codex.violation(name)
+                if why:  # limit reached or credits mid-run: stop it, credits are never spent
+                    self.codex.stop(ln["id"])
+                    ln.update(state="stopped", finished=True, status="MISSING", finished_ts=self.now())
+                    self.event("codex_stop", lane=name, id=ln["id"], reason=why)
+                    continue
             found = self.find_report(name, ln.get("report_since") or self.started_ts(ln), ln.get("worktree"))
             if found and found[1] == INTERIM:
                 if self.codex.status(ln["id"]) == "running":
@@ -1757,10 +1764,11 @@ class Conveyor:
 
     def start_codex(self, name, base, text):
         """`codex exec` one lane in a worktree the conveyor creates; returns its session id
-        or None. Unknown or low live headroom holds the lane (fail closed, never credits)."""
-        h = self.codex.usage()
-        if h is None or h < CODEX_MIN_HEADROOM:
-            self.event("codex_hold", lane=name, headroom=h)
+        or None. Admission refused (unknown/stale reading, not the ChatGPT route, limit
+        reached, credits, low headroom) holds the lane (fail closed, never credits)."""
+        h, why = self.codex.admit()
+        if why:
+            self.event("codex_hold", lane=name, headroom=h, reason=why)
             return None
         wt = self.root / ".claude" / "worktrees" / name
         try:
