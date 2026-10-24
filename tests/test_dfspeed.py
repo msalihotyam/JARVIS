@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import itertools
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -94,8 +95,14 @@ class TurnTimingTests(IntentTestCase):
         self.assertEqual(len(answer), marks["output_chars"])
         timing = payload["intent"]["usage"]["timing"]
         self.assertEqual({"total_ms", "auth_ms", "spawn_ms", "first_text_ms", "first_visible_ms", "text_ms",
-                          "parse_ms", "output_chars"}, set(timing))
+                          "parse_ms", "output_chars", "lane", "t_route", "t_proc_ready", "t_stdin_write",
+                          "t_first_token", "t_turn_done", "tokens_out"}, set(timing))
+        self.assertEqual("current", timing.pop("lane"))
         self.assertTrue(all(type(v) is int and v > 0 for v in timing.values()), timing)
+        self.assertEqual(12, timing["tokens_out"])
+        self.assertLess(timing["t_route"], timing["t_proc_ready"])
+        self.assertEqual((timing["spawn_ms"], timing["first_visible_ms"], timing["total_ms"]),
+                         (timing["t_proc_ready"], timing["t_first_token"], timing["t_turn_done"]))
         self.assertLess(timing["auth_ms"], timing["spawn_ms"])                       # the auth check precedes the spawn
         self.assertEqual(timing["first_visible_ms"], timing["spawn_ms"] + timing["first_text_ms"])
         self.assertLess(timing["first_visible_ms"] + timing["text_ms"] + timing["parse_ms"], timing["total_ms"])
@@ -105,18 +112,36 @@ class TurnTimingTests(IntentTestCase):
         marks = {"started": 10.2, "auth_started": 10.5, "auth_ended": 11.3, "spawned": 11.5,
                  "first_text": 13.0, "last_text": 20.0, "exited": 20.5, "ended": 20.6, "output_chars": 1234}
         app = self.build(MarkedModel(marks, proposal(kind="chat", reply=REPLY)))
-        with app_clock(10.0, 21.0, 21.25, 21.5):            # start, model returned, validated, answered
+        with app_clock(10.0, 10.1, 21.0, 21.25, 21.5):      # start, routed, model returned, validated, answered
             payload = app.submit_text("Selam").payload
         self.assertEqual({"total_ms": 11500, "auth_ms": 800, "spawn_ms": 1500, "first_text_ms": 1500,
-                          "first_visible_ms": 3000, "text_ms": 7000, "parse_ms": 250, "output_chars": 1234},
+                          "first_visible_ms": 3000, "text_ms": 7000, "parse_ms": 250, "output_chars": 1234,
+                          "lane": "current", "t_route": 100, "t_proc_ready": 1500, "t_stdin_write": 1500,
+                          "t_first_token": 3000, "t_turn_done": 11500},
                          payload["intent"]["usage"]["timing"])
+
+    def test_speedbase_fields_carry_the_model_effort_and_reported_usage(self) -> None:
+        marks = {"started": 0.1, "spawned": 0.5, "first_text": 1.0, "last_text": 2.0}
+        model = MarkedModel(marks, proposal(kind="chat", reply=REPLY))
+        model.model, model.effort, model.reported = "sonnet", "low", {}
+        usage = {"input_tokens": 7, "output_tokens": 40, "cache_read_input_tokens": 9000,
+                 "cache_creation_input_tokens": 300, "service_tier": "standard"}
+        model.on_complete = lambda task: model.reported.__setitem__(task.id, usage)
+        with app_clock(0.0, 0.05, 2.5, 2.6, 2.7):
+            timing = self.build(model).submit_text("Selam").payload["intent"]["usage"]["timing"]
+        self.assertEqual({"lane": "current", "model": "sonnet", "effort": "low", "t_route": 50,
+                          "t_proc_ready": 500, "t_stdin_write": 500, "t_first_token": 1000, "t_turn_done": 2700,
+                          "tokens_in": 7, "tokens_out": 40, "cache_read": 9000, "cache_creation": 300},
+                         {k: v for k, v in timing.items() if k.startswith(("t_", "tokens", "cache"))
+                          or k in ("lane", "model", "effort")})
 
     def test_a_model_without_marks_still_gets_its_total_and_answer_size(self) -> None:
         app = self.build(ScriptedModel(proposal(kind="chat", reply=REPLY)))
-        with app_clock(0.0, 4.0, 4.1, 4.2):
+        with app_clock(0.0, 0.2, 4.0, 4.1, 4.2):
             payload = app.submit_text("Selam").payload
         answer = proposal(kind="chat", reply=REPLY)
-        self.assertEqual({"total_ms": 4200, "parse_ms": 100, "output_chars": len(answer)}, payload["intent"]["usage"]["timing"])
+        self.assertEqual({"total_ms": 4200, "parse_ms": 100, "output_chars": len(answer), "lane": "current",
+                          "t_route": 200, "t_turn_done": 4200}, payload["intent"]["usage"]["timing"])
 
     def test_refused_and_failed_turns_never_crash_and_record_what_happened(self) -> None:
         # Refused before any model is asked: no usage record at all, exactly as before.
@@ -127,16 +152,31 @@ class TurnTimingTests(IntentTestCase):
         self.assertEqual(("invalid_input", None), (payload["intent"]["status"], payload["intent"]["usage"]))
         # The model failed: its total and how long the failure took to judge.
         failing = ScriptedModel(error=StructuredError(code=ErrorCode.CONNECTOR_FAILED, message="boom"))
-        with app_clock(0.0, 2.0, 2.5):
+        with app_clock(0.0, 0.0, 2.0, 2.5):
             payload = self.build(failing).submit_text("Selam").payload
         self.assertEqual("model_failed", payload["intent"]["status"])
-        self.assertEqual({"total_ms": 2500, "parse_ms": 500}, payload["intent"]["usage"]["timing"])
+        self.assertEqual({"total_ms": 2500, "parse_ms": 500, "lane": "current", "t_route": 0, "t_turn_done": 2500},
+                         payload["intent"]["usage"]["timing"])
         # The adapter raised: the total alone - no phase is invented.
         raising = ScriptedModel()
         raising.on_complete = lambda task: (_ for _ in ()).throw(RuntimeError("x"))
-        with app_clock(0.0, 3.0):
+        with app_clock(0.0, 0.0, 3.0):
             payload = self.build(raising).submit_text("Selam").payload
-        self.assertEqual(("model_failed", {"total_ms": 3000}), (payload["intent"]["status"], payload["intent"]["usage"]["timing"]))
+        self.assertEqual(("model_failed", {"total_ms": 3000, "lane": "current", "t_route": 0, "t_turn_done": 3000}),
+                         (payload["intent"]["status"], payload["intent"]["usage"]["timing"]))
+
+
+class SpeedBaselineScriptTests(unittest.TestCase):
+    def test_the_script_refuses_the_live_data_dir(self) -> None:
+        import importlib.util
+        root = Path(__file__).resolve().parents[1]
+        spec = importlib.util.spec_from_file_location("speed_baseline", root / "scripts" / "speed_baseline.py")
+        script = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(script)
+        for live in (root / "data", root / "data" / "sub", root / "data" / "jarvis.db"):
+            with self.assertRaises(SystemExit):
+                script.refuse_live(live)
+        script.refuse_live(Path(tempfile.gettempdir()) / "speedbase-x")     # a TEMP dir passes
 
 
 class DetailLineTests(UiTestCase):

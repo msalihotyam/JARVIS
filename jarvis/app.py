@@ -3771,6 +3771,29 @@ def _turn_timing(turn: Mapping[str, Any], now: float) -> dict[str, Any]:
     chars = call.get("output_chars", turn.get("output_chars"))
     if type(chars) is int:
         timing["output_chars"] = chars
+    # SPEEDBASE: the same marks as offsets from the turn's start, plus what was
+    # asked and what the CLI reported. The connector writes the request to stdin
+    # right after the spawn and before ``spawned`` is marked, so both read it.
+    timing["lane"] = "current"
+    for key, name in (("model", "model"), ("effort", "effort")):
+        value = getattr(turn["model"], name, None)
+        if isinstance(value, str):
+            timing[key] = value
+    if "routed" in turn:
+        timing["t_route"] = ms(start, turn["routed"])
+    if "spawned" in call:
+        timing["t_proc_ready"] = timing["t_stdin_write"] = ms(start, call["spawned"])
+    if "first_text" in call:
+        timing["t_first_token"] = ms(start, call["first_text"])
+    timing["t_turn_done"] = timing["total_ms"]
+    reported = getattr(turn["model"], "reported", None)
+    reported = reported.get(turn["request_id"]) if isinstance(reported, dict) else None
+    reported = reported if isinstance(reported, dict) else {}
+    for key, name in (("tokens_in", "input_tokens"), ("tokens_out", "output_tokens"),
+                      ("cache_read", "cache_read_input_tokens"),
+                      ("cache_creation", "cache_creation_input_tokens")):
+        if type(reported.get(name)) is int:
+            timing[key] = reported[name]
     return timing
 
 
@@ -4416,6 +4439,7 @@ class JarvisApp:
                 exit_code=self._exit_code(run),
             )
         model = self.intent_model
+        turn["routed"] = time.monotonic()
         if model is None:
             return refused(
                 IntentStatus.MODEL_UNAVAILABLE,
