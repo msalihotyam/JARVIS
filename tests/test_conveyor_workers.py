@@ -367,6 +367,15 @@ class WorkerFieldTest(unittest.TestCase):
         for bad in ("gpt", "Codex", "", None, ["codex"]):
             with self.subTest(worker=bad):
                 self.assertEqual(conveyor.validate_slice({**s, "worker": bad}), "bad worker")
+        self.assertIsNone(conveyor.validate_slice({**s, "worker": "auto"}))  # ROUTE1
+
+    def test_class_validation(self):  # ROUTE1
+        s = {"id": "WA1", "model": "opus", "effort": "high", "tier": "T1", "prompt": "x.md"}
+        for ok in ("A", "B", "C"):
+            self.assertIsNone(conveyor.validate_slice({**s, "class": ok}))
+        for bad in ("D", "b", "", None, ["C"], 1):
+            with self.subTest(cls=bad):
+                self.assertEqual(conveyor.validate_slice({**s, "class": bad}), "bad class")
 
 
 class FakeCodex:
@@ -399,6 +408,88 @@ class FakeCodex:
 
     def status(self, sid):
         return self.state
+
+
+class RouteTest(Base):
+    """ROUTE1: worker "auto" is codex only when every rule holds; anything else is claude."""
+    def setUp(self):
+        super().setUp()
+        self.c.usage, self.c.codex = 80, FakeCodex(50)  # claude 20% left < codex 50%
+        self.s = {"id": "RT1", "worker": "auto", "tier": "T1", "class": "C", "files": ["docs/x.md"]}
+
+    def test_all_rules_hold_routes_codex(self):
+        self.assertEqual(self.c.route(self.s), ("codex", "claude headroom 20 < codex 50"))
+        self.assertEqual(self.c.route({**self.s, "class": "B", "tier": "T0"})[0], "codex")
+
+    def test_explicit_worker_is_kept(self):
+        for w in ("claude", "codex"):
+            self.assertEqual(self.c.route({**self.s, "worker": w}), (w, "explicit"))
+        self.assertEqual(self.c.route({k: v for k, v in self.s.items() if k != "worker"}), ("claude", "explicit"))
+
+    def test_tier_and_class_rules(self):
+        self.assertEqual(self.c.route({**self.s, "tier": "T2"}), ("claude", "tier T2"))
+        self.assertEqual(self.c.route({**self.s, "class": "A"}), ("claude", "class A"))
+        self.assertEqual(self.c.route({k: v for k, v in self.s.items() if k != "class"}),
+                         ("claude", "class unmarked"))
+
+    def test_protected_file_veto(self):
+        for f in ("scripts/x.py", "scripts", "Scripts/X.py", "scripts\\conveyor.py", "./scripts/a.py",
+                  "docs/../scripts/a.py", ".claude/skills/a.md", ".github/workflows/ci.yml", ".github/CODEOWNERS",
+                  "CLAUDE.md", "docs/AGENTS.md", "agents.md", "uv.lock", "data/x.json", "data\\jarvis.db",
+                  ".env.local", "docs/key.pem", "dev/dashboard/a.js", "docs/*", "docs/**", "jarvis/?.py",
+                  "../x.md", "/etc/x", "C:/x.md", "", " ", ".", "jarvis/ui/a.db",
+                  "scripts./x.py", ".claude./settings.json", ".github. /ci.yml", "CLAUDE.md.", "docs/AGENTS.md.",
+                  "uv.lock.", "data./x.json", "docs/key.pem.", "CLAUDE~1/settings.json", "GITHUB~1/workflows/ci.yml"):
+            with self.subTest(f=f):
+                self.assertTrue(conveyor.codex_veto(f))
+                self.assertEqual(self.c.route({**self.s, "files": ["docs/ok.md", f]}),
+                                 ("claude", f"protected file {f}"))
+        for f in ("docs/x.md", "tests/test_x.py", "jarvis/ui/strings.py", "docs/scripts/x.md"):
+            self.assertFalse(conveyor.codex_veto(f), f)
+        for f in (None, 1, ["docs/x.md"]):
+            self.assertTrue(conveyor.codex_veto(f), f)
+        self.assertEqual(self.c.route({**self.s, "files": []}), ("claude", "no files"))
+        self.assertEqual(self.c.route({k: v for k, v in self.s.items() if k != "files"}), ("claude", "no files"))
+
+    def test_unknown_claude_usage_is_claude(self):
+        for u in (None, "80", True):
+            with self.subTest(usage=u):
+                self.c.usage = u
+                self.assertEqual(self.c.route(self.s), ("claude", "claude usage unknown"))
+
+    def test_codex_admission_refused_is_claude(self):
+        for h, why in ((None, "unknown"), (None, "stale"), (5, "low"), (None, "api_key_route")):
+            with self.subTest(why=why):
+                self.c.codex = FakeCodex(h, why)
+                self.assertEqual(self.c.route(self.s), ("claude", f"codex {why}"))
+        for h in (None, "50", True):
+            with self.subTest(h=h):
+                self.c.codex = FakeCodex(h)
+                self.assertEqual(self.c.route(self.s), ("claude", "codex headroom unknown"))
+        self.c.codex.admit = lambda: (_ for _ in ()).throw(OSError("boom"))
+        self.assertEqual(self.c.route(self.s), ("claude", "codex admit OSError"))
+
+    def test_claude_not_scarcer_is_claude(self):
+        for u, h in ((50, 50), (20, 50)):
+            with self.subTest(usage=u):
+                self.c.usage, self.c.codex = u, FakeCodex(h)
+                self.assertEqual(self.c.route(self.s), ("claude", f"claude headroom {100 - u} >= codex {h}"))
+
+    def test_dispatch_emits_one_route_event_per_auto_slice(self):
+        events = []
+        self.c.event = lambda kind, **kw: events.append((kind, kw))
+        self.git.fail[("git", "worktree", "add")] = (0, "")
+        self.backlog({"id": "RTA", "worker": "auto", "class": "C", "files": ["docs/rta.md"]},
+                     {"id": "RTB", "worker": "auto", "class": "A", "files": ["docs/rtb.md"]},
+                     {"id": "RTC"})
+        lanes = {}
+        self.c.max_lanes = 5
+        self.c.dispatch_backlog(lanes, set())
+        routes = [kw for k, kw in events if k == "route"]
+        self.assertEqual(sorted((r["lane"], r["worker"]) for r in routes), [("RTA", "codex"), ("RTB", "claude")])
+        self.assertEqual([n for n, *_ in self.c.codex.started], ["RTA"])
+        self.assertEqual([lanes[n].get("worker") for n in ("RTA", "RTB", "RTC")], ["codex", None, None])
+        self.assertEqual(sorted(self.fake.bg_names()), ["RTB", "RTC"])
 
 
 class ConveyorCodexTest(Base):

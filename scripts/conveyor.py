@@ -17,6 +17,7 @@ See JARVIS_RUNBOOK.md "Konveyor".
 import calendar
 import json
 import os
+import posixpath
 import re
 import shutil
 import socket
@@ -47,6 +48,18 @@ def protected_path(p):
     return (base == "uv.lock" or base.startswith(".env") or p.startswith(("data/", "dev/dashboard/"))
             or p.startswith(PROTECTED_DIRS) or "/.jarvis/" in "/" + p
             or base.endswith((".pem", ".key", ".p12", ".pfx", ".crt", ".cer", ".db", ".sqlite", ".sqlite3")))
+
+
+CODEX_VETO = ("scripts/", ".claude/", ".github/", "data/")  # ROUTE1: worker "auto" never sends these to codex
+def codex_veto(p):
+    """A slice file that keeps a `worker: "auto"` slice on claude (ROUTE1, fail closed): empty,
+    a glob, outside the repo, under CODEX_VETO, any CLAUDE.md / AGENTS.md, or protected_path().
+    A segment ending in "." or " " (Win32 trims it: "scripts./x") or a "~" (8.3 short name) is vetoed."""
+    q = posixpath.normpath(p.replace("\\", "/").strip()).lower() if isinstance(p, str) and p.strip() else ""
+    base = q.rsplit("/", 1)[-1]
+    return (q in ("", ".", "..") or any(c in q for c in "*?[~") or ":" in q or q.startswith(("/", "../"))
+            or any(s.endswith((".", " ")) for s in q.split("/"))
+            or (q + "/").startswith(CODEX_VETO) or base in ("claude.md", "agents.md") or protected_path(q))
 
 
 SKIPLIST_RE = re.compile(r"(skip|allow)[_-]?list|load[_-]?sensitive", re.I)
@@ -792,8 +805,10 @@ def validate_slice(s):
     for k in ("files", "depends_on"):
         if not isinstance(s.get(k, []), list) or not all(isinstance(x, str) for x in s.get(k, [])):
             return f"bad {k}"
-    if s.get("worker", "claude") not in WORKERS:  # absent = claude; no automatic routing
+    if s.get("worker", "claude") not in (*WORKERS, "auto"):  # absent = claude; "auto" = Conveyor.route
         return "bad worker"
+    if "class" in s and s["class"] not in ("A", "B", "C"):  # absent = unmarked = never codex
+        return "bad class"
     return None
 
 
@@ -1854,6 +1869,35 @@ class Conveyor:
             return None
         return m.group(1)
 
+    def route(self, s):
+        """ROUTE1 deterministic worker -> (worker, reason). An explicit worker is kept; "auto" is
+        codex only for a T0/T1 class B/C slice whose files are listed and none vetoed (codex_veto),
+        with a fresh Claude weekly reading, a passing codex admit() and less Claude headroom than
+        codex headroom. Anything else (class A / unmarked, unknown quota) is claude."""
+        w = s.get("worker", "claude")
+        if w != "auto":
+            return w, "explicit"
+        if s.get("tier") not in ("T0", "T1"):
+            return "claude", f"tier {s.get('tier')}"
+        if s.get("class") not in ("B", "C"):
+            return "claude", f"class {s.get('class') or 'unmarked'}"
+        files = s.get("files", [])
+        bad = next((f for f in files if codex_veto(f)), None)
+        if not files or bad is not None:
+            return "claude", f"protected file {bad}" if files else "no files"
+        if isinstance(self.usage, bool) or not isinstance(self.usage, (int, float)):
+            return "claude", "claude usage unknown"
+        try:
+            h, why = self.codex.admit()
+        except Exception as e:
+            return "claude", f"codex admit {type(e).__name__}"
+        if why:
+            return "claude", f"codex {why}"
+        if isinstance(h, bool) or not isinstance(h, (int, float)):
+            return "claude", "codex headroom unknown"
+        left = 100 - self.usage
+        return ("codex" if left < h else "claude"), f"claude headroom {left:g} {'<' if left < h else '>='} codex {h}"
+
     def start_codex(self, name, base, text):
         """`codex exec` one lane in a worktree the conveyor creates; returns its session id
         or None. Admission refused (unknown/stale reading, not the ChatGPT route, limit
@@ -2447,7 +2491,10 @@ class Conveyor:
                 self.error(f"backlog {name}: prompt: {e}", lane=name)
                 slices = [x for x in slices if x is not s]
                 continue
-            codex = s.get("worker") == "codex"
+            worker, why = self.route(s)
+            if s.get("worker") == "auto":
+                self.event("route", lane=name, worker=worker, reason=why)
+            codex = worker == "codex"
             sid = self.start_codex(name, base, text) if codex else \
                 self.start(name, s["model"], s["effort"], text)
             if not sid:
