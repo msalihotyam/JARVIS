@@ -7,8 +7,9 @@ The hard rules below never relax. `CLAUDE.md` holds the same rules for Claude Co
 
 Hard rules:
 
-- Never push. Commit ONCE, only on your worktree branch, never on `main`.
-- Never touch, stage or commit `uv.lock`. Never stage `dev/dashboard/*`. Stage only explicit paths.
+- Never push. Never run `git add` or `git commit`: the sandbox keeps you out of `.git`; after a
+  `STATUS: PASS` report the conveyor commits the files your slice grants (and nothing else).
+- Never touch `uv.lock` or `dev/dashboard/*`. Change only the files your prompt grants.
 - No `git reset` / `restore` / `clean` / `stash`: never delete or hide work. Stay in your own worktree.
 - No live connector, model, auth or network call; never start or reinstall the packaged app.
 - Protected paths: `data/**`, `~/.jarvis/`, `.env*`, key/certificate/database files.
@@ -17,9 +18,11 @@ Hard rules:
   rollback target.
 - Tests only with `python -m unittest` (via `python scripts/test_parallel.py <modules>`); never `uv run`.
 - Never edit `CLAUDE.md`, `AGENTS.md` or anything under `.claude/`. Touch only the files your prompt owns.
-- `git diff --check` before the commit. GREEN MEANS STOP: no extra tests, audits or refactors.
+- `git diff --check` before the report. GREEN MEANS STOP: no extra tests, audits or refactors.
 - Fail closed: on uncertainty, an unowned file or a higher risk tier, stop and report BLOCKED.
 
 Report: write `build/reports/<ID>.md` in your worktree ONCE, after every check. First line exactly
-`STATUS: PASS` or `STATUS: BLOCKED`, then the fields LANE_RULES C7 lists (BRANCH, COMMIT: <40 hex>,
-FILES, RUNS, ...). The conveyor trusts only that file, the diff and its own test gate.
+`STATUS: PASS` or `STATUS: BLOCKED`, then `FILES`, one line
+`COMMIT MESSAGE: <type>(<scope>): <ID> <what+why>`, then the other fields LANE_RULES C7 lists (RUNS, ...)
+but no `COMMIT:` line (the conveyor writes the real sha), and stop. A changed file outside the grant
+leaves the lane BLOCKED. The conveyor trusts only that file, the diff and its own test gate.

@@ -40,19 +40,20 @@ PROHIBITED_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "OPENAI_
                   "OPENAI_ORGANIZATION", "OPENAI_PROJECT_ID", "AZURE_OPENAI_API_KEY")
 
 
-def check_argv(argv):
+def check_argv(argv, worktree=None):
     """Raise ValueError unless argv runs `codex exec` with exactly one sandbox no weaker
     than workspace-write, `--ignore-user-config`, `-c forced_login_method=chatgpt` and
     `-c windows.sandbox=mxc` exactly once each, and no other config or flag that widens
-    it or buys credits."""
+    it or buys credits; given `worktree`, `-C` must name exactly that path, once."""
     if len(argv) < 2 or argv[1] != "exec":
         raise ValueError("not codex exec")
-    sandboxes, configs, ignores, skip = [], [], 0, False
+    sandboxes, configs, cds, ignores, skip = [], [], [], 0, False
     for i, a in enumerate(argv[1:], 1):
         if skip:
             skip = False
             continue
         if argv[i - 1] == "-C" and not a.startswith("-"):
+            cds.append(a)
             continue  # the worktree path: a lane id like BYPASSFIX is no flag
         if a == "-c":  # exact-match allowlist: nothing else may ride on -c
             value = argv[i + 1] if i + 1 < len(argv) else None
@@ -66,7 +67,8 @@ def check_argv(argv):
             continue
         flag = a.split("=", 1)[0]  # case-sensitive: -C is the worktree, -c is config
         # a[:2] also refuses attached short values (-cKEY=V, -pPROFILE)
-        if flag in BANNED_FLAGS or a[:2] in ("-c", "-p") or a.startswith("--ignore-user-config") \
+        if flag in BANNED_FLAGS or a[:2] in ("-c", "-p") or (a[:2] == "-C" and a != "-C") \
+                or a.startswith("--ignore-user-config") \
                 or any(w in a.lower() for w in BANNED_WORDS):
             raise ValueError(f"refused argument: {a}")
         if flag in ("-s", "--sandbox"):
@@ -75,6 +77,9 @@ def check_argv(argv):
         raise ValueError(f"needs --ignore-user-config and -c {' -c '.join(CONFIGS)} exactly once")
     if len(sandboxes) != 1 or sandboxes[0] not in SANDBOXES:
         raise ValueError(f"sandbox must be one of {SANDBOXES}: {sandboxes}")
+    norm = lambda p: os.path.normcase(os.path.abspath(str(p)))  # noqa: E731
+    if worktree is not None and [norm(c) for c in cds] != [norm(worktree)]:
+        raise ValueError(f"-C must be the lane worktree {worktree} exactly once: {cds}")
     return argv
 
 
@@ -223,7 +228,7 @@ class CodexWorker:
             raise FileNotFoundError("no trusted native codex binary")
         return check_argv([exe, "exec", "--json", "--ignore-user-config", "-c", FORCED_LOGIN,
                            "-c", WINDOWS_SANDBOX, "-C", str(worktree), "--sandbox",
-                           "workspace-write", "-"])  # prompt on stdin
+                           "workspace-write", "-"], worktree=worktree)  # prompt on stdin
 
     def admit(self):
         """(headroom, None) when a FRESH account reading shows the ChatGPT subscription

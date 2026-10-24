@@ -129,6 +129,16 @@ class CheckArgvTest(unittest.TestCase):
             with self.subTest(argv=argv), self.assertRaises(ValueError):
                 check_argv(argv)
 
+    def test_cd_must_be_exactly_the_lane_worktree(self):
+        wt = "C:/repo/.claude/worktrees/CDXA"
+        argv = lambda *cd: ["codex", "exec", *FLAGS, *cd, "--sandbox", "workspace-write", "-"]  # noqa: E731
+        check_argv(argv("-C", wt), worktree=wt)
+        check_argv(argv("-C", "c:\\repo\\.claude\\worktrees\\CDXA\\"), worktree=wt)  # normalised
+        for cd in (("-C", "C:/repo"), ("-C", "C:/repo/.claude/worktrees/CDXB"), (),
+                   ("-C", wt, "-C", wt), ("-C", wt + "/sub"), ("-C", wt, "-CC:/repo")):
+            with self.subTest(cd=cd), self.assertRaises(ValueError):
+                check_argv(argv(*cd), worktree=wt)
+
 
 class HeadroomTest(unittest.TestCase):
     def test_tighter_window_wins_and_bad_values_are_unknown(self):
@@ -397,6 +407,7 @@ class ConveyorCodexTest(Base):
         self.events = []
         self.c.event = lambda kind, **kw: self.events.append((kind, kw))
         self.git.fail[("git", "worktree", "add")] = (0, "")
+        self.c.codex_commit = lambda name, ln, report: None  # CODEXCOMMIT: real git in CodexCommitTest
 
     def test_refused_admission_holds_without_start(self):
         for h, why in ((None, "unknown"), (None, "stale"), (None, "api_key_route"),
@@ -476,6 +487,24 @@ class ConveyorCodexTest(Base):
         self.c.codex_track(lanes)
         self.assertTrue(lanes["CDXA"]["finished"])
         self.assertEqual(lanes["CDXA"]["status"], "PASS")
+        self.assertEqual(self.c.codex.stopped, ["codex-7"])  # still running at PASS: stopped first
+
+    def test_refused_conveyor_commit_blocks_with_attention(self):
+        self.c.codex = FakeCodex(50)
+        self.c.codex_commit = lambda name, ln, report: "ungranted files changed: x.py"
+        lanes = self.lane()
+        report = Path(lanes["CDXA"]["worktree"]) / "build" / "reports" / "CDXA.md"
+        report.parent.mkdir(parents=True)
+        report.write_text("STATUS: PASS\n", encoding="utf-8")
+        os.utime(report, (self.t + 1, self.t + 1))
+        self.c.codex_track(lanes)
+        ln = lanes["CDXA"]
+        self.assertEqual((ln["finished"], ln["status"]), (True, "BLOCKED"))
+        self.assertEqual(ln["codex_commit"], "ungranted files changed: x.py")
+        self.assertIn(("codex_commit", {"lane": "CDXA", "id": "codex-7",
+                                        "reason": "ungranted files changed: x.py"}), self.events)
+        self.assertTrue(any(i[0] == "CDXA" and "conveyor commit refused: ungranted files changed: x.py"
+                            in str(i) for i in self.c.attention(lanes)))
 
     def test_interim_report_of_an_exited_session_is_missing(self):
         self.c.codex = FakeCodex(50)
@@ -601,6 +630,91 @@ class ConveyorCodexTest(Base):
                 step.assert_not_called()
                 self.assertNotIn("cleanup", lanes["CDXA"])
                 shutil.rmtree(Path(lanes["CDXA"]["worktree"]) / "build")
+
+
+class CodexCommitTest(Base):
+    """CODEXCOMMIT: the conveyor (outside the sandbox) commits a PASS codex lane's granted
+    files in a real temp git repo; anything else is refused with HEAD unchanged."""
+
+    def setUp(self):
+        super().setUp()
+        self.events = []
+        self.c.event = lambda kind, **kw: self.events.append((kind, kw))
+        self.c.cmd = conveyor.real_cmd
+        self.wt = self.root / "wt"
+        self.wt.mkdir()
+        for args in (["init", "-q"], ["config", "user.name", "t"], ["config", "user.email", "t@t"],
+                     ["config", "commit.gpgsign", "false"]):
+            self.assertEqual(self.git_(*args)[0], 0)
+        (self.wt / "a.txt").write_text("a\n", encoding="utf-8")
+        self.git_("add", "a.txt")
+        self.assertEqual(self.git_("commit", "-q", "-m", "init")[0], 0)
+        self.head = self.git_("rev-parse", "HEAD")[1].strip()
+        self.report = self.root / "CDXA.md"  # outside the repo: never in its status
+        self.ln = {"worktree": str(self.wt), "files": ["a.txt", "b.txt", ".env", "data/x.db"],
+                   "id": "codex-7"}
+
+    def git_(self, *args):
+        return conveyor.real_cmd(["git", "-C", str(self.wt), *args])
+
+    def run_(self, msg="COMMIT MESSAGE: fix(conveyor): CDXA granted files"):
+        self.report.write_text(f"STATUS: PASS\nCOMMIT: {'f' * 40}\n{msg}\nFILES: a.txt\n",
+                               encoding="utf-8")
+        return self.c.codex_commit("CDXA", self.ln, self.report)
+
+    def test_pass_commits_only_the_granted_files_and_writes_the_sha(self):
+        (self.wt / "a.txt").write_text("a2\n", encoding="utf-8")
+        (self.wt / "b.txt").write_text("b\n", encoding="utf-8")
+        self.assertIsNone(self.run_())
+        sha = self.git_("rev-parse", "HEAD")[1].strip()
+        self.assertNotEqual(sha, self.head)
+        out = self.git_("show", "--name-only", "--format=%B", "HEAD")[1]
+        self.assertIn("fix(conveyor): CDXA granted files", out)
+        self.assertIn("Worker: codex", out)
+        self.assertEqual(sorted(x for x in out.splitlines()[-2:]), ["a.txt", "b.txt"])
+        lines = self.report.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[:2], ["STATUS: PASS", f"COMMIT: {sha}"])
+        self.assertEqual(sum(x.startswith("COMMIT:") for x in lines), 1)  # the lane's own line is gone
+        self.assertEqual(self.events, [("codex_commit", {"lane": "CDXA", "id": "codex-7", "sha": sha})])
+        self.assertEqual(self.git_("status", "--porcelain")[1], "")
+        self.report.write_text(f"# CDXA\n**STATUS: PASS**\n**COMMIT:** {'f' * 40}\n", encoding="utf-8")
+        (self.wt / "a.txt").write_text("a3\n", encoding="utf-8")
+        self.assertIsNone(self.c.codex_commit("CDXA", self.ln, self.report))
+        sha = self.git_("rev-parse", "HEAD")[1].strip()
+        self.assertEqual(self.report.read_text(encoding="utf-8").splitlines(),
+                         ["# CDXA", "**STATUS: PASS**", f"COMMIT: {sha}"])  # prefixed fake gone, ours after STATUS
+
+    def test_ungranted_file_is_refused_and_nothing_is_committed(self):
+        (self.wt / "a.txt").write_text("a2\n", encoding="utf-8")
+        (self.wt / "evil.py").write_text("x\n", encoding="utf-8")
+        self.assertEqual(self.run_(), "ungranted files changed: evil.py")
+        self.assertEqual(self.git_("rev-parse", "HEAD")[1].strip(), self.head)
+        self.assertEqual(self.events, [])
+
+    def test_protected_paths_are_refused_even_when_granted(self):
+        (self.wt / ".env").write_text("K=1\n", encoding="utf-8")
+        (self.wt / "data").mkdir()
+        (self.wt / "data" / "x.db").write_text("x", encoding="utf-8")
+        self.assertEqual(self.run_(), "protected paths refused: .env, data/x.db")
+        self.assertEqual(self.git_("rev-parse", "HEAD")[1].strip(), self.head)
+        for p in ("uv.lock", "data/a.txt", "x/.env.local", "dev/dashboard/x.js", "k.PEM",
+                  "C:\\Users\\u\\.jarvis\\c.json", "a.sqlite3"):
+            self.assertTrue(conveyor.protected_path(p), p)
+        self.assertFalse(conveyor.protected_path("scripts/conveyor.py"))
+
+    def test_message_is_sanitised_and_falls_back(self):
+        for msg, want in (("COMMIT MESSAGE: fix(x): CDXA a\x01b   c", "fix(x): CDXA a b c"),
+                          ("COMMIT MESSAGE: fix(x): other lane", "chore: CDXA codex lane"),
+                          ("COMMIT MESSAGE: rm -rf; CDXA", "chore: CDXA codex lane"),
+                          ("", "chore: CDXA codex lane")):
+            with self.subTest(msg=msg):
+                (self.wt / "a.txt").write_text(msg + "\n", encoding="utf-8")
+                self.assertIsNone(self.run_(msg))
+                self.assertEqual(self.git_("log", "-1", "--format=%s")[1].strip(), want)
+
+    def test_nothing_changed_is_refused(self):
+        self.assertEqual(self.run_(), "no changes to commit")
+        self.assertEqual(self.c.codex_commit("CDXA", {"id": "x"}, self.report), "no lane worktree")
 
 
 if __name__ == "__main__":

@@ -39,6 +39,16 @@ STALE_LOCK_S = 300
 # CI, its build-time skip/allow lists, the conveyor itself and the Claude config
 PROTECTED_DIRS = (".github/workflows/", ".claude/")
 PROTECTED_FILES = {"scripts/test_parallel.py", "scripts/ci.ps1", "scripts/quality.ps1", "scripts/conveyor.py"}
+def protected_path(p):
+    """Never staged by the conveyor's codex commit (CODEXCOMMIT): uv.lock, operator data,
+    secrets, keys/certificates/databases, the retired dashboard, CI and the Claude config."""
+    p = p.replace("\\", "/").lower()
+    base = p.rsplit("/", 1)[-1]
+    return (base == "uv.lock" or base.startswith(".env") or p.startswith(("data/", "dev/dashboard/"))
+            or p.startswith(PROTECTED_DIRS) or "/.jarvis/" in "/" + p
+            or base.endswith((".pem", ".key", ".p12", ".pfx", ".crt", ".cer", ".db", ".sqlite", ".sqlite3")))
+
+
 SKIPLIST_RE = re.compile(r"(skip|allow)[_-]?list|load[_-]?sensitive", re.I)
 STATE_DOC = "JARVIS_ACTIVE_STATE.md"  # its "- Load-sensitive list" item (scripts/test_parallel.py)
 LOAD_SENSITIVE_RE = re.compile(r"^- Load-sensitive list.*?(?=^- |^#|\Z)", re.M | re.S)
@@ -1246,6 +1256,55 @@ class Conveyor:
         except Exception as e:  # advisory: the conveyor goes on
             self.event("reader_error", lane=name, status=type(e).__name__)
 
+    def codex_commit(self, name, ln, report):
+        """Commit a PASS codex lane's worktree outside its sandbox: only the slice's granted
+        files, by explicit path, trailer `Worker: codex`; then write the real sha as the
+        report's COMMIT line. Return None, or the refusal (nothing committed: fail closed)."""
+        wt = ln.get("worktree")
+        if not wt:
+            return "no lane worktree"
+        rc, out = self.cmd([*GIT_PIN, "-C", wt, "status", "--porcelain=v1", "-z", "-uall"])
+        if rc != 0:
+            return f"git status failed: {out.strip()[:200]}"
+        changed, parts = [], out.split("\0")
+        while parts:
+            e = parts.pop(0)
+            if len(e) > 3:
+                changed.append(e[3:])
+                if "R" in e[:2] or "C" in e[:2]:
+                    changed.append(parts.pop(0) if parts else "")  # a rename's source path
+        changed = sorted(set(changed))
+        if not changed:
+            return "no changes to commit"
+        bad = [p for p in changed if p not in set(ln.get("files") or [])]
+        if bad:
+            return "ungranted files changed: " + ", ".join(bad)
+        bad = [p for p in changed if protected_path(p)]
+        if bad:
+            return "protected paths refused: " + ", ".join(bad)
+        try:
+            text = Path(report).read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            return f"report unreadable: {e}"
+        m = re.search(r"(?mi)^[ \t]*COMMIT MESSAGE:(.*)$", text)
+        msg = " ".join(re.sub(r"[\x00-\x1f\x7f]", " ", m[1]).split())[:200] if m else ""
+        if not (re.match(r"[a-z]+(\([\w./-]+\))?!?: \S", msg) and name in msg):
+            msg = f"chore: {name} codex lane"
+        for args in (["add", "--", *changed], ["commit", "-m", msg, "-m", "Worker: codex"]):
+            rc, out = self.cmd([*GIT_PIN, "-C", wt, *args])
+            if rc != 0:
+                return f"git {args[0]} failed: {out.strip()[:200]}"
+        rc, out = self.cmd([*GIT_PIN, "-C", wt, "rev-parse", "HEAD"])
+        sha = out.strip()
+        if rc != 0 or not SHA_RE.fullmatch(sha):
+            return f"commit sha unreadable: {sha[:80]}"
+        # the lane's own COMMIT lines go, past the prefixes report_status skips; ours follows STATUS
+        lines = [x for x in text.splitlines() if not re.match(r"(?i)COMMIT[ \t*`]*:", x.lstrip(" \t>#*`"))]
+        at = next((i + 1 for i, x in enumerate(lines) if x.lstrip(" \t>#*`").upper().startswith("STATUS")), 1)
+        Path(report).write_text("\n".join(lines[:at] + [f"COMMIT: {sha}"] + lines[at:]) + "\n", encoding="utf-8")
+        self.event("codex_commit", lane=name, id=ln["id"], sha=sha)
+        return None
+
     def codex_track(self, lanes):
         """Codex lanes: the report file finishes them; an exited (or, after a conveyor
         restart, unknown) session without one is MISSING, and a late report still wins."""
@@ -1290,6 +1349,14 @@ class Conveyor:
                 if self.codex.status(ln["id"]) == "running":
                     continue  # ponytail: no INTERIM_TIMEOUT_S for a running codex lane; add if they write interims
                 found = None  # an interim from a gone session is no finish: MISSING below
+            if found and found[1] in GOOD:  # CODEXCOMMIT: the lane never commits, the conveyor does
+                if self.codex.status(ln["id"]) == "running":
+                    self.codex.stop(ln["id"])  # a PASS report is final: no edits after the snapshot
+                why = self.codex_commit(name, ln, found[0])
+                if why:
+                    ln["codex_commit"] = why
+                    self.event("codex_commit", lane=name, id=ln["id"], reason=why)
+                    found = (found[0], "BLOCKED")
             if found:
                 self.finish(name, ln, *found)
                 continue
@@ -2447,7 +2514,8 @@ class Conveyor:
             elif ln.get("status") in BAD or ln.get("status") in ("STUCK", "MISSING"):
                 why.append(f"STATUS {ln['status']}")
                 for k, lead in (("ci_why", ""), ("resume_refused", "resume in place refused: "),
-                                ("interim_timeout", ""), ("codex_unverified", "")):
+                                ("interim_timeout", ""), ("codex_unverified", ""),
+                                ("codex_commit", "conveyor commit refused: ")):
                     if ln.get(k):
                         why.append(lead + ln[k])
             elif ln.get("status") not in GOOD | {CI_PENDING}:  # CONVFIX61: unknown status pages (fail-closed)
