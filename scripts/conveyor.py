@@ -184,6 +184,10 @@ RESET_DONE_ID = "quota-reset"
 # Version pin (CONVPIN): pace.json "claude_version" set -> dispatch only when `claude --version`
 # equals it; absent -> no check. Mismatch/unreadable: nothing is sent, no lane is failed.
 CC_VERSION_ID = "cc-version"  # attention id (and ack file)
+# RMREADALERT: claude rm refused for an unreadable ~/.claude/jobs/<id>/state.json (or worktree dir):
+# one global item instead of one per lane, paged at most once per REGISTRY_PAGE_S
+CLEANUP_REGISTRY_ID = "cleanup-registry"
+REGISTRY_PAGE_S = 86400
 CC_VERSION_TIMEOUT_S = 20
 CC_VERSION_RE = re.compile(r"\s*v?(\d+(?:\.\d+)+\S*)")  # "2.1.123 (Claude Code)" -> 2.1.123
 USAGE_FRESH_S = 7 * 86400  # weekly % never drops before the window resets
@@ -2653,7 +2657,9 @@ class Conveyor:
                     self.quiet.add(n)
         for n, ln in lanes.items():  # CONV11: one item per preserved lane, until acked
             c = ln.get("cleanup") or {}
-            if c.get("retry_ts") and not c.get("in_main"):  # in_main: only waits for the next push
+            # in_main: only waits for the next push; registry: the global cleanup-registry item
+            if c.get("retry_ts") and not c.get("in_main") and not (
+                    c.get("registry") and self.pager_flag("cleanup_registry")):
                 items.append((f"cleanup:{n}", f"cleanup refused ({c['reason']}); retried after "
                                               f"{iso(c['retry_ts'])}", c["ts"]))
                 self.quiet.add(f"cleanup:{n}")
@@ -2695,6 +2701,12 @@ class Conveyor:
         reset = self.pager_flag("quota_reset")
         if reset:
             items.append((RESET_DONE_ID, "kota sıfırlandı, tempo modu açık", reset))
+        reg = self.pager_flag("cleanup_registry")
+        if reg:
+            items.append((CLEANUP_REGISTRY_ID, "claude rm blocked by an unreadable session record or worktree "
+                                               "dir; check ~/.claude/jobs/*/state.json",
+                          (reg.get("since") if isinstance(reg, dict) else None) or self.now()))
+            self.quiet.add(CLEANUP_REGISTRY_ID)  # paged by rm_registry, once per REGISTRY_PAGE_S
         cc = self.pager_flag("cc_version")
         if cc:
             items.append((CC_VERSION_ID, f"cc-version: {cc[0]}", cc[1]))
@@ -3730,6 +3742,11 @@ class Conveyor:
                         except Exception as e:
                             rc, out = type(e).__name__, ""
                         steps.append({"cmd": cmd, "id": a["id"], "rc": rc, "output": out[-300:], "discard": True})
+                    if cmd == "rm" and rc == 0 and self.pager_flag("cleanup_registry"):
+                        self.pager_flag("cleanup_registry", False)  # the registry reads again
+                    elif cmd == "rm" and rc != 0 and not found and self.rm_gone(a, out):
+                        steps[-1].update(rc=0, rm_rc=rc, gone=True)  # already removed elsewhere
+                        rc = 0
                     if rc != 0:
                         break
                 if steps[-1]["rc"] != 0:
@@ -3749,6 +3766,8 @@ class Conveyor:
                     # the next day
                     self.retry_cleanup(name, ln, "rm", f"claude rm refused: {steps[-1]['output'][-150:]}",
                                        self.rm_in_main(out))  # the full text, not the 300-char tail
+                    if self.rm_registry(out):
+                        ln["cleanup"]["registry"] = True
 
     def archive_sessions(self, lanes, agents, attention_ids=(), dry_run=False, limit=None):
         """SESSIONSWEEP: move (never delete) the transcripts (<projects>/<slug>/<id>-*.jsonl and
@@ -3850,6 +3869,39 @@ class Conveyor:
             return None
         return m[1], toks, [t[:40] for t in toks]
 
+    def rm_registry(self, out):
+        """True (and the global cleanup-registry flag set, paged once per REGISTRY_PAGE_S) when a
+        claude rm refusal says a session record or the directory couldn't be read."""
+        low = out.lower().replace("’", "'")
+        if "couldn't be read" not in low and "record names this directory" not in low:
+            return False
+        f = self.pager_flag("cleanup_registry")
+        if not isinstance(f, dict) or not isinstance(f.get("since"), (int, float)):
+            self.pager_flag("cleanup_registry", {"since": self.now()})
+        # the page clock is its own key: a success elsewhere clearing the item never re-arms it
+        paged = self.pager_flag("cleanup_registry_paged")
+        if not isinstance(paged, (int, float)) or self.now() - paged >= REGISTRY_PAGE_S:
+            self.page("claude rm blocked by an unreadable session record or worktree dir; "
+                      "check ~/.claude/jobs/*/state.json")
+            self.pager_flag("cleanup_registry_paged", self.now())
+        return True
+
+    def rm_gone(self, a, out):
+        """True when claude rm said "No job matching" and a fresh `claude agents` listing no longer
+        shows the session (its id or sessionId); fail closed: any error is False."""
+        if "no job matching" not in out.lower():
+            return False
+        self.beat()
+        try:
+            if a["id"] not in out:
+                return False
+            ids = {a["id"], a.get("sessionId")} - {None}
+            listed = self.agents()  # an empty listing proves nothing (jobs dir unreadable?)
+            return bool(listed) and not any(x.get("id") in ids or x.get("sessionId") in ids
+                                            for x in listed)
+        except Exception:
+            return False
+
     def rm_in_main(self, out):
         """True when a claude rm refusal names only unpushed commits whose tips are provably on
         local main (off_main): they wait for the next push, nothing for the orchestrator.
@@ -3912,7 +3964,7 @@ class Conveyor:
         if why:
             self.retry_cleanup(name, ln, "worktree", why)
         else:
-            for k in ("step", "reason", "ts", "retry_ts", "in_main"):
+            for k in ("step", "reason", "ts", "retry_ts", "in_main", "registry"):
                 ln["cleanup"].pop(k, None)
 
     def remove_worktree(self, name, ln):

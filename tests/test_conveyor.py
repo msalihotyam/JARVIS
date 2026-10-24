@@ -3893,6 +3893,63 @@ class TestPreserved(Base):
         self.assertNotIn("cleanup:A", "\n".join(self.pushes))
         self.assertEqual(self.cleanup_ids(), ["cleanup:A"])  # still on the board
 
+    def registry_pages(self):
+        text = "\n".join(self.pushes + self.c.load_pager().get("pending", []))
+        return text.count("unreadable session record")
+
+    def test_rm_unreadable_record_is_one_global_item_paged_once_a_day(self):
+        """RMREADALERT: the unreadable-record refusal is one cleanup-registry item, paged once per
+        24 h, never a per-lane cleanup item; success clears it."""
+        self.fake.rm_rc = 1
+        self.fake.rm_out = ("Couldn’t verify that no other session’s record names this directory "
+                            "(a session record, or the directory itself, couldn’t be read)")
+        self.run_cleanup()
+        ids = [i["id"] for i in self.status()["attention"]]
+        self.assertIn(conveyor.CLEANUP_REGISTRY_ID, ids)
+        self.assertEqual(self.cleanup_ids(), [])
+        self.assertEqual(len([e for e in self.events() if e["event"] == "cleanup_refused"]), 1)
+        self.assertEqual(self.registry_pages(), 1)
+        self.t += 3600  # the same refusal within 24 h of the page: no second page
+        self.assertTrue(self.c.rm_registry(self.fake.rm_out))
+        self.assertEqual(self.registry_pages(), 1)
+        self.t = self.lanes()["A"]["cleanup"]["retry_ts"]  # the daily retry: 24 h since the page
+        self.c.pass_once()
+        self.assertEqual(len(self.cli("rm")), 2)
+        self.assertEqual(self.registry_pages(), 2)
+        self.assertEqual(self.cleanup_ids(), [])
+        self.fake.rm_rc = 0
+        self.t = self.lanes()["A"]["cleanup"]["retry_ts"]
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["A"]["cleanup"]["result"], "removed")
+        self.assertNotIn(conveyor.CLEANUP_REGISTRY_ID, [i["id"] for i in self.status()["attention"]])
+
+    def test_rm_no_job_matching_and_not_listed_is_removed(self):
+        self.fake.rm_rc = 1
+        self.fake.rm_out = "No job matching '{sid}'"
+        run = self.c.run
+
+        def gone(args, **kw):
+            r = run(args, **kw)
+            if args[0] == "rm":  # the orchestrator stays listed: an empty listing proves nothing
+                self.fake.agents = [a for a in self.fake.agents if a["id"] != args[1]] + [
+                    {"id": "ffff0002", "name": "orchestrator", "kind": "interactive",
+                     "state": "running", "status": "busy", "pid": 2, "sessionId": "ffff0002-x"}]
+            return r
+        self.c.run = gone
+        self.run_cleanup()
+        c = self.lanes()["A"]["cleanup"]
+        self.assertEqual(c["result"], "removed")
+        self.assertNotIn("retry_ts", c)
+        self.assertEqual(self.cleanup_ids(), [])
+        self.assertNotIn("--discard-unpushed", " ".join(" ".join(x) for x in self.cli("rm")))
+
+    def test_rm_no_job_matching_while_listed_is_refused(self):
+        self.fake.rm_rc = 1
+        self.fake.rm_out = "No job matching '{sid}'"
+        self.run_cleanup()
+        self.assertIn("retry_ts", self.lanes()["A"]["cleanup"])
+        self.assertEqual(self.cleanup_ids(), ["cleanup:A"])
+
     def test_preserved_never_pages(self):
         self.lane_commit()
         self.run_cleanup()
