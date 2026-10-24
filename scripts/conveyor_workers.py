@@ -420,14 +420,15 @@ def _http(method, url, headers, body=None):
         return e.code, {}
 
 
-def _clip(v, n=JULES_TEXT_MAX):
-    """A Jules value as text of at most n chars; None stays None."""
+def _clip(v, n=JULES_TEXT_MAX, scrub=str):
+    """A Jules value as text of at most n chars, scrubbed as a whole text before the clip
+    (so dict keys too, and nothing straddles the cut); None stays None."""
     if v is None:
         return None
-    return (v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str))[:n]
+    return scrub(v if isinstance(v, str) else json.dumps(v, ensure_ascii=False, default=str))[:n]
 
 
-def _activity(a):
+def _activity(a, scrub=str):
     """One Jules activity -> the few fields a human needs (each clipped)."""
     def sub(k):
         v = a.get(k)
@@ -445,7 +446,7 @@ def _activity(a):
         "error": sub("sessionFailed").get("reason"),
         "text": a.get("description"),
     }
-    return {k: _clip(v) for k, v in fields.items() if v not in (None, "", {}, [])}
+    return {k: _clip(v, scrub=scrub) for k, v in fields.items() if v not in (None, "", {}, [])}
 
 
 def _git(argv):
@@ -637,42 +638,48 @@ class JulesWorker:
             jid = None
         key = self._key()
 
-        def scrub(v):  # never echo the key, even if Jules quoted it back; values only, before any clip
-            if isinstance(v, str):
-                return v.replace(key, "[key]") if key else v
-            if isinstance(v, dict):
-                return {k: scrub(x) for k, x in v.items()}
-            return [scrub(x) for x in v] if isinstance(v, list) else v
+        def scrub(t):  # never echo the key, even if Jules quoted it back; once, on _clip's whole text
+            return t.replace(key, "[key]") if key else t
 
         def get(path, field):
             r = self._call("GET", path)
-            return scrub(r.get(field)) if isinstance(r, dict) else None
+            return r.get(field) if isinstance(r, dict) else None
         if jid:
             try:
-                out["state"] = _clip(get(f"sessions/{jid}", "state"))
+                out["state"] = _clip(get(f"sessions/{jid}", "state"), scrub=scrub)
             except Exception as e:  # a read error is recorded, never fatal
-                out["errors"].append(_clip(str(e)))
+                out["errors"].append(_clip(str(e), scrub=scrub))
             try:  # ponytail: one page of 100; the newest 10 of a longer session need paging
                 acts = get(f"sessions/{jid}/activities?pageSize=100", "activities")
                 acts = [a for a in acts if isinstance(a, dict)] if isinstance(acts, list) else []
                 acts.sort(key=lambda a: str(a.get("createTime") or ""), reverse=True)
-                out["activities"] = [_activity(a) for a in acts[:10]]
+                out["activities"] = [_activity(a, scrub) for a in acts[:10]]
             except Exception as e:
-                out["errors"].append(_clip(scrub(str(e))))
-        blob = json.dumps(out, ensure_ascii=False, indent=1)
-        while len(blob.encode("utf-8")) > JULES_WHY_MAX and out["activities"]:
-            out["activities"].pop()  # the oldest goes first
-            blob = json.dumps(out, ensure_ascii=False, indent=1)
+                out["errors"].append(_clip(str(e), scrub=scrub))
+        def dump():  # the exact bytes written: LF only, so the size on disk is the size measured
+            return json.dumps(out, ensure_ascii=False, indent=1).encode("utf-8")
+        blob = dump()
+        while len(blob) > JULES_WHY_MAX:
+            if out["activities"]:
+                out["activities"].pop()  # the oldest goes first
+            elif out["errors"]:
+                out["errors"].pop()
+            elif out["state"]:
+                out["state"] = out["state"][:len(out["state"]) // 2] or None
+            else:
+                break  # lane + sid alone are far below the cap
+            blob = dump()
         texts = [t for a in out["activities"] for k, t in a.items() if k not in ("type", "time") and t]
         line = " ".join(" ".join(str(x).split()) for x in [out["state"] or "", *texts[:1], *out["errors"][:1]] if x)
-        line = "".join(c for c in line if c.isprintable())  # one clean line for the BLOCKED report
+        # one clean line for the BLOCKED report; a space, not a deletion, so no key is re-joined
+        line = "".join(c if c.isprintable() else " " for c in line)
         try:
             if not JULES_ID_RE.fullmatch(str(name)):
                 raise OSError("bad lane name")
             f = self.root / JULES_DIR / f"{name}.json"
             f.parent.mkdir(parents=True, exist_ok=True)
             tmp = f.with_suffix(".tmp")
-            tmp.write_text(blob, encoding="utf-8")
+            tmp.write_bytes(blob)  # no CRLF translation on Windows
             os.replace(tmp, f)
         except OSError as e:
             line += f" (summary not saved: {type(e).__name__})"

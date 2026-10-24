@@ -1087,6 +1087,35 @@ class JulesWorkerTest(unittest.TestCase):
         self.assertEqual(self.w.why("jules-abc", "JX"), "[key] h[key]llo")
         self.assertEqual(sorted(json.loads(self.summary())), ["activities", "errors", "lane", "sid", "state"])
 
+    def test_why_caps_the_bytes_on_disk_under_a_crlf_newline(self):
+        real = Path.write_text
+
+        def crlf(path, data, encoding=None, errors=None, newline=None):  # Windows text mode
+            return real(path, data, encoding=encoding, errors=errors, newline="\r\n" if newline is None else newline)
+        big = "ğ\x01" * 2000  # 2-byte and 6-byte (\u0001) characters
+        self.reply([{"createTime": f"t{i}", "agentMessaged": {"agentMessage": "ğ" * 2000}}
+                    for i in range(10)], state=big)  # ~2000 B state + ~1000 B each: one activity fits
+        with mock.patch.object(Path, "write_text", crlf):
+            self.w.why("jules-abc", "JX")
+        raw = (self.root / workers.JULES_DIR / "JX.json").read_bytes()
+        self.assertLessEqual(len(raw), workers.JULES_WHY_MAX)
+        self.assertNotIn(b"\r\n", raw)
+        data = json.loads(raw.decode("utf-8"))
+        self.assertTrue(data["state"])
+        self.assertTrue(data["activities"])
+
+    def test_why_scrubs_the_key_as_a_dict_key(self):
+        self.reply([{"sessionFailed": {"reason": {KEY: 1}}, "description": {KEY: {KEY: "x"}}},
+                    {"description": {"x" * 488: {KEY: 1}}}], state={KEY: KEY})  # 2nd: a key straddling the clip
+        line = self.w.why("jules-abc", "JX")
+        text = self.summary()
+        self.assertNotIn(KEY[:5], text + line)
+        self.assertIn("[key]", text)
+
+    def test_why_line_never_rejoins_a_key_split_by_a_control_char(self):
+        self.reply([{"agentMessaged": {"agentMessage": KEY[:6] + "\x01" + KEY[6:]}}])
+        self.assertNotIn(KEY, self.w.why("jules-abc", "JX"))
+
     def test_why_bad_lane_name_saves_nothing(self):
         self.reply([])
         for name in ("../x", "a b", "", "x" * 129):
