@@ -6,7 +6,10 @@ route(text) picks the lane before any model call:
   L2  one-turn task that needs tools, files or live data
   L3  long, multi-step or background project work
 Fail safe: when unsure, the higher lane. L0 only when every word of the
-message belongs to one local intent; a single leftover content word drops it.
+message belongs to one local intent (explicit word lists, so a negation like
+"kapatma" or any second clause drops it). L1 only on positive evidence: every
+word is known chat vocabulary, or the open words are the nouns of a plain
+question; anything else is L2.
 Pure: no network, no model, no I/O, no mutable module state; never executes.
 """
 
@@ -62,21 +65,24 @@ _L0 = (
     ("cancel", _rx(r"^(.*\s)?(dur|durdur|dursana|sus|sussana|kes|yeter)(\s.*)?$"),
      _rx(r"dur|durdur|dursana|sus|sussana|kes|yeter|bir|dakika|saniye|konusma(yi)?")),
     ("cancel", _rx(r"\b(iptal|vazgec\w*|bosver|bos\s+ver|gerek\s+yok)\b"),
-     _rx(r"iptal|et|etsene|eder|edin|edebilir\w*|vazgec(tim|tik|elim|iyorum)?|bosver"
+     _rx(r"iptal|et|etsene|eder|edin|edebilir|edebilirsin|edebilirmisin|vazgec(tim|tik|elim|iyorum)?|bosver"
          r"|bos|ver|gerek|yok|neyse|bunu|onu|hepsini|islemi|unut")),
     ("close_window", _rx(r"\bkapat"),
-     _rx(r"kapat(ir|sana|in|iver\w*|alim|abilir\w*)?|pencere(yi)?|bunu|onu|bu|olur")),
+     _rx(r"kapat(ir|sana|in|iniz|alim|abilir|abilirsin|abilirmisin|iver|iversene)?"
+         r"|pencere(yi)?|bunu|onu|bu|olur")),
     ("time.now", _rx(r"\bsaat(i|in)?\b"),
-     _rx(r"saat(i|in|e)?|kac(tir|ti)?|oldu|olmus|su|an|suan|simdiki|ne|nedir|tam"
-         r"|olarak|soyle\w*|soyler|ogren\w*|bak\w*|var")),
+     _rx(r"saat(i|e)?|kac(tir|ti)?|oldu|olmus|su|an|suan|simdiki|ne|nedir|tam|olarak"
+         r"|soyle|soyler|soylesene|soyleyebilir|soyleyebilirsin|soyleyebilirmisin"
+         r"|ogrenebilir|ogrenebilirmiyim|bak|bakar|baksana|bakabilir|bakabilirsin")),
     ("date.today", _rx(r"gunlerden|tarih|\bayin\s+kac|\b(hangi|ne)\s+gun|gundeyiz"
                        r"|kacindayiz"),
      _rx(r"bugun(un|ku)?|gunlerden|ne|nedir|tarih(i|ini|imiz)?|kac|kaci|kacinci"
-         r"|kacindayiz|ayin|hangi|gun(u|un|e|deyiz|undeyiz)?|haftanin|soyle\w*"
-         r"|soyler|ogren\w*|su|an|itibariyla")),
+         r"|kacindayiz|ayin|hangi|gun(u|un|e|deyiz|undeyiz)?|haftanin|soyle|soyler"
+         r"|soylesene|soyleyebilir|soyleyebilirsin|ogrenebilir|su|an|itibariyla")),
     ("thanks", _rx(r"tesekkur|sag\s?ol|eyvallah|\b(tsk|tsks|tskler|eyv|mersi|sagolasin)\b"
                    r"|eline\s+saglik"),
-     _rx(r"tesekkur\w*|sag|ol|olun|sagol\w*|eyv|tsk\w*|mersi|ederim|ederiz|eline"
+     _rx(r"tesekkur(ler|ederim|ederiz)?|sag|ol|olun|sagol(un|asin|dun)?|eyv|tsk(ler|s)?"
+         r"|mersi|ederim|ederiz|eline"
          r"|saglik|bin|kere|varol|varolasin|olasin|olsun")),
     ("greet", _rx(r"gorusuruz|hosca\s?kal|iyi\s+geceler|bay\s+bay|\bbye\b|gule\s+gule"),
      _rx(r"gorusuruz|gorusmek|uzere|hosca|kal|hoscakal|geceler|bay|bye|gule"
@@ -88,8 +94,10 @@ _L0 = (
 )
 # The task verbs / tool nouns an L0 intent owns; any other one refuses L0
 # ("tarihi güncelle", "saati ayarla" are tasks).
-_L0_OWN = {"cancel": _rx(r"durdur|iptal"), "close_window": _rx(r"kapat\w*|pencere\w*"),
-           "time.now": _rx(r"bak\w*")}
+_L0_OWN = {"cancel": _rx(r"durdur|iptal"),
+           "close_window": _rx(r"kapat(ir|sana|in|iniz|alim|abilir|abilirsin|abilirmisin"
+                               r"|iver|iversene)?|pencere(yi)?"),
+           "time.now": _rx(r"bak|bakar|baksana|bakabilir|bakabilirsin")}
 
 # Verbs that ask for an action with tools. Short stems get explicit suffixes
 # (vowel harmony aware) so "acaba", "yapay", "bulut", "silah" stay out;
@@ -121,24 +129,28 @@ _TOOL_NOUN = _rx(r"""
     dosya\w*|klasor\w*|dizin\w*|tablo\w*|excel\w*|pdf\w*|word\w*|docx|xlsx|csv\w*
     |json\w*|belge\w*|dokuman\w*|rapor\w*|sunum\w*|slayt\w*|powerpoint\w*|e?mail\w*
     |eposta\w*|posta(mi|lari|larimi|yi)|takvim\w*|toplanti\w*|randevu\w*
-    |hatirlatici\w*|alarm\w*|link\w*|url\w*|internet(te|ten|i)|web\w*|google\w*
+    |hatirlatici\w*|alarm\w*|link\w*|url\w*|internet\w*|web\w*|google\w*
     |tarayici\w*|chrome\w*|sekme\w*|spotify\w*|youtube\w*|muzi\w*|sarki(yi|lari)
     |playlist\w*|video\w*|fotograf\w*|foto(lar\w*|yu|yi|da|dan)?|resim\w*|gorsel\w*|github\w*|issue\w*
     |script\w*|betik\w*|bilgisayar(i|imi|da|daki|imda|imdaki)|ekran(i|goruntusu)?
     |goruntusu|pencere(yi|leri)|uygulama\w*|mesaj\w*|whatsapp\w*|telegram\w*|sms\w*
     |hava(si|lar|yi|da)?|havadurumu|dolar\w*|euro\w*|borsa\w*|bitcoin\w*|kripto\w*
-    |haber(ler\w*|i|in)|skor\w*|trafik\w*|masaustu\w*|indirilenler\w*|ses(i|ini)|parlakli\w*
+    |haber(ler\w*|i|in)|skor\w*|trafik\w*|masaustu\w*|indirilenler\w*|ses(|i|in|ini)|parlakli\w*
     |wifi\w*|bluetooth\w*|kod(u|unu|umu|da|daki|lari|larini|um)|fonksiyon\w*
     |test(leri|lerini|i)|notlar\w*|yedek\w*|eczane\w*|tarif\w*|cv\w*|hesap(tan|ima|imdan)
     |fiyat\w*|oturum(u|unu|dan)|ozet\w*|sterlin\w*|yagmur\w*|ezan\w*|benzinlik\w*
-    |pil(im|i|in)|baglanti(m|mi|si|yi)\w*|mac(i|in|lar\w*)?
+    |pil(im|i|in)?|baglanti(m|mi|si|yi)\w*|mac(i|in|lar\w*)?|altin\w*|gumus\w*
+    |fatura\w*|bakiye\w*|cpu\w*|gpu\w*|ram(i|im|imi|in)|islemci(m|mi|nin|yi)
+    |bellek(im|imi|i)|disk(im|imi|i|in|te)|sicakli\w*|telemetri\w*|batarya\w*|sarj\w*
+    |fan(i|in|lar\w*)?|disari(si|da)|bilgisayar(im|imin|imiz|in)|benzin\w*|mazot\w*
+    |deprem\w*|gundem\w*|iftar\w*|sahur\w*|yol(u|lar|da)?
 """)
 # Live prices: "altın kaç lira", "gram altın ne kadar", "kaç TL".
 _LIVE = re.compile(r"\b(kac|ne\s+kadar)\s+(lira|tl|kurus|dolar|euro)\b"
                    r"|\b(altin|gumus|benzin|mazot|motorin|akaryakit|faiz)\w*\s+"
                    r"(\w+\s+)?(ne\s+kadar|kac\b|fiyat)"
                    r"|\byag(ar|acak|iyor)\b|\bgun\s+batim|\bsistem\s+saat|\ben\s+yakin\b"
-                   r"|\bip\s+adres")
+                   r"|\bip\s+adres|\bkaca\b|\bkac\s+kac\b")
 # L3: project nouns + build verbs, rewrite markers, background/recurring work.
 _PROJECT = _rx(r"""
     proje\w*|\w*repo\w*|depo(yu|nun|daki|da)|uygulama\w*|app\w*|(web)?site\w*|sistem\w*
@@ -155,7 +167,11 @@ _L3_PHRASE = re.compile(
     r"|\barka\s+planda\b|\bbitince\s+haber|\bkod\s+taban|\bweb\s+sayfa|\blanding\s+page"
     r"|\belden\s+gecir")
 _RECURRING = re.compile(r"\bher\s+(gun|sabah|aksam|gece|hafta|ay|saat|pazartesi|sali"
-                        r"|carsamba|persembe|cuma|cumartesi|pazar)\w*")
+                        r"|carsamba|persembe|cuma|cumartesi|pazar)\w*"
+                        r"|\bher\s+\w+\s+(saatte|gunde|haftada)\b|\bhergun\w*"
+                        r"|\b(haftada|gunde|ayda)\s+(bir|iki|uc|\d+)\b|\bsaat\s+basi\b"
+                        r"|\b(pazartesi|sali|carsamba|persembe|cuma|cumartesi|pazar)(leri|lari)\b"
+                        r"|\bsurekli\b")
 _ALL = re.compile(r"\b(tum|butun|hepsini|her\s+bir)\b")
 _SEQUENCE = re.compile(r"\b(sonra|ardindan|akabinde|sonrasinda|once|en\s+son|daha\s+sonra)\b")
 # Request markers: "yapar mısın", "-abilir", "-sana", "lütfen".
@@ -183,12 +199,14 @@ _ACK = _rx(r"naber|nbr|merhaba|selam\w*|tamam|peki|evet|hayir")
 _SOCIAL = _rx(r"tesekkur\w*|sagol\w*|harika|super|guzel|anladim|anladik|yorgun\w*"
               r"|sikil\w*|hissed\w*|mutlu\w*|uzgun\w*|sence|bence")
 # "devam edelim mi", "silsem mi": a proposal to act, not a question.
-_PROPOSAL = _rx(r"\w+[ae]lim|\w+s[ae]m")
+_PROPOSAL = _rx(r"\w+[ae]lim|\w+s[ae]m|\w+[ae]y[iu]m")
 # Mixed messages are routed per clause: "nasılsın, bir de pr at" is work.
 _CLAUSE = re.compile(r"[,;?!.]+|\b(?:ve|sonra|ayrica|bir de)\b")
 # "sor/söyle/ver/say" alone are orders or relays ("bana pizza söyle",
-# "ahmete sor"); with a chat object ("bir söz söyle") they are chat.
-_WEAK_CHAT = _rx(r"(sor|soyle|ver|say)(sana|sene|[iu]n(iz)?)?")
+# "ahmete sor", "söyler misin", "sorabilir misin"); with a chat object
+# ("bir söz söyle") they are chat.
+_WEAK_CHAT = _rx(r"(sor|soyle|ver|say)(|sana|sene|[iu]n(iz)?|[ae]?r|[iu]r|y?[ae]bil\w*"
+                 r"|y?[ae]c[ae]k\w*)")
 _TALK_OBJ = _rx(r"(espri|fikra|saka|bilmece|tekerleme|soz|tavsiye|fikir|fikr|oneri"
                 r"|bilgi|cevap|yorum|motivasyon|ornek)\w*")
 _WISH = _rx(r"isti(yorum|yoruz|yom)|isterim|isteriz")
@@ -196,6 +214,30 @@ _POINTED = _rx(r"(bu|su|o)(n[iu]|nlari)")
 _ACCUSATIVE = _rx(r"\w+[iu]")
 _STRONG_CHAT = _rx(r"(anlat|acikla|tanimla|oner|tavsiye|cevapla|yorumla|dusun|tahmin"
                    r"|konus|sohbet|espri|fikra)\w*")
+
+# Positive evidence for L1: small function words that are neither content
+# nor a task ("ben de", "biraz daha", "kısaca").
+_L1_WORD = _rx(r"""
+    bugun|canim|kendim\w*|ben|beni|bana|benim|sen|seni|sana|senin|biz|siz|o|bu|su
+    |an|bunlar|bir|en|az|daha|biraz|ama|fakat|ve|ile|gibi|icin|kadar|zaman|demek
+    |fark|haber|saniye|dakika|dur|kisaca|boyle|oyle|gercekten|var|yok|olur|ileri
+    |geri|uzun|kisa|kotu|yapiyorsun|dersin|\d+
+""")
+_KNOWN = (_SOFT, _L1_WORD, _ASK, _SOCIAL, _ACK, _TALK_OBJ, _CHAT_VERB, _WISH)
+# Questions about the present moment need live data ("X şu an ne kadar");
+# "... ne dersin / olur mu" after an order is a proposal to act.
+_NOW = re.compile(r"\b(su\s+an|suan|simdi\w*|anlik|guncel\w*|bugun\w*|yarin\w*|canli"
+                  r"|son\s+durum)\b")
+_PROPOSE_TAIL = re.compile(r"\b(ne\s+dersin|olur\s+mu|olmaz\s+mi|nasil\s+olur|tamam\s+mi)$")
+# A finite verb may follow the question word ("dünya neden döner");
+# a second-person verb ("yatıracaksın", "geliyor musun") asks me to act.
+_FINITE = _rx(r"\w+(d[iu]|t[iu]|m[iu]s|[iu]yor|[aeiu]r)")
+_SECOND = _rx(r"\w+([ae]c[ae]k|[iu]yor|m[ae]l[iu]|[aeiu]r)s[iu]n(iz)?")
+_QUANT = _rx(r"kac\w*|hangi\w*")
+# Bare "saat kaç" is L0; any other content around it ("tokyoda") needs a tool.
+_CLOCK = re.compile(r"\bsaat\s+kac\b")
+# A bare yes/no particle makes an order a question ("yeter mi", "kapat mı").
+_YESNO = _rx(r"m[iu]")
 
 _LONG = 35
 
@@ -205,6 +247,8 @@ def _l0(tokens: list[str], text: str) -> str | None:
         return None
     for intent, core, extra in _L0:
         own = _L0_OWN.get(intent)
+        if intent in ("cancel", "close_window") and any(_YESNO.fullmatch(t) for t in tokens):
+            continue
         if core.search(text) and all(
             (_SOFT.fullmatch(t) or extra.fullmatch(t))
             and not ((_TASK_VERB.fullmatch(t) or _TOOL_NOUN.fullmatch(t))
@@ -213,6 +257,28 @@ def _l0(tokens: list[str], text: str) -> str | None:
         ):
             return intent
     return None
+
+
+def _known(t: str) -> bool:
+    return any(p.fullmatch(t) for p in _KNOWN)
+
+
+def _plain_question(tokens: list[str], norm: str) -> bool:
+    """Open words are nouns of a question about the world, not an order."""
+    if _NOW.search(norm) or _PROPOSE_TAIL.search(norm) or _CLOCK.search(norm):
+        return False
+    last = max(i for i, t in enumerate(tokens) if _ASK.fullmatch(t))
+    for i, t in enumerate(tokens):
+        if _known(t):
+            continue
+        nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
+        if _SECOND.fullmatch(t):
+            return False
+        if i < last and _ACCUSATIVE.fullmatch(t) and nxt and not _known(nxt):
+            return False
+        if i > last and not _FINITE.fullmatch(t) and not _QUANT.fullmatch(tokens[i - 1]):
+            return False
+    return True
 
 
 def _requests(tokens: list[str]) -> list[str]:
@@ -302,12 +368,26 @@ def _route(norm: str) -> Route:
         return Route("L2", "task", 0.5, "l2:proposal to act")
     social = (any(_SOCIAL.fullmatch(t) for t in tokens)
               or all(_ACK.fullmatch(t) for t in tokens))
-    if is_q or talk or wish or strong or social:
-        return Route("L1", "question" if is_q else "chat", 0.6, "l1:chat signal")
-    return Route("L2", "task", 0.5, "l2:no chat signal")
+    if all(_known(t) for t in tokens):
+        if is_q or talk or wish or strong or social:
+            return Route("L1", "question" if is_q else "chat", 0.6, "l1:chat signal")
+        return Route("L2", "task", 0.5, "l2:no chat signal")
+    if is_q and _plain_question(tokens, norm):
+        return Route("L1", "question", 0.6, "l1:plain question")
+    if wish:
+        return Route("L1", "chat", 0.6, "l1:own wish")
+    return Route("L2", "task", 0.5, "l2:unrecognised content")
 
 
 def route(text: str) -> Route:
+    found = _clauses(text)
+    # "Her salı çiçekleri sula": a recurring order is background work.
+    if found.lane == "L2" and _RECURRING.search(normalize(text)):
+        return Route("L3", "background", 0.75, "l3:recurring task")
+    return found
+
+
+def _clauses(text: str) -> Route:
     whole = _route(normalize(text))
     if whole.lane != "L1":  # L0 already refuses any task word
         return whole

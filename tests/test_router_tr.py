@@ -68,7 +68,6 @@ class BehaviourTests(unittest.TestCase):
         self.assertEqual(normalize("Iğdır"), "igdir")
         self.assertEqual(route("SAAT KAÇ?").intent, "time.now")
         self.assertEqual(route("İPTAL").intent, "cancel")
-        self.assertEqual(route("TEŞEKKÜRLER").intent, "thanks")
 
     def test_missing_turkish_characters(self):
         self.assertEqual(route("saat kac").intent, "time.now")
@@ -150,6 +149,65 @@ class BehaviourTests(unittest.TestCase):
             with self.subTest(mark=hex(ord(mark))):
                 self.assertEqual(normalize(f"İstanbul{mark}da"), "istanbulda")
         self.assertEqual(route("İPTAL").intent, "cancel")
+
+
+class ConstructionTests(unittest.TestCase):
+    """L0/L1 hold by construction: extra content can only raise the lane."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.rows = _rows()
+
+    def test_task_clause_lifts_every_l0_l1_row(self):
+        for row in self.rows:
+            if row["lane"] not in ("L0", "L1"):
+                continue
+            for tail in (" ve faturayı yatır", " sonra dosyayı sil", ", ahmete mesaj at",
+                         "; arabayı yıka"):
+                with self.subTest(text=row["text"] + tail):
+                    self.assertIn(route(row["text"] + tail).lane, ("L2", "L3"))
+
+    def test_negation_prefix_never_l0(self):
+        for row in self.rows:
+            if row["lane"] != "L0":
+                continue
+            for head in ("hayır ", "sakın ", "asla ", "değil "):
+                with self.subTest(text=head + row["text"]):
+                    self.assertNotEqual(route(head + row["text"]).lane, "L0")
+
+    def test_negated_verbs_never_l0(self):
+        for text in ("kapatma", "pencereyi kapatıverme", "KAPATIVERME", "kapatmayın", "durma",
+                     "iptal etme", "vazgeçme", "saati söylemeyin", "saate bakma",
+                     "saatin bakımı nedir"):
+            with self.subTest(text=text):
+                self.assertNotEqual(route(text).lane, "L0")
+
+    def test_unrecognised_content_goes_up(self):
+        for text in ("Bana pizza söyler misin?", "Bana pizza söyleyebilir misin?",
+                     "Ahmet'e ne zaman geleceğini sorar mısın?", "Gram altın şu an ne kadar?",
+                     "CPU sıcaklığı kaç derece?", "faturayı yatır ne dersin",
+                     "faturayı ne zaman yatıracaksın", "çiçekleri sula ne dersin",
+                     "süper yatır", "HARİKA FATURAYI YATIR"):
+            with self.subTest(text=text):
+                self.assertEqual(route(text).lane, "L2")
+        self.assertEqual(route("Her salı faturayı yatır").lane, "L3")
+        for text in ("", "   "):
+            self.assertEqual(route(text).lane, "L1")
+        self.assertEqual(route("TEŞEKKÜRLER").intent, "thanks")
+
+    def test_device_state_live_data_and_recurring(self):
+        for text in ("şu an kaç derece", "ışık yak olur mu", "ses açık mı",
+                     "internet çalışıyor mu", "benzin kaça", "galatasaray kaç kaç",
+                     "iftara ne kadar var", "kahve demle ne dersin", "saat kaç tokyoda",
+                     "İstanbul’da saat kaç"):
+            with self.subTest(text=text):
+                self.assertEqual(route(text).lane, "L2")
+        self.assertNotEqual(route("yeter mi").lane, "L0")
+        for text in ("hergün dosyaları yedekle", "haftada bir yedek al",
+                     "saat başı haber ver", "pazartesileri raporu gönder",
+                     "her iki saatte bir kontrol et", "sürekli diski izle"):
+            with self.subTest(text=text):
+                self.assertEqual(route(text).lane, "L3")
 
 
 if __name__ == "__main__":

@@ -343,3 +343,15 @@
 {"text": "tamam devam", "lane": "L2", "intent": "task"}
 {"text": "devam edelim mi", "lane": "L2", "intent": "task"}
 {"text": "silsem mi", "lane": "L2", "intent": "task"}
+{"text": "HARİKA FATURAYI YATIR", "lane": "L2", "intent": "task"}
+{"text": "Bana pizza söyler misin?", "lane": "L2", "intent": "task"}
+{"text": "Bana pizza söyleyebilir misin?", "lane": "L2", "intent": "task"}
+{"text": "Ahmet'e ne zaman geleceğini sorar mısın?", "lane": "L2", "intent": "task"}
+{"text": "Gram altın şu an ne kadar?", "lane": "L2", "intent": "task"}
+{"text": "CPU sıcaklığı kaç derece?", "lane": "L2", "intent": "task"}
+{"text": "Bilgisayarım kaç derece?", "lane": "L2", "intent": "task"}
+{"text": "pencereyi kapatıverme", "lane": "L2", "intent": "task"}
+{"text": "faturayı yatır ne dersin", "lane": "L2", "intent": "task"}
+{"text": "arabayı ne zaman yıkayacaksın", "lane": "L2", "intent": "task"}
+{"text": "süper yatır", "lane": "L2", "intent": "task"}
+{"text": "Her salı faturayı yatır", "lane": "L3", "intent": "background"}
