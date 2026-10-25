@@ -6,10 +6,11 @@ route(text) picks the lane before any model call:
   L2  one-turn task that needs tools, files or live data
   L3  long, multi-step or background project work
 Fail safe: when unsure, the higher lane. L0 only when every word of the
-message belongs to one local intent (explicit word lists, so a negation like
-"kapatma" or any second clause drops it). L1 only on positive evidence: every
-word is known chat vocabulary, or the open words are the nouns of a plain
-question; anything else is L2.
+message belongs to one local intent (explicit word lists, each content word
+once, so a negation like "kapatma", a modal question or any second clause
+drops it). L1 only on positive evidence: every word is known vocabulary
+(exact forms: chat words, question words, a small factual vocabulary) and
+the message does not ask about the present moment; anything else is L2.
 Pure: no network, no model, no I/O, no mutable module state; never executes.
 """
 
@@ -56,7 +57,7 @@ def _rx(pattern: str) -> re.Pattern:
 _SOFT = _rx(r"""
     jarvis|hey|lutfen|acaba|peki|simdi|hemen|artik|bana|ya|yahu|abi|abla|kanka
     |dostum|kardesim|hocam|bi|iste|yani|sey|e+|e?h+m+|a+|i+|o+|evet|tamam(dir)?
-    |ok(ey)?|m[iu](s[iu]n(iz)?|y[iu]m|y[iu]z)?|merhaba(lar)?|selam(lar)?|cok
+    |ok(ey)?|m[iu](s[iu]n(iz)?)?|merhaba(lar)?|selam(lar)?|cok
     |tesekkur(ler|ederim)?|sagol(un|asin)?|eyvallah|super|harika|guzel|iyi
 """)
 
@@ -71,7 +72,7 @@ _L0 = (
      _rx(r"kapat(ir|sana|in|iniz|alim|abilir|abilirsin|abilirmisin|iver|iversene)?"
          r"|pencere(yi)?|bunu|onu|bu|olur")),
     ("time.now", _rx(r"\bsaat(i|in)?\b"),
-     _rx(r"saat(i|e)?|kac(tir|ti)?|oldu|olmus|su|an|suan|simdiki|ne|nedir|tam|olarak"
+     _rx(r"saat(i|e)?|kac(tir)?|oldu|olmus|su|an|suan|simdiki|ne|nedir|tam|olarak"
          r"|soyle|soyler|soylesene|soyleyebilir|soyleyebilirsin|soyleyebilirmisin"
          r"|ogrenebilir|ogrenebilirmiyim|bak|bakar|baksana|bakabilir|bakabilirsin")),
     ("date.today", _rx(r"gunlerden|tarih|\bayin\s+kac|\b(hangi|ne)\s+gun|gundeyiz"
@@ -150,7 +151,10 @@ _LIVE = re.compile(r"\b(kac|ne\s+kadar)\s+(lira|tl|kurus|dolar|euro)\b"
                    r"|\b(altin|gumus|benzin|mazot|motorin|akaryakit|faiz)\w*\s+"
                    r"(\w+\s+)?(ne\s+kadar|kac\b|fiyat)"
                    r"|\byag(ar|acak|iyor)\b|\bgun\s+batim|\bsistem\s+saat|\ben\s+yakin\b"
-                   r"|\bip\s+adres|\bkaca\b|\bkac\s+kac\b")
+                   r"|\bip\s+adres|\bkaca\b|\bkac\s+kac\b"
+                   # "kaç derece" is the weather unless it is a fixed point;
+                   # "kahve kaç" (one bare noun) asks a price.
+                   r"|(?<!noktasi\s)\bkac\s+derece\b|^(?!saat\b)\w+\s+kac(tir)?$")
 # L3: project nouns + build verbs, rewrite markers, background/recurring work.
 _PROJECT = _rx(r"""
     proje\w*|\w*repo\w*|depo(yu|nun|daki|da)|uygulama\w*|app\w*|(web)?site\w*|sistem\w*
@@ -177,7 +181,11 @@ _SEQUENCE = re.compile(r"\b(sonra|ardindan|akabinde|sonrasinda|once|en\s+son|dah
 # Request markers: "yapar mısın", "-abilir", "-sana", "lütfen".
 _REQUEST = _rx(r"\w{2,}([ae]bil(ir|ecek)\w*|s[ae]n[ae])|lutfen")
 _REQ_PARTICLE = _rx(r"m[iu]s[iu]n(iz)?")
-_NOT_REQUEST = _rx(r"olabil\w*|ol[ae]bil\w*")
+# "-r mı / -ir misin / -acak mısın" asks me to act ("ısmarlayacak mısın").
+_VERB_ASKED = _rx(r"\w+([aeiu]?r|[ae]c[ae]k)")
+_NOT_REQUEST = _rx(r"olabil\w*|ol[ae]bil\w*|olur|var|\w+yor")
+# Negated orders and refusals: "konuşmayın", "yapmasın", "istemiyorum".
+_NEG = _rx(r"istem(iyor|em|ez)\w*|\w+m[ae]y[iu]n(iz)?|\w+m[ae]s[iu]n")
 # "X istiyorum / lazım / gerek" with a project noun is project work;
 # "oyun oynamak istiyorum" (an infinitive) is the speaker's own wish.
 _WANT = _rx(r"isti(yorum|yoruz|yom)|isterim|isteriz|lazim|gerek(li|iyor)?|ihtiyacim")
@@ -186,54 +194,68 @@ _INFINITIVE = _rx(r"\w+m[ae]k")
 _IMPERATIVE = _rx(r"\w{3,}l[ae]")
 _NOT_IMPERATIVE = _rx(r"(b|s|o|bo|so|oy|boy|soy)le|ile|bile|hele|\w*(ce|ca)le")
 # Conversational verbs: a request made with one of these is one-line chat.
-_CHAT_VERB = _rx(r"(anlat|soyle|acikla|tanimla|oner|tavsiye|sor|cevapla|yorumla|dusun"
-                 r"|bil|tahmin|ver|konus|sohbet|espri|fikra|sev|say|yardim)\w*")
+# Exact forms only: "konuşlandırır" is not "konuş", "kaçırma" not "kaç".
+_CV_SFX = (r"(|[aeiu]?r|[aeiu]?rm[iu]s[iu]n|s[ae]n[ae]|y?[iu]n(iz)?|y?[ae]bilir(sin|misin)?"
+           r"|y?[ae]c[ae]k|[iu]?yor(sun|um)?)")
+_CHAT_VERB = _rx(r"(anlat|soyle|acikla|tanimla|oner|sor|cevapla|yorumla|dusun|bil|ver"
+                 r"|konus|sev|say)" + _CV_SFX
+                 + r"|espri|fikra|sohbet|tavsiye|tahmin|yardim")
+_OBJ_SFX = r"(|i|si|yi|u|yu|ler|lar|leri|lari)"
 # "bir espri yap" / "fıkra anlat": a made-up line, not a tool task.
-_CHAT_OBJ = _rx(r"(espri|fikra|saka|bilmece|tekerleme)\w*")
-_MAKE = _rx(r"(yap|soyle)\w*")
+_CHAT_OBJ = _rx(r"(espri|fikra|saka|bilmece|tekerleme)" + _OBJ_SFX)
+_MAKE = _rx(r"(yap|soyle)(|[ae]?r|s[ae]n[ae]|y?[iu]n|y?[ae]bilir(sin)?|y?[iu]ver)")
 # Fail upward: L1 needs a recognised chat signal, anything else is L2.
-_ASK = _rx(r"ne(dir|den|ler\w*|yi|ye|si|yin)?|nicin|niye|nasil\w*|kim\w*|nere\w*"
-           r"|hangi\w*|kac\w*|m[iu](s[iu]n(iz)?|y[iu]m|y[iu]z|d[iu]r|yd[iu]\w*)?")
+_ASK = _rx(r"ne|nedir|neden|neler|neyi|neye|nesi|neyin|nicin|niye|nasil|nasilsin"
+           r"|nasilsiniz|kim|kimdir|kimsin|kimin|kime|kimi|nere|nerede|neresi|nereden"
+           r"|nereye|hangi|hangisi|kac|kactir|m[iu](s[iu]n(iz)?|y[iu]m|y[iu]z|d[iu]r|yd[iu])?")
 # Acknowledgements are chat only on their own: "tamam bitir" is an order.
-_ACK = _rx(r"naber|nbr|merhaba|selam\w*|tamam|peki|evet|hayir")
-_SOCIAL = _rx(r"tesekkur\w*|sagol\w*|harika|super|guzel|anladim|anladik|yorgun\w*"
-              r"|sikil\w*|hissed\w*|mutlu\w*|uzgun\w*|sence|bence")
+_ACK = _rx(r"naber|nbr|merhaba|selam(lar)?|tamam|peki|evet|hayir")
+_SOCIAL = _rx(r"tesekkur(ler|ederim)?|sagol(un|asin)?|harika|super|guzel|anladim|anladik"
+              r"|anlamadim|yorgun(um|uz)?|sikildim|sikiliyor(um)?|sikici|hissediyorum"
+              r"|mutlu(yum)?|uzgun(um)?|sence|bence")
 # "devam edelim mi", "silsem mi": a proposal to act, not a question.
 _PROPOSAL = _rx(r"\w+[ae]lim|\w+s[ae]m|\w+[ae]y[iu]m")
 # Mixed messages are routed per clause: "nasılsın, bir de pr at" is work.
-_CLAUSE = re.compile(r"[,;?!.]+|\b(?:ve|sonra|ayrica|bir de)\b")
+# Clause breaks, including the converb: "bir şaka yapıp kapıyı kapa".
+_CLAUSE = re.compile(r"[,;?!.]+|\b(?:ve|sonra|ayrica|bir de)\b|(?<=\w[iu]p)\s")
 # "sor/söyle/ver/say" alone are orders or relays ("bana pizza söyle",
 # "ahmete sor", "söyler misin", "sorabilir misin"); with a chat object
 # ("bir söz söyle") they are chat.
 _WEAK_CHAT = _rx(r"(sor|soyle|ver|say)(|sana|sene|[iu]n(iz)?|[ae]?r|[iu]r|y?[ae]bil\w*"
                  r"|y?[ae]c[ae]k\w*)")
-_TALK_OBJ = _rx(r"(espri|fikra|saka|bilmece|tekerleme|soz|tavsiye|fikir|fikr|oneri"
-                r"|bilgi|cevap|yorum|motivasyon|ornek)\w*")
+_TALK_OBJ = _rx(r"(espri|fikra|saka|bilmece|tekerleme|soz|tavsiye|fikir|oneri"
+                r"|bilgi|cevap|yorum|motivasyon|ornek)" + _OBJ_SFX + r"|fikri|fikrin|cevabi")
 _WISH = _rx(r"isti(yorum|yoruz|yom)|isterim|isteriz")
+# The speaker's own wish ("oyun oynamak istiyorum"), exact infinitives only.
+_OWN_WISH = _rx(r"gitmek|oynamak|uyumak|dinlenmek|konusmak|gezmek|yurumek|kosmak"
+                r"|yemek|icmek|ogrenmek|eglenmek")
 _POINTED = _rx(r"(bu|su|o)(n[iu]|nlari)")
 _ACCUSATIVE = _rx(r"\w+[iu]")
-_STRONG_CHAT = _rx(r"(anlat|acikla|tanimla|oner|tavsiye|cevapla|yorumla|dusun|tahmin"
-                   r"|konus|sohbet|espri|fikra)\w*")
+_STRONG_CHAT = _rx(r"(anlat|acikla|tanimla|oner|cevapla|yorumla|dusun|konus)" + _CV_SFX
+                   + r"|tavsiye|tahmin|sohbet|espri|fikra")
 
 # Positive evidence for L1: small function words that are neither content
 # nor a task ("ben de", "biraz daha", "kısaca").
 _L1_WORD = _rx(r"""
-    bugun|canim|kendim\w*|ben|beni|bana|benim|sen|seni|sana|senin|biz|siz|o|bu|su
-    |an|bunlar|bir|en|az|daha|biraz|ama|fakat|ve|ile|gibi|icin|kadar|zaman|demek
-    |fark|haber|saniye|dakika|dur|kisaca|boyle|oyle|gercekten|var|yok|olur|ileri
+    bugun|canim|kendim(i|e|den)?|ben|beni|bana|benim|sen|seni|sana|senin|biz|siz|o
+    |bu|su|an|bunlar|bir|en|az|daha|biraz|ama|fakat|ve|ile|gibi|icin|kadar|zaman
+    |demek|fark|saniye|dakika|dur|kisaca|boyle|oyle|gercekten|var|yok|olur|ileri
     |geri|uzun|kisa|kotu|yapiyorsun|dersin|\d+
 """)
-_KNOWN = (_SOFT, _L1_WORD, _ASK, _SOCIAL, _ACK, _TALK_OBJ, _CHAT_VERB, _WISH)
+# A small closed factual vocabulary; any other noun is unknown, so L2.
+_FACT = _rx(r"""
+    turkiyenin|baskenti|everestin|yuksekligi|pi|sayisi|isik|hizi|fotosentez|python
+    |ataturk|dogdu|kuantum|bilgisayar|yilda|gun|gunde|saat|carpi|eder|sevdigin|renk
+    |adin|rekursiyon|ingilizcede|elma|dunyanin|nehri|ayda|yercekimi|yapay|zeka
+    |tehlikeli|kahve|cay|istanbulun|nufusu|mona|lisayi|yapti|suyun|kaynama|noktasi
+    |derece|http|https|arasindaki|film|dilimi|saatler|aliniyor
+""")
+_KNOWN = (_SOFT, _L1_WORD, _ASK, _SOCIAL, _ACK, _TALK_OBJ, _CHAT_VERB, _WISH, _FACT)
 # Questions about the present moment need live data ("X şu an ne kadar");
 # "... ne dersin / olur mu" after an order is a proposal to act.
 _NOW = re.compile(r"\b(su\s+an|suan|simdi\w*|anlik|guncel\w*|bugun\w*|yarin\w*|canli"
-                  r"|son\s+durum)\b")
+                  r"|son\s+durum|bu\s+(gun|dakika|saat)\w*)\b")
 _PROPOSE_TAIL = re.compile(r"\b(ne\s+dersin|olur\s+mu|olmaz\s+mi|nasil\s+olur|tamam\s+mi)$")
-# A finite verb may follow the question word ("dünya neden döner");
-# a second-person verb ("yatıracaksın", "geliyor musun") asks me to act.
-_FINITE = _rx(r"\w+(d[iu]|t[iu]|m[iu]s|[iu]yor|[aeiu]r)")
-_SECOND = _rx(r"\w+([ae]c[ae]k|[iu]yor|m[ae]l[iu]|[aeiu]r)s[iu]n(iz)?")
-_QUANT = _rx(r"kac\w*|hangi\w*")
 # Bare "saat kaç" is L0; any other content around it ("tokyoda") needs a tool.
 _CLOCK = re.compile(r"\bsaat\s+kac\b")
 # A bare yes/no particle makes an order a question ("yeter mi", "kapat mı").
@@ -244,6 +266,11 @@ _LONG = 35
 
 def _l0(tokens: list[str], text: str) -> str | None:
     if _LIVE.search(text) or _ET_TASK.search(text):
+        return None
+    # "dur dur" is one word; "boş ver, bunu bana ver" says two things.
+    once = [t for i, t in enumerate(tokens) if not i or t != tokens[i - 1]]
+    content = [t for t in once if not _SOFT.fullmatch(t)]
+    if len(content) != len(set(content)):
         return None
     for intent, core, extra in _L0:
         own = _L0_OWN.get(intent)
@@ -263,24 +290,6 @@ def _known(t: str) -> bool:
     return any(p.fullmatch(t) for p in _KNOWN)
 
 
-def _plain_question(tokens: list[str], norm: str) -> bool:
-    """Open words are nouns of a question about the world, not an order."""
-    if _NOW.search(norm) or _PROPOSE_TAIL.search(norm) or _CLOCK.search(norm):
-        return False
-    last = max(i for i, t in enumerate(tokens) if _ASK.fullmatch(t))
-    for i, t in enumerate(tokens):
-        if _known(t):
-            continue
-        nxt = tokens[i + 1] if i + 1 < len(tokens) else ""
-        if _SECOND.fullmatch(t):
-            return False
-        if i < last and _ACCUSATIVE.fullmatch(t) and nxt and not _known(nxt):
-            return False
-        if i > last and not _FINITE.fullmatch(t) and not _QUANT.fullmatch(tokens[i - 1]):
-            return False
-    return True
-
-
 def _requests(tokens: list[str]) -> list[str]:
     """Words carrying a request marker ("yapabilir", "yapar" of "yapar mısın")."""
     found = []
@@ -289,7 +298,9 @@ def _requests(tokens: list[str]) -> list[str]:
             continue
         if _REQUEST.fullmatch(t):
             found.append(t)
-        elif i and _REQ_PARTICLE.fullmatch(t) and tokens[i - 1].endswith("r"):
+        elif (i and (_REQ_PARTICLE.fullmatch(t) or _YESNO.fullmatch(t))
+              and _VERB_ASKED.fullmatch(tokens[i - 1])
+              and not _NOT_REQUEST.fullmatch(tokens[i - 1])):
             found.append(tokens[i - 1])
     return found
 
@@ -302,6 +313,7 @@ def _imperative(tokens: list[str]) -> bool:
 
 
 def _route(norm: str) -> Route:
+    norm = re.sub(r"\bne haber\b", "naber", norm)
     tokens = norm.split()
     if not tokens:
         return Route("L1", "chat", 0.5, "empty")
@@ -334,8 +346,13 @@ def _route(norm: str) -> Route:
     if task and len(tokens) > _LONG:
         return Route("L3", "project", 0.6, "l3:long task")
 
-    if (verb_count == 1 and not objects and verbs and _MAKE.fullmatch(verbs[0])
-            and any(_CHAT_OBJ.fullmatch(t) for t in tokens)):
+    # Negation and task checks come before any joke/social exception.
+    if any(_NEG.fullmatch(t) for t in tokens):
+        return Route("L2", "task", 0.55, "l2:negated order")
+    if (verb_count == 1 and not objects and verbs and not _LIVE.search(norm)
+            and _MAKE.fullmatch(verbs[0])
+            and any(_CHAT_OBJ.fullmatch(t) for t in tokens)
+            and all(_known(t) for t in tokens if t != verbs[0])):
         return Route("L1", "chat", 0.6, "l1:joke/riddle request")
     if task:
         why = "verb" if verb_count else "tool/live-data noun"
@@ -362,18 +379,23 @@ def _route(norm: str) -> Route:
     # Own wish ("oyun oynamak istiyorum"); "lazım" or an accusative object
     # ("ortalığı toparlamak istiyorum") asks for work.
     wish = (any(_WISH.fullmatch(t) for t in tokens)
-            and any(_INFINITIVE.fullmatch(t) for t in tokens)
+            and any(_OWN_WISH.fullmatch(t) for t in tokens)
             and not any(_ACCUSATIVE.fullmatch(t) for t in tokens))
     if any(_PROPOSAL.fullmatch(t) for t in tokens):
         return Route("L2", "task", 0.5, "l2:proposal to act")
     social = (any(_SOCIAL.fullmatch(t) for t in tokens)
               or all(_ACK.fullmatch(t) for t in tokens))
     if all(_known(t) for t in tokens):
+        # "bugün ne var", "bugün bilgi ver": a question or request about the
+        # present moment needs a tool; "bugün nasılsın/yorgunum" is chat.
+        live = _NOW.search(norm) and (talk or any(
+            _CHAT_VERB.fullmatch(t) or (_ASK.fullmatch(t) and t not in ("nasilsin", "nasilsiniz"))
+            for t in tokens))
+        if live or _PROPOSE_TAIL.search(norm) or _CLOCK.search(norm):
+            return Route("L2", "task", 0.5, "l2:live data or proposal")
         if is_q or talk or wish or strong or social:
             return Route("L1", "question" if is_q else "chat", 0.6, "l1:chat signal")
         return Route("L2", "task", 0.5, "l2:no chat signal")
-    if is_q and _plain_question(tokens, norm):
-        return Route("L1", "question", 0.6, "l1:plain question")
     if wish:
         return Route("L1", "chat", 0.6, "l1:own wish")
     return Route("L2", "task", 0.5, "l2:unrecognised content")

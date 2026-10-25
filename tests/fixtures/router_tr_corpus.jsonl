@@ -355,3 +355,84 @@
 {"text": "arabayı ne zaman yıkayacaksın", "lane": "L2", "intent": "task"}
 {"text": "süper yatır", "lane": "L2", "intent": "task"}
 {"text": "Her salı faturayı yatır", "lane": "L3", "intent": "background"}
+{"text": "Boş ver, bunu bana ver.", "lane": "L2", "intent": "task"}
+{"text": "Pencereyi kapatabilir miyim?", "lane": "L2", "intent": "task"}
+{"text": "Bir şaka yapıp kapıyı kapa.", "lane": "L2", "intent": "task"}
+{"text": "Bu işi bir hallet ne olur.", "lane": "L2", "intent": "task"}
+{"text": "Kahve ısmarlayacak mısın?", "lane": "L2", "intent": "task"}
+{"text": "Botu konuşlandırır mısın?", "lane": "L2", "intent": "task"}
+{"text": "Yazıcıyı tanımlar mısın?", "lane": "L2", "intent": "task"}
+{"text": "Ahmet'e cevap verir misin?", "lane": "L2", "intent": "task"}
+{"text": "Bir daha konuşmayın.", "lane": "L2", "intent": "task"}
+{"text": "Bir daha kaçırma.", "lane": "L2", "intent": "task"}
+{"text": "Şaka yapmanı istemiyorum.", "lane": "L2", "intent": "task"}
+{"text": "bugün ne var", "lane": "L2", "intent": "task"}
+{"text": "bugün haber var mı", "lane": "L2", "intent": "task"}
+{"text": "bana haber var mı", "lane": "L2", "intent": "task"}
+{"text": "İstanbul'da kaç derece?", "lane": "L2", "intent": "task"}
+{"text": "Ankara'da kar var mı?", "lane": "L2", "intent": "task"}
+{"text": "Tokyo'da saat kaçtır?", "lane": "L2", "intent": "task"}
+{"text": "Dün ayın kaçıydı?", "lane": "L2", "intent": "task"}
+{"text": "Son seçimi kim kazandı?", "lane": "L2", "intent": "task"}
+{"text": "Fenerbahçe kaçıncı sırada?", "lane": "L2", "intent": "task"}
+{"text": "Son dakika gelişmeleri neler?", "lane": "L2", "intent": "task"}
+{"text": "1 litre süt kaç para?", "lane": "L2", "intent": "task"}
+{"text": "ETH ne kadar?", "lane": "L2", "intent": "task"}
+{"text": "Kargom nerede?", "lane": "L2", "intent": "task"}
+{"text": "TK1951 rötarlı mı?", "lane": "L2", "intent": "task"}
+{"text": "O an saat kaçtı?", "lane": "L2", "intent": "task"}
+{"text": "Dur, anladım.", "lane": "L1", "intent": "chat"}
+{"text": "kapatma", "lane": "L2", "intent": "task"}
+{"text": "durma", "lane": "L2", "intent": "task"}
+{"text": "kesme", "lane": "L2", "intent": "task"}
+{"text": "susma", "lane": "L2", "intent": "task"}
+{"text": "iptal etme", "lane": "L2", "intent": "task"}
+{"text": "pencereyi kapatma", "lane": "L2", "intent": "task"}
+{"text": "bunu silmene gerek yok", "lane": "L2", "intent": "task"}
+{"text": "teşekkürler şimdi maili gönder", "lane": "L2", "intent": "task"}
+{"text": "nasılsın, ekranı kilitle", "lane": "L2", "intent": "task"}
+{"text": "bir fıkra anlat ve maili gönder", "lane": "L2", "intent": "task"}
+{"text": "bir espri yap sonra bilgisayarı kapat", "lane": "L3", "intent": "project"}
+{"text": "bir fıkra anlatıp ışıkları kapa", "lane": "L2", "intent": "task"}
+{"text": "bir şaka yapıp dosyayı sil", "lane": "L2", "intent": "task"}
+{"text": "naber; mail gönder", "lane": "L2", "intent": "task"}
+{"text": "kapatabilirmiyim", "lane": "L2", "intent": "task"}
+{"text": "pencereyi kapatabilirmiyim", "lane": "L2", "intent": "task"}
+{"text": "botu konuşlandırırmısın", "lane": "L2", "intent": "task"}
+{"text": "kahve ısmarlarmısın", "lane": "L2", "intent": "task"}
+{"text": "KAHVE ISMARLAYACAK MISIN", "lane": "L2", "intent": "task"}
+{"text": "İSTANBUL'DA KAÇ DERECE", "lane": "L2", "intent": "task"}
+{"text": "Bir daha unutmayın", "lane": "L2", "intent": "task"}
+{"text": "onu silmesin", "lane": "L2", "intent": "task"}
+{"text": "anlamadım", "lane": "L1", "intent": "chat"}
+{"text": "İstanbul’da kaç derece", "lane": "L2", "intent": "task"}
+{"text": "Tokyo´da saat kaçtır", "lane": "L2", "intent": "task"}
+{"text": "şaka yapma", "lane": "L2", "intent": "task"}
+{"text": "istemiyorum şaka yap", "lane": "L2", "intent": "task"}
+{"text": "şaka yap istemiyorum", "lane": "L2", "intent": "task"}
+{"text": "maili gönder sonra fıkra anlat", "lane": "L2", "intent": "task"}
+{"text": "fıkra anlat sonra maili gönder", "lane": "L2", "intent": "task"}
+{"text": "kapatabilir mi", "lane": "L2", "intent": "task"}
+{"text": "saat kaçt", "lane": "L2", "intent": "task"}
+{"text": "boş ver bunu bana ver", "lane": "L2", "intent": "task"}
+{"text": "bana bir fıkra anlatır mısın", "lane": "L1", "intent": "question"}
+{"text": "merhaba, nasılsın?", "lane": "L1", "intent": "question"}
+{"text": "ne haber", "lane": "L1", "intent": "chat"}
+{"text": "bugün nasılsın", "lane": "L1", "intent": "question"}
+{"text": "dosyayı tanımlar mısın", "lane": "L2", "intent": "task"}
+{"text": "kapıyı açar mısın", "lane": "L2", "intent": "task"}
+{"text": "bana kahve yapar mısın", "lane": "L2", "intent": "task"}
+{"text": "toplantıyı kaçırma", "lane": "L2", "intent": "task"}
+{"text": "kaç derece", "lane": "L2", "intent": "task"}
+{"text": "kaç derece var", "lane": "L2", "intent": "task"}
+{"text": "istanbulun kaç derece", "lane": "L2", "intent": "task"}
+{"text": "bu gün kaç derece", "lane": "L2", "intent": "task"}
+{"text": "bilgisayar kaç derece", "lane": "L2", "intent": "task"}
+{"text": "bu gün ne var", "lane": "L2", "intent": "task"}
+{"text": "bu dakika ne var", "lane": "L2", "intent": "task"}
+{"text": "bana bugün için bilgi ver", "lane": "L2", "intent": "task"}
+{"text": "bana bugün bilgi ver", "lane": "L2", "intent": "task"}
+{"text": "şu an için kısa bir bilgi ver", "lane": "L2", "intent": "task"}
+{"text": "kahve kaç", "lane": "L2", "intent": "task"}
+{"text": "kahve kaç?", "lane": "L2", "intent": "task"}
+{"text": "teşekkürler bugün ne var", "lane": "L2", "intent": "task"}

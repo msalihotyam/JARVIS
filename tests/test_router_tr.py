@@ -210,5 +210,64 @@ class ConstructionTests(unittest.TestCase):
                 self.assertEqual(route(text).lane, "L3")
 
 
+class DefectClassTests(unittest.TestCase):
+    """ROUTERTRC5: one test per CDXINT79 defect-class variant."""
+
+    def assertUp(self, texts):
+        for text in texts:
+            with self.subTest(text=text):
+                self.assertIn(route(text).lane, ("L2", "L3"))
+
+    def test_clause_separators(self):
+        self.assertUp(("nasılsın, ekranı kilitle", "bir fıkra anlat ve maili gönder",
+                       "bir espri yap sonra bilgisayarı kapat", "bir fıkra anlatıp ışıkları kapa",
+                       "Bir şaka yapıp kapıyı kapa.", "naber; mail gönder"))
+
+    def test_question_form_verb_is_request(self):
+        self.assertUp(("Pencereyi kapatabilir miyim?", "kapatabilirmiyim", "kapatabilir mi",
+                       "Kahve ısmarlayacak mısın?", "kahve ısmarlarmısın",
+                       "Botu konuşlandırır mısın?", "Yazıcıyı tanımlar mısın?",
+                       "Ahmet'e cevap verir misin?", "kapıyı açar mısın"))
+        self.assertEqual(route("bana bir fıkra anlatır mısın").lane, "L1")
+
+    def test_upper_case(self):
+        self.assertUp(("KAHVE ISMARLAYACAK MISIN", "İSTANBUL'DA KAÇ DERECE"))
+
+    def test_suffix_negation(self):
+        self.assertUp(("Bir daha konuşmayın.", "Bir daha unutmayın", "onu silmesin",
+                       "Bir daha kaçırma.", "Şaka yapmanı istemiyorum.", "şaka yapma",
+                       "kapatma", "pencereyi kapatma", "bunu silmene gerek yok"))
+        self.assertEqual(route("anlamadım").lane, "L1")
+
+    def test_unicode_apostrophes(self):
+        self.assertUp(("İstanbul’da kaç derece", "Tokyo´da saat kaçtır", "İstanbul'da kaç derece?"))
+
+    def test_empty_and_punctuation(self):
+        for text in ("", "   ", "?!."):
+            self.assertEqual(route(text).lane, "L1")
+
+    def test_negation_and_task_ordering(self):
+        self.assertUp(("istemiyorum şaka yap", "şaka yap istemiyorum",
+                       "maili gönder sonra fıkra anlat", "fıkra anlat sonra maili gönder",
+                       "teşekkürler şimdi maili gönder", "Boş ver, bunu bana ver."))
+
+    def test_truncated_forms(self):
+        self.assertUp(("kapatabilir mi", "saat kaçt", "O an saat kaçtı?"))
+
+    def test_live_data_on_known_words(self):
+        self.assertUp(("bugün ne var", "bugün haber var mı", "bana haber var mı",
+                       "bugün hava nasıl", "Dün ayın kaçıydı?", "Son dakika gelişmeleri neler?",
+                       "ETH ne kadar?", "Kargom nerede?", "kaç derece", "bu gün ne var",
+                       "bu dakika ne var", "bana bugün bilgi ver",
+                       "şu an için kısa bir bilgi ver", "kahve kaç"))
+        for text in ("bugün nasılsın", "bugün çok yorgunum", "suyun kaynama noktası kaç derece"):
+            self.assertEqual(route(text).lane, "L1", text)
+
+    def test_l0_word_once_and_no_modal(self):
+        self.assertEqual(route("dur dur").lane, "L0")
+        self.assertUp(("Pencereyi kapatabilir miyim?",))
+        self.assertNotEqual(route("pencereyi kapat pencereyi").lane, "L0")
+
+
 if __name__ == "__main__":
     unittest.main()
