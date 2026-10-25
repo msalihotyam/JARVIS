@@ -172,7 +172,10 @@ Tipli sözleşme ve akış:
 `PLAN` aşaması sabit altı metin yerine, yalnızca güvenli yapısal task
 durumundan üretilen deterministik, sınırlı ve görev-farkında altı adımlı planı
 kurar. Model üretimli/semantik planlama, çok adımlı yürütme, replanning ve plan
-UI'ı kapsam dışıdır ve karar verilmemiştir.
+UI'ı kapsam dışıdır ve karar verilmemiştir. İstisna (§4.28, PM00): yalnız proje
+çalıştırmalarında (`work_run`) model önerili plan, çok adımlı yürütme ve
+yeniden planlama §4.28 değişmezleri içinde kapsamdadır; bu altı adımlı `PLAN`
+aşaması ve diğer her yol için yukarıdaki satır aynen geçerlidir.
 
 - Saf fonksiyonlar `jarvis/planning.py` içindedir: `objective_fingerprint`,
   `normalize_plan_symbol`, `normalize_plan_step`, `build_task_plan`.
@@ -4081,6 +4084,8 @@ dosyasındadır.
    Salih belirler.
 9. **Kabul: Core yerel kontrolleri + kullanıcı kabulü.** Komut çalıştırma
    kabul kontrolü olarak henüz yoktur; ileride kendi tehdit modeliyle gelir.
+   *Kapandı (§4.28, PM00):* proje çalıştırmalarında komut çalıştırma, I7
+   Core kontrol çalıştırıcısı ve I6 regresyon kapısıyla kabul kontrolüdür.
 10. **Günlük kullanım noktası: Adım 5'in sonu.**
 11. **Edge→Chrome tamamlandı.** Tek çalışma zamanı Chrome; Edge profili
     yalnız geri dönüş olarak kalır (§5.1).
@@ -4181,7 +4186,9 @@ Salih'in ayarıdır.
 biçimi/şeması, deterministik içerik kuralları, geri okuma, tazelik,
 kullanıcı kabulü. Komut çalıştırma kabul kontrolü değildir. Kanıt makbuzu
 artefakt değişince bayatlar. `claim_done` → verifying; `needs_revision` en
-fazla 3 kez; kapılar fail-closed ("doğrulanamadı").
+fazla 3 kez; kapılar fail-closed ("doğrulanamadı"). Proje çalıştırmalarında
+§4.28 bu paragrafı iki yerde değiştirir: komut çalıştırma I7/I6 üzerinden
+kabul kontrolüdür ve revizyon sınırı dilim başına 5'tir (D2).
 
 **W2 veri sözleşmesi.** W2 yalnız Work defterinden beslenir; yüzde çubuğu
 yoktur. N dakika olay gelmezse `needs_attention`.
@@ -4199,3 +4206,267 @@ kabul edilir.
 onaydan sonra plan değişikliği, politika değişikliği sonrası devam, döngü,
 okuma araçlarıyla dışa sızdırma, CLI yapılandırma kurcalama; ayrıca ~20
 görevde tek ajanla karşılaştırma.
+
+### 4.28 Proje çalıştırmaları ve yazıcı çalışanlar (Aşama 2 "Proje modu" ADR'si, PM00; tasarım kararı, henüz kodda yok)
+
+**Bağlam ve karar.** Aşama 2, tek bir fikri (yazılı metin; ses dökümü
+ileride aynı metin yolundan gelir) baştan sona bitmiş bir sonuca çeviren
+**proje çalıştırmasını** (`work_run`) ekler. Bu ADR iki şeyi karara bağlar:
+§4.3'teki "çok adımlı yürütme kapsam dışı" satırı yalnız proje
+çalıştırmaları için kaldırılır, ve yazma yetkili çalışanlar (Claude Code,
+Codex, Jules) aşağıdaki tehdit modeli ve I1–I12 değişmezleriyle tanımlanır.
+V2.4'ün yedi ince adımı omurga olarak kalır; proje modu onları genişletir,
+yerine geçmez. §4.27 zincir sürücüsü yürütücü olarak kalır: her dilim
+`resume()` ile ulaşılan sıradan bir Task'tır, artık artefakt ve kanıtla.
+Kaynak: `build/orch/PLAN_PROJECT_MODE.md` §1–§3 ve Salih'in son kararları
+`build/orch/kb/PM_DECISIONS.md` (2026-10-25; plandan farklı olduğu yerde
+kararlar geçerlidir).
+
+**Kapsam (Aşama 2).**
+
+- Akış: fikir → netleştirme → plan → (onay, yalnız büyük) → çalışanlarla
+  dilimleri yapma → dilim başına Core kabulü → yerel entegrasyon → son kabul
+  → sonucu gösterme.
+- **Netleştirme aşaması.** Bütün sorular en başta, numaralı tek mesajda
+  sorulur. Model soruları önerir; **ProjectBrief yuvaları** Core'undur: amaç;
+  kullanıcılar ve kullanım; platform ve çalışma zamanı; hedef konum; en az
+  bir somut kabul örneği içeren "bitti" tanımı; kısıtlar; açık kapsam dışı;
+  veri hassasiyeti; dışa giden eylem veya para (evet/hayır).
+- **"Tam anlaşıldı" çıkış kontrolü** deterministik ve fail-closed'dır; hepsi
+  sağlanmalıdır: her zorunlu yuva dolu; açık soru yok; her kabul örneği bir
+  kontrole çevrilebilir (ya da "Salih'in elle kontrolü" olarak işaretlidir,
+  bu da çalıştırmayı büyük sınıfa zorlar); geri okuma özeti gösterildikten
+  sonraki bir turda kullanıcı tarafından onaylanmıştır. Modelin "anladım"
+  demesi kontrolü asla geçirmez. Yalnız boş yuva bırakan cevaplar için en
+  fazla 3 takip turu; sonra `needs_input`.
+- **Yazıcı çalışanlar** yalnız JARVIS'in açtığı git worktree'sinde, hedef
+  başına tek yazıcı kirasıyla yazar.
+- **Kabul Core'undur:** Core'un kendisinin koştuğu test ve kontroller, artı
+  tabana karşı "yalnız yeni hatalar" regresyon kapısı. Çalışan raporu
+  danışma niteliğindedir, hüküm değildir (gerekçe: "bitti" iddialarının
+  %22,58'i yanlış, RESEARCH_V24).
+- **Yetki zarfı:** içeriğe bağlı plan hash'i. Zarf içindeki geri alınabilir
+  yerel yazımlar sorusuz yürür; geri alınamaz, dışa giden, para ve push
+  eylemleri her zaman tek dokunuş onay ister.
+- **Bildirimler:** uygulama içi kart/şerit + Windows toast + bildirim başına
+  defter olayı + Aşama 3'ün (Telegram) boşaltacağı `notify_outbox` satırı.
+- **Boyut sınıfları** Core tarafından hesaplanır: küçük ve orta gözetimsiz
+  yürür; büyükte Salih plan ve birleştirme noktalarında işe katılır (O47).
+- **İlk müşteri JARVIS'in kendisidir:** JARVIS deposu daha sıkı korunan
+  kümeli bir hedeftir (I12); proje modu zamanla konveyörden T0/T1 sınıf B/C
+  dilimlerini alır (D7).
+- **Çalışanlar** `jarvis/workers/` altına `scripts/conveyor_workers.py`'nin
+  kanıtlanmış duruşuyla taşınır: argv izin listesi ve `BANNED_FLAGS`,
+  `scrubbed_env` ve `PROHIBITED_ENV`, fail-closed `admit()`, collect/verify
+  adımı. Yönlendirme `Conveyor.route` kurallarını izler: yalnız T0/T1 sınıf
+  B/C, `codex_veto` yol listesi, sayısal kota payı, Jules yalnız `linux_ok`
+  iken. `scripts/**` düzenlenmez; konveyör geçişe kadar olduğu gibi kalır.
+- **AgentProfile:** her çalışan tipinin rolü, yetenek tavanı, çalışan tipi ve
+  model politikası vardır. Etkin yetki = profil ∩ plan zarfı ∩ Core
+  politikası.
+- **Defter:** ek tablolar `work_run` / `work_event` / `work_step` (yalnız
+  ekleme, deterministik adım anahtarları, kaydedilmiş model çıktıları, H2
+  deneme bağlantısı, idempotency anahtarı) ve `notify_outbox`. Yalnız ek
+  tablo, ALTER yok; `SCHEMA_VERSION` 10'da kalır.
+
+**Kapsam dışı (açık; parantez içi aşama).**
+
+- Ses girişi/çıkışı ve overlay (4). Aşama 2 metin kabul eder; döküm yalnız
+  metindir.
+- Telegram, telefon onay kanalı, her zaman açık arka plan servisi (3).
+  Aşama 2 yalnız uygulama açıkken, mevcut 30 sn dispatcher taramasıyla
+  yürür; outbox'a yalnız yazar.
+- Gemini, yeni model sağlayıcıları, sağlayıcılar arası en az yüklü kota
+  modeli (5). Yalnız konveyörün Claude/Codex kota payı yönlendirmesi
+  yeniden kullanılır.
+- Hesaplar ve çok kullanıcı (6).
+- Çalışan yeteneği olarak bilgisayar kullanımı (masaüstü/tarayıcı sürme) (7).
+  Tarayıcı ve masaüstü connector'ları proje çalışanlarına verilmez.
+- Proaktif gözcü, kendiliğinden proje fikri, sabah özeti (8).
+- Bir hedefte paralel yazıcılar. Hedef başına sıralı; konuşma başına en fazla
+  bir, konuşmalar arası en fazla iki etkin çalıştırma (V2.4).
+- Tek dokunuş onay olmadan yapılan projeyi herhangi bir yere deploy,
+  publish veya push etmek.
+- Büyük pencere UI cilası (O46). UI, mevcut sohbette bir ilerleme kartı artı
+  onay ve sonuç kartlarıdır.
+- Rakip: Anthropic "Claude Duet". Eşlenecek çekirdek döngü: fikir girer, iş
+  gözetimsiz eşzamansız yürür, onay yalnız önemli yerde sorulur, sonuç
+  kanıtla döner. Bilinçli farklar: çalışanlar yerel worktree'lerde (tek bulut
+  çalışanı Jules), aboneliklerle çok sağlayıcılı kota kullanımı ve API
+  harcaması yok, kabul Core'un koştuğu kanıta dayanır; model asla otorite
+  değildir.
+
+**Çalıştırma durumları.** `clarifying → planning → awaiting_approval →
+building → accepting → integrating → done`, artı `needs_input`,
+`blocked:budget`, `interrupted`, `failed`, `cancelled`. Çökme kurtarma ve
+devam kuralları V2.4'ten gelir. Kontroller karttan: duraklat, iptal, devam.
+
+**Bildirim noktaları.** Her nokta bir `work_event`, uygulama içi kart veya
+şerit, önem ≥ normal ise Windows toast ve bir `notify_outbox` satırı yazar.
+
+- `questions_ready` (normal): netleştirme soruları bekliyor.
+- `readback_ready` (normal): "şunu anladım", evet bekleniyor.
+- `plan_ready` (yüksek, yalnız büyük): plan onay kartı.
+- `needs_input` (yüksek): yalnız Salih'in bildiği bir bilgide takıldı.
+- `blocked:budget` (yüksek): bir bütçe bitti; uzat veya durdur.
+- `slice_failed_after_cap` (yüksek): revizyon sınırı doldu; seçenekler.
+- `approval_required` (yüksek): geri alınamaz, dışa giden, para veya push
+  eylemi.
+- `awaiting_acceptance` (normal; büyükte ya da brief'te elle kontrol
+  varsa): sonuç Salih'in kendi kontrolüne hazır.
+- `done` (normal): kanıtlı sonuç ve "göster" eylemi.
+- `interrupted` (normal): uygulama çalıştırma ortasında yeniden başladı;
+  devam tek dokunuş.
+- İlerleme (düşük, toast yok): dilim başladı, dilim kabul edildi.
+
+**Kanıt makbuzu (dilim başına).** Plan hash'i, diff sha, kontrol argv'si,
+çıkış kodu, çıktı sha, taban sonucu, hüküm.
+
+**Tehdit modeli: varlıklar.** Salih'in dosyaları ve depoları; sırlar
+(`~\.jarvis\`, `.env*`, anahtarlar, `data\**`); JARVIS'in kendi
+politika/onay kodu; abonelik kotası; "bitti"nin doğruluğu.
+
+**Tehdit modeli: hasımlar.** Enjekte içerik (depo dosyaları, web, issue'lar,
+bağımlılık README'leri); kafası karışık veya aşırı emin model; kontroller
+sırasında çalışan, çalışanın yazdığı kod.
+
+**Değişmezler (Core zorlar; modeller değiştiremez).**
+
+- **I1 Hazırlama (staging).** Çalışanlar yalnız çalıştırma için JARVIS'in
+  açtığı git worktree'sinde yazar (dal `jarvis/<run>/<slice>`), hedef
+  checkout'ta asla. Artefakt diff'tir.
+- **I2 Tek yazıcı.** Hedef (depo + yol kümesi) başına bir kira; `JobRunLease`
+  örneğinde (claim/renew/release, süre sonu, boot id). İkinci yazıcı
+  reddedilir. Bayat kira yalnız sahibinin öldüğü kanıtlandıktan sonra
+  toplanır.
+- **I3 Diff kapsamı.** Her kontrolden önce Core diff'i doğrular: yollar ⊆
+  zarf hedefleri; korunan yol yok (`data\**`, `~\.jarvis\`, `.env*`,
+  anahtar/sertifika/veritabanı); `.git/` ve hook yok; symlink, junction,
+  submodule yok; CLI/ajan yapılandırması yok (`.claude/`, `.codex/`,
+  `AGENTS.md`, `CLAUDE.md`, `.github/workflows`); boyut ve ikili dosya
+  sınırları. Herhangi bir ihlal: dilim `blocked_by_gate`, hiçbir şey
+  uygulanmaz.
+- **I4 Zarf.** Her eylem onaylı plan hash'ine karşı denetlenir. Adım, hedef,
+  kontrol veya bütçe değişikliği yeni hash üretir: küçük/ortada Core yeni
+  zarfı brief'e ve boyut sınıfına karşı yeniden doğrular; büyükte ya da
+  boyut sınıfı yükselince yeniden onay gerekir.
+- **I5 Onay sınıfları.** Zarf içindeki geri alınabilir yerel eylemler
+  sorusuz yürür: hazırlama yazımları, kontrol koşuları, checkpoint ref'li
+  bir JARVIS dalına ff-merge. Geri alınamaz eylemler, dışa giden eylemler
+  (push, ağdan kurulum, e-posta, Jules yüklemesi), para ve JARVIS deposu
+  `main` push'u her zaman tek dokunuş onay ister. JARVIS `main`'i
+  konveyörün iki anahtarlı push kapısını korur.
+- **I6 Kabul.** Hüküm yalnız Core'un koştuğu kontrollerden ve regresyon
+  kapısından gelir: plana sabitlenmiş kontroller; plan anında hash'lenmiş
+  kabul fixture'ları; düşmemesi gereken test sayısı; tabana göre yeni hata =
+  başarısız. Kilitli bir fixture'ı düzenleyen çalışan kapıdan geçemez.
+- **I7 Kontrol çalıştırıcısı.** Shell yok. Komutlar, planda bağlanmış Core
+  izin listesindeki argv şablonlarından gelir. Sırsız temizlenmiş env; cwd
+  hazırlama worktree'si; zaman aşımı ve çıktı sınırı; `owned_process` /
+  `trusted_exec` yeniden kullanılarak süreç ağacı öldürme; D1 ağ yasağı.
+  Bağımlılık kurulumu ayrı bir dışa giden adımdır.
+- **I8 Çalışan duruşu.** Çalışanlara dışa çıkış aracı verilmez, argv
+  sertleştirilmiştir. Claude: WebFetch/WebSearch/MCP yok,
+  `--strict-mcp-config`, sabitlenmiş sürüm,
+  `CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH=1`, bypass bayrağı yok. Codex:
+  `workspace-write` artı `mxc`, `--ignore-user-config`, `BANNED_FLAGS`.
+  Jules: yalnız listelenmiş dosyalar, kendi onayı (D6).
+- **I9 İkili kuralı (Rule of Two).** Güvenilmez girdi, yazma yetkisi ve dışa
+  giden eylem insan onayı olmadan asla bir araya gelmez.
+- **I10 Bütçeler ve watchdog.** Çalıştırma başına sınırlar: çalışan
+  oturumu, revizyon (dilim başına 5, D2), duvar saati, model çağrısı.
+  Takılma → `timeout`; biten sınır → `blocked:budget`; watchdog bayat
+  kiraları toplar.
+- **I11 Çökme güvenliği.** Defter yazımları synchronous=FULL. Çökme →
+  `interrupted`; devam açıktır ve şu sırayla yeniden doğrular: kimlik →
+  yetenek → hedef → kapsam → onay. Uygulama, uygulama öncesi checkpoint
+  ref'li (geri alma) atomik bir ff'dir.
+- **I12 Öz-hedef kümesi.** Hedef JARVIS deposuyken Core, LANE_RULES C2'nin
+  asla verilemez kümesini kesin reddeder: `jarvis/policy*`, onay/yetki
+  kapıları, `jarvis/memory.py`, `SCHEMA_VERSION`, kimlik bilgisi/redaksiyon
+  kodu, `scripts/**`, `.claude/**`, push/release betikleri. Plan bunları
+  veremez; bu değişiklikler Salih ve konveyör üzerinden gider.
+
+**Ne ters gidebilir → hangi değişmez durdurur.**
+
+- Hedef dışına yazma (traversal, mutlak yol, symlink, junction,
+  `.git/hooks`) → I1, I3.
+- Testleri düzenleyip assert'leri gevşeterek "geçme" → I6 (kilitli
+  fixture, test sayısı, taban karşılaştırması).
+- Yanlış "bitti" iddiası → I6 (rapor danışmadır, kontrolleri Core koşar).
+- Depo/web içeriğinden prompt injection → I8 (dışa çıkış aracı yok), I9, I3
+  (diff yine zarfa sığmalı).
+- Test komutuyla dışa sızdırma (`ping`/`dig` ile DNS, npm betiklerinde
+  `curl`) → I7 (izinli argv, shell yok, temiz env, ağ duruşu).
+- Sırları okuma (`.env`, `~\.jarvis\`) → I7/I8: temiz env; hazırlama
+  worktree'si `.env*` içermez; Claude çalışanının cwd dışı okumaları `-p`
+  modunda reddedilir; Codex `mxc` yazımları sınırlar. Kalan risk:
+  Windows'ta Codex/Claude'un worktree dışı okumaları tam sandbox'lı değildir
+  (D1'de kabul edildi).
+- İki yazıcının birbirini ezmesi (C-derleyici vakası) → I2.
+- Onaydan sonra plan değişmesi → I4.
+- Onay yorgunluğu (istemlerin %93'ü onaylanıyor) → I5 (istem yalnız geri
+  alınamaz, dışa giden, para veya push için; kart farkları gösterir).
+- Kaçak döngü veya kota yakma → I10.
+- Uygulama ortasında çökme → I11.
+- Yapılandırma kurcalama (`.claude/settings`, `AGENTS.md`, `.codex`, git
+  hook'ları, CI iş akışları) → I3, I8; JARVIS git'i `-c core.hooksPath=`
+  boş olarak çalıştırır.
+- Bağımlılık tedarik zinciri saldırısı (çalışan paket ekler) → I7, I5; yeni
+  bağımlılıklar bir plan alanıdır, kurulum dışa giden eylemdir.
+- Salih'in commit edilmemiş işinin üzerine birleştirme → I1 (hedef checkout
+  asla yazılmaz; kirli hedef uygulamayı reddeder ve Salih'e bildirilir).
+- JARVIS'in kendi kapılarını zayıflatması → I12.
+- Modelin kendine geniş hedef planlaması (`**`, sürücü kökü) → I4 (Core
+  zarfı doğrular: proje kökünün üstünde glob yok, korunan yol yok, boyut
+  sınıfını Core kendisi yeniden hesaplar).
+
+**Salih'in kararları (D1–D9, 2026-10-25, son).**
+
+- **D1 Kontrol koşularında ağ (onaylandı).** Kontrol koşularında ağ yok:
+  temizlenmiş env, ölü proxy env (`HTTP_PROXY`/`HTTPS_PROXY` =
+  `127.0.0.1:9`), izinli argv, shell yok. Bağımlılık kurulumu ayrı bir
+  dışa giden adımdır ve her yeni paket kümesi için bir kez onaylanır (büyükte
+  her zaman gösterilir). Kalan risk: Windows'ta worktree dışı okumalar.
+- **D2 Revizyon sınırı (Salih değiştirdi).** Dilim başına en fazla 5
+  revizyon denemesi, sonra `slice_failed_after_cap`; 3 başarısız dilimden
+  sonra çalıştırma duraklar.
+- **D3 Bütçe (onaylandı).** Yalnız abonelikler, asla ödeme yok. Küçük ≤ 10
+  çalışan oturumu / 2 sa, orta ≤ 30 / 8 sa, büyük plan kartında belirlenir.
+  Kota bitti → `blocked:budget` (bekle).
+- **D4 Boyut eşikleri (onaylandı).** Otomatik sınıflandırma. Küçük: ≤ 5
+  dilim, tek yeni klasör, dışa giden yok. Orta: ≤ 15 dilim ya da mevcut bir
+  depo, dışa giden yok. Büyük: geri kalan her şey; herhangi bir dışa giden
+  eylem veya para, JARVIS deposu ve elle kontrollü kabul her zaman büyüktür.
+- **D5 Yeni projelerin yeri (onaylandı).**
+  `%USERPROFILE%\JARVIS-Projeler\<ad>\`, her biri taze bir git deposuyla.
+- **D6 Jules (onaylandı).** Aşama 2'de yeni projeler için kapalı (yükleme =
+  dışa giden); yalnız JARVIS deposu için konveyör yolu üzerinden açık.
+- **D7 Konveyör geçişi (onaylandı).** Önce gölge: proje modu T0/T1 sınıf B/C
+  JARVIS dilimlerini alır; T2, entegrasyon ve `main` push'u konveyörde
+  kalır. Geçiş, geçme oranı konveyörünkine eşit ya da yüksek ve sıfır
+  güvenlik olaylı art arda 20 gölge dilimden sonra.
+- **D8 Yapım ortası sorular (Salih değiştirdi).** Bütün sorular en başta,
+  VE cevap sonucu iyileştirecekse ya da sonradan yeniden işi önleyecekse
+  yapım ortasında soru serbesttir ("iş bittikten sonra yanlışı düzeltmek
+  daha zor"). "Sadece kontrol" pingi yok: yapım ortası soru kararı,
+  seçenekleri ve JARVIS'in varsayılanını adlandırmalıdır; sorular
+  toplanarak sorulur; cevaba bağlı olmayan parçalar beklerken devam eder
+  (`needs_input` yalnız bağımlı dilimleri bloklar).
+- **D9 Başlama (onaylandı).** Küçük ve orta çalıştırmalar geri okumaya
+  verilen "evet" ile başlar; plan gösterilir ve duraklatılabilir, ayrı plan
+  dokunuşu yoktur (grant = "evet" + Core'un doğruladığı zarf). Büyük
+  açık plan onayı ister.
+
+**V2.4 karar 9'un kapanışı.** Komut çalıştırma artık proje
+çalıştırmalarında bir kabul kontrolüdür: I7 Core kontrol çalıştırıcısı
+(plana bağlı izinli argv, shell yok, ağ yok) artı I6 regresyon kapısı.
+Proje çalıştırmalarında V2.4'ün "`needs_revision` en fazla 3 kez" sınırının
+yerini D2'nin 5'i alır. Proje çalıştırmaları dışındaki kabul yolu V2.4
+"Kabul ve kanıt" paragrafındaki gibi kalır.
+
+**İlişkiler.** §4.3: kapsam dışı satırı yalnız proje çalıştırmaları için
+kaldırıldı. §4.27: zincir sürücüsü dilimleri yürütür; değişmez. V2.4
+kararları: iki eşzamanlı çalıştırma, W2 veri sözleşmesi, `blocked:budget`
+ve API'ye geri düşüş yokluğu aynen geçerlidir; regresyon paketi yazıcı
+senaryolarıyla genişler (PM30).
