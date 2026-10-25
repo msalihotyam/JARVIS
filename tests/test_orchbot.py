@@ -534,10 +534,10 @@ class AgreementTest(BotCase):
                          ("write_key1", "2026-10-15T11:00:00", "ask_salih_key1", "2026-10-15T11:30:00"))
 
     def test_unmatched_after_the_window(self):
-        self.clock.set("2026-10-15T12:00:00")
+        self.clock.set("2026-10-16T11:00:00")
         self.run_bot()
         self.assertEqual(self.kinds(), [])
-        self.clock.set("2026-10-15T12:00:01")
+        self.clock.set("2026-10-16T11:00:01")
         self.run_bot()
         self.assertEqual(self.kinds(), ["unmatched"])
         v = self.verdicts()[0]
@@ -545,11 +545,11 @@ class AgreementTest(BotCase):
         self.assertEqual(self.shadow()["agreement"]["key1"], {"agree": 0, "total": 1})
 
     def test_missed_an_action_the_bot_never_proposed(self):
-        self.approve("2026-10-15T12:10:00", name=f"push-{SHA2}-L2")
-        self.clock.set("2026-10-15T13:10:00")
+        self.approve("2026-10-16T10:10:00", name=f"push-{SHA2}-L2")
+        self.clock.set("2026-10-16T11:00:01")
         self.run_bot()
         self.assertEqual(self.kinds(), ["unmatched"])  # the 11:00 L1 decision; the L2 action is still in its window
-        self.clock.set("2026-10-15T13:10:01")
+        self.clock.set("2026-10-16T11:10:01")
         self.run_bot()
         self.assertEqual(self.kinds(), ["unmatched", "missed"])
         v = self.verdicts()[1]
@@ -573,7 +573,7 @@ class AgreementTest(BotCase):
 
     def test_laneless_approval_of_another_sha_never_matches(self):
         self.approve("2026-10-15T11:30:00", name=f"push-{SHA2}")
-        self.clock.set("2026-10-15T12:30:01")
+        self.clock.set("2026-10-16T11:00:01")
         self.run_bot()
         self.assertEqual(sorted(self.kinds()), ["missed", "unmatched"])
 
@@ -586,18 +586,18 @@ class AgreementTest(BotCase):
         self.assertFalse(s(f"key1:@{k7}", f"fix:@{k7}"))
         self.assertFalse(s(None, "dispatch"))
 
-    def test_window_edge_3600_matches(self):
-        self.approve("2026-10-15T12:00:00")
-        self.clock.set("2026-10-15T12:00:00")
+    def test_window_edge_86400_matches(self):
+        self.approve("2026-10-16T11:00:00")
+        self.clock.set("2026-10-16T11:00:00")
         self.run_bot()
         self.assertEqual(self.kinds(), ["agree"])
 
-    def test_window_edge_3601_is_unmatched_then_missed(self):
-        self.approve("2026-10-15T12:00:01")
-        self.clock.set("2026-10-15T12:00:01")
+    def test_window_edge_86401_is_unmatched_then_missed(self):
+        self.approve("2026-10-16T11:00:01")
+        self.clock.set("2026-10-16T11:00:01")
         self.run_bot()
         self.assertEqual(self.kinds(), ["unmatched"])
-        self.clock.set("2026-10-15T13:00:02")
+        self.clock.set("2026-10-16T12:00:02")
         self.run_bot()
         self.assertEqual(self.kinds(), ["unmatched", "missed"])
 
@@ -617,11 +617,75 @@ class AgreementTest(BotCase):
         for days, agree, total, ready in ((6, 10, 10, False), (7, 9, 9, False), (7, 9, 10, False),
                                           (7, 10, 10, True)):
             with self.subTest(days=days, agree=agree, total=total):
-                self.seed({"start": now - days * 86400, "key1": {"agree": agree, "total": total}})
+                self.seed({"version": 2, "start": now - days * 86400, "key1": {"agree": agree, "total": total}})
                 self.assertEqual(self.run_bot(), [])
                 g = self.shadow()["agreement"]["graduation"]
                 self.assertEqual(g, {"days": days, "pushes": total, "agree_pct": round(100 * agree / total, 1),
-                                     "ready": ready})
+                                     "ready": ready, "stage_a": False, "classes": {}})
+
+    def test_per_class_counters_and_stage_a(self):
+        self.approve("2026-10-15T11:30:00")
+        self.clock.set("2026-10-15T12:05:00")
+        self.run_bot()
+        ag = self.shadow()["agreement"]
+        self.assertEqual(ag["classes"], {"key1_orch": {"agree": 1}})
+        self.assertEqual(ag["graduation"]["classes"], {"key1_orch": {"n": 1, "pct": 100.0}})
+        facts = (self.root / "build" / "bot" / "facts.md").read_text(encoding="utf-8")
+        self.assertIn("- key1_orch: n 1, agree 100% (shadow.json)\n", facts)
+        now = self.clock()
+        cls = {"ack": {"agree": 27, "disagree": 3}, "ask": {"agree": 9, "bot_only": 1}}
+        for days, ack, ready in ((7, cls["ack"], True), (6, cls["ack"], False), (7, {"agree": 26, "missed": 3}, False),
+                                 (7, {"agree": 26, "disagree": 4}, False)):
+            with self.subTest(days=days, ack=ack):
+                self.seed({"version": 2, "start": now - days * 86400, "classes": dict(cls, ack=ack)})
+                self.run_bot()
+                self.assertIs(self.shadow()["agreement"]["graduation"]["stage_a"], ready)
+
+    def test_version_mismatch_resets_without_failclosed(self):
+        for old in ({"start": 5, "key1": {"agree": 3, "total": 3}}, {"version": 1, "key1": {"agree": 3, "total": 3}}):
+            with self.subTest(old=old):
+                self.seed(old)
+                ds = self.run_bot()
+                self.assertEqual(self.acts(ds), [("none", "VERSION", "shadow.json agreement")])
+                ag = self.shadow()["agreement"]
+                self.assertEqual((ag["version"], ag["key1"]), (2, {"agree": 0, "total": 0}))
+
+    def key1_after(self, text):
+        self.approve("2026-10-15T11:30:00", text)
+        self.clock.set("2026-10-15T12:05:00")
+        self.run_bot()
+        ag = self.shadow()["agreement"]
+        return ag["classes"], ag["key1"]
+
+    def test_conveyor_auto_approval_stays_out_of_graduation(self):
+        self.assertEqual(self.key1_after("auto-approved by the conveyor"),
+                         ({"key1_conveyor": {"agree": 1}}, {"agree": 0, "total": 0}))
+
+    def test_o42_pre_approval_stays_out_of_graduation(self):
+        self.assertEqual(self.key1_after("approved under O42 pre-approval"),
+                         ({"key1_conveyor": {"agree": 1}}, {"agree": 0, "total": 0}))
+
+    def test_salih_chat_approval_is_ask_salih(self):
+        self.assertEqual(self.key1_after("salih onay verdi"), ({"key1_orch": {"disagree": 1}}, {"agree": 0, "total": 1}))
+
+    def test_manual_key1_is_ask_salih(self):
+        self.assertEqual(self.key1_after("manual key 1 in chat"), ({"key1_orch": {"disagree": 1}}, {"agree": 0, "total": 1}))
+
+    def test_windows_by_key(self):
+        h = orchbot.horizon
+        self.assertEqual([h(k) for k in ("ack:x", "ask:x", "key1:l", "fix:l", "dispatch", "rerun:l")],
+                         [86400, 86400, 86400, 86400, 3600, 3600])
+
+    def test_ask_open_close_agree(self):
+        b = orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append)
+        b.st = {"asks": {}, "history": [], "counters": {}, "agreement": orchbot.agree_blank()}
+        b.new, b.live = [], {}
+        b.log_asks([{"id": "Q1", "since": "x"}])
+        b.log_asks([])
+        ag = b.st["agreement"]
+        self.assertEqual([(p["key"], p["action"]) for p in ag["pending"]], [("ask:q1", "none")])
+        self.assertEqual([(a["key"], a["side"]) for a in ag["actual"]], [("ask:q1", "orchestrator")])
+        self.assertTrue(orchbot.entries(ag["actual"]))
 
 
 class FactsTest(BotCase):

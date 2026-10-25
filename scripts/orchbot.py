@@ -71,6 +71,11 @@ PICK_TOK_RE = re.compile(r"\b[A-Z][A-Z0-9_-]{1,63}\b")  # no '.' or '/': a lane 
 TS_FMT = "%Y-%m-%dT%H:%M:%S"
 HEAD_N = 256  # events.jsonl rotation fingerprint: a hash of its first bytes
 MATCH_S = 3600  # BOTAGREE: a decision and an actual action on one target within 60 min are one match
+# BOTFIX3B: an ack / ask / key-1 / fix waits up to a day for the orchestrator; a fix may land 5 min early
+DAY_S, FIX_EARLY_S, AGREE_VERSION = 86400, 300, 2
+SALIH_RE = re.compile(r"(?i)\bby salih\b|salih onay|chat .*onay|manual key 1")
+PRE_RE = re.compile(r"(?i)under O42|pre-approval")  # pre-approved: not an orchestrator key-1 call
+STAGE_A, STAGE_PCT = {"ack": 30, "ask": 10}, 90  # stage A: ack + ask agree >= 90% on enough samples
 RECENT_N = 10
 GRAD_DAYS, GRAD_PUSHES = 7, 10  # stage 4 exit: >= 1 week, >= 10 key-1 decisions, 100% agree
 KEY1 = {"write_key1", "ask_salih_key1"}
@@ -210,9 +215,22 @@ def same_key(a, b):
 
 
 def agree_blank():
-    return {"start": None, "since": None, "pending": [], "actual": [], "known": None, "totals": {},
-            "rules": {}, "key1": {"agree": 0, "total": 0}, "recent": [],
-            "graduation": {"days": 0, "pushes": 0, "agree_pct": 0.0, "ready": False}}
+    return {"version": AGREE_VERSION, "start": None, "since": None, "pending": [], "actual": [], "known": None,
+            "totals": {}, "rules": {}, "key1": {"agree": 0, "total": 0}, "recent": [], "classes": {},
+            "graduation": {"days": 0, "pushes": 0, "agree_pct": 0.0, "ready": False, "stage_a": False,
+                           "classes": {}}}
+
+
+def horizon(key):
+    return DAY_S if key.split(":")[0] in ("ack", "ask", "key1", "fix") else MATCH_S
+
+
+def klass(p, a):
+    """The metric class of a verdict; key-1 splits by who wrote the approval."""
+    k = (p or a)["key"].split(":")[0]
+    if k == "key1":
+        return "key1_conveyor" if a and a["side"] == "conveyor" else "key1_orch"
+    return k if k in ("ack", "ask", "fix") else None
 
 
 def entries(v):
@@ -244,6 +262,8 @@ AGREE_SHAPES = {  # shadow.json "agreement"; a present key of another shape rese
     "key1": lambda v: isinstance(v, dict) and all(type(v.get(k)) is int for k in ("agree", "total")),
     "recent": lambda v: isinstance(v, list) and all(isinstance(r, dict) for r in v),
     "graduation": lambda v: isinstance(v, dict),
+    "version": lambda v: type(v) is int,
+    "classes": counts,
 }
 
 
@@ -728,9 +748,12 @@ class Bot:
         now, was = self.now(), self.st["asks"]
         cur = {a["id"]: a["since"] for a in asks}
         for i in sorted(cur.keys() - was.keys()):
-            self.decide(now, f"ask {i}", "none", "ASK", i, f"open {i}")
+            self.decide(now, f"ask {i}", "none", "ASK", i, f"open {i}", key=f"ask:{i}".lower())
         for i in sorted(was.keys() - cur.keys()):
             self.decide(now, f"ask {i}", "none", "ASK", i, f"close {i}")
+            # BOTFIX3B: the ask closing is the orchestrator's answer to the bot's open decision
+            self.st["agreement"]["actual"].append({"at": now, "action": "none", "key": f"ask:{i}".lower(),
+                                                   "side": "orchestrator", "what": f"close {i}"})
         self.st["asks"] = cur
 
     def asks(self):
@@ -980,6 +1003,10 @@ class Bot:
         if isinstance(g, dict) and all(num(g.get(k)) for k in ("days", "pushes", "agree_pct")):
             grad = [f"days {g['days']:g}/{GRAD_DAYS}, key-1 pushes {g['pushes']:g}/{GRAD_PUSHES}, "
                     f"agree {g['agree_pct']:g}%, ready {yn(g.get('ready') is True)} (shadow.json)"]
+            if isinstance(g.get("classes"), dict):
+                grad.append(f"stage A ready {yn(g.get('stage_a') is True)} (shadow.json)")
+                grad += [f"{c}: n {v['n']:g}, agree {v['pct']:g}% (shadow.json)" for c, v in g["classes"].items()
+                         if isinstance(v, dict) and num(v.get("n")) and num(v.get("pct"))]
         else:
             grad = [f"graduation: {unk('shadow.json')}"]
 
@@ -1196,6 +1223,11 @@ class Bot:
             self.st["agreement"] = agree_blank()
             self.decide(self.now(), "shadow.json agreement malformed", "escalate_orchestrator", "FAILCLOSED",
                         "shadow.json agreement", f"bad: {', '.join(bad)}; agreement reset")
+        elif ag.get("version") != AGREE_VERSION:
+            # DECISION TAKEN: a block of another version restarts the measurement (alternative: migrate it)
+            self.st["agreement"] = agree_blank()
+            self.decide(self.now(), "shadow.json agreement version", "none", "VERSION", "shadow.json agreement",
+                        f"version {ag.get('version')} -> {AGREE_VERSION}; agreement reset")
         else:
             self.st["agreement"] = dict(agree_blank(), **ag)
 
@@ -1246,9 +1278,10 @@ class Bot:
                     approvals.discard(ident)
                     continue
                 key = agree_key("write_key1", name)
-                if text.startswith("auto-approved by the conveyor"):
+                # DECISION TAKEN: an O42 pre-approval is conveyor-side, outside key-1 graduation (alternative: skip it)
+                if text.startswith("auto-approved by the conveyor") or PRE_RE.search(text):
                     act(mt, "write_key1", key, "conveyor", f"{raw}: {text}")
-                elif re.search(r"\bby salih\b", text, re.I):
+                elif SALIH_RE.search(text):
                     act(mt, "ask_salih_key1", key, "orchestrator", f"{raw}: {text}")
                 else:
                     act(mt, "write_key1", key, "orchestrator", f"{raw}: {text}")
@@ -1282,7 +1315,8 @@ class Bot:
         used, keep = set(), []
         for a in acts:
             i = next((i for i, p in enumerate(pend) if i not in used and same_key(p["key"], a["key"])
-                      and abs(p["at"] - a["at"]) <= MATCH_S), None)
+                      and -(FIX_EARLY_S if p["key"].startswith("fix:") else MATCH_S) <= a["at"] - p["at"]
+                      <= horizon(p["key"])), None)
             if i is not None:
                 used.add(i)
                 self.verdict("agree" if pend[i]["action"] == a["action"] else "disagree", pend[i], a)
@@ -1295,7 +1329,7 @@ class Bot:
         for i, p in enumerate(pend):
             if i in used:
                 continue
-            if now - p["at"] > MATCH_S:
+            if now - p["at"] > horizon(p["key"]):
                 self.verdict("unmatched", p, None)
             else:
                 ag["pending"].append(p)
@@ -1304,6 +1338,11 @@ class Bot:
                             "agree_pct": round(100 * k1["agree"] / k1["total"], 1) if k1["total"] else 0.0}
         ag["graduation"]["ready"] = ag["graduation"]["days"] >= GRAD_DAYS and k1["total"] >= GRAD_PUSHES \
             and k1["agree"] == k1["total"]
+        cls = {c: {"n": sum(v.values()), "pct": round(100 * v.get("agree", 0) / sum(v.values()), 1)}
+               for c, v in sorted(ag["classes"].items()) if sum(v.values())}
+        ag["graduation"]["classes"] = cls
+        ag["graduation"]["stage_a"] = ag["graduation"]["days"] >= GRAD_DAYS and all(
+            cls.get(c, {}).get("n", 0) >= n and cls[c]["pct"] >= STAGE_PCT for c, n in STAGE_A.items())
 
     def verdict(self, kind, p, a):
         ag = self.st["agreement"]
@@ -1317,7 +1356,12 @@ class Bot:
             if name:
                 book.setdefault(name, {}).setdefault(kind, 0)
                 book[name][kind] += 1
-        if (p and p["action"] in KEY1) or (a and a["action"] in KEY1):
+        c = klass(p, a)
+        if c:
+            row = ag["classes"].setdefault(c, {})
+            row["bot_only" if kind == "unmatched" else kind] = row.get("bot_only" if kind == "unmatched" else kind,
+                                                                       0) + 1
+        if c == "key1_orch":  # BOTFIX3B: a conveyor auto-approval or O42 pre-approval is not a key-1 call
             ag["key1"]["total"] += 1
             ag["key1"]["agree"] += kind == "agree"
         if kind != "agree":
