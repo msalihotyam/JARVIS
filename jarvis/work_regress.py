@@ -38,6 +38,18 @@ def _one(pattern: str, output: str) -> str:
     return matches[0]
 
 
+def _node_suite(lines: list[str], index: int, indent: str) -> bool:
+    """True when the YAML block after lines[index] declares a describe() suite."""
+    if lines[index + 1:index + 2] != [indent + "---"]:
+        return False
+    for meta in lines[index + 2:]:
+        if meta == indent + "...":
+            return False
+        if meta == indent + "type: 'suite'":
+            return True
+    return False
+
+
 def parse_output(output: str, runner: str) -> TestResult:
     """Parse unittest, pytest, node TAP, or Jest text (explicit runner).
 
@@ -51,7 +63,7 @@ def parse_output(output: str, runner: str) -> TestResult:
         total = int(_one(r"^Ran (\d+) tests? in .+$", output))
         status = _one(r"^(OK(?: \([^\n]*\))?|FAILED \([^\n]*\))$", output)
         ids = re.findall(r"^(?:FAIL|ERROR): (.+)$", output, re.MULTILINE)
-        count = sum(int(n) for n in re.findall(r"(?:failures|errors|unexpected successes)=(\d+)", status))
+        count = sum(int(n) for n in re.findall(r"\b(?<!expected )(?:failures|errors)=(\d+)", status))
         # Unexpected successes and subtest failures cannot safely be assigned
         # to ordinary test identities from a summary alone.
         if "unexpected successes=" in status or (status.startswith("FAILED") and not count):
@@ -62,8 +74,11 @@ def parse_output(output: str, runner: str) -> TestResult:
         if not counts:
             raise ValueError("missing pytest counts")
         total = sum(int(n) for n, kind in counts if kind != "deselected")
-        count = sum(int(n) for n, kind in counts if kind in {"failed", "error", "errors", "xpassed"})
-        ids = re.findall(r"^(?:FAILED|ERROR) (\S+)(?: - .*)?$", output, re.MULTILINE)
+        # Non-strict XPASS prints no FAILED line; strict XPASS is "failed".
+        count = sum(int(n) for n, kind in counts if kind in {"failed", "error", "errors"})
+        # A node id has no spaces outside its [param] part, which may hold
+        # " - "; captured log lines ("ERROR    root:...") never match.
+        ids = re.findall(r"^(?:FAILED|ERROR) ([^\s\[]+(?:\[[^\n]*?\])?)(?: - .*)?$", output, re.MULTILINE)
     elif runner == "node":
         total = int(_one(r"^# tests (\d+)$", output))
         count = int(_one(r"^# fail (\d+)$", output))
@@ -72,15 +87,19 @@ def parse_output(output: str, runner: str) -> TestResult:
             raise ValueError("cancelled node tests")
         # TAP indentation identifies nested suite ancestry. Ordinal numbers
         # are deliberately excluded: inserting a test must not rename failures.
+        # "# fail" counts tests (t.test parents included) but not describe()
+        # suites or TODO/SKIP directives, so those not-ok lines are skipped.
         parents: list[tuple[int, str]] = []
-        for line in output.splitlines():
+        lines = output.splitlines()
+        for index, line in enumerate(lines):
             sub = re.match(r"^( *)# Subtest: (.+)$", line)
             if sub:
                 depth = len(sub[1])
                 parents = [(d, name) for d, name in parents if d < depth]
                 parents.append((depth, sub[2]))
-            failure = re.match(r"^( *)not ok \d+ - (.+?)(?: # .*)?$", line)
-            if failure:
+            failure = re.match(r"^( *)not ok \d+ - (.*?)(?: # (\w+)\b.*)?$", line)
+            if (failure and (failure[3] or "").upper() not in {"TODO", "SKIP"}
+                    and not _node_suite(lines, index, failure[1] + "  ")):
                 depth = len(failure[1])
                 names = [name for d, name in parents if d < depth]
                 ids.append(" > ".join([*names, failure[2]]))
@@ -91,15 +110,29 @@ def parse_output(output: str, runner: str) -> TestResult:
         count = int(failed[1]) if failed else 0
         _one(r"^Test Suites: +(.+)$", output)
         file_id = None
+        console = None
         for line in output.splitlines():
-            heading = re.match(r"^FAIL\s+(.+?)(?: \([\d.]+ s\))?$", line)
+            # Multi-suite runs repeat every failure after this heading.
+            if line.strip() == "Summary of all failing tests":
+                break
+            indent = len(line) - len(line.lstrip())
+            # Logged text is indented under "● Console" and may look like
+            # headings or failures; the block ends at its own indent or less.
+            if console is not None:
+                if not line.strip() or indent > console:
+                    continue
+                console = None
+            heading = re.match(r"^ ?FAIL\s+(.+?)(?: \([\d.]+ m?s\))?$", line)
             if heading:
                 file_id = heading[1]
-            case = re.match(r"^\s*● (.+)$", line)
-            if case:
+            # Column-0 bullets are config warnings ("● Validation Warning:").
+            case = re.match(r"^( +)● (.+)$", line)
+            if case and case[2] == "Console":
+                console = len(case[1])
+            elif case:
                 if file_id is None:
                     raise ValueError("Jest failure without file identity")
-                ids.append(f"{file_id}::{case[1]}")
+                ids.append(f"{file_id}::{case[2]}")
         suites_failed = re.search(r"^Test Suites:.*?(\d+) failed", output, re.MULTILINE)
         if suites_failed and not count:
             raise ValueError("Jest suite failed before tests ran")
