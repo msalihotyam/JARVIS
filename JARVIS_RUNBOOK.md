@@ -1238,3 +1238,4 @@ Work out, in this order:
 State this before proposing what to do next, so the next action is always
 anchored to the actual current state rather than to what the plan assumed it
 would be.
+- Jules canary: a Jules-worker lane ran end-to-end through the normal conveyor gate (JULESCANARY2).
