@@ -1,0 +1,275 @@
+{"text": "saat kaç", "lane": "L0", "intent": "time.now"}
+{"text": "Saat kaç?", "lane": "L0", "intent": "time.now"}
+{"text": "saat kac", "lane": "L0", "intent": "time.now"}
+{"text": "SAAT KAÇ", "lane": "L0", "intent": "time.now"}
+{"text": "saat kaçtır", "lane": "L0", "intent": "time.now"}
+{"text": "saat kactir acaba", "lane": "L0", "intent": "time.now"}
+{"text": "şu an saat kaç", "lane": "L0", "intent": "time.now"}
+{"text": "su an saat kac", "lane": "L0", "intent": "time.now"}
+{"text": "jarvis saat kaç", "lane": "L0", "intent": "time.now"}
+{"text": "Jarvis, saat kaç oldu?", "lane": "L0", "intent": "time.now"}
+{"text": "saat kaç oldu", "lane": "L0", "intent": "time.now"}
+{"text": "saati söyler misin", "lane": "L0", "intent": "time.now"}
+{"text": "saati soyler misin", "lane": "L0", "intent": "time.now"}
+{"text": "saat kaç,, acaba..", "lane": "L0", "intent": "time.now"}
+{"text": "saat... kaç...", "lane": "L0", "intent": "time.now"}
+{"text": "eee saat kaç", "lane": "L0", "intent": "time.now"}
+{"text": "saat ne", "lane": "L0", "intent": "time.now"}
+{"text": "saat kaç lütfen", "lane": "L0", "intent": "time.now"}
+{"text": "şimdiki saat ne", "lane": "L0", "intent": "time.now"}
+{"text": "tam olarak saat kaç", "lane": "L0", "intent": "time.now"}
+{"text": "SAAT KAÇTIR?", "lane": "L0", "intent": "time.now"}
+{"text": "saat kaç olmuş", "lane": "L0", "intent": "time.now"}
+{"text": "hey jarvis saati söyle", "lane": "L0", "intent": "time.now"}
+{"text": "bugün günlerden ne", "lane": "L0", "intent": "date.today"}
+{"text": "bugun gunlerden ne", "lane": "L0", "intent": "date.today"}
+{"text": "Bugün günlerden ne?", "lane": "L0", "intent": "date.today"}
+{"text": "BUGÜN GÜNLERDEN NE", "lane": "L0", "intent": "date.today"}
+{"text": "günlerden ne", "lane": "L0", "intent": "date.today"}
+{"text": "bugünün tarihi ne", "lane": "L0", "intent": "date.today"}
+{"text": "bugunun tarihi ne", "lane": "L0", "intent": "date.today"}
+{"text": "tarih ne", "lane": "L0", "intent": "date.today"}
+{"text": "bugün ayın kaçı", "lane": "L0", "intent": "date.today"}
+{"text": "bugun ayin kaci", "lane": "L0", "intent": "date.today"}
+{"text": "bugün hangi gün", "lane": "L0", "intent": "date.today"}
+{"text": "bugun hangi gun", "lane": "L0", "intent": "date.today"}
+{"text": "hangi gündeyiz", "lane": "L0", "intent": "date.today"}
+{"text": "bugün ne gün", "lane": "L0", "intent": "date.today"}
+{"text": "ayın kaçındayız", "lane": "L0", "intent": "date.today"}
+{"text": "tarihi söyler misin", "lane": "L0", "intent": "date.today"}
+{"text": "jarvis bugün günlerden ne,,", "lane": "L0", "intent": "date.today"}
+{"text": "bugünün tarihi nedir", "lane": "L0", "intent": "date.today"}
+{"text": "haftanın hangi günündeyiz", "lane": "L0", "intent": "date.today"}
+{"text": "bugün günlerden ne acaba", "lane": "L0", "intent": "date.today"}
+{"text": "merhaba", "lane": "L0", "intent": "greet"}
+{"text": "Merhaba!", "lane": "L0", "intent": "greet"}
+{"text": "selam", "lane": "L0", "intent": "greet"}
+{"text": "selam jarvis", "lane": "L0", "intent": "greet"}
+{"text": "Selamlar", "lane": "L0", "intent": "greet"}
+{"text": "slm", "lane": "L0", "intent": "greet"}
+{"text": "mrb", "lane": "L0", "intent": "greet"}
+{"text": "günaydın", "lane": "L0", "intent": "greet"}
+{"text": "gunaydin", "lane": "L0", "intent": "greet"}
+{"text": "GÜNAYDIN JARVIS", "lane": "L0", "intent": "greet"}
+{"text": "iyi akşamlar", "lane": "L0", "intent": "greet"}
+{"text": "iyi aksamlar", "lane": "L0", "intent": "greet"}
+{"text": "iyi geceler", "lane": "L0", "intent": "greet"}
+{"text": "hey jarvis", "lane": "L0", "intent": "greet"}
+{"text": "selamün aleyküm", "lane": "L0", "intent": "greet"}
+{"text": "merhaba merhaba..", "lane": "L0", "intent": "greet"}
+{"text": "görüşürüz", "lane": "L0", "intent": "greet"}
+{"text": "hoşça kal", "lane": "L0", "intent": "greet"}
+{"text": "iyi günler", "lane": "L0", "intent": "greet"}
+{"text": "teşekkürler", "lane": "L0", "intent": "thanks"}
+{"text": "tesekkurler", "lane": "L0", "intent": "thanks"}
+{"text": "Teşekkür ederim.", "lane": "L0", "intent": "thanks"}
+{"text": "tesekkur ederim", "lane": "L0", "intent": "thanks"}
+{"text": "çok teşekkürler", "lane": "L0", "intent": "thanks"}
+{"text": "sağol", "lane": "L0", "intent": "thanks"}
+{"text": "sagol", "lane": "L0", "intent": "thanks"}
+{"text": "sağ ol", "lane": "L0", "intent": "thanks"}
+{"text": "sağolun", "lane": "L0", "intent": "thanks"}
+{"text": "eyvallah", "lane": "L0", "intent": "thanks"}
+{"text": "EYVALLAH", "lane": "L0", "intent": "thanks"}
+{"text": "tşk", "lane": "L0", "intent": "thanks"}
+{"text": "tsk", "lane": "L0", "intent": "thanks"}
+{"text": "teşekkürler jarvis", "lane": "L0", "intent": "thanks"}
+{"text": "süper teşekkürler", "lane": "L0", "intent": "thanks"}
+{"text": "eline sağlık", "lane": "L0", "intent": "thanks"}
+{"text": "sağ olasın", "lane": "L0", "intent": "thanks"}
+{"text": "tamam teşekkürler,, ", "lane": "L0", "intent": "thanks"}
+{"text": "çok sağol", "lane": "L0", "intent": "thanks"}
+{"text": "tamam kapat", "lane": "L0", "intent": "close_window"}
+{"text": "Tamam, kapat.", "lane": "L0", "intent": "close_window"}
+{"text": "kapat", "lane": "L0", "intent": "close_window"}
+{"text": "kapat bunu", "lane": "L0", "intent": "close_window"}
+{"text": "pencereyi kapat", "lane": "L0", "intent": "close_window"}
+{"text": "jarvis kapat", "lane": "L0", "intent": "close_window"}
+{"text": "kapatır mısın", "lane": "L0", "intent": "close_window"}
+{"text": "kapatir misin", "lane": "L0", "intent": "close_window"}
+{"text": "tamam kapatabilirsin", "lane": "L0", "intent": "close_window"}
+{"text": "kapatsana", "lane": "L0", "intent": "close_window"}
+{"text": "tamam kapat,, kapat", "lane": "L0", "intent": "close_window"}
+{"text": "TAMAM KAPAT", "lane": "L0", "intent": "close_window"}
+{"text": "iptal", "lane": "L0", "intent": "cancel"}
+{"text": "İptal", "lane": "L0", "intent": "cancel"}
+{"text": "IPTAL", "lane": "L0", "intent": "cancel"}
+{"text": "iptal et", "lane": "L0", "intent": "cancel"}
+{"text": "İPTAL ET", "lane": "L0", "intent": "cancel"}
+{"text": "vazgeç", "lane": "L0", "intent": "cancel"}
+{"text": "vazgec", "lane": "L0", "intent": "cancel"}
+{"text": "vazgeçtim", "lane": "L0", "intent": "cancel"}
+{"text": "boşver", "lane": "L0", "intent": "cancel"}
+{"text": "bos ver", "lane": "L0", "intent": "cancel"}
+{"text": "neyse boşver", "lane": "L0", "intent": "cancel"}
+{"text": "dur", "lane": "L0", "intent": "cancel"}
+{"text": "Dur!", "lane": "L0", "intent": "cancel"}
+{"text": "dur dur", "lane": "L0", "intent": "cancel"}
+{"text": "durdur", "lane": "L0", "intent": "cancel"}
+{"text": "sus", "lane": "L0", "intent": "cancel"}
+{"text": "yeter", "lane": "L0", "intent": "cancel"}
+{"text": "jarvis dur", "lane": "L0", "intent": "cancel"}
+{"text": "bir dakika dur", "lane": "L0", "intent": "cancel"}
+{"text": "gerek yok", "lane": "L0", "intent": "cancel"}
+{"text": "iptal,, iptal..", "lane": "L0", "intent": "cancel"}
+{"text": "bunu iptal et lütfen", "lane": "L0", "intent": "cancel"}
+{"text": "nasılsın", "lane": "L1", "intent": ""}
+{"text": "nasilsin jarvis", "lane": "L1", "intent": ""}
+{"text": "naber", "lane": "L1", "intent": ""}
+{"text": "ne yapıyorsun", "lane": "L1", "intent": ""}
+{"text": "bugün çok yorgunum", "lane": "L1", "intent": ""}
+{"text": "canım sıkılıyor", "lane": "L1", "intent": ""}
+{"text": "bana bir fıkra anlat", "lane": "L1", "intent": ""}
+{"text": "bir espri yap", "lane": "L1", "intent": ""}
+{"text": "türkiyenin başkenti neresi", "lane": "L1", "intent": ""}
+{"text": "Türkiye'nin başkenti neresi?", "lane": "L1", "intent": ""}
+{"text": "everestin yüksekliği ne kadar", "lane": "L1", "intent": ""}
+{"text": "pi sayısı kaçtır", "lane": "L1", "intent": ""}
+{"text": "ışık hızı ne kadar", "lane": "L1", "intent": ""}
+{"text": "isik hizi ne kadar", "lane": "L1", "intent": ""}
+{"text": "fotosentez nedir", "lane": "L1", "intent": ""}
+{"text": "python nedir", "lane": "L1", "intent": ""}
+{"text": "atatürk ne zaman doğdu", "lane": "L1", "intent": ""}
+{"text": "ataturk ne zaman dogdu", "lane": "L1", "intent": ""}
+{"text": "kuantum bilgisayar nedir kısaca anlat", "lane": "L1", "intent": ""}
+{"text": "bir yılda kaç gün var", "lane": "L1", "intent": ""}
+{"text": "bir günde kaç saat var", "lane": "L1", "intent": ""}
+{"text": "15 çarpı 23 kaç eder", "lane": "L1", "intent": ""}
+{"text": "en sevdiğin renk ne", "lane": "L1", "intent": ""}
+{"text": "sen kimsin", "lane": "L1", "intent": ""}
+{"text": "adın ne", "lane": "L1", "intent": ""}
+{"text": "beni seviyor musun", "lane": "L1", "intent": ""}
+{"text": "rekürsiyon ne demek", "lane": "L1", "intent": ""}
+{"text": "ingilizcede elma ne demek", "lane": "L1", "intent": ""}
+{"text": "dünyanın en uzun nehri hangisi", "lane": "L1", "intent": ""}
+{"text": "dunyanin en uzun nehri hangisi", "lane": "L1", "intent": ""}
+{"text": "ayda yerçekimi neden az", "lane": "L1", "intent": ""}
+{"text": "bana motivasyon verecek bir söz söyle", "lane": "L1", "intent": ""}
+{"text": "sence yapay zeka tehlikeli mi", "lane": "L1", "intent": ""}
+{"text": "kahve mi çay mı", "lane": "L1", "intent": ""}
+{"text": "bugün kendimi iyi hissediyorum", "lane": "L1", "intent": ""}
+{"text": "tamam anladım", "lane": "L1", "intent": ""}
+{"text": "peki", "lane": "L1", "intent": ""}
+{"text": "harika bir fikir", "lane": "L1", "intent": ""}
+{"text": "istanbul'un nüfusu kaç", "lane": "L1", "intent": ""}
+{"text": "mona lisa'yı kim yaptı", "lane": "L1", "intent": ""}
+{"text": "suyun kaynama noktası kaç derece", "lane": "L1", "intent": ""}
+{"text": "http ile https arasındaki fark ne", "lane": "L1", "intent": ""}
+{"text": "bana bir tavsiye ver", "lane": "L1", "intent": ""}
+{"text": "en iyi film hangisi sence", "lane": "L1", "intent": ""}
+{"text": "saat dilimi nedir", "lane": "L1", "intent": ""}
+{"text": "saatler neden ileri alınıyor", "lane": "L1", "intent": ""}
+{"text": "merhaba nasılsın bugün", "lane": "L1", "intent": ""}
+{"text": "selam ne haber", "lane": "L1", "intent": ""}
+{"text": "teşekkürler ama neden böyle düşünüyorsun", "lane": "L1", "intent": ""}
+{"text": "dur bir saniye bu ne demek", "lane": "L1", "intent": ""}
+{"text": "bana bir tablo yap", "lane": "L2", "intent": ""}
+{"text": "bana bi tablo yap", "lane": "L2", "intent": ""}
+{"text": "şu dosyayı özetle", "lane": "L2", "intent": ""}
+{"text": "su dosyayi ozetle", "lane": "L2", "intent": ""}
+{"text": "Şu dosyayı özetler misin?", "lane": "L2", "intent": ""}
+{"text": "bu pdfi özetle", "lane": "L2", "intent": ""}
+{"text": "masaüstündeki rapor dosyasını aç", "lane": "L2", "intent": ""}
+{"text": "saat kaçta toplantı var, takvime ekle", "lane": "L2", "intent": ""}
+{"text": "saat kacta toplanti var takvime ekle", "lane": "L2", "intent": ""}
+{"text": "saat 3'te toplantı ayarla", "lane": "L2", "intent": ""}
+{"text": "saat beşe alarm kur", "lane": "L2", "intent": ""}
+{"text": "saat 7de beni uyandır", "lane": "L2", "intent": ""}
+{"text": "yarın saat 10 için hatırlatıcı ekle", "lane": "L2", "intent": ""}
+{"text": "bugünkü toplantılarım neler", "lane": "L2", "intent": ""}
+{"text": "takvimimde bugün ne var", "lane": "L2", "intent": ""}
+{"text": "bugün hava nasıl", "lane": "L2", "intent": ""}
+{"text": "bugun hava nasil", "lane": "L2", "intent": ""}
+{"text": "istanbulda hava kaç derece", "lane": "L2", "intent": ""}
+{"text": "dolar kaç lira", "lane": "L2", "intent": ""}
+{"text": "bitcoin ne kadar oldu", "lane": "L2", "intent": ""}
+{"text": "son haberleri getir", "lane": "L2", "intent": ""}
+{"text": "ahmet'e mail gönder", "lane": "L2", "intent": ""}
+{"text": "ahmete mail at toplantı iptal oldu de", "lane": "L2", "intent": ""}
+{"text": "maillerimi kontrol et", "lane": "L2", "intent": ""}
+{"text": "gelen kutumdaki son e-postayı oku", "lane": "L2", "intent": ""}
+{"text": "spotify'da müzik aç", "lane": "L2", "intent": ""}
+{"text": "spotifyda muzik ac", "lane": "L2", "intent": ""}
+{"text": "biraz müzik çal", "lane": "L2", "intent": ""}
+{"text": "chrome'u aç", "lane": "L2", "intent": ""}
+{"text": "youtube'u aç", "lane": "L2", "intent": ""}
+{"text": "googleda python dersleri ara", "lane": "L2", "intent": ""}
+{"text": "internette bunu araştır", "lane": "L2", "intent": ""}
+{"text": "bilgisayarı kapat", "lane": "L2", "intent": ""}
+{"text": "bilgisayari kapat", "lane": "L2", "intent": ""}
+{"text": "chrome'u kapat", "lane": "L2", "intent": ""}
+{"text": "spotify'ı kapat", "lane": "L2", "intent": ""}
+{"text": "müziği durdur", "lane": "L2", "intent": ""}
+{"text": "alarmı iptal et", "lane": "L2", "intent": ""}
+{"text": "yarınki toplantıyı iptal et", "lane": "L2", "intent": ""}
+{"text": "ekran görüntüsü al", "lane": "L2", "intent": ""}
+{"text": "sesi kıs", "lane": "L2", "intent": ""}
+{"text": "sesi aç", "lane": "L2", "intent": ""}
+{"text": "parlaklığı artır", "lane": "L2", "intent": ""}
+{"text": "bu metni ingilizceye çevir", "lane": "L2", "intent": ""}
+{"text": "bu cümleyi ingilizceye çevirir misin", "lane": "L2", "intent": ""}
+{"text": "bir not al süt alınacak", "lane": "L2", "intent": ""}
+{"text": "notlarımı göster", "lane": "L2", "intent": ""}
+{"text": "indirilenler klasörünü temizle", "lane": "L2", "intent": ""}
+{"text": "bu excel dosyasındaki satırları sırala", "lane": "L2", "intent": ""}
+{"text": "bana bir sunum hazırla", "lane": "L2", "intent": ""}
+{"text": "bir e-posta taslağı yaz", "lane": "L2", "intent": ""}
+{"text": "bu fonksiyonu düzelt", "lane": "L2", "intent": ""}
+{"text": "bu koddaki hatayı bul", "lane": "L2", "intent": ""}
+{"text": "kodu açıkla şu dosyadaki", "lane": "L2", "intent": ""}
+{"text": "testleri çalıştır", "lane": "L2", "intent": ""}
+{"text": "bu fotoğrafı küçült", "lane": "L2", "intent": ""}
+{"text": "csv dosyasını json'a dönüştür", "lane": "L2", "intent": ""}
+{"text": "anneme whatsapptan mesaj gönder", "lane": "L2", "intent": ""}
+{"text": "en yakın eczane nerede", "lane": "L2", "intent": ""}
+{"text": "trafik durumu nasıl", "lane": "L2", "intent": ""}
+{"text": "galatasaray maçının skoru ne", "lane": "L2", "intent": ""}
+{"text": "bana bir şiir yaz", "lane": "L2", "intent": ""}
+{"text": "harcamalarımı hesapla", "lane": "L2", "intent": ""}
+{"text": "dur müziği kapat", "lane": "L2", "intent": ""}
+{"text": "tamam şu dosyayı kaydet", "lane": "L2", "intent": ""}
+{"text": "teşekkürler şimdi de bunu pdf olarak kaydet", "lane": "L2", "intent": ""}
+{"text": "merhaba bana bir tablo hazırlar mısın", "lane": "L2", "intent": ""}
+{"text": "iptal et ve yeni bir toplantı oluştur", "lane": "L2", "intent": ""}
+{"text": "vazgeçtim onun yerine raporu gönder", "lane": "L2", "intent": ""}
+{"text": "saati kaydet", "lane": "L2", "intent": ""}
+{"text": "bugünün tarihini dosyaya yaz", "lane": "L2", "intent": ""}
+{"text": "linki aç", "lane": "L2", "intent": ""}
+{"text": "bu sayfayı yer imlerine ekle", "lane": "L2", "intent": ""}
+{"text": "bunu bir yere kaydet,, lütfen", "lane": "L2", "intent": ""}
+{"text": "şu projeyi kur", "lane": "L3", "intent": ""}
+{"text": "su projeyi kur", "lane": "L3", "intent": ""}
+{"text": "bu repoyu baştan yaz", "lane": "L3", "intent": ""}
+{"text": "bu repoyu bastan yaz", "lane": "L3", "intent": ""}
+{"text": "bana bir web sitesi yap", "lane": "L3", "intent": ""}
+{"text": "bir e-ticaret sitesi kur", "lane": "L3", "intent": ""}
+{"text": "react ile bir uygulama geliştir", "lane": "L3", "intent": ""}
+{"text": "bu uygulamayı sıfırdan yaz", "lane": "L3", "intent": ""}
+{"text": "projeyi typescripte taşı", "lane": "L3", "intent": ""}
+{"text": "tüm kod tabanını refactor et", "lane": "L3", "intent": ""}
+{"text": "kod tabanını baştan düzenle", "lane": "L3", "intent": ""}
+{"text": "veritabanını postgresqle migrate et", "lane": "L3", "intent": ""}
+{"text": "bir telegram botu yaz", "lane": "L3", "intent": ""}
+{"text": "bana bir oyun yap", "lane": "L3", "intent": ""}
+{"text": "backend servisini kur ve deploy et", "lane": "L3", "intent": ""}
+{"text": "önce repoyu klonla sonra testleri çalıştır sonra raporla", "lane": "L3", "intent": ""}
+{"text": "dosyaları indir, düzenle, sonra hepsini zip yap ve gönder", "lane": "L3", "intent": ""}
+{"text": "bütün pdfleri özetle ve tek bir rapora topla", "lane": "L3", "intent": ""}
+{"text": "klasördeki tüm dosyaları yeniden adlandır", "lane": "L3", "intent": ""}
+{"text": "her sabah bana haber özeti gönder", "lane": "L3", "intent": ""}
+{"text": "her gün saat 9da yedek al", "lane": "L3", "intent": ""}
+{"text": "arka planda bütün logları analiz et", "lane": "L3", "intent": ""}
+{"text": "bu işi arka planda yap bitince haber ver", "lane": "L3", "intent": ""}
+{"text": "jarvisin arayüzünü baştan tasarla", "lane": "L3", "intent": ""}
+{"text": "bir api yaz ve dokümantasyonunu hazırla", "lane": "L3", "intent": ""}
+{"text": "proje için ci pipeline kur", "lane": "L3", "intent": ""}
+{"text": "bu sistemi mikroservis mimarisine geçir", "lane": "L3", "intent": ""}
+{"text": "yeni bir django projesi oluştur", "lane": "L3", "intent": ""}
+{"text": "web sayfamı yeniden tasarla", "lane": "L3", "intent": ""}
+{"text": "tamam şimdi şu projeyi kur", "lane": "L3", "intent": ""}
+{"text": "SU PROJEYI KUR", "lane": "L3", "intent": ""}
+{"text": "şu projeyi kurar mısın,, lütfen", "lane": "L3", "intent": ""}
+{"text": "chrome eklentisi geliştir", "lane": "L3", "intent": ""}
+{"text": "tüm testleri yaz, çalıştır ve hataları düzelt", "lane": "L3", "intent": ""}
+{"text": "bir crm sistemi kur", "lane": "L3", "intent": ""}
+{"text": "bu otomasyonu yaz ve her gece çalıştır", "lane": "L3", "intent": ""}
