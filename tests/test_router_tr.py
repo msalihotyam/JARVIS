@@ -121,6 +121,30 @@ class BehaviourTests(unittest.TestCase):
             with self.subTest(day=day):
                 self.assertEqual(route(f"her {day} beni uyandır").lane, "L3")
 
+    def test_unrecognised_request_fails_upward(self):
+        # One case per variant of the ROUTERTRC3 class.
+        for variant, text in (("plain", "şunu hallet"), ("case", "ŞUNU HALLET"),
+                              ("separator", "şunu-hallet"),
+                              ("suffix -sene", "halletsene şunu"),
+                              ("suffix -ir misin", "halleder misin"),
+                              ("want", "kahve ısmarlamanı istiyorum"),
+                              ("lazım", "bunu halletmek lazım"),
+                              ("ascii-folded", "sunu hallet"),
+                              ("order", "hallet şunu"), ("truncated", "şunu hall"),
+                              ("relay verb", "ahmete sor gelecek mi"),
+                              ("order verb", "bana pizza söyle"),
+                              ("mixed clause", "nasılsın, bir de pr at"),
+                              ("mixed conjunction", "öneri ver ve uygula"),
+                              ("acknowledged order", "tamam bitir"),
+                              ("proposal", "devam edelim mi")):
+            with self.subTest(variant=variant):
+                self.assertEqual(route(text).lane, "L2")
+        for text in ("bana motivasyon verecek bir söz söyle", "oyun oynamak istiyorum",
+                     "canım sıkılıyor", "bana bir fıkra anlat", "peki", "",
+                     "merhaba, nasılsın?", "tamam anladım"):
+            with self.subTest(text=text):
+                self.assertEqual(route(text).lane, "L1")
+
     def test_apostrophe_like_marks(self):
         for mark in "'´’ʼ′`＇":
             with self.subTest(mark=hex(ord(mark))):

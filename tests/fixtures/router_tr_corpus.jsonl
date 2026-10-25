@@ -316,3 +316,30 @@
 {"text": "bir chatbot lazım", "lane": "L3", "intent": "project"}
 {"text": "üniversiteye gitmek istiyorum", "lane": "L1", "intent": "chat"}
 {"text": "oyun oynamak istiyorum", "lane": "L1", "intent": "chat"}
+{"text": "bak ne diyeceğim", "lane": "L2", "intent": "task"}
+{"text": "bana pizza söyle", "lane": "L2", "intent": "task"}
+{"text": "ahmete sor gelecek mi", "lane": "L2", "intent": "task"}
+{"text": "bunu kapat", "lane": "L0", "intent": "close_window"}
+{"text": "şunu hallet", "lane": "L2", "intent": "task"}
+{"text": "halletsene şunu", "lane": "L2", "intent": "task"}
+{"text": "bunu halleder misin", "lane": "L2", "intent": "task"}
+{"text": "bana kahve ısmarla", "lane": "L2", "intent": "task"}
+{"text": "kahve ısmarlamanı istiyorum", "lane": "L2", "intent": "task"}
+{"text": "bunu halletmek lazım", "lane": "L2", "intent": "task"}
+{"text": "yardım eder misin", "lane": "L2", "intent": "task"}
+{"text": "hava neden mavi", "lane": "L2", "intent": "task"}
+{"text": "dosya nedir", "lane": "L2", "intent": "task"}
+{"text": "bana tavsiye ver ve siparişi ver", "lane": "L2", "intent": "task"}
+{"text": "bir fıkra ver ve siparişi ver", "lane": "L2", "intent": "task"}
+{"text": "tavsiye ver, sonra commit at", "lane": "L2", "intent": "task"}
+{"text": "söz ver bana, push at", "lane": "L2", "intent": "task"}
+{"text": "öneri ver ve uygula", "lane": "L2", "intent": "task"}
+{"text": "neden? deploy at", "lane": "L2", "intent": "task"}
+{"text": "nasılsın, bir de pr at", "lane": "L2", "intent": "task"}
+{"text": "merhaba, faturayı yatır", "lane": "L2", "intent": "task"}
+{"text": "2+2 kaç? ayrıca commit at", "lane": "L2", "intent": "task"}
+{"text": "ne zaman bitiyor bu iş, bitir", "lane": "L2", "intent": "task"}
+{"text": "tamam bitir", "lane": "L2", "intent": "task"}
+{"text": "tamam devam", "lane": "L2", "intent": "task"}
+{"text": "devam edelim mi", "lane": "L2", "intent": "task"}
+{"text": "silsem mi", "lane": "L2", "intent": "task"}

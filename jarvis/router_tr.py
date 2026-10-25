@@ -175,8 +175,27 @@ _CHAT_VERB = _rx(r"(anlat|soyle|acikla|tanimla|oner|tavsiye|sor|cevapla|yorumla|
 # "bir espri yap" / "fıkra anlat": a made-up line, not a tool task.
 _CHAT_OBJ = _rx(r"(espri|fikra|saka|bilmece|tekerleme)\w*")
 _MAKE = _rx(r"(yap|soyle)\w*")
-_QUESTION = _rx(r"ne|nedir|neden|nicin|niye|nasil|kim|kimdir|nerede|neresi|nereye"
-                r"|hangi\w*|kac\w*|m[iu]\w*|ne\w+")
+# Fail upward: L1 needs a recognised chat signal, anything else is L2.
+_ASK = _rx(r"ne(dir|den|ler\w*|yi|ye|si|yin)?|nicin|niye|nasil\w*|kim\w*|nere\w*"
+           r"|hangi\w*|kac\w*|m[iu](s[iu]n(iz)?|y[iu]m|y[iu]z|d[iu]r|yd[iu]\w*)?")
+# Acknowledgements are chat only on their own: "tamam bitir" is an order.
+_ACK = _rx(r"naber|nbr|merhaba|selam\w*|tamam|peki|evet|hayir")
+_SOCIAL = _rx(r"tesekkur\w*|sagol\w*|harika|super|guzel|anladim|anladik|yorgun\w*"
+              r"|sikil\w*|hissed\w*|mutlu\w*|uzgun\w*|sence|bence")
+# "devam edelim mi", "silsem mi": a proposal to act, not a question.
+_PROPOSAL = _rx(r"\w+[ae]lim|\w+s[ae]m")
+# Mixed messages are routed per clause: "nasılsın, bir de pr at" is work.
+_CLAUSE = re.compile(r"[,;?!.]+|\b(?:ve|sonra|ayrica|bir de)\b")
+# "sor/söyle/ver/say" alone are orders or relays ("bana pizza söyle",
+# "ahmete sor"); with a chat object ("bir söz söyle") they are chat.
+_WEAK_CHAT = _rx(r"(sor|soyle|ver|say)(sana|sene|[iu]n(iz)?)?")
+_TALK_OBJ = _rx(r"(espri|fikra|saka|bilmece|tekerleme|soz|tavsiye|fikir|fikr|oneri"
+                r"|bilgi|cevap|yorum|motivasyon|ornek)\w*")
+_WISH = _rx(r"isti(yorum|yoruz|yom)|isterim|isteriz")
+_POINTED = _rx(r"(bu|su|o)(n[iu]|nlari)")
+_ACCUSATIVE = _rx(r"\w+[iu]")
+_STRONG_CHAT = _rx(r"(anlat|acikla|tanimla|oner|tavsiye|cevapla|yorumla|dusun|tahmin"
+                   r"|konus|sohbet|espri|fikra)\w*")
 
 _LONG = 35
 
@@ -216,8 +235,7 @@ def _imperative(tokens: list[str]) -> bool:
             and not _NOT_IMPERATIVE.fullmatch(last) and not _CHAT_VERB.fullmatch(last))
 
 
-def route(text: str) -> Route:
-    norm = normalize(text)
+def _route(norm: str) -> Route:
     tokens = norm.split()
     if not tokens:
         return Route("L1", "chat", 0.5, "empty")
@@ -266,5 +284,37 @@ def route(text: str) -> Route:
         return Route("L2", "task", 0.5, "l2:long message")
     if intent:  # L0 words but too long to trust
         return Route("L1", "chat", 0.6, "l1:long l0-like")
-    is_q = any(_QUESTION.fullmatch(t) for t in tokens)
-    return Route("L1", "question" if is_q else "chat", 0.6, "l1:no task signal")
+    talk = any(_TALK_OBJ.fullmatch(t) for t in tokens)
+    if any(_WEAK_CHAT.fullmatch(t) for t in tokens) and not talk:
+        return Route("L2", "task", 0.5, "l2:order/relay verb")
+    strong = any(_STRONG_CHAT.fullmatch(t) for t in tokens)
+    # A pointed object ("şunu hallet", "tamam bunu hallet", "bunu nasıl
+    # hallederim") is work unless the verb is a chat verb ("bunu açıkla").
+    if any(_POINTED.fullmatch(t) for t in tokens) and not (talk or strong):
+        return Route("L2", "task", 0.5, "l2:pointed object")
+    is_q = any(_ASK.fullmatch(t) for t in tokens)
+    # Own wish ("oyun oynamak istiyorum"); "lazım" or an accusative object
+    # ("ortalığı toparlamak istiyorum") asks for work.
+    wish = (any(_WISH.fullmatch(t) for t in tokens)
+            and any(_INFINITIVE.fullmatch(t) for t in tokens)
+            and not any(_ACCUSATIVE.fullmatch(t) for t in tokens))
+    if any(_PROPOSAL.fullmatch(t) for t in tokens):
+        return Route("L2", "task", 0.5, "l2:proposal to act")
+    social = (any(_SOCIAL.fullmatch(t) for t in tokens)
+              or all(_ACK.fullmatch(t) for t in tokens))
+    if is_q or talk or wish or strong or social:
+        return Route("L1", "question" if is_q else "chat", 0.6, "l1:chat signal")
+    return Route("L2", "task", 0.5, "l2:no chat signal")
+
+
+def route(text: str) -> Route:
+    whole = _route(normalize(text))
+    if whole.lane != "L1":  # L0 already refuses any task word
+        return whole
+    # A bare "jarvis," is the address, not a clause.
+    clauses = [c for part in re.split(r"[,;?!.]+", str(text or ""))
+               for c in _CLAUSE.split(normalize(part)) if c.strip() not in ("", "jarvis")]
+    if len(clauses) < 2:
+        return whole
+    worst = max((_route(c.strip()) for c in clauses), key=lambda r: r.lane)
+    return worst if worst.lane in ("L2", "L3") else whole
