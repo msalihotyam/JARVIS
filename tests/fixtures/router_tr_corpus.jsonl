@@ -273,3 +273,46 @@
 {"text": "tüm testleri yaz, çalıştır ve hataları düzelt", "lane": "L3", "intent": ""}
 {"text": "bir crm sistemi kur", "lane": "L3", "intent": ""}
 {"text": "bu otomasyonu yaz ve her gece çalıştır", "lane": "L3", "intent": ""}
+{"text": "tarihi güncelle", "lane": "L2", "intent": "task"}
+{"text": "oturumu kilitle", "lane": "L2", "intent": "task"}
+{"text": "altın kaç lira", "lane": "L2", "intent": "task"}
+{"text": "sıfırdan bir e-ticaret sitesi istiyorum", "lane": "L3", "intent": "project"}
+{"text": "oturumu kilitleyebilir misin ve sonucu söyle", "lane": "L2", "intent": "task"}
+{"text": "oturumu kilitleyebilir misin", "lane": "L2", "intent": "task"}
+{"text": "her salı beni uyandır", "lane": "L3", "intent": "background"}
+{"text": "her pazartesi beni uyandır", "lane": "L3", "intent": "background"}
+{"text": "İstanbul´da hava nasıl", "lane": "L2", "intent": "task"}
+{"text": "İstanbul'da hava nasıl", "lane": "L2", "intent": "task"}
+{"text": "İPTAL", "lane": "L0", "intent": "cancel"}
+{"text": "beni 10 dakika sonra uyar", "lane": "L2", "intent": "task"}
+{"text": "şu repoyu incele", "lane": "L2", "intent": "task"}
+{"text": "loglara bak", "lane": "L2", "intent": "task"}
+{"text": "pizza sipariş ver", "lane": "L2", "intent": "task"}
+{"text": "sipariş verir misin", "lane": "L2", "intent": "task"}
+{"text": "uber çağır", "lane": "L2", "intent": "task"}
+{"text": "taksi çağır", "lane": "L2", "intent": "task"}
+{"text": "faturayı öde", "lane": "L2", "intent": "task"}
+{"text": "uçak bileti al", "lane": "L2", "intent": "task"}
+{"text": "saati ileri al", "lane": "L2", "intent": "task"}
+{"text": "saati senkronize et", "lane": "L2", "intent": "task"}
+{"text": "ışığı söndür", "lane": "L2", "intent": "task"}
+{"text": "sterlin ne kadar", "lane": "L2", "intent": "task"}
+{"text": "bugün yağmur yağacak mı", "lane": "L2", "intent": "task"}
+{"text": "yarın kar yağar mı", "lane": "L2", "intent": "task"}
+{"text": "fenerbahçe maçı kaç kaç", "lane": "L2", "intent": "task"}
+{"text": "maç sonucu ne oldu", "lane": "L2", "intent": "task"}
+{"text": "akşam ezanı ne zaman", "lane": "L2", "intent": "task"}
+{"text": "ezan saat kaçta", "lane": "L2", "intent": "task"}
+{"text": "gün batımı saat kaçta", "lane": "L2", "intent": "task"}
+{"text": "en yakın benzinlik nerede", "lane": "L2", "intent": "task"}
+{"text": "pilim kaç", "lane": "L2", "intent": "task"}
+{"text": "ip adresim ne", "lane": "L2", "intent": "task"}
+{"text": "internet bağlantım var mı", "lane": "L2", "intent": "task"}
+{"text": "sistem saati kaç", "lane": "L2", "intent": "task"}
+{"text": "bilgisayarı yeniden başlat", "lane": "L2", "intent": "task"}
+{"text": "sunucuyu yeniden başlat", "lane": "L2", "intent": "task"}
+{"text": "her sabah beni uyar", "lane": "L3", "intent": "background"}
+{"text": "her sabah 8de haber özeti", "lane": "L3", "intent": "background"}
+{"text": "bir chatbot lazım", "lane": "L3", "intent": "project"}
+{"text": "üniversiteye gitmek istiyorum", "lane": "L1", "intent": "chat"}
+{"text": "oyun oynamak istiyorum", "lane": "L1", "intent": "chat"}

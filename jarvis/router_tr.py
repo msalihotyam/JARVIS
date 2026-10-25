@@ -24,6 +24,11 @@ class Route(NamedTuple):
     reason: str
 
 
+_APOSTROPHE = re.compile(
+    "['`\u00b4\u02b9\u02bb\u02bc\u02bd\u02c8\u02ca\u02cb"
+    "\u2018\u2019\u201b\u2032\u2035\uff07]")
+
+
 def normalize(text: str) -> str:
     """Turkish casefold, strip diacritics and punctuation, collapse spaces.
 
@@ -31,9 +36,10 @@ def normalize(text: str) -> str:
     "saat kaç" and "saat kac" normalize the same way.
     """
     t = str(text or "").replace("İ", "i").replace("I", "ı").lower()
+    # Before NFKD: it turns "´" into a space plus a combining accent.
+    t = _APOSTROPHE.sub("", t)  # istanbul'da / istanbul´da -> istanbulda
     t = unicodedata.normalize("NFKD", t)
     t = "".join(c for c in t if not unicodedata.combining(c)).replace("ı", "i")
-    t = re.sub(r"['’‘`´]", "", t)  # istanbul'da -> istanbulda
     t = re.sub(r"[\W_]+", " ", t)
     return " ".join(t.split())
 
@@ -66,8 +72,8 @@ _L0 = (
     ("date.today", _rx(r"gunlerden|tarih|\bayin\s+kac|\b(hangi|ne)\s+gun|gundeyiz"
                        r"|kacindayiz"),
      _rx(r"bugun(un|ku)?|gunlerden|ne|nedir|tarih(i|ini|imiz)?|kac|kaci|kacinci"
-         r"|kacindayiz|ayin|hangi|gun\w*|haftanin|soyle\w*|soyler|ogren\w*"
-         r"|su|an|itibariyla")),
+         r"|kacindayiz|ayin|hangi|gun(u|un|e|deyiz|undeyiz)?|haftanin|soyle\w*"
+         r"|soyler|ogren\w*|su|an|itibariyla")),
     ("thanks", _rx(r"tesekkur|sag\s?ol|eyvallah|\b(tsk|tsks|tskler|eyv|mersi|sagolasin)\b"
                    r"|eline\s+saglik"),
      _rx(r"tesekkur\w*|sag|ol|olun|sagol\w*|eyv|tsk\w*|mersi|ederim|ederiz|eline"
@@ -80,6 +86,10 @@ _L0 = (
      _rx(r"slm|mrb|hello|gunaydin|tunaydin|aksamlar|gunler|sabahlar|selamun"
          r"|aleykum(selam)?|aleyna")),
 )
+# The task verbs / tool nouns an L0 intent owns; any other one refuses L0
+# ("tarihi güncelle", "saati ayarla" are tasks).
+_L0_OWN = {"cancel": _rx(r"durdur|iptal"), "close_window": _rx(r"kapat\w*|pencere\w*"),
+           "time.now": _rx(r"bak\w*")}
 
 # Verbs that ask for an action with tools. Short stems get explicit suffixes
 # (vowel harmony aware) so "acaba", "yapay", "bulut", "silah" stay out;
@@ -94,13 +104,16 @@ _TASK_VERB = _rx(
     r"|iptal|analiz|karsilastir|hesapla|getir|goster|doldur|yazdir|arastir|tasarla"
     r"|gelistir|kontrol|cikart|sikistir|adlandir|indir(?!im)|isaretle|yayinla"
     r"|kodla|programla|refactor|migrate|otomatiklestir|raporla|ayikla|ayir|kucult"
-    r"|buyut|artir|azalt|yukselt|yenile|tercume|kurulum|topla(?!nti)|uyandir)\w*"
-    r"|(yap|yaz|kur|sil|bul|oku|ac|ara|tasi|ciz|tara|cal|cek|gecir|kis)" + _SFX
+    r"|buyut|artir|azalt|yukselt|yenile|tercume|kurulum|topla(?!nti)|uyandir"
+    r"|kilitle|oynat|sustur|tikla|kaydir|uyut|incele|cagir|sondur)\w*"
+    r"|(yap|yaz|kur|sil|bul|oku|ac|ara|tasi|ciz|tara|cal|cek|gecir|kis|uyar|bak|ode|al)"
+    + _SFX
 )
 # "X et" compounds: "test et", "tercüme et", "kontrol eder misin".
 _ET_TASK = _rx(r"\b(test|tercume|transfer|rezerve|siparis|organize|tamir|kayit|teslim"
                r"|takip|optimize|format|deploy|commit|push|merge|install|update"
-               r"|not)\s+(et|eder|ed[ie]\w*|etsene|etmek|etmen\w*)\b"
+               r"|not|senkronize)\s+(et|eder|ed[ie]\w*|etsene|etmek|etmen\w*)\b"
+               r"|\bsiparis\s+ver\w*"
                r"|\bnot\s+al\w*|\bmail\s+at\w*|\bara\s+(?!sira)\w")
 # Nouns that need files, apps, the OS or live data. Ambiguous nouns only in
 # their object/locative forms ("bilgisayarı kapat", not "bilgisayar nedir").
@@ -117,30 +130,46 @@ _TOOL_NOUN = _rx(r"""
     |haber(ler\w*|i|in)|skor\w*|trafik\w*|masaustu\w*|indirilenler\w*|ses(i|ini)|parlakli\w*
     |wifi\w*|bluetooth\w*|kod(u|unu|umu|da|daki|lari|larini|um)|fonksiyon\w*
     |test(leri|lerini|i)|notlar\w*|yedek\w*|eczane\w*|tarif\w*|cv\w*|hesap(tan|ima|imdan)
+    |fiyat\w*|oturum(u|unu|dan)|ozet\w*|sterlin\w*|yagmur\w*|ezan\w*|benzinlik\w*
+    |pil(im|i|in)|baglanti(m|mi|si|yi)\w*|mac(i|in|lar\w*)?
 """)
+# Live prices: "altın kaç lira", "gram altın ne kadar", "kaç TL".
+_LIVE = re.compile(r"\b(kac|ne\s+kadar)\s+(lira|tl|kurus|dolar|euro)\b"
+                   r"|\b(altin|gumus|benzin|mazot|motorin|akaryakit|faiz)\w*\s+"
+                   r"(\w+\s+)?(ne\s+kadar|kac\b|fiyat)"
+                   r"|\byag(ar|acak|iyor)\b|\bgun\s+batim|\bsistem\s+saat|\ben\s+yakin\b"
+                   r"|\bip\s+adres")
 # L3: project nouns + build verbs, rewrite markers, background/recurring work.
 _PROJECT = _rx(r"""
-    proje\w*|\w*repo\w*|depo(yu|nun|daki|da)|uygulama\w*|app\w*|\w*site\w*|sistem\w*
+    proje\w*|\w*repo\w*|depo(yu|nun|daki|da)|uygulama\w*|app\w*|(web)?site\w*|sistem\w*
     |altyapi\w*|oyun(u|unu)?|backend\w*|frontend\w*|api\w*|servis\w*|bot(u|unu)?
     |eklenti\w*|kutuphane\w*|mimari\w*|codebase\w*|veritabani\w*|platform\w*
-    |otomasyon\w*|pipeline\w*|sunucu\w*|crm\w*|erp\w*
+    |otomasyon\w*|pipeline\w*|sunucu\w*|crm\w*|erp\w*|chatbot\w*
 """)
 _BUILD = _rx(r"(kur|yap|yaz|tasi|gecir)" + _SFX +
              r"|(gelistir|olustur|tasarla|insa|kodla|programla|refactor|migrate"
              r"|donustur|kurulum)\w*")
 _L3_ALONE = _rx(r"(gelistir|refactor|migrate|migrasyon|otomatiklestir)\w*")
 _L3_PHRASE = re.compile(
-    r"\b(bastan|sifirdan|bastanbasa|komple|tamamen|yeniden|uctan\s+uca)\b"
+    r"\b(bastan|sifirdan|bastanbasa|komple|tamamen|yeniden(?!\s+basla)|uctan\s+uca)\b"
     r"|\barka\s+planda\b|\bbitince\s+haber|\bkod\s+taban|\bweb\s+sayfa|\blanding\s+page"
     r"|\belden\s+gecir")
-_RECURRING = re.compile(r"\bher\s+(gun|sabah|aksam|gece|hafta|ay|saat|pazartesi|cuma)\w*")
+_RECURRING = re.compile(r"\bher\s+(gun|sabah|aksam|gece|hafta|ay|saat|pazartesi|sali"
+                        r"|carsamba|persembe|cuma|cumartesi|pazar)\w*")
 _ALL = re.compile(r"\b(tum|butun|hepsini|her\s+bir)\b")
 _SEQUENCE = re.compile(r"\b(sonra|ardindan|akabinde|sonrasinda|once|en\s+son|daha\s+sonra)\b")
 # Request markers: "yapar mısın", "-abilir", "-sana", "lütfen".
 _REQUEST = _rx(r"\w{2,}([ae]bil(ir|ecek)\w*|s[ae]n[ae])|lutfen")
 _REQ_PARTICLE = _rx(r"m[iu]s[iu]n(iz)?")
 _NOT_REQUEST = _rx(r"olabil\w*|ol[ae]bil\w*")
-# Conversational verbs: a request with one of these is still one-line chat.
+# "X istiyorum / lazım / gerek" with a project noun is project work;
+# "oyun oynamak istiyorum" (an infinitive) is the speaker's own wish.
+_WANT = _rx(r"isti(yorum|yoruz|yom)|isterim|isteriz|lazim|gerek(li|iyor)?|ihtiyacim")
+_INFINITIVE = _rx(r"\w+m[ae]k")
+# Denominal "-lA" imperative after an object ("oturumu kilitle"); not these.
+_IMPERATIVE = _rx(r"\w{3,}l[ae]")
+_NOT_IMPERATIVE = _rx(r"(b|s|o|bo|so|oy|boy|soy)le|ile|bile|hele|\w*(ce|ca)le")
+# Conversational verbs: a request made with one of these is one-line chat.
 _CHAT_VERB = _rx(r"(anlat|soyle|acikla|tanimla|oner|tavsiye|sor|cevapla|yorumla|dusun"
                  r"|bil|tahmin|ver|konus|sohbet|espri|fikra|sev|say|yardim)\w*")
 # "bir espri yap" / "fıkra anlat": a made-up line, not a tool task.
@@ -153,23 +182,38 @@ _LONG = 35
 
 
 def _l0(tokens: list[str], text: str) -> str | None:
+    if _LIVE.search(text) or _ET_TASK.search(text):
+        return None
     for intent, core, extra in _L0:
+        own = _L0_OWN.get(intent)
         if core.search(text) and all(
-            _SOFT.fullmatch(t) or extra.fullmatch(t) for t in tokens
+            (_SOFT.fullmatch(t) or extra.fullmatch(t))
+            and not ((_TASK_VERB.fullmatch(t) or _TOOL_NOUN.fullmatch(t))
+                     and not (own and own.fullmatch(t)))
+            for t in tokens
         ):
             return intent
     return None
 
 
-def _is_request(tokens: list[str]) -> bool:
+def _requests(tokens: list[str]) -> list[str]:
+    """Words carrying a request marker ("yapabilir", "yapar" of "yapar mısın")."""
+    found = []
     for i, t in enumerate(tokens):
         if _NOT_REQUEST.fullmatch(t):
             continue
         if _REQUEST.fullmatch(t):
-            return True
-        if i and _REQ_PARTICLE.fullmatch(t) and tokens[i - 1].endswith("r"):
-            return True
-    return False
+            found.append(t)
+        elif i and _REQ_PARTICLE.fullmatch(t) and tokens[i - 1].endswith("r"):
+            found.append(tokens[i - 1])
+    return found
+
+
+def _imperative(tokens: list[str]) -> bool:
+    last = tokens[-1]
+    return (len(tokens) >= 2 and tokens[-2][-1] in "iu"
+            and bool(_IMPERATIVE.fullmatch(last))
+            and not _NOT_IMPERATIVE.fullmatch(last) and not _CHAT_VERB.fullmatch(last))
 
 
 def route(text: str) -> Route:
@@ -184,13 +228,17 @@ def route(text: str) -> Route:
     verbs = [t for t in tokens if _TASK_VERB.fullmatch(t)]
     verb_count = len(verbs) + len(_ET_TASK.findall(norm))
     objects = [t for t in tokens if _TOOL_NOUN.fullmatch(t)]
-    task = bool(verb_count or objects)
+    task = bool(verb_count or objects or _LIVE.search(norm))
     build = any(_BUILD.fullmatch(t) for t in tokens)
+    project = any(_PROJECT.fullmatch(t) for t in tokens)
 
     if any(_L3_ALONE.fullmatch(t) for t in tokens):
         return Route("L3", "project", 0.85, "l3:develop/refactor/migrate verb")
-    if build and any(_PROJECT.fullmatch(t) for t in tokens):
+    if build and project:
         return Route("L3", "project", 0.85, "l3:project noun + build verb")
+    if (project and any(_WANT.fullmatch(t) for t in tokens)
+            and not any(_INFINITIVE.fullmatch(t) for t in tokens)):
+        return Route("L3", "project", 0.75, "l3:project noun + want")
     if task and _L3_PHRASE.search(norm) and (build or verb_count):
         return Route("L3", "project", 0.8, "l3:rewrite/background marker")
     if task and _RECURRING.search(norm):
@@ -208,9 +256,12 @@ def route(text: str) -> Route:
     if task:
         why = "verb" if verb_count else "tool/live-data noun"
         return Route("L2", "task", 0.8, "l2:" + why)
-    chat_verb = any(_CHAT_VERB.fullmatch(t) for t in tokens)
-    if _is_request(tokens) and not chat_verb:
+    # A chat verb only makes its own request chat: "anlatır mısın" is L1,
+    # "kilitleyebilir misin ve sonucu söyle" is still a request.
+    if any(not _CHAT_VERB.fullmatch(t) for t in _requests(tokens)):
         return Route("L2", "task", 0.55, "l2:request without known verb")
+    if _imperative(tokens):
+        return Route("L2", "task", 0.5, "l2:imperative -lA verb")
     if len(tokens) > _LONG:
         return Route("L2", "task", 0.5, "l2:long message")
     if intent:  # L0 words but too long to trust
