@@ -28,6 +28,7 @@ from jarvis.memory import (
     MEMORY_V21_SCHEMA_OBJECTS,
     SCHEMA_VERSION,
     SKILL_SCHEMA_OBJECTS,
+    WORK_SCHEMA_OBJECTS,
     SQLiteMemoryStore,
     memory_records_fts_available,
 )
@@ -207,7 +208,8 @@ class PreChangeDatabaseTests(Case):
         self.assertFalse(MEMORY_V21_SCHEMA_OBJECTS & set(before))
         SQLiteMemoryStore(self.database)
         after = objects(self.database)
-        self.assertEqual(MEMORY_V21_SCHEMA_OBJECTS | SKILL_SCHEMA_OBJECTS, set(after) - set(before))
+        self.assertEqual(MEMORY_V21_SCHEMA_OBJECTS | SKILL_SCHEMA_OBJECTS | WORK_SCHEMA_OBJECTS,
+                         set(after) - set(before))
         for name, sql in before.items():
             self.assertEqual(sql, after[name], name)
         SQLiteMemoryStore(self.database)

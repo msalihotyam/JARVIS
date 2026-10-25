@@ -213,6 +213,16 @@ from jarvis.progress import NON_FAILURE_ISSUE_KINDS, clear_issues, set_issue
 from jarvis.planning import build_task_plan
 from jarvis import project_files
 from jarvis import project_folders
+from jarvis.work_ledger import (
+    EventKind,
+    RunSize,
+    RunState,
+    StepState,
+    WorkEvent,
+    WorkLedgerError,
+    WorkRun,
+    WorkStep,
+)
 
 
 SCHEMA_VERSION = 10
@@ -955,6 +965,57 @@ CREATE TABLE IF NOT EXISTS skill_experiences (
     skill_id TEXT NULL,
     created_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS work_run (
+    snapshot_id INTEGER PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    state TEXT NOT NULL,
+    size TEXT NULL,
+    resume_state TEXT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_work_run_run ON work_run(run_id, snapshot_id);
+CREATE TABLE IF NOT EXISTS work_step (
+    snapshot_id INTEGER PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    step_key TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    slug TEXT NOT NULL,
+    state TEXT NOT NULL,
+    depends_on_json TEXT NOT NULL,
+    attempt INTEGER NOT NULL,
+    attempt_link TEXT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_work_step_run ON work_step(run_id, step_key, snapshot_id);
+CREATE TABLE IF NOT EXISTS work_event (
+    run_id TEXT NOT NULL,
+    seq INTEGER NOT NULL CHECK (seq >= 1),
+    kind TEXT NOT NULL,
+    step_key TEXT NULL,
+    payload_json TEXT NOT NULL,
+    idempotency_key TEXT NULL UNIQUE,
+    at TEXT NOT NULL,
+    PRIMARY KEY (run_id, seq)
+);
+CREATE TABLE IF NOT EXISTS work_lease (
+    lease_id INTEGER PRIMARY KEY,
+    target TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    boot_id TEXT NOT NULL,
+    claimed_at TEXT NOT NULL,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_work_lease_target ON work_lease(target, lease_id);
+CREATE TABLE IF NOT EXISTS notify_outbox (
+    outbox_id INTEGER PRIMARY KEY,
+    run_id TEXT NOT NULL,
+    event_seq INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    severity TEXT NOT NULL CHECK (severity IN ('low', 'normal', 'high')),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (run_id, event_seq) REFERENCES work_event(run_id, seq)
+);
 """
 
 # V2.1 typed memory (above): every memory_record* table and the toggle table
@@ -980,6 +1041,14 @@ CREATE TABLE IF NOT EXISTS skill_experiences (
 # nothing offers an UPDATE or DELETE of them. ``body`` is the skill_types
 # to_dict JSON, ``body_format`` its layout version.
 # ponytail: no FTS5 index - the Python matcher scans rows; add FTS5 when a user has > 1k skills.
+
+# Stage 2 project mode (PM02, jarvis/work_ledger.py types): every work_* table
+# and notify_outbox are insert-only - a run's or step's state is its LATEST
+# snapshot row (highest snapshot_id), a recorded model output is a
+# work_event payload, a lease's current holder is its target's latest
+# work_lease row (claim/renew/release logic: PM03) - and nothing offers an
+# UPDATE or DELETE of them. A notification point writes its work_event and its
+# notify_outbox row in one transaction; stage 3 drains the outbox.
 
 #: The FTS5 index over record text + subject_key. Its rows are written by the
 #: record store in the same transaction as the record; retrieval falls back to
@@ -1100,6 +1169,20 @@ SKILL_SCHEMA_OBJECTS = frozenset(
     }
 )
 
+#: The stage-2 project-mode work ledger objects of the compatibility layer.
+WORK_SCHEMA_OBJECTS = frozenset(
+    {
+        "work_run",
+        "idx_work_run_run",
+        "work_step",
+        "idx_work_step_run",
+        "work_event",
+        "work_lease",
+        "idx_work_lease_target",
+        "notify_outbox",
+    }
+)
+
 #: Every object the compatibility layer owns - kept apart from the numbered
 #: schema's objects so a migration test can still say exactly what ITS step
 #: added.
@@ -1119,7 +1202,7 @@ COMPATIBILITY_SCHEMA_OBJECTS = frozenset(
         "project_folder_links",
         "idx_project_folder_links_current",
     }
-) | MEMORY_V21_SCHEMA_OBJECTS | SKILL_SCHEMA_OBJECTS
+) | MEMORY_V21_SCHEMA_OBJECTS | SKILL_SCHEMA_OBJECTS | WORK_SCHEMA_OBJECTS
 
 #: The one pre-V2 copy, beside the database: ``<stem>.pre-v2<suffix>``.
 PRE_V2_BACKUP_TAG = ".pre-v2"
@@ -11685,3 +11768,249 @@ class SQLiteMemoryStore:
                 (task_id,),
             ).fetchone()
         return json.loads(row[0]) if row else None
+
+    # Stage 2 project mode (PM02): append-only work ledger. Every write is one
+    # INSERT under BEGIN IMMEDIATE with synchronous=FULL (I11); nothing here
+    # updates or deletes a work_* or notify_outbox row.
+
+    @contextmanager
+    def _work_write(self) -> Iterator[sqlite3.Connection]:
+        connection = self._connect()
+        try:
+            # Must precede the transaction: SQLite refuses a safety-level
+            # change inside one.
+            connection.execute("PRAGMA synchronous = FULL")
+            _begin_immediate(connection)
+            yield connection
+            connection.commit()
+            try:
+                connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except sqlite3.OperationalError:
+                pass
+        except Exception:
+            connection.rollback()
+            raise
+        finally:
+            connection.close()
+
+    def append_work_run(self, run: WorkRun) -> None:
+        """Append a run snapshot; the latest snapshot is the run's state."""
+        if not isinstance(run, WorkRun):
+            raise WorkLedgerError("run must be a WorkRun")
+        with self._work_write() as connection:
+            connection.execute(
+                """
+                INSERT INTO work_run (run_id, state, size, resume_state, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    run.run_id,
+                    run.state.value,
+                    run.size.value if run.size is not None else None,
+                    run.resume_state.value if run.resume_state is not None else None,
+                    run.created_at.isoformat(),
+                    run.updated_at.isoformat(),
+                ),
+            )
+
+    def latest_work_run(self, run_id: str) -> WorkRun | None:
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM work_run WHERE run_id = ? ORDER BY snapshot_id DESC LIMIT 1",
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return WorkRun(
+            run_id=row["run_id"],
+            state=RunState(row["state"]),
+            created_at=datetime.fromisoformat(row["created_at"]),
+            updated_at=datetime.fromisoformat(row["updated_at"]),
+            size=RunSize(row["size"]) if row["size"] is not None else None,
+            resume_state=RunState(row["resume_state"]) if row["resume_state"] is not None else None,
+        )
+
+    def append_work_step(self, step: WorkStep) -> None:
+        """Append a step snapshot; the latest snapshot per key is the step's state."""
+        if not isinstance(step, WorkStep):
+            raise WorkLedgerError("step must be a WorkStep")
+        with self._work_write() as connection:
+            connection.execute(
+                """
+                INSERT INTO work_step (
+                    run_id, step_key, ordinal, slug, state, depends_on_json,
+                    attempt, attempt_link, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    step.run_id,
+                    step.key,
+                    step.ordinal,
+                    step.slug,
+                    step.state.value,
+                    json.dumps(list(step.depends_on)),
+                    step.attempt,
+                    step.attempt_link,
+                    step.updated_at.isoformat(),
+                ),
+            )
+
+    def work_steps(self, run_id: str) -> list[WorkStep]:
+        """The latest snapshot of every step of a run, in ordinal order."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT s.* FROM work_step AS s
+                WHERE s.run_id = ? AND s.snapshot_id = (
+                    SELECT MAX(snapshot_id) FROM work_step
+                    WHERE run_id = s.run_id AND step_key = s.step_key
+                )
+                ORDER BY s.ordinal, s.step_key
+                """,
+                (run_id,),
+            ).fetchall()
+        return [
+            WorkStep(
+                run_id=row["run_id"],
+                key=row["step_key"],
+                ordinal=row["ordinal"],
+                slug=row["slug"],
+                state=StepState(row["state"]),
+                updated_at=datetime.fromisoformat(row["updated_at"]),
+                depends_on=tuple(json.loads(row["depends_on_json"])),
+                attempt=row["attempt"],
+                attempt_link=row["attempt_link"],
+            )
+            for row in rows
+        ]
+
+    def append_work_event(
+        self,
+        event: WorkEvent,
+        *,
+        idempotency_key: str | None = None,
+        severity: str | None = None,
+    ) -> bool:
+        """Append an event (and, with a severity, its notify_outbox row in the
+        same transaction). An identical repeat of (run_id, seq) is a no-op that
+        returns False; a different event at that seq, or an idempotency key
+        already used by another event, fails closed."""
+        if not isinstance(event, WorkEvent):
+            raise WorkLedgerError("event must be a WorkEvent")
+        if idempotency_key is not None and (not isinstance(idempotency_key, str) or not idempotency_key):
+            raise WorkLedgerError("idempotency_key must be a non-empty string or None")
+        if severity is not None and severity not in ("low", "normal", "high"):
+            raise WorkLedgerError("severity must be low, normal, high or None")
+        values = (
+            event.kind.value,
+            event.step_key,
+            event.payload_json,
+            idempotency_key,
+            event.at.isoformat(),
+        )
+        with self._work_write() as connection:
+            existing = connection.execute(
+                """
+                SELECT kind, step_key, payload_json, idempotency_key, at
+                FROM work_event WHERE run_id = ? AND seq = ?
+                """,
+                (event.run_id, event.seq),
+            ).fetchone()
+            if existing is not None:
+                if tuple(existing) != values:
+                    raise WorkLedgerError(f"work_event {event.run_id}#{event.seq} already holds a different event")
+                # A retry that adds a severity must not lose the notification.
+                if severity is not None and not connection.execute(
+                    "SELECT 1 FROM notify_outbox WHERE run_id = ? AND event_seq = ?", (event.run_id, event.seq)
+                ).fetchone():
+                    connection.execute(
+                        """
+                        INSERT INTO notify_outbox (run_id, event_seq, kind, severity, created_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (event.run_id, event.seq, event.kind.value, severity, event.at.isoformat()),
+                    )
+                return False
+            if idempotency_key is not None and connection.execute(
+                "SELECT 1 FROM work_event WHERE idempotency_key = ?", (idempotency_key,)
+            ).fetchone():
+                raise WorkLedgerError("idempotency_key already used by another event")
+            connection.execute(
+                """
+                INSERT INTO work_event (run_id, seq, kind, step_key, payload_json, idempotency_key, at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (event.run_id, event.seq, *values),
+            )
+            if severity is not None:
+                connection.execute(
+                    """
+                    INSERT INTO notify_outbox (run_id, event_seq, kind, severity, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (event.run_id, event.seq, event.kind.value, severity, event.at.isoformat()),
+                )
+        return True
+
+    def work_events(self, run_id: str) -> list[WorkEvent]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM work_event WHERE run_id = ? ORDER BY seq", (run_id,)
+            ).fetchall()
+        return [
+            WorkEvent(
+                run_id=row["run_id"],
+                seq=row["seq"],
+                kind=EventKind(row["kind"]),
+                at=datetime.fromisoformat(row["at"]),
+                step_key=row["step_key"],
+                payload_json=row["payload_json"],
+            )
+            for row in rows
+        ]
+
+    def append_work_lease(
+        self, *, target: str, run_id: str, boot_id: str, claimed_at: datetime, expires_at: datetime
+    ) -> None:
+        """Record a lease row. Claim/renew/release rules (one lease per
+        target, I2) belong to PM03; this only appends."""
+        for name, value in (("target", target), ("run_id", run_id), ("boot_id", boot_id)):
+            if not isinstance(value, str) or not value:
+                raise WorkLedgerError(f"{name} must be a non-empty string")
+        for name, value in (("claimed_at", claimed_at), ("expires_at", expires_at)):
+            if not isinstance(value, datetime) or value.tzinfo is None:
+                raise WorkLedgerError(f"{name} must be an aware datetime")
+        if expires_at <= claimed_at:
+            raise WorkLedgerError("expires_at must follow claimed_at")
+        with self._work_write() as connection:
+            connection.execute(
+                """
+                INSERT INTO work_lease (target, run_id, boot_id, claimed_at, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (target, run_id, boot_id, claimed_at.isoformat(), expires_at.isoformat()),
+            )
+
+    def work_leases(self, target: str) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM work_lease WHERE target = ? ORDER BY lease_id", (target,)
+            ).fetchall()
+        return [
+            {
+                "lease_id": row["lease_id"],
+                "target": row["target"],
+                "run_id": row["run_id"],
+                "boot_id": row["boot_id"],
+                "claimed_at": datetime.fromisoformat(row["claimed_at"]),
+                "expires_at": datetime.fromisoformat(row["expires_at"]),
+            }
+            for row in rows
+        ]
+
+    def notify_outbox_rows(self, *, after_id: int = 0) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM notify_outbox WHERE outbox_id > ? ORDER BY outbox_id", (after_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
