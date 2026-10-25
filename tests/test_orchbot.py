@@ -42,6 +42,11 @@ class BotCase(unittest.TestCase):
         self.conv.mkdir(parents=True)
         self.clock = Clock("2026-10-15T12:00:00")
         self.sleeps = []
+        self.posts = []
+        self.topic = self.root / "wake.topic"
+
+    def post(self, topic, text):
+        self.posts.append((topic, text))
 
     def put(self, rel, data):
         p = self.root / rel
@@ -56,6 +61,8 @@ class BotCase(unittest.TestCase):
 
     def run_bot(self, **kw):
         kw.setdefault("from_start", True)
+        kw.setdefault("wake_post", self.post)
+        kw.setdefault("wake_topic", self.topic)
         return orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append, **kw).run()
 
     def acts(self, ds):
@@ -1090,6 +1097,13 @@ class AsksTest(BotCase):
 
 
 class MainTest(BotCase):
+    def setUp(self):
+        super().setUp()
+        for name, value in (("wake_http", self.post), ("WAKE_TOPIC", self.topic)):
+            p = mock.patch.object(orchbot, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
     def test_cli_exit_0_even_on_a_broken_root(self):
         self.events({"ts": "2026-10-15T11:00:00", "event": "pace", "usage_pct": 99})
         self.assertEqual(orchbot.main(["--shadow", "--once", "--root", str(self.root)], now=self.clock), 0)
@@ -1103,6 +1117,170 @@ class MainTest(BotCase):
         with mock.patch.object(sys, "stderr", io.StringIO()) as err:
             self.assertEqual(orchbot.main(["--once"]), 0)
         self.assertIn("--shadow", err.getvalue())
+
+
+class WakeTest(BotCase):
+    """BOTFIX3 orchestrator wake: fake HTTP only; the topic never leaves the topic file."""
+
+    def bot(self, records, **kw):
+        b = orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append, wake_post=self.post,
+                        wake_topic=self.topic, **kw)
+        b.out.mkdir(parents=True, exist_ok=True)
+        b.st, b.new, b.wakes = {}, [{"rule": r, "target": t, "would_do": a} for r, t, a in records], []
+        return b
+
+    def sent(self):
+        return [line for _, text in self.posts for line in text.split("\n")]
+
+    def test_each_wake_rule_posts_and_each_quiet_kind_does_not(self):
+        b = self.bot([(r, "T", "escalate_orchestrator") for r in sorted(orchbot.WAKE)])
+        b.wake()
+        self.assertEqual(self.sent(), [f"{r} T escalate_orchestrator" for r in sorted(orchbot.WAKE)])
+        self.posts.clear()
+        self.clock.t += 600
+        b = self.bot([("O33", "x", "ack"), ("KEEP-UNMERGED", "cleanup:x", "none"), ("O26", "x", "write_key1"),
+                      ("ASK", "x", "ask_salih_key1"), ("R4", "x", "rerun_ci_once"), ("PACE", "x", "hold_dispatch"),
+                      ("FAILCLOSED", "y", "none"), ("O5", "y", "none")])
+        b.wake()
+        self.assertEqual(self.posts, [])
+
+    def test_status_kinds_wake_and_routine_ones_do_not(self):
+        self.put("build/conveyor/status.json", {
+            "breaker": "open", "memory_hold": True, "disk_hold": False,
+            "lanes": [{"name": "L1", "state": "working", "started_at": "2026-10-15T08:00:00"},
+                      {"name": "L2", "state": "working", "started_at": "2026-10-15T11:00:00"},
+                      {"name": "L3", "state": "waiting", "started_at": "2026-10-15T01:00:00"}],
+            "attention": [{"id": "backlog-dry", "reason": "backlog ran dry", "since": "2026-10-15T11:59:00"},
+                          {"id": "disk-low", "reason": "disk low", "since": "2026-10-15T11:59:00"},
+                          {"id": "lane:Z", "reason": "BLOCKED: tests", "since": "2026-10-15T11:00:00"},
+                          {"id": "lane:Y", "reason": "BLOCKED: tests", "since": "2026-10-15T11:50:00"},
+                          {"id": "lane:R", "reason": "FINDINGS: x", "since": "2026-10-15T11:00:00"},
+                          {"id": "cleanup:Q", "reason": "cleanup refused (dirty)", "since": "2026-10-15T11:00:00"}]})
+        ds = self.run_bot()
+        self.assertIn(("ack", "O33", "lane:R"), self.acts(ds))
+        self.assertIn(("none", "KEEP-UNMERGED", "cleanup:Q"), self.acts(ds))
+        self.assertEqual(len(self.posts), 1)
+        self.assertEqual(sorted(self.sent()), sorted([
+            "BREAKER push-gate escalate_orchestrator", "HOLD memory hold_dispatch", "STUCK L1 escalate_orchestrator",
+            "DRY backlog escalate_orchestrator", "HOLD disk hold_dispatch", "ATTN lane:Z escalate_orchestrator"]))
+
+    def test_dedupe_rate_limit_and_coalescing(self):
+        self.events({"ts": "2026-10-15T11:59:00", "event": "pace", "usage_pct": 99})
+        self.run_bot()
+        self.assertEqual(len(self.posts), 1)
+        self.assertTrue(self.sent()[0].startswith("O23 "))
+        self.clock.t += 60
+        self.put("build/conveyor/status.json", {"breaker": "open", "attention": [
+            {"id": "lane:Z", "reason": "BLOCKED: tests", "since": "2026-10-15T11:00:00"}]})
+        self.run_bot()
+        self.assertEqual(len(self.posts), 1)  # inside the 2 min window: queued, not sent
+        self.clock.t += 30
+        self.run_bot()
+        self.assertEqual(self.shadow()["wake"]["queue"],
+                         ["BREAKER push-gate escalate_orchestrator", "ATTN lane:Z escalate_orchestrator"])
+        self.clock.t += 30
+        self.run_bot()
+        self.assertEqual(len(self.posts), 2)
+        self.assertEqual(self.posts[1][1], "BREAKER push-gate escalate_orchestrator\nATTN lane:Z escalate_orchestrator")
+        self.clock.t += 600
+        self.run_bot()  # the same targets again in the same episode: nothing new
+        self.assertEqual(len(self.posts), 2)
+
+    def test_wake_off_disables_and_drops_the_queue(self):
+        self.put("build/bot/WAKE_OFF", "")
+        self.put("build/conveyor/status.json", {"breaker": "open"})
+        self.run_bot()
+        self.assertEqual(self.posts, [])
+        self.assertFalse(self.topic.exists())
+        (self.root / "build" / "bot" / "WAKE_OFF").unlink()
+        self.clock.t += 600
+        self.run_bot()
+        self.assertEqual(self.posts, [])  # the same episode, already seen while off
+
+    def test_topic_created_never_leaks_and_failures_keep_the_queue(self):
+        def boom(topic, text):
+            raise OSError("POST https://ntfy.sh/" + topic)
+
+        self.put("build/conveyor/status.json", {"breaker": "open"})
+        with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            self.run_bot(wake_post=boom)
+        topic = self.topic.read_text(encoding="utf-8").strip()
+        self.assertRegex(topic, r"^[A-Za-z0-9_-]{32}$")
+        self.assertIn("orch-wake topic post failed: OSError", err.getvalue())
+        self.assertEqual(self.shadow()["wake"]["queue"], ["BREAKER push-gate escalate_orchestrator"])
+        self.clock.t += 120
+        with mock.patch.object(sys, "stderr", io.StringIO()) as err2:
+            self.run_bot()
+        self.assertEqual(self.posts, [(topic, "BREAKER push-gate escalate_orchestrator")])
+        self.assertEqual(self.shadow()["wake"]["queue"], [])
+        bot = self.root / "build" / "bot"
+        for text in [err.getvalue(), err2.getvalue()] + [p.read_text(encoding="utf-8") for p in bot.iterdir()]:
+            self.assertNotIn(topic, text)
+
+    def test_bad_topic_file_or_state_never_breaks_the_tick(self):
+        self.topic.write_text("not a topic/../x\n", encoding="utf-8")
+        self.put("build/conveyor/status.json", {"breaker": "open"})
+        with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            self.run_bot()
+        self.assertEqual(self.posts, [])
+        self.assertIn("orch-wake topic post failed: ValueError", err.getvalue())
+        self.assertNotIn("not a topic", err.getvalue())
+        st = self.shadow()
+        st["wake"] = {"queue": "x", "sent": []}
+        self.put("build/bot/shadow.json", st)
+        self.topic.write_text("﻿t0pic-orch-wake-test-01\n", encoding="utf-8")  # a BOM is tolerated
+        self.clock.t += 600
+        self.run_bot()
+        self.assertEqual(self.posts, [("t0pic-orch-wake-test-01", "BREAKER push-gate escalate_orchestrator")])
+
+    def test_short_or_pager_topic_is_refused_and_parent_dir_is_created(self):
+        self.topic.write_text("short\n", encoding="utf-8")
+        b = self.bot([("O5", "x", "escalate_orchestrator")])
+        with mock.patch.object(sys, "stderr", io.StringIO()) as err:
+            b.wake()
+        self.assertEqual(self.posts, [])
+        self.assertIn("ValueError", err.getvalue())
+        self.topic.write_text("pager-topic-0123456789\n", encoding="utf-8")
+        with mock.patch.dict(os.environ, {"JARVIS_NTFY_TOPIC": "pager-topic-0123456789"}), \
+                mock.patch.object(sys, "stderr", io.StringIO()):
+            b = self.bot([("O5", "y", "escalate_orchestrator")])
+            b.wake()
+        self.assertEqual(self.posts, [])
+        self.topic = self.root / "new" / "dir" / "wake.topic"
+        self.bot([("O5", "z", "escalate_orchestrator")]).wake()
+        self.assertTrue(self.topic.exists())
+        self.assertEqual(len(self.posts), 1)
+
+    def test_bad_times_and_bad_status_shapes_recover(self):
+        b = self.bot([("O5", "x", "escalate_orchestrator")])
+        b.st["wake"] = {"sent": {"O5:x": "soon", "O5:y": float("inf")}, "last": float("inf"), "queue": []}
+        b.wake()
+        self.assertEqual(self.sent(), ["O5 x escalate_orchestrator"])
+        self.put("build/conveyor/status.json", {"lanes": 5, "attention": [
+            "junk", {"id": "breaker", "reason": "breaker open", "since": "2026-10-15T11:00:00"},
+            {"id": "lane:R", "reason": "FINDINGS: x", "since": "2026-10-15T11:00:00"}]})
+        self.clock.t += 600
+        ds = self.run_bot()
+        self.assertIn(("ack", "O33", "lane:R"), self.acts(ds))
+        self.assertNotIn("ATTN breaker escalate_orchestrator", self.sent())
+
+    def test_target_is_sanitised_and_a_full_queue_keeps_the_oldest(self):
+        b = self.bot([("O5", "https://x/run?token=SECRET", "escalate_orchestrator"),
+                      ("O10", "a\nPAGER fake line", "escalate_orchestrator")]
+                     + [("LOOP", f"t{i}", "escalate_orchestrator") for i in range(60)])
+        b.wake()
+        lines = self.sent()
+        self.assertEqual(lines[:3], ["O5 run escalate_orchestrator", "O10 a escalate_orchestrator",
+                                     "LOOP t0 escalate_orchestrator"])
+        self.assertNotIn("SECRET", self.posts[0][1])
+        self.assertEqual(b.st["wake"]["queue"][-1], "LOOP t47 escalate_orchestrator")
+
+    def test_message_carries_no_paths(self):
+        b = self.bot([("FAILCLOSED", "build/conveyor/PAUSE", "escalate_orchestrator"),
+                      ("FAILCLOSED", "C:\\x\\facts.md", "escalate_orchestrator")])
+        b.wake()
+        self.assertEqual(self.sent(), ["FAILCLOSED PAUSE escalate_orchestrator",
+                                       "FAILCLOSED facts.md escalate_orchestrator"])
 
 
 class LiveTest(BotCase):

@@ -34,8 +34,10 @@ import json
 import os
 import posixpath
 import re
+import secrets
 import sys
 import time
+import urllib.request
 from datetime import datetime
 from pathlib import Path
 
@@ -51,6 +53,13 @@ ACK_AGE_S = 25 * 60  # O33a: routine attention must not age past 30 min
 FIX_CAP = 2  # O5/O15: a third fix for one target goes to the orchestrator
 KEEP = 50
 SEEN_S = 7 * 86400
+# BOTFIX3 orchestrator wake: one coalesced ntfy message per WAKE_S on these rules; never the human paging topic
+WAKE_TOPIC = Path.home() / ".jarvis" / "orch_wake.topic"
+WAKE_S = 120
+STUCK_S = 3 * 3600  # a working lane with no status update for 3 h
+WAKE = {"O5", "O10", "DRY", "CONVSAFE", "R7/O19", "STUCK", "EVTAUDIT1", "PAGER", "O23", "HOLD", "BREAKER",
+        "ATTN", "LOOP", "FAILCLOSED"}
+TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{20,64}")  # unguessable: token_urlsafe(24) gives 32
 REPORT_MAX = 256 * 1024
 ROUTINE_RE = re.compile(r"^(reader needs_orchestrator|FINDINGS):")
 # the only cleanup refusals raised after the work was proven on main (conveyor remove_worktree: worktree
@@ -151,6 +160,11 @@ def git_ref(root, name):
     except (OSError, UnicodeDecodeError):
         return None
     return None
+
+
+def wake_http(topic, text):
+    req = urllib.request.Request("https://ntfy.sh/" + topic, data=text.encode("utf-8"), method="POST")
+    urllib.request.urlopen(req, timeout=10).close()  # nosec B310 - fixed https URL
 
 
 def proc_started(pid):
@@ -290,8 +304,10 @@ def protected(files):
 
 class Bot:
     def __init__(self, root, now=time.time, sleep=time.sleep, quota_ceiling=90, from_start=False,
-                 started=proc_started):
+                 started=proc_started, wake_post=None, wake_topic=None):
         self.root = Path(root)
+        self.wake_post, self.wake_topic = wake_post, wake_topic  # None: wake_http / WAKE_TOPIC at post time
+        self.wakes = []  # the replay calls check_attention without run()
         self.started = started  # pid -> process start epoch (OSError when unreadable)
         self.conv = self.root / "build" / "conveyor"
         self.out = self.root / "build" / "bot"
@@ -302,7 +318,7 @@ class Bot:
     def run(self):
         """One pass; returns the decisions it appended."""
         self.out.mkdir(parents=True, exist_ok=True)
-        self.new, self.reports, self.verdicts, self.observed = [], {}, [], []
+        self.new, self.reports, self.verdicts, self.observed, self.wakes = [], {}, [], [], []
         self.live = set()
         self.st = self.load_state()
         try:
@@ -376,13 +392,58 @@ class Bot:
             if self.fresh("bad:digest", self.now()):
                 self.decide(self.now(), "digest.md write failed", "escalate_orchestrator", "FAILCLOSED",
                             "digest.md", f"{e!r}"[:300])
+        try:
+            self.wake()
+        except Exception as e:  # never break the tick; never the topic or the message in the log
+            print(f"orchbot: orch-wake topic step failed: {type(e).__name__}", file=sys.stderr)
         self.save()
         return self.new
+
+    def wake(self):
+        """BOTFIX3: queue each new wake item once per target episode; post one coalesced message per WAKE_S."""
+        now, w = self.now(), self.st.get("wake")
+        if not (isinstance(w, dict) and isinstance(w.get("sent", {}), dict) and num(w.get("last", 0))
+                and isinstance(w.get("queue", []), list) and all(isinstance(q, str) for q in w.get("queue", []))):
+            w = self.st["wake"] = {}  # a bad block starts over (fail closed: at worst one repeat message)
+        # a non-number, future or non-finite time is dropped (comparisons with nan/inf are false)
+        sent = w["sent"] = {k: v for k, v in w.get("sent", {}).items() if num(v) and now - SEEN_S <= v <= now}
+        queue = w.setdefault("queue", [])
+        items = [(d["rule"], d.get("target", ""), d["would_do"]) for d in self.new  # live records: no would_do
+                 if d.get("rule") in WAKE and d.get("would_do", "none") != "none"] + self.wakes
+        for rule, target, action in items:
+            key = f"{rule}:{target}"
+            last = sent.get(key)
+            sent[key] = now
+            # last path segment only, cut at query/fragment/whitespace: no paths, URL secrets or extra lines
+            seg = re.split(r"[?#\s]", str(target).replace("\\", "/"))[0].rstrip("/").rsplit("/", 1)[-1]
+            seg = re.sub(r"[^\w.:@-]", "_", seg)[:60]
+            line = f"{rule} {seg} {action}"
+            if (last is None or now - last > EPISODE_S) and line not in queue and len(queue) < 50:
+                queue.append(line)  # a full queue drops the newest, never the oldest unsent
+        if (self.out / "WAKE_OFF").exists():  # kill switch: nothing queued is sent later either
+            queue.clear()
+            return
+        if not queue or 0 <= now - w.get("last", 0) < WAKE_S:  # a future or inf last never mutes
+            return
+        w["last"] = now
+        try:
+            path = Path(self.wake_topic or WAKE_TOPIC)
+            if not path.exists():
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(secrets.token_urlsafe(24) + "\n", encoding="utf-8")
+            topic = path.read_text(encoding="utf-8-sig").strip()
+            if not TOPIC_RE.fullmatch(topic) or topic == os.environ.get("JARVIS_NTFY_TOPIC", "").strip():
+                raise ValueError("bad topic")  # never the human paging topic
+            (self.wake_post or wake_http)(topic, "\n".join(queue[:20]))
+        except Exception as e:  # the queue stays for the next window
+            print(f"orchbot: orch-wake topic post failed: {type(e).__name__}", file=sys.stderr)
+            return
+        del queue[:20]
 
     def load_state(self):
         blank = {"cursor": None, "decisions": [], "counters": {}, "seen": {}, "history": [],
                  "fixes": {}, "respawns": {}, "head": "", "agreement": agree_blank(),
-                 "asks": {}, "conv_push": {}, "live": {}}
+                 "asks": {}, "conv_push": {}, "live": {}, "wake": {}}
         path = self.out / "shadow.json"
         if not path.exists():
             return blank
@@ -1442,10 +1503,31 @@ class Bot:
 
     def check_attention(self):
         now = self.now()
-        for it in self.read_json(self.conv / "status.json", {}).get("attention") or []:
+        status = self.read_json(self.conv / "status.json", {})
+        status = status if isinstance(status, dict) else {}
+        listed = lambda k: [x for x in status.get(k) or [] if isinstance(x, dict)] \
+            if isinstance(status.get(k) or [], list) else []  # noqa: E731  a bad status never aborts the acks
+        wake = self.wakes.append
+        if status.get("breaker") == "open":
+            wake(("BREAKER", "push-gate", "escalate_orchestrator"))
+        if status.get("disk_hold") is True or status.get("memory_hold") is True:
+            wake(("HOLD", "disk" if status.get("disk_hold") is True else "memory", "hold_dispatch"))
+        for ln in listed("lanes"):
+            if ln.get("state") == "working":
+                at = max([t for t in (parse_ts(ln.get("started_at")), parse_ts(ln.get("updated_at"))) if t],
+                         default=None)
+                if at is not None and now - at > STUCK_S:
+                    wake(("STUCK", str(ln.get("name") or ln.get("id")), "escalate_orchestrator"))
+        for it in listed("attention"):
             iid, reason, since = str(it.get("id")), str(it.get("reason") or ""), parse_ts(it.get("since"))
             routine = iid.startswith(("cleanup:", "preserved:")) or \
                 (reason and all(ROUTINE_RE.match(p) for p in reason.split("; ")))
+            if iid == cv.DRY_ID:
+                wake(("DRY", "backlog", "escalate_orchestrator"))
+            elif iid == cv.DISK_ID:
+                wake(("HOLD", "disk", "hold_dispatch"))
+            elif iid != cv.BREAKER_ID and not routine and since is not None and now - since > ACK_AGE_S:
+                wake(("ATTN", iid, "escalate_orchestrator"))
             if not routine or since is None or now - since <= ACK_AGE_S:
                 continue
             ack = self.conv / "ack" / cv.ack_name(iid)
