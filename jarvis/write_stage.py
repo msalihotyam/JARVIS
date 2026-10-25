@@ -21,7 +21,7 @@ GIT_PIN = (
     "-c", "log.diffMerges=separate", "-c", "diff.ignoreSubmodules=none",
     "-c", "diff.relative=false", "-c", "status.showUntrackedFiles=all",
     "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
-    "-c", "core.hooksPath=", "-c", "core.quotePath=true",
+    "-c", "core.hooksPath=", "-c", "core.quotePath=true", "-c", "core.excludesFile=",
 )
 
 
@@ -69,7 +69,8 @@ are retained as recovery refs. This is not a diff-scope or approval gate.
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise StageError(f"git {args[0]} failed: {type(exc).__name__}") from exc
         if result.returncode:
-            raise StageError(f"git {args[0]} exited {result.returncode}")
+            tail = result.stderr.decode("utf-8", "replace").strip()[-500:]
+            raise StageError(f"git {args[0]} exited {result.returncode}: {tail}")
         return result.stdout
 
     @staticmethod
@@ -93,9 +94,17 @@ are retained as recovery refs. This is not a diff-scope or approval gate.
         return target
 
     def _clean(self, path: Path) -> None:
-        if self._git(path, "status", "--porcelain=v1", "--untracked-files=all",
-                     "--ignored", "--ignore-submodules=none").strip():
-            raise StageError("repository contains dirty, untracked or ignored files")
+        """Refuse tracked or untracked changes; ignored files are tolerated."""
+        changes = self._git(path, "status", "--porcelain=v1", "--untracked-files=all",
+                            "--ignore-submodules=none").decode("utf-8", "replace").splitlines()
+        if changes:
+            raise StageError(f"repository contains {len(changes)} dirty or untracked files: "
+                             + "; ".join(changes)[:500])
+        # An ignore file that ignores itself would hide untracked work from status.
+        ignored = self._git(path, "ls-files", "--others", "--ignored", "--exclude-standard",
+                            "--directory", "-z").split(b"\0")
+        if any(entry.rsplit(b"/", 1)[-1] == b".gitignore" for entry in ignored):
+            raise StageError("repository contains an ignored .gitignore")
         entries = self._git(path, "ls-files", "-v").splitlines()
         if any(not line.startswith(b"H ") for line in entries):
             raise StageError("repository contains hidden index entries")

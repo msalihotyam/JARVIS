@@ -1,6 +1,7 @@
 """Offline staging tests: every repository lives beneath TEMP."""
 
 import os
+import subprocess
 import tempfile
 import unittest
 from dataclasses import replace
@@ -103,14 +104,75 @@ class StageTests(unittest.TestCase):
         with self.assertRaisesRegex(StageError, "hidden"):
             self.manager.cleanup(stage)
 
-    def test_ignored_files_refuse_cleanup(self):
-        (self.repo / ".gitignore").write_text("ignored.txt\n")
+    def test_ignored_files_do_not_block_cleanup(self):
+        (self.repo / ".gitignore").write_text("__pycache__/\n")
         self.commit(self.repo)
         stage = self.stage()
-        (stage.path / "ignored.txt").write_text("keep")
-        with self.assertRaises(StageError):
+        (stage.path / "__pycache__").mkdir()
+        (stage.path / "__pycache__" / "x.pyc").write_bytes(b"\0")
+        self.manager.cleanup(stage)
+        self.assertFalse(stage.path.exists())
+
+    def test_ignored_target_files_allow_apply(self):
+        (self.repo / ".gitignore").write_text("build/\n")
+        self.commit(self.repo)
+        stage = self.stage()
+        (self.repo / "build" / "nested").mkdir(parents=True)
+        (self.repo / "build" / "nested" / "out.txt").write_text("keep")
+        (self.repo / ".git" / "info" / "exclude").write_text("uv.lock\n")
+        (self.repo / "uv.lock").write_text("keep")
+        self.manager.assert_apply_ready(stage)
+        self.assertEqual((self.repo / "uv.lock").read_text(), "keep")
+
+    def test_self_ignoring_gitignore_or_excludes_file_cannot_hide_work(self):
+        stage = self.stage()
+        (stage.path / ".gitignore").write_text("*\n")
+        (stage.path / "work.py").write_text("keep")
+        with self.assertRaisesRegex(StageError, "ignored .gitignore"):
             self.manager.cleanup(stage)
-        self.assertTrue((stage.path / "ignored.txt").exists())
+        self.assertTrue((stage.path / "work.py").exists())
+        excludes = self.home / "excludes"
+        excludes.write_text("*\n")
+        self.manager._git(self.repo, "config", "core.excludesFile", excludes.as_posix())
+        (self.repo / "untracked.py").write_text("keep")
+        with self.assertRaisesRegex(StageError, "untracked"):
+            self.manager.assert_apply_ready(stage)
+
+    def test_cleanup_lists_tracked_and_untracked_changes(self):
+        (self.repo / "tracked.txt").write_text("base")
+        self.commit(self.repo)
+        stage = self.stage()
+        (stage.path / "tracked.txt").write_text("edit")
+        (stage.path / "fresh.txt").write_text("new")
+        with self.assertRaises(StageError) as caught:
+            self.manager.cleanup(stage)
+        self.assertIn("tracked.txt", str(caught.exception))
+        self.assertIn("fresh.txt", str(caught.exception))
+        self.assertTrue((stage.path / "fresh.txt").exists())
+
+    def test_planted_post_checkout_hook_does_not_run(self):
+        marker = self.home / "hook-ran"
+        hook = self.repo / ".git" / "hooks" / "post-checkout"
+        hook.write_text(f'#!/bin/sh\necho ran > "{marker.as_posix()}"\n', newline="\n")
+        hook.chmod(0o755)
+        self.stage()
+        self.assertFalse(marker.exists())
+        unpinned = tuple(arg for pair in zip(GIT_PIN[::2], GIT_PIN[1::2])
+                         if pair[1] != "core.hooksPath=" for arg in pair)
+        with patch("jarvis.write_stage.GIT_PIN", unpinned):
+            self.manager.create(self.repo, "run1", "control")
+        self.assertTrue(marker.exists(), "control: the hook runs without the pin")
+
+    def test_git_error_carries_capped_stderr_tail(self):
+        failed = subprocess.CompletedProcess([], 1, b"", b"\xff" + b"x" * 1000 + b"END")
+        with patch("jarvis.write_stage.subprocess.run", return_value=failed):
+            with self.assertRaises(StageError) as caught:
+                self.manager._git(self.repo, "status")
+        message = str(caught.exception)
+        self.assertTrue(message.endswith("END"))
+        self.assertLessEqual(len(message), len("git status exited 1: ") + 500)
+        with self.assertRaisesRegex(StageError, "fatal"):
+            self.manager.create(self.repo, "run", "slice", base="missing-ref")
 
     def test_identifiers_base_and_collisions(self):
         for value in ("../x", "-bad", "a/b", "", "a\\b"):
