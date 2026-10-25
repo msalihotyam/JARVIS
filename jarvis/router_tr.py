@@ -56,21 +56,20 @@ def _rx(pattern: str) -> re.Pattern:
 # address, question particles, and the small social words themselves.
 _SOFT = _rx(r"""
     jarvis|hey|lutfen|acaba|peki|simdi|hemen|artik|bana|ya|yahu|abi|abla|kanka
-    |dostum|kardesim|hocam|bi|iste|yani|sey|e+|e?h+m+|a+|i+|o+|evet|tamam(dir)?
+    |dostum|kardesim|hocam|bi|iste|yani|sey|e+|e?h+m+|a+|i+|evet|tamam(dir)?
     |ok(ey)?|m[iu](s[iu]n(iz)?)?|merhaba(lar)?|selam(lar)?|cok
     |tesekkur(ler|ederim)?|sagol(un|asin)?|eyvallah|super|harika|guzel|iyi
 """)
 
-# (intent, core pattern on the normalized text, extra words it may contain)
+# State-changing L0 intents: only these whole utterances, after normalization
+# and one optional leading "jarvis" / trailing "lutfen". Nothing else is added.
+_L0_ACTION = {"iptal": "cancel", "iptal et": "cancel", "vazgec": "cancel",
+              "dur": "cancel", "durdur": "cancel", "kapat": "close_window",
+              "tamam kapat": "close_window", "pencereyi kapat": "close_window"}
+
+# Read-only L0 intents: (intent, core pattern on the normalized text, extra
+# words it may contain)
 _L0 = (
-    ("cancel", _rx(r"^(.*\s)?(dur|durdur|dursana|sus|sussana|kes|yeter)(\s.*)?$"),
-     _rx(r"dur|durdur|dursana|sus|sussana|kes|yeter|bir|dakika|saniye|konusma(yi)?")),
-    ("cancel", _rx(r"\b(iptal|vazgec\w*|bosver|bos\s+ver|gerek\s+yok)\b"),
-     _rx(r"iptal|et|etsene|eder|edin|edebilir|edebilirsin|edebilirmisin|vazgec(tim|tik|elim|iyorum)?|bosver"
-         r"|bos|ver|gerek|yok|neyse|bunu|onu|hepsini|islemi|unut")),
-    ("close_window", _rx(r"\bkapat"),
-     _rx(r"kapat(ir|sana|in|iniz|alim|abilir|abilirsin|abilirmisin|iver|iversene)?"
-         r"|pencere(yi)?|bunu|onu|bu|olur")),
     ("time.now", _rx(r"\bsaat(i|in)?\b"),
      _rx(r"saat(i|e)?|kac(tir)?|oldu|olmus|su|an|suan|simdiki|ne|nedir|tam|olarak"
          r"|soyle|soyler|soylesene|soyleyebilir|soyleyebilirsin|soyleyebilirmisin"
@@ -95,10 +94,7 @@ _L0 = (
 )
 # The task verbs / tool nouns an L0 intent owns; any other one refuses L0
 # ("tarihi güncelle", "saati ayarla" are tasks).
-_L0_OWN = {"cancel": _rx(r"durdur|iptal"),
-           "close_window": _rx(r"kapat(ir|sana|in|iniz|alim|abilir|abilirsin|abilirmisin"
-                               r"|iver|iversene)?|pencere(yi)?"),
-           "time.now": _rx(r"bak|bakar|baksana|bakabilir|bakabilirsin")}
+_L0_OWN = {"time.now": _rx(r"bak|bakar|baksana|bakabilir|bakabilirsin")}
 
 # Verbs that ask for an action with tools. Short stems get explicit suffixes
 # (vowel harmony aware) so "acaba", "yapay", "bulut", "silah" stay out;
@@ -127,7 +123,7 @@ _ET_TASK = _rx(r"\b(test|tercume|transfer|rezerve|siparis|organize|tamir|kayit|t
 # Nouns that need files, apps, the OS or live data. Ambiguous nouns only in
 # their object/locative forms ("bilgisayarı kapat", not "bilgisayar nedir").
 _TOOL_NOUN = _rx(r"""
-    dosya\w*|klasor\w*|dizin\w*|tablo\w*|excel\w*|pdf\w*|word\w*|docx|xlsx|csv\w*
+    dosya\w*|klasor\w*|dizin\w*|tablo\w*|rezervasyon\w*|excel\w*|pdf\w*|word\w*|docx|xlsx|csv\w*
     |json\w*|belge\w*|dokuman\w*|rapor\w*|sunum\w*|slayt\w*|powerpoint\w*|e?mail\w*
     |eposta\w*|posta(mi|lari|larimi|yi)|takvim\w*|toplanti\w*|randevu\w*
     |hatirlatici\w*|alarm\w*|link\w*|url\w*|internet\w*|web\w*|google\w*
@@ -153,8 +149,9 @@ _LIVE = re.compile(r"\b(kac|ne\s+kadar)\s+(lira|tl|kurus|dolar|euro)\b"
                    r"|\byag(ar|acak|iyor)\b|\bgun\s+batim|\bsistem\s+saat|\ben\s+yakin\b"
                    r"|\bip\s+adres|\bkaca\b|\bkac\s+kac\b"
                    # "kaç derece" is the weather unless it is a fixed point;
-                   # "kahve kaç" (one bare noun) asks a price.
-                   r"|(?<!noktasi\s)\bkac\s+derece\b|^(?!saat\b)\w+\s+kac(tir)?$")
+                   # "(bir) kahve kaç / ne kadar" (one bare noun) asks a price.
+                   r"|(?<!noktasi\s)\bkac\s+derece\b"
+                   r"|^(bir\s+)?(?!saat\b)\w+\s+(kac(tir)?|ne\s+kadar)$")
 # L3: project nouns + build verbs, rewrite markers, background/recurring work.
 _PROJECT = _rx(r"""
     proje\w*|\w*repo\w*|depo(yu|nun|daki|da)|uygulama\w*|app\w*|(web)?site\w*|sistem\w*
@@ -265,17 +262,18 @@ _LONG = 35
 
 
 def _l0(tokens: list[str], text: str) -> str | None:
+    action = tokens[1:] if tokens[:1] == ["jarvis"] else tokens
+    action = action[:-1] if action[-1:] == ["lutfen"] else action
+    if " ".join(action) in _L0_ACTION:
+        return _L0_ACTION[" ".join(action)]
     if _LIVE.search(text) or _ET_TASK.search(text):
         return None
-    # "dur dur" is one word; "boş ver, bunu bana ver" says two things.
     once = [t for i, t in enumerate(tokens) if not i or t != tokens[i - 1]]
     content = [t for t in once if not _SOFT.fullmatch(t)]
     if len(content) != len(set(content)):
         return None
     for intent, core, extra in _L0:
         own = _L0_OWN.get(intent)
-        if intent in ("cancel", "close_window") and any(_YESNO.fullmatch(t) for t in tokens):
-            continue
         if core.search(text) and all(
             (_SOFT.fullmatch(t) or extra.fullmatch(t))
             and not ((_TASK_VERB.fullmatch(t) or _TOOL_NOUN.fullmatch(t))

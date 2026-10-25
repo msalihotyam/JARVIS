@@ -82,14 +82,14 @@
 {"text": "tamam kapat", "lane": "L0", "intent": "close_window"}
 {"text": "Tamam, kapat.", "lane": "L0", "intent": "close_window"}
 {"text": "kapat", "lane": "L0", "intent": "close_window"}
-{"text": "kapat bunu", "lane": "L0", "intent": "close_window"}
+{"text": "kapat bunu", "lane": "L2", "intent": ""}
 {"text": "pencereyi kapat", "lane": "L0", "intent": "close_window"}
 {"text": "jarvis kapat", "lane": "L0", "intent": "close_window"}
-{"text": "kapatır mısın", "lane": "L0", "intent": "close_window"}
-{"text": "kapatir misin", "lane": "L0", "intent": "close_window"}
-{"text": "tamam kapatabilirsin", "lane": "L0", "intent": "close_window"}
-{"text": "kapatsana", "lane": "L0", "intent": "close_window"}
-{"text": "tamam kapat,, kapat", "lane": "L0", "intent": "close_window"}
+{"text": "kapatır mısın", "lane": "L2", "intent": ""}
+{"text": "kapatir misin", "lane": "L2", "intent": ""}
+{"text": "tamam kapatabilirsin", "lane": "L2", "intent": ""}
+{"text": "kapatsana", "lane": "L2", "intent": ""}
+{"text": "tamam kapat,, kapat", "lane": "L2", "intent": ""}
 {"text": "TAMAM KAPAT", "lane": "L0", "intent": "close_window"}
 {"text": "iptal", "lane": "L0", "intent": "cancel"}
 {"text": "İptal", "lane": "L0", "intent": "cancel"}
@@ -98,21 +98,21 @@
 {"text": "İPTAL ET", "lane": "L0", "intent": "cancel"}
 {"text": "vazgeç", "lane": "L0", "intent": "cancel"}
 {"text": "vazgec", "lane": "L0", "intent": "cancel"}
-{"text": "vazgeçtim", "lane": "L0", "intent": "cancel"}
-{"text": "boşver", "lane": "L0", "intent": "cancel"}
-{"text": "bos ver", "lane": "L0", "intent": "cancel"}
-{"text": "neyse boşver", "lane": "L0", "intent": "cancel"}
+{"text": "vazgeçtim", "lane": "L2", "intent": ""}
+{"text": "boşver", "lane": "L2", "intent": ""}
+{"text": "bos ver", "lane": "L2", "intent": ""}
+{"text": "neyse boşver", "lane": "L2", "intent": ""}
 {"text": "dur", "lane": "L0", "intent": "cancel"}
 {"text": "Dur!", "lane": "L0", "intent": "cancel"}
-{"text": "dur dur", "lane": "L0", "intent": "cancel"}
+{"text": "dur dur", "lane": "L2", "intent": ""}
 {"text": "durdur", "lane": "L0", "intent": "cancel"}
-{"text": "sus", "lane": "L0", "intent": "cancel"}
-{"text": "yeter", "lane": "L0", "intent": "cancel"}
+{"text": "sus", "lane": "L2", "intent": ""}
+{"text": "yeter", "lane": "L2", "intent": ""}
 {"text": "jarvis dur", "lane": "L0", "intent": "cancel"}
-{"text": "bir dakika dur", "lane": "L0", "intent": "cancel"}
-{"text": "gerek yok", "lane": "L0", "intent": "cancel"}
-{"text": "iptal,, iptal..", "lane": "L0", "intent": "cancel"}
-{"text": "bunu iptal et lütfen", "lane": "L0", "intent": "cancel"}
+{"text": "bir dakika dur", "lane": "L2", "intent": ""}
+{"text": "gerek yok", "lane": "L2", "intent": ""}
+{"text": "iptal,, iptal..", "lane": "L2", "intent": ""}
+{"text": "bunu iptal et lütfen", "lane": "L2", "intent": ""}
 {"text": "nasılsın", "lane": "L1", "intent": ""}
 {"text": "nasilsin jarvis", "lane": "L1", "intent": ""}
 {"text": "naber", "lane": "L1", "intent": ""}
@@ -319,7 +319,7 @@
 {"text": "bak ne diyeceğim", "lane": "L2", "intent": "task"}
 {"text": "bana pizza söyle", "lane": "L2", "intent": "task"}
 {"text": "ahmete sor gelecek mi", "lane": "L2", "intent": "task"}
-{"text": "bunu kapat", "lane": "L0", "intent": "close_window"}
+{"text": "bunu kapat", "lane": "L2", "intent": ""}
 {"text": "şunu hallet", "lane": "L2", "intent": "task"}
 {"text": "halletsene şunu", "lane": "L2", "intent": "task"}
 {"text": "bunu halleder misin", "lane": "L2", "intent": "task"}
@@ -436,3 +436,12 @@
 {"text": "kahve kaç", "lane": "L2", "intent": "task"}
 {"text": "kahve kaç?", "lane": "L2", "intent": "task"}
 {"text": "teşekkürler bugün ne var", "lane": "L2", "intent": "task"}
+{"text": "Boşver, bunu bana ver.", "lane": "L2", "intent": ""}
+{"text": "İptal yok.", "lane": "L2", "intent": ""}
+{"text": "O pencereyi kapatabilir.", "lane": "L2", "intent": ""}
+{"text": "O an saat kaç olmuş?", "lane": "L2", "intent": ""}
+{"text": "O günün tarihi ne?", "lane": "L2", "intent": ""}
+{"text": "Kahve ne kadar?", "lane": "L2", "intent": ""}
+{"text": "Bir kahve kaç?", "lane": "L2", "intent": ""}
+{"text": "Yemek için rezervasyon istiyorum.", "lane": "L2", "intent": ""}
+{"text": "Tarih kaç?", "lane": "L2", "intent": ""}

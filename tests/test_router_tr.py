@@ -264,9 +264,91 @@ class DefectClassTests(unittest.TestCase):
             self.assertEqual(route(text).lane, "L1", text)
 
     def test_l0_word_once_and_no_modal(self):
-        self.assertEqual(route("dur dur").lane, "L0")
+        self.assertNotEqual(route("dur dur").lane, "L0")
         self.assertUp(("Pencereyi kapatabilir miyim?",))
         self.assertNotEqual(route("pencereyi kapat pencereyi").lane, "L0")
+
+
+class ActionClosedSetTests(unittest.TestCase):
+    """ROUTERTRC6: L0 action intents only on an exact closed-set utterance."""
+
+    def assertNotL0(self, texts):
+        for text in texts:
+            with self.subTest(text=text):
+                self.assertNotEqual(route(text).lane, "L0")
+
+    def test_closed_set_and_allowed_wrappers(self):
+        for text, intent in (("iptal", "cancel"), ("İptal et.", "cancel"), ("dur", "cancel"),
+                             ("kapat", "close_window"), ("Tamam kapat", "close_window"),
+                             ("pencereyi kapat", "close_window"),
+                             ("Jarvis, iptal et lütfen.", "cancel"),
+                             ("jarvis kapat", "close_window"), ("kapat lütfen", "close_window")):
+            with self.subTest(text=text):
+                self.assertEqual((route(text).lane, route(text).intent), ("L0", intent))
+
+    def test_any_extra_token_is_not_l0(self):
+        rows = [r["text"] for r in _rows() if r["intent"] in ("cancel", "close_window")]
+        self.assertTrue(rows)
+        extras = ("o", "yok", "bunu", "şunu", "hey", "tamam", "bir", "şimdi", "değil", "mı",
+                  "ve", "x", "hemen", "neyse", "pencereyi", "et", "dur", "kapat", "iptal",
+                  "jarvis", "lütfen", "dakika", "gerek")
+        for text in rows:
+            words = text.split()
+            for extra in extras:
+                for i in range(len(words) + 1):
+                    if (i == 0 and extra == "jarvis") or (i == len(words) and extra == "lütfen"):
+                        continue  # the two allowed wrappers
+                    cand = " ".join(words[:i] + [extra] + words[i:])
+                    core = normalize(cand).split()
+                    core = core[1:] if core[:1] == ["jarvis"] else core
+                    core = core[:-1] if core[-1:] == ["lutfen"] else core
+                    if " ".join(core) in ("iptal et", "tamam kapat", "pencereyi kapat"):
+                        continue  # the result is itself a closed-set phrase
+                    with self.subTest(text=cand):
+                        self.assertNotEqual(route(cand).lane, "L0")
+
+    def test_cdxint80_r1_to_r5(self):
+        self.assertNotL0(("Boşver, bunu bana ver.", "İptal yok.", "O pencereyi kapatabilir.",
+                          "O an saat kaç olmuş?", "O günün tarihi ne?"))
+
+    def test_cdxint80_minor_inputs_go_up(self):
+        for text in ("Kahve ne kadar?", "Bir kahve kaç?", "Yemek için rezervasyon istiyorum.",
+                     "Tarih kaç?"):
+            with self.subTest(text=text):
+                self.assertEqual(route(text).lane, "L2")
+
+    def test_separators(self):
+        self.assertNotL0(("Boşver, bunu bana ver.", "iptal, yok", "kapat; kapat",
+                          "iptal,, iptal..", "tamam kapat,, kapat"))
+
+    def test_contractions(self):
+        self.assertNotL0(("Boşver bunu bana ver", "boşver", "bos ver", "vazgeçtim"))
+
+    def test_case(self):
+        self.assertNotL0(("İPTAL YOK", "KAPAT BUNU"))
+        self.assertEqual(route("İPTAL").intent, "cancel")
+
+    def test_suffix_and_negation(self):
+        self.assertNotL0(("O pencereyi kapatabilir.", "kapatma", "iptal etme", "kapatsana",
+                          "kapatır mısın", "durma"))
+
+    def test_unicode(self):
+        self.assertNotL0(("İptal’i yok", "iptal yok", "kapat bunu"))
+        self.assertEqual(route("iptal et").intent, "cancel")
+
+    def test_empty_and_raw(self):
+        for text in ("", "jarvis", "lütfen", "jarvis lütfen"):
+            with self.subTest(text=text):
+                self.assertNotEqual(route(text).lane, "L0")
+
+    def test_ordering(self):
+        self.assertNotL0(("yok iptal", "kapat tamam", "lütfen jarvis kapat", "kapat pencereyi",
+                          "et iptal"))
+
+    def test_truncation_and_o(self):
+        self.assertNotL0(("O an saat kaç olmuş?", "O günün tarihi ne?", "o kapat", "kapa",
+                          "ipta"))
+        self.assertEqual(route("saat kaç").intent, "time.now")
 
 
 if __name__ == "__main__":
