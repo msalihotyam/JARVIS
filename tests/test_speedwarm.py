@@ -1,4 +1,4 @@
-"""Warm Claude Code session for the intent adapter (opt-in, fake process only)."""
+"""Warm Claude Code session for the intent adapter (setting on by default, fake process only)."""
 
 from __future__ import annotations
 
@@ -12,9 +12,17 @@ from pathlib import Path
 from unittest.mock import patch
 
 import jarvis.intent as intent
+from jarvis.app import build_default_app
 from jarvis.connectors.claude_code import ClaudeCodeConnector
 from jarvis.contracts import ActionScope, SessionState, Task
-from tests.helpers import safe_cleanup
+from jarvis.settings import (
+    WARM_CLAUDE_KEY,
+    Settings,
+    _document_from_settings,
+    _settings_from_document,
+    fail_closed_settings,
+)
+from tests.helpers import isolated_settings, safe_cleanup
 from tests.test_claude_connector import OAUTH_MAX_AUTH_STATUS, patch_oauth_environment
 
 MARKER = "EARLIER-TURN-MARKER"
@@ -421,6 +429,86 @@ class WarmFailClosedTest(WarmTest):
         process = self.processes[0]
         self.assertEqual((process.returncode, process.waited, process.closed), (-9, True, 2))
         self.assertEqual(intent._WARM_PROCESSES, set())
+
+
+class WarmSettingTest(unittest.TestCase):
+    def test_default_on_and_anything_but_true_is_off(self) -> None:
+        self.assertIs(Settings().warm_claude, True)
+        for value in ("yes", "true", 1, None, False):
+            self.assertIs(Settings(warm_claude=value).warm_claude, False)
+        self.assertIs(fail_closed_settings().warm_claude, False)
+
+    def test_document_writes_only_off_and_reads_invalid_as_off(self) -> None:
+        document = _document_from_settings(Settings())
+        self.assertNotIn(WARM_CLAUDE_KEY, document)
+        self.assertIs(_settings_from_document(dict(document)).warm_claude, True)
+        self.assertIs(_document_from_settings(Settings(warm_claude=False))[WARM_CLAUDE_KEY], False)
+        for value in (False, 1, "true", None):
+            self.assertIs(_settings_from_document({**document, WARM_CLAUDE_KEY: value}).warm_claude, False)
+        self.assertIs(_settings_from_document({**document, WARM_CLAUDE_KEY: True}).warm_claude, True)
+
+
+class WarmAppTest(WarmTest):
+    """WARMON: build_default_app applies the setting; app-built adapters share one lane table."""
+
+    def setUp(self) -> None:
+        super().setUp()
+        self.addCleanup(intent.WARM_SESSIONS.clear)
+        self.adapter = self.shared_adapter()
+
+    def shared_adapter(self) -> intent.ClaudeIntentAdapter:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        root = Path(temp.name)
+        adapter = intent.ClaudeIntentAdapter(
+            allowed_roots=(root,), default_working_directory=root, warm_sessions=intent.WARM_SESSIONS)
+        adapter._clock = lambda: self.now
+        adapter.max_budget_usd = 1.0
+        adapter.warm_claude = True
+        adapter.warm_lane = "c1"
+        return adapter
+
+    def test_default_setting_reaches_the_adapter(self) -> None:
+        model = build_default_app(isolated_settings(self)).intent_model
+        self.assertIs(model.warm_claude, True)
+        self.assertIs(model._warm, intent.WARM_SESSIONS)
+        self.assertIs(build_default_app(isolated_settings(self, warm_claude="on")).intent_model.warm_claude, False)
+
+    def test_a_fresh_adapter_reuses_the_shared_process(self) -> None:
+        self.turn()
+        self.adapter = self.shared_adapter()
+        self.turn()
+        self.assertEqual(len(self.processes), 1)
+        self.assertEqual(len(self.processes[0].user_lines()), 2)
+
+    def test_setting_off_closes_shared_processes_and_spawns_per_turn(self) -> None:
+        self.turn()
+        model = build_default_app(isolated_settings(self, warm_claude=False)).intent_model
+        self.assertEqual((self.processes[0].returncode, self.processes[0].waited), (-9, True))
+        self.assertEqual(intent.WARM_SESSIONS, {})
+        self.assertIs(model.warm_claude, False)
+        task = self.task()
+        with patch.object(ClaudeCodeConnector, "_run_process", return_value=(1, "", "")) as base:
+            model.warm_lane = "c1"
+            model.execute(task, SessionState())
+            model.warm_lane = None
+            model.execute(task, SessionState())
+        self.assertEqual(base.call_count, 2)
+        self.assertEqual(base.call_args_list[0], base.call_args_list[1])   # lane or not: the same spawn
+        self.assertEqual(len(self.processes), 1)
+
+    def test_shutdown_closes_warm_processes_even_when_capture_fails(self) -> None:
+        self.turn()
+        app = build_default_app(isolated_settings(self))
+        app.shutdown_memory_capture()
+        self.assertEqual(self.processes[0].returncode, -9)
+        self.assertEqual(intent.WARM_SESSIONS, {})
+        self.turn()
+        with patch.object(app.memory_triggers, "shutdown", side_effect=RuntimeError("capture")):
+            with self.assertRaises(RuntimeError):
+                app.shutdown_memory_capture()
+        self.assertEqual(self.processes[1].returncode, -9)
+        self.assertEqual(intent.WARM_SESSIONS, {})
 
 
 if __name__ == "__main__":

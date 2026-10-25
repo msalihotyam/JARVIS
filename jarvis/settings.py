@@ -187,6 +187,11 @@ class Settings:
     #: well-formed model name (any other type, a flag-like string) falls back
     #: to ``""`` rather than reaching a connector.
     memory_extract_model: str = ""
+    #: Speed S1: keep one warm Claude session per conversation lane (the
+    #: intent adapter's ``warm_claude``). On by default; any value other than
+    #: exactly ``True`` reads as off. Not authority: every warm-path check in
+    #: the adapter is unchanged either way.
+    warm_claude: bool = True
 
     @property
     def browser_profile_dir(self) -> Path:
@@ -376,6 +381,8 @@ class Settings:
             or CLAUDE_MODEL_PATTERN.match(self.memory_extract_model)
         ):
             object.__setattr__(self, "memory_extract_model", "")
+        if self.warm_claude is not True:
+            object.__setattr__(self, "warm_claude", False)
 
     def enable_paid_api(self, approval_id: str) -> Settings:
         if not approval_id.strip():
@@ -492,6 +499,13 @@ SKILLS_ENABLED_KEY = "skills_enabled"
 #: optional-keys hole. Only the current shape gains it, because only this
 #: build (which always writes the full current shape) ever writes it.
 SKILLS_CONFIG_KEYS = frozenset(CONFIG_KEYS) | {SKILLS_ENABLED_KEY}
+
+#: Speed S1 warm-session switch. Like the skills switch, outside
+#: ``CONFIG_KEYS`` and written only when it differs from its default, i.e.
+#: only as ``false``, so a default document stays readable by an older build.
+#: A document without the key loads with warm on; a present value other than
+#: exactly ``true`` loads as off.
+WARM_CLAUDE_KEY = "warm_claude"
 
 #: Raw provider tokens the canonical policy does not classify. It is
 #: syntax-aware - it reads labels and delimiters - and a raw token carries
@@ -822,6 +836,8 @@ def _document_from_settings(settings: Settings) -> dict[str, object]:
     }
     if settings.skills_enabled:
         document[SKILLS_ENABLED_KEY] = True
+    if not settings.warm_claude:
+        document[WARM_CLAUDE_KEY] = False
     return document
 
 
@@ -839,6 +855,8 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
     if keys not in (
         set(CONFIG_KEYS),
         set(SKILLS_CONFIG_KEYS),
+        set(CONFIG_KEYS) | {WARM_CLAUDE_KEY},
+        set(SKILLS_CONFIG_KEYS) | {WARM_CLAUDE_KEY},
         set(PRE_MEMORY_EXTRACT_CONFIG_KEYS),
         set(PRE_DESKTOP_CONFIG_KEYS),
         set(PRE_BROWSER_CONFIG_KEYS),
@@ -853,7 +871,7 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
         _fail(
             "The configuration document must contain exactly the current v1 "
             "keys: " + ", ".join(CONFIG_KEYS) + " (and optionally "
-            + SKILLS_ENABLED_KEY + ")."
+            + SKILLS_ENABLED_KEY + ", " + WARM_CLAUDE_KEY + ")."
         )
     if document["config_version"] != CONFIG_VERSION or type(
         document["config_version"]
@@ -913,6 +931,8 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
             # Absent (a pre-memory-extract document) or unusable: the
             # constructor falls back to "", the conversation's current model.
             memory_extract_model=document.get("memory_extract_model", ""),
+            # Absent means on; anything but exact true is off (constructor).
+            warm_claude=document.get(WARM_CLAUDE_KEY, True),
         )
     except ValueError as exc:
         # The existing constructor refused it. Its message is already
@@ -933,6 +953,7 @@ def fail_closed_settings() -> Settings:
         permission_mode=PermissionMode.STRICT,
         paid_api_enabled=False,
         skills_enabled=False,
+        warm_claude=False,
     )
 
 

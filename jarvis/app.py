@@ -219,6 +219,7 @@ from jarvis.intent import (
     CHAT_REPLY_TOO_LONG,
     INTENT_ACTION,
     INTENT_CAPABILITY,
+    WARM_SESSIONS,
     ClaudeIntentAdapter,
     ClaudeResearchAdapter,
     IntentStatus,
@@ -4305,7 +4306,13 @@ class JarvisApp:
         return self.memory_triggers.schedule(self, conversation_id, MemoryRecordOrigin.CAPTURE_SESSION_END)
 
     def shutdown_memory_capture(self, open_ids: Iterable[str] = (), timeout: float = 5.0) -> tuple[str, ...]:
-        return self.memory_triggers.shutdown(self, open_ids, timeout)
+        try:
+            return self.memory_triggers.shutdown(self, open_ids, timeout)
+        finally:
+            # WARMON: quitting kills the warm Claude processes (atexit also reaps them).
+            close_warm = getattr(self.intent_model, "close_warm", None)
+            if close_warm is not None:
+                close_warm()
 
     @property
     def permission_mode(self) -> PermissionMode:
@@ -6502,7 +6509,13 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
         max_budget_usd=settings.claude_call_budget_usd,
         model=settings.claude_model,
         effort=settings.claude_effort,
+        warm_sessions=WARM_SESSIONS,
     )
+    # WARMON: the warm session follows the setting (default on); turned off,
+    # the warm processes still alive are killed, and each turn spawns anew.
+    intent_model.warm_claude = settings.warm_claude
+    if not settings.warm_claude:
+        intent_model.close_warm()
     # Web Research: the same seam, the same operator model/effort, one tool
     # (WebSearch). Held by the app and NOT registered, like the understanding call.
     research_model = ClaudeResearchAdapter(

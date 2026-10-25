@@ -1405,6 +1405,10 @@ def _warm_drift(command: list[str], granted: set[str], init: dict[str, Any]) -> 
 #: when its adapter was collected without ``close_warm``.
 _WARM_PROCESSES: set[Any] = set()
 
+#: The lane table every app-built intent adapter shares: the UI builds a new
+#: app (and adapter) per call, so a per-adapter table would never be reused.
+WARM_SESSIONS: dict[str, Any] = {}
+
 
 def _reap_warm(process: Any) -> None:
     _WARM_PROCESSES.discard(process)
@@ -1472,7 +1476,7 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
     #: safe mode, empty MCP set, model, effort, streamed output and timeout.
     request_on_stdin = True
 
-    def __init__(self, *args: Any, **kwargs: Any) -> None:
+    def __init__(self, *args: Any, warm_sessions: dict[str, Any] | None = None, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         #: request id -> the usage Claude reported for that call (see ``reported_usage``).
         self.reported: dict[str, dict[str, Any]] = {}
@@ -1491,14 +1495,17 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         #: streamed characters. Measured only; nothing reads them to decide anything.
         self.timings: dict[str, dict[str, Any]] = {}
         self._marks: dict[str, Any] | None = None
-        #: Settings ``warm_claude`` (default off = one process per turn,
-        #: unchanged). ``warm_lane`` is the conversation of the next call; the
-        #: caller sets it per turn, and ``None`` also keeps the per-turn path.
+        #: Settings ``warm_claude`` (off here = one process per turn, unchanged;
+        #: ``build_default_app`` applies the setting, default on). ``warm_lane``
+        #: is the conversation of the next call; the caller sets it per turn, and
+        #: ``None`` also keeps the per-turn path.
         # ponytail: one adapter call at a time (the chat path is serial); a lock if that changes.
         self.warm_claude = False
         self.warm_lane: str | None = None
         self._clock = time.monotonic
-        self._warm: dict[str, WarmClaudeSession] = {}
+        #: lane -> warm session; ``warm_sessions`` shares one table across the
+        #: adapters the UI builds per call (``WARM_SESSIONS``), so a turn reuses it.
+        self._warm: dict[str, WarmClaudeSession] = {} if warm_sessions is None else warm_sessions
         #: Task ids whose payload left the conversation out for a live warm process.
         self._warm_dropped: set[str] = set()
 
