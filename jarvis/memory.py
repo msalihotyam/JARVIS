@@ -223,6 +223,7 @@ from jarvis.work_ledger import (
     WorkRun,
     WorkStep,
 )
+from jarvis.work_plan import _target_refusal
 
 
 SCHEMA_VERSION = 10
@@ -12007,6 +12008,124 @@ class SQLiteMemoryStore:
             }
             for row in rows
         ]
+
+    # PM03 lease store. Every claim, renew and release APPENDS a work_lease
+    # row (I8/I16); a target's holder is its latest row. A row is live while
+    # expires_at is after both claimed_at and now AND it was written in the
+    # caller's boot: a row from another boot belongs to a dead process and is
+    # reaped by being superseded, never deleted. A release appends a
+    # zero-length row (claimed_at == expires_at), which is never live.
+
+    @staticmethod
+    def _work_lease_fold(target: str) -> str:
+        """The PM10-normalised, case-folded key; a subtree keeps its "/"."""
+        return target.replace("\\", "/").upper().casefold()
+
+    @classmethod
+    def _work_lease_key(cls, target: Any) -> str:
+        # jarvis_repo=False: the plan validator already applied the repo's
+        # self-target rule; here only escapes, globs and protected paths.
+        if _target_refusal(target, False) is not None:
+            raise WorkLedgerError("work lease target is not a literal relative path")
+        return cls._work_lease_fold(target)
+
+    @staticmethod
+    def _work_lease_overlaps(a: str, b: str) -> bool:
+        """Same file, or one is a subtree ("x/") containing the other."""
+        return (a.rstrip("/") == b.rstrip("/")
+                or (a.endswith("/") and b.startswith(a))
+                or (b.endswith("/") and a.startswith(b)))
+
+    @staticmethod
+    def _work_lease_args(run_id: Any, boot_id: Any, now: Any) -> datetime:
+        for name, value in (("run_id", run_id), ("boot_id", boot_id)):
+            if not isinstance(value, str) or not value:
+                raise WorkLedgerError(f"{name} must be a non-empty string")
+        if not isinstance(now, datetime) or now.tzinfo is None:
+            raise WorkLedgerError("now must be an aware datetime")
+        return now.astimezone(timezone.utc)
+
+    @staticmethod
+    def _work_lease_until(lease: Any, now: datetime) -> datetime:
+        if type(lease) is not timedelta or not MIN_JOB_LEASE <= lease <= MAX_JOB_LEASE:
+            raise WorkLedgerError(
+                f"lease must be a timedelta within {MIN_JOB_LEASE} .. {MAX_JOB_LEASE}"
+            )
+        return now + lease
+
+    @staticmethod
+    def _work_lease_live(row: sqlite3.Row, boot_id: str, now: datetime) -> bool:
+        claimed = datetime.fromisoformat(row["claimed_at"])
+        expires = datetime.fromisoformat(row["expires_at"])
+        return row["boot_id"] == boot_id and claimed < expires and now < expires
+
+    @staticmethod
+    def _work_lease_insert(
+        connection: sqlite3.Connection, target: str, run_id: str, boot_id: str,
+        claimed_at: datetime, expires_at: datetime,
+    ) -> dict[str, Any]:
+        cursor = connection.execute(
+            "INSERT INTO work_lease (target, run_id, boot_id, claimed_at, expires_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (target, run_id, boot_id, claimed_at.isoformat(), expires_at.isoformat()),
+        )
+        return {
+            "lease_id": cursor.lastrowid, "target": target, "run_id": run_id,
+            "boot_id": boot_id, "claimed_at": claimed_at, "expires_at": expires_at,
+        }
+
+    def _work_lease_held(
+        self, connection: sqlite3.Connection, key: str, run_id: str, boot_id: str,
+        now: datetime,
+    ) -> None:
+        row = connection.execute(
+            "SELECT * FROM work_lease WHERE target = ? ORDER BY lease_id DESC LIMIT 1", (key,)
+        ).fetchone()
+        if row is None or row["run_id"] != run_id or not self._work_lease_live(row, boot_id, now):
+            raise WorkLedgerError("work lease is not held by this run")
+
+    def claim_work_lease(
+        self, target: str, run_id: str, boot_id: str, *, now: datetime, lease: timedelta
+    ) -> dict[str, Any]:
+        """Claim ``target`` for ``run_id`` in one immediate transaction.
+
+        Refused while any live lease overlaps it - the same run included,
+        which renews instead.
+        """
+        key = self._work_lease_key(target)
+        moment = self._work_lease_args(run_id, boot_id, now)
+        until = self._work_lease_until(lease, moment)
+        with self._work_write() as connection:
+            # ponytail: scans every target's latest row; index by prefix if
+            # the lease table ever grows past a few thousand targets.
+            latest = connection.execute(
+                "SELECT * FROM work_lease WHERE lease_id IN "
+                "(SELECT MAX(lease_id) FROM work_lease GROUP BY target)"
+            ).fetchall()
+            for row in latest:
+                if (self._work_lease_live(row, boot_id, moment)
+                        and self._work_lease_overlaps(key, self._work_lease_fold(row["target"]))):
+                    raise WorkLedgerError("work lease target overlaps a live lease")
+            return self._work_lease_insert(connection, key, run_id, boot_id, moment, until)
+
+    def renew_work_lease(
+        self, target: str, run_id: str, boot_id: str, *, now: datetime, lease: timedelta
+    ) -> dict[str, Any]:
+        """Extend a live lease; only its holder, in the holder's boot, may."""
+        key = self._work_lease_key(target)
+        moment = self._work_lease_args(run_id, boot_id, now)
+        until = self._work_lease_until(lease, moment)
+        with self._work_write() as connection:
+            self._work_lease_held(connection, key, run_id, boot_id, moment)
+            return self._work_lease_insert(connection, key, run_id, boot_id, moment, until)
+
+    def release_work_lease(self, target: str, run_id: str, boot_id: str, *, now: datetime) -> None:
+        """End a live lease now; only its holder may."""
+        key = self._work_lease_key(target)
+        moment = self._work_lease_args(run_id, boot_id, now)
+        with self._work_write() as connection:
+            self._work_lease_held(connection, key, run_id, boot_id, moment)
+            self._work_lease_insert(connection, key, run_id, boot_id, moment, moment)
 
     def notify_outbox_rows(self, *, after_id: int = 0) -> list[dict[str, Any]]:
         with self._connection() as connection:
