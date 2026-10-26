@@ -4414,6 +4414,8 @@ class TestAutoApproval(AutopilotBase):
         cases = {
             "status not exactly GREEN": ("GREEN (CI red)", GREEN, None, "single 'STATUS: GREEN'"),
             "two STATUS lines": ("GREEN", GREEN + "STATUS: BLOCKED\n", None, "single 'STATUS: GREEN'"),
+            "BOM-hidden STATUS line": ("GREEN", GREEN + "﻿STATUS: BLOCKED\n", None, "single 'STATUS: GREEN'"),
+            "BOM-hidden sha line": ("GREEN", GREEN + f"﻿NEW MAIN SHA: {START}\n", None, "NEW MAIN SHA"),
             "short sha": ("GREEN", GREEN.replace(MAIN, MAIN[:7]), None, "NEW MAIN SHA: <40 hex>"),
             "no sha line": ("GREEN", GREEN.replace("NEW MAIN SHA", "NEW MAIN"), None, "NEW MAIN SHA"),
             "two sha lines": ("GREEN", GREEN + f"NEW MAIN SHA: {START}\n", None, "NEW MAIN SHA"),
@@ -4987,6 +4989,18 @@ class TestCandidate(AutopilotBase):
         self.assertIn(["git", "merge", "--ff-only", SHA_B], self.git.calls)
         self.assertEqual([e["sha"] for e in self.ev("fast_forward")], [SHA_B])
         self.assertEqual((self.git.main, self.git.pushes()), (SHA_B, [["git", "push", "origin", f"{SHA_B}:refs/heads/main"]]))
+
+    def test_bom_prefixed_candidate_report_is_read(self):
+        self.drop("INT1.md", INT_HDR.format("INT1") + "INTEGRATE\n")
+        self.c.pass_once()
+        self.git.main = ORIGIN
+        self.t += 60
+        p = self.report("INT1", "CI_PENDING", extra=f"CANDIDATE SHA: {SHA_B}\nCI: pushed ci/int1, run in progress\n")
+        p.write_bytes(b"\xef\xbb\xbf" + p.read_bytes())
+        os.utime(p, (self.t, self.t))
+        self.c.pass_once()
+        ln = self.lanes()["INT1"]
+        self.assertEqual((ln["status"], ln["ci"]["sha"], ln["ci"]["cand"]), ("CI_PENDING", SHA_B, True))
 
     def test_dirty_main_checkout_blocks_the_fast_forward_and_the_push(self):
         self.git.dirty = " M jarvis/core.py\n"
@@ -5847,6 +5861,20 @@ class TestConvHeal(AutopilotBase):
             p.write_text(text, encoding="utf-8")
             self.assertEqual(conveyor.report_status(p), want, text)
         self.assertIsNone(conveyor.report_status(d / "absent.md"))
+
+    def test_report_reader_tolerates_a_bom(self):
+        # CONVBOM: a Codex lane wrote a PASS report starting with U+FEFF and the lane finished MISSING
+        d = self.root / "r"
+        d.mkdir()
+        shapes = {"STATUS: PASS\n": "PASS", "STATUS: BLOCKED\nREASON: x\n": "BLOCKED",
+                  "```\nSTATUS: PASS\n```\n": "PASS", "# CONVX report\nSTATUS: PASS\n": "PASS",
+                  "**STATUS:** GREEN\n": "GREEN", "STATUS: PASS (interim)\n": conveyor.INTERIM,
+                  "﻿STATUS: PASS\n": "PASS", "\n﻿STATUS: BLOCKED\n": "BLOCKED",
+                  "": None, "no status here\nCOMMIT: x\n": None, "x\n" * 16 + "STATUS: PASS\n": None}
+        for i, (text, want) in enumerate(shapes.items()):
+            p = d / f"{i}.md"
+            p.write_bytes(b"\xef\xbb\xbf" + text.encode("utf-8"))
+            self.assertEqual(conveyor.report_status(p), want, repr(text))
 
     def test_lane_ending_without_report_is_missing_with_attention(self):
         self.lane("N")

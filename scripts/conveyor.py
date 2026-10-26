@@ -679,7 +679,7 @@ def fact_note(cmd, wt, base, lane):
     if wt is not None and re.fullmatch(r"[A-Za-z0-9._-]{1,80}", lane):
         try:
             p = Path(wt) / "build" / "reports" / f"{lane}.md"
-            text = p.read_text(encoding="utf-8", errors="replace") if p.is_file() else None
+            text = p.read_text(encoding="utf-8-sig", errors="replace") if p.is_file() else None
             if text is None:
                 report, tests = "absent", "none"
             else:
@@ -780,12 +780,12 @@ def where_raised(e):
 
 def report_status(path):
     try:
-        text = Path(path).read_text(encoding="utf-8", errors="replace")
+        text = Path(path).read_text(encoding="utf-8-sig", errors="replace")
     except OSError:
         return None
     # CONVHEAL: the first STATUS line among the first 15 non-empty ones, past fences, **, #,
     # backticks, a title and AMENDED:/WRITTEN BY: lines; None (empty, no STATUS) -> track's MISSING
-    lines = [s for s in (x.lstrip(" \t>#*`").rstrip() for x in text.splitlines()) if s][:15]
+    lines = [s for s in (x.lstrip(" \t>#*`\ufeff").rstrip() for x in text.splitlines()) if s][:15]
     for s in lines:
         m = STATUS_RE.match(s)
         if m:
@@ -1207,7 +1207,7 @@ class Conveyor:
         if status == CI_PENDING:
             return  # read when ci_wait turns it GREEN or BLOCKED
         try:
-            text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+            text = Path(ln["report"]).read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             text = None
         found = status in GOOD and text and FINDINGS_RE.search(text)
@@ -1306,7 +1306,7 @@ class Conveyor:
         if bad:
             return "protected paths refused: " + ", ".join(bad)
         try:
-            text = Path(report).read_text(encoding="utf-8", errors="replace")
+            text = Path(report).read_text(encoding="utf-8-sig", errors="replace")
         except OSError as e:
             return f"report unreadable: {e}"
         m = re.search(r"(?mi)^[ \t]*COMMIT MESSAGE:(.*)$", text)
@@ -1322,8 +1322,8 @@ class Conveyor:
         if rc != 0 or not SHA_RE.fullmatch(sha):
             return f"commit sha unreadable: {sha[:80]}"
         # the lane's own COMMIT lines go, past the prefixes report_status skips; ours follows STATUS
-        lines = [x for x in text.splitlines() if not re.match(r"(?i)COMMIT[ \t*`]*:", x.lstrip(" \t>#*`"))]
-        at = next((i + 1 for i, x in enumerate(lines) if x.lstrip(" \t>#*`").upper().startswith("STATUS")), 1)
+        lines = [x for x in text.splitlines() if not re.match(r"(?i)COMMIT[ \t*`]*:", x.lstrip(" \t>#*`\ufeff"))]
+        at = next((i + 1 for i, x in enumerate(lines) if x.lstrip(" \t>#*`\ufeff").upper().startswith("STATUS")), 1)
         Path(report).write_text("\n".join(lines[:at] + [f"COMMIT: {sha}"] + lines[at:]) + "\n", encoding="utf-8")
         self.event("codex_commit", lane=name, id=ln["id"], sha=sha)
         return None
@@ -1662,7 +1662,7 @@ class Conveyor:
                 or "resumed_in_place" in ln:  # CONVHEAL: an -AFX fix lane gets the grant (R1 still denies)
             return False  # a DEAD lane's late report is only collected
         try:
-            text = Path(report).read_text(encoding="utf-8", errors="replace")
+            text = Path(report).read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             return False
         needs = NEEDS_RE.findall(text)
@@ -3019,7 +3019,8 @@ class Conveyor:
         CONV12 handoff (ci_wait found CI success): the single STATUS line is 'STATUS: CI_PENDING',
         sha and branch are the ones waited for, the run is the one ci_wait saw, and a running
         integration lane is fine (it stacks on this sha; push_checks keeps the order)."""
-        text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+        # CONVBOM: drop every BOM so a "﻿STATUS:" line still counts toward the single-line check
+        text = Path(ln["report"]).read_text(encoding="utf-8-sig", errors="replace").replace("﻿", "")
         ci = ln.get("ci") or {}
         handoff = ci.get("state") == "success"
         want = CI_PENDING if handoff else "GREEN"
@@ -3112,7 +3113,7 @@ class Conveyor:
 
     def ci_step(self, name, ln, lanes):
         if "sha" not in (ln.get("ci") or {}):
-            text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+            text = Path(ln["report"]).read_text(encoding="utf-8-sig", errors="replace").replace("﻿", "")
             st = [x for x in text.splitlines() if re.match(r"\s*STATUS:", x)]
             why, sha, branch = self.main_and_ci(text)
             cand = bool(CANDIDATE_RE.search(text))
@@ -3183,7 +3184,7 @@ class Conveyor:
             ln["ci_why"] = why
         self.event("finish", lane=name, id=ln["id"], status=status, reason=why)
         try:
-            text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+            text = Path(ln["report"]).read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
             text = None
         self.read_report(name, ln, text)
@@ -3294,7 +3295,7 @@ class Conveyor:
         kw = {"INT": name, "AFX": afx, "R": r, "REPORT": ln["report"], "MAIN": main or "",
               "BRANCH": afx.lower(), "RBRANCH": f"{name.lower()}-2"}  # each attempt its own ci/ branch
         if ci is None:
-            text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+            text = Path(ln["report"]).read_text(encoding="utf-8-sig", errors="replace")
             tests = sorted(set(TEST_ID_RE.findall(text)))
             if not tests:
                 return "the report names no failing test id", None
@@ -3370,7 +3371,7 @@ class Conveyor:
                 picks[-1][2].add(x.strip())
         if not tests or len(picks) < 2 or any(not SHA_RE.fullmatch(p[0]) for p in picks):
             return None
-        text = Path(ln["report"]).read_text(encoding="utf-8", errors="replace")
+        text = Path(ln["report"]).read_text(encoding="utf-8-sig", errors="replace")
         sus = {p[0] for p in picks for s in re.findall(r"(?m)^[ \t]*SUSPECT COMMIT:\s*([0-9a-f]{7,40})\b", text)
                if p[0].startswith(s)}
         hits = {}  # pick sha -> its failing tests
