@@ -256,11 +256,14 @@ def classify(brief_facts, plan):
 CHECK_ALLOWLIST = (("python", "-m", "unittest"),)
 _CHECK_ARG = re.compile(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*")
 #: Glob segments are judged per segment ("*" and "?" never cross "/", no
-#: dotfile exception). "*"/"?" are checked exactly against every protected and
-#: self-target predicate; "[", "]", "{", "}" and "!" are never proven safe and
-#: are refused outright (fail closed).
+#: dotfile exception) after Win32 folding. Only "*" is checked exactly against
+#: every protected, self-target, device and 8.3 short-name predicate; "?" (it
+#: can spell a Win32-stripped trailing "." or " ", CDXINT93 A1), "[", "]", "{",
+#: "}" and "!" are never proven safe and are refused outright (fail closed).
+#: A literal trailing "." or whitespace is already path_escape, so "*" can only
+#: reach such an alias at a segment end, where it is always refused.
 _GLOB = re.compile(r"[*?\[\]{}!]")
-_UNPROVABLE = re.compile(r"[\[\]{}!]")
+_UNPROVABLE = re.compile(r"[?\[\]{}!]")
 _DEVICES = re.compile(r"(con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]"
                       r"|lpt[0-9¹²³])\s*(\..*)?")
 _DEVICE_NAMES = ("con", "prn", "aux", "nul", "conin$", "conout$") + tuple(
@@ -274,6 +277,12 @@ _PROTECTED_SUFFIXES = (
 _PROTECTED_NAMES = (".jarvis", ".git", ".claude", ".codex", ".github",
                     "agents.md", "claude.md")
 _KEY_PREFIXES = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
+#: 8.3 short names a "*" can match (FindFirstFile also matches them): dot names
+#: become NAME~N, ".env*" any ENV..., and extensions are cut to three letters;
+#: after collisions NTFS hashes them to two letters + four hex + ~N.
+_SHORT_PREFIXES = tuple(n[1:7] + "~" for n in _PROTECTED_NAMES
+                        if n.startswith(".")) + ("env",)
+_SHORT_SUFFIXES = tuple({s[:4] for s in _PROTECTED_SUFFIXES})
 #: I12 name heuristics inside the JARVIS repo; over-matching fails closed.
 _SELF_WORDS = ("policy", "approval", "auth", "gate", "credential", "redact",
                "secret", "push", "release", "schema")
@@ -326,10 +335,21 @@ def _may_contain(glob, word):
 
 
 def _glob_protected(part, index):
-    return (any(_may_start(part, p) for p in (".env", *_KEY_PREFIXES))
+    return (any(_may_start(part, p) for p in
+                (".env", *_KEY_PREFIXES, *_SHORT_PREFIXES))
+            or any(_may_start(part, p[:2]) and "*" in part[:7]
+                   for p in _SHORT_PREFIXES)
             or any(fnmatch.fnmatchcase(n, part) for n in
                    _PROTECTED_NAMES + (("data",) if index == 0 else ()))
-            or any(_may_end(part, s) for s in _PROTECTED_SUFFIXES))
+            or any(_may_end(part, s) for s in
+                   _PROTECTED_SUFFIXES + _SHORT_SUFFIXES))
+
+
+# Win32 maps a device name plus any whitespace and/or extension to the device.
+def _glob_device(part):
+    return any(_may_start(part, d) and (
+        len(part) == len(d) or "*" in part[:len(d) + 1]
+        or part[len(d)] in ".?" or part[len(d)].isspace()) for d in _DEVICE_NAMES)
 
 
 def _glob_self(part, index):
@@ -344,26 +364,30 @@ def _target_refusal(target, jarvis_repo):
         return Refusal("path_escape", repr(target))
     path = target.replace("\\", "/")
     parts = path.split("/")
-    if (path.startswith(("/", "~")) or ":" in path or "~" in path
-            or any(p in ("", ".", "..") or p != p.rstrip(". ")
-                   or _DEVICES.fullmatch(p.lower()) for p in parts)):
+    # < > " are FindFirstFile DOS wildcards (CDXINT93 F2); | is invalid on Win32.
+    if (path.startswith(("/", "~")) or any(c in ':~<>"|' for c in path)
+            or any(p in ("", ".", "..") or p.endswith(".") or p[-1].isspace()
+                   or _DEVICES.fullmatch(p.upper().lower()) for p in parts)):
         return Refusal("path_escape", target)
-    lowered = path.lower()
+    # upper().lower() also folds "ı"/"ſ"/Kelvin sign that NTFS may upcase.
+    lowered = path.upper().lower()
     unprovable = False
     for index, part in enumerate(lowered.split("/")):
         if not _GLOB.search(part):
             continue
         if _UNPROVABLE.search(part):
-            if any(fnmatch.fnmatchcase(probe, part) for probe in ("..", ".")):
+            if (any(fnmatch.fnmatchcase(probe, part) for probe in ("..", "."))
+                    or _glob_device(part)):
                 return Refusal("path_escape", target)
+            if jarvis_repo and _glob_self(part, index):
+                return Refusal("self_target", target)
             unprovable = True
         elif jarvis_repo and _glob_self(part, index):
             return Refusal("self_target", target)
         elif _glob_protected(part, index):
             return Refusal("protected_path", target)
         elif (any(fnmatch.fnmatchcase(probe, part) for probe in ("..", "."))
-              or any(_fits(part, d) or _may_start(part, d + ".")
-                     or _may_start(part, d + " ") for d in _DEVICE_NAMES)):
+              or _glob_device(part)):
             return Refusal("path_escape", target)
     if _GLOB.search(lowered):
         if any(fnmatch.fnmatchcase(p, lowered) for p in ("data", "data/x")):

@@ -69,7 +69,7 @@ class ValidateTests(unittest.TestCase):
                        "jarvis/owned_process.py", "jarvis/memory_guard.py"):
             self.assertEqual(["self_target"],
                              codes(with_targets(target), jarvis_repo=True), target)
-            if not set("*[") & set(target):
+            if not set("*[?") & set(target):
                 self.assertEqual([], codes(with_targets(target)), target)
         self.assertEqual([], codes(with_targets("jarvis/work_classify.py"),
                                    jarvis_repo=True))
@@ -96,6 +96,31 @@ class ValidateTests(unittest.TestCase):
         for target in ("NUL .txt", "a/con  .py", "nu?", "src/co?.txt", "lpt?",
                        "?ux", "conin?", "co? .x"):
             self.assertEqual(["path_escape"], codes(with_targets(target)), target)
+
+    def test_windows_alias_globs_refused(self):
+        # CDXINT93 A1/A2: "?" and "*" reached Win32 aliases of protected names
+        # (trailing dot/space, case, 8.3, sidecars); device padding was ASCII.
+        for jr in (False, True):
+            for target in ("src/customer.db?", ".git?/x", "x.db?",
+                           "SRC/Customer.DB?", "x.db-wal?", "src/pkg/mod_?.py"):
+                self.assertEqual(["protected_path"],
+                                 codes(with_targets(target), jarvis_repo=jr),
+                                 (target, jr))
+            for target in ("x.sqlite3-journal*", ".git.*/x", ".GIT*/x",
+                           "data.*/x", "git*/x", "src/env*", "src/x.db*",
+                           "nul　*", "con*", "src/en1*.loc", "src/gi0*1"):
+                self.assertIn(codes(with_targets(target), jarvis_repo=jr),
+                              (["protected_path"], ["self_target"]),
+                              (target, jr))
+            for target in ("nu?\xa0.txt", "nu?　.txt", "con.*",
+                           "a/b\t", "x.db.", "x.db ",
+                           "a/b.db:stream", "GIT~1/x", "NUL\xa0.txt",
+                           'src/x"db', "src/.en<", "src/.gi>", "a|b"):
+                self.assertEqual(["path_escape"],
+                                 codes(with_targets(target), jarvis_repo=jr),
+                                 (target, jr))
+        self.assertEqual(["path_escape"],
+                         codes(with_targets("nul　*.txt")))
 
     def test_slice_targets_are_checked(self):
         data = example()
@@ -143,7 +168,7 @@ class ValidateTests(unittest.TestCase):
         for target in ("src/metadata/x.py", "mydata/file.txt", "data_tools.py",
                        "src/data/x.py", "environment.py", "src\\pkg\\a.py",
                        "docs/keys.md", "tests/test_*.py", "src/app_*.py",
-                       "src/pkg/mod_?.py", "docs/guide*.md", "a.dbx",
+                       "docs/guide*.md", "a.dbx",
                        "monkey.py", "store.sqlite3.bak.txt"):
             self.assertEqual([], codes(with_targets(target)), target)
         data = example()
