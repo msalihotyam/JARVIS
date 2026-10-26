@@ -66,7 +66,7 @@ ROUTINE_RE = re.compile(r"^(reader needs_orchestrator|FINDINGS):")
 # remove after the clean+integrated checks, branch delete after the off-main check); any other is kept
 PROVEN_RE = re.compile(r"^cleanup refused \(git (?:worktree remove|update-ref -d \S+) rc=-?\d+: ")
 FILES_RE = re.compile(r"(?m)^[ \t]*(?:[A-Z]+ )*FILES:[ \t]*(.*)$")
-PICKS_RE = re.compile(r"(?m)^PICKS\b.*(?:\n|$)((?:(?:[ \t]*\n)*[ \t]+\S.*(?:\n|$))*)")  # an INT range
+PICKS_RE = re.compile(r"(?m)^PICKS\b([^\n]*)(?:\n|$)((?:(?:[ \t]*\n)*[ \t]+\S.*(?:\n|$))*)")  # an INT range
 PICK_TOK_RE = re.compile(r"\b[A-Z][A-Z0-9_-]{1,63}\b")  # no '.' or '/': a lane id, never a path
 TS_FMT = "%Y-%m-%dT%H:%M:%S"
 HEAD_N = 256  # events.jsonl rotation fingerprint: a hash of its first bytes
@@ -1491,10 +1491,11 @@ class Bot:
         # its FILES (and maybe its own PICKS). DECISION TAKEN: an empty block, a line naming no
         # lane with a report, a lane already on the path, or a pick adding no path empties the
         # whole list, so key 1 is asked (alternative: trust the other picks' lists).
-        for block in PICKS_RE.findall(rep):
+        for header, block in PICKS_RE.findall(rep):
+            block = header.partition(":")[2] + "\n" + block
             if not block.strip():
                 return []
-            for line in filter(str.strip, block.splitlines()):
+            for line in filter(str.strip, re.split(r"[;\n]", block)):
                 subs = [t for t in PICK_TOK_RE.findall(line) if self.report(t, {})]  # every lane id
                 if not subs or seen & set(subs):
                     return []
