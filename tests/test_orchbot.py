@@ -1441,8 +1441,52 @@ class WakeTest(BotCase):
         self.assertIn(("none", "KEEP-UNMERGED", "cleanup:Q"), self.acts(ds))
         self.assertEqual(len(self.posts), 1)
         self.assertEqual(sorted(self.sent()), sorted([
-            "BREAKER push-gate escalate_orchestrator", "HOLD memory hold_dispatch", "STUCK L1 escalate_orchestrator",
+            "BREAKER push-gate escalate_orchestrator", "STUCK L1 escalate_orchestrator",
             "DRY backlog escalate_orchestrator", "HOLD disk hold_dispatch", "ATTN lane:Z escalate_orchestrator"]))
+
+    def test_finished_working_lanes_are_never_stuck_or_running(self):
+        terminal = ["PASS", "BLOCKED", "DROPPED", "STUCK", "MISSING", "GREEN", "CI_PENDING", "done"]
+        for source in ("status", "lanes"):
+            for marker in [{"finished": True}] + [{"status": value} for value in terminal]:
+                with self.subTest(source=source, marker=marker):
+                    lane = {"id": "FINISHED", "state": "working", "started_at": "2026-10-15T08:00:00"}
+                    self.put("build/conveyor/lanes.json", {"FINISHED": marker} if source == "lanes" else {})
+                    self.put("build/conveyor/status.json", {"lanes": [
+                        dict(lane, **marker) if source == "status" else lane,
+                        dict(lane, id="ACTIVE")]})
+                    self.posts.clear()
+                    self.run_bot()
+                    facts = (self.root / "build/bot/facts.md").read_text(encoding="utf-8")
+                    self.assertNotIn("FINISHED:", facts)
+                    self.assertIn("ACTIVE:", facts)
+                    self.assertNotIn("STUCK FINISHED escalate_orchestrator", self.sent())
+        self.assertIn("STUCK:ACTIVE", self.shadow()["wake"]["sent"])
+
+    def test_status_holds_wait_30_minutes_and_restart_after_clear(self):
+        for target in ("memory", "disk"):
+            with self.subTest(target=target):
+                self.posts.clear()
+                self.put("build/conveyor/status.json", {f"{target}_hold": True})
+                self.run_bot()
+                self.clock.t += 29 * 60
+                self.run_bot()
+                self.assertEqual(self.posts, [])
+                self.clock.t += 2 * 60
+                self.run_bot()
+                self.assertEqual(self.sent(), [f"HOLD {target} hold_dispatch"])
+                self.clock.t += 180
+                self.run_bot()
+                self.assertEqual(len(self.posts), 1)
+                self.put("build/conveyor/status.json", {f"{target}_hold": False})
+                self.run_bot()
+                self.assertNotIn(target, self.shadow()["hold_since"])
+                self.clock.t += 180
+                self.put("build/conveyor/status.json", {f"{target}_hold": True})
+                self.run_bot()
+                self.assertEqual(self.shadow()["hold_since"][target], self.clock.t)
+                self.clock.t += 29 * 60
+                self.run_bot()
+                self.assertEqual(len(self.posts), 1)
 
     def test_dedupe_rate_limit_and_coalescing(self):
         self.events({"ts": "2026-10-15T11:59:00", "event": "pace", "usage_pct": 99})

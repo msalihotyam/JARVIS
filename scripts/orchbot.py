@@ -489,7 +489,7 @@ class Bot:
     def load_state(self):
         blank = {"cursor": None, "decisions": [], "counters": {}, "seen": {}, "history": [],
                  "fixes": {}, "respawns": {}, "head": "", "agreement": agree_blank(),
-                 "asks": {}, "conv_push": {}, "live": {}, "wake": {},
+                 "asks": {}, "conv_push": {}, "live": {}, "wake": {}, "hold_since": {},
                  "blocked": {}, "items": {}, "auto": {}, "waiting": {}}
         path = self.out / "shadow.json"
         if not path.exists():
@@ -900,6 +900,15 @@ class Bot:
             [("Yeniden başlat", RESTART_CMD)],
             "Konveyör yeni kodla açılır; yeni pid görülünce bu istek kapanır.", time="6 dk")]
 
+    def lane_finished(self, lane):
+        """Either conveyor snapshot can prove a stale working lane has finished."""
+        name = lane.get("id") or lane.get("name")
+        records = (lane, getattr(self, "lanes", {}).get(name, {}))
+        return any(isinstance(record, dict) and (
+            record.get("finished") is True or str(record.get("status") or "").upper() in {
+                "PASS", "BLOCKED", "DROPPED", "STUCK", "MISSING", "GREEN", "CI_PENDING", "DONE"})
+                   for record in records)
+
     def ask_t2(self):
         """Onay: a T2 slice with approved=false that is the only thing keeping the queue dry."""
         items, lanes = self.status.get("backlog"), self.status.get("lanes")  # missing lanes = unknown, not idle
@@ -912,7 +921,7 @@ class Bot:
         # anything else holding or busy (conveyor pick_slice states, pause, holds): T2 is not the only cause
         if states & OTHER_HOLD or any(s.startswith("held: ") for s in states) or any(
                 self.status.get(k) for k in ("paused", "usage_hold", "memory_hold", "outage_hold")) or any(not isinstance(x, dict) or not isinstance(x.get("state"), (str, type(None)))
-                                                    or str(x.get("state")).lower() in LIVE_STATES
+                                                    or (str(x.get("state")).lower() in LIVE_STATES and not self.lane_finished(x))
                                                 for x in lanes):  # an unreadable lane is never idle
             return []
         return [self.ask(
@@ -997,7 +1006,8 @@ class Bot:
 
         lanes = get("lanes", lambda v: isinstance(v, list))
         lane_rows = []
-        live = [ln for ln in lanes or [] if isinstance(ln, dict) and str(ln.get("state")).lower() in LIVE_STATES]
+        live = [ln for ln in lanes or [] if isinstance(ln, dict) and str(ln.get("state")).lower() in LIVE_STATES
+                and not self.lane_finished(ln)]
         for ln in live[:LANES_MAX]:
             t = parse_ts(ln.get("started_at"))
             mins = f"{int(now - t) // 60} min" if t is not None else "unknown min"
@@ -1669,10 +1679,20 @@ class Bot:
         wake = self.wakes.append
         if status.get("breaker") == "open":
             wake(("BREAKER", "push-gate", "escalate_orchestrator"))
-        if status.get("disk_hold") is True or status.get("memory_hold") is True:
-            wake(("HOLD", "disk" if status.get("disk_hold") is True else "memory", "hold_dispatch"))
+        holds = self.st.setdefault("hold_since", {})
+        if not isinstance(holds, dict):
+            holds = self.st["hold_since"] = {}
+        for target in ("disk", "memory"):
+            if status.get(f"{target}_hold") is not True:
+                holds.pop(target, None)
+                continue
+            since = holds.get(target)
+            if not num(since) or not 0 <= now - since:
+                since = holds[target] = now
+            if now - since >= 30 * 60:
+                wake(("HOLD", target, "hold_dispatch"))
         for ln in listed("lanes"):
-            if ln.get("state") == "working":
+            if ln.get("state") == "working" and not self.lane_finished(ln):
                 at = max([t for t in (parse_ts(ln.get("started_at")), parse_ts(ln.get("updated_at"))) if t],
                          default=None)
                 if at is not None and now - at > STUCK_S:
