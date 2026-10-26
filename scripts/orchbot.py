@@ -72,7 +72,9 @@ TS_FMT = "%Y-%m-%dT%H:%M:%S"
 HEAD_N = 256  # events.jsonl rotation fingerprint: a hash of its first bytes
 MATCH_S = 3600  # BOTAGREE: a decision and an actual action on one target within 60 min are one match
 # BOTFIX3B: an ack / ask / key-1 / fix waits up to a day for the orchestrator; a fix may land 5 min early
-DAY_S, FIX_EARLY_S, AGREE_VERSION = 86400, 300, 3
+DAY_S, FIX_EARLY_S, AGREE_VERSION = 86400, 300, 4
+# BOTFIX3D: words a board ask uses for a bot ask without a lane/id in it
+ASK_WORDS = {"restart": ("restart", "yeniden başlat")}  # ponytail: one alias set, grow it per new board wording
 SWEEP_N = 10  # BOTFIX3C: this many orchestrator acks in one minute are a sweep, not a judgement
 SALIH_RE = re.compile(r"(?i)\bby salih\b|salih onay|chat .*onay|manual key 1")
 PRE_RE = re.compile(r"(?i)under O42|pre-approval")  # pre-approved: not an orchestrator key-1 call
@@ -211,13 +213,18 @@ def same_key(a, b):
         return True
     if not (isinstance(a, str) and isinstance(b, str)):
         return False
+    for x, y in ((a, b), (b, a)):  # BOTFIX3D: a board ask names the bot ask's subject in its text
+        if x.startswith("ask:board:") and y.startswith("ask:") and not y.startswith("ask:board:"):
+            s = y[4:].split(":", 1)[-1]
+            return any(re.search(rf"(?<![\w-]){re.escape(w)}(?![\w-])", x[10:])
+                       for w in ASK_WORDS.get(s, (s,)) if w)
     return any(x.startswith("key1:@") and len(x) > 6 and y.startswith("key1:") and y.endswith(x[5:])
                for x, y in ((a, b), (b, a)))
 
 
 def agree_blank():
     return {"version": AGREE_VERSION, "start": None, "since": None, "pending": [], "actual": [], "known": None,
-            "totals": {}, "rules": {}, "key1": {"agree": 0, "total": 0}, "recent": [], "classes": {},
+            "answered": [], "totals": {}, "rules": {}, "key1": {"agree": 0, "total": 0}, "recent": [], "classes": {},
             "graduation": {"days": 0, "pushes": 0, "agree_pct": 0.0, "ready": False, "stage_a": False,
                            "classes": {}}}
 
@@ -249,15 +256,17 @@ def known_ok(v):
     return v is None or isinstance(v, dict) and isinstance(v.get("acks"), dict) and \
         all(num(t) for t in v["acks"].values()) and \
         all(isinstance(v.get(k), list) and all(isinstance(x, str) for x in v[k]) for k in ("approvals", "backlog")) \
-        and isinstance(v.get("pace"), dict) and all(num(x) or isinstance(x, bool) for x in v["pace"].values())
+        and isinstance(v.get("pace"), dict) and all(num(x) or isinstance(x, bool) for x in v["pace"].values()) \
+        and isinstance(v.get("board", []), list) and all(isinstance(x, str) for x in v.get("board", []))
 
 
 AGREE_SHAPES = {  # shadow.json "agreement"; a present key of another shape resets the block (fail closed)
     "start": lambda v: v is None or num(v),
     "since": lambda v: v is None or isinstance(v, str),
     "pending": lambda v: entries(v) and all(isinstance(e.get("rule"), str) for e in v),
-    "actual": lambda v: entries(v) and all(e.get("side") in ("orchestrator", "conveyor") for e in v),
+    "actual": lambda v: entries(v) and all(e.get("side") in ("orchestrator", "conveyor", "salih") for e in v),
     "known": known_ok,
+    "answered": entries,
     "totals": counts,
     "rules": counts,
     "key1": lambda v: isinstance(v, dict) and all(type(v.get(k)) is int for k in ("agree", "total")),
@@ -767,13 +776,14 @@ class Bot:
         """One decision when an ask opens and one when it closes; st["asks"] is the open set."""
         now, was = self.now(), self.st["asks"]
         cur = {a["id"]: a["since"] for a in asks}
+        open_ = {p["key"] for p in self.st["agreement"]["pending"]}
         for i in sorted(cur.keys() - was.keys()):
-            self.decide(now, f"ask {i}", "none", "ASK", i, f"open {i}", key=f"ask:{i}".lower())
+            # BOTFIX3D: a flapping ask (closed one pass, reopened) is still the one pending decision
+            k = f"ask:{i}".lower()
+            self.decide(now, f"ask {i}", "none", "ASK", i, f"open {i}", key=k if k not in open_ else None)
         for i in sorted(was.keys() - cur.keys()):
+            # BOTFIX3D: the bot's own ask closing is no actual; observe() reads the board and Salih's files
             self.decide(now, f"ask {i}", "none", "ASK", i, f"close {i}")
-            # BOTFIX3B: the ask closing is the orchestrator's answer to the bot's open decision
-            self.st["agreement"]["actual"].append({"at": now, "action": "none", "key": f"ask:{i}".lower(),
-                                                   "side": "orchestrator", "what": f"close {i}"})
         self.st["asks"] = cur
 
     def asks(self):
@@ -798,7 +808,7 @@ class Bot:
                 raise ValueError(f"{aid}: cmd would be truncated or rewritten, no ask (fail closed)")
         safe = ask_text(aid, c["where"])
         if safe != aid:  # two raw ids must never collapse into one sanitized id
-            safe = ask_text(aid, c["where"] - 9) + "-" + hashlib.sha1(str(aid).encode()).hexdigest()[:8]
+            safe = ask_text(aid, c["where"] - 9) + "-" + hashlib.sha1(str(aid).encode(), usedforsecurity=False).hexdigest()[:8]
         aid = safe
         return {"id": aid, "title": ask_text(title, c["title"]), "blocks": ask_text(blocks, c["why"]),
                 "where": ask_text(where, c["where"]), "time": time, "why": ask_text(why, c["why"]),
@@ -1256,7 +1266,8 @@ class Bot:
         DECISION TAKEN: the first pass (or one after a reset) only records a baseline (alternative:
         count every file already there as an actual)."""
         now, out = self.now(), []
-        first, known = known is None, known or {"acks": {}, "approvals": [], "backlog": [], "pace": {}}
+        first, known = known is None, known or {"acks": {}, "approvals": [], "backlog": [], "pace": {},
+                                                          "board": []}
 
         def act(at, action, key, side, what):
             if not first:
@@ -1278,10 +1289,19 @@ class Bot:
 
         acks, new, minute = {}, [], {}
         for name, _, mt in files(self.conv / "ack"):
-            acks[name] = mt
-            if mt > known["acks"].get(name, -1) and self.st.get("live", {}).get("acks", {}).get(name) != mt:
+            if self.st.get("live", {}).get("acks", {}).get(name) == mt:  # the bot's own live ack
+                acks[name] = mt
+                continue
+            # BOTFIX3D: a sweep is counted over the wall-clock minute (every orchestrator ack file there),
+            # and an ack of a minute still running waits for the next pass, so a split sweep is still seen
+            minute[int(mt // 60)] = minute.get(int(mt // 60), 0) + 1
+            if mt > known["acks"].get(name, -1):
+                if int(mt // 60) >= int(now // 60) and not first:
+                    if name in known["acks"]:
+                        acks[name] = known["acks"][name]
+                    continue
                 new.append((name, mt))
-                minute[int(mt // 60)] = minute.get(int(mt // 60), 0) + 1
+            acks[name] = mt
         for name, mt in [] if first else new:
             # BOTFIX3C: only an ack of a routine item the bot saw counts; a young one pre-empts the bot
             a, it = {"at": mt, "action": "ack", "key": "ack:" + name.lower(), "side": "orchestrator",
@@ -1314,6 +1334,8 @@ class Bot:
                     act(mt, "write_key1", key, "conveyor", f"{raw}: {text}")
                 elif SALIH_RE.search(text):
                     act(mt, "ask_salih_key1", key, "orchestrator", f"{raw}: {text}")
+                    if key.split("@")[0] != "key1:":  # BOTFIX3D: Salih's decision is a real key-1 ask, closed
+                        act(mt, "none", "ask:" + key.split("@")[0], "salih", f"{raw}: {text}")
                 else:
                     act(mt, "write_key1", key, "orchestrator", f"{raw}: {text}")
         slices = self.backlog.get("slices")
@@ -1331,7 +1353,19 @@ class Bot:
             cut.append("paused")
         if cut:  # ponytail: one hold per pass whatever changed; per-key holds if they are ever told apart
             act(now, "hold_dispatch", "dispatch", "orchestrator", f"pace.json {', '.join(cut)}")
-        return out, {"acks": acks, "approvals": sorted(approvals), "backlog": ids, "pace": pace}
+        # BOTFIX3D: an ask on the board (story.json "asks") is the real ask; its text names the bot's subject
+        story = self.read_json(self.root / "build" / "pano" / "story.json", {})
+        board = {}
+        for b in story.get("asks") if isinstance(story.get("asks"), list) else []:
+            if isinstance(b, dict) and str(b.get("title") or "").strip():
+                text = " ".join(str(b.get(k) or "") for k in ("title", "blocks", "why", "cmds"))
+                board[str(b["title"]).strip().lower()[:200]] = " ".join(text.lower().split())[:1000]
+        if not isinstance(story.get("asks"), list):
+            board = dict.fromkeys(known.get("board", []), "")
+        for t in sorted(board.keys() - set(known.get("board", []))):
+            act(now, "none", "ask:board:" + board[t], "orchestrator", f"board ask {t}")
+        return out, {"acks": acks, "approvals": sorted(approvals), "backlog": ids, "pace": pace,
+                     "board": sorted(board)}
 
     def agree(self):
         """Match each pending decision to an actual action on the same key within MATCH_S. Every
@@ -1344,25 +1378,32 @@ class Bot:
         pend = sorted(ag["pending"], key=lambda e: e["at"])
         acts = sorted(ag["actual"] + actual + self.observed, key=lambda e: e["at"])
         used, keep = set(), []
+        # BOTFIX3D: an ask already answered by one real actual (board or Salih) is never missed by the next one
+        done = [d for d in ag.setdefault("answered", []) if now - d["at"] <= 2 * DAY_S]
         for a in acts:
             i = next((i for i, p in enumerate(pend) if i not in used and same_key(p["key"], a["key"])
                       and -(FIX_EARLY_S if p["key"].startswith("fix:") else MATCH_S) <= a["at"] - p["at"]
                       <= horizon(p["key"])), None)
             if i is not None:
                 used.add(i)
+                if pend[i]["key"].startswith("ask:"):
+                    done.append({"at": pend[i]["at"], "key": pend[i]["key"], "action": "none"})
                 self.verdict("agree" if pend[i]["action"] == a["action"] else "disagree", pend[i], a)
             elif now - a["at"] <= MATCH_S:
                 keep.append(a)
-            elif a["side"] == "orchestrator":  # DECISION TAKEN: a conveyor action is never missed
+            elif any(same_key(d["key"], a["key"]) and abs(a["at"] - d["at"]) <= DAY_S for d in done):
+                pass
+            elif a["side"] != "conveyor":  # DECISION TAKEN: a conveyor action is never missed; a Salih ask is
                 self.verdict("missed", None, a)  # (alternative: count it missed too)
-        ag["actual"] = keep
+        ag["actual"], ag["answered"] = keep, done
         ag["pending"] = []
         for i, p in enumerate(pend):
             if i in used:
                 continue
             gone = p["key"].startswith("ack:") and self.attn is not None and p["key"][4:] not in self.attn
             if now - p["at"] > horizon(p["key"]) or gone:  # BOTFIX3C: an ack whose item cleared is done
-                self.verdict("unmatched", p, None)
+                # BOTFIX3D: the bot asked and nothing real was asked within the day -> disagree
+                self.verdict("disagree" if p["key"].startswith("ask:") and not gone else "unmatched", p, None)
             else:
                 ag["pending"].append(p)
         k1 = ag["key1"]
@@ -1370,7 +1411,11 @@ class Bot:
                             "agree_pct": round(100 * k1["agree"] / k1["total"], 1) if k1["total"] else 0.0}
         ag["graduation"]["ready"] = ag["graduation"]["days"] >= GRAD_DAYS and k1["total"] >= GRAD_PUSHES \
             and k1["agree"] == k1["total"]
-        cls = {c: {"n": sum(v.values()), "pct": round(100 * v.get("agree", 0) / sum(v.values()), 1)}
+        # BOTFIX3D: n and pct over evaluated verdicts (agree + disagree) only; the rest are side counters
+        cls = {c: {"n": v.get("agree", 0) + v.get("disagree", 0),
+                   "pct": round(100 * v.get("agree", 0) / (v.get("agree", 0) + v.get("disagree", 0)), 1)
+                   if v.get("agree", 0) + v.get("disagree", 0) else 0.0,
+                   **{k: v.get(k, 0) for k in ("bot_only", "missed", "excluded")}}
                for c, v in sorted(ag["classes"].items()) if sum(v.values())}
         ag["graduation"]["classes"] = cls
         ag["graduation"]["stage_a"] = ag["graduation"]["days"] >= GRAD_DAYS and all(
@@ -1388,14 +1433,12 @@ class Bot:
             if name:
                 book.setdefault(name, {}).setdefault(kind, 0)
                 book[name][kind] += 1
-        if kind == "excluded":  # BOTFIX3C: in the totals only, never in a class metric
-            return
         c = klass(p, a)
-        if c:
+        if c:  # BOTFIX3D: excluded is a per-class side counter, never in n or pct
             row = ag["classes"].setdefault(c, {})
             row["bot_only" if kind == "unmatched" else kind] = row.get("bot_only" if kind == "unmatched" else kind,
                                                                        0) + 1
-        if c == "key1_orch":  # BOTFIX3B: a conveyor auto-approval or O42 pre-approval is not a key-1 call
+        if c == "key1_orch" and kind != "excluded":  # BOTFIX3B: a conveyor auto-approval or O42 pre-approval is not a key-1 call
             ag["key1"]["total"] += 1
             ag["key1"]["agree"] += kind == "agree"
         if kind != "agree":
@@ -1643,7 +1686,7 @@ class Bot:
             ack = self.conv / "ack" / cv.ack_name(iid)
             if ack.exists() and since <= ack.stat().st_mtime <= now:  # BOTREPLAY2: a future ack hides nothing
                 continue
-            if iid.startswith("cleanup:") and not PROVEN_RE.match(reason):
+            if iid.startswith(("cleanup:", "preserved:")) and not PROVEN_RE.match(reason):  # BOTFIX3D: M7
                 # BOTV1: work not proven on main stays in front of a human (fail closed); logged once a day
                 if self.once(f"keep:{iid}:{cv.iso(now)[:10]}", now):
                     self.decide(now, f"cleanup refusal {iid}: work not on main", "none", "KEEP-UNMERGED",

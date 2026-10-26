@@ -644,11 +644,12 @@ class AgreementTest(BotCase):
         self.run_bot()
         ag = self.shadow()["agreement"]
         self.assertEqual(ag["classes"], {"key1_orch": {"agree": 1}})
-        self.assertEqual(ag["graduation"]["classes"], {"key1_orch": {"n": 1, "pct": 100.0}})
+        self.assertEqual(ag["graduation"]["classes"],
+                         {"key1_orch": {"n": 1, "pct": 100.0, "bot_only": 0, "missed": 0, "excluded": 0}})
         facts = (self.root / "build" / "bot" / "facts.md").read_text(encoding="utf-8")
         self.assertIn("- key1_orch: n 1, agree 100% (shadow.json)\n", facts)
         now = self.clock()
-        cls = {"ack": {"agree": 27, "disagree": 3}, "ask": {"agree": 9, "bot_only": 1}}
+        cls = {"ack": {"agree": 27, "disagree": 3}, "ask": {"agree": 10, "bot_only": 1}}
         for days, ack, ready in ((7, cls["ack"], True), (6, cls["ack"], False), (7, {"agree": 26, "missed": 3}, False),
                                  (7, {"agree": 26, "disagree": 4}, False)):
             with self.subTest(days=days, ack=ack):
@@ -691,7 +692,7 @@ class AgreementTest(BotCase):
         self.assertEqual([h(k) for k in ("ack:x", "ask:x", "key1:l", "fix:l", "dispatch", "rerun:l")],
                          [86400, 86400, 86400, 86400, 3600, 3600])
 
-    def test_ask_open_close_agree(self):
+    def test_ask_close_is_no_actual(self):
         b = orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append)
         b.st = {"asks": {}, "history": [], "counters": {}, "agreement": orchbot.agree_blank()}
         b.new, b.live = [], {}
@@ -699,8 +700,153 @@ class AgreementTest(BotCase):
         b.log_asks([])
         ag = b.st["agreement"]
         self.assertEqual([(p["key"], p["action"]) for p in ag["pending"]], [("ask:q1", "none")])
-        self.assertEqual([(a["key"], a["side"]) for a in ag["actual"]], [("ask:q1", "orchestrator")])
-        self.assertTrue(orchbot.entries(ag["actual"]))
+        self.assertEqual(ag["actual"], [])
+
+    def test_stage_a_n_and_pct_over_agree_and_disagree(self):  # BOTFIX3D M1
+        now = self.clock()
+        side = {"bot_only": 50, "missed": 5, "excluded": 7}
+        self.seed({"version": orchbot.AGREE_VERSION, "start": now - 7 * 86400,
+                   "classes": {"ack": dict(side, agree=30), "ask": {"agree": 10}}})
+        self.run_bot()
+        g = self.shadow()["agreement"]["graduation"]
+        self.assertEqual(g["classes"]["ack"], dict(side, n=30, pct=100.0))
+        self.assertIs(g["stage_a"], True)
+        for ack in ({"agree": 29, "bot_only": 1}, {"agree": 29, "excluded": 1}, {"agree": 5, "bot_only": 40}):
+            with self.subTest(ack=ack):
+                self.seed({"version": orchbot.AGREE_VERSION, "start": now - 7 * 86400,
+                           "classes": {"ack": ack, "ask": {"agree": 10}}})
+                self.run_bot()
+                self.assertIs(self.shadow()["agreement"]["graduation"]["stage_a"], False)
+
+    def test_board_ask_same_key(self):  # BOTFIX3D M2
+        s = orchbot.same_key
+        self.assertTrue(s("ask:board:push l1 now", "ask:key1:l1"))
+        self.assertTrue(s("ask:key1:l1", "ask:board:push l1 now"))
+        self.assertFalse(s("ask:board:push l10 now", "ask:key1:l1"))
+        self.assertTrue(s("ask:board:yeniden başlat lütfen", "ask:restart"))
+        self.assertFalse(s("ask:board:a", "ask:board:a b"))
+
+    def test_board_ask_the_bot_never_asked_is_missed(self):  # BOTFIX3D M2
+        self.put("build/pano/story.json", {"asks": [{"title": "Something else", "why": "x"}]})
+        self.run_bot()
+        self.assertEqual(self.kinds(), [])
+        self.clock.set("2026-10-15T13:00:01")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["missed"])
+        self.assertTrue(self.verdicts()[0]["key"].startswith("ask:board:something else"))
+
+    def test_bot_ask_with_no_real_ask_is_disagree(self):  # BOTFIX3D M2
+        ag = self.shadow()["agreement"]
+        ag["pending"].append({"at": self.clock() - 86401, "action": "none", "rule": "ASK", "target": "Q1",
+                              "key": "ask:q1", "detail": "open Q1"})
+        self.seed(ag)
+        self.run_bot()
+        self.assertEqual([(v["verdict"], v["key"]) for v in self.verdicts()], [("disagree", "ask:q1")])
+
+    def test_salih_decision_is_a_real_ask(self):  # BOTFIX3D M2
+        self.approve("2026-10-15T11:30:00", "approved by salih")
+        self.clock.set("2026-10-15T12:05:00")
+        self.run_bot()
+        self.assertIn(("ask:key1:l1", "salih"), [(a["key"], a["side"]) for a in self.shadow()["agreement"]["actual"]])
+        self.clock.set("2026-10-15T12:30:01")
+        self.assertEqual(self.acts(self.run_bot()), [])  # a salih actual is a valid shape (no FAILCLOSED)
+        self.assertEqual(self.kinds(), ["disagree", "missed"])
+        self.assertEqual(self.verdicts()[1]["key"], "ask:key1:l1")
+
+    def test_bot_ask_answered_on_the_board_then_by_salih_is_one_agree(self):  # BOTFIX3D M2 review
+        now, ag = self.clock(), self.shadow()["agreement"]
+        ag["pending"].append({"at": now - 9000, "action": "none", "rule": "ASK", "target": "L1",
+                              "key": "ask:key1:l1", "detail": "open L1"})
+        ag["actual"] += [{"at": now - 8700, "action": "none", "key": "ask:board:anahtar 1: l1 push", "side": "orchestrator"},
+                         {"at": now - 8100, "action": "none", "key": "ask:key1:l1", "side": "salih"}]
+        self.seed(ag)
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["agree"])
+
+    def test_flapping_ask_stays_one_pending(self):  # BOTFIX3D M2 review
+        b = orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append)
+        b.st = {"asks": {}, "history": [], "counters": {}, "agreement": orchbot.agree_blank()}
+        b.new, b.live = [], {}
+        for asks in ([{"id": "restart", "since": "x"}], [], [{"id": "restart", "since": "x"}]):
+            b.log_asks(asks)
+        self.assertEqual([p["key"] for p in b.st["agreement"]["pending"]], ["ask:restart"])
+
+
+class AckAgreementTest(BotCase):
+    """BOTFIX3D: the BOTFIX3C ack/backlog/pruning paths and the M5/M7 fixes."""
+    def attention(self, *items):
+        self.put("build/conveyor/status.json", {"attention": [{"id": i, "reason": r, "since": s} for i, r, s in items]})
+
+    def ack(self, iid, at):
+        p = self.put("build/conveyor/ack/" + orchbot.cv.ack_name(iid), "")
+        os.utime(p, (ts(at), ts(at)))
+
+    def kinds(self):
+        return [v["verdict"] for v in self.verdicts()]
+
+    def test_preserved_is_acked_after_keep_unmerged(self):  # M7
+        self.attention(("preserved:P1", "x", "2026-10-15T11:30:00"))
+        self.assertEqual(self.acts(self.run_bot()), [("none", "KEEP-UNMERGED", "preserved:P1"),
+                                                     ("ack", "O33", "preserved:P1")])
+
+    def test_sweep_is_counted_per_wall_clock_minute(self):  # M5
+        ids = [f"A{i}" for i in range(10)]
+        self.attention(*[(i, "FINDINGS: x", "2026-10-15T10:00:00") for i in ids])
+        self.run_bot()
+        for i in ids[:5]:
+            self.ack(i, "2026-10-15T12:01:10")
+        self.clock.set("2026-10-15T12:01:30")
+        self.run_bot()
+        self.assertEqual(self.kinds(), [])  # the minute is still running: deferred
+        for i in ids[5:]:
+            self.ack(i, "2026-10-15T12:01:20")
+        self.clock.set("2026-10-15T12:02:30")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["excluded"] * 10)
+
+    def test_ack_of_an_unknown_item_is_excluded(self):
+        self.run_bot()
+        self.ack("Z9", "2026-10-15T12:01:00")
+        self.clock.set("2026-10-15T12:03:00")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["excluded"])
+
+    def test_young_ack_pre_empts_the_bot(self):
+        self.attention(("Y1", "FINDINGS: x", "2026-10-15T11:50:00"))
+        self.run_bot()
+        self.ack("Y1", "2026-10-15T12:05:00")
+        self.clock.set("2026-10-15T12:06:30")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["agree"])
+        self.assertIn("(pre-empted)", str(self.verdicts()[0]))
+
+    def test_ack_pending_is_unmatched_once_the_item_clears(self):
+        self.attention(("O1", "FINDINGS: x", "2026-10-15T11:00:00"))
+        self.assertEqual(self.acts(self.run_bot()), [("ack", "O33", "O1")])
+        self.attention()
+        self.clock.set("2026-10-15T12:01:00")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["unmatched"])
+
+    def test_backlog_fix_only_after_a_blocked_finish(self):
+        self.put("build/conveyor/backlog.json", {"slices": []})
+        self.run_bot()
+        s = self.shadow()
+        s["blocked"] = {"lane": self.clock() - 10, "late": self.clock() + 100}
+        self.put("build/bot/shadow.json", s)
+        self.put("build/conveyor/backlog.json", {"slices": [{"id": "LANE-fix"}, {"id": "OTHER-x"}, {"id": "LATE-fix"}]})
+        self.run_bot()
+        self.assertEqual([a["key"] for a in self.shadow()["agreement"]["actual"]], ["fix:lane"])
+
+    def test_seen_and_blocked_are_pruned(self):
+        self.run_bot()
+        s, now = self.shadow(), self.clock()
+        s["seen"] = {"old": now - orchbot.SEEN_S - 1, "new": now}
+        s["blocked"] = {"old": now - orchbot.SEEN_S - 1, "new": now}
+        self.put("build/bot/shadow.json", s)
+        self.run_bot()
+        s = self.shadow()
+        self.assertEqual((set(s["seen"]) & {"old", "new"}, set(s["blocked"])), ({"new"}, {"new"}))
 
 
 class FactsTest(BotCase):
