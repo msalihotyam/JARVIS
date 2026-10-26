@@ -3487,6 +3487,107 @@ class TestPreserved(Base):
         self.assertEqual((pv["branch"], pv["first_unintegrated_sha"]), ("lane-a", sha))
         self.assertEqual(self.cli("stop"), [])
 
+    def preserve_then(self, on_main):
+        """CONVCHERRY: preserved before its pick landed; on_main(sha) changes main; an hour later."""
+        sha = self.lane_commit()
+        sid = self.run_cleanup()
+        self.assert_preserved_once()
+        on_main(sha)
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        return sid
+
+    def released(self):
+        return [e["lane"] for e in self.events() if e["event"] == "preserved_released"]
+
+    def assert_still_preserved(self):
+        self.assertEqual(self.released(), [])
+        self.assertEqual(self.cli("rm"), [])
+        self.assertTrue(self.wt.exists())
+        self.assertEqual(self.g("branch", "--list", "lane-a").strip("* +"), "lane-a")
+        self.assertEqual(self.lanes()["A"]["preserved"]["recheck_ts"], self.t)  # it was re-proved
+
+    def test_pick_landing_after_preserve_releases_and_cleans(self):
+        sid = self.preserve_then(lambda sha: self.g("cherry-pick", "-x", sha))
+        self.assertEqual(self.released(), ["A"])
+        self.c.pass_once()
+        self.assert_cleaned(sid)
+        self.assertEqual(len([e for e in self.events() if e["event"] == "preserved"]), 1)
+        self.assertEqual([i["id"] for i in self.status()["attention"] if i["id"].startswith("preserved:")], [])
+
+    def test_pick_with_one_unpicked_commit_stays_preserved(self):
+        def pick_one(sha):
+            self.g("cherry-pick", "-x", sha)
+            (self.wt / "k.txt").write_text("real work\n")
+            self.g("add", "k.txt", cwd=self.wt)
+            self.g("commit", "-q", "-m", "real", cwd=self.wt)
+        self.preserve_then(pick_one)
+        self.assert_still_preserved()
+
+    def test_pick_with_git_error_on_recheck_stays_preserved(self):
+        def pick_fail(sha):
+            self.g("cherry-pick", "-x", sha)
+            self.git_fail, self.git_fail_on = (128, "fatal: boom"), ["git", "cherry"]
+        self.preserve_then(pick_fail)
+        self.assert_still_preserved()
+
+    def test_recheck_exception_stays_preserved(self):
+        def boom(*a, **k):
+            raise conveyor.subprocess.TimeoutExpired("git", 1)
+        self.preserve_then(lambda sha: (self.g("cherry-pick", "-x", sha), setattr(self.c, "off_main", boom)))
+        self.assert_still_preserved()
+
+    def test_amended_pick_stays_preserved(self):
+        self.preserve_then(lambda sha: (self.main_commit({"g.txt": "work, amended\n"}), self.origin_main()))
+        self.assert_still_preserved()
+
+    def test_pick_then_revert_on_main_is_released_as_merged_equivalent(self):
+        """The pick stays in main's history, so the revert is main's choice (merged_equivalent's rule)."""
+        def pick_revert(sha):
+            self.g("cherry-pick", "-x", sha)
+            self.g("revert", "--no-edit", "HEAD")
+            self.origin_main()
+        sid = self.preserve_then(pick_revert)
+        self.assertEqual(self.released(), ["A"])
+        self.c.pass_once()
+        self.assert_cleaned(sid)
+
+    def test_recheck_waits_cleanup_s_and_branchless_preserve_is_never_rechecked(self):
+        sha = self.lane_commit()
+        self.run_cleanup()
+        ts = self.assert_preserved_once()["ts"]
+        self.g("cherry-pick", "-x", sha)
+        self.t = ts + conveyor.CLEANUP_S - 1
+        self.c.pass_once()
+        self.assertEqual(self.released(), [])
+        self.assertNotIn("recheck_ts", self.lanes()["A"]["preserved"])
+        lanes = self.lanes()
+        lanes["A"]["preserved"]["branch"] = None  # e.g. "worktree branch unknown"
+        self.c.save_lanes(lanes)
+        self.t += 2 * conveyor.CLEANUP_S
+        self.c.pass_once()
+        self.assertEqual(self.released(), [])
+        self.assertEqual(self.cli("rm"), [])
+        self.assertNotIn("recheck_ts", self.lanes()["A"]["preserved"])
+
+    def test_hand_edited_preserve_record_does_not_break_cleanup(self):
+        self.lane_commit()
+        self.run_cleanup()
+        self.assert_preserved_once()
+        lanes = self.lanes()
+        lanes["A"]["preserved"]["ts"] = "yesterday"  # non-numeric: rechecked, never a TypeError
+        self.c.save_lanes(lanes)
+        self.c.pass_once()
+        self.assert_still_preserved()
+        lanes = self.lanes()
+        lanes["A"]["preserved"] = {"branch": ["lane-a"], "ts": 0, "reason": "x"}  # a non-str branch: no recheck
+        self.c.save_lanes(lanes)
+        self.t += conveyor.CLEANUP_S
+        self.c.pass_once()
+        self.assertEqual(self.released(), [])
+        self.assertEqual(self.cli("rm"), [])
+        self.assertNotIn("recheck_ts", self.lanes()["A"]["preserved"])
+
     def origin_main(self, rev="main"):
         self.g("update-ref", "refs/remotes/origin/main", self.g("rev-parse", rev))
 

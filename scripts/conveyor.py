@@ -3707,6 +3707,14 @@ class Conveyor:
             if done >= CLEANUP_PER_PASS:
                 return
             c = ln.get("cleanup") or {}
+            pv = ln.get("preserved")
+            pt = pv.get("recheck_ts") or pv.get("ts") if isinstance(pv, dict) else None
+            if (isinstance(pv, dict) and isinstance(pv.get("branch"), str) and pv["branch"] and ln.get("finished")
+                    and name not in attention_ids
+                    and self.now() - (pt if isinstance(pt, (int, float)) else 0) >= CLEANUP_S):
+                done += 1
+                self.beat()
+                self.release_preserved(name, ln, pv)
             if (not ln.get("finished") or "preserved" in ln or name in attention_ids
                     or (c and self.now() < c.get("retry_ts", float("inf")))):
                 continue
@@ -4238,10 +4246,27 @@ class Conveyor:
         return rc, branch
 
     def preserve(self, ln, name, reason, branch, sha):
-        """Mark the lane preserved (the orchestrator removes the mark by hand): never rm'd again."""
+        """Mark the lane preserved: never rm'd while marked. The orchestrator removes the mark by
+        hand, or release_preserved once the branch is proven on main."""
         ln["preserved"] = {"ts": self.now(), "at": iso(self.now()), "reason": reason,
                            "branch": branch, "first_unintegrated_sha": sha}
         self.event("preserved", lane=name, reason=reason, branch=branch, sha=sha)
+
+    def release_preserved(self, name, ln, pv):
+        """CONVCHERRY: integrations cherry-pick, so a lane preserved before its pick landed stays
+        off main by sha forever. Re-prove the recorded branch (cleanup calls this at most once per
+        CLEANUP_S): the mark goes only when off_main or merged_equivalent proves it on main (every
+        commit patch-equivalent and its content there). Any reason or git error keeps the mark;
+        cleanup then re-proves the worktree itself and remove_worktree the tip before deleting."""
+        pv["recheck_ts"] = self.now()
+        branch = pv["branch"]
+        try:
+            if self.off_main(branch) and not self.merged_equivalent(branch)[0]:
+                return
+        except Exception:  # a timeout etc.: fail closed
+            return
+        del ln["preserved"]
+        self.event("preserved_released", lane=name, branch=branch, reason=pv.get("reason"))
 
     def loop(self, once=False):
         if not self.acquire_lock():
