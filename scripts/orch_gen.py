@@ -1,11 +1,14 @@
 """Deterministic generator for the orchestrator's routine prompts (ORCHGEN).
 
-    python scripts/orch_gen.py [--root DIR] review <SLICE>... [--write]
+    python scripts/orch_gen.py [--root DIR] review <SLICE>... [--with-partial ID]... [--write]
     python scripts/orch_gen.py [--root DIR] int <REVIEW>... [--write]
 
 review: reads build/reports/<SLICE>.md (STATUS PASS, one 40-hex COMMIT, FILES, a "Worker: codex"
 line) and writes an independent review prompt: CLREVnn (Claude) for work the Codex worker wrote,
 CDXINTnn (Codex) for work Claude wrote, plus a backlog entry with the next free number.
+FILES entries lose "(...)" annotations; the lane's own report is ignored; a "Worker: jules" report
+without FILES uses git show --name-only. --with-partial ID adds a BLOCKED "partial" predecessor
+only when a reviewed report names it as BASE: <ID> AT <sha> and builds on that commit.
 int: once the named reviews are PASS, writes INTnn: base = origin/main (git ls-remote), picks in
 ancestry order, expected files = union of git show --name-only, their tests modules (+ tests.test_ui
 only when a UI file is touched), CI BRANCH ci/<intnn>.
@@ -29,8 +32,12 @@ import conveyor  # noqa: E402  (read-only: the conveyor's own validators)
 
 SHA40 = re.compile(r"[0-9a-f]{40}")
 COMMIT_RE = re.compile(r"(?m)^[\s>#*`-]*COMMIT:[\s`]*([0-9a-fA-F]{7,40})\b")
-FILES_RE = re.compile(r"(?m)^[\s>#*`-]*FILES:[ \t]*(.*)$")
+# FILES value plus indented or bulleted continuation lines that are not another upper-case
+# "LABEL:" line (any other indented line stays FILES content and must be a changed path)
+FILES_RE = re.compile(r"(?m)^[\s>#*`-]*FILES:[ \t]*(.*(?:\n(?:[ \t]+|[ \t]*[-*][ \t]+)"
+                      r"(?![-*]?[ \t]*[A-Z][A-Z0-9 _-]*:)\S.*)*)")
 WORKER_RE = re.compile(r"(?im)^[\s>#*`-]*worker:[\s`]*codex\b")
+JULES_RE = re.compile(r"(?im)^[\s>#*`-]*worker:[\s`]*jules\b")
 SCOPE_RE = re.compile(r"(?m)^.*?\bScope:(.*)$")
 PAIR_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][A-Za-z0-9._-]*) `?([0-9a-f]{7,40})\b")
 PATH_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
@@ -71,16 +78,26 @@ class Gen:
             raise Refuse("backlog has no slices list")
         return b
 
-    def report(self, sid):
+    def report(self, sid, partial=False):
+        """Report text; PASS, or with partial=True a BLOCKED report whose STATUS line says partial."""
         if not conveyor.LANE_RE.fullmatch(sid):
             raise Refuse(f"{sid}: not a lane id")
         p = self.reports / f"{sid}.md"
         if not p.is_file():
             raise Refuse(f"{sid}: no report {p.relative_to(self.root).as_posix()}")
         status = conveyor.report_status(p)
-        if status != "PASS":
-            raise Refuse(f"{sid}: report STATUS is {status or 'missing'}, not PASS")
-        return p.read_text(encoding="utf-8", errors="replace")
+        text = p.read_text(encoding="utf-8", errors="replace")
+        if not partial:
+            if status != "PASS":
+                raise Refuse(f"{sid}: report STATUS is {status or 'missing'}, not PASS")
+            return text
+        # the same STATUS line conveyor.report_status reads; "partial" must follow BLOCKED
+        lines = [s for s in (x.lstrip(" \t>#*`﻿").rstrip() for x in text.splitlines()) if s][:15]
+        line = next((s for s in lines if conveyor.STATUS_RE.match(s)), "")
+        if status != "BLOCKED" or not re.match(r"(?i)STATUS:[\s*`]*BLOCKED[\s*`]*[(:,-]?[ \t]*partial\b",
+                                                line):
+            raise Refuse(f"{sid}: report STATUS is {status or 'missing'}, not BLOCKED (partial ...)")
+        return text
 
     def changed(self, sha):
         files = [f for f in self.git("show", "--name-only", "--format=", sha).splitlines() if f]
@@ -88,9 +105,7 @@ class Gen:
             raise Refuse(f"{sha[:12]}: commit changes no files")
         return files
 
-    def slice_info(self, sid):
-        """(sha40, changed files, codex?) from a PASS slice report; refuses when unclear."""
-        text = self.report(sid)
+    def commit_of(self, sid, text):
         shas = {m.lower() for m in COMMIT_RE.findall(text)}
         if not shas:
             raise Refuse(f"{sid}: report has no COMMIT line")
@@ -102,11 +117,32 @@ class Gen:
         rc, kind = self.git_fn(self.root, "cat-file", "-t", sha)
         if rc != 0 or kind.strip() != "commit":
             raise Refuse(f"{sid}: COMMIT {sha} is not a commit")
+        return sha
+
+    def is_codex(self, text, sha):
+        return bool(WORKER_RE.search(text)) or bool(
+            WORKER_RE.search(self.git("show", "-s", "--format=%B", sha)))
+
+    def slice_info(self, sid):
+        """(sha40, changed files, codex?) from a PASS slice report; refuses when unclear."""
+        text = self.report(sid)
+        sha = self.commit_of(sid, text)
+        codex = self.is_codex(text, sha)
         m = FILES_RE.search(text)
+        # the conveyor writes Jules reports without FILES, with "BRANCH: jules/<ID>"
+        if not m and JULES_RE.search(text) and re.search(rf"(?m)^BRANCH:[ \t]*jules/{re.escape(sid)}[ \t]*$",
+                                                          text):
+            if codex:
+                raise Refuse(f"{sid}: report names both the Jules and the Codex worker")
+            return sha, self.changed(sha), codex
+        raw = m.group(1) if m else ""
+        while (s := re.sub(r"\([^()]*\)", "", raw)) != raw:  # annotations, innermost first
+            raw = s
+        own = f"build/reports/{sid}.md"
         listed = []
-        for part in re.split(r"[;,]", m.group(1) if m else ""):
-            p = re.sub(r"\s*\(.*?\)", "", part).strip(" \t`'\"")
-            if p:
+        for part in re.split(r"[,;\n]", raw):
+            p = re.sub(r"^[ \t]*[-*][ \t]+", "", part).strip(" \t`'\"")
+            if p and p.replace("\\", "/") != own:  # the lane's own report is not in its commit
                 listed.append(p)
         if not listed:
             raise Refuse(f"{sid}: report has no FILES")
@@ -114,9 +150,28 @@ class Gen:
         unknown = [p for p in listed if not PATH_RE.fullmatch(p) or p not in files]
         if unknown:
             raise Refuse(f"{sid}: FILES not changed by {sha[:12]}: {', '.join(unknown)}")
-        codex = bool(WORKER_RE.search(text)) or bool(
-            WORKER_RE.search(self.git("show", "-s", "--format=%B", sha)))
         return sha, files, codex
+
+    def partial_info(self, pid, info):
+        """(pid, sha40, files, codex?, later id) for a BLOCKED partial slice that a later reviewed
+        slice names as its BASE (BASE: <pid> AT <sha>) and builds on; refuses otherwise."""
+        text = self.report(pid, partial=True)
+        sha = self.commit_of(pid, text)
+        base_re = re.compile(rf"(?m)^[\s>#*`-]*BASE:[ \t`]*{re.escape(pid)}[ \t`]+(?i:AT)[ \t`]+"
+                             r"([0-9a-fA-F]{7,40})\b")
+        later = []
+        for sid, lsha, *_ in info:
+            named = base_re.findall((self.reports / f"{sid}.md").read_text(encoding="utf-8", errors="replace"))
+            if any(not conveyor.sha_matches(sha, n.lower()) for n in named):
+                raise Refuse(f"{sid}: BASE {pid} is not {pid}'s COMMIT {sha[:12]}")
+            if named:
+                later.append((sid, lsha))
+        if not later:
+            raise Refuse(f"{pid}: partial, but no reviewed report names BASE: {pid} AT {sha[:12]}")
+        for sid, lsha in later:
+            if not self.is_ancestor(sha, lsha):
+                raise Refuse(f"{sid}: {lsha[:12]} does not build on {pid} {sha[:12]}")
+        return pid, sha, self.changed(sha), self.is_codex(text, sha), later[0][0]
 
     def next_id(self, rx, prefix, ids):
         nums = [int(m.group(1)) for x in ids if (m := rx.match(x))]
@@ -125,10 +180,15 @@ class Gen:
                 nums += [int(m.group(1)) for f in os.listdir(d) if (m := rx.match(f))]
         return f"{prefix}{max(nums, default=0) + 1}"
 
-    def review(self, sids):
-        if not sids or len(set(sids)) != len(sids):
+    def review(self, sids, partials=()):
+        if not sids or len({*sids, *partials}) != len(sids) + len(partials):
             raise Refuse("name each slice once")
         info = [(sid, *self.slice_info(sid)) for sid in sids]
+        tags = {}
+        for pid in partials:
+            pid, sha, files, codex, later = self.partial_info(pid, info)
+            info.insert(0, (pid, sha, files, codex))
+            tags[pid] = f" [partial, finished by {later}]"
         writers = {codex for *_, codex in info}
         if len(writers) != 1:
             raise Refuse("mixed writers (Codex and Claude): review them separately")
@@ -137,8 +197,10 @@ class Gen:
         codex = writers.pop()
         rid = self.next_id(REVIEW_NUM, "CLREV" if codex else "CDXINT", ids)
         names = " + ".join(sids)
-        scope = "; ".join(f"{sid} {sha} ({', '.join(files)})" for sid, sha, files, _ in info)
+        scope = "; ".join(f"{sid} {sha} ({', '.join(files)}){tags.get(sid, '')}" for sid, sha, files, _ in info)
         main = self.git("rev-parse", "refs/heads/main").strip()
+        if tags:
+            scope += f"; review as one diff main..{info[-1][1][:12]}"
         if codex:
             title = f"Claude inceleme: Codex işi {names}"
             body = (
@@ -327,13 +389,16 @@ def main(argv=None, git=real_git, out=print):
     for name in ("review", "int"):
         p = sub.add_parser(name)
         p.add_argument("ids", nargs="+")
+        if name == "review":
+            p.add_argument("--with-partial", action="append", default=[], metavar="ID",
+                           help="a BLOCKED partial predecessor a reviewed slice names as BASE")
         m = p.add_mutually_exclusive_group()
         m.add_argument("--write", action="store_true", help="write the prompt and the backlog entry")
         m.add_argument("--dry-run", action="store_true", help="print only (the default)")
     a = ap.parse_args(argv)
     g = Gen(a.root, git=git, out=out)
     try:
-        made = g.review(a.ids) if a.cmd == "review" else g.integration(a.ids)
+        made = g.review(a.ids, a.with_partial) if a.cmd == "review" else g.integration(a.ids)
         return g.emit(*made, a.write)
     except (Refuse, OSError) as e:
         out(f"REFUSED: {e}")

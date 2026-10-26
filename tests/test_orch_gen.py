@@ -146,6 +146,79 @@ class OrchGenTest(unittest.TestCase):
         self.assert_lints("INT1")
         self.assertEqual([s["id"] for s in self.backlog()["slices"]], ["CDXINT1", "CLREV2", "INT1"])
 
+    def assert_review(self, ok, why, *argv):
+        rc, out = self.run_gen("review", *argv)
+        self.assertEqual(rc, 0 if ok else 2, out)
+        self.assertIn(why, out)
+        return out
+
+    def test_files_separators_annotations_and_own_report(self):
+        both = f"Scope: PMA {self.sha_a} (jarvis/foo.py, tests/test_foo_extra.py)"
+        for files in ("jarvis/foo.py\n  - tests/test_foo_extra.py (new)\nRUNS: tests.test_foo 3 tests",
+                      "jarvis/foo.py (PM10 section: CHECK_ALLOWLIST, Refusal; validate), "
+                      "tests/test_foo_extra.py (new, 13 tests)",
+                      "jarvis/foo.py (a (b, c); d); tests/test_foo_extra.py",
+                      "build/reports/PMA.md, jarvis/foo.py, tests/test_foo_extra.py"):
+            with self.subTest(files):
+                self.report("PMA", self.sha_a, files)
+                self.assert_review(True, both, "PMA")
+        for files, why in (("jarvis/foo.py (unbalanced", "not changed by"),
+                           ("jarvis/foo.py\n  - jarvis/other.py (new)", "jarvis/other.py"),
+                           ("jarvis/foo.py\n  jarvis/other.py: new helper", "jarvis/other.py"),
+                           ("jarvis/foo.py\n  Note: x\n  jarvis/other.py", "Note"),
+                           ("build/reports/PMA.md", "no FILES"),
+                           ("jarvis/foo.py, build/reports/PMAFIX.md", "build/reports/PMAFIX.md")):
+            with self.subTest(files):
+                self.report("PMA", self.sha_a, files)
+                self.assert_review(False, why, "PMA")
+
+    def test_jules_report_without_files_uses_the_commit(self):
+        head = f"STATUS: PASS\nCOMMIT: {self.sha_a}\nBRANCH: jules/PMA\n"
+        self.put("build/reports/PMA.md", head + "Worker: jules (its own claims untrusted)\n")
+        self.assert_review(True, f"Scope: PMA {self.sha_a} (jarvis/foo.py, tests/test_foo_extra.py)", "PMA")
+        for text, why in ((head + "Worker: jules\nFILES:\n", "no FILES"),
+                          (head, "no FILES"),
+                          (head.replace("jules/PMA", "lane/PMA") + "Worker: jules\n", "no FILES"),
+                          (head + "Worker: jules\nWorker: codex\n", "both the Jules and the Codex")):
+            with self.subTest(why):
+                self.put("build/reports/PMA.md", text)
+                self.assert_review(False, why, "PMA")
+
+    def test_with_partial_predecessor(self):
+        def setup(status="BLOCKED (partial: fix list 1-3 done; 4 open)", base=None):
+            self.report("PMA", self.sha_a, "jarvis/foo.py", status=status, extra="Worker: codex\n")
+            self.report("PMAFIX", self.sha_b, "jarvis/foo.py", extra=base if base is not None
+                        else f"BASE: PMA AT {self.sha_a}\n")
+        setup()
+        out = self.assert_review(True, "@jarvis lane=CLREV1 ", "PMAFIX", "--with-partial", "PMA")
+        self.assertIn(f"PMA {self.sha_a} (jarvis/foo.py, tests/test_foo_extra.py) [partial, finished by PMAFIX];"
+                      f" PMAFIX {self.sha_b} (jarvis/foo.py); review as one diff main..{self.sha_b[:12]}", out)
+        cases = (
+            ({"base": f"BASE: PMB AT {self.sha_a}\n"}, "no reviewed report names BASE: PMA"),
+            ({"base": f"BASE: PMA AT {self.sha_b}\n"}, "is not PMA's COMMIT"),
+            ({"base": ""}, "no reviewed report names BASE: PMA"),
+            ({"status": "PASS"}, "not BLOCKED (partial"),
+            ({"status": "BLOCKED"}, "not BLOCKED (partial"),
+            ({"status": "BLOCKED (not partial: nothing usable)"}, "not BLOCKED (partial"),
+        )
+        for kw, why in cases:
+            with self.subTest(why, **kw):
+                setup(**kw)
+                self.assert_review(False, why, "PMAFIX", "--with-partial", "PMA")
+        setup()
+        # "partial" only in a title line, not the STATUS line conveyor.report_status reads
+        self.put("build/reports/PMA.md", f"# PMA (prior STATUS: partial)\nSTATUS: BLOCKED\nCOMMIT: {self.sha_a}\n"
+                 "FILES: jarvis/foo.py\nWorker: codex\n")
+        self.assert_review(False, "not BLOCKED (partial", "PMAFIX", "--with-partial", "PMA")
+        setup()
+        self.assert_review(False, "report STATUS is BLOCKED, not PASS", "PMAFIX", "PMA")
+        self.assert_review(False, "name each slice once", "PMAFIX", "PMA", "--with-partial", "PMA")
+        # roles swapped: the later slice is the ancestor, so it does not build on the partial
+        self.report("PMAFIX", self.sha_b, "jarvis/foo.py", status="BLOCKED (partial)", extra="Worker: codex\n")
+        self.report("PMA", self.sha_a, "jarvis/foo.py", extra=f"Worker: codex\nBASE: PMAFIX AT {self.sha_b}\n")
+        self.assert_review(False, "does not build on PMAFIX", "PMA", "--with-partial", "PMAFIX")
+        self.assertEqual(self.backlog()["slices"], [])
+
     def test_ui_files_add_test_ui(self):
         g = orch_gen.Gen(self.root)
         self.assertEqual(g.test_groups(["jarvis/foo.py"]), [["tests.test_foo"]])
