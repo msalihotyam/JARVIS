@@ -8,10 +8,11 @@ Expiry is an explicit UTC Unix timestamp; no clock or environment is consulted.
 """
 
 from dataclasses import asdict, dataclass, fields
-import fnmatch
 import hashlib
 import json
 import re
+import unicodedata
+from urllib.parse import unquote
 
 
 class PlanSchemaError(ValueError):
@@ -255,34 +256,21 @@ def classify(brief_facts, plan):
 #: a prefix may only be dotted test ids, never flags, paths or shell syntax.
 CHECK_ALLOWLIST = (("python", "-m", "unittest"),)
 _CHECK_ARG = re.compile(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*")
-#: Glob segments are judged per segment ("*" and "?" never cross "/", no
-#: dotfile exception) after Win32 folding. Only "*" is checked exactly against
-#: every protected, self-target, device and 8.3 short-name predicate; "?" (it
-#: can spell a Win32-stripped trailing "." or " ", CDXINT93 A1), "[", "]", "{",
-#: "}" and "!" are never proven safe and are refused outright (fail closed).
-#: A literal trailing "." or whitespace is already path_escape, so "*" can only
-#: reach such an alias at a segment end, where it is always refused.
+#: RULE A (PM10FIX3): a target is a literal path. Any glob metacharacter, also
+#: URL-encoded ("%2A") or as an NFKC lookalike (U+FF0A), is refused as "glob";
+#: no glob is ever matched against protected or self-target names.
 _GLOB = re.compile(r"[*?\[\]{}!]")
-_UNPROVABLE = re.compile(r"[?\[\]{}!]")
 _DEVICES = re.compile(r"(con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]"
                       r"|lpt[0-9¹²³])\s*(\..*)?")
-_DEVICE_NAMES = ("con", "prn", "aux", "nul", "conin$", "conout$") + tuple(
-    p + d for p in ("com", "lpt") for d in "0123456789¹²³")
 _PROTECTED_SUFFIXES = (
     ".key", ".pem", ".crt", ".cer", ".der", ".p12", ".pfx", ".jks", ".keystore",
-    ".kdbx", ".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3",
-    ".sqlite-wal", ".sqlite-shm", ".sqlite-journal", ".sqlite3-wal",
-    ".sqlite3-shm", ".sqlite3-journal")
+    ".kdbx", ".db", ".sqlite", ".sqlite3")
+#: SQLite sidecars: -wal, -shm, -journal and the -mjXXXX super-journal.
+_SIDECAR = re.compile(r"\.(db|sqlite3?)-")
 #: Also the I3 repo/agent-config set, so a plan cannot even declare them.
-_PROTECTED_NAMES = (".jarvis", ".git", ".claude", ".codex", ".github",
+_PROTECTED_NAMES = (".jarvis", ".git", ".claude", ".codex", ".github", ".ssh",
                     "agents.md", "claude.md")
 _KEY_PREFIXES = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
-#: 8.3 short names a "*" can match (FindFirstFile also matches them): dot names
-#: become NAME~N, ".env*" any ENV..., and extensions are cut to three letters;
-#: after collisions NTFS hashes them to two letters + four hex + ~N.
-_SHORT_PREFIXES = tuple(n[1:7] + "~" for n in _PROTECTED_NAMES
-                        if n.startswith(".")) + ("env",)
-_SHORT_SUFFIXES = tuple({s[:4] for s in _PROTECTED_SUFFIXES})
 #: I12 name heuristics inside the JARVIS repo; over-matching fails closed.
 _SELF_WORDS = ("policy", "approval", "auth", "gate", "credential", "redact",
                "secret", "push", "release", "schema")
@@ -290,7 +278,8 @@ _SELF_WORDS = ("policy", "approval", "auth", "gate", "credential", "redact",
 _SELF_FILES = ("jarvis/memory.py", "jarvis/contracts.py", "jarvis/memory_filter.py",
                "jarvis/settings.py", "jarvis/gmail_cli.py", "jarvis/app.py",
                "jarvis/work_plan.py", "jarvis/trusted_exec.py",
-               "jarvis/owned_process.py", "jarvis/memory_guard.py")
+               "jarvis/owned_process.py", "jarvis/memory_guard.py",
+               "jarvis/__init__.py")
 
 
 @dataclass(frozen=True)
@@ -305,105 +294,51 @@ def _protected(lowered):
     return (parts[0] == "data"
             or any(p.startswith(".env") or p in _PROTECTED_NAMES
                    or p.startswith(_KEY_PREFIXES)
-                   or p.endswith(_PROTECTED_SUFFIXES) for p in parts))
+                   or p.endswith(_PROTECTED_SUFFIXES) or _SIDECAR.search(p)
+                   for p in parts))
 
 
 def _self_target(lowered):
     parts = lowered.split("/")
-    return (parts[0] in ("scripts", ".claude") or lowered in _SELF_FILES
+    # A same-named package dir, .pyd/.pyc or __pycache__ entry shadows the .py.
+    return (parts[0] in ("scripts", ".claude") or "__pycache__" in parts
+            or any(lowered == f[:-3] or lowered.startswith((f[:-3] + "/", f[:-3] + "."))
+                   for f in _SELF_FILES)
             or any(w in p for p in parts for w in _SELF_WORDS))
 
 
-# Exact tests for a segment glob of literals, "?" and "*" only.
-def _fits(glob, text):
-    return len(glob) == len(text) and all(g in ("?", t) for g, t in zip(glob, text))
-
-
-def _may_start(glob, prefix):
-    head, star, _ = glob.partition("*")
-    n = min(len(head), len(prefix)) if star else len(prefix)
-    return len(head) >= n and _fits(head[:n], prefix[:n])
-
-
-def _may_end(glob, suffix):
-    return _may_start(glob[::-1], suffix[::-1])
-
-
-def _may_contain(glob, word):
-    return "*" in glob or any(_fits(glob[i:i + len(word)], word)
-                              for i in range(len(glob) - len(word) + 1))
-
-
-def _glob_protected(part, index):
-    return (any(_may_start(part, p) for p in
-                (".env", *_KEY_PREFIXES, *_SHORT_PREFIXES))
-            or any(_may_start(part, p[:2]) and "*" in part[:7]
-                   for p in _SHORT_PREFIXES)
-            or any(fnmatch.fnmatchcase(n, part) for n in
-                   _PROTECTED_NAMES + (("data",) if index == 0 else ()))
-            or any(_may_end(part, s) for s in
-                   _PROTECTED_SUFFIXES + _SHORT_SUFFIXES))
-
-
-# Win32 maps a device name plus any whitespace and/or extension to the device.
-def _glob_device(part):
-    return any(_may_start(part, d) and (
-        len(part) == len(d) or "*" in part[:len(d) + 1]
-        or part[len(d)] in ".?" or part[len(d)].isspace()) for d in _DEVICE_NAMES)
-
-
-def _glob_self(part, index):
-    return ((index == 0 and any(fnmatch.fnmatchcase(n, part)
-                                for n in ("scripts", ".claude")))
-            or any(_may_contain(part, w) for w in _SELF_WORDS))
-
-
 def _target_refusal(target, jarvis_repo):
+    # Category C: control, format (zero-width joiners git may ignore), unassigned.
     if (type(target) is not str or not target
-            or any(ord(c) < 32 or ord(c) == 127 for c in target)):
+            or any(unicodedata.category(c)[0] == "C" for c in target)):
         return Refusal("path_escape", repr(target))
+    canonical = unicodedata.normalize("NFKC", unquote(target))
+    if _GLOB.search(target) or _GLOB.search(canonical):
+        return Refusal("glob", target)
     path = target.replace("\\", "/")
+    subtree = path.endswith("/")
+    if subtree:
+        path = path[:-1]
+    if path in ("", "."):
+        return Refusal("repo_root", target)
     parts = path.split("/")
     # < > " are FindFirstFile DOS wildcards (CDXINT93 F2); | is invalid on Win32.
     if (path.startswith(("/", "~")) or any(c in ':~<>"|' for c in path)
             or any(p in ("", ".", "..") or p.endswith(".") or p[-1].isspace()
+                   or p[0].isspace()
                    or _DEVICES.fullmatch(p.upper().lower()) for p in parts)):
         return Refusal("path_escape", target)
     # upper().lower() also folds "ı"/"ſ"/Kelvin sign that NTFS may upcase.
     lowered = path.upper().lower()
-    unprovable = False
-    for index, part in enumerate(lowered.split("/")):
-        if not _GLOB.search(part):
-            continue
-        if _UNPROVABLE.search(part):
-            if (any(fnmatch.fnmatchcase(probe, part) for probe in ("..", "."))
-                    or _glob_device(part)):
-                return Refusal("path_escape", target)
-            if jarvis_repo and _glob_self(part, index):
-                return Refusal("self_target", target)
-            unprovable = True
-        elif jarvis_repo and _glob_self(part, index):
-            return Refusal("self_target", target)
-        elif _glob_protected(part, index):
-            return Refusal("protected_path", target)
-        elif (any(fnmatch.fnmatchcase(probe, part) for probe in ("..", "."))
-              or _glob_device(part)):
-            return Refusal("path_escape", target)
-    if _GLOB.search(lowered):
-        if any(fnmatch.fnmatchcase(p, lowered) for p in ("data", "data/x")):
-            return Refusal("protected_path", target)
-        if jarvis_repo and any(fnmatch.fnmatchcase(p, lowered) for p in
-                               _SELF_FILES + ("scripts/x", ".claude/x")):
-            return Refusal("self_target", target)
-    if unprovable:
-        plain = _UNPROVABLE.sub("", lowered)
-        if jarvis_repo and _self_target(plain) and not _protected(plain):
-            return Refusal("self_target", target)
-        return Refusal("protected_path", target)
     if _protected(lowered):
         return Refusal("protected_path", target)
-    if jarvis_repo and _self_target(lowered):
+    # The pure validator cannot see a folder's files, so in the JARVIS repo
+    # every subtree may contain a self-target and is refused (fail closed).
+    if jarvis_repo and (subtree or _self_target(lowered)):
         return Refusal("self_target", target)
+    # %XX escapes and NFKC lookalikes ("．．", fullwidth letters) are not literal.
+    if canonical != target:
+        return Refusal("path_escape", target)
     return None
 
 
@@ -412,10 +347,10 @@ def validate(plan, project_root, *, jarvis_repo):
 
     project_root is the root the caller resolved for this plan and must name
     the same root as plan.project_root. jarvis_repo must be an explicit bool;
-    True adds the I12 self-target set. Targets are relative to the root, in
-    POSIX or Windows form; anything absolute, escaping, device-like, any glob
-    that could match a protected or self-target name, any "[]{}!" glob, or
-    otherwise unrecognised is refused (fail closed).
+    True adds the I12 self-target set. Targets are literal paths relative to
+    the root, in POSIX or Windows form; any glob, the root itself, anything
+    absolute, escaping, device-like or otherwise unrecognised is refused (fail
+    closed). A folder target (trailing / or \\) is a subtree scope, see scope().
     """
     if type(plan) is not Plan:
         return [Refusal("unknown_plan", type(plan).__name__)]
@@ -458,3 +393,17 @@ def validate(plan, project_root, *, jarvis_repo):
     if max(plan.child_count, len(plan.slices)) > 5:
         refusals.append(Refusal("too_many_children", str(plan.child_count)))
     return refusals
+
+
+def scope(plan, project_root, *, jarvis_repo):
+    """Return {target: "file" | "subtree"} when validate() passes, else None.
+
+    A "subtree" target is a scope, not a file: the PM15 diff scope gate must
+    check every real changed file under it one by one.
+    """
+    if validate(plan, project_root, jarvis_repo=jarvis_repo):
+        return None
+    targets = list(plan.targets)
+    for item in plan.slices:
+        targets.extend(item.targets)
+    return {t: "subtree" if t.endswith(("/", "\\")) else "file" for t in targets}
