@@ -255,12 +255,21 @@ def classify(brief_facts, plan):
 #: a prefix may only be dotted test ids, never flags, paths or shell syntax.
 CHECK_ALLOWLIST = (("python", "-m", "unittest"),)
 _CHECK_ARG = re.compile(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*")
-_GLOB = re.compile(r"[*?\[\]{}]")
+#: Glob segments are judged per segment ("*" and "?" never cross "/", no
+#: dotfile exception). "*"/"?" are checked exactly against every protected and
+#: self-target predicate; "[", "]", "{", "}" and "!" are never proven safe and
+#: are refused outright (fail closed).
+_GLOB = re.compile(r"[*?\[\]{}!]")
+_UNPROVABLE = re.compile(r"[\[\]{}!]")
 _DEVICES = re.compile(r"(con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]"
-                      r"|lpt[0-9¹²³])(\..*)?")
+                      r"|lpt[0-9¹²³])\s*(\..*)?")
+_DEVICE_NAMES = ("con", "prn", "aux", "nul", "conin$", "conout$") + tuple(
+    p + d for p in ("com", "lpt") for d in "0123456789¹²³")
 _PROTECTED_SUFFIXES = (
     ".key", ".pem", ".crt", ".cer", ".der", ".p12", ".pfx", ".jks", ".keystore",
-    ".kdbx", ".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3")
+    ".kdbx", ".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3",
+    ".sqlite-wal", ".sqlite-shm", ".sqlite-journal", ".sqlite3-wal",
+    ".sqlite3-shm", ".sqlite3-journal")
 #: Also the I3 repo/agent-config set, so a plan cannot even declare them.
 _PROTECTED_NAMES = (".jarvis", ".git", ".claude", ".codex", ".github",
                     "agents.md", "claude.md")
@@ -270,11 +279,9 @@ _SELF_WORDS = ("policy", "approval", "auth", "gate", "credential", "redact",
                "secret", "push", "release", "schema")
 #: Known credential/redaction/authority code the name heuristic misses.
 _SELF_FILES = ("jarvis/memory.py", "jarvis/contracts.py", "jarvis/memory_filter.py",
-               "jarvis/settings.py", "jarvis/gmail_cli.py", "jarvis/app.py")
-#: Single-segment names a glob segment must not be able to match.
-_PROTECTED_PROBES = (".env", ".env.local", *_PROTECTED_NAMES, *_KEY_PREFIXES,
-                     *(f"x{s}" for s in _PROTECTED_SUFFIXES))
-_SELF_PROBES = ("memory.py", *_SELF_WORDS, *(f"{w}.py" for w in _SELF_WORDS))
+               "jarvis/settings.py", "jarvis/gmail_cli.py", "jarvis/app.py",
+               "jarvis/work_plan.py", "jarvis/trusted_exec.py",
+               "jarvis/owned_process.py", "jarvis/memory_guard.py")
 
 
 @dataclass(frozen=True)
@@ -298,6 +305,39 @@ def _self_target(lowered):
             or any(w in p for p in parts for w in _SELF_WORDS))
 
 
+# Exact tests for a segment glob of literals, "?" and "*" only.
+def _fits(glob, text):
+    return len(glob) == len(text) and all(g in ("?", t) for g, t in zip(glob, text))
+
+
+def _may_start(glob, prefix):
+    head, star, _ = glob.partition("*")
+    n = min(len(head), len(prefix)) if star else len(prefix)
+    return len(head) >= n and _fits(head[:n], prefix[:n])
+
+
+def _may_end(glob, suffix):
+    return _may_start(glob[::-1], suffix[::-1])
+
+
+def _may_contain(glob, word):
+    return "*" in glob or any(_fits(glob[i:i + len(word)], word)
+                              for i in range(len(glob) - len(word) + 1))
+
+
+def _glob_protected(part, index):
+    return (any(_may_start(part, p) for p in (".env", *_KEY_PREFIXES))
+            or any(fnmatch.fnmatchcase(n, part) for n in
+                   _PROTECTED_NAMES + (("data",) if index == 0 else ()))
+            or any(_may_end(part, s) for s in _PROTECTED_SUFFIXES))
+
+
+def _glob_self(part, index):
+    return ((index == 0 and any(fnmatch.fnmatchcase(n, part)
+                                for n in ("scripts", ".claude")))
+            or any(_may_contain(part, w) for w in _SELF_WORDS))
+
+
 def _target_refusal(target, jarvis_repo):
     if (type(target) is not str or not target
             or any(ord(c) < 32 or ord(c) == 127 for c in target)):
@@ -309,23 +349,33 @@ def _target_refusal(target, jarvis_repo):
                    or _DEVICES.fullmatch(p.lower()) for p in parts)):
         return Refusal("path_escape", target)
     lowered = path.lower()
+    unprovable = False
     for index, part in enumerate(lowered.split("/")):
         if not _GLOB.search(part):
             continue
-        if any(fnmatch.fnmatchcase(probe, part) for probe in
-               _PROTECTED_PROBES + (("data",) if index == 0 else ())):
-            return Refusal("protected_path", target)
-        if any(fnmatch.fnmatchcase(probe, part) for probe in ("..", ".")):
-            return Refusal("path_escape", target)
-        if jarvis_repo and any(fnmatch.fnmatchcase(probe, part) for probe in
-                               _SELF_PROBES + (("scripts",) if index == 0 else ())):
+        if _UNPROVABLE.search(part):
+            if any(fnmatch.fnmatchcase(probe, part) for probe in ("..", ".")):
+                return Refusal("path_escape", target)
+            unprovable = True
+        elif jarvis_repo and _glob_self(part, index):
             return Refusal("self_target", target)
+        elif _glob_protected(part, index):
+            return Refusal("protected_path", target)
+        elif (any(fnmatch.fnmatchcase(probe, part) for probe in ("..", "."))
+              or any(_fits(part, d) or _may_start(part, d + ".")
+                     or _may_start(part, d + " ") for d in _DEVICE_NAMES)):
+            return Refusal("path_escape", target)
     if _GLOB.search(lowered):
         if any(fnmatch.fnmatchcase(p, lowered) for p in ("data", "data/x")):
             return Refusal("protected_path", target)
         if jarvis_repo and any(fnmatch.fnmatchcase(p, lowered) for p in
                                _SELF_FILES + ("scripts/x", ".claude/x")):
             return Refusal("self_target", target)
+    if unprovable:
+        plain = _UNPROVABLE.sub("", lowered)
+        if jarvis_repo and _self_target(plain) and not _protected(plain):
+            return Refusal("self_target", target)
+        return Refusal("protected_path", target)
     if _protected(lowered):
         return Refusal("protected_path", target)
     if jarvis_repo and _self_target(lowered):
@@ -339,8 +389,9 @@ def validate(plan, project_root, *, jarvis_repo):
     project_root is the root the caller resolved for this plan and must name
     the same root as plan.project_root. jarvis_repo must be an explicit bool;
     True adds the I12 self-target set. Targets are relative to the root, in
-    POSIX or Windows form; anything absolute, escaping, device-like, globbing
-    onto a protected name, or otherwise unrecognised is refused (fail closed).
+    POSIX or Windows form; anything absolute, escaping, device-like, any glob
+    that could match a protected or self-target name, any "[]{}!" glob, or
+    otherwise unrecognised is refused (fail closed).
     """
     if type(plan) is not Plan:
         return [Refusal("unknown_plan", type(plan).__name__)]

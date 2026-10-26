@@ -64,13 +64,38 @@ class ValidateTests(unittest.TestCase):
                        "jarvis/credentials.py", "tools/push_main.ps1",
                        "jarvis/*.py", "scripts", "*.py", "jarvis/[pm]*",
                        "jar*/memory.py", "j?rvis/memory.py", "[j]arvis/memory.py",
-                       "jarvis/contracts.py", "jarvis/memory_filter.py"):
+                       "jarvis/contracts.py", "jarvis/memory_filter.py",
+                       "jarvis/work_plan.py", "jarvis/trusted_exec.py",
+                       "jarvis/owned_process.py", "jarvis/memory_guard.py"):
             self.assertEqual(["self_target"],
                              codes(with_targets(target), jarvis_repo=True), target)
-            if "*" not in target:
+            if not set("*[") & set(target):
                 self.assertEqual([], codes(with_targets(target)), target)
-        self.assertEqual([], codes(with_targets("jarvis/work_plan.py"),
+        self.assertEqual([], codes(with_targets("jarvis/work_classify.py"),
                                    jarvis_repo=True))
+
+    def test_globs_cannot_reach_protected_names(self):
+        # CDXINT91: globs were matched against fixed probe names only.
+        for target in ("src/.en[v].production", "db/customer.d[b]",
+                       "src/customer.d?", "src/.en?.production",
+                       "src/.e*v.production", "src/{a}.py", "src/a!.py",
+                       "SRC\\.EN[V]", "src/.en[!x]", "keys/id_r?a",
+                       "store.sqlite3-wal", "x.sqlite-shm", "a.sqlite3-journal",
+                       "src/**/*.py", "src/*.py"):
+            self.assertEqual(["protected_path"], codes(with_targets(target)),
+                             target)
+
+    def test_globs_cannot_reach_self_targets(self):
+        for target in ("jarvis/polic[y]_engine.py", "jarvis/polic?_engine.py",
+                       "jarvis/pol*cy_x.py", "jarvis/{policy}.py",
+                       "jarvis/aut?.py"):
+            self.assertEqual(["self_target"],
+                             codes(with_targets(target), jarvis_repo=True), target)
+
+    def test_device_name_with_trailing_space(self):
+        for target in ("NUL .txt", "a/con  .py", "nu?", "src/co?.txt", "lpt?",
+                       "?ux", "conin?", "co? .x"):
+            self.assertEqual(["path_escape"], codes(with_targets(target)), target)
 
     def test_slice_targets_are_checked(self):
         data = example()
@@ -108,18 +133,18 @@ class ValidateTests(unittest.TestCase):
         data["slices"] = [dict(data["slices"][0], slice_id=f"s{i}")
                           for i in range(6)]
         data["child_count"] = 1
-        try:
-            many = Plan.from_dict(data)
-        except Exception:
-            return  # schema already refuses the mismatch
-        self.assertIn("too_many_children", codes(many))
+        self.assertEqual(["too_many_children"], codes(Plan.from_dict(data)))
+        data["slices"] = data["slices"][:5]
+        data["child_count"] = 5
+        self.assertEqual([], codes(Plan.from_dict(data)))
 
     def test_near_misses_pass(self):
         self.assertEqual([], codes(plan(child_count=5)))
         for target in ("src/metadata/x.py", "mydata/file.txt", "data_tools.py",
                        "src/data/x.py", "environment.py", "src\\pkg\\a.py",
-                       "docs/keys.md", "src/*.py", "tests/test_*.py",
-                       "a.dbx", "monkey.py"):
+                       "docs/keys.md", "tests/test_*.py", "src/app_*.py",
+                       "src/pkg/mod_?.py", "docs/guide*.md", "a.dbx",
+                       "monkey.py", "store.sqlite3.bak.txt"):
             self.assertEqual([], codes(with_targets(target)), target)
         data = example()
         data["checks"][0]["argv"] = ["python", "-m", "unittest",
