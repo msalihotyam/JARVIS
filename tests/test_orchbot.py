@@ -175,7 +175,7 @@ class ConvsafeTest(BotCase):
                       ["JARVIS_ACTIVE_STATE.md"]):
             self.assertIsNotNone(orchbot.protected(files), files)
 
-    def integration(self, picks, **reports):  # BOTREPLAY2: an INT report has PICKS, no FILES line
+    def integration(self, picks, auto="auto_approve_refused", **reports):  # BOTREPLAY2: PICKS, no FILES
         self.put("build/conveyor/lanes.json", {"INT9": {"files": [], "ci": {"cand": True}}})
         self.put("build/reports/INT9.md", "STATUS: CI_PENDING\nCI BRANCH: ci/int9\n\nPICKS (a -> b):\n"
                  + "".join(f"  {p}\n" if p else "\n" for p in picks) + "LOCAL TESTS: ok\n")
@@ -183,7 +183,19 @@ class ConvsafeTest(BotCase):
             self.put(f"build/reports/{lane}.md", text)
         self.events({"ts": "2026-10-15T11:00:00", "event": "ci_result", "lane": "INT9", "sha": SHA,
                      "result": "success"})
+        if auto:  # BOTFIX3C: no file list waits for the conveyor's own verdict
+            self.events({"ts": "2026-10-15T11:01:00", "event": auto, "lane": "INT9",
+                         "approval": f"push-{SHA}-INT9", "reason": "protected path"})
         return self.acts(self.run_bot())
+
+    def test_no_file_list_waits_for_the_conveyor_auto_approve(self):
+        self.assertEqual(self.integration(["INT9 fix (new) -> 816d1a1"], auto=None), [])
+        self.events({"ts": "2026-10-15T11:02:00", "event": "auto_approve", "lane": "INT9",
+                     "approval": f"push-{'0' * 40}-INT9"})  # another sha: still waiting
+        self.assertEqual(self.acts(self.run_bot()), [])
+        self.events({"ts": "2026-10-15T11:03:00", "event": "auto_approve", "lane": "INT9",
+                     "approval": f"push-{SHA}-INT9"})
+        self.assertEqual(self.acts(self.run_bot()), [("write_key1", "O26", "INT9")])
 
     def test_integration_picks_with_files_write_key1(self):
         self.assertEqual(self.integration(["e3fc068 -> a89b825 DFTONE", "DFQUEUE 86a603f -> 04b050d"],
@@ -302,7 +314,10 @@ class StateRulesTest(BotCase):
         self.put("build/conveyor/status.json", {"attention": [
             {"id": i, "reason": r, "since": old} for i, r in (unmerged | proven).items()]})
         keep = [("none", "KEEP-UNMERGED", i) for i in unmerged]
-        self.assertEqual(self.acts(self.run_bot()), keep + [("ack", "O33", i) for i in proven])
+        # DECISION Salih 2026-10-26: once KEEP-UNMERGED is logged the bot may ack it (branch preserved)
+        self.assertEqual(self.acts(self.run_bot()),
+                         [a for i in unmerged for a in (("none", "KEEP-UNMERGED", i), ("ack", "O33", i))]
+                         + [("ack", "O33", i) for i in proven])
         self.clock.set("2026-10-15T23:59:00")
         self.assertEqual(self.run_bot(), [])
         self.assertFalse(any((self.conv / "ack" / orchbot.cv.ack_name(i)).exists() for i in unmerged))
@@ -617,7 +632,7 @@ class AgreementTest(BotCase):
         for days, agree, total, ready in ((6, 10, 10, False), (7, 9, 9, False), (7, 9, 10, False),
                                           (7, 10, 10, True)):
             with self.subTest(days=days, agree=agree, total=total):
-                self.seed({"version": 2, "start": now - days * 86400, "key1": {"agree": agree, "total": total}})
+                self.seed({"version": orchbot.AGREE_VERSION, "start": now - days * 86400, "key1": {"agree": agree, "total": total}})
                 self.assertEqual(self.run_bot(), [])
                 g = self.shadow()["agreement"]["graduation"]
                 self.assertEqual(g, {"days": days, "pushes": total, "agree_pct": round(100 * agree / total, 1),
@@ -637,7 +652,7 @@ class AgreementTest(BotCase):
         for days, ack, ready in ((7, cls["ack"], True), (6, cls["ack"], False), (7, {"agree": 26, "missed": 3}, False),
                                  (7, {"agree": 26, "disagree": 4}, False)):
             with self.subTest(days=days, ack=ack):
-                self.seed({"version": 2, "start": now - days * 86400, "classes": dict(cls, ack=ack)})
+                self.seed({"version": orchbot.AGREE_VERSION, "start": now - days * 86400, "classes": dict(cls, ack=ack)})
                 self.run_bot()
                 self.assertIs(self.shadow()["agreement"]["graduation"]["stage_a"], ready)
 
@@ -648,7 +663,7 @@ class AgreementTest(BotCase):
                 ds = self.run_bot()
                 self.assertEqual(self.acts(ds), [("none", "VERSION", "shadow.json agreement")])
                 ag = self.shadow()["agreement"]
-                self.assertEqual((ag["version"], ag["key1"]), (2, {"agree": 0, "total": 0}))
+                self.assertEqual((ag["version"], ag["key1"]), (orchbot.AGREE_VERSION, {"agree": 0, "total": 0}))
 
     def key1_after(self, text):
         self.approve("2026-10-15T11:30:00", text)
@@ -1395,14 +1410,14 @@ class LiveTest(BotCase):
         self.assertFalse(self.ack().exists())
         self.assertEqual([r["target"] for r in self.recs(ds)], ["asks"])
 
-    def test_ack_live_respects_keep_unmerged(self):
+    def test_ack_live_acks_only_after_keep_unmerged(self):
         self.live(ack=True)
         iid = "cleanup:MDREAD"
         self.attention("2026-10-15T11:30:00", iid, "cleanup refused (worktree-mdread has commits not on main "
                                                    "(first abc1234)); retried after x")
         ds = self.run_bot()
-        self.assertEqual(self.acts(ds), [("none", "KEEP-UNMERGED", iid)])
-        self.assertFalse(self.ack(iid).exists())
+        self.assertEqual((ds[0]["rule"], {d["rule"] for d in ds[1:]}), ("KEEP-UNMERGED", {"O33"}))
+        self.assertTrue(self.ack(iid).exists())
 
     def test_asks_live_marks_them_for_the_pano_and_shadow_does_not(self):
         self.put("build/conveyor/lanes.json", {"INT63": {"files": [".github/workflows/tests.yml"],

@@ -74,7 +74,7 @@ class ReplayTest(unittest.TestCase):
                                   "verdicts"})
         self.assertEqual(s["events"], 5)
         self.assertEqual(s["per_action"]["write_key1"]["agree"], 1)
-        self.assertEqual(s["per_action"]["ack"]["agree"], 1)
+        self.assertEqual(s["per_action"]["ack"]["agree"], 0)  # BOTFIX3C: no attention item -> excluded
         self.assertEqual(s["per_action"]["queue_fix_slice"], {"n": 1, "agree": 0, "disagree": 0, "unmatched": 0,
                                                               "missed": 1})
         for row in s["per_action"].values():

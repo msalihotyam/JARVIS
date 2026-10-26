@@ -72,7 +72,8 @@ TS_FMT = "%Y-%m-%dT%H:%M:%S"
 HEAD_N = 256  # events.jsonl rotation fingerprint: a hash of its first bytes
 MATCH_S = 3600  # BOTAGREE: a decision and an actual action on one target within 60 min are one match
 # BOTFIX3B: an ack / ask / key-1 / fix waits up to a day for the orchestrator; a fix may land 5 min early
-DAY_S, FIX_EARLY_S, AGREE_VERSION = 86400, 300, 2
+DAY_S, FIX_EARLY_S, AGREE_VERSION = 86400, 300, 3
+SWEEP_N = 10  # BOTFIX3C: this many orchestrator acks in one minute are a sweep, not a judgement
 SALIH_RE = re.compile(r"(?i)\bby salih\b|salih onay|chat .*onay|manual key 1")
 PRE_RE = re.compile(r"(?i)under O42|pre-approval")  # pre-approved: not an orchestrator key-1 call
 STAGE_A, STAGE_PCT = {"ack": 30, "ask": 10}, 90  # stage A: ack + ask agree >= 90% on enough samples
@@ -267,6 +268,17 @@ AGREE_SHAPES = {  # shadow.json "agreement"; a present key of another shape rese
 }
 
 
+def routine(iid, reason):
+    """O33: an attention item the bot may ack - a cleanup/preserved item, or every '; ' part routine."""
+    return iid.startswith(("cleanup:", "preserved:")) or \
+        bool(reason and all(ROUTINE_RE.match(p) for p in reason.split("; ")))
+
+
+def rows(*fields):  # a dict of dicts whose `fields` are numbers
+    return lambda v: isinstance(v, dict) and all(isinstance(x, dict) and all(num(x.get(f)) for f in fields)
+                                                 for x in v.values())
+
+
 SHAPES = {  # shadow.json keys; a present key of another shape resets the state (fail closed)
     "decisions": lambda v: isinstance(v, list) and all(isinstance(d, dict) for d in v),
     "counters": lambda v: isinstance(v, dict) and all(num(x) for x in v.values()),
@@ -284,6 +296,10 @@ SHAPES = {  # shadow.json keys; a present key of another shape resets the state 
                                                   for k in ("demoted", "acks"))
     and isinstance(v.get("pause", {}), dict) and isinstance(v.get("pause", {}).get("text", ""), str)
     and num(v.get("pause", {}).get("mtime", 0)) and isinstance(v.get("asks", False), bool),
+    "blocked": lambda v: isinstance(v, dict) and all(num(x) for x in v.values()),
+    "items": rows("since", "seen"),
+    "auto": rows("at"),
+    "waiting": rows("at"),
 }
 
 
@@ -339,7 +355,7 @@ class Bot:
         """One pass; returns the decisions it appended."""
         self.out.mkdir(parents=True, exist_ok=True)
         self.new, self.reports, self.verdicts, self.observed, self.wakes = [], {}, [], [], []
-        self.live = set()
+        self.live, self.attn = set(), None  # attn: ack names on status.json's attention list this pass
         self.st = self.load_state()
         try:
             self.live = self.load_live()
@@ -463,7 +479,8 @@ class Bot:
     def load_state(self):
         blank = {"cursor": None, "decisions": [], "counters": {}, "seen": {}, "history": [],
                  "fixes": {}, "respawns": {}, "head": "", "agreement": agree_blank(),
-                 "asks": {}, "conv_push": {}, "live": {}, "wake": {}}
+                 "asks": {}, "conv_push": {}, "live": {}, "wake": {},
+                 "blocked": {}, "items": {}, "auto": {}, "waiting": {}}
         path = self.out / "shadow.json"
         if not path.exists():
             return blank
@@ -688,6 +705,9 @@ class Bot:
         now = self.now()
         st = self.st
         st["seen"] = {k: v for k, v in st["seen"].items() if v >= now - SEEN_S}
+        st["blocked"] = {k: v for k, v in st["blocked"].items() if v >= now - SEEN_S}
+        for book, f in (("items", "seen"), ("auto", "at"), ("waiting", "at")):
+            st[book] = {k: v for k, v in st[book].items() if v[f] >= now - SEEN_S}
         st["respawns"] = {n: ts for n, ts in st["respawns"].items() if ts and ts[-1] >= now - RESPAWN_S}
         st["history"] = [h for h in st["history"] if h[0] >= now - LOOP_S]
         st["counters"]["passes"] = st["counters"].get("passes", 0) + 1
@@ -1256,11 +1276,22 @@ class Bot:
                 pass
             return sorted(found)
 
-        acks = {}
+        acks, new, minute = {}, [], {}
         for name, _, mt in files(self.conv / "ack"):
             acks[name] = mt
             if mt > known["acks"].get(name, -1) and self.st.get("live", {}).get("acks", {}).get(name) != mt:
-                act(mt, "ack", "ack:" + name.lower(), "orchestrator", f"ack/{name}")
+                new.append((name, mt))
+                minute[int(mt // 60)] = minute.get(int(mt // 60), 0) + 1
+        for name, mt in [] if first else new:
+            # BOTFIX3C: only an ack of a routine item the bot saw counts; a young one pre-empts the bot
+            a, it = {"at": mt, "action": "ack", "key": "ack:" + name.lower(), "side": "orchestrator",
+                     "what": f"ack/{name}"}, self.st["items"].get(name.lower())
+            if minute[int(mt // 60)] >= SWEEP_N or not it or not it.get("routine"):
+                self.verdict("excluded", None, dict(a, what=a["what"] + " (sweep, system or non-routine)"))
+            elif mt - it["since"] < ACK_AGE_S:
+                self.verdict("agree", None, dict(a, what=a["what"] + " (pre-empted)"))
+            else:
+                out.append(a)
         approvals = set()
         for d in (self.root / "build" / "approvals", self.root / "build" / "approvals" / "done"):
             for raw, path, mt in files(d):
@@ -1288,8 +1319,8 @@ class Bot:
         slices = self.backlog.get("slices")
         ids = sorted({str(s.get("id")) for s in slices if isinstance(s, dict) and s.get("id")}) \
             if isinstance(slices, list) else known["backlog"]
-        for i in ids:
-            if i not in known["backlog"]:
+        for i in ids:  # BOTFIX3C: only a new id whose prefix is a lane that finished BLOCKED before it
+            if i not in known["backlog"] and self.st["blocked"].get(i.split("-")[0].lower(), now + 1) <= now:
                 act(now, "queue_fix_slice", agree_key("queue_fix_slice", i.split("-")[0]), "orchestrator",
                     f"backlog id {i}")
         p, old = self.read_json(self.conv / "pace.json", {}), known["pace"]
@@ -1329,7 +1360,8 @@ class Bot:
         for i, p in enumerate(pend):
             if i in used:
                 continue
-            if now - p["at"] > horizon(p["key"]):
+            gone = p["key"].startswith("ack:") and self.attn is not None and p["key"][4:] not in self.attn
+            if now - p["at"] > horizon(p["key"]) or gone:  # BOTFIX3C: an ack whose item cleared is done
                 self.verdict("unmatched", p, None)
             else:
                 ag["pending"].append(p)
@@ -1356,6 +1388,8 @@ class Bot:
             if name:
                 book.setdefault(name, {}).setdefault(kind, 0)
                 book[name][kind] += 1
+        if kind == "excluded":  # BOTFIX3C: in the totals only, never in a class metric
+            return
         c = klass(p, a)
         if c:
             row = ag["classes"].setdefault(c, {})
@@ -1430,7 +1464,8 @@ class Bot:
         handler = {"ci_result": self.ci_result, "finish": self.finish, "respawn": self.respawn,
                    "error": self.error, "push_blocked": self.push_blocked, "pace": self.pace,
                    "page": self.seen_page, "ci_rerun": self.seen_rerun,
-                   "push": self.seen_push}.get(ev.get("event"))
+                   "push": self.seen_push, "auto_approve": self.seen_auto,
+                   "auto_approve_refused": self.seen_auto}.get(ev.get("event"))
         if handler:
             handler(ev, at, str(ev.get("lane") or ""))
 
@@ -1473,11 +1508,35 @@ class Bot:
             return self.decide(at, saw, "none", "O26", lane, "not a candidate flow; the conveyor gate decides")
         if self.approved(sha):
             return self.decide(at, saw, "none", "O26", lane, "key 1 already in build/approvals")
-        why, key = protected(self.changed(ln, rep)), agree_key("write_key1", f"push-{sha}-{lane}")
+        files, key = self.changed(ln, rep), agree_key("write_key1", f"push-{sha}-{lane}")
+        if not files:  # BOTFIX3C: no file list - the conveyor's own auto_approve verdict decides, or wait
+            self.st["waiting"][lane] = {"sha": sha, "at": at, "saw": saw, "key": key}
+            return self.wait_key1(lane)
+        why = protected(files)
         if why:
             self.decide(at, saw, "ask_salih_key1", "CONVSAFE", lane, why, key=key)
         else:
             self.decide(at, saw, "write_key1", "O26", lane, f"build/approvals/push-{sha}-{lane}", key=key)
+
+    def seen_auto(self, ev, at, lane):
+        ok = ev.get("event") == "auto_approve"
+        self.st["auto"][lane] = {"ok": ok, "at": at, "sha": str(ev.get("approval") or "")[5:45] if ok else "",
+                                 "why": "" if ok else str(ev.get("reason") or "")[:300]}
+        self.wait_key1(lane)
+
+    def wait_key1(self, lane):
+        """Decide a waiting key 1 once the conveyor said auto_approve (O26 agree path) or
+        auto_approve_refused (CONVSAFE, fail closed whatever the reason) for it; else keep waiting."""
+        w, auto = self.st["waiting"].get(lane), self.st["auto"].get(lane)
+        if not w or not auto or auto["at"] < w["at"] or (auto["ok"] and auto["sha"] != w["sha"]):
+            return
+        del self.st["waiting"][lane]
+        if auto["ok"]:
+            self.decide(auto["at"], w["saw"], "write_key1", "O26", lane,
+                        f"build/approvals/push-{w['sha']}-{lane} (conveyor auto_approve)", key=w["key"])
+        else:
+            self.decide(auto["at"], w["saw"], "ask_salih_key1", "CONVSAFE", lane,
+                        f"conveyor auto_approve_refused: {auto['why'] or 'no reason'}", key=w["key"])
 
     def finish(self, ev, at, lane):
         status = str(ev.get("status") or "").upper()
@@ -1485,6 +1544,8 @@ class Bot:
         saw = f"finish {lane} {status}"
         if status == "GREEN":  # ci_done after CI_PENDING; deduped with its ci_result on the sha
             return self.key1(at, saw, lane, ln, str((ln.get("ci") or {}).get("sha") or ""))
+        if status in cv.BAD:  # BOTFIX3C: a later backlog id with this prefix may be its fix slice
+            self.st["blocked"][lane.split("-")[0].lower()] = at
         if status not in cv.BAD or str(ev.get("reason") or "").startswith("CI:"):
             return  # a CI red was decided on its ci_result
         need = cv.NEEDS_RE.search(self.report(lane, ln))
@@ -1562,17 +1623,22 @@ class Bot:
                          default=None)
                 if at is not None and now - at > STUCK_S:
                     wake(("STUCK", str(ln.get("name") or ln.get("id")), "escalate_orchestrator"))
+        if isinstance(status.get("attention"), list):
+            self.attn = {}
         for it in listed("attention"):
             iid, reason, since = str(it.get("id")), str(it.get("reason") or ""), parse_ts(it.get("since"))
-            routine = iid.startswith(("cleanup:", "preserved:")) or \
-                (reason and all(ROUTINE_RE.match(p) for p in reason.split("; ")))
+            ok = routine(iid, reason)
+            name = cv.ack_name(iid).lower()
+            self.attn[name] = since
+            self.st["items"][name] = {"since": since if since is not None else now, "seen": now,
+                                      "routine": ok and iid not in (cv.DRY_ID, cv.DISK_ID, cv.BREAKER_ID)}
             if iid == cv.DRY_ID:
                 wake(("DRY", "backlog", "escalate_orchestrator"))
             elif iid == cv.DISK_ID:
                 wake(("HOLD", "disk", "hold_dispatch"))
-            elif iid != cv.BREAKER_ID and not routine and since is not None and now - since > ACK_AGE_S:
+            elif iid != cv.BREAKER_ID and not ok and since is not None and now - since > ACK_AGE_S:
                 wake(("ATTN", iid, "escalate_orchestrator"))
-            if not routine or since is None or now - since <= ACK_AGE_S:
+            if not ok or since is None or now - since <= ACK_AGE_S:
                 continue
             ack = self.conv / "ack" / cv.ack_name(iid)
             if ack.exists() and since <= ack.stat().st_mtime <= now:  # BOTREPLAY2: a future ack hides nothing
@@ -1582,7 +1648,7 @@ class Bot:
                 if self.once(f"keep:{iid}:{cv.iso(now)[:10]}", now):
                     self.decide(now, f"cleanup refusal {iid}: work not on main", "none", "KEEP-UNMERGED",
                                 iid, reason[:300])
-                continue
+                # DECISION (Salih 2026-10-26): once KEEP-UNMERGED is logged the branch is preserved; ack it
             if self.once(f"ack:{iid}:{it.get('since')}", now):
                 self.decide(now, f"routine attention {iid} {int((now - since) // 60)} min old", "ack", "O33",
                             iid, f"touch build/conveyor/ack/{cv.ack_name(iid)}")
