@@ -233,6 +233,33 @@ class ConvsafeTest(BotCase):
                                           CONVPACE="FILES: scripts/conveyor.py, tests/test_conveyor.py\n"),
                          [("ask_salih_key1", "CONVSAFE", "INT9")])
 
+    def test_changed_inline_and_block_picks_include_report_files(self):
+        self.put("build/reports/PM03.md", "FILES: jarvis/pm.py, tests/test_pm.py\n")
+        self.put("build/reports/BOTNOISE.md", "FILES: scripts/orchbot.py\n")
+        bot = orchbot.Bot(self.root, now=self.clock)
+        bot.reports = {}
+        for picks in ("PICKS: PM03 5644eb86 -> 56e25c38; BOTNOISE 5dc4ddcc -> 795c83e3\n",
+                      "PICKS (a -> b):\n  PM03 5644eb86 -> 56e25c38\n"
+                      "  BOTNOISE 5dc4ddcc -> 795c83e3\n",
+                      "PICKS: PM03 5644eb86 -> 56e25c38\n  BOTNOISE 5dc4ddcc -> 795c83e3\n"):
+            with self.subTest(picks=picks):
+                self.assertEqual(bot.changed({}, picks + "FILES: tests/test_orchbot.py\n"
+                                             "ADJACENT FILES: tests/test_orchbot_replay.py\n"),
+                                 ["jarvis/pm.py", "tests/test_pm.py", "scripts/orchbot.py",
+                                  "tests/test_orchbot.py", "tests/test_orchbot_replay.py"])
+
+    def test_changed_inline_picks_fail_closed(self):
+        self.put("build/reports/PM03.md", "FILES: jarvis/pm.py\n")
+        self.put("build/reports/NOFILES.md", "STATUS: PASS\n")
+        self.put("build/reports/CYCLE.md", "PICKS: CYCLE a -> b\nFILES: jarvis/cycle.py\n")
+        bot = orchbot.Bot(self.root, now=self.clock)
+        bot.reports = {}
+        for picks in ("PICKS: UNKNOWN a -> b\n", "PICKS: PM03 a -> b; UNKNOWN c -> d\n",
+                      "PICKS: PM03 a -> b; NOFILES c -> d\n", "PICKS: CYCLE a -> b\n",
+                      "PICKS:\n", "PICKS (a -> b):\n  \n"):
+            with self.subTest(picks=picks):
+                self.assertEqual(bot.changed({}, picks + "FILES: tests/test_orchbot.py\n"), [])
+
     def test_report_files_lines_are_parsed_loosely(self):
         for line in ("CHANGED FILES: `scripts/conveyor.py`:", "FILES: JARVIS_ACTIVE_STATE.md."):
             files = orchbot.Bot.changed(None, {"files": ["jarvis/a.py"]}, f"STATUS: PASS\n{line}\n")
