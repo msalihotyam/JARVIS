@@ -1,7 +1,7 @@
 """Pure project-plan schema and content binding (PM09).
 
-This module does not classify plans, validate policy, execute checks, or grant
-authority. Later classifier/validator slices can consume these immutable values.
+Classification consumes explicit facts; it does not validate policy, execute
+checks, or grant authority.
 Canonical JSON sorts object keys, preserves array order and exact string values,
 uses compact UTF-8 JSON, and admits integers only for numeric schema fields.
 Expiry is an explicit UTC Unix timestamp; no clock or environment is consulted.
@@ -193,3 +193,55 @@ class GrantEnvelope:
 
     def to_dict(self):
         return {"plan_hash": self.plan_hash, "plan": self.plan.to_dict()}
+
+
+def classify(brief_facts, plan):
+    """Return (D4 size, reasons), without reading any model class field.
+
+    brief_facts is a dict with target_folders (a nonempty list/tuple of
+    distinct folder strings) and explicit boolean existing_repo,
+    outgoing_actions, money_actions, manual_checks and jarvis_repo facts.
+    plan is a Plan or a dict with positive integer slice_count and a
+    list/tuple of new_dependencies. Dependencies alone do not imply an
+    install: any network install must be declared in outgoing_actions.
+    Missing/invalid facts fail closed. More than 15 slices is always large,
+    including in an existing repo. No filesystem or environment is read.
+    """
+    if type(brief_facts) is not dict:
+        return "large", ["unknown brief facts"]
+    reasons = []
+    flags = ("existing_repo", "outgoing_actions", "money_actions",
+             "manual_checks", "jarvis_repo")
+    for name in flags:
+        if type(brief_facts.get(name)) is not bool:
+            reasons.append(f"unknown {name}")
+        elif name != "existing_repo" and brief_facts[name]:
+            reasons.append(name)
+    folders = brief_facts.get("target_folders")
+    if (type(folders) not in (list, tuple) or not folders
+            or any(type(v) is not str or not v.strip() for v in folders)):
+        reasons.append("unknown target_folders")
+    elif len(set(folders)) != len(folders):
+        reasons.append("duplicate target_folders")
+    if type(plan) is Plan:
+        count = len(plan.slices)
+        dependencies = plan.new_dependencies
+    elif type(plan) is dict:
+        count = plan.get("slice_count")
+        dependencies = plan.get("new_dependencies")
+    else:
+        return "large", reasons + ["unknown plan facts"]
+    if type(count) is not int or count < 1:
+        reasons.append("unknown slice_count")
+    elif count > 15:
+        reasons.append("more than 15 slices")
+    if (type(dependencies) not in (list, tuple)
+            or any(type(v) is not str or not v.strip() for v in dependencies)):
+        reasons.append("unknown new_dependencies")
+    if reasons:
+        return "large", reasons
+    if count <= 5 and len(folders) == 1 and not brief_facts["existing_repo"]:
+        return "small", ["at most 5 slices in one new folder"]
+    if brief_facts["existing_repo"]:
+        return "medium", ["existing repo with at most 15 slices"]
+    return "medium", ["at most 15 slices; exceeds small scope"]
