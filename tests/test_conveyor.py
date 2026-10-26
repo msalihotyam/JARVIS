@@ -1799,6 +1799,128 @@ class TestPaceGovernor(TestUsageGuard):
         self.assertEqual(self.status()["pace"]["band"], "full_burn")
 
 
+class TestConvCap(Base):
+    """CONVCAP: max_lanes counts only Claude-quota lanes; codex/jules lanes have codex_max/jules_max."""
+    ledger, fresh, pace = TestUsageGuard.ledger, TestPaceGovernor.fresh, TestPaceGovernor.pace
+
+    def setUp(self):
+        super().setUp()
+        for attr, fn in (("start_codex", lambda n, b, t: "cx-" + n),
+                         ("start_jules", lambda n, b, t, f: "jl-" + n)):
+            p = mock.patch.object(self.c, attr, side_effect=fn)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def go(self, running, backlog=(), inbox=(), **pace):
+        """One governed pass with nothing waiting, then one dispatch over seeded running lanes;
+        returns the names it started."""
+        self.pace(**{"max_lanes": 1, **pace})
+        self.c.pass_once()
+        lanes = {n: {"id": n.lower(), "state": "working", **({"worker": w} if w else {})}
+                 for n, w in running.items()}
+        if backlog:
+            self.backlog(*backlog)
+        for n in inbox:
+            self.drop(f"{n}.md", HDR.format(n))
+        self.c.dispatch(lanes, [])
+        return sorted(set(lanes) - set(running))
+
+    CX = {"id": "CX1", "worker": "codex"}
+    JL = {"id": "JL1", "worker": "jules", "linux_ok": True}
+
+    def test_jules_lane_leaves_the_claude_slot_to_an_inbox_prompt(self):
+        self.assertEqual(self.go({"J": "jules"}, backlog=[{"id": "CL1"}], inbox=["A"]), ["A"])
+        self.assertEqual(self.fake.bg_names(), ["A"])  # CL1 waits: A took the one Claude slot
+
+    def test_jules_and_codex_lanes_leave_the_claude_slot_to_a_backlog_slice(self):
+        self.assertEqual(self.go({"J": "jules", "X": "codex"}, backlog=[{"id": "CL1"}]), ["CL1"])
+        self.assertEqual(self.fake.bg_names(), ["CL1"])
+
+    def test_claude_slot_full_codex_lane_still_dispatches(self):
+        # "C" has no worker: a Claude lane, also when it calls Codex itself (CDX review lanes)
+        got = self.go({"C": None}, backlog=[{"id": "CL1"}, self.CX], inbox=["A"])
+        self.assertEqual(got, ["CX1"])
+        self.assertEqual(self.fake.bg_names(), [])
+        self.assertEqual([c.args[0] for c in self.c.start_codex.call_args_list], ["CX1"])
+        self.assertTrue((self.base / "inbox" / "A.md").exists())  # waits for the Claude slot
+        self.assertEqual(self.c.cap_full({"C": {}}), True)
+
+    def test_codex_and_jules_caps(self):
+        full = {"C": None, "X": "codex", "J1": "jules", "J2": "jules"}
+        self.assertEqual(self.go(full, backlog=[self.CX, self.JL], max_lanes=2), [])
+        self.c.start_codex.assert_not_called()
+        self.c.start_jules.assert_not_called()
+        self.fresh()
+        two = [self.CX, {**self.CX, "id": "CX2"}]
+        self.assertEqual(self.go({"X": "codex"}, backlog=two, codex_max=2), ["CX1"])
+        self.fresh()
+        self.assertEqual(self.go({"J1": "jules"}, backlog=[self.JL, {**self.JL, "id": "JL2"}]), ["JL1"])
+        self.fresh()
+        self.assertEqual(self.go({}, backlog=[self.CX, self.JL], codex_max=0, jules_max=0), [])
+        self.c.start_codex.assert_not_called()
+        self.c.start_jules.assert_not_called()
+
+    def test_holds_still_stop_codex_and_jules_lanes(self):
+        def mem():
+            self.memory = (2.9, 50.0)
+
+        def pause():
+            (self.base / "PAUSE").write_text("")
+        for why, arm in (("memory", mem), ("usage", lambda: self.ledger(98)), ("pause", pause)):
+            with self.subTest(why):
+                self.fresh()
+                arm()
+                self.assertEqual(self.go({}, backlog=[self.CX, self.JL]), [])
+                self.c.start_codex.assert_not_called()
+                self.c.start_jules.assert_not_called()
+
+    def test_bad_worker_caps_rejected_like_other_pace_keys(self):
+        for key in ("codex_max", "jules_max"):
+            for bad in (-1, True, False, "1", 1.5, None, conveyor.MAX_LANES_CAP + 1):
+                with self.subTest(key=key, value=bad):
+                    self.fresh()
+                    self.pace(**{key: bad})
+                    self.c.pass_once()
+                    self.assertTrue(self.status()["pace"]["error"])
+                    self.assertIn(conveyor.PACE_BAD_ID, self.attn())
+                    self.assertEqual(getattr(self.c, key), conveyor.PACE_DEFAULTS[key])
+            for good in (0, conveyor.MAX_LANES_CAP):
+                with self.subTest(key=key, value=good):
+                    self.fresh()
+                    self.pace(**{key: good})
+                    self.c.pass_once()
+                    self.assertIsNone(self.status()["pace"]["error"])
+                    self.assertEqual(getattr(self.c, key), good)
+
+    def test_unknown_or_auto_worker_counts_as_claude(self):
+        self.c.max_lanes, self.c.codex_max, self.c.jules_max = 1, 1, 2
+        weird = {"U": {"worker": "weird"}}
+        for w in (None, "claude", "auto", "weird", ""):
+            self.assertTrue(self.c.cap_full(weird, w), w)
+        self.assertFalse(self.c.cap_full(weird, "codex"))
+        self.assertFalse(self.c.cap_full(weird, "jules"))
+        gone = {"F": {"worker": "codex", "finished": True}, "M": {"worker": "codex", "state": "missing"}}
+        self.assertFalse(self.c.cap_full(gone, "codex"))
+        self.assertTrue(self.c.cap_full({"X": {"worker": "codex"}}, "codex"))
+        # an "auto" slice routed to claude (unmarked class) waits for the Claude slot
+        self.assertEqual(self.go({"C": None}, backlog=[{"id": "AU1", "worker": "auto"}]), [])
+        self.fresh()
+        self.assertEqual(self.go({"J": "jules"}, backlog=[{"id": "AU1", "worker": "auto"}]), ["AU1"])
+        self.assertEqual(self.fake.bg_names(), ["AU1"])
+
+    def test_auto_slice_routed_to_codex_falls_back_to_claude_on_a_full_codex_cap(self):
+        auto = {"id": "AU1", "worker": "auto"}
+        for running, cap, claude in (({}, 0, True), ({"X": "codex"}, 1, True), ({}, 1, False)):
+            with self.subTest(running=running, codex_max=cap):
+                self.fresh()
+                p = mock.patch.object(self.c, "route", return_value=("codex", "claude headroom 5 < codex 50"))
+                p.start()
+                self.addCleanup(p.stop)
+                self.assertEqual(self.go(running, backlog=[auto], codex_max=cap), ["AU1"])
+                self.assertEqual(self.fake.bg_names(), ["AU1"] if claude else [])
+                self.assertEqual([c.args[0] for c in self.c.start_codex.call_args_list], [] if claude else ["AU1"])
+
+
 class TestMemoryGuard(Base):
     def test_low_free_memory_holds_and_releases(self):
         self.memory = (2.9, 50.0)

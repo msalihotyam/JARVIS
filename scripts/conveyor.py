@@ -155,8 +155,10 @@ PACE_DEFAULTS = {"mode": "full_burn", "window_start": None, "days": 7,
                  "power_switch": False, "power_switch_cmd": [], "blocked_nudge_min": 10,
                  "power_switch_query_cmd": ["powercfg", "/getactivescheme"],  # read-only (CONVBAG)
                  "power_switch_skip_plans": ["9b1e4f52-2c7d-4a8e-b6f3-1d0a7c55b205",
-                                             "LaptopControl - Çanta"]}  # LaptopControl bag profile
-MAX_LANES_CAP = 8  # pace.json max_lanes / lanes_* are clamped to 1..MAX_LANES_CAP
+                                             "LaptopControl - Çanta"],  # LaptopControl bag profile
+                 # CONVCAP: max_lanes paces only Claude-quota lanes; codex/jules lanes have their own caps
+                 "codex_max": 1, "jules_max": 2}
+MAX_LANES_CAP = 8  # pace.json max_lanes / lanes_* are clamped to 1..MAX_LANES_CAP; codex/jules_max 0..
 # Presence modes (CONV6, LaptopControl v1.3 plan Phase A): user idle time picks present/away.
 PRESENT_IDLE_S = 60  # idle under this: present (away: idle >= pace.json away_after_min)
 PRESENCE_HOLD_S = 120  # hysteresis: the new state must hold this long before it counts
@@ -917,6 +919,7 @@ class Conveyor:
         self.usage, self.usage_source = None, None
         self.usage_hold = False
         self.max_lanes = MAX_LANES
+        self.codex_max, self.jules_max = PACE_DEFAULTS["codex_max"], PACE_DEFAULTS["jules_max"]
         self.pace = {}
         self.backlog_view = []
         self.main_sha = False
@@ -1856,6 +1859,15 @@ class Conveyor:
         return [n for n, ln in lanes.items()
                 if not ln.get("finished") and ln.get("state") not in ("missing",)]
 
+    def cap_full(self, lanes, worker=None):
+        """CONVCAP: max_lanes paces the Claude weekly quota, so it counts only Claude lanes
+        (a Claude lane that calls Codex is one); codex/jules lanes count toward codex_max/jules_max."""
+        w = worker if worker in ("codex", "jules") else None
+        cap = {"codex": self.codex_max, "jules": self.jules_max}.get(w, self.max_lanes)
+        kinds = [lanes[n].get("worker") for n in self.running(lanes)]
+        return sum((k if k in ("codex", "jules") else None) == w  # any other value: a Claude lane
+                   for k in kinds) >= cap
+
     def int_blocked(self, name, lanes):
         """An integration lane waits while another one runs (they share the main checkout
         and run the full suite), whatever max_lanes allows."""
@@ -2153,6 +2165,9 @@ class Conveyor:
                     raise ValueError(f"{k} {p[k]!r}")
             for k in lane_keys:
                 p[k] = min(MAX_LANES_CAP, max(1, int(p[k])))
+            for k in ("codex_max", "jules_max"):  # CONVCAP: rejected, not clamped; 0 stops that worker
+                if isinstance(p[k], bool) or not isinstance(p[k], int) or not 0 <= p[k] <= MAX_LANES_CAP:
+                    raise ValueError(f"{k} {p[k]!r}")
             if p.get("min_lanes", 0) > p.get("max_lanes", MAX_LANES_CAP):
                 raise ValueError(f"min_lanes {p['min_lanes']} > max_lanes {p['max_lanes']}")
             p["max_commit_pct"] = min(COMMIT_PCT_RANGE[1], max(COMMIT_PCT_RANGE[0], p["max_commit_pct"]))
@@ -2227,6 +2242,7 @@ class Conveyor:
         if self.usage_hold and p["mode"] == "paced":
             band = f"paced: hold at {PACED_LIMIT} %"
         self.max_lanes = 0 if self.usage_hold else n
+        self.codex_max, self.jules_max = p["codex_max"], p["jules_max"]  # usage_hold stops them via hold()
         m = self.memory
         if m is not None and (m[0] < p["min_free_mem_gb"] or m[1] > p["max_commit_pct"]):
             self.mem_hold, self.mem_ok_since = True, None
@@ -2403,8 +2419,9 @@ class Conveyor:
             if self.breaker and not INT_RE.match(name):
                 held.add(f)  # breaker open: no new product lane; integration/fix lanes go on
                 continue
-            if len(self.running(lanes)) >= self.max_lanes:
-                return
+            if self.cap_full(lanes):  # CONVCAP: waits for a Claude slot; codex/jules backlog lanes go on
+                held.add(f)
+                continue
             if name in busy or self.int_blocked(name, lanes):
                 continue  # same-name lane still working, or another integration lane; wait
             sid = self.start(name, hdr["model"], hdr["effort"], text)
@@ -2492,8 +2509,9 @@ class Conveyor:
         # CONVAUTO: a BLOCKED integration lane whose fix-forward re-run <INT>-R is done counts as done
         return ok(sid) or bool(INT_RE.match(sid)) and ok(f"{sid}-R")
 
-    def pick_slice(self, slices, lanes, busy):
-        """First dispatchable slice (or None) and a {id: state} view of the backlog."""
+    def pick_slice(self, slices, lanes, busy, skip=()):
+        """First dispatchable slice (or None) and a {id: state} view of the backlog;
+        a ready slice in skip (its worker's cap is full this pass) is not chosen."""
         view, choice = {}, None
         run_files = [lanes[n].get("files", []) for n in self.running(lanes)]
         ids = {x["id"] for x in slices}
@@ -2530,7 +2548,8 @@ class Conveyor:
                 view[sid] = "held: " + why  # the lint would drop its header
             else:
                 view[sid] = "ready"
-                choice = choice or s
+                if sid not in skip:
+                    choice = choice or s
         return choice, view
 
     def slice_text(self, s):
@@ -2564,16 +2583,16 @@ class Conveyor:
 
     def dispatch_backlog(self, lanes, busy):
         slices, errors = self.load_backlog()
-        started, first_pick = False, True
+        started, first_pick, capped = False, True, set()
         while True:
-            s, view = self.pick_slice(slices, lanes, busy)
+            s, view = self.pick_slice(slices, lanes, busy, capped)
             self.backlog_view = [{"id": k, "state": v} for k, v in view.items()] + \
                                 [{"error": e} for e in errors]
             if first_pick:  # every slice judged once: a stable item for the attention list
                 first_pick = False
                 self.note_backlog_errors(errors + [f"slice {k}: {v}" for k, v in view.items()
                                                    if v.startswith("held: ")])
-            if s is None or len(self.running(lanes)) >= self.max_lanes:
+            if s is None:
                 return started
             name = s["id"]
             try:
@@ -2583,6 +2602,11 @@ class Conveyor:
                 slices = [x for x in slices if x is not s]
                 continue
             worker, why = self.route(s)
+            if s.get("worker") == "auto" and worker == "codex" and self.cap_full(lanes, "codex"):
+                worker, why = "claude", "codex cap full"  # CONVCAP: auto never waits on a full codex cap
+            if self.cap_full(lanes, worker):  # CONVCAP: its worker's cap; the next ready slice may go
+                capped.add(name)
+                continue
             if s.get("worker") == "auto":
                 self.event("route", lane=name, worker=worker, reason=why)
             codex = worker == "codex"
