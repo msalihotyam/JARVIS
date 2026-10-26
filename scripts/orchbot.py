@@ -364,6 +364,7 @@ class Bot:
         """One pass; returns the decisions it appended."""
         self.out.mkdir(parents=True, exist_ok=True)
         self.new, self.reports, self.verdicts, self.observed, self.wakes = [], {}, [], [], []
+        self.deferred = set()  # BOTFIX3E: ack keys observe() deferred to the next pass
         self.live, self.attn = set(), None  # attn: ack names on status.json's attention list this pass
         self.st = self.load_state()
         try:
@@ -1287,7 +1288,7 @@ class Bot:
                 pass
             return sorted(found)
 
-        acks, new, minute = {}, [], {}
+        acks, new, minute, self.deferred = {}, [], {}, set()
         for name, _, mt in files(self.conv / "ack"):
             if self.st.get("live", {}).get("acks", {}).get(name) == mt:  # the bot's own live ack
                 acks[name] = mt
@@ -1297,6 +1298,8 @@ class Bot:
             minute[int(mt // 60)] = minute.get(int(mt // 60), 0) + 1
             if mt > known["acks"].get(name, -1):
                 if int(mt // 60) >= int(now // 60) and not first:
+                    if int(mt // 60) == int(now // 60):  # BOTFIX3E: its pending ack waits for it (a future mtime does not)
+                        self.deferred.add("ack:" + name.lower())
                     if name in known["acks"]:
                         acks[name] = known["acks"][name]
                     continue
@@ -1359,11 +1362,16 @@ class Bot:
         for b in story.get("asks") if isinstance(story.get("asks"), list) else []:
             if isinstance(b, dict) and str(b.get("title") or "").strip():
                 text = " ".join(str(b.get(k) or "") for k in ("title", "blocks", "why", "cmds"))
-                board[str(b["title"]).strip().lower()[:200]] = " ".join(text.lower().split())[:1000]
+                text = " ".join(text.lower().split())[:1000]
+                # BOTFIX3E: keyed by title AND body: a new body under the same title is a new ask
+                board[str(b["title"]).strip().lower()[:200] + "\x1f" + text] = text
         if not isinstance(story.get("asks"), list):
             board = dict.fromkeys(known.get("board", []), "")
-        for t in sorted(board.keys() - set(known.get("board", []))):
-            act(now, "none", "ask:board:" + board[t], "orchestrator", f"board ask {t}")
+        seen = set(known.get("board", []))
+        for t in sorted(board.keys() - seen):
+            title = t.split("\x1f")[0]
+            if title not in seen:  # a title-only key is a pre-BOTFIX3E state: not new
+                act(now, "none", "ask:board:" + board[t], "orchestrator", f"board ask {title}")
         return out, {"acks": acks, "approvals": sorted(approvals), "backlog": ids, "pace": pace,
                      "board": sorted(board)}
 
@@ -1399,6 +1407,9 @@ class Bot:
         ag["pending"] = []
         for i, p in enumerate(pend):
             if i in used:
+                continue
+            if p["key"] in getattr(self, "deferred", ()):  # BOTFIX3E: never finalized while its ack waits for the next pass
+                ag["pending"].append(p)
                 continue
             gone = p["key"].startswith("ack:") and self.attn is not None and p["key"][4:] not in self.attn
             if now - p["at"] > horizon(p["key"]) or gone:  # BOTFIX3C: an ack whose item cleared is done

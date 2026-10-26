@@ -735,6 +735,31 @@ class AgreementTest(BotCase):
         self.assertEqual(self.kinds(), ["missed"])
         self.assertTrue(self.verdicts()[0]["key"].startswith("ask:board:something else"))
 
+    def board_actuals(self):
+        return [a["key"] for a in self.shadow()["agreement"]["actual"] if a["key"].startswith("ask:board:")]
+
+    def test_board_body_change_under_the_same_title_is_a_new_ask(self):  # BOTFIX3E CDXINT89 B MINOR
+        self.put("build/pano/story.json", {"asks": [{"title": "Push", "why": "l1"}]})
+        self.run_bot()
+        self.assertEqual(self.board_actuals(), ["ask:board:push l1"])
+        self.clock.set("2026-10-15T12:05:00")
+        self.run_bot()
+        self.assertEqual(self.board_actuals(), ["ask:board:push l1"])  # unchanged: not new
+        self.put("build/pano/story.json", {"asks": [{"title": "Push", "why": "l2"}]})
+        self.clock.set("2026-10-15T12:10:00")
+        self.run_bot()
+        self.assertEqual(self.board_actuals(), ["ask:board:push l1", "ask:board:push l2"])
+
+    def test_title_only_board_state_is_not_a_new_ask(self):  # BOTFIX3E: pre-BOTFIX3E known["board"]
+        self.put("build/pano/story.json", {"asks": [{"title": "Push", "why": "l1"}]})
+        self.run_bot()
+        s = self.shadow()
+        s["agreement"]["actual"], s["agreement"]["known"]["board"] = [], ["push"]
+        self.seed(s["agreement"])
+        self.clock.set("2026-10-15T12:05:00")
+        self.run_bot()
+        self.assertEqual(self.board_actuals(), [])
+
     def test_bot_ask_with_no_real_ask_is_disagree(self):  # BOTFIX3D M2
         ag = self.shadow()["agreement"]
         ag["pending"].append({"at": self.clock() - 86401, "action": "none", "rule": "ASK", "target": "Q1",
@@ -825,6 +850,36 @@ class AckAgreementTest(BotCase):
         self.assertEqual(self.acts(self.run_bot()), [("ack", "O33", "O1")])
         self.attention()
         self.clock.set("2026-10-15T12:01:00")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["unmatched"])
+
+    def test_item_clears_in_the_minute_of_its_ack_is_agree(self):  # BOTFIX3E CDXINT89 B MAJOR
+        self.attention(("O1", "FINDINGS: x", "2026-10-15T11:00:00"))
+        self.assertEqual(self.acts(self.run_bot()), [("ack", "O33", "O1")])
+        self.ack("O1", "2026-10-15T12:01:05")
+        self.attention()
+        self.clock.set("2026-10-15T12:01:30")
+        self.run_bot()
+        self.assertEqual(self.kinds(), [])  # the ack is deferred: its pending ack waits
+        self.clock.set("2026-10-15T12:02:30")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["agree"])
+
+    def test_deferred_ack_of_another_item_does_not_hold_the_pending(self):  # BOTFIX3E variant
+        self.attention(("O1", "FINDINGS: x", "2026-10-15T11:00:00"), ("O2", "FINDINGS: x", "2026-10-15T11:59:00"))
+        self.run_bot()
+        self.ack("O2", "2026-10-15T12:01:05")
+        self.attention(("O2", "FINDINGS: x", "2026-10-15T11:59:00"))
+        self.clock.set("2026-10-15T12:01:30")
+        self.run_bot()
+        self.assertEqual(self.kinds(), ["unmatched"])
+
+    def test_ack_from_the_future_does_not_hold_the_pending(self):  # BOTFIX3E variant
+        self.attention(("O1", "FINDINGS: x", "2026-10-15T11:00:00"))
+        self.run_bot()
+        self.ack("O1", "2026-10-15T13:00:00")
+        self.attention()
+        self.clock.set("2026-10-15T12:01:30")
         self.run_bot()
         self.assertEqual(self.kinds(), ["unmatched"])
 
