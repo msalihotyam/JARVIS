@@ -8,8 +8,10 @@ Expiry is an explicit UTC Unix timestamp; no clock or environment is consulted.
 """
 
 from dataclasses import asdict, dataclass, fields
+import fnmatch
 import hashlib
 import json
+import re
 
 
 class PlanSchemaError(ValueError):
@@ -245,3 +247,139 @@ def classify(brief_facts, plan):
     if brief_facts["existing_repo"]:
         return "medium", ["existing repo with at most 15 slices"]
     return "medium", ["at most 15 slices; exceeds small scope"]
+
+
+# PM10 plan validator. Pure string checks: no filesystem, environment or clock.
+
+#: Core check allowlist (I7): argv prefixes run without a shell. Arguments after
+#: a prefix may only be dotted test ids, never flags, paths or shell syntax.
+CHECK_ALLOWLIST = (("python", "-m", "unittest"),)
+_CHECK_ARG = re.compile(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*")
+_GLOB = re.compile(r"[*?\[\]{}]")
+_DEVICES = re.compile(r"(con|prn|aux|nul|conin\$|conout\$|com[0-9¹²³]"
+                      r"|lpt[0-9¹²³])(\..*)?")
+_PROTECTED_SUFFIXES = (
+    ".key", ".pem", ".crt", ".cer", ".der", ".p12", ".pfx", ".jks", ".keystore",
+    ".kdbx", ".db", ".db-wal", ".db-shm", ".db-journal", ".sqlite", ".sqlite3")
+#: Also the I3 repo/agent-config set, so a plan cannot even declare them.
+_PROTECTED_NAMES = (".jarvis", ".git", ".claude", ".codex", ".github",
+                    "agents.md", "claude.md")
+_KEY_PREFIXES = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
+#: I12 name heuristics inside the JARVIS repo; over-matching fails closed.
+_SELF_WORDS = ("policy", "approval", "auth", "gate", "credential", "redact",
+               "secret", "push", "release", "schema")
+#: Known credential/redaction/authority code the name heuristic misses.
+_SELF_FILES = ("jarvis/memory.py", "jarvis/contracts.py", "jarvis/memory_filter.py",
+               "jarvis/settings.py", "jarvis/gmail_cli.py", "jarvis/app.py")
+#: Single-segment names a glob segment must not be able to match.
+_PROTECTED_PROBES = (".env", ".env.local", *_PROTECTED_NAMES, *_KEY_PREFIXES,
+                     *(f"x{s}" for s in _PROTECTED_SUFFIXES))
+_SELF_PROBES = ("memory.py", *_SELF_WORDS, *(f"{w}.py" for w in _SELF_WORDS))
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """One typed validation failure; code is the stable machine reason."""
+    code: str
+    detail: str
+
+
+def _protected(lowered):
+    parts = lowered.split("/")
+    return (parts[0] == "data"
+            or any(p.startswith(".env") or p in _PROTECTED_NAMES
+                   or p.startswith(_KEY_PREFIXES)
+                   or p.endswith(_PROTECTED_SUFFIXES) for p in parts))
+
+
+def _self_target(lowered):
+    parts = lowered.split("/")
+    return (parts[0] in ("scripts", ".claude") or lowered in _SELF_FILES
+            or any(w in p for p in parts for w in _SELF_WORDS))
+
+
+def _target_refusal(target, jarvis_repo):
+    if (type(target) is not str or not target
+            or any(ord(c) < 32 or ord(c) == 127 for c in target)):
+        return Refusal("path_escape", repr(target))
+    path = target.replace("\\", "/")
+    parts = path.split("/")
+    if (path.startswith(("/", "~")) or ":" in path or "~" in path
+            or any(p in ("", ".", "..") or p != p.rstrip(". ")
+                   or _DEVICES.fullmatch(p.lower()) for p in parts)):
+        return Refusal("path_escape", target)
+    lowered = path.lower()
+    for index, part in enumerate(lowered.split("/")):
+        if not _GLOB.search(part):
+            continue
+        if any(fnmatch.fnmatchcase(probe, part) for probe in
+               _PROTECTED_PROBES + (("data",) if index == 0 else ())):
+            return Refusal("protected_path", target)
+        if any(fnmatch.fnmatchcase(probe, part) for probe in ("..", ".")):
+            return Refusal("path_escape", target)
+        if jarvis_repo and any(fnmatch.fnmatchcase(probe, part) for probe in
+                               _SELF_PROBES + (("scripts",) if index == 0 else ())):
+            return Refusal("self_target", target)
+    if _GLOB.search(lowered):
+        if any(fnmatch.fnmatchcase(p, lowered) for p in ("data", "data/x")):
+            return Refusal("protected_path", target)
+        if jarvis_repo and any(fnmatch.fnmatchcase(p, lowered) for p in
+                               _SELF_FILES + ("scripts/x", ".claude/x")):
+            return Refusal("self_target", target)
+    if _protected(lowered):
+        return Refusal("protected_path", target)
+    if jarvis_repo and _self_target(lowered):
+        return Refusal("self_target", target)
+    return None
+
+
+def validate(plan, project_root, *, jarvis_repo):
+    """Return [] when plan passes PM10, else a list of Refusal reasons.
+
+    project_root is the root the caller resolved for this plan and must name
+    the same root as plan.project_root. jarvis_repo must be an explicit bool;
+    True adds the I12 self-target set. Targets are relative to the root, in
+    POSIX or Windows form; anything absolute, escaping, device-like, globbing
+    onto a protected name, or otherwise unrecognised is refused (fail closed).
+    """
+    if type(plan) is not Plan:
+        return [Refusal("unknown_plan", type(plan).__name__)]
+    refusals = []
+    if type(jarvis_repo) is not bool:
+        refusals.append(Refusal("unknown_fact", "jarvis_repo"))
+        jarvis_repo = True
+
+    def root(value):
+        return value.replace("\\", "/").rstrip("/").casefold()
+
+    if (type(project_root) is not str or not project_root.strip()
+            or root(project_root) != root(plan.project_root)):
+        refusals.append(Refusal("root_mismatch", repr(project_root)))
+    elif any(p == "data" or p.startswith(".env") or p in _PROTECTED_NAMES
+             for p in root(project_root).split("/")):
+        refusals.append(Refusal("protected_path", project_root))
+    targets = list(plan.targets)
+    for item in plan.slices:
+        targets.extend(item.targets)
+    for target in dict.fromkeys(targets):
+        refusal = _target_refusal(target, jarvis_repo)
+        if refusal:
+            refusals.append(refusal)
+    check_ids = [check.check_id for check in plan.checks]
+    for check in plan.checks:
+        argv = check.argv
+        prefix = next((p for p in CHECK_ALLOWLIST if argv[:len(p)] == p), None)
+        if prefix is None or not all(
+                _CHECK_ARG.fullmatch(a)
+                and a.split(".")[0] in ("tests", "test")
+                for a in argv[len(prefix):]):
+            refusals.append(Refusal("check_not_allowlisted", check.check_id))
+        if check_ids.count(check.check_id) > 1:
+            refusals.append(Refusal("unknown_check", check.check_id))
+    for item in plan.slices:
+        for check_id in item.check_ids:
+            if check_id not in check_ids:
+                refusals.append(Refusal("unknown_check", check_id))
+    if max(plan.child_count, len(plan.slices)) > 5:
+        refusals.append(Refusal("too_many_children", str(plan.child_count)))
+    return refusals
