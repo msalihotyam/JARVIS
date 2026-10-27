@@ -204,6 +204,87 @@ class StageTests(unittest.TestCase):
             self.assertFalse(call.kwargs["shell"])
             self.assertTrue(Path(argv[0]).is_absolute())
 
+    def rev(self, ref):
+        return self.manager._git(self.repo, "rev-parse", ref).decode().strip()
+
+    def change(self, stage, name):
+        (stage.path / name).write_text(name + "\n")
+        return self.commit(stage.path)
+
+    def test_apply_creates_checkpoint_and_undo_restores_exact_tree(self):
+        stage = self.stage()
+        before = self.rev(f"{stage.base}^{{tree}}")
+        commit = self.change(stage, "a.txt")
+        checkpoint = self.manager.apply(stage, commit)
+        self.assertEqual(checkpoint, "refs/jarvis/checkpoints/run1/1")
+        self.assertEqual(self.rev(checkpoint), stage.base)
+        self.assertEqual(self.rev("refs/heads/jarvis/run1/main"), commit)
+        self.assertEqual(self.manager.undo(self.repo, "run1"), stage.base)
+        self.assertEqual(self.rev("jarvis/run1/main^{tree}"), before)
+        self.assertEqual(self.manager._git(self.repo, "for-each-ref", "refs/jarvis/"), b"")
+        with self.assertRaisesRegex(StageError, "no checkpoint"):
+            self.manager.undo(self.repo, "run1")
+
+    def test_two_applies_and_two_undos(self):
+        first = self.stage()
+        one = self.change(first, "a.txt")
+        self.manager.apply(first, one)
+        second = self.manager.create(self.repo, "run1", "slice2", base=one)
+        two = self.change(second, "b.txt")
+        self.assertEqual(self.manager.apply(second, two), "refs/jarvis/checkpoints/run1/2")
+        self.assertEqual(self.rev("refs/jarvis/checkpoints/run1/1"), first.base)
+        self.assertEqual(self.rev("refs/jarvis/checkpoints/run1/2"), one)
+        trees = [self.rev(f"{sha}^{{tree}}") for sha in (first.base, one)]
+        self.assertEqual(self.manager.undo(self.repo, "run1"), one)
+        self.assertEqual(self.rev("jarvis/run1/main^{tree}"), trees[1])
+        self.assertEqual(self.manager.undo(self.repo, "run1"), first.base)
+        self.assertEqual(self.rev("jarvis/run1/main^{tree}"), trees[0])
+
+    def test_non_fast_forward_apply_refused(self):
+        first, second = self.stage(), self.manager.create(self.repo, "run1", "slice2")
+        one = self.change(first, "a.txt")
+        two = self.change(second, "b.txt")
+        self.manager.apply(first, one)
+        with self.assertRaisesRegex(StageError, "non-fast-forward"):
+            self.manager.apply(second, two)
+        self.assertEqual(self.rev("refs/heads/jarvis/run1/main"), one)
+        self.assertEqual(self.manager._git(self.repo, "for-each-ref", "--format=%(refname)",
+                                           "refs/jarvis/").decode().split(), ["refs/jarvis/checkpoints/run1/1"])
+        with self.assertRaisesRegex(StageError, "stage branch tip"):
+            self.manager.apply(first, first.base)
+
+    def test_integration_branch_name_cannot_clash(self):
+        for slice_id in ("main", "MAIN", "Main"):
+            with self.subTest(slice_id=slice_id), self.assertRaisesRegex(StageError, "reserved"):
+                self.manager.create(self.repo, "run1", slice_id)
+        stage = self.manager.create(self.repo, "main", "slice1")
+        commit = self.change(stage, "a.txt")
+        self.assertEqual(self.manager.apply(stage, commit), "refs/jarvis/checkpoints/main/1")
+        self.assertEqual(self.rev("refs/heads/jarvis/main/main"), commit)
+        self.assertEqual(self.rev("refs/heads/jarvis/main/slice1"), commit)
+
+    def test_checked_out_integration_branch_refused(self):
+        stage = self.stage()
+        commit = self.change(stage, "a.txt")
+        self.manager.apply(stage, commit)
+        self.manager._git(self.repo, "checkout", "jarvis/run1/main")
+        with self.assertRaisesRegex(StageError, "checked out"):
+            self.manager.undo(self.repo, "run1")
+        self.assertEqual(self.rev("refs/heads/jarvis/run1/main"), commit)
+
+    def test_apply_and_undo_never_force(self):
+        stage = self.stage()
+        commit = self.change(stage, "a.txt")
+        with patch("jarvis.write_stage.subprocess.run", wraps=subprocess.run) as run:
+            self.manager.apply(stage, commit)
+            self.manager.undo(self.repo, "run1")
+        for call in run.call_args_list:
+            argv = call.args[0]
+            self.assertIn("core.hooksPath=", argv)
+            self.assertFalse(any("force" in arg for arg in argv))
+            self.assertNotIn(b"force", call.kwargs["input"] or b"")
+            self.assertNotIn("push", argv)
+
     def test_git_failure_is_closed(self):
         with self.assertRaises(StageError):
             self.manager.create(self.repo, "run", "slice", base="missing-ref")
