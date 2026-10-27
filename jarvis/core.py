@@ -262,6 +262,24 @@ from jarvis.skill_types import (
     SkillStatus,
     fold_token,
 )
+from jarvis.work_controls import (
+    Budget as WorkBudget,
+    Usage as WorkUsage,
+    budget_for,
+    budget_verdict,
+)
+from jarvis.work_ledger import (
+    TERMINAL_RUN_STATES,
+    EventKind,
+    RunSize,
+    RunState,
+    WorkEvent,
+    WorkLedgerError,
+    WorkRun,
+    advance_run,
+    event_payload_json,
+)
+from jarvis.work_plan import Plan as WorkPlan, validate as validate_work_plan
 
 
 #: Task preference holding the billing fingerprint that cleared cost preflight.
@@ -1359,6 +1377,51 @@ def _release_stale_capture_runs(store: Any, now: str) -> int:
         ).rowcount
 
 
+@dataclass(frozen=True)
+class ResumeRefused:
+    """PM05: why an explicit resume was refused; the run stays interrupted.
+
+    ``code`` is the first failed check, in resume order: ``not_interrupted``,
+    ``policy``, ``scope_narrowed``, ``plan``, ``lease``, ``budget``."""
+
+    code: str
+    detail: str
+
+
+def _lease_fold(target: str) -> str:
+    # Mirrors SQLiteMemoryStore._work_lease_fold: a subtree keeps its "/".
+    return target.replace("\\", "/").upper().casefold()
+
+
+def _lease_covers(outer: str, inner: str) -> bool:
+    """Whether folded ``outer`` is ``inner`` or a subtree containing it."""
+    return outer == inner or (outer.endswith("/") and inner.startswith(outer))
+
+
+def _plan_targets(plan: WorkPlan) -> tuple[str, ...]:
+    """Every target the plan names, deduplicated as the PM10 validator does."""
+    return tuple(dict.fromkeys(
+        [*plan.targets, *(target for item in plan.slices for target in item.targets)]
+    ))
+
+
+def _lease_targets(targets: tuple[str, ...]) -> tuple[str, ...]:
+    """The minimal lease set: a target inside another target's subtree (or a
+    fold-duplicate) is already covered, and claiming it would overlap."""
+    folded = [_lease_fold(target) for target in targets]
+    kept: list[str] = []
+    seen: set[str] = set()
+    for target, key in zip(targets, folded):
+        # "src" and "src/" overlap in the store; keep only the subtree form.
+        if key.rstrip("/") in seen or (not key.endswith("/") and key + "/" in folded):
+            continue
+        if any(other != key and _lease_covers(other, key) for other in folded):
+            continue
+        seen.add(key.rstrip("/"))
+        kept.append(target)
+    return tuple(kept)
+
+
 class AgentCore:
     def __init__(
         self,
@@ -1433,6 +1496,205 @@ class AgentCore:
                     f"identity binding: {reason}."
                 )
         self.gmail_identity: GmailIdentityBinding | None = gmail_identity
+
+    # PM05: the project-run lifecycle. Every transition goes through the PM01
+    # ledger types and is recorded as an append-only work_event whose payload
+    # names the boot that made it; the first event also binds the plan. No
+    # worker is started here, and nothing resumes on its own.
+
+    def _append_run_event(
+        self, run_id: str, kind: EventKind, at: datetime, payload: dict[str, Any]
+    ) -> None:
+        seq = len(self.memory.work_events(run_id)) + 1
+        self.memory.append_work_event(WorkEvent(
+            run_id=run_id, seq=seq, kind=kind, at=at,
+            payload_json=event_payload_json(payload),
+        ))
+
+    def _project_run_payloads(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+        """The (first, latest) event payloads: the plan binding and the owner."""
+        events = self.memory.work_events(run_id)
+        if not events:
+            return {}, {}
+        return json.loads(events[0].payload_json), json.loads(events[-1].payload_json)
+
+    def create_project_run(
+        self,
+        run_id: str,
+        plan: WorkPlan,
+        *,
+        project_root: str,
+        jarvis_repo: bool,
+        size: RunSize,
+        boot_id: str,
+        at: datetime,
+    ) -> WorkRun:
+        """Record a new run in ``planning`` bound to a plan the PM10 validator
+        accepts; resume revalidates against exactly this binding."""
+        refusals = validate_work_plan(plan, project_root, jarvis_repo=jarvis_repo)
+        if refusals:
+            raise WorkLedgerError(
+                "plan refused: " + ", ".join(refusal.code for refusal in refusals)
+            )
+        if self.memory.latest_work_run(run_id) is not None:
+            raise WorkLedgerError("project run already exists")
+        run = WorkRun(run_id=run_id, state=RunState.PLANNING, created_at=at, updated_at=at, size=size)
+        self.memory.append_work_run(run)
+        self._append_run_event(run_id, EventKind.RUN_STATE, at, {
+            "to": run.state.value, "boot_id": boot_id, "plan": plan.to_dict(),
+            "plan_hash": plan.plan_hash, "project_root": project_root,
+            "jarvis_repo": jarvis_repo, "size": size.value,
+        })
+        return run
+
+    def advance_project_run(
+        self,
+        run_id: str,
+        to: RunState,
+        *,
+        boot_id: str,
+        at: datetime,
+        extra: dict[str, Any] | None = None,
+    ) -> WorkRun:
+        """One legal ledger transition plus its event; illegal ones raise."""
+        run = self.memory.latest_work_run(run_id)
+        if run is None:
+            raise WorkLedgerError("unknown project run")
+        moved = advance_run(run, to, at=at)
+        self.memory.append_work_run(moved)
+        kind = EventKind.INTERRUPTED if to is RunState.INTERRUPTED else EventKind.RUN_STATE
+        self._append_run_event(run_id, kind, at, {
+            **(extra or {}), "from": run.state.value, "to": to.value, "boot_id": boot_id,
+        })
+        return moved
+
+    def _release_project_leases(
+        self, targets: tuple[str, ...], run_id: str, boot_id: str, now: datetime
+    ) -> None:
+        for target in targets:
+            try:
+                self.memory.release_work_lease(target, run_id, boot_id, now=now)
+            except WorkLedgerError:
+                pass  # expired or never claimed: no live lease to end
+
+    def recover_project_runs(self, boot_id: str, *, now: datetime) -> list[str]:
+        """Boot sweep: every non-terminal run last touched by another boot is
+        marked interrupted and that boot's leases are released. It never
+        resumes anything - resume is ``resume_project_run`` only. Returns the
+        interrupted run ids."""
+        # ponytail: MemoryStore lists no runs (jarvis/memory.py is another
+        # lane's), so this reads the SQLite store directly, as capture runs do.
+        # Upgrade: a public run listing on MemoryStore, then drop this.
+        connection = getattr(self.memory, "_connection", None)
+        if not callable(connection):
+            return []
+        with connection() as db:
+            run_ids = [row[0] for row in db.execute(
+                "SELECT DISTINCT run_id FROM work_run ORDER BY run_id"
+            )]
+        interrupted: list[str] = []
+        for run_id in run_ids:
+            run = self.memory.latest_work_run(run_id)
+            if run is None or run.state in TERMINAL_RUN_STATES or run.state is RunState.INTERRUPTED:
+                continue
+            first, latest = self._project_run_payloads(run_id)
+            old_boot = latest.get("boot_id")
+            if old_boot == boot_id:
+                continue
+            try:
+                self.advance_project_run(
+                    run_id, RunState.INTERRUPTED, boot_id=boot_id,
+                    at=max(now, run.updated_at), extra={"old_boot_id": old_boot},
+                )
+            except ValueError:
+                continue  # one unreadable run must not stop the sweep for the others
+            interrupted.append(run_id)
+            if not isinstance(old_boot, str) or not old_boot:
+                continue
+            try:
+                targets = _plan_targets(WorkPlan.from_dict(first["plan"]))
+            except (KeyError, TypeError, ValueError):
+                continue  # no readable plan: its leases expire on their own
+            self._release_project_leases(_lease_targets(targets), run_id, old_boot, now)
+        return interrupted
+
+    def resume_project_run(
+        self,
+        run_id: str,
+        *,
+        boot_id: str,
+        now: datetime,
+        granted_targets: AbstractSet[str],
+        lease: timedelta,
+        usage: WorkUsage,
+        quota_available: bool = True,
+        large_budget: WorkBudget | None = None,
+    ) -> WorkRun | ResumeRefused:
+        """Explicit resume of an interrupted run. Revalidates in a fixed order
+        before any work - policy and granted scope, the plan through the PM10
+        validator, every target lease re-claimed, the D3 budget - and refuses
+        on the first failure, leaving the run interrupted with no lease held.
+        On success the run returns to its saved phase; no worker is started."""
+        run = self.memory.latest_work_run(run_id)
+        if run is None or run.state is not RunState.INTERRUPTED or run.resume_state is None:
+            return ResumeRefused("not_interrupted", "only an interrupted run can resume")
+        if not self.execution_gate():
+            return ResumeRefused("policy", "execution is frozen")
+        first, _ = self._project_run_payloads(run_id)
+        try:
+            plan = WorkPlan.from_dict(first["plan"])
+        except (KeyError, TypeError, ValueError):
+            return ResumeRefused("plan", "the run has no readable plan binding")
+        targets = _plan_targets(plan)
+        granted = [_lease_fold(target) for target in granted_targets]
+        missing = [
+            target for target in targets
+            if not any(_lease_covers(grant, _lease_fold(target)) for grant in granted)
+        ]
+        if missing:
+            return ResumeRefused("scope_narrowed", "no longer granted: " + ", ".join(missing))
+        if plan.plan_hash != first.get("plan_hash"):
+            return ResumeRefused("plan", "the plan no longer matches its bound hash")
+        refusals = validate_work_plan(
+            plan, first.get("project_root"), jarvis_repo=first.get("jarvis_repo") is True
+        )
+        if refusals:
+            return ResumeRefused("plan", ", ".join(refusal.code for refusal in refusals))
+        claimed: list[str] = []
+        try:
+            for target in _lease_targets(targets):
+                self.memory.claim_work_lease(target, run_id, boot_id, now=now, lease=lease)
+                claimed.append(target)
+        except ValueError as exc:
+            self._release_project_leases(tuple(claimed), run_id, boot_id, now)
+            return ResumeRefused("lease", str(exc))
+        try:
+            caps = plan.budgets
+            d3 = budget_for(
+                getattr(run.size, "value", ""), model_calls=caps.model_calls,
+                large=large_budget,
+            )
+            # The approved plan's own caps can only tighten the D3 envelope.
+            budget = WorkBudget(
+                min(d3.sessions, caps.worker_sessions),
+                min(d3.wall_seconds, caps.wall_clock_seconds), d3.model_calls,
+            )
+            verdict = budget_verdict(
+                budget, usage, started_at=run.created_at.timestamp(),
+                now=now.timestamp(), quota_available=quota_available,
+            )
+        except ValueError as exc:
+            verdict = f"invalid budget: {exc}"
+        if verdict != "continue":
+            self._release_project_leases(tuple(claimed), run_id, boot_id, now)
+            return ResumeRefused("budget", verdict)
+        try:
+            return self.advance_project_run(
+                run_id, run.resume_state, boot_id=boot_id, at=now, extra={"resumed": True},
+            )
+        except ValueError:
+            self._release_project_leases(tuple(claimed), run_id, boot_id, now)
+            raise
 
     def start_session(self, objective: str = "") -> SessionState:
         session = SessionState(objective=objective)
