@@ -13,7 +13,8 @@ from contextlib import AbstractContextManager, contextmanager, nullcontext
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterable, Iterator, Sequence
+from types import EllipsisType
+from typing import Any, Callable, Iterable, Iterator, Mapping, Sequence
 from uuid import uuid4
 
 from jarvis.conditions import ConditionResult
@@ -214,6 +215,7 @@ from jarvis.planning import build_task_plan
 from jarvis import project_files
 from jarvis import project_folders
 from jarvis.work_ledger import (
+    TERMINAL_RUN_STATES,
     EventKind,
     RunSize,
     RunState,
@@ -222,6 +224,7 @@ from jarvis.work_ledger import (
     WorkLedgerError,
     WorkRun,
     WorkStep,
+    event_payload_json,
 )
 from jarvis.work_plan import _target_refusal
 
@@ -1449,6 +1452,17 @@ _RECORD_SEARCH_FTS_SQL = (
     "WHERE record_id = r.record_id)"
 )
 _RECORD_SEARCH_MAX_TOKENS = 32
+
+
+def _work_run_from_row(row: sqlite3.Row) -> WorkRun:
+    return WorkRun(
+        run_id=row["run_id"],
+        state=RunState(row["state"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+        updated_at=datetime.fromisoformat(row["updated_at"]),
+        size=RunSize(row["size"]) if row["size"] is not None else None,
+        resume_state=RunState(row["resume_state"]) if row["resume_state"] is not None else None,
+    )
 
 
 class SQLiteMemoryStore:
@@ -11794,11 +11808,38 @@ class SQLiteMemoryStore:
         finally:
             connection.close()
 
-    def append_work_run(self, run: WorkRun) -> None:
-        """Append a run snapshot; the latest snapshot is the run's state."""
+    def append_work_run(
+        self,
+        run: WorkRun,
+        *,
+        event_kind: EventKind | None = None,
+        event_payload: Mapping[str, Any] | None = None,
+        prior: WorkRun | None | EllipsisType = ...,
+    ) -> int | None:
+        """Append a run snapshot; the latest snapshot is the run's state.
+
+        With ``event_kind`` the snapshot and its event (at ``run.updated_at``)
+        are ONE transaction and the event seq is assigned inside it, so a
+        concurrent writer can neither split them nor take the same seq. Given
+        ``prior`` (``None`` = the run must not exist yet) the latest snapshot
+        is compared inside that transaction and a mismatch raises, so two
+        writers from one base cannot fork the run. Returns the seq, or None
+        when no event was asked for."""
         if not isinstance(run, WorkRun):
             raise WorkLedgerError("run must be a WorkRun")
+        if event_kind is None and event_payload is not None:
+            raise WorkLedgerError("event_payload needs an event_kind")
+        if event_kind is not None and not isinstance(event_kind, EventKind):
+            raise WorkLedgerError("event_kind must be an EventKind")
+        payload_json = event_payload_json(event_payload or {}) if event_kind is not None else None
         with self._work_write() as connection:
+            if prior is not ...:
+                row = connection.execute(
+                    "SELECT * FROM work_run WHERE run_id = ? ORDER BY snapshot_id DESC LIMIT 1",
+                    (run.run_id,),
+                ).fetchone()
+                if (None if row is None else _work_run_from_row(row)) != prior:
+                    raise WorkLedgerError("run changed concurrently")
             connection.execute(
                 """
                 INSERT INTO work_run (run_id, state, size, resume_state, created_at, updated_at)
@@ -11813,6 +11854,17 @@ class SQLiteMemoryStore:
                     run.updated_at.isoformat(),
                 ),
             )
+            if event_kind is None:
+                return None
+            seq = connection.execute(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM work_event WHERE run_id = ?", (run.run_id,)
+            ).fetchone()[0]
+            event = WorkEvent(run_id=run.run_id, seq=seq, kind=event_kind, at=run.updated_at, payload_json=payload_json)
+            connection.execute(
+                "INSERT INTO work_event (run_id, seq, kind, payload_json, at) VALUES (?, ?, ?, ?, ?)",
+                (event.run_id, event.seq, event.kind.value, event.payload_json, event.at.isoformat()),
+            )
+            return seq
 
     def latest_work_run(self, run_id: str) -> WorkRun | None:
         with self._connection() as connection:
@@ -11820,16 +11872,20 @@ class SQLiteMemoryStore:
                 "SELECT * FROM work_run WHERE run_id = ? ORDER BY snapshot_id DESC LIMIT 1",
                 (run_id,),
             ).fetchone()
-        if row is None:
-            return None
-        return WorkRun(
-            run_id=row["run_id"],
-            state=RunState(row["state"]),
-            created_at=datetime.fromisoformat(row["created_at"]),
-            updated_at=datetime.fromisoformat(row["updated_at"]),
-            size=RunSize(row["size"]) if row["size"] is not None else None,
-            resume_state=RunState(row["resume_state"]) if row["resume_state"] is not None else None,
-        )
+        return None if row is None else _work_run_from_row(row)
+
+    def work_runs_open(self) -> list[WorkRun]:
+        """Latest snapshot of every run not in a terminal state, by run_id."""
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM work_run
+                WHERE snapshot_id IN (SELECT MAX(snapshot_id) FROM work_run GROUP BY run_id)
+                ORDER BY run_id
+                """
+            ).fetchall()
+        runs = [_work_run_from_row(row) for row in rows]
+        return [run for run in runs if run.state not in TERMINAL_RUN_STATES]
 
     def append_work_step(self, step: WorkStep) -> None:
         """Append a step snapshot; the latest snapshot per key is the step's state."""

@@ -269,15 +269,12 @@ from jarvis.work_controls import (
     budget_verdict,
 )
 from jarvis.work_ledger import (
-    TERMINAL_RUN_STATES,
     EventKind,
     RunSize,
     RunState,
-    WorkEvent,
     WorkLedgerError,
     WorkRun,
     advance_run,
-    event_payload_json,
 )
 from jarvis.work_plan import Plan as WorkPlan, validate as validate_work_plan
 
@@ -1502,15 +1499,6 @@ class AgentCore:
     # names the boot that made it; the first event also binds the plan. No
     # worker is started here, and nothing resumes on its own.
 
-    def _append_run_event(
-        self, run_id: str, kind: EventKind, at: datetime, payload: dict[str, Any]
-    ) -> None:
-        seq = len(self.memory.work_events(run_id)) + 1
-        self.memory.append_work_event(WorkEvent(
-            run_id=run_id, seq=seq, kind=kind, at=at,
-            payload_json=event_payload_json(payload),
-        ))
-
     def _project_run_payloads(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
         """The (first, latest) event payloads: the plan binding and the owner."""
         events = self.memory.work_events(run_id)
@@ -1539,12 +1527,11 @@ class AgentCore:
         if self.memory.latest_work_run(run_id) is not None:
             raise WorkLedgerError("project run already exists")
         run = WorkRun(run_id=run_id, state=RunState.PLANNING, created_at=at, updated_at=at, size=size)
-        self.memory.append_work_run(run)
-        self._append_run_event(run_id, EventKind.RUN_STATE, at, {
+        self.memory.append_work_run(run, event_kind=EventKind.RUN_STATE, event_payload={
             "to": run.state.value, "boot_id": boot_id, "plan": plan.to_dict(),
             "plan_hash": plan.plan_hash, "project_root": project_root,
             "jarvis_repo": jarvis_repo, "size": size.value,
-        })
+        }, prior=None)
         return run
 
     def advance_project_run(
@@ -1561,11 +1548,10 @@ class AgentCore:
         if run is None:
             raise WorkLedgerError("unknown project run")
         moved = advance_run(run, to, at=at)
-        self.memory.append_work_run(moved)
         kind = EventKind.INTERRUPTED if to is RunState.INTERRUPTED else EventKind.RUN_STATE
-        self._append_run_event(run_id, kind, at, {
+        self.memory.append_work_run(moved, event_kind=kind, event_payload={
             **(extra or {}), "from": run.state.value, "to": to.value, "boot_id": boot_id,
-        })
+        }, prior=run)
         return moved
 
     def _release_project_leases(
@@ -1582,21 +1568,11 @@ class AgentCore:
         marked interrupted and that boot's leases are released. It never
         resumes anything - resume is ``resume_project_run`` only. Returns the
         interrupted run ids."""
-        # ponytail: MemoryStore lists no runs (jarvis/memory.py is another
-        # lane's), so this reads the SQLite store directly, as capture runs do.
-        # Upgrade: a public run listing on MemoryStore, then drop this.
-        connection = getattr(self.memory, "_connection", None)
-        if not callable(connection):
-            return []
-        with connection() as db:
-            run_ids = [row[0] for row in db.execute(
-                "SELECT DISTINCT run_id FROM work_run ORDER BY run_id"
-            )]
         interrupted: list[str] = []
-        for run_id in run_ids:
-            run = self.memory.latest_work_run(run_id)
-            if run is None or run.state in TERMINAL_RUN_STATES or run.state is RunState.INTERRUPTED:
+        for run in self.memory.work_runs_open():
+            if run.state is RunState.INTERRUPTED:
                 continue
+            run_id = run.run_id
             first, latest = self._project_run_payloads(run_id)
             old_boot = latest.get("boot_id")
             if old_boot == boot_id:

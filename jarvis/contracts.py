@@ -18,8 +18,12 @@ from urllib.parse import urlsplit, urlunsplit
 from uuid import UUID, uuid4
 
 if TYPE_CHECKING:
+    from collections.abc import Mapping
+    from types import EllipsisType
+
     from jarvis.conversation import ConversationRecord, ConversationState
     from jarvis.memory import MemoryRecordView
+    from jarvis.work_ledger import EventKind, WorkEvent, WorkRun
 
 # Scheduler phase 1A kernels. Both are PURE - stdlib only, no persistence, no
 # clock, no Core import - so depending on them here creates no cycle, and the
@@ -10095,6 +10099,50 @@ class MemoryStore(Protocol):
         judgement for later work to inherit; no decision row is written and
         every other part of the transaction is unchanged.
         """
+        ...
+
+    # PM05 project-run ledger (append-only; history is never updated).
+
+    def append_work_run(
+        self,
+        run: WorkRun,
+        *,
+        event_kind: EventKind | None = None,
+        event_payload: Mapping[str, Any] | None = None,
+        prior: WorkRun | None | EllipsisType = ...,
+    ) -> int | None:
+        """Append one run snapshot and, given ``event_kind``, its event in the
+        same transaction, the event seq assigned inside it. Given ``prior``
+        (``None`` = must not exist yet) a different latest snapshot raises
+        ``WorkLedgerError`` in that transaction. Returns the seq, or ``None``
+        when no event was asked for."""
+        ...
+
+    def latest_work_run(self, run_id: str) -> WorkRun | None:
+        ...
+
+    def work_runs_open(self) -> list[WorkRun]:
+        """Latest snapshot of every run not in a terminal state, by run_id."""
+        ...
+
+    def append_work_event(
+        self,
+        event: WorkEvent,
+        *,
+        idempotency_key: str | None = None,
+        severity: str | None = None,
+    ) -> bool:
+        ...
+
+    def work_events(self, run_id: str) -> list[WorkEvent]:
+        ...
+
+    def claim_work_lease(
+        self, target: str, run_id: str, boot_id: str, *, now: datetime, lease: timedelta
+    ) -> dict[str, Any]:
+        ...
+
+    def release_work_lease(self, target: str, run_id: str, boot_id: str, *, now: datetime) -> None:
         ...
 
 
