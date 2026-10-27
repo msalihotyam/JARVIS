@@ -267,9 +267,14 @@ _PROTECTED_SUFFIXES = (
     ".kdbx", ".db", ".sqlite", ".sqlite3")
 #: SQLite sidecars: -wal, -shm, -journal and the -mjXXXX super-journal.
 _SIDECAR = re.compile(r"\.(db|sqlite3?)-")
+#: Agent, tool and IDE config that agents or editors obey or run (lowercase
+#: path components). Single source: jarvis.write_scope imports this tuple.
+AGENT_CONFIG_NAMES = (
+    ".claude", ".codex", ".cursor", ".gemini", "agents.md", "agents.override.md",
+    "claude.md", "claude.local.md", "gemini.md", ".mcp.json", ".cursorrules",
+    ".windsurfrules", ".aider.conf.yml", ".vscode", ".idea", ".devcontainer")
 #: Also the I3 repo/agent-config set, so a plan cannot even declare them.
-_PROTECTED_NAMES = (".jarvis", ".git", ".claude", ".codex", ".github", ".ssh",
-                    "agents.md", "claude.md")
+_PROTECTED_NAMES = (".jarvis", ".git", ".github", ".ssh") + AGENT_CONFIG_NAMES
 _KEY_PREFIXES = ("id_rsa", "id_dsa", "id_ecdsa", "id_ed25519")
 #: I12 name heuristics inside the JARVIS repo; over-matching fails closed.
 _SELF_WORDS = ("policy", "approval", "auth", "gate", "credential", "redact",

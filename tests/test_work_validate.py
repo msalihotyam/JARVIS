@@ -55,7 +55,13 @@ class ValidateTests(unittest.TestCase):
                        ".git/config", ".claude/settings.json", "AGENTS.md",
                        "store.sqlite3-wal", "x.sqlite-shm", "a.sqlite3-journal",
                        ".GIT/x", "DATA/x", ".ssh/authorized_keys", ".SSH/config",
-                       "x.db-mj0A1B2C3D", "x.DB-WAL"):
+                       "x.db-mj0A1B2C3D", "x.DB-WAL",
+                       # Agent/tool/IDE config shared with PM15 write_scope.
+                       ".mcp.json", "src/CLAUDE.local.md", ".vscode/", "GEMINI.md",
+                       ".cursorrules", "AGENTS.override.md", ".idea/workspace.xml",
+                       ".cursor/", ".codex/config.toml", "CLAUDE.md",
+                       ".windsurfrules", ".aider.conf.yml", ".devcontainer/x.json",
+                       ".gemini/settings.json"):
             for jr in (False, True):
                 self.assertEqual(["protected_path"],
                                  codes(with_targets(target), jarvis_repo=jr),

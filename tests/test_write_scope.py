@@ -1,6 +1,7 @@
 import unittest
 
-from jarvis.work_plan import Refusal
+from jarvis import write_scope
+from jarvis.work_plan import AGENT_CONFIG_NAMES, Refusal
 from jarvis.write_scope import MAX_FILE_BYTES, check
 
 TARGETS = {"src/": "subtree", "README.md": "file", "assets/": "subtree"}
@@ -95,6 +96,67 @@ class WriteScopeTests(unittest.TestCase):
             "src/.windsurfrules", "src/.aider.conf.yml", "src/.gitea/workflows/x.yml",
             "src/.forgejo/workflows/x.yml"])
 
+    def test_agent_config_names_come_from_work_plan(self):
+        self.assertTrue(set(AGENT_CONFIG_NAMES) <= set(write_scope._CONFIG_NAMES))
+        self.assertIs(write_scope.AGENT_CONFIG_NAMES, AGENT_CONFIG_NAMES)
+
+    BUILD = ["src/conftest.py", "src/setup.py", "src/setup.cfg",
+             "src/pyproject.toml", "src/pytest.ini", "src/tox.ini",
+             "src/noxfile.py", "src/Makefile", "src/makefile", "src/GNUmakefile",
+             "src/package.json", "src/package-lock.json", "src/requirements.txt",
+             "src/requirements-dev.txt", "src/requirements/dev.txt",
+             "src/ruff.toml", "src/mypy.ini", "src/.coveragerc", "src/uv.lock",
+             "src/jest.config.js", "src/__pycache__/a.cpython-313.pyc",
+             "src/a.pyc", "src/ext.pyd", "src/rules.mk", "src/constraints.txt",
+             "src/vite.config.ts", "src/tsconfig.json", "src/justfile",
+             "src/CMakeLists.txt", "src/MANIFEST.in"]
+
+    def test_build_config_needs_a_literal_file_target(self):
+        self.assertRefused("build_config", self.BUILD)
+        for path in self.BUILD:
+            with self.subTest(path=path):
+                self.assertEqual(codes([change(path)], dict(TARGETS, **{path: "file"})),
+                                 [])
+
+    def test_build_config_case_nesting_and_status(self):
+        self.assertRefused("build_config", ["SRC/ConfTest.PY", "src/a/b/conftest.py",
+                                            "src/PyProject.Toml", "src/x/setup.cfg"])
+        for status in ("A", "D", "T"):
+            self.assertRefused("build_config", ["src/conftest.py"], status=status)
+        # The literal grant matches case-insensitively, like every target.
+        self.assertEqual(codes([change("SRC/CONFTEST.PY")],
+                               {"src/conftest.py": "file"}), [])
+        # A literal grant covers only that path, not a nested look-alike.
+        self.assertEqual(codes([change("src/a/conftest.py")],
+                               {"src/": "subtree", "src/conftest.py": "file"}),
+                         ["build_config"])
+
+    def test_build_config_rename_or_copy_either_side(self):
+        for status in ("R100", "C075"):
+            with self.subTest(status=status):
+                self.assertEqual(codes([change("src/conftest.py", status=status,
+                                               old_path="src/a.py")]),
+                                 ["build_config"])
+                self.assertEqual(codes([change("src/a.py", status=status,
+                                               old_path="src/conftest.py")]),
+                                 ["build_config"])
+                both = dict(TARGETS, **{"src/conftest.py": "file"})
+                self.assertEqual(codes([change("src/a/conftest.py", status=status,
+                                               old_path="src/conftest.py")], both),
+                                 ["build_config"])
+                self.assertEqual(codes([change("src/conftest.py", status=status,
+                                               old_path="src/a.py")], both), [])
+
+    def test_top_level_stdlib_shadow(self):
+        self.assertEqual(codes([change("unittest/__init__.py")],
+                               {"unittest/": "subtree"}), ["build_config"])
+        self.assertEqual(codes([change("json.py")], {"json.py": "file"}), [])
+        self.assertEqual(codes([change("Json.py")], {"json.py": "file"}), [])
+        self.assertEqual(codes([change("json.py")], {"src/": "subtree"}),
+                         ["build_config"])
+        self.assertEqual(codes([change("tests/test_a.py")], {"tests/": "subtree"}), [])
+        self.assertEqual(codes([change("src/json.py")]), [])
+
     def test_protected_paths(self):
         self.assertRefused("protected_path", ["src/.env", "src/.env.local",
                                               "src/server.key", "src/id_rsa",
@@ -148,7 +210,12 @@ class WriteScopeTests(unittest.TestCase):
                            old_path="src/old.sh", new_mode="100755")
 
     def test_unknown_status_and_malformed_entries_fail_closed(self):
-        for status in ("U", "X", "B", "?", "R1000", "m", "", None):
+        for status in ("C000", "R0", "R00", "R099", "R100", "C75"):
+            with self.subTest(status=status):
+                self.assertEqual(codes([change("src/a.py", status=status,
+                                               old_path="src/b.py")]), [])
+        for status in ("U", "X", "B", "?", "R1000", "m", "", None, "R101",
+                       "C999", "R200", "R-1", "R1.0", "R 1"):
             with self.subTest(status=status):
                 self.assertEqual(codes([change("src/a.py", status=status)]),
                                  ["unknown_status"])
@@ -176,6 +243,10 @@ class WriteScopeTests(unittest.TestCase):
         self.assertEqual(codes(tuple(ok)), ["unparseable"])
         self.assertEqual(codes(ok, targets=[("src/", "subtree")]), ["unparseable"])
         self.assertEqual(codes(ok, max_bytes=True), ["unparseable"])
+        self.assertEqual(codes(ok, max_bytes=MAX_FILE_BYTES + 1), ["unparseable"])
+        self.assertEqual(codes(ok, max_bytes=-1), ["unparseable"])
+        self.assertEqual(codes(ok, max_bytes=MAX_FILE_BYTES), [])
+        self.assertEqual(codes(ok, max_bytes=0), ["size_cap"])
         self.assertEqual(codes(ok, binary_targets="src/"), ["unparseable"])
         for targets in ({"src": "subtree"}, {"src/": "file"}, {"src/": "dir"},
                         {"../src/": "subtree"}, {"data/": "subtree"},
