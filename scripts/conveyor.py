@@ -2721,6 +2721,7 @@ class Conveyor:
         dry = self.pager_flag("dry")
         if dry and dry is not True:  # True: a v1 flag (paged then); dispatch() gives it a time
             items.append((DRY_ID, "kuyruk boş, çalışan lane yok", dry))
+            self.quiet.add(DRY_ID)  # CONVDRYQUIET: the orchestrator's business, never pages Salih
         o = self.pager_flag("outage")
         if o:
             items.append(("outage", f"API kesintisi şüphesi ({o['why']}): dispatch durdu, "
