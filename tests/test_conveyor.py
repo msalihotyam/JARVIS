@@ -1301,19 +1301,19 @@ class TestPager(Base):
         self.c.pass_once()
         self.assertEqual(len(self.pushes), 1)
         self.assertIn("A: STATUS BLOCKED", self.pushes[0])
-        self.t += 60                             # B and dry due, inside the 10 min gap: held
+        self.t += 60                             # B due, inside the 10 min gap: held
         self.c.pass_once()
         self.assertEqual(len(self.pushes), 1)
         self.t += 600
         self.c.pass_once()
-        self.assertIn("B: STATUS FAIL\n", self.pushes[1])  # held pages, coalesced
-        self.assertIn("boş", self.pushes[1])               # with "dry"
+        self.assertIn("B: STATUS FAIL", self.pushes[1])  # the held page
+        self.assertNotIn("boş", " ".join(self.pushes))   # CONVDRYQUIET: dry never pages
         self.assertNotIn("C: STATUS", " ".join(self.pushes))
         self.t += 3600
         self.c.pass_once()
         self.assertEqual(len(self.pushes), 2)  # one backstop page per item
 
-    def test_dry_to_attention_backstop_once(self):
+    def test_dry_stays_in_attention_and_never_pages(self):
         self.c.pass_once()
         self.assertEqual(self.pushes, [])
         self.assertEqual(self.status()["attention"], [{"id": conveyor.DRY_ID, "since": conveyor.iso(self.t),
@@ -1322,8 +1322,23 @@ class TestPager(Base):
         self.c.pass_once()
         self.t += 3600
         self.c.pass_once()
+        self.assertEqual(self.pushes, [])  # CONVDRYQUIET: the orchestrator's business
+        self.assertEqual(self.attn(), [conveyor.DRY_ID])
+
+    def test_dry_quiet_while_a_loud_item_still_pages(self):
+        t0 = self.t
+        self.backlog({"id": "A"})
+        self.c.pass_once()
+        self.report("A", "BLOCKED")
+        self.c.pass_once()
+        self.assertEqual(self.attn(), ["A", conveyor.DRY_ID])
+        self.t = t0 + conveyor.ATTENTION_PAGE_S + 3600
+        self.c.pass_once()
         self.assertEqual(len(self.pushes), 1)
-        self.assertIn("boş", self.pushes[0])
+        self.assertIn("A: STATUS BLOCKED", self.pushes[0])
+        self.assertNotIn("boş", self.pushes[0])
+        self.assertNotIn(conveyor.DRY_ID, self.pushes[0])
+        self.assertEqual(self.attn(), ["A", conveyor.DRY_ID])
 
     def test_acked_item_leaves_attention_and_is_not_paged(self):
         self.c.pass_once()  # dry
@@ -2612,7 +2627,7 @@ class TestReader(Base):
         self.assertEqual(self.pushes, [])
         self.t += conveyor.ATTENTION_PAGE_S + 3600
         self.c.pass_once()
-        self.assertEqual(len(self.pushes), 1)  # A and the dry item escalate together
+        self.assertEqual(len(self.pushes), 1)  # A escalates; the dry item stays quiet
         self.assertIn("A: reader says needs_salih: karar", self.pushes[0])
         self.t += conveyor.ATTENTION_PAGE_S + 3600
         self.c.pass_once()
