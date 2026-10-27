@@ -81,6 +81,9 @@ are retained as recovery refs. This is not a diff-scope or approval gate.
 
     def _destination(self, run: str, slice_id: str) -> tuple[Path, str]:
         run, slice_id = self._identifier(run), self._identifier(slice_id)
+        # jarvis/<run>/main is the run's integration branch (refs are case-insensitive on NTFS).
+        if slice_id.casefold() == "main":
+            raise StageError("slice identifier is reserved")
         path = self.root / run / slice_id
         if path.resolve() != path or path.exists():
             raise StageError("stage destination exists or traverses a link")
@@ -158,6 +161,51 @@ are retained as recovery refs. This is not a diff-scope or approval gate.
         self._clean(stage.target)
         if self._git(stage.target, "rev-parse", "HEAD").decode().strip() != stage.base:
             raise StageError("target advanced from the stage baseline")
+
+    def _integration(self, target: Path, run: str) -> tuple[str, str | None, list[int]]:
+        """Return the run's integration ref, its sha (None if absent) and checkpoint numbers."""
+        ref = f"refs/heads/jarvis/{self._identifier(run)}/main"
+        # update-ref never touches a working tree, so a checked-out integration branch would desync.
+        if f"branch {ref}\n".encode() in self._git(target, "worktree", "list", "--porcelain"):
+            raise StageError("integration branch is checked out")
+        current = self._git(target, "for-each-ref", "--format=%(objectname)", ref).decode().strip() or None
+        names = self._git(target, "for-each-ref", "--format=%(refname)",
+                          f"refs/jarvis/checkpoints/{run}/").decode().split()
+        numbers = sorted(int(name.rsplit("/", 1)[1]) for name in names)
+        return ref, current, numbers
+
+    def apply(self, stage: Stage, commit: str) -> str:
+        """Fast-forward jarvis/<run>/main to an accepted stage commit; return the checkpoint ref."""
+        self._validate(stage)
+        run = stage.branch.split("/")[1]
+        commit = self._git(stage.target, "rev-parse", "--verify", "--end-of-options",
+                           f"{commit}^{{commit}}").decode().strip()
+        if commit != self._git(stage.target, "rev-parse", "--verify", f"refs/heads/{stage.branch}").decode().strip():
+            raise StageError("commit is not the stage branch tip")
+        ref, current, numbers = self._integration(stage.target, run)
+        old = current or stage.base
+        try:
+            self._git(stage.target, "merge-base", "--is-ancestor", old, commit)
+        except StageError as exc:
+            raise StageError("non-fast-forward apply refused") from exc
+        checkpoint = f"refs/jarvis/checkpoints/{run}/{(numbers[-1] if numbers else 0) + 1}"
+        main = f"update {ref} {commit} {current}" if current else f"create {ref} {commit}"
+        # One transaction: the checkpoint must not exist and main must not have moved.
+        self._git(stage.target, "update-ref", "--stdin",
+                  input=f"start\ncreate {checkpoint} {old}\n{main}\nprepare\ncommit\n".encode())
+        return checkpoint
+
+    def undo(self, target: Path, run: str) -> str:
+        """Move jarvis/<run>/main back to the last checkpoint and consume it; return the sha."""
+        target = self._repository(target)
+        ref, current, numbers = self._integration(target, run)
+        if not numbers or current is None:
+            raise StageError("no checkpoint to undo")
+        checkpoint = f"refs/jarvis/checkpoints/{run}/{numbers[-1]}"
+        sha = self._git(target, "rev-parse", "--verify", checkpoint).decode().strip()
+        self._git(target, "update-ref", "--stdin", input=(
+            f"start\nupdate {ref} {sha} {current}\ndelete {checkpoint} {sha}\nprepare\ncommit\n").encode())
+        return sha
 
     def cleanup(self, stage: Stage) -> None:
         self._validate(stage)
