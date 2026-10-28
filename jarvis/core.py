@@ -278,6 +278,7 @@ from jarvis.work_ledger import (
 )
 from jarvis.work_plan import Plan as WorkPlan, validate as validate_work_plan
 from jarvis import clarify
+from jarvis import work_planner
 from jarvis.notify import NotificationCore
 
 
@@ -1515,17 +1516,18 @@ class AgentCore:
     # worker is started here, and nothing resumes on its own.
 
     def _project_run_payloads(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        """The (first, latest owned) event payloads: the plan binding and the
-        owner. Notification events carry no boot_id, so they never own a run."""
-        events = self.memory.work_events(run_id)
+        """The (first plan-bearing, latest owned) event payloads: the plan
+        binding and the owner. A clarify-born run binds its plan on a later
+        event (PM11). Notification events carry no boot_id, so they never own
+        a run."""
+        events = [json.loads(event.payload_json) for event in self.memory.work_events(run_id)]
         if not events:
             return {}, {}
-        first = json.loads(events[0].payload_json)
-        for event in reversed(events):
-            payload = json.loads(event.payload_json)
+        first = next((payload for payload in events if "plan" in payload), events[0])
+        for payload in reversed(events):
             if "boot_id" in payload:
                 return first, payload
-        return first, json.loads(events[-1].payload_json)
+        return first, events[-1]
 
     def create_project_run(
         self,
@@ -1708,6 +1710,7 @@ class AgentCore:
         boot_id: str,
         at: datetime,
         propose: Callable[[str, dict[str, Any]], Any],
+        plan_model: Callable[[dict[str, Any]], Any] | None = None,
     ) -> str | None:
         """One chat turn of the clarify dialog; None means ordinary chat.
 
@@ -1715,7 +1718,10 @@ class AgentCore:
         context)`` is the model: "questions" returns [{slot, text}], "answers"
         and "correction" return {slot: value}. A proposal that fails
         validation is refused and leaves the brief unchanged; a refused
-        correction re-issues the read-back on this turn."""
+        correction re-issues the read-back on this turn. ``plan_model(context)``
+        is the separate planner adapter (PM11): when given, a confirmed
+        read-back is planned on the same turn; without it the run waits in
+        planning."""
         with self._clarify_lock:
             active = self._clarify_active(conversation_id, boot_id)
             if active is None:
@@ -1758,7 +1764,7 @@ class AgentCore:
                             "Onay, özetten sonraki ayrı bir mesajla gelmeli; özeti okuyup "
                             "\"evet\" yazın."
                         )
-                    self.advance_project_run(
+                    planning = self.advance_project_run(
                         run.run_id, RunState.PLANNING, boot_id=boot_id,
                         at=max(at, run.updated_at), extra={
                             "conversation_id": conversation_id,
@@ -1766,7 +1772,12 @@ class AgentCore:
                             "large_forced": verdict.large_forced,
                         },
                     )
-                    return "Onaylandı; proje planlama aşamasına geçti."
+                    if plan_model is None:
+                        return "Onaylandı; proje planlama aşamasına geçti."
+                    return self._plan_clarified(
+                        planning, confirmed, verdict.large_forced, conversation_id,
+                        boot_id=boot_id, at=at, plan_model=plan_model,
+                    )
                 try:
                     brief, reopened = clarify.reopen_slots(
                         state.brief, _clarify_proposal(propose, "correction", context)
@@ -1807,6 +1818,53 @@ class AgentCore:
             run = self._clarify_save(run, state, conversation_id, boot_id, at)
             self._clarify_notify(run, "readback_ready", f"{state.readback.brief_hash}-{turn}")
             return clarify.render_readback(brief)
+
+    def _plan_clarified(
+        self, run: WorkRun, state: clarify.ClarifyState, large_forced: bool,
+        conversation_id: str, *, boot_id: str, at: datetime,
+        plan_model: Callable[[dict[str, Any]], Any],
+    ) -> str:
+        """PM11: ask for the plan, then validate, classify and hash it here.
+
+        Sizing facts come from the brief and the disk, never from the model.
+        Only the plan and its verdict are recorded; nothing runs or is written
+        in the project."""
+        root, facts = work_planner.brief_facts(state.brief, large_forced=large_forced)
+        base = {"conversation_id": conversation_id, "clarify": clarify.state_to_dict(state)}
+        if not os.path.isabs(root):
+            result: work_planner.Planned | work_planner.PlanFailed = work_planner.PlanFailed(
+                (work_planner.Refusal("root_not_absolute", "target location"),), 0
+            )
+        else:
+            result = work_planner.plan_project(state.brief, root, facts, plan_model)
+        if isinstance(result, work_planner.PlanFailed):
+            # The run keeps its clarify state, so a cancel still ends it.
+            self.advance_project_run(
+                run.run_id, RunState.NEEDS_INPUT, boot_id=boot_id,
+                at=max(at, run.updated_at), extra={
+                    **base, "attempts": result.attempts,
+                    "refusals": [{"code": r.code, "detail": r.detail} for r in result.refusals],
+                },
+            )
+            return (
+                "Geçerli bir proje planı oluşturulamadı. 'iptal' yazıp hedef klasörü "
+                "ve kapsamı daraltarak projeyi yeniden tarif edebilirsiniz."
+            )
+        to = RunState.AWAITING_APPROVAL if result.size == "large" else RunState.BUILDING
+        moved = advance_run(replace(run, size=RunSize(result.size)), to, at=max(at, run.updated_at))
+        # D9: the plan is bound to the confirmed read-back by its brief hash.
+        self.memory.append_work_run(moved, event_kind=EventKind.RUN_STATE, event_payload={
+            **base, "plan": result.plan.to_dict(), "plan_hash": result.plan_hash,
+            "size": result.size, "size_reasons": list(result.reasons),
+            "project_root": root, "jarvis_repo": facts["jarvis_repo"], "facts": facts,
+            "brief_hash": clarify.brief_hash(state.brief), "attempts": result.attempts,
+            "from": run.state.value, "to": to.value, "boot_id": boot_id,
+        }, prior=run)
+        if to is RunState.AWAITING_APPROVAL:
+            self._clarify_notify(moved, "plan_ready", result.plan_hash)
+            return "Plan hazır (büyük); onayınız bekleniyor."
+        label = "küçük" if result.size == "small" else "orta"
+        return f"Plan hazır ({label}); onaylanan özete bağlı olarak inşa aşamasına geçti."
 
     def _clarify_active(
         self, conversation_id: str, boot_id: str
