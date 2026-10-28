@@ -1726,13 +1726,22 @@ class AgentCore:
                             conversation_id, pending, turn=turn, boot_id=boot_id, at=at,
                             propose=propose,
                         )
-                    if answer == "no":
+                    if answer == "no" or clarify.parse_cancel(text):
                         return "Peki, projeyi başlatmıyorum."
                 if not clarify.looks_like_project(text):
                     return None
                 self._clarify_pending[conversation_id] = text
                 return clarify.CONFIRM_PROMPT
             run, state = active
+            if clarify.parse_cancel(text):
+                self.advance_project_run(
+                    run.run_id, RunState.CANCELLED, boot_id=boot_id,
+                    at=max(at, run.updated_at), extra={
+                        "conversation_id": conversation_id,
+                        "clarify": clarify.state_to_dict(state),
+                    },
+                )
+                return "Peki, projeyi iptal ettim."
             context = {
                 "text": text, "state": clarify.state_to_dict(state),
                 "empty": list(clarify.empty_slots(state.brief)),
@@ -1796,8 +1805,11 @@ class AgentCore:
             if run.state is not RunState.CLARIFYING:
                 continue
             for event in reversed(self.memory.work_events(run.run_id)):
-                payload = json.loads(event.payload_json)
-                if "clarify" not in payload:
+                try:
+                    payload = json.loads(event.payload_json)
+                except ValueError:
+                    break  # unreadable event: never continue this run
+                if not isinstance(payload, dict) or "clarify" not in payload:
                     continue  # a notification
                 if (payload.get("conversation_id") != conversation_id
                         or payload.get("boot_id") != boot_id):
@@ -1892,7 +1904,9 @@ class AgentCore:
                 return
             except WorkLedgerError:
                 if attempt == 2:
-                    raise
+                    # Best effort: the state is already saved and the reply
+                    # must describe it, never claim nothing started.
+                    return
 
     def start_session(self, objective: str = "") -> SessionState:
         session = SessionState(objective=objective)

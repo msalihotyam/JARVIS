@@ -14,6 +14,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import unicodedata
 from dataclasses import asdict, dataclass, field, replace
 
 SLOTS = (
@@ -214,6 +215,24 @@ def parse_yes_no(text: object) -> str | None:
     if folded in _NO:
         return "no"
     return None
+
+
+# PM07B: leaving the dialog. A closed set of whole-message answers, like the
+# router's L0 rule; "iptal etme" or a sentence around the word is not one.
+_CANCEL = frozenset({
+    "vazgeç", "vazgec", "vazgeçtim", "vazgectim", "vazgeçelim", "vazgecelim",
+    "iptal", "iptal et", "iptal edin", "boşver", "bosver", "boş ver", "bos ver", "cancel",
+})
+
+
+def parse_cancel(text: object) -> bool:
+    """True only when the whole message is a cancel word (case, I/İ and
+    trailing punctuation tolerated; full-width forms folded by NFKC)."""
+    if not isinstance(text, str):
+        return False
+    # "?" is kept: "iptal?" asks, it does not cancel.
+    folded = _fold(unicodedata.normalize("NFKC", text)).strip(" .!,;:")
+    return folded.replace("ı", "i") in _CANCEL
 
 
 def _text(value: object, what: str) -> str:

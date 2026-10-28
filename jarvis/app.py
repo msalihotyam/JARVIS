@@ -3607,6 +3607,8 @@ RESEARCH_PROVIDER_UNSUPPORTED = "research_provider_unsupported"
 #: The ``chat_reply_too_long`` verdict's sentence (the interface says it in its own words).
 _TOO_LONG_MESSAGE = ("The reply was longer than JARVIS keeps in one message (about 50,000 characters), so it was "
                      "cut there; the part shown was kept. Nothing was executed.")
+#: PM07B: the one reply when the clarify dialog fails; nothing else runs for that text.
+_CLARIFY_FAILED = "Proje isteğinizi şu an işleyemedim; hiçbir şey başlatılmadı. Lütfen biraz sonra tekrar deneyin."
 
 #: The execution barrier on the free-text entry: the request was understood,
 #: and nothing authoritative followed.
@@ -4282,6 +4284,11 @@ class JarvisApp:
         self.research_model = research_model
         self._cancelled_text: set[str] = set()
         self.memory_triggers = MEMORY_TRIGGERS
+        # PM07B: the clarify dialog's boot identity, turn counter and clock.
+        self._boot_id = str(uuid4())
+        self._clarify_turns = 0
+        self._clarify_turns_lock = threading.Lock()
+        self.clarify_clock: Callable[[], datetime] = utc_now
 
     def watch_conversations(self, store: Any, resolve: Callable[[], Any] | None = None) -> None:
         """PreCompact: capture exactly the turns ``store`` is about to compact,
@@ -4458,6 +4465,22 @@ class JarvisApp:
                 IntentStatus.MODEL_UNAVAILABLE,
                 availability.reason or "The understanding model is unavailable.",
             )
+        if scoped and hasattr(self.core, "clarify_turn"):
+            # PM07B: the project clarify dialog answers first; None is ordinary
+            # chat. A failure is one fail-closed reply - this text never falls
+            # through to intent resolution.
+            with self._clarify_turns_lock:
+                self._clarify_turns += 1
+                clarify_turn = self._clarify_turns
+            try:
+                clarify_reply = self.core.clarify_turn(
+                    conversation_id, text, turn=clarify_turn, boot_id=self._boot_id,
+                    at=self.clarify_clock(), propose=self._clarify_proposer(model, text),
+                )
+            except Exception:  # noqa: BLE001 - fail closed; type is not shown
+                return respond(mode, IntentStatus.CONVERSATION, request_id, reply=_CLARIFY_FAILED)
+            if clarify_reply is not None:
+                return respond(mode, IntentStatus.CONVERSATION, request_id, reply=clarify_reply)
         groups, attachments = list(context_groups), list(context_attachments)
         # One canonical conversation, read more than once below: never a one-shot iterator.
         if not isinstance(conversation, ConversationState):
@@ -4680,6 +4703,26 @@ class JarvisApp:
             destination=resolution.destination,
             choices=resolution.choices,
         )
+
+    def _clarify_proposer(self, model: Any, text: str) -> Callable[[str, dict[str, Any]], Any]:
+        """PM07B: the clarify dialog's ``propose(kind, context)`` on the intent model's call path.
+
+        The answer is JSON data only; ``clarify`` validates it. Any failure raises
+        and Core refuses the proposal."""
+        def propose(kind: str, context: dict[str, Any]) -> Any:
+            task = Task(
+                objective=json.dumps({"clarify": kind, **context}, ensure_ascii=False),
+                capability=INTENT_CAPABILITY,
+                scope=ActionScope(action=INTENT_ACTION, destination=DEFAULT_TASK_DESTINATION),
+                context={"clarify_kind": kind, "clarify": context},
+                id=str(uuid4()),
+            )
+            result = model.complete(task, SessionState(objective=text))
+            answer = result.data.get(MODEL_ANSWER_RESULT_KEY) if result.ok and isinstance(result.data, dict) else None
+            if type(answer) is not ModelAnswer or not answer.present or answer.truncated:
+                raise ValueError("no usable clarify proposal")
+            return json.loads(answer.content)
+        return propose
 
     def _intent_instruction(
         self, owner: str | None, scope: ActionScope, usage: dict[str, Any]
