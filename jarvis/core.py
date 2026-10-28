@@ -279,7 +279,7 @@ from jarvis.work_ledger import (
 )
 from jarvis.work_plan import Plan as WorkPlan, validate as validate_work_plan
 from jarvis import clarify
-from jarvis import work_planner
+from jarvis import work_planner, work_scout
 from jarvis.notify import NotificationCore
 
 
@@ -1839,6 +1839,7 @@ class AgentCore:
         at: datetime,
         propose: Callable[[str, dict[str, Any]], Any],
         plan_model: Callable[[dict[str, Any]], Any] | None = None,
+        scout: Callable[[str], str | None] | None = None,
     ) -> str | None:
         """One chat turn of the clarify dialog; None means ordinary chat.
 
@@ -1849,7 +1850,8 @@ class AgentCore:
         correction re-issues the read-back on this turn. ``plan_model(context)``
         is the separate planner adapter (PM11): when given, a confirmed
         read-back is planned on the same turn; without it the run waits in
-        planning."""
+        planning. ``scout(root)`` (PM13, e.g. work_scout.run_scout bound to a
+        runner) explores an existing target once before that call."""
         with self._clarify_lock:
             active = self._clarify_active(conversation_id, boot_id)
             if active is None:
@@ -1904,7 +1906,7 @@ class AgentCore:
                         return "Onaylandı; proje planlama aşamasına geçti."
                     return self._plan_clarified(
                         planning, confirmed, verdict.large_forced, conversation_id,
-                        boot_id=boot_id, at=at, plan_model=plan_model,
+                        boot_id=boot_id, at=at, plan_model=plan_model, scout=scout,
                     )
                 try:
                     brief, reopened = clarify.reopen_slots(
@@ -1951,6 +1953,7 @@ class AgentCore:
         self, run: WorkRun, state: clarify.ClarifyState, large_forced: bool,
         conversation_id: str, *, boot_id: str, at: datetime,
         plan_model: Callable[[dict[str, Any]], Any],
+        scout: Callable[[str], str | None] | None = None,
     ) -> str:
         """PM11: ask for the plan, then validate, classify and hash it here.
 
@@ -1964,7 +1967,9 @@ class AgentCore:
                 (work_planner.Refusal("root_not_absolute", "target location"),), 0
             )
         else:
-            result = work_planner.plan_project(state.brief, root, facts, plan_model)
+            # PM13: one read-only look at an existing target; failure -> None
+            notes = work_scout.explore(scout, root) if scout is not None else None
+            result = work_planner.plan_project(state.brief, root, facts, plan_model, scout=notes)
         if isinstance(result, work_planner.PlanFailed):
             # The run keeps its clarify state, so a cancel still ends it.
             self.advance_project_run(
