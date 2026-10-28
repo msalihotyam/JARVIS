@@ -1714,7 +1714,8 @@ class AgentCore:
         ``turn`` is the conversation's increasing turn number. ``propose(kind,
         context)`` is the model: "questions" returns [{slot, text}], "answers"
         and "correction" return {slot: value}. A proposal that fails
-        validation is refused and leaves the run unchanged."""
+        validation is refused and leaves the brief unchanged; a refused
+        correction re-issues the read-back on this turn."""
         with self._clarify_lock:
             active = self._clarify_active(conversation_id, boot_id)
             if active is None:
@@ -1742,6 +1743,8 @@ class AgentCore:
                     },
                 )
                 return "Peki, projeyi iptal ettim."
+            if run.state is RunState.NEEDS_INPUT:
+                return None  # past the round cap only a cancel is a clarify turn
             context = {
                 "text": text, "state": clarify.state_to_dict(state),
                 "empty": list(clarify.empty_slots(state.brief)),
@@ -1769,9 +1772,19 @@ class AgentCore:
                         state.brief, _clarify_proposal(propose, "correction", context)
                     )
                 except ValueError:
-                    return "Düzeltmenizi işleyemedim; lütfen neyin değişeceğini yazın."
+                    reopened = ()
                 if not reopened:
-                    return "Hangi bilgiyi düzeltmek istediğinizi yazar mısınız?"
+                    # A failed correction must not leave the old read-back
+                    # confirmable: issue it again, bound to this turn, so only
+                    # a later "evet" can confirm it.
+                    state = replace(
+                        state, readback=clarify.ReadBack(clarify.brief_hash(state.brief), turn)
+                    )
+                    run = self._clarify_save(run, state, conversation_id, boot_id, at)
+                    self._clarify_notify(
+                        run, "readback_ready", f"{state.readback.brief_hash}-{turn}"
+                    )
+                    return "Düzeltmeyi anlayamadım.\n" + clarify.render_readback(state.brief)
                 # Drop the rejected read-back first, so it can never be confirmed.
                 state = clarify.ClarifyState(brief, state.rounds_asked)
                 run = self._clarify_save(run, state, conversation_id, boot_id, at)
@@ -1798,11 +1811,14 @@ class AgentCore:
     def _clarify_active(
         self, conversation_id: str, boot_id: str
     ) -> tuple[WorkRun, clarify.ClarifyState] | None:
-        """The conversation's run in clarifying, from its latest saved state.
-        A run another boot owns is never continued; the boot sweep handles it."""
+        """The conversation's run in clarifying, or in needs-input after the
+        round cap, from its latest saved state. A run another boot owns is
+        never continued; the boot sweep handles it. The saved state must be the
+        one that moved the run to its current state, so a run that left clarify
+        and later needs input elsewhere is never taken for a clarify run."""
         # ponytail: O(runs x events) scan, index runs by conversation if they grow
         for run in self.memory.work_runs_open():
-            if run.state is not RunState.CLARIFYING:
+            if run.state not in (RunState.CLARIFYING, RunState.NEEDS_INPUT):
                 continue
             for event in reversed(self.memory.work_events(run.run_id)):
                 try:
@@ -1812,7 +1828,8 @@ class AgentCore:
                 if not isinstance(payload, dict) or "clarify" not in payload:
                     continue  # a notification
                 if (payload.get("conversation_id") != conversation_id
-                        or payload.get("boot_id") != boot_id):
+                        or payload.get("boot_id") != boot_id
+                        or payload.get("to") != run.state.value):
                     break
                 try:
                     return run, clarify.state_from_dict(payload["clarify"])

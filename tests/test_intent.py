@@ -74,11 +74,14 @@ from jarvis.intent import (
     INTENT_CAPABILITY,
     CHAT_REPLY_MAX_CHARS,
     CLAUDE_NOT_LOGGED_IN,
+    CLARIFY_SYSTEM_PROMPT,
     INTENT_SYSTEM_PROMPT,
     NL_CAPABILITIES,
+    ClaudeClarifyAdapter,
     ClaudeIntentAdapter,
     IntentStatus,
     ProposalError,
+    parse_clarify_proposal,
     parse_proposal,
     response_language_hint,
 )
@@ -1827,6 +1830,49 @@ class ClaudeModelSelectionTests(unittest.TestCase):
         self.assertEqual("", argv[argv.index("--tools") + 1])
         self.assertEqual(intent.NO_CONSOLE_WINDOW, popen.call_args[1]["creationflags"])  # no console flash
         process.kill.assert_called()
+
+
+class ClarifyProposalTests(unittest.TestCase):
+    """PM07C: the clarify proposer's own prompt and strict parser."""
+
+    def test_valid_questions_and_values_are_accepted(self) -> None:
+        questions = [{"slot": "goal", "text": "?"}]
+        self.assertEqual(questions, parse_clarify_proposal("questions", json.dumps({"questions": questions})))
+        for kind in ("answers", "correction"):
+            self.assertEqual({"goal": "x"}, parse_clarify_proposal(kind, '{"values": {"goal": "x"}}'))
+
+    def test_every_other_shape_is_refused(self) -> None:
+        cases = [
+            ("intent", '{"values": {}}'),
+            ("questions", None),
+            ("questions", b'{"questions": []}'),
+            ("questions", "not json"),
+            ("questions", '[{"slot": "goal", "text": "?"}]'),
+            ("questions", '{"questions": [], "extra": 1}'),
+            ("questions", '{"questions": {"slot": "goal"}}'),
+            ("questions", '{"values": {"goal": "x"}}'),
+            ("answers", '{"questions": []}'),
+            ("answers", '{"values": ["x"]}'),
+            ("answers", '{"values": {}, "reply": "x"}'),
+            ("correction", '"x"'),
+            ("questions", chat_proposal("Merhaba")),
+            ("answers", chat_proposal("Merhaba")),
+        ]
+        for kind, content in cases:
+            with self.subTest(kind=kind, content=content), self.assertRaises(ProposalError):
+                parse_clarify_proposal(kind, content)
+
+    def test_the_clarify_adapter_is_its_own_cold_call(self) -> None:
+        adapter = build_default_app(isolated_settings(self)).clarify_model
+        self.assertIsInstance(adapter, ClaudeClarifyAdapter)
+        command = adapter._command("p")
+        self.assertEqual(CLARIFY_SYSTEM_PROMPT, command[command.index("--system-prompt") + 1])
+        self.assertNotEqual(INTENT_SYSTEM_PROMPT, CLARIFY_SYSTEM_PROMPT)
+        self.assertEqual("claude-clarify", adapter.name)
+        self.assertEqual("claude-clarify", adapter.manifest.name)
+        self.assertEqual(("clarify",), tuple(adapter.manifest.capabilities))
+        self.assertFalse(adapter.request_on_stdin)
+        self.assertFalse(adapter.warm_claude)
 
 
 if __name__ == "__main__":  # pragma: no cover

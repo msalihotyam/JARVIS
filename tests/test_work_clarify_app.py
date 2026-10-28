@@ -64,7 +64,7 @@ class ClarifyChatTests(IntentTestCase):
         self.assertEqual([], self.runs())
 
     def test_yes_asks_questions_through_the_intent_model_path(self):
-        self.start(json.dumps(ROUND1))
+        self.start(json.dumps({"questions": ROUND1}))
         self.to_questions()
         [call] = self.model.calls
         self.assertEqual("questions", json.loads(call.objective)["clarify"])
@@ -78,7 +78,7 @@ class ClarifyChatTests(IntentTestCase):
         self.assertEqual([], self.runs())
 
     def test_cancel_ends_the_run_and_the_next_turn_is_chat(self):
-        self.start(json.dumps(ROUND1), chat_proposal("Merhaba!"))
+        self.start(json.dumps({"questions": ROUND1}), chat_proposal("Merhaba!"))
         run = self.to_questions()
         self.assertEqual("Peki, projeyi iptal ettim.", self.say("İptal!")["reply"])
         self.assertEqual([], self.runs())
@@ -110,13 +110,28 @@ class ClarifyChatTests(IntentTestCase):
         self.assertEqual(0, self.table_count("tasks"))
 
     def test_clarify_failure_mid_run_does_not_advance_it(self):
-        self.start(json.dumps(ROUND1))
+        self.start(json.dumps({"questions": ROUND1}))
         run = self.to_questions()
         before = self.memory.work_events(run.run_id)
         with mock.patch.object(self.app.core, "clarify_turn", side_effect=RuntimeError):
             self.assertEqual(_CLARIFY_FAILED, self.say("tarif saklamak")["reply"])
         self.assertEqual(before, self.memory.work_events(run.run_id))
         self.assertEqual(1, len(self.model.calls))
+
+    def test_intent_shaped_questions_are_refused(self):
+        self.start(chat_proposal("Merhaba!"))
+        self.say(IDEA)
+        self.assertTrue(self.say("evet")["reply"].startswith("Sorular hazırlanamadı"))
+        self.assertEqual([], self.runs())
+
+    def test_the_clarify_model_is_used_instead_of_the_intent_model(self):
+        self.start()
+        clarify_model = ScriptedModel(json.dumps({"questions": ROUND1}))
+        self.app.clarify_model = clarify_model
+        self.to_questions()
+        self.assertEqual([], self.model.calls)
+        [call] = clarify_model.calls
+        self.assertEqual("questions", json.loads(call.objective)["clarify"])
 
     # One test per entry point: only the chat turn carries a conversation's text.
 

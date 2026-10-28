@@ -11,7 +11,7 @@ from jarvis import clarify
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
-from jarvis.work_ledger import EventKind, RunState
+from jarvis.work_ledger import EventKind, RunState, WorkLedgerError
 
 T0 = datetime(2026, 10, 27, 9, 0, tzinfo=timezone.utc)
 CONV = "conv-1"
@@ -155,6 +155,82 @@ class ClarifyDialogTests(unittest.TestCase):
         self.assertIsNone(self.core._clarify_active(CONV, "boot-1")[1].readback)
         self.assertTrue(self.say("evet", model).startswith("Yanıtınızı işleyemedim"))
         self.assertIs(self.memory.latest_work_run(run.run_id).state, RunState.CLARIFYING)
+
+    def assert_readback_reissued(self, reply, run):
+        self.assertTrue(reply.startswith("Düzeltmeyi anlayamadım.\nAnladığım kadarıyla:"))
+        state = self.core._clarify_active(CONV, "boot-1")[1]
+        self.assertEqual(state.readback.shown_turn, self.turn)
+        # A yes in the very turn that re-issued the read-back cannot confirm it.
+        reply = self.say("evet", model=FakeModel(), turn=self.turn)
+        self.assertTrue(reply.startswith("Onay, özetten sonraki ayrı bir mesajla gelmeli"))
+        self.assertIs(self.memory.latest_work_run(run.run_id).state, RunState.CLARIFYING)
+        self.assertEqual(self.say("evet", FakeModel()), "Onaylandı; proje planlama aşamasına geçti.")
+        self.assertIs(self.memory.latest_work_run(run.run_id).state, RunState.PLANNING)
+
+    def test_failed_correction_then_yes_needs_reissued_readback(self):
+        # A-C9: the scripted model has no correction: it raises IndexError.
+        model = self.model()
+        run = self.walk_to_readback(model)
+        self.assert_readback_reissued(self.say("platform yanlış", model), run)
+
+    def test_invalid_correction_then_yes_needs_reissued_readback(self):
+        model = self.model(correction=[{"secret": "x"}])
+        run = self.walk_to_readback(model)
+        self.assert_readback_reissued(self.say("şunu değiştir", model), run)
+
+    def test_empty_correction_then_yes_needs_reissued_readback(self):
+        model = self.model(correction=[{}])
+        run = self.walk_to_readback(model)
+        self.assert_readback_reissued(self.say("bir şey değişsin", model), run)
+
+    def test_notify_seq_conflict_keeps_reply_and_state_consistent(self):
+        # A-C9: every notification write loses its seq; the saved state and
+        # the reply still agree and the re-issued read-back stays confirmable.
+        model = self.model()
+        run = self.walk_to_readback(model)
+        before = self.kinds(run.run_id)
+        with mock.patch.object(
+            self.memory, "append_work_event", side_effect=WorkLedgerError("seq taken"),
+        ) as write:
+            reply = self.say("platform yanlış", model)
+        self.assertEqual(write.call_count, 2)
+        # Only the re-issued state was saved; no notification got through.
+        self.assertEqual(self.kinds(run.run_id), before + [EventKind.RUN_STATE])
+        self.assert_readback_reissued(reply, run)
+
+    def drive_to_needs_input(self):
+        partial = [{"goal": "x"}, {"users": "ben"}, {"platform": "Windows"}]
+        model = FakeModel(
+            questions=[ROUND1, round2(partial[0]), round2({**partial[0], **partial[1]})],
+            answers=partial,
+        )
+        self.say(IDEA, model)
+        self.say("evet", model)
+        self.say("x", model)
+        self.say("ben", model)
+        reply = self.say("Windows", model)
+        self.assertTrue(reply.startswith("Soru sınırına ulaşıldı"))
+        run = self.runs()[0]
+        self.assertIs(run.state, RunState.NEEDS_INPUT)
+        return run
+
+    def test_needs_input_run_cancels_from_chat(self):
+        run = self.drive_to_needs_input()
+        self.assertEqual(self.say("iptal", FakeModel()), "Peki, projeyi iptal ettim.")
+        self.assertIs(self.memory.latest_work_run(run.run_id).state, RunState.CANCELLED)
+        self.assertEqual(self.runs(), [])
+
+    def test_needs_input_run_other_text_is_ordinary_chat(self):
+        run = self.drive_to_needs_input()
+        before = self.memory.work_events(run.run_id)
+        model = FakeModel()
+        self.assertIsNone(self.say("evet", model))
+        self.assertIsNone(self.say("tarif saklamak", model))
+        self.assertEqual(model.calls, [])
+        self.assertEqual(self.memory.work_events(run.run_id), before)
+        # Another boot never cancels it either.
+        self.assertIsNone(self.say("iptal", model, boot="boot-2"))
+        self.assertIs(self.memory.latest_work_run(run.run_id).state, RunState.NEEDS_INPUT)
 
     def test_other_boot_never_continues_run_before_sweep(self):
         model = self.model()
