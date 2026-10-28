@@ -1,7 +1,6 @@
 """PM29: the project run card - a read-only mirror of the newest project run
 whose actions are Core calls that Core re-checks."""
 
-import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -10,7 +9,9 @@ from unittest import mock
 from jarvis.core import AgentCore
 from jarvis.registry import ToolRegistry
 from jarvis.ui.bridge import _PROJECT_CARD_LABELS, _RUN_STATE_LABELS
-from jarvis.work_ledger import EventKind, RunSize, RunState, WorkEvent, WorkRun
+from jarvis.work_ledger import (
+    WAIT_RUN_STATES, EventKind, RunSize, RunState, WorkEvent, WorkRun, advance_run, event_payload_json,
+)
 from jarvis.work_plan import Plan, PlanBudget, PlanCheck, PlanSlice
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
 from tests.test_ui import _APP, UiTestCase, find, pump
@@ -65,18 +66,32 @@ class ProjectCardTests(UiTestCase):
     def run_at(self, run_id: str, size: RunSize) -> None:
         self.core.create_project_run(run_id, self.plan, project_root=self.target, jarvis_repo=False,
                                      size=size, boot_id="b", at=T0)
-        nxt = RunState.AWAITING_APPROVAL if size is RunSize.LARGE else RunState.BUILDING
-        self.core.advance_project_run(run_id, nxt, boot_id="b", at=T0)
+        if size is RunSize.LARGE:
+            self.core.advance_project_run(run_id, RunState.AWAITING_APPROVAL, boot_id="b", at=T0)
+        else:
+            # PM12: small/medium build only on the planner's read-back approval
+            # row; Core has no API for it, so write it as the planner does.
+            run = self.memory.latest_work_run(run_id)
+            record = {"run_id": run_id, "plan_hash": self.plan.plan_hash, "approver": "readback",
+                      "brief_hash": "brief", "approved_at": int(T0.timestamp()),
+                      "expires_at": int(T0.timestamp()) + 3600}
+            self.memory.append_work_run(advance_run(run, RunState.BUILDING, at=T0),
+                                        event_kind=EventKind.RUN_STATE, event_payload={
+                "from": run.state.value, "to": RunState.BUILDING.value, "boot_id": "b",
+                "plan": self.plan.to_dict(), "plan_hash": self.plan.plan_hash, "project_root": self.target,
+                "jarvis_repo": False, "brief_hash": "brief", "approval": record,
+            }, prior=run)
         self.ui.refreshProjectCard()
 
     def test_every_run_state_maps_to_a_label_and_flags(self):
         self.assertEqual(set(RunState), set(_RUN_STATE_LABELS))
-        payload = json.dumps({"project_root": self.target, "plan_hash": "h", "checks": "3/3 geçti",
+        payload = event_payload_json({"project_root": self.target, "plan_hash": "h", "checks": "3/3 geçti",
                               "diff_summary": "2 dosya", "brief": {"definition_of_done": "python app.py"}})
         for size in (RunSize.LARGE, RunSize.SMALL):
             for state in RunState:
                 with self.subTest(state=state, size=size):
-                    run = WorkRun("r", state, T0, T0, size=size)
+                    resume = RunState.BUILDING if state in WAIT_RUN_STATES else None
+                    run = WorkRun("r", state, T0, T0, size=size, resume_state=resume)
                     event = WorkEvent("r", 1, EventKind.RUN_STATE, T0, step_key="s1", payload_json=payload)
                     with mock.patch.object(self.ui, "_conversation_db", return_value=FakeStore(run, [event])):
                         card = self.ui._project_card_snapshot()
@@ -148,7 +163,7 @@ class ProjectCardTests(UiTestCase):
         self.load(self.ui)
         root = self.engine.rootObjects()[0]
         pump(50)
-        card = find(root, "projectRunCard")
+        card = find(root.contentItem(), "projectRunCard")
         self.assertIsNotNone(card)
         self.assertFalse(find(card, "projectApprove").property("enabled"))
         self.assertFalse(find(card, "projectReject").property("enabled"))
