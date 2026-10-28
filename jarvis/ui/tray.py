@@ -39,6 +39,11 @@ _ICONS: dict[str, QIcon] = {}
 _NOTICE_MS = 2000
 _NOTICE_DISMISS_MS = 2500
 
+# PM28: project-mode notifications are polled from the outbox and stay up
+# (no empty-balloon dismissal); NotifySink throttles them.
+_OUTBOX_POLL_MS = 2000
+_TOAST_MS = 8000
+
 
 class TrayController(QObject):
     """What the tray says and does, from the bridge's authoritative state."""
@@ -132,6 +137,36 @@ def _icon(badge: str) -> QIcon:
     return cached
 
 
+def outbox_fetch(bridge):
+    """``fetch(after_id)`` over the bridge's store, or None without one.
+
+    A store failure reads as "nothing new" so a poll never breaks the tray.
+    """
+    conversations = getattr(getattr(bridge, "backend", None), "conversations", None)
+    if not callable(conversations):
+        return None
+
+    def fetch(after_id: int) -> list:
+        try:
+            store = conversations()
+            return [] if store is None else store.notify_outbox_rows(after_id=after_id)
+        except Exception:
+            return []
+    return fetch
+
+
+def deliver(icon, sink) -> None:
+    """One poll: new rows in, at most one toast out (high = Warning icon)."""
+    from PySide6.QtWidgets import QSystemTrayIcon
+
+    sink.poll()
+    toast = sink.toast()
+    if toast is not None:
+        title, text, importance = toast
+        kind = QSystemTrayIcon.MessageIcon.Warning if importance == "high" else QSystemTrayIcon.MessageIcon.Information
+        icon.showMessage(title, text, kind, _TOAST_MS)
+
+
 def install_tray(app, bridge, window):
     """Create the tray icon and its menu, or return None when the platform has no tray."""
     from PySide6.QtWidgets import QMenu, QSystemTrayIcon
@@ -174,6 +209,18 @@ def install_tray(app, bridge, window):
     bridge.languageChanged.connect(refresh)
     bridge.hiddenToTray.connect(hidden)
     app.aboutToQuit.connect(icon.hide)
+    clicked = getattr(icon, "messageClicked", None)
+    if clicked is not None:
+        clicked.connect(controller.open)
+    fetch = outbox_fetch(bridge)
+    if fetch is not None:
+        from jarvis.notify_sink import NotifySink
+
+        app._jarvis_notify = sink = NotifySink(fetch)
+        poll = QTimer(icon)
+        poll.setInterval(_OUTBOX_POLL_MS)
+        poll.timeout.connect(lambda: deliver(icon, sink))
+        poll.start()
     refresh()
     icon.show()
     bridge.setTrayAvailable(True)
