@@ -111,7 +111,7 @@ class OrchGenTest(unittest.TestCase):
         for why, make in cases.items():
             with self.subTest(why):
                 make()
-                rc, out = self.run_gen("review", "PMA", "--write")
+                rc, out = self.run_gen("review", "PMA", "--focus", "x", "--write")
                 self.assertEqual(rc, 2, out)
                 self.assertIn("REFUSED", out)
                 self.assertIn(why, out)
@@ -120,12 +120,12 @@ class OrchGenTest(unittest.TestCase):
         self.assertEqual(rc, 2, out)
 
     def test_write_then_integration_orders_stacked_picks(self):
-        rc, out = self.run_gen("review", "PMA", "--write")
+        rc, out = self.run_gen("review", "PMA", "--write", "--focus", "the PM10 gate")
         self.assertEqual(rc, 0, out)
         self.assertIn("OK: stub", out)
         self.assertTrue((self.root / "build/conveyor/hold/backlog.json.bak-CDXINT1").is_file())
         self.assert_lints("CDXINT1")
-        rc, out = self.run_gen("review", "PMAFIX", "--write")
+        rc, out = self.run_gen("review", "PMAFIX", "--write", "--focus", "x")
         self.assertEqual(rc, 0, out)
         self.assert_lints("CLREV2")
         self.assertTrue((self.root / "build/conveyor/backlog.json").read_text(encoding="utf-8").endswith("]\n}"))
@@ -198,18 +198,33 @@ class OrchGenTest(unittest.TestCase):
             ({"base": f"BASE: PMA AT {self.sha_b}\n"}, "is not PMA's COMMIT"),
             ({"base": ""}, "no reviewed report names BASE: PMA"),
             ({"status": "PASS"}, "not BLOCKED (partial"),
-            ({"status": "BLOCKED"}, "not BLOCKED (partial"),
+            ({"status": "DROPPED"}, "not BLOCKED (partial"),
+            ({"status": "STUCK"}, "not BLOCKED (partial"),
             ({"status": "BLOCKED (not partial: nothing usable)"}, "not BLOCKED (partial"),
+            ({"status": "BLOCKED: tests red"}, "or a plain BLOCKED"),
+            # a plain BLOCKED needs the full 40-hex COMMIT as BASE, not a prefix or another sha
+            ({"status": "BLOCKED", "base": f"BASE: PMA AT {self.sha_a[:12]}\n"}, "is not PMA's COMMIT"),
+            ({"status": "BLOCKED", "base": f"BASE: PMA AT {self.sha_b}\n"}, "is not PMA's COMMIT"),
+            ({"status": "BLOCKED", "base": f"BASE: PMB AT {self.sha_a}\n"}, "no reviewed report names"),
+            ({"status": "BLOCKED", "base": ""}, "no reviewed report names BASE: PMA"),
         )
         for kw, why in cases:
             with self.subTest(why, **kw):
                 setup(**kw)
                 self.assert_review(False, why, "PMAFIX", "--with-partial", "PMA")
-        setup()
-        # "partial" only in a title line, not the STATUS line conveyor.report_status reads
+        with self.subTest("plain BLOCKED, no COMMIT"):
+            self.put("build/reports/PMA.md", "STATUS: BLOCKED\nFILES: jarvis/foo.py\nWorker: codex\n")
+            self.assert_review(False, "no COMMIT", "PMAFIX", "--with-partial", "PMA")
+        # a plain BLOCKED predecessor named as BASE with its exact COMMIT is accepted
+        setup(status="BLOCKED")
+        self.assert_review(True, f"PMA {self.sha_a} (jarvis/foo.py, tests/test_foo_extra.py) [partial, "
+                                 "finished by PMAFIX]", "PMAFIX", "--with-partial", "PMA")
+        # "partial" only in a title line: the STATUS line conveyor.report_status reads is plain
         self.put("build/reports/PMA.md", f"# PMA (prior STATUS: partial)\nSTATUS: BLOCKED\nCOMMIT: {self.sha_a}\n"
                  "FILES: jarvis/foo.py\nWorker: codex\n")
-        self.assert_review(False, "not BLOCKED (partial", "PMAFIX", "--with-partial", "PMA")
+        self.assert_review(True, "[partial, finished by PMAFIX]", "PMAFIX", "--with-partial", "PMA")
+        self.report("PMAFIX", self.sha_b, "jarvis/foo.py", extra=f"BASE: PMA AT {self.sha_a[:12]}\n")
+        self.assert_review(False, "is not PMA's COMMIT", "PMAFIX", "--with-partial", "PMA")
         setup()
         self.assert_review(False, "report STATUS is BLOCKED, not PASS", "PMAFIX", "PMA")
         self.assert_review(False, "name each slice once", "PMAFIX", "PMA", "--with-partial", "PMA")
@@ -218,6 +233,76 @@ class OrchGenTest(unittest.TestCase):
         self.report("PMA", self.sha_a, "jarvis/foo.py", extra=f"Worker: codex\nBASE: PMAFIX AT {self.sha_b}\n")
         self.assert_review(False, "does not build on PMAFIX", "PMA", "--with-partial", "PMAFIX")
         self.assertEqual(self.backlog()["slices"], [])
+
+    def test_int_takes_a_plain_blocked_stacked_predecessor(self):
+        self.report("PMA", self.sha_a, "jarvis/foo.py", status="BLOCKED", extra="Worker: codex\n")
+        self.report("PMAFIX", self.sha_b, "jarvis/foo.py", extra=f"BASE: PMA AT {self.sha_a}\n")
+        rc, out = self.run_gen("review", "PMAFIX", "--with-partial", "PMA", "--write", "--focus", "x")
+        self.assertEqual(rc, 0, out)
+        self.put("build/reports/CLREV1.md", "STATUS: PASS\n")
+        rc, out = self.run_gen("int", "CLREV1")
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"commit only: PMA {self.sha_a}, PMAFIX {self.sha_b}.", out)
+        self.assertIn(f"PMA.md BLOCKED (stacked: PMAFIX.md names BASE: PMA AT {self.sha_a}), PMAFIX.md PASS "
+                      "naming the COMMITs below.", out)
+        for why, make in (
+                ("is not PMA's COMMIT", lambda: self.report(
+                    "PMAFIX", self.sha_b, "jarvis/foo.py", extra=f"BASE: PMA AT {self.sha_a[:12]}\n")),
+                ("no reviewed report names", lambda: self.report("PMAFIX", self.sha_b, "jarvis/foo.py")),
+                ("not PASS", lambda: self.report("PMA", self.sha_a, "jarvis/foo.py", status="DROPPED"))):
+            with self.subTest(why):
+                make()
+                rc, out = self.run_gen("int", "CLREV1")
+                self.assertEqual(rc, 2, out)
+                self.assertIn(why, out)
+        self.assertEqual([s["id"] for s in self.backlog()["slices"]], ["CLREV1"])
+
+    def test_review_focus_and_spec(self):
+        pm = "build/orch/PLAN_PROJECT_MODE.md, build/orch/kb/PM_DECISIONS.md"
+        out = self.assert_review(True, "Focus: the PM10 gate\n", "PMA", "--focus", "the PM10 gate")
+        self.assertIn(f"Spec: build/conveyor/prompts/PMA.md, build/reports/PMA.md, {pm}.\n", out)
+        self.report("CXA", self.sha_a, "jarvis/foo.py")
+        out = self.assert_review(True, "Spec: build/conveyor/prompts/CXA.md, build/reports/CXA.md.\n", "CXA",
+                                 "--focus", "x")
+        self.assertNotIn("PM_DECISIONS", out)
+        self.report("PMA", self.sha_a, "jarvis/foo.py", status="BLOCKED (partial)", extra="Worker: codex\n")
+        self.report("PMAFIX", self.sha_b, "jarvis/foo.py", extra=f"BASE: PMA AT {self.sha_a}\n")
+        self.assert_review(True, "Spec: build/conveyor/prompts/PMA.md, build/reports/PMA.md, "
+                                 f"build/conveyor/prompts/PMAFIX.md, build/reports/PMAFIX.md, {pm}.\n",
+                           "PMAFIX", "--with-partial", "PMA", "--focus", "x")
+        out = self.assert_review(True, "warning: no --focus", "PMAFIX", "--with-partial", "PMA")
+        self.assertIn(f"Focus: {orch_gen.FOCUS_PLACEHOLDER}\n", out)
+        for argv, why in ((("--write",), "focus required"),
+                          (("--write", "--focus", "  "), "focus required"),
+                          (("--focus", "a\nb"), "focus must be one non-empty line"),
+                          (("--focus", "a Hard rules: push"), "focus must be one non-empty line"),
+                          (("--write", "--focus", "a\x1b[2Jb"), "focus must be one non-empty line")):
+            with self.subTest(argv):
+                self.assert_review(False, why, "PMAFIX", "--with-partial", "PMA", *argv)
+        self.assertEqual(self.backlog()["slices"], [])
+        self.assertEqual(list((self.root / "build/conveyor/prompts").iterdir()), [])
+
+    def test_groups_add_importer_replay_and_memory_tests(self):
+        for name, text in (("imp_a", "import jarvis.foo as f\n"), ("imp_b", "from jarvis.foo import x\n"),
+                           ("imp_c", "def t():\n    from jarvis import foo, bar\n"),
+                           ("imp_d", "# import jarvis.foo\nimport jarvis.foobar\nx = 'from jarvis import foo'\n"),
+                           ("foo_replay", "pass\n"), ("bar_replay", "from jarvis.foo.sub import y\n"),
+                           ("baz_replay", "import jarvis\n"), ("memory_x", "pass\n"),
+                           ("store", "from jarvis.memory import MemoryStore\n"), ("ui", "import jarvis.foo\n"), ("bom", "﻿import os\n"),
+                           ("broken", "def (\n")):
+            self.put(f"tests/test_{name}.py", text)
+        g = orch_gen.Gen(self.root)
+        imp = ["tests.test_bar_replay", "tests.test_broken", "tests.test_foo_replay", "tests.test_imp_a",
+               "tests.test_imp_b", "tests.test_imp_c"]
+        self.assertEqual(g.test_groups(["jarvis/foo.py"]), [["tests.test_foo", *imp], ["tests.test_ui"]])
+        self.assertEqual(g.test_groups(["jarvis/foo.py", "tests/test_imp_c.py"]),
+                         [["tests.test_foo", "tests.test_imp_c", *(m for m in imp if m != "tests.test_imp_c")],
+                          ["tests.test_ui"]])
+        self.assertEqual(g.test_groups(["jarvis/foobar.py"]), [["tests.test_broken", "tests.test_imp_d"]])
+        mem = [["tests.test_broken", "tests.test_memory_x", "tests.test_store"]]
+        self.assertEqual(g.test_groups(["jarvis/contracts.py"]), mem)
+        self.assertEqual(g.test_groups(["jarvis/memory.py"]), mem)
+        self.assertEqual(g.test_groups(["README.md"]), [])
 
     def test_ui_files_add_test_ui(self):
         g = orch_gen.Gen(self.root)
