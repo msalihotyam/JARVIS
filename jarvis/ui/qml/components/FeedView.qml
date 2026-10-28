@@ -1128,6 +1128,14 @@ Item {
                 // which the stack skips.
                 sourceComponent: Component { SafetyCards { width: stack.width; inset: feed.messageX } }
             }
+            Loader {
+                // PM29: the newest project run, while there is one.
+                id: projectRunLoader
+                objectName: "projectRunLoader"
+                width: stack.width
+                active: !!bridge.projectCard.runId
+                sourceComponent: Component { ProjectRunCard { width: stack.width; inset: feed.messageX } }
+            }
         }
     }
 

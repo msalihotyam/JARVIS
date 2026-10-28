@@ -14,6 +14,8 @@ selection and cancellation it is handed.
 from __future__ import annotations
 
 import contextlib
+import json
+import logging
 import os
 import tempfile
 import threading
@@ -21,13 +23,16 @@ import time
 import unicodedata
 import weakref
 from pathlib import Path
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 from uuid import uuid4
 
-from PySide6.QtCore import Property, QDateTime, QLocale, QObject, Qt, QThreadPool, QTimer, QUrl, Signal, Slot
-from PySide6.QtGui import QWindow
+from PySide6.QtCore import (Property, QCoreApplication, QDateTime, QLocale, QObject, Qt, QThreadPool, QTimer, QUrl,
+                            Signal, Slot)
+from PySide6.QtGui import QDesktopServices, QWindow
 import shiboken6
+
+from jarvis.work_ledger import ACTIVE_RUN_STATES, TERMINAL_RUN_STATES, RunSize, RunState, WorkLedgerError
 
 from jarvis.context_items import (
     DEFAULT_RESPONSE_MODE,
@@ -219,6 +224,40 @@ _K3_NOTICES = (QT_TRANSLATE_NOOP("Bridge", "JARVIS is frozen; no new folder requ
                QT_TRANSLATE_NOOP("Bridge", "JARVIS could not propose a folder for this project. Nothing was created."))
 
 
+log = logging.getLogger(__name__)
+
+# PM29 project run card texts (Turkish, "siz"); the card renders them as plain text.
+_RUN_STATE_LABELS = {
+    RunState.CLARIFYING: "Ayrıntılar netleştiriliyor",
+    RunState.PLANNING: "Plan hazırlanıyor",
+    RunState.AWAITING_APPROVAL: "Onayınızı bekliyor",
+    RunState.BUILDING: "Yapılıyor",
+    RunState.ACCEPTING: "Kontroller çalışıyor",
+    RunState.INTEGRATING: "Birleştiriliyor",
+    RunState.NEEDS_INPUT: "Sizden bilgi bekliyor",
+    RunState.BLOCKED_BUDGET: "Bütçe sınırında durdu",
+    RunState.PAUSED: "Duraklatıldı",
+    RunState.INTERRUPTED: "Yarıda kesildi",
+    RunState.DONE: "Tamamlandı",
+    RunState.FAILED: "Başarısız oldu",
+    RunState.CANCELLED: "İptal edildi",
+}
+_PROJECT_CARD_LABELS = {
+    "title": "Proje", "slice": "Şu anki adım", "checks": "Kontroller", "diff": "Değişiklikler",
+    "hint": "Nasıl çalıştırılır", "approve": "Onayla", "reject": "Reddet", "pause": "Duraklat",
+    "cancel": "İptal et", "show": "Sonucu göster", "recent": "Son bildirimler",
+    "refused": "İşlem JARVIS tarafından reddedildi.",
+}
+
+
+def _card_text(value: Any, cap: int) -> str:
+    """One capped, redacted plain line from an untrusted payload value."""
+    if value is None or value == "":
+        return ""
+    text = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, default=str)
+    return redact_credentials(" ".join(text.split())[:cap])[0]
+
+
 def _project_run(prior: dict, payload: Any, intent: Any = None) -> dict[str, Any]:
     """One conversation's slots after a task envelope (a run, a decision, a cancel, a resume, a
     clarify), from that conversation's own prior slots only. A run envelope answers any
@@ -379,6 +418,15 @@ class Bridge(QObject):
         self._telemetry_timer.timeout.connect(self._sample_telemetry)
         QTimer.singleShot(1_500, self._sample_telemetry)
         self._telemetry_timer.start()
+        # PM29 project run card: polled on the telemetry clock; Core is
+        # injectable (tests) and otherwise resolved lazily from the backend.
+        self.project_core = None
+        self.project_clock = lambda: datetime.now(timezone.utc)
+        self._project_boot = f"ui-{uuid4().hex}"
+        self._project_card: dict = {}
+        self._project_notice = ""
+        self._project_last = ""
+        self._telemetry_timer.timeout.connect(self.refreshProjectCard)
         # Current weather for the clock card (jarvis.ui.weather): the operator's
         # fixed place, its own thread (never the chat worker), every ~5 minutes,
         # and no network at all without a key. The key is held here only.
@@ -1314,6 +1362,132 @@ class Bridge(QObject):
         self._note(("Bridge", QT_TRANSLATE_NOOP("Bridge", "Opened a conversation (1 turn)") if count == 1
                     else QT_TRANSLATE_NOOP("Bridge", "Opened a conversation (%1 turns)"), (count,)), "system")
         return True
+
+    # -- project run card (PM29): read-only view of the newest project run --
+    #
+    # The card only mirrors the ledger; every action is a Core call that
+    # re-checks the run (size, state, plan hash) and may refuse. The enable
+    # flags merely predict Core so a button Core would refuse stays disabled.
+
+    projectCardChanged = Signal()
+
+    @Property(dict, notify=projectCardChanged)
+    def projectCard(self) -> dict:
+        return self._project_card
+
+    @Slot()
+    def refreshProjectCard(self) -> None:
+        try:
+            card = self._project_card_snapshot()
+        except Exception:                       # a broken store hides the card, never the window
+            log.debug("project card refresh failed", exc_info=True)
+            card = {}
+        if card != self._project_card:
+            self._project_card = card
+            self.projectCardChanged.emit()
+
+    def _project_card_snapshot(self) -> dict:
+        store = self._conversation_db()
+        if store is None:
+            return {}
+        runs = sorted(store.work_runs_open(), key=lambda r: r.updated_at)
+        run = runs[-1] if runs else (store.latest_work_run(self._project_last) if self._project_last else None)
+        if run is None:
+            return {}
+        state = RunState(run.state)
+        large = run.size == RunSize.LARGE
+        found: dict[str, Any] = {}
+        current = ""
+        for event in store.work_events(run.run_id):
+            current = event.step_key or current
+            try:
+                payload = json.loads(event.payload_json or "{}")
+            except ValueError:
+                continue
+            if isinstance(payload, dict):
+                for key in ("checks", "verdict", "diff_summary", "plan_hash", "project_root", "brief"):
+                    if key in payload:
+                        found[key] = payload[key]
+        brief = found.get("brief")
+        root = _card_text(found.get("project_root"), 400)
+        return {
+            "runId": run.run_id, "state": state.value, "stateLabel": _RUN_STATE_LABELS[state],
+            "size": run.size.value if run.size else "",
+            "currentSlice": _card_text(current, 120),
+            "checks": _card_text(found.get("checks", found.get("verdict")), 240),
+            "diffSummary": _card_text(found.get("diff_summary"), 240),
+            "runHint": _card_text(brief.get("definition_of_done") if isinstance(brief, dict) else "", 400),
+            "planHash": _card_text(found.get("plan_hash"), 128), "projectRoot": root,
+            "canApprove": large and state is RunState.AWAITING_APPROVAL,
+            "canReject": large and state is RunState.AWAITING_APPROVAL,
+            "canPause": state in ACTIVE_RUN_STATES,
+            "canCancel": state not in TERMINAL_RUN_STATES,
+            "canShowResult": state is RunState.DONE and bool(root),
+            "notice": self._project_notice,
+            "notifications": self._project_notifications(),
+            "labels": _PROJECT_CARD_LABELS,
+        }
+
+    @staticmethod
+    def _project_notifications() -> list[str]:
+        sink = getattr(QCoreApplication.instance(), "_jarvis_notify", None)
+        if sink is None:
+            return []
+        return [_card_text(f"{item.get('title', '')} — {item.get('text', '')}", 160) for item in sink.recent()[-5:]]
+
+    def _project_agent_core(self):
+        if self.project_core is not None:
+            return self.project_core
+        try:
+            loaded = self.backend.store.load()
+            return self.backend._app(loaded.settings).core if loaded.usable else None
+        except Exception:
+            log.debug("project core unavailable", exc_info=True)
+            return None
+
+    def _project_act(self, action: Callable[[Any, str, datetime], Any]) -> bool:
+        run_id = str(self._project_card.get("runId") or "")
+        core = self._project_agent_core()
+        ok = False
+        if run_id and core is not None:
+            try:
+                action(core, run_id, self.project_clock())
+                ok = True
+            except (WorkLedgerError, ValueError):
+                log.info("project action refused for %s", run_id)
+        self._project_last = run_id or self._project_last
+        self._project_notice = "" if ok else _PROJECT_CARD_LABELS["refused"]
+        self.refreshProjectCard()
+        return ok
+
+    @Slot(result=bool)
+    def approveProjectPlan(self) -> bool:
+        plan_hash = str(self._project_card.get("planHash") or "")
+        return self._project_act(lambda core, run_id, at: core.approve_project_plan(
+            run_id, plan_hash, approver="operator", boot_id=self._project_boot, at=at,
+            expires_at=at + timedelta(hours=1)))
+
+    @Slot(result=bool)
+    def rejectProjectPlan(self) -> bool:
+        return self._project_act(lambda core, run_id, at: core.reject_project_plan(
+            run_id, approver="operator", boot_id=self._project_boot, at=at))
+
+    @Slot(result=bool)
+    def pauseProjectRun(self) -> bool:
+        return self._project_act(lambda core, run_id, at: core.advance_project_run(
+            run_id, RunState.PAUSED, boot_id=self._project_boot, at=at))
+
+    @Slot(result=bool)
+    def cancelProjectRun(self) -> bool:
+        return self._project_act(lambda core, run_id, at: core.advance_project_run(
+            run_id, RunState.CANCELLED, boot_id=self._project_boot, at=at))
+
+    @Slot(result=bool)
+    def showProjectResult(self) -> bool:
+        card = self._project_card
+        if not card.get("canShowResult"):
+            return False
+        return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(card["projectRoot"])))
 
     # -- projects (Gate 6A): the window's view of the Gate 1-5 project model --
     #
