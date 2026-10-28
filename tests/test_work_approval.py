@@ -7,7 +7,7 @@ from datetime import timedelta
 from pathlib import Path
 
 from jarvis.contracts import WorkApproval
-from jarvis.core import AgentCore, ResumeRefused
+from jarvis.core import _BINDING_KEYS, AgentCore, ResumeRefused
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.work_controls import Budget, Usage
@@ -49,6 +49,15 @@ class ApprovalGateTests(unittest.TestCase):
     def payloads(self, run_id="r1"):
         return [json.loads(e.payload_json) for e in self.memory.work_events(run_id)]
 
+    def rebind(self, to, plan, plan_hash=None, at=T0):
+        """A store-level binding row, as only the planner writes one."""
+        run = self.memory.latest_work_run("r1")
+        kind = EventKind.INTERRUPTED if to is RunState.INTERRUPTED else EventKind.RUN_STATE
+        self.memory.append_work_run(advance_run(run, to, at=at), event_kind=kind, event_payload={
+            "from": run.state.value, "to": to.value, "boot_id": "old", "plan": plan.to_dict(),
+            "plan_hash": plan_hash or plan.plan_hash, "project_root": self.root, "jarvis_repo": False,
+        }, prior=run)
+
     def test_large_needs_an_operator_approval(self):
         self.awaiting()
         with self.assertRaisesRegex(WorkLedgerError, "approval refused: no approval"):
@@ -84,9 +93,8 @@ class ApprovalGateTests(unittest.TestCase):
     def test_replanned_run_needs_an_approval_of_the_new_plan(self):
         self.awaiting()
         other = self.other_plan()
-        self.core.advance_project_run("r1", RunState.PLANNING, boot_id="old", at=T0, extra={
-            "plan": other.to_dict(), "plan_hash": other.plan_hash,
-        })
+        # The planner rebinds a replan by appending the bound plan itself.
+        self.rebind(RunState.PLANNING, other)
         self.core.advance_project_run("r1", RunState.AWAITING_APPROVAL, boot_id="old", at=T0)
         with self.assertRaisesRegex(WorkLedgerError, "another run or plan"):
             self.approve()
@@ -104,7 +112,7 @@ class ApprovalGateTests(unittest.TestCase):
                     self.core.reject_project_plan("r1", approver=approver, boot_id="old", at=T0)
         forged = {"run_id": "r1", "plan_hash": self.plan.plan_hash, "approver": "operator",
                   "approved_at": 0, "expires_at": 4102444800}
-        with self.assertRaisesRegex(WorkLedgerError, "only by approve_project_plan"):
+        with self.assertRaisesRegex(WorkLedgerError, "recorded only by the planner or approve_project_plan"):
             self.core.advance_project_run("r1", RunState.PAUSED, boot_id="old", at=T0, extra={"approval": forged})
         self.assertIs(self.memory.latest_work_run("r1").state, RunState.AWAITING_APPROVAL)
 
@@ -155,20 +163,69 @@ class ApprovalGateTests(unittest.TestCase):
         self.assertIs(self.memory.latest_work_run("r1").state, RunState.INTERRUPTED)
 
     def test_plan_change_after_approval_is_refused(self):
-        other = self.other_plan()
-        # Resume revalidates the latest binding before the gate, so a rebound
-        # plan is refused there already; either way the run never builds.
-        for plan_hash, detail in ((other.plan_hash, "root_mismatch"),
-                                  (self.plan.plan_hash, "the plan no longer matches its bound hash")):
-            with self.subTest(detail=detail):
+        # A valid Q with its matching hash passes revalidation and reaches the
+        # gate, which holds P's approval; a mismatched hash stops earlier.
+        for matching, refusal in ((True, ("approval", "the approval is for another run or plan")),
+                                  (False, ("plan", "the plan no longer matches its bound hash"))):
+            with self.subTest(refusal=refusal):
                 self.setUp()
                 self.awaiting()
                 self.approve()
-                self.core.advance_project_run("r1", RunState.INTERRUPTED, boot_id="old", at=T0 + timedelta(minutes=2),
-                                              extra={"plan": other.to_dict(), "plan_hash": plan_hash})
+                other = self.other_plan()
+                plan_hash = other.plan_hash if matching else self.plan.plan_hash
+                self.rebind(RunState.INTERRUPTED, other, plan_hash, at=T0 + timedelta(minutes=2))
                 refused = self.resume()
-                self.assertEqual((refused.code, refused.detail), ("plan", detail))
+                self.assertIsInstance(refused, ResumeRefused)
+                self.assertEqual((refused.code, refused.detail), refusal)
                 self.assertIs(self.memory.latest_work_run("r1").state, RunState.INTERRUPTED)
+
+    def test_extra_cannot_rebind_a_building_transition(self):
+        # CDXINT113 F1: a valid Q + matching hash after P was approved.
+        self.awaiting()
+        self.approve()
+        self.core.advance_project_run("r1", RunState.ACCEPTING, boot_id="old", at=T0 + timedelta(minutes=2))
+        other = self.other_plan()
+        events = self.memory.work_events("r1")
+        with self.assertRaisesRegex(WorkLedgerError, "recorded only by the planner or approve_project_plan"):
+            self.core.advance_project_run("r1", RunState.BUILDING, boot_id="old", at=T0 + timedelta(minutes=3),
+                                          extra={"plan": other.to_dict(), "plan_hash": other.plan_hash})
+        self.assertIs(self.memory.latest_work_run("r1").state, RunState.ACCEPTING)
+        self.assertEqual(self.memory.work_events("r1"), events)
+        self.assertIs(self.core.advance_project_run(
+            "r1", RunState.BUILDING, boot_id="old", at=T0 + timedelta(minutes=3), extra={"resumed": False},
+        ).state, RunState.BUILDING)
+
+    def test_no_transition_takes_a_binding_key_in_extra(self):
+        class Key(str):
+            pass
+
+        other = self.other_plan()
+        values = {"plan": other.to_dict(), "plan_hash": other.plan_hash, "brief_hash": "b",
+                  "approval": {"approver": "operator"}, "project_root": self.root, "jarvis_repo": True,
+                  "size": "small", "size_reasons": [], "facts": {}}
+        self.assertEqual(set(values), _BINDING_KEYS)
+        keys = [*values, Key("plan"), Key("resumed"), 1, ("plan",)]
+        self.awaiting()
+        events = self.memory.work_events("r1")
+        for to in (RunState.BUILDING, RunState.PLANNING, RunState.PAUSED, RunState.INTERRUPTED, RunState.CANCELLED):
+            for key in keys:
+                with self.subTest(to=to, key=key):
+                    with self.assertRaisesRegex(WorkLedgerError, "recorded only by the planner"):
+                        self.core.advance_project_run("r1", to, boot_id="old", at=T0,
+                                                      extra={key: values.get(key, other.plan_hash)})
+                    self.assertEqual(self.memory.work_events("r1"), events)
+        self.assertIs(self.memory.latest_work_run("r1").state, RunState.AWAITING_APPROVAL)
+
+    def test_gate_judges_the_binding_the_event_will_record(self):
+        self.awaiting()
+        self.approve()
+        run = self.memory.latest_work_run("r1")
+        at = T0 + timedelta(minutes=2)
+        other = self.other_plan()
+        self.assertIsNone(self.core._approval_gate(run, at))
+        self.assertIsNone(self.core._approval_gate(run, at, pending={"resumed": True}))
+        self.assertEqual(self.core._approval_gate(run, at, pending={"plan": other.to_dict(), "plan_hash": other.plan_hash}),
+                         "the approval is for another run or plan")
 
     def test_reject_ends_cancelled(self):
         self.awaiting()

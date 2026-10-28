@@ -1406,6 +1406,12 @@ class ResumeRefused:
 _PLAN_APPROVERS = frozenset({"operator"})
 # A read-back approval lapses after a day at most, whatever the plan claims.
 _READBACK_TTL_S = 86_400
+# Event keys that bind a run to a plan or approve it; advance_project_run
+# refuses them in ``extra`` on every transition.
+_BINDING_KEYS = frozenset({
+    "plan", "plan_hash", "brief_hash", "approval", "project_root", "jarvis_repo",
+    "size", "size_reasons", "facts",
+})
 
 
 def _lease_fold(target: str) -> str:
@@ -1582,17 +1588,19 @@ class AgentCore:
         run = self.memory.latest_work_run(run_id)
         if run is None:
             raise WorkLedgerError("unknown project run")
-        if extra and "approval" in extra:
-            raise WorkLedgerError("an approval is recorded only by approve_project_plan")
+        # PM12FIX: only the planner and approve_project_plan write a binding;
+        # exact str keys, so no str subclass can serialise as one.
+        if any(type(key) is not str or key in _BINDING_KEYS for key in extra or {}):
+            raise WorkLedgerError(
+                "a plan binding or approval is recorded only by the planner or approve_project_plan")
+        payload = {**(extra or {}), "from": run.state.value, "to": to.value, "boot_id": boot_id}
         if to is RunState.BUILDING:
-            reason = self._approval_gate(run, at)
+            reason = self._approval_gate(run, at, pending=payload)
             if reason is not None:
                 raise WorkLedgerError(f"approval refused: {reason}")
         moved = advance_run(run, to, at=at)
         kind = EventKind.INTERRUPTED if to is RunState.INTERRUPTED else EventKind.RUN_STATE
-        self.memory.append_work_run(moved, event_kind=kind, event_payload={
-            **(extra or {}), "from": run.state.value, "to": to.value, "boot_id": boot_id,
-        }, prior=run)
+        self.memory.append_work_run(moved, event_kind=kind, event_payload=payload, prior=run)
         return moved
 
     def _approval_refusal(
@@ -1631,9 +1639,14 @@ class AgentCore:
             return "the approval is expired or not yet valid"
         return None
 
-    def _approval_gate(self, run: WorkRun, now: datetime) -> str | None:
-        """PM12: the latest approval checked against the latest bound plan."""
+    def _approval_gate(
+        self, run: WorkRun, now: datetime, pending: dict[str, Any] | None = None
+    ) -> str | None:
+        """PM12: the latest approval checked against the latest bound plan,
+        counting the ``pending`` event payload as already recorded."""
         events = [json.loads(event.payload_json) for event in self.memory.work_events(run.run_id)]
+        if pending is not None:
+            events.append(pending)
         bound = next((payload for payload in reversed(events) if "plan" in payload), None)
         record = next((payload["approval"] for payload in reversed(events) if "approval" in payload), None)
         return self._approval_refusal(run, record, bound, now)

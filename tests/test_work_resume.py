@@ -10,7 +10,7 @@ from jarvis.core import AgentCore, ResumeRefused
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.work_controls import Budget, Usage
-from jarvis.work_ledger import EventKind, RunSize, RunState, WorkEvent, WorkLedgerError, WorkRun
+from jarvis.work_ledger import EventKind, RunSize, RunState, WorkEvent, WorkLedgerError, WorkRun, advance_run
 from jarvis.work_plan import Plan, PlanBudget, PlanCheck, PlanSlice
 
 T0 = datetime(2026, 10, 27, 9, 0, tzinfo=timezone.utc)
@@ -139,6 +139,33 @@ class WorkResumeTests(unittest.TestCase):
             self.assertEqual((row["run_id"], row["boot_id"]), ("r1", "new"))
             self.assertGreater(row["expires_at"], row["claimed_at"])
         self.assertEqual(self.resume().code, "not_interrupted")
+
+    def test_small_run_resumes_on_the_default_budget(self):
+        run = self.core.create_project_run(
+            "r1", self.plan, project_root=self.root, jarvis_repo=False,
+            size=RunSize.SMALL, boot_id="old", at=T0,
+        )
+        at, brief = int(T0.timestamp()), "b" * 64
+        self.memory.append_work_run(advance_run(run, RunState.BUILDING, at=T0), event_kind=EventKind.RUN_STATE, event_payload={
+            "from": "planning", "to": "building", "boot_id": "old",
+            "plan": self.plan.to_dict(), "plan_hash": self.plan.plan_hash, "brief_hash": brief,
+            "project_root": self.root, "jarvis_repo": False,
+            "approval": {
+                "run_id": "r1", "plan_hash": self.plan.plan_hash, "approver": "readback",
+                "brief_hash": brief, "approved_at": at, "expires_at": at + 3600,
+            },
+        }, prior=run)
+        for target in TARGETS:
+            self.memory.claim_work_lease(target, "r1", "old", now=T0, lease=LEASE)
+        self.core.recover_project_runs("new", now=T0 + timedelta(minutes=1))
+        kwargs = dict(
+            boot_id="new", now=T0 + timedelta(minutes=2), granted_targets=GRANTED,
+            lease=LEASE,
+        )
+        self.assertEqual(self.core.resume_project_run("r1", usage=Usage(model_calls=50), **kwargs).code, "budget")
+        resumed = self.core.resume_project_run("r1", usage=Usage(), **kwargs)
+        self.assertIs(resumed.state, RunState.BUILDING)
+        self.assertIs(self.memory.latest_work_run("r1").state, RunState.BUILDING)
 
     def test_events_are_append_only(self):
         self.killed_run()
