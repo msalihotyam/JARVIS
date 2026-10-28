@@ -199,14 +199,16 @@ class GrantEnvelope:
 
 
 def classify(brief_facts, plan):
-    """Return (D4 size, reasons), without reading any model class field.
+    """Return (D4 size, reasons), without reading any model size class field.
 
     brief_facts is a dict with target_folders (a nonempty list/tuple of
     distinct folder strings) and explicit boolean existing_repo,
     outgoing_actions, money_actions, manual_checks and jarvis_repo facts.
-    plan is a Plan or a dict with positive integer slice_count and a
-    list/tuple of new_dependencies. Dependencies alone do not imply an
-    install: any network install must be declared in outgoing_actions.
+    plan is a Plan or a dict with positive integer slice_count and
+    list/tuples of new_dependencies, connector_classes and operation_classes.
+    Any declared or unknown connector/operation class forces large, so the
+    size never comes from the brief alone (CDXINT109 F2). Dependencies alone
+    do not imply an install: any network install must be declared in outgoing_actions.
     Missing/invalid facts fail closed. More than 15 slices is always large,
     including in an existing repo. No filesystem or environment is read.
     """
@@ -229,9 +231,11 @@ def classify(brief_facts, plan):
     if type(plan) is Plan:
         count = len(plan.slices)
         dependencies = plan.new_dependencies
+        classes = plan.connector_classes, plan.operation_classes
     elif type(plan) is dict:
         count = plan.get("slice_count")
         dependencies = plan.get("new_dependencies")
+        classes = plan.get("connector_classes"), plan.get("operation_classes")
     else:
         return "large", reasons + ["unknown plan facts"]
     if type(count) is not int or count < 1:
@@ -241,6 +245,15 @@ def classify(brief_facts, plan):
     if (type(dependencies) not in (list, tuple)
             or any(type(v) is not str or not v.strip() for v in dependencies)):
         reasons.append("unknown new_dependencies")
+    for value, known in zip(classes, (CONNECTOR_CLASSES, OPERATION_CLASSES)):
+        if type(value) not in (list, tuple) or any(v not in known for v in value):
+            reason = "unknown action classes"
+        elif value:
+            reason = "declared action classes"
+        else:
+            continue
+        if reason not in reasons:
+            reasons.append(reason)
     if reasons:
         return "large", reasons
     if count <= 5 and len(folders) == 1 and not brief_facts["existing_repo"]:
@@ -255,6 +268,9 @@ def classify(brief_facts, plan):
 #: Core check allowlist (I7): argv prefixes run without a shell. Arguments after
 #: a prefix may only be dotted test ids, never flags, paths or shell syntax.
 CHECK_ALLOWLIST = (("python", "-m", "unittest"),)
+#: Closed class sets a plan may declare; anything else is refused by validate().
+CONNECTOR_CLASSES = ("local",)
+OPERATION_CLASSES = ("stage_write", "check")
 _CHECK_ARG = re.compile(r"[A-Za-z0-9_]+(\.[A-Za-z0-9_]+)*")
 #: RULE A (PM10FIX3): a target is a literal path. Any glob metacharacter, also
 #: URL-encoded ("%2A") or as an NFKC lookalike (U+FF0A), is refused as "glob";
@@ -347,12 +363,15 @@ def _target_refusal(target, jarvis_repo):
     return None
 
 
-def validate(plan, project_root, *, jarvis_repo):
+def validate(plan, project_root, *, jarvis_repo, repo_prefix=None):
     """Return [] when plan passes PM10, else a list of Refusal reasons.
 
     project_root is the root the caller resolved for this plan and must name
     the same root as plan.project_root. jarvis_repo must be an explicit bool;
-    True adds the I12 self-target set. Targets are literal paths relative to
+    True adds the I12 self-target set. repo_prefix ("" or "a/b/") is where
+    project_root sits inside the JARVIS checkout: each target is then also
+    checked as repo_prefix + target, as the checkout sees it (CDXINT109 F1).
+    Unknown connector/operation classes are refused. Targets are literal paths relative to
     the root, in POSIX or Windows form; any glob, the root itself, anything
     absolute, escaping, device-like or otherwise unrecognised is refused (fail
     closed). A folder target (trailing / or \\) is a subtree scope, see scope().
@@ -377,9 +396,14 @@ def validate(plan, project_root, *, jarvis_repo):
     for item in plan.slices:
         targets.extend(item.targets)
     for target in dict.fromkeys(targets):
-        refusal = _target_refusal(target, jarvis_repo)
+        refusal = _target_refusal(target, jarvis_repo) or (
+            repo_prefix is not None and _target_refusal(repo_prefix + target, True))
         if refusal:
             refusals.append(refusal)
+    for name, known in (("connector_classes", CONNECTOR_CLASSES),
+                        ("operation_classes", OPERATION_CLASSES)):
+        refusals.extend(Refusal("unknown_class", v) for v in getattr(plan, name)
+                        if v not in known)
     check_ids = [check.check_id for check in plan.checks]
     for check in plan.checks:
         argv = check.argv
@@ -400,13 +424,13 @@ def validate(plan, project_root, *, jarvis_repo):
     return refusals
 
 
-def scope(plan, project_root, *, jarvis_repo):
+def scope(plan, project_root, *, jarvis_repo, repo_prefix=None):
     """Return {target: "file" | "subtree"} when validate() passes, else None.
 
     A "subtree" target is a scope, not a file: the PM15 diff scope gate must
     check every real changed file under it one by one.
     """
-    if validate(plan, project_root, jarvis_repo=jarvis_repo):
+    if validate(plan, project_root, jarvis_repo=jarvis_repo, repo_prefix=repo_prefix):
         return None
     targets = list(plan.targets)
     for item in plan.slices:

@@ -29,7 +29,10 @@ class FakePlanner:
 
     def __call__(self, context):
         self.calls.append(context)
-        return self.replies.pop(0)
+        reply = self.replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
 
 
 class PlannerTests(unittest.TestCase):
@@ -46,7 +49,32 @@ class PlannerTests(unittest.TestCase):
                       "target_location": self.root}
 
     def plan(self, **changes):
-        return json.dumps({**example(), "project_root": self.root, **changes})
+        # no declared action classes: those alone force large (CDXINT109 F2)
+        return json.dumps({**example(), "project_root": self.root, "connector_classes": [],
+                           "operation_classes": [], **changes})
+
+    def checkout(self, name="JARVIS"):
+        home = self.dir / name
+        for sub in ("jarvis", "data", "projects"):
+            (home / sub).mkdir(parents=True, exist_ok=True)
+        return home
+
+    def overlap(self, home, root, *targets):
+        """plan_project for root with JARVIS_ROOT = home; every reply targets targets."""
+        root = str(root)
+        reply = self.plan(project_root=root, targets=list(targets),
+                          slices=[{**example()["slices"][0], "targets": list(targets)}])
+        facts = dict(target_folders=[root], existing_repo=True, outgoing_actions=False,
+                     money_actions=False, manual_checks=False, jarvis_repo=True)
+        planner = FakePlanner(reply, reply, reply)
+        with mock.patch.object(work_planner, "JARVIS_ROOT", home):
+            return work_planner.plan_project(self.brief(), root, facts, planner), planner
+
+    def assertRefused(self, outcome, code, calls=3):
+        result, planner = outcome
+        self.assertIsInstance(result, work_planner.PlanFailed)
+        self.assertIn(code, [r.code for r in result.refusals])
+        self.assertEqual(len(planner.calls), calls)
 
     def say(self, text, model, planner=None, *, boot="boot-1"):
         self.turn += 1
@@ -80,7 +108,7 @@ class PlannerTests(unittest.TestCase):
         self.assertEqual(payload["plan"], json.loads(self.plan()))
         self.assertEqual(payload["attempts"], 1)
         self.assertEqual(payload["to"], "building")
-        self.assertIn("brief_hash", payload)
+        self.assertEqual(payload["brief_hash"], clarify.brief_hash(self.brief()))
         self.assertEqual(len(planner.calls), 1)
         self.assertEqual(planner.calls[0]["refusals"], [])
 
@@ -138,12 +166,127 @@ class PlannerTests(unittest.TestCase):
         self.assertTrue(self.last_payload(run_id)["facts"]["jarvis_repo"])
         self.assertTrue(self.last_payload(run_id)["jarvis_repo"])
 
-    def test_root_above_the_jarvis_checkout_is_jarvis_repo(self):
-        with mock.patch.object(work_planner, "JARVIS_ROOT", Path(self.root) / "JARVIS"):
+    def test_root_above_the_jarvis_checkout_is_refused_before_any_model_call(self):
+        # V3, CDXINT109 F1: root=<parent>, "JARVIS/jarvis/memory.py"
+        home = self.checkout()
+        with mock.patch.object(work_planner, "JARVIS_ROOT", home):
+            _, facts = work_planner.brief_facts(self.brief(), large_forced=False)
+        self.assertFalse(facts["jarvis_repo"])  # self.root is a sibling
+        self.part1["target_location"] = str(self.dir)
+        with mock.patch.object(work_planner, "JARVIS_ROOT", home):
             _, facts = work_planner.brief_facts(self.brief(), large_forced=False)
         self.assertTrue(facts["jarvis_repo"])
-        _, facts = work_planner.brief_facts(self.brief(), large_forced=False)
-        self.assertFalse(facts["jarvis_repo"])
+        result, planner = self.overlap(home, self.dir, "JARVIS/jarvis/memory.py")
+        self.assertEqual(result, work_planner.PlanFailed(
+            (work_planner.Refusal("jarvis_ancestor", str(self.dir)),), 0))
+        self.assertEqual(planner.calls, [])
+
+    def test_root_at_the_checkout_sees_self_targets(self):  # V1
+        home = self.checkout()
+        self.assertRefused(self.overlap(home, home, "jarvis/memory.py"), "self_target")
+        self.assertRefused(self.overlap(home, home, "data/x.txt"), "protected_path")
+
+    def test_root_under_the_checkout_checks_targets_checkout_relative(self):  # V2, V8
+        home = self.checkout()
+        self.assertRefused(self.overlap(home, home / "jarvis", "memory.py"), "self_target")
+        self.assertRefused(self.overlap(home, home / "jarvis", ".env"), "protected_path")
+        self.assertRefused(self.overlap(home, home / "data", "x.txt"), "protected_path")
+        # an ordinary file under a checkout subfolder still plans, as large
+        result, _ = self.overlap(home, home / "projects", "a.py")
+        self.assertIsInstance(result, work_planner.Planned)
+        self.assertEqual(result.size, "large")
+
+    def test_other_spellings_of_the_checkout_overlap(self):  # V4, V5
+        home = self.checkout()
+        for root in (str(home / "jarvis").upper(), str(home / "jarvis").lower(),
+                     str(home / "jarvis") + ".", str(home / "jarvis") + " ",
+                     str(home) + ". \\jarvis"):
+            with self.subTest(root=root):
+                self.assertRefused(self.overlap(home, root, "memory.py"), "self_target")
+
+    def test_short_name_of_the_checkout_overlaps(self):  # V6
+        home = self.checkout("JARVIS-checkout-long")
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(1024)
+            size = ctypes.windll.kernel32.GetShortPathNameW(str(home / "jarvis"), buf, 1024)
+        except (ImportError, AttributeError, OSError):
+            self.skipTest("no GetShortPathNameW")
+        if not size or "~" not in buf.value:
+            self.skipTest("8.3 names disabled on this volume")
+        self.assertRefused(self.overlap(home, buf.value, "memory.py"), "self_target")
+
+    def test_links_into_the_checkout_overlap(self):  # V7
+        home = self.checkout()
+        made = []
+        for name, source in (("junction", home / "jarvis"), ("symlink", home / "jarvis"),
+                             ("junction-up", self.dir)):
+            link = self.dir / "links" / name
+            link.parent.mkdir(exist_ok=True)
+            try:
+                if name.startswith("junction"):
+                    import _winapi
+                    _winapi.CreateJunction(str(source), str(link))
+                else:
+                    os.symlink(source, link, target_is_directory=True)
+            except (ImportError, AttributeError, OSError):
+                continue
+            # remove the link itself before the temp dir is cleaned up
+            self.addCleanup(os.rmdir, link)
+            made.append(name)
+            with self.subTest(name=name):
+                if name == "junction-up":  # a link to the parent is an ancestor
+                    self.assertRefused(self.overlap(home, link, "JARVIS/jarvis/memory.py"),
+                                       "jarvis_ancestor", calls=0)
+                else:
+                    self.assertRefused(self.overlap(home, link, "memory.py"), "self_target")
+        if not made:
+            self.skipTest("no junction or symlink support")
+
+    def test_relative_root_is_refused_before_any_model_call(self):  # V9
+        home = self.checkout()
+        for root in ("proj", "\\proj", "C:proj", "\\\\localhost\\c$\\proj",
+                     "\\\\?\\C:\\proj", "//server/share/proj"):
+            with self.subTest(root=root):
+                self.assertRefused(self.overlap(home, root, "a.py"), "root_unresolvable",
+                                   calls=0)
+                self.part1["target_location"] = root
+                with mock.patch.object(work_planner.Path, "exists") as exists:
+                    _, facts = work_planner.brief_facts(self.brief(), large_forced=False)
+                exists.assert_not_called()  # a UNC root is never stat'ed
+                self.assertTrue(facts["jarvis_repo"] and facts["existing_repo"])
+
+    def test_action_classes_force_large_or_are_refused(self):  # F2
+        root, facts = work_planner.brief_facts(self.brief(), large_forced=False)
+        self.assertFalse(facts["jarvis_repo"] or facts["outgoing_actions"])
+        declared = FakePlanner(self.plan(connector_classes=["local"],
+                                         operation_classes=["stage_write", "check"]))
+        result = work_planner.plan_project(self.brief(), root, facts, declared)
+        self.assertEqual((result.size, result.reasons), ("large", ("declared action classes",)))
+        for name in ("connector_classes", "operation_classes"):
+            planner = FakePlanner(*[self.plan(**{name: ["network"]})] * 3)
+            result = work_planner.plan_project(self.brief(), root, facts, planner)
+            self.assertIn(work_planner.Refusal("unknown_class", "network"), result.refusals)
+            self.assertEqual(len(planner.calls), 3)
+
+    def test_model_errors_are_reasked_until_the_third_attempt(self):  # F3
+        root, facts = work_planner.brief_facts(self.brief(), large_forced=False)
+        planner = FakePlanner(RuntimeError("down"), TimeoutError("slow"), self.plan())
+        result = work_planner.plan_project(self.brief(), root, facts, planner)
+        self.assertIsInstance(result, work_planner.Planned)
+        self.assertEqual(result.attempts, 3)
+        self.assertEqual(planner.calls[1]["refusals"], [{"code": "model_error", "detail": "RuntimeError"}])
+        self.assertEqual(planner.calls[2]["refusals"], [{"code": "model_error", "detail": "TimeoutError"}])
+
+    def test_encoded_glob_in_slice_targets_is_refused(self):  # F3
+        root, facts = work_planner.brief_facts(self.brief(), large_forced=False)
+        for target in ("a%2A.py", "a%3f.py", "a＊.py", "a［1］.py"):
+            with self.subTest(target=target):
+                reply = self.plan(slices=[{**example()["slices"][0], "targets": [target]}])
+                planner = FakePlanner(reply, reply, reply)
+                result = work_planner.plan_project(self.brief(), root, facts, planner)
+                self.assertIn(work_planner.Refusal("glob", target), result.refusals)
+                self.assertEqual(len(planner.calls), 3)
 
     def test_chat_planned_run_resumes_after_restart(self):
         run_id, _ = self.confirm(FakePlanner(self.plan()))

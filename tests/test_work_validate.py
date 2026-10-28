@@ -85,6 +85,33 @@ class ValidateTests(unittest.TestCase):
         self.assertEqual([], codes(with_targets("jarvis/work_classify.py"),
                                    jarvis_repo=True))
 
+    def test_repo_prefix_checks_targets_as_the_checkout_sees_them(self):
+        # CDXINT109 F1: under root=<checkout>/jarvis "memory.py" is jarvis/memory.py.
+        for prefix, target, code in (("jarvis/", "memory.py", "self_target"),
+                                     ("JARVIS/", "Settings.py", "self_target"),
+                                     ("scripts/", "conveyor.py", "self_target"),
+                                     ("jarvis/memory/", "__init__.py", "self_target"),
+                                     ("data/", "x.txt", "protected_path"),
+                                     ("data/sub/", "x.txt", "protected_path"),
+                                     (".claude/", "settings.json", "protected_path")):
+            refusals = validate(with_targets(target), "projects/demo",
+                                jarvis_repo=True, repo_prefix=prefix)
+            # example()'s own slice target is checked under the prefix too
+            self.assertEqual({code}, {r.code for r in refusals}, (prefix, target))
+            # the same target with no prefix passes: the prefix is what refuses it
+            self.assertEqual([], codes(with_targets(target), jarvis_repo=True), (prefix, target))
+        self.assertEqual([], validate(with_targets("work_classify.py"), "projects/demo",
+                                      jarvis_repo=True, repo_prefix="jarvis/"))
+
+    def test_unknown_action_classes_are_refused(self):
+        for name, value in (("connector_classes", "network"),
+                            ("connector_classes", "LOCAL"),
+                            ("operation_classes", "push"),
+                            ("operation_classes", "stage_write ")):
+            refusals = validate(plan(**{name: [value]}), "projects/demo", jarvis_repo=False)
+            self.assertEqual([Refusal("unknown_class", value)], refusals, (name, value))
+        self.assertEqual([], codes(plan(connector_classes=[], operation_classes=[])))
+
     def test_any_glob_is_refused(self):
         # RULE A: every glob from CDXINT91/93/94 and the old near-misses.
         for target in (

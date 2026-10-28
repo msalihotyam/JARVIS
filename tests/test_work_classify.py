@@ -12,7 +12,8 @@ def facts():
 
 
 def plan(count=1):
-    return dict(slice_count=count, new_dependencies=[])
+    return dict(slice_count=count, new_dependencies=[], connector_classes=[],
+                operation_classes=[])
 
 
 class ClassifyTests(unittest.TestCase):
@@ -65,7 +66,9 @@ class ClassifyTests(unittest.TestCase):
                 brief[key] = value
                 self.assertEqual("large", classify(brief, plan())[0])
         for key, values in (("slice_count", (None, True, 0, -1, 5.0, "5")),
-                            ("new_dependencies", (None, "pkg", [None], [""]))):
+                            ("new_dependencies", (None, "pkg", [None], [""])),
+                            ("connector_classes", (None, "local", ["bogus"], [None])),
+                            ("operation_classes", (None, "check", ["push"], [[]]))):
             for value in values:
                 with self.subTest(key=key, value=value):
                     data = plan()
@@ -83,11 +86,26 @@ class ClassifyTests(unittest.TestCase):
                     brief[key] = value[key] = label
                 self.assertEqual(expected, classify(brief, value))
 
+    def test_declared_action_classes_force_large(self):
+        # CDXINT109 F2: the size never comes from the brief alone.
+        for name, value in (("connector_classes", ["local"]),
+                            ("operation_classes", ["stage_write"]),
+                            ("operation_classes", ("check",))):
+            with self.subTest(name=name, value=value):
+                data = plan()
+                data[name] = value
+                self.assertEqual(("large", ["declared action classes"]),
+                                 classify(facts(), data))
+
     def test_plan_object_and_hash_unchanged(self):
-        value = Plan.from_dict(example())
-        before = value.canonical_json(), value.plan_hash
-        self.assertEqual("small", classify(facts(), value)[0])
-        self.assertEqual(before, (value.canonical_json(), value.plan_hash))
+        for classes, expected in ((None, "large"), ([], "small")):
+            data = example()
+            if classes is not None:
+                data["connector_classes"] = data["operation_classes"] = classes
+            value = Plan.from_dict(data)
+            before = value.canonical_json(), value.plan_hash
+            self.assertEqual(expected, classify(facts(), value)[0])
+            self.assertEqual(before, (value.canonical_json(), value.plan_hash))
 
     def test_pure_and_deterministic(self):
         brief, value = facts(), plan(6)
