@@ -1,6 +1,8 @@
 """Project-mode clarification contracts (PM06): ProjectBrief and the exit check.
 
-Pure and deterministic; nothing here is wired into a run yet. The exit check
+Pure and deterministic; AgentCore.clarify_turn (PM07) drives it from chat, and
+every model proposal (questions, slot values) passes through the parsers here
+as data before it can touch a brief. The exit check
 is fail-closed: every required slot filled, no open question, every acceptance
 example convertible to a check (or marked manual, which forces the large
 class), and a read-back of the *current* brief confirmed by the user in a
@@ -11,7 +13,8 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import asdict, dataclass, field
+import re
+from dataclasses import asdict, dataclass, field, replace
 
 SLOTS = (
     "goal",
@@ -161,6 +164,169 @@ def validate_question_set(qs: QuestionSet, brief: ProjectBrief) -> None:
             raise ValueError(f"blank question for slot {q.slot}")
         if qs.round > 1 and q.slot not in empty:
             raise ValueError(f"follow-up round asks filled slot {q.slot}")
+
+
+# PM07: the chat side. Everything below is deterministic; a model's proposal
+# is only ever an argument to these parsers, never trusted as-is.
+
+CONFIRM_PROMPT = "Bunu bir proje olarak başlatayım mı? (evet / hayır)"
+MAX_TEXT = 2000  # one slot value or question, in characters
+MAX_EXAMPLES = 20
+
+_YES = frozenset({"evet", "yes", "olur", "tamam", "onaylıyorum", "onayla", "başlat"})
+_NO = frozenset({"hayır", "no", "vazgeç", "iptal", "istemiyorum"})
+_BUILD = re.compile(r"\b(yap|oluştur|geliştir|kur|yaz|başlat|build|create|make|develop)")
+_THING = re.compile(r"\b(proje|uygulama|site|oyun|bot|program|app|website)")
+_LABELS = {
+    "goal": "Amaç",
+    "users": "Kullanıcılar",
+    "platform": "Platform",
+    "target_location": "Hedef konum",
+    "definition_of_done": "Bitti sayılması için",
+    "constraints": "Kısıtlar",
+    "out_of_scope": "Kapsam dışı",
+    "data_sensitivity": "Veri hassasiyeti",
+    "outgoing_or_money": "Dışarıya gönderim veya para",
+}
+
+
+def _fold(text: str) -> str:
+    """Turkish-aware lower case (I -> ı, İ -> i), collapsed whitespace."""
+    return " ".join(text.replace("İ", "i").replace("I", "ı").lower().split())
+
+
+def looks_like_project(text: object) -> bool:
+    """A build verb and a buildable thing in one message. Only ever earns the
+    confirm question; misses fall through to ordinary chat (fail closed)."""
+    if not isinstance(text, str):
+        return False
+    folded = _fold(text)
+    return bool(_BUILD.search(folded) and _THING.search(folded))
+
+
+def parse_yes_no(text: object) -> str | None:
+    """'yes' / 'no' only for an exact short answer; anything else is None."""
+    if not isinstance(text, str):
+        return None
+    folded = _fold(text).strip(" .!?,;:")
+    if folded in _YES:
+        return "yes"
+    if folded in _NO:
+        return "no"
+    return None
+
+
+def _text(value: object, what: str) -> str:
+    if not isinstance(value, str) or len(value) > MAX_TEXT:
+        raise ValueError(f"{what} must be a string of at most {MAX_TEXT} characters")
+    return value
+
+
+def fill_brief(brief: ProjectBrief, values: object) -> ProjectBrief:
+    """Apply proposed slot values; any unknown key or wrong type refuses all."""
+    if not isinstance(values, dict):
+        raise ValueError("slot values must be a mapping")
+    changes: dict[str, object] = {}
+    for key, value in values.items():
+        if key == "outgoing_or_money":
+            if value is not None and not isinstance(value, bool):
+                raise ValueError("outgoing_or_money must be true, false or null")
+            changes[key] = value
+        elif key == "acceptance_examples":
+            if not isinstance(value, (list, tuple)) or len(value) > MAX_EXAMPLES:
+                raise ValueError(f"acceptance_examples must be a list of at most {MAX_EXAMPLES}")
+            examples = []
+            for item in value:
+                if not isinstance(item, dict) or not set(item) <= {"text", "check", "manual"}:
+                    raise ValueError("acceptance example must be {text, check, manual}")
+                manual = item.get("manual", False)
+                if not isinstance(manual, bool):
+                    raise ValueError("acceptance example manual must be a bool")
+                examples.append(AcceptanceExample(
+                    _text(item.get("text"), "example text"),
+                    _text(item.get("check", ""), "example check"), manual,
+                ))
+            changes[key] = tuple(examples)
+        elif key in SLOTS:
+            changes[key] = _text(value, key)
+        else:
+            raise ValueError(f"unknown slot: {key!r}")
+    return replace(brief, **changes)
+
+
+def reopen_slots(brief: ProjectBrief, values: object) -> tuple[ProjectBrief, tuple[str, ...]]:
+    """A read-back correction: the slots the proposal touches are emptied so
+    they are asked again; the proposed values themselves are not applied."""
+    fill_brief(brief, values)  # same validation as an answer
+    touched = {"definition_of_done" if k == "acceptance_examples" else k for k in values}
+    changes: dict[str, object] = {}
+    for slot in touched:
+        if slot == "outgoing_or_money":
+            changes[slot] = None
+        elif slot == "definition_of_done":
+            changes.update(definition_of_done="", acceptance_examples=())
+        else:
+            changes[slot] = ""
+    return replace(brief, **changes), tuple(s for s in SLOTS if s in touched)
+
+
+def question_set(round_: int, proposed: object, brief: ProjectBrief) -> QuestionSet:
+    """Parse and validate a proposed question list ([{slot, text}, ...])."""
+    if not isinstance(proposed, (list, tuple)) or len(proposed) > len(SLOTS):
+        raise ValueError(f"questions must be a list of at most {len(SLOTS)}")
+    questions = []
+    for item in proposed:
+        if not isinstance(item, dict) or set(item) != {"slot", "text"}:
+            raise ValueError("question must be {slot, text}")
+        questions.append(Question(_text(item["slot"], "slot"), _text(item["text"], "question")))
+    qs = QuestionSet(round_, tuple(questions))
+    validate_question_set(qs, brief)
+    return qs
+
+
+def render_readback(brief: ProjectBrief) -> str:
+    lines = ["Anladığım kadarıyla:"]
+    for slot in SLOTS:
+        if slot == "outgoing_or_money":
+            value = "Evet" if brief.outgoing_or_money else "Hayır"
+        else:
+            value = getattr(brief, slot).strip()
+        lines.append(f"- {_LABELS[slot]}: {value}")
+        if slot == "definition_of_done":
+            for example in brief.acceptance_examples:
+                how = "elle kontrol" if example.manual else example.check.strip()
+                lines.append(f"  - Örnek: {example.text.strip()} ({how})")
+    lines.append(
+        "Doğruysa ayrı bir mesajla \"evet\" yazın; düzeltmek istediğiniz bir şey "
+        "varsa onu yazın."
+    )
+    return "\n".join(lines)
+
+
+def state_to_dict(state: ClarifyState) -> dict:
+    return asdict(state)
+
+
+def state_from_dict(data: object) -> ClarifyState:
+    """Rebuild a persisted state; anything malformed raises ValueError."""
+    if not isinstance(data, dict):
+        raise ValueError("clarify state must be a mapping")
+    try:
+        brief = fill_brief(ProjectBrief(), data["brief"])
+        rounds = data["rounds_asked"]
+        questions = tuple(_text(q, "open question") for q in data["open_questions"])
+        readback = data["readback"]
+        confirmed = data["confirmed_turn"]
+        if readback is not None:
+            readback = ReadBack(readback["brief_hash"], readback["shown_turn"])
+    except (KeyError, TypeError) as exc:
+        raise ValueError(f"malformed clarify state: {exc}") from exc
+    for number in (rounds, confirmed, getattr(readback, "shown_turn", 0)):
+        if number is not None and (isinstance(number, bool) or not isinstance(number, int)):
+            raise ValueError("clarify state counters must be integers")
+    if readback is not None and not isinstance(readback.brief_hash, str):
+        raise ValueError("read-back hash must be a string")
+    return ClarifyState(brief, rounds, questions, readback, confirmed)
 
 
 @dataclass(frozen=True)

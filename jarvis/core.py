@@ -277,6 +277,8 @@ from jarvis.work_ledger import (
     advance_run,
 )
 from jarvis.work_plan import Plan as WorkPlan, validate as validate_work_plan
+from jarvis import clarify
+from jarvis.notify import NotificationCore
 
 
 #: Task preference holding the billing fingerprint that cleared cost preflight.
@@ -312,6 +314,16 @@ BILLING_REASON_MAX_CHARS = 120
 # Nothing here coerces. ``str()``, ``int()``, ``bool()`` and ``Enum(value)``
 # would turn tampered data into plausible active state, which is the failure
 # these checks exist to prevent: a malformed value is refused, never repaired.
+
+
+def _clarify_proposal(
+    propose: Callable[[str, dict[str, Any]], Any], kind: str, context: dict[str, Any]
+) -> Any:
+    """The model's PM07 proposal as plain JSON data; anything else is refused."""
+    try:
+        return json.loads(json.dumps(propose(kind, context)))
+    except Exception as exc:  # any model failure is a refused proposal
+        raise ValueError("clarify proposal is not plain data") from exc
 
 
 def _exact_type(value: Any, expected: type, name: str) -> Any:
@@ -1493,6 +1505,9 @@ class AgentCore:
                     f"identity binding: {reason}."
                 )
         self.gmail_identity: GmailIdentityBinding | None = gmail_identity
+        # PM07: conversation id -> the project-looking text awaiting "evet".
+        self._clarify_pending: dict[str, str] = {}
+        self._clarify_lock = threading.Lock()
 
     # PM05: the project-run lifecycle. Every transition goes through the PM01
     # ledger types and is recorded as an append-only work_event whose payload
@@ -1500,11 +1515,17 @@ class AgentCore:
     # worker is started here, and nothing resumes on its own.
 
     def _project_run_payloads(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        """The (first, latest) event payloads: the plan binding and the owner."""
+        """The (first, latest owned) event payloads: the plan binding and the
+        owner. Notification events carry no boot_id, so they never own a run."""
         events = self.memory.work_events(run_id)
         if not events:
             return {}, {}
-        return json.loads(events[0].payload_json), json.loads(events[-1].payload_json)
+        first = json.loads(events[0].payload_json)
+        for event in reversed(events):
+            payload = json.loads(event.payload_json)
+            if "boot_id" in payload:
+                return first, payload
+        return first, json.loads(events[-1].payload_json)
 
     def create_project_run(
         self,
@@ -1671,6 +1692,207 @@ class AgentCore:
         except ValueError:
             self._release_project_leases(tuple(claimed), run_id, boot_id, now)
             raise
+
+    # PM07: the clarify dialog in chat. A project-looking turn earns only a
+    # confirm question; an explicit "evet" creates the run in clarifying. The
+    # model only proposes questions and slot values, which jarvis.clarify
+    # parses as data; the exit check and the later-turn read-back confirm are
+    # deterministic. Nothing here plans, starts a worker or writes a file.
+
+    def clarify_turn(
+        self,
+        conversation_id: str,
+        text: str,
+        *,
+        turn: int,
+        boot_id: str,
+        at: datetime,
+        propose: Callable[[str, dict[str, Any]], Any],
+    ) -> str | None:
+        """One chat turn of the clarify dialog; None means ordinary chat.
+
+        ``turn`` is the conversation's increasing turn number. ``propose(kind,
+        context)`` is the model: "questions" returns [{slot, text}], "answers"
+        and "correction" return {slot: value}. A proposal that fails
+        validation is refused and leaves the run unchanged."""
+        with self._clarify_lock:
+            active = self._clarify_active(conversation_id, boot_id)
+            if active is None:
+                pending = self._clarify_pending.pop(conversation_id, None)
+                if pending is not None:
+                    answer = clarify.parse_yes_no(text)
+                    if answer == "yes":
+                        return self._clarify_start(
+                            conversation_id, pending, turn=turn, boot_id=boot_id, at=at,
+                            propose=propose,
+                        )
+                    if answer == "no":
+                        return "Peki, projeyi başlatmıyorum."
+                if not clarify.looks_like_project(text):
+                    return None
+                self._clarify_pending[conversation_id] = text
+                return clarify.CONFIRM_PROMPT
+            run, state = active
+            context = {
+                "text": text, "state": clarify.state_to_dict(state),
+                "empty": list(clarify.empty_slots(state.brief)),
+            }
+            if state.readback is not None:
+                if clarify.parse_yes_no(text) == "yes":
+                    confirmed = replace(state, confirmed_turn=turn)
+                    verdict = clarify.check_understood(confirmed)
+                    if not verdict.ok:
+                        return (
+                            "Onay, özetten sonraki ayrı bir mesajla gelmeli; özeti okuyup "
+                            "\"evet\" yazın."
+                        )
+                    self.advance_project_run(
+                        run.run_id, RunState.PLANNING, boot_id=boot_id,
+                        at=max(at, run.updated_at), extra={
+                            "conversation_id": conversation_id,
+                            "clarify": clarify.state_to_dict(confirmed),
+                            "large_forced": verdict.large_forced,
+                        },
+                    )
+                    return "Onaylandı; proje planlama aşamasına geçti."
+                try:
+                    brief, reopened = clarify.reopen_slots(
+                        state.brief, _clarify_proposal(propose, "correction", context)
+                    )
+                except ValueError:
+                    return "Düzeltmenizi işleyemedim; lütfen neyin değişeceğini yazın."
+                if not reopened:
+                    return "Hangi bilgiyi düzeltmek istediğinizi yazar mısınız?"
+                # Drop the rejected read-back first, so it can never be confirmed.
+                state = clarify.ClarifyState(brief, state.rounds_asked)
+                run = self._clarify_save(run, state, conversation_id, boot_id, at)
+                return self._clarify_ask(
+                    run, state, conversation_id, text, boot_id=boot_id, at=at, propose=propose,
+                )
+            try:
+                brief = clarify.fill_brief(
+                    state.brief, _clarify_proposal(propose, "answers", context)
+                )
+            except ValueError:
+                return "Yanıtınızı işleyemedim; lütfen tekrar yazar mısınız?"
+            state = clarify.ClarifyState(brief, state.rounds_asked)
+            if clarify.empty_slots(brief):
+                return self._clarify_ask(
+                    run, state, conversation_id, text, boot_id=boot_id, at=at, propose=propose,
+                )
+            # The read-back is bound to this turn: a confirm needs a later one.
+            state = replace(state, readback=clarify.ReadBack(clarify.brief_hash(brief), turn))
+            run = self._clarify_save(run, state, conversation_id, boot_id, at)
+            self._clarify_notify(run, "readback_ready", f"{state.readback.brief_hash}-{turn}")
+            return clarify.render_readback(brief)
+
+    def _clarify_active(
+        self, conversation_id: str, boot_id: str
+    ) -> tuple[WorkRun, clarify.ClarifyState] | None:
+        """The conversation's run in clarifying, from its latest saved state.
+        A run another boot owns is never continued; the boot sweep handles it."""
+        # ponytail: O(runs x events) scan, index runs by conversation if they grow
+        for run in self.memory.work_runs_open():
+            if run.state is not RunState.CLARIFYING:
+                continue
+            for event in reversed(self.memory.work_events(run.run_id)):
+                payload = json.loads(event.payload_json)
+                if "clarify" not in payload:
+                    continue  # a notification
+                if (payload.get("conversation_id") != conversation_id
+                        or payload.get("boot_id") != boot_id):
+                    break
+                try:
+                    return run, clarify.state_from_dict(payload["clarify"])
+                except ValueError:
+                    break  # unreadable state: fail closed, never continue it
+        return None
+
+    def _clarify_questions(
+        self, round_: int, brief: clarify.ProjectBrief, text: str,
+        propose: Callable[[str, dict[str, Any]], Any],
+    ) -> clarify.QuestionSet | None:
+        context = {
+            "round": round_, "text": text,
+            "state": clarify.state_to_dict(clarify.ClarifyState(brief)),
+            "empty": list(clarify.empty_slots(brief)),
+        }
+        try:
+            return clarify.question_set(round_, _clarify_proposal(propose, "questions", context), brief)
+        except ValueError:
+            return None
+
+    def _clarify_start(
+        self, conversation_id: str, idea: str, *, turn: int, boot_id: str, at: datetime,
+        propose: Callable[[str, dict[str, Any]], Any],
+    ) -> str:
+        brief = clarify.ProjectBrief()
+        qs = self._clarify_questions(1, brief, idea, propose)
+        if qs is None:
+            return "Sorular hazırlanamadı; proje başlatılmadı. Lütfen tekrar deneyin."
+        digest = hashlib.sha256(f"{boot_id}\n{conversation_id}\n{turn}".encode("utf-8")).hexdigest()
+        run = WorkRun(
+            run_id="clarify-" + digest[:16], state=RunState.CLARIFYING,
+            created_at=at, updated_at=at,
+        )
+        state = clarify.ClarifyState(brief, 1, tuple(q.text for q in qs.questions))
+        self.memory.append_work_run(run, event_kind=EventKind.RUN_STATE, event_payload={
+            "to": run.state.value, "boot_id": boot_id, "conversation_id": conversation_id,
+            "clarify": clarify.state_to_dict(state),
+        }, prior=None)
+        self._clarify_notify(run, "questions_ready", "round-1")
+        return (
+            "Projeyi netleştirmek için birkaç sorum var; yanıtlarınızı tek mesajda "
+            "yazabilirsiniz:\n" + qs.render()
+        )
+
+    def _clarify_ask(
+        self, run: WorkRun, state: clarify.ClarifyState, conversation_id: str, text: str,
+        *, boot_id: str, at: datetime, propose: Callable[[str, dict[str, Any]], Any],
+    ) -> str:
+        """Batch one follow-up round for the still-empty slots, or stop at the cap."""
+        if state.rounds_asked >= clarify.MAX_ROUNDS:
+            self.advance_project_run(
+                run.run_id, RunState.NEEDS_INPUT, boot_id=boot_id,
+                at=max(at, run.updated_at), extra={
+                    "conversation_id": conversation_id, "clarify": clarify.state_to_dict(state),
+                },
+            )
+            return "Soru sınırına ulaşıldı; proje eksik bilgiler için sizden girdi bekliyor."
+        round_ = state.rounds_asked + 1
+        qs = self._clarify_questions(round_, state.brief, text, propose)
+        if qs is None:
+            return "Sorular hazırlanamadı; lütfen yanıtınızı tekrar yazın."
+        state = replace(
+            state, rounds_asked=round_, open_questions=tuple(q.text for q in qs.questions)
+        )
+        run = self._clarify_save(run, state, conversation_id, boot_id, at)
+        self._clarify_notify(run, "questions_ready", f"round-{round_}")
+        return "Birkaç sorum daha var:\n" + qs.render()
+
+    def _clarify_save(
+        self, run: WorkRun, state: clarify.ClarifyState, conversation_id: str,
+        boot_id: str, at: datetime,
+    ) -> WorkRun:
+        saved = replace(run, updated_at=max(at, run.updated_at))
+        self.memory.append_work_run(saved, event_kind=EventKind.RUN_STATE, event_payload={
+            "to": run.state.value, "boot_id": boot_id, "conversation_id": conversation_id,
+            "clarify": clarify.state_to_dict(state),
+        }, prior=run)
+        return saved
+
+    def _clarify_notify(self, run: WorkRun, point: str, dedupe_key: str) -> None:
+        notifier = NotificationCore(self.memory.append_work_event, self.memory.work_events)
+        for attempt in (1, 2):
+            # Other ledger writers may take the seq first; retry once on a fresh
+            # one (a replay of this point collapses in notify itself).
+            seq = self.memory.work_events(run.run_id)[-1].seq + 1
+            try:
+                notifier.notify(run.run_id, point, dedupe_key, seq=seq, at=run.updated_at)
+                return
+            except WorkLedgerError:
+                if attempt == 2:
+                    raise
 
     def start_session(self, objective: str = "") -> SessionState:
         session = SessionState(objective=objective)
