@@ -6,10 +6,13 @@ No real process is ever started: every test injects FakeRunner.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import shutil
+import stat
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -24,6 +27,7 @@ from jarvis.workers.claude import (
     check_argv,
     rule_path,
     scrubbed_env,
+    stage_links,
     worker_settings,
 )
 
@@ -111,7 +115,7 @@ class ArgvTests(WorkerTestCase):
                 "--settings", SETTINGS,
                 "--strict-mcp-config", "--mcp-config", EMPTY_MCP_CONFIG,
                 "--tools", "Edit,Write",
-                "--disallowedTools", "Bash,Glob,Grep,NotebookEdit,Read,Task,WebFetch,WebSearch",
+                "--disallowedTools", "Bash,Glob,Grep,NotebookEdit,Task,WebFetch,WebSearch",
                 "--disable-slash-commands", "--no-chrome", "--no-session-persistence",
                 "--max-turns", "12", "--max-budget-usd", "0.5000",
             ],
@@ -128,7 +132,7 @@ class ArgvTests(WorkerTestCase):
         argv = self.worker(prof=profile(max_turns=7), max_budget_usd=2).build_argv(SETTINGS)
         self.assertEqual(argv[argv.index("--max-turns") + 1], "7")
         self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "2.0000")
-        for denied in ("Bash", "Glob", "Grep", "Read", "WebFetch", "WebSearch"):
+        for denied in ("Bash", "Glob", "Grep", "WebFetch", "WebSearch"):
             self.assertNotIn(denied, argv[argv.index("--tools") + 1].split(","))
             self.assertIn(denied, DENIED_TOOLS)
 
@@ -154,13 +158,15 @@ class ArgvTests(WorkerTestCase):
             "default_mode": _replace(good, "--permission-mode", "dontAsk"),
             "bash_tool": _replace(good, "--tools", "Edit,Bash"),
             "web_tool": _replace(good, "--tools", "Edit,WebFetch"),
-            "read_tool": _replace(good, "--tools", "Edit,Read"),
             "glob_tool": _replace(good, "--tools", "Edit,Glob"),
             "grep_tool": _replace(good, "--tools", "Edit,Grep"),
             "dup_tool": _replace(good, "--tools", "Edit,Edit"),
             "empty_tools": _replace(good, "--tools", ""),
             "weak_deny": _replace(good, "--disallowedTools", "Bash"),
-            "deny_without_read": _replace(good, "--disallowedTools", "Bash,NotebookEdit,Task,WebFetch,WebSearch"),
+            "deny_without_glob": _replace(good, "--disallowedTools", "Bash,Grep,NotebookEdit,Task,WebFetch,WebSearch"),
+            "deny_with_read": _replace(
+                good, "--disallowedTools", "Bash,Glob,Grep,NotebookEdit,Read,Task,WebFetch,WebSearch"
+            ),
             "zero_turns": _replace(good, "--max-turns", "0"),
             "zero_budget": _replace(good, "--max-budget-usd", "0.0000"),
             "flag_model": good + ["--model", "--add-dir"],
@@ -173,6 +179,12 @@ class ArgvTests(WorkerTestCase):
         for name, argv in cases.items():
             with self.subTest(name), self.assertRaises(WorkerRefused):
                 check_argv(argv, COMMAND, SETTINGS)
+
+    def test_read_tool_accepted(self) -> None:
+        argv = self.worker(prof=profile(tools=frozenset({"Edit", "Read", "Write"}))).build_argv(SETTINGS)
+        self.assertEqual(argv[argv.index("--tools") + 1], "Edit,Read,Write")
+        check_argv(argv, COMMAND, SETTINGS)
+        self.assertNotIn("Read", DENIED_TOOLS)
 
     def test_banned_flag_from_build_argv_never_reaches_runner(self) -> None:
         seen: list[str] = []
@@ -236,16 +248,20 @@ class RefusalTests(WorkerTestCase):
 
     def test_profile_refusals(self) -> None:
         cases = {
-            "profile_tools": profile(tools=frozenset({"Edit", "Read"})),
+            "profile_tools": profile(tools=frozenset({"Edit", "Glob"})),
             "profile_network": profile(network=True),
             "budget_sessions_exhausted": profile(budget_sessions=0),
         }
         for code, prof in cases.items():
             with self.subTest(code):
                 self.assert_refused(self.worker(prof=prof), code)
-        for tools in (frozenset(), {"Edit", "Bash"}, {"Write", "Glob"}):
+        for tools in (frozenset(), {"Edit", "Bash"}, {"Write", "Glob"}, {"Read", "Grep"}):
             with self.subTest(tools=sorted(tools)):
                 self.assert_refused(self.worker(prof=profile(tools=frozenset(tools))), "profile_tools")
+
+    def test_read_only_profile_allowed(self) -> None:
+        self.worker(prof=profile(tools=frozenset({"Read"}))).start("task")
+        self.assertEqual(len(self.runner.started), 1)
 
     def test_empty_task_refused(self) -> None:
         self.assert_refused(self.worker(), "task_empty", task="  ")
@@ -278,6 +294,41 @@ class RefusalTests(WorkerTestCase):
         link = self.root / "link"
         _link_or_skip(self, outside, link)
         self.assert_refused(self.worker(link), "stage_escape")
+
+    def test_link_below_stage_refused(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        (self.stage / "pkg").mkdir()
+        _link_or_skip(self, outside, self.stage / "pkg" / "out")
+        self.assert_refused(self.worker(), "stage_has_link")
+
+    def test_stage_containing_home_refused(self) -> None:
+        home = self.stage / "Users" / "x"
+        home.mkdir(parents=True)
+        mkdtemp = tempfile.mkdtemp
+        made: list = []
+        tempfile.mkdtemp = lambda *a, **k: made.append(a) or mkdtemp(*a, **k)
+        self.addCleanup(setattr, tempfile, "mkdtemp", mkdtemp)
+        cases = {
+            "equal": (home, home),
+            "case_differs": (Path(str(home).upper()), home),
+            "parent": (self.stage / "Users", home),
+            "grandparent": (self.stage, home),
+        }
+        for name, (stage, given_home) in cases.items():
+            with self.subTest(name):
+                self.assert_refused(self.worker(stage, home=given_home), "stage_contains_home")
+        self.assertEqual(made, [])
+
+    def test_stage_containing_run_dir_refused(self) -> None:
+        (self.stage / "tmp").mkdir()
+        self.addCleanup(setattr, tempfile, "tempdir", tempfile.tempdir)
+        for temp in (self.stage, self.stage / "tmp", Path(str(self.stage / "tmp").upper())):
+            tempfile.tempdir = str(temp)
+            with self.subTest(str(temp)):
+                self.assert_refused(self.worker(), "run_dir_in_stage")
+        self.assertEqual(sorted(path.name for path in self.stage.iterdir()), ["tmp"])
+        self.assertEqual(list((self.stage / "tmp").iterdir()), [])
 
     def test_cwd_mismatch_refused(self) -> None:
         other = self.root / "other"
@@ -333,14 +384,101 @@ class SpawnRecheckTests(WorkerTestCase):
 
         self.start_refused(worker, retarget, "stage_changed")
 
+    def test_link_below_stage_appears_before_spawn(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+        self.start_refused(self.worker(), lambda: _link_or_skip(self, outside, self.stage / "in"), "stage_has_link")
+
     def test_unchanged_stage_spawns(self) -> None:
         self.runner.before = lambda argv: None
         self.worker().start("task")
         self.assertEqual(len(self.runner.started), 1)
 
 
+class FakeEntry:
+    def __init__(self, path: str, *, kind: str = "file", attrs: int = 0, nlink: int = 1) -> None:
+        self.path = path
+        self.kind = kind
+        self.attrs = attrs
+        self.nlink = nlink
+
+    def is_symlink(self) -> bool:
+        return self.kind == "symlink"
+
+    def is_dir(self, *, follow_symlinks: bool = True) -> bool:
+        return self.kind == "dir"
+
+    def stat(self, *, follow_symlinks: bool = True):
+        mode = stat.S_IFLNK if self.kind == "symlink" else stat.S_IFDIR if self.kind == "dir" else stat.S_IFREG
+        return types.SimpleNamespace(st_mode=mode, st_file_attributes=self.attrs)
+
+
+class LinkScanTests(unittest.TestCase):
+    """stage_links over a fake filesystem: {dir: [FakeEntry]}; an Exception value is raised by scandir."""
+
+    def scan(self, tree: dict) -> None:
+        def scandir(path):
+            if isinstance(tree[path], Exception):
+                raise tree[path]
+            return contextlib.nullcontext(tree[path])
+
+        entries = {entry.path: entry for listing in tree.values() if isinstance(listing, list) for entry in listing}
+        stage_links("root", scandir=scandir, lstat=lambda path: types.SimpleNamespace(st_nlink=entries[path].nlink))
+
+    def nested(self, leaf: FakeEntry) -> dict:
+        return {
+            "root": [FakeEntry("root/a.py"), FakeEntry("root/pkg", kind="dir")],
+            "root/pkg": [FakeEntry("root/pkg/b.py"), FakeEntry("root/pkg/sub", kind="dir")],
+            "root/pkg/sub": [FakeEntry("root/pkg/sub/c.py"), leaf],
+        }
+
+    def test_clean_nested_tree_passes(self) -> None:
+        self.scan(self.nested(FakeEntry("root/pkg/sub/d.py")))
+
+    def test_links_at_depth_refused(self) -> None:
+        cases = {
+            "symlink": FakeEntry("root/pkg/sub/out", kind="symlink"),
+            "junction": FakeEntry("root/pkg/sub/out", kind="dir", attrs=stat.FILE_ATTRIBUTE_REPARSE_POINT),
+            "reparse_file": FakeEntry("root/pkg/sub/out.py", attrs=stat.FILE_ATTRIBUTE_REPARSE_POINT),
+            "hard_link": FakeEntry("root/pkg/sub/out.py", nlink=2),
+        }
+        for name, leaf in cases.items():
+            with self.subTest(name), self.assertRaises(WorkerRefused) as caught:
+                self.scan(self.nested(leaf))
+            self.assertEqual(caught.exception.code, "stage_has_link")
+
+    def test_scan_error_refused(self) -> None:
+        for where in ("root", "root/pkg/sub"):
+            tree = self.nested(FakeEntry("root/pkg/sub/d.py"))
+            tree[where] = PermissionError(where)
+            with self.subTest(where), self.assertRaises(WorkerRefused) as caught:
+                self.scan(tree)
+            self.assertEqual(caught.exception.code, "stage_scan_failed")
+
+    def test_junction_is_not_descended(self) -> None:
+        tree = {"root": [FakeEntry("root/j", kind="dir", attrs=stat.FILE_ATTRIBUTE_REPARSE_POINT)]}
+        with self.assertRaises(WorkerRefused) as caught:
+            self.scan(tree)
+        self.assertEqual(caught.exception.code, "stage_has_link")
+
+    def test_real_hard_link_refused(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            (root / "stage").mkdir()
+            (root / "outside.txt").write_text("secret", encoding="utf-8")
+            stage_links(root / "stage")
+            try:
+                os.link(root / "outside.txt", root / "stage" / "innocent.txt")
+            except OSError as exc:
+                self.skipTest(f"hard link unavailable: {exc}")
+            with self.assertRaises(WorkerRefused) as caught:
+                stage_links(root / "stage")
+            self.assertEqual(caught.exception.code, "stage_has_link")
+
+
 class SettingsTests(WorkerTestCase):
     HOME = "C:\\Users\\x"
+    HOME_FORMS = ("//c/Users/x", "//c/[uU][sS][eE][rR][sS]/[xX]")
 
     def test_rule_path(self) -> None:
         self.assertEqual(rule_path("C:\\Users\\x"), "//c/Users/x")
@@ -364,35 +502,57 @@ class SettingsTests(WorkerTestCase):
         self.assertEqual(permissions["disableBypassPermissionsMode"], "disable")
         self.assertNotIn("allow", permissions)
         deny = permissions["deny"]
-        self.assertEqual(deny[:3], ["Read", "Glob", "Grep"])
-        self.assertEqual(deny[-2:], ["Edit(//c/Temp/run/**)", "Edit(//c/Users/x/**)"])
+        self.assertEqual(deny[:2], ["Glob", "Grep"])
+        self.assertNotIn("Read", deny)
+        self.assertEqual(deny[-2:], [f"Read({home}/**)" for home in self.HOME_FORMS])
+        for tool in ("Edit", "Read"):
+            for run in ("//c/Temp/run", "//c/[tT][eE][mM][pP]/[rR][uU][nN]"):
+                self.assertIn(f"{tool}({run})", deny)
+                self.assertIn(f"{tool}({run}/**)", deny)
+            for home in self.HOME_FORMS:
+                self.assertIn(f"{tool}({home}/**)", deny)
+                self.assertIn(f"{tool}({home}/.[sS][sS][hH]/**)", deny)
         self.assertEqual(len(deny), len(set(deny)))
-        self.assertTrue(all(rule.startswith("Edit(") and rule.endswith(")") for rule in deny[3:]))
-        for name in (".env*", "*.db", "*.sqlite*", "*.key", "*.pem", "id_rsa*", ".git", ".ssh", ".claude",
-                     ".codex", ".mcp.json", ".vscode", "claude.md", "CLAUDE.md", "AGENTS.md",
-                     "AGENTS.override.md", "GEMINI.md"):  # fmt: skip
-            with self.subTest(name):
-                self.assertIn(f"Edit(**/{_fold(name)})", deny)
-                self.assertIn(f"Edit(**/{_fold(name)}/**)", deny)
-        for rule in ("Edit(**/.git)", "Edit(**/.[gG][iI][tT])", "Edit(**/*.[dD][bB]-*/**)", "Edit(./data)",
-                     "Edit(./[dD][aA][tT][aA])", "Edit(./[dD][aA][tT][aA]/**)", "Edit(~/.jarvis/**)",
-                     "Edit(~/.[sS][sS][hH]/**)", "Edit(//c/Users/x/.[cC][lL][aA][uU][dD][eE]/**)",
-                     "Edit(//c/Users/x/.codex)"):  # fmt: skip
-            self.assertIn(rule, deny)
+        self.assertTrue(all(rule[:5] in ("Edit(", "Read(") and rule.endswith(")") for rule in deny[2:]))
+        for tool in ("Edit", "Read"):
+            for name in (".env*", "*.db", "*.sqlite*", "*.key", "*.pem", "id_rsa*", ".git", ".ssh", ".claude",
+                         ".codex", ".mcp.json", ".vscode", "claude.md", "CLAUDE.md", "AGENTS.md",
+                         "AGENTS.override.md", "GEMINI.md"):  # fmt: skip
+                with self.subTest(tool=tool, name=name):
+                    self.assertIn(f"{tool}(**/{_fold(name)})", deny)
+                    self.assertIn(f"{tool}(**/{_fold(name)}/**)", deny)
+            for path in ("**/.git", "**/.[gG][iI][tT]", "**/*.[dD][bB]-*/**", "./data", "./[dD][aA][tT][aA]",
+                         "./[dD][aA][tT][aA]/**", "~/.jarvis/**", "~/.[sS][sS][hH]/**",
+                         "//c/Users/x/.[cC][lL][aA][uU][dD][eE]/**", "//c/Users/x/.codex"):  # fmt: skip
+                self.assertIn(f"{tool}({path})", deny)
+
+    def test_read_deny_set_mirrors_edit_deny_set(self) -> None:
+        for stage in ("D:\\work\\stage", "C:\\Users\\x\\repo\\stage", "C:\\Users\\x", "C:\\Users"):
+            with self.subTest(stage):
+                deny = worker_settings(self.HOME, stage, "C:\\Temp\\run")["permissions"]["deny"]
+                edit = [rule[5:-1] for rule in deny if rule.startswith("Edit(")]
+                read = [rule[5:-1] for rule in deny if rule.startswith("Read(")]
+                self.assertTrue(edit)
+                self.assertEqual(read, edit)
+                self.assertEqual(len(deny), 2 + 2 * len(edit))
 
     def test_stage_at_or_above_home_denies_whole_home(self) -> None:
         for stage in ("C:\\Users\\x", "c:\\users\\X", "C:\\Users"):
             with self.subTest(stage):
                 deny = worker_settings(self.HOME, stage, "C:\\Temp\\run")["permissions"]["deny"]
-                self.assertEqual(deny[-1], "Edit(//c/Users/x/**)")
+                self.assertEqual(deny[-2:], [f"Read({home}/**)" for home in self.HOME_FORMS])
+                for home in self.HOME_FORMS:
+                    self.assertIn(f"Edit({home}/**)", deny)
 
     def test_stage_inside_home_keeps_stage_editable(self) -> None:
         for stage in ("C:\\Users\\x\\repo\\stage", "c:\\users\\X\\repo"):
             with self.subTest(stage):
                 deny = worker_settings(self.HOME, stage, "C:\\Temp\\run")["permissions"]["deny"]
-                self.assertNotIn("Edit(//c/Users/x/**)", deny)
-                self.assertIn("Edit(//c/Users/x/.claude/**)", deny)
-                self.assertEqual(deny[-1], "Edit(//c/Temp/run/**)")
+                for tool in ("Edit", "Read"):
+                    for home in self.HOME_FORMS:
+                        self.assertNotIn(f"{tool}({home}/**)", deny)
+                        self.assertIn(f"{tool}({home}/.claude/**)", deny)
+                self.assertEqual(deny[-1], "Read(//c/[tT][eE][mM][pP]/[rR][uU][nN]/**)")
 
     def test_unsafe_run_dir_refused(self) -> None:
         with self.assertRaises(WorkerRefused) as caught:
@@ -414,7 +574,8 @@ class SettingsTests(WorkerTestCase):
         self.assertTrue(path.parent.name.startswith(RUN_DIR_PREFIX))
         self.assertFalse(path.is_relative_to(self.stage))
         self.assertEqual(content, worker_settings(self.root / "home", self.stage, path.parent))
-        self.assertIn(f"Edit({rule_path(self.root / 'home')}/**)", content["permissions"]["deny"])
+        for tool in ("Edit", "Read"):
+            self.assertIn(f"{tool}({rule_path(self.root / 'home')}/**)", content["permissions"]["deny"])
         self.assertTrue(path.exists())
         worker.collect(run_id)
         self.assertFalse(path.parent.exists())

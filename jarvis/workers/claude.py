@@ -21,6 +21,7 @@ import math
 import os
 import re
 import shutil
+import stat
 import tempfile
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -39,15 +40,15 @@ from jarvis.trusted_exec import trusted_environment
 from jarvis.work_plan import AGENT_CONFIG_NAMES
 from jarvis.workers.base import AgentProfile, Worker, WorkerResult
 
-# The only tools a writer gets: edit files. No Bash (no shell, no network
-# through it), no WebFetch/WebSearch, no Task (no subagent fan-out).
-# No Read/Glob/Grep either (PM20B): permission rules have no negation and deny
-# beats allow, so "nothing outside the stage" cannot be written without also
-# denying a stage that lives under the denied home; Glob/Grep take any path and
+# The only tools a writer gets: read and edit files. No Bash (no shell, no
+# network through it), no WebFetch/WebSearch, no Task (no subagent fan-out).
+# Read is back (PM20C) because the CLI's Edit/Write refuse an existing file
+# that was not Read first; every Edit deny path is denied to Read as well (see
+# worker_settings). Glob/Grep stay dropped (PM20B): they take any path and
 # Read rules reach them only best-effort. Unprovable confinement -> dropped.
-WRITER_TOOLS = frozenset({"Edit", "Write"})
+WRITER_TOOLS = frozenset({"Edit", "Read", "Write"})
 # Denied explicitly as well, so a CLI default that re-adds one still loses.
-DENIED_TOOLS = ("Bash", "Glob", "Grep", "NotebookEdit", "Read", "Task", "WebFetch", "WebSearch")
+DENIED_TOOLS = ("Bash", "Glob", "Grep", "NotebookEdit", "Task", "WebFetch", "WebSearch")
 EMPTY_MCP_CONFIG = json.dumps({"mcpServers": {}}, separators=(",", ":"))
 PERMISSION_MODE = "acceptEdits"
 WORKER_FORCED_ENV = {
@@ -224,7 +225,8 @@ def stage_directory(stage: Any) -> Path:
 
     Absolute, no ``..`` part, existing directory, and resolving changes
     nothing: a symlink/junction anywhere on the path makes the resolved path
-    differ from the literal one and is refused rather than followed.
+    differ from the literal one and is refused rather than followed. Nothing
+    below it may be a link either (see ``stage_links``).
     """
     raw = os.fspath(stage)
     literal = Path(raw)
@@ -238,7 +240,43 @@ def stage_directory(stage: Any) -> Path:
         raise WorkerRefused("stage_not_directory")
     if os.path.normcase(str(resolved)) != os.path.normcase(os.path.abspath(raw)):
         raise WorkerRefused("stage_escape")
+    try:
+        root_link = _is_link(os.lstat(resolved))
+    except OSError:
+        raise WorkerRefused("stage_scan_failed") from None
+    if root_link:
+        raise WorkerRefused("stage_has_link")
+    stage_links(resolved)
     return resolved
+
+
+def _is_link(st: os.stat_result) -> bool:
+    # A junction is not S_ISLNK; on Windows every link kind is a reparse point.
+    return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def stage_links(
+    root: Any, scandir: Callable[[str], Any] = os.scandir, lstat: Callable[[str], Any] = os.lstat
+) -> None:
+    """Refuse a symlink, junction, any reparse point or a hard-linked file anywhere below ``root``.
+
+    Nothing is followed, so the CLI never gets a path inside the stage that
+    leads out of it. An unreadable directory refuses too: unscanned is unproven.
+    The link count comes from ``lstat``: ``DirEntry.stat`` reports 0 on Windows.
+    """
+    pending = [os.fspath(root)]
+    try:
+        while pending:
+            with scandir(pending.pop()) as entries:
+                for entry in entries:
+                    if entry.is_symlink() or _is_link(entry.stat(follow_symlinks=False)):
+                        raise WorkerRefused("stage_has_link")
+                    if entry.is_dir(follow_symlinks=False):
+                        pending.append(entry.path)
+                    elif lstat(entry.path).st_nlink > 1:
+                        raise WorkerRefused("stage_has_link")
+    except OSError:
+        raise WorkerRefused("stage_scan_failed") from None
 
 
 def _inside(path: Any, root: Any) -> bool:
@@ -263,32 +301,43 @@ def _fold(name: str) -> str:
     return "".join(f"[{c.lower()}{c.upper()}]" if c.isalpha() else c for c in name)
 
 
+def _rule_forms(path: Any) -> tuple[str, ...]:
+    """``rule_path`` literal and case-folded past the drive: ``//c/U`` -> ``//c/[uU]``."""
+    rule = rule_path(path)
+    return tuple(dict.fromkeys((rule, rule[:3] + _fold(rule[3:]))))
+
+
 def worker_settings(home: Any, stage: Any, run_dir: Any) -> dict[str, Any]:
     """The per-run ``--settings`` content: deterministic for its inputs.
 
-    Read/Glob/Grep are denied whole (see WRITER_TOOLS). Edit rules cover every
-    file-editing tool: the PM10 protected set anywhere under the stage,
-    ``data/`` at its root, the home's agent/secret dirs, this run's own dir,
-    and the whole home unless the stage lives under it (deny beats allow, so
-    that one cannot be written without denying the stage too).
+    Glob/Grep are denied whole (see WRITER_TOOLS). One path list is denied to
+    Edit (which covers every file-editing tool) and, identically, to Read: the
+    PM10 protected set anywhere under the stage, ``data/`` at its root, the
+    home's agent/secret dirs, this run's own dir, and the whole home unless
+    the stage lives under it (deny beats allow, so that one cannot be written
+    without denying the stage too; a stage holding the home is refused at
+    start).
     """
-    home_rule = rule_path(home)
-    deny = ["Read", "Glob", "Grep"]
+    homes = _rule_forms(home)
+    paths = []
     for name in (*_PROTECTED_GLOBS, *map(_fold, _PROTECTED_GLOBS)):
-        deny += [f"Edit(**/{name})", f"Edit(**/{name}/**)"]
+        paths += [f"**/{name}", f"**/{name}/**"]
     for name in ("data", _fold("data")):
-        deny += [f"Edit(./{name})", f"Edit(./{name}/**)"]
+        paths += [f"./{name}", f"./{name}/**"]
     for name in (*_HOME_ROOTS, *map(_fold, _HOME_ROOTS)):
-        deny += [f"Edit(~/{name})", f"Edit(~/{name}/**)", f"Edit({home_rule}/{name})", f"Edit({home_rule}/{name}/**)"]
-    deny.append(f"Edit({rule_path(run_dir)}/**)")
+        paths += [f"~/{name}", f"~/{name}/**"]
+        paths += [rule for home_rule in homes for rule in (f"{home_rule}/{name}", f"{home_rule}/{name}/**")]
+    for run_rule in _rule_forms(run_dir):
+        paths += [run_rule, f"{run_rule}/**"]
     # Stage equal to the home is not "under" it: the whole home stays denied.
     if not _inside(stage, home) or _inside(home, stage):
-        deny.append(f"Edit({home_rule}/**)")
+        paths += [f"{home_rule}/**" for home_rule in homes]
+    deny = ["Glob", "Grep", *(f"{tool}({path})" for tool in ("Edit", "Read") for path in dict.fromkeys(paths))]
     return {
         "permissions": {
             "defaultMode": PERMISSION_MODE,
             "disableBypassPermissionsMode": "disable",
-            "deny": list(dict.fromkeys(deny)),
+            "deny": deny,
         },
         "disableAllHooks": True,
         "enableAllProjectMcpServers": False,
@@ -393,6 +442,14 @@ class ClaudeWriterWorker(Worker):
             # must still be the same real directory, not swapped for a link.
             if os.path.normcase(str(stage_directory(self.stage))) != os.path.normcase(str(cwd)):
                 raise WorkerRefused("stage_changed")
+
+        # Folded containment, not rule prefixes: a stage at or above the home
+        # would put the home's secrets inside the child's working dir.
+        if _inside(self._home, cwd):
+            raise WorkerRefused("stage_contains_home")
+        # Same for the run dir, refused before anything is created in the stage.
+        if _inside(os.path.realpath(tempfile.gettempdir()), cwd):
+            raise WorkerRefused("run_dir_in_stage")
 
         run_dir = os.path.realpath(tempfile.mkdtemp(prefix=RUN_DIR_PREFIX))
         try:
