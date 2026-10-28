@@ -1,6 +1,6 @@
 """Deterministic generator for the orchestrator's routine prompts (ORCHGEN).
 
-    python scripts/orch_gen.py [--root DIR] review <SLICE>... [--with-partial ID]... [--write]
+    python scripts/orch_gen.py [--root DIR] review <SLICE>... [--with-partial ID]... [--focus TEXT] [--write]
     python scripts/orch_gen.py [--root DIR] int <REVIEW>... [--write]
 
 review: reads build/reports/<SLICE>.md (STATUS PASS, one 40-hex COMMIT, FILES, a "Worker: codex"
@@ -8,10 +8,15 @@ line) and writes an independent review prompt: CLREVnn (Claude) for work the Cod
 CDXINTnn (Codex) for work Claude wrote, plus a backlog entry with the next free number.
 FILES entries lose "(...)" annotations; the lane's own report is ignored; a "Worker: jules" report
 without FILES uses git show --name-only. --with-partial ID adds a BLOCKED "partial" predecessor
-only when a reviewed report names it as BASE: <ID> AT <sha> and builds on that commit.
+only when a reviewed report names it as BASE: <ID> AT <sha> and builds on that commit; a plain
+"STATUS: BLOCKED" predecessor needs that BASE sha to be its full 40-hex COMMIT. The prompt carries
+"Spec:" (the slices' prompts and reports, + the PM plan/decisions for PM ids) and "Focus: <TEXT>";
+--write without --focus refuses.
 int: once the named reviews are PASS, writes INTnn: base = origin/main (git ls-remote), picks in
-ancestry order, expected files = union of git show --name-only, their tests modules (+ tests.test_ui
-only when a UI file is touched), CI BRANCH ci/<intnn>.
+ancestry order (a BLOCKED pick only as a stacked predecessor, same rule), expected files = union of
+git show --name-only, their tests modules + tests importing a changed jarvis module, matching
+*_replay tests, memory-schema tests for memory.py/contracts.py (+ tests.test_ui only when a UI
+file is touched), CI BRANCH ci/<intnn>.
 Dry run is the default (prints what it would write). --write writes the prompt and the backlog entry,
 keeps a backup of the backlog in build/conveyor/hold/ and runs build/orch/check_backlog.py.
 Anything unclear refuses (exit 2) with the reason. Never edits conveyor.py, never pushes, never
@@ -20,6 +25,7 @@ writes approvals (the entry carries no "approved" key).
 from __future__ import annotations
 
 import argparse
+import ast
 import json
 import os
 import re
@@ -45,8 +51,20 @@ REVIEW_NUM = re.compile(r"(?i)^(?:CDXINT|CLREV)(\d+)")
 INT_NUM = re.compile(r"(?i)^INT(\d+)")
 
 
+PARTIAL_RE = re.compile(r"(?i)STATUS:[\s*`]*BLOCKED[\s*`]*[(:,-]?[ \t]*partial\b")
+PLAIN_BLOCKED_RE = re.compile(r"(?i)STATUS:[\s*`]*BLOCKED[\s*`.]*")
+PM_SPECS = ("build/orch/PLAN_PROJECT_MODE.md", "build/orch/kb/PM_DECISIONS.md")
+FOCUS_PLACEHOLDER = "<FOCUS: fill in before --write>"
+
+
 class Refuse(Exception):
     pass
+
+
+def status_line(text):
+    """The same STATUS line conveyor.report_status reads (first 15 non-blank lines)."""
+    lines = [s for s in (x.lstrip(" \t>#*`﻿").rstrip() for x in text.splitlines()) if s][:15]
+    return next((s for s in lines if conveyor.STATUS_RE.match(s)), "")
 
 
 def real_git(root, *args):
@@ -91,12 +109,10 @@ class Gen:
             if status != "PASS":
                 raise Refuse(f"{sid}: report STATUS is {status or 'missing'}, not PASS")
             return text
-        # the same STATUS line conveyor.report_status reads; "partial" must follow BLOCKED
-        lines = [s for s in (x.lstrip(" \t>#*`﻿").rstrip() for x in text.splitlines()) if s][:15]
-        line = next((s for s in lines if conveyor.STATUS_RE.match(s)), "")
-        if status != "BLOCKED" or not re.match(r"(?i)STATUS:[\s*`]*BLOCKED[\s*`]*[(:,-]?[ \t]*partial\b",
-                                                line):
-            raise Refuse(f"{sid}: report STATUS is {status or 'missing'}, not BLOCKED (partial ...)")
+        line = status_line(text)
+        if status != "BLOCKED" or not (PARTIAL_RE.match(line) or PLAIN_BLOCKED_RE.fullmatch(line)):
+            raise Refuse(f"{sid}: report STATUS is {status or 'missing'}, not BLOCKED (partial ...) "
+                         "or a plain BLOCKED")
         return text
 
     def changed(self, sha):
@@ -157,12 +173,14 @@ class Gen:
         slice names as its BASE (BASE: <pid> AT <sha>) and builds on; refuses otherwise."""
         text = self.report(pid, partial=True)
         sha = self.commit_of(pid, text)
+        # a plain BLOCKED (no "partial" marker) needs the full 40-hex COMMIT as the named BASE
+        plain = not PARTIAL_RE.match(status_line(text))
         base_re = re.compile(rf"(?m)^[\s>#*`-]*BASE:[ \t`]*{re.escape(pid)}[ \t`]+(?i:AT)[ \t`]+"
                              r"([0-9a-fA-F]{7,40})\b")
         later = []
         for sid, lsha, *_ in info:
             named = base_re.findall((self.reports / f"{sid}.md").read_text(encoding="utf-8", errors="replace"))
-            if any(not conveyor.sha_matches(sha, n.lower()) for n in named):
+            if any(n.lower() != sha if plain else not conveyor.sha_matches(sha, n.lower()) for n in named):
                 raise Refuse(f"{sid}: BASE {pid} is not {pid}'s COMMIT {sha[:12]}")
             if named:
                 later.append((sid, lsha))
@@ -180,9 +198,11 @@ class Gen:
                 nums += [int(m.group(1)) for f in os.listdir(d) if (m := rx.match(f))]
         return f"{prefix}{max(nums, default=0) + 1}"
 
-    def review(self, sids, partials=()):
+    def review(self, sids, partials=(), focus=None):
         if not sids or len({*sids, *partials}) != len(sids) + len(partials):
             raise Refuse("name each slice once")
+        if focus is not None and (not focus.strip() or not focus.isprintable()):
+            raise Refuse("focus must be one non-empty line")
         info = [(sid, *self.slice_info(sid)) for sid in sids]
         tags = {}
         for pid in partials:
@@ -201,13 +221,17 @@ class Gen:
         main = self.git("rev-parse", "refs/heads/main").strip()
         if tags:
             scope += f"; review as one diff main..{info[-1][1][:12]}"
+        specs = [p for sid, *_ in info for p in (f"build/conveyor/prompts/{sid}.md", f"build/reports/{sid}.md")]
+        if any(sid.upper().startswith("PM") for sid, *_ in info):
+            specs += PM_SPECS
+        spec = f"Spec: {', '.join(specs)}.\nFocus: {focus or FOCUS_PLACEHOLDER}\n"
         if codex:
             title = f"Claude inceleme: Codex işi {names}"
             body = (
                 f"@jarvis lane={rid} model=opus effort=medium base=main\n"
                 f'Read-only lane. "Claude independent review" of {names} WRITTEN BY THE CODEX WORKER '
                 "(Codex must not review them). LANE RULES: build/conveyor/notes/LANE_RULES.md (CORE).\n"
-                f"Scope: {scope}.\n"
+                f"Scope: {scope}.\n{spec}"
                 "Check: spec match; fail-closed on bad input; test strength (would a wrong implementation "
                 "pass?); scope discipline. Short QUALITY NOTE vs a Claude lane. "
                 f"OUTPUT: build/reports/{rid}.md. PASS = no REAL BLOCKER/MAJOR; else BLOCKED + one fix "
@@ -222,7 +246,7 @@ class Gen:
                 "CDXINT63C\n(build/reviews/cdxint63/run.ps1: Sol 6.1, effort high, read-only sandbox, tools "
                 "off, --ignore-user-config). Label it honestly.\n"
                 "LANE RULES: build/conveyor/notes/LANE_RULES.md (CORE).\n"
-                f"Scope: {scope}; main {main[:12]}.\n"
+                f"Scope: {scope}; main {main[:12]}.\n{spec}"
                 f"1. Review pack: git --no-optional-locks show of {' '.join(sha for _, sha, _, _ in info)}. "
                 "2. ONE Codex round (<= 2 calls): spec match, fail-closed on bad input, test strength "
                 "(would a wrong implementation pass?), scope discipline. Severity + file:line.\n"
@@ -246,12 +270,22 @@ class Gen:
         pairs = [x for x in PAIR_RE.findall(m.group(1)) if x[0].lower() != "main"] if m else []
         if not pairs:
             raise Refuse(f"{rid}: prompt has no 'Scope: <SLICE> <sha>' pairs")
-        out = []
+        out, stacked = [], []
         for sid, short in pairs:
-            sha, files, _ = self.slice_info(sid)
+            if not conveyor.LANE_RE.fullmatch(sid):
+                raise Refuse(f"{sid}: not a lane id")
+            if conveyor.report_status(self.reports / f"{sid}.md") == "BLOCKED":
+                stacked.append((sid, short))  # only as a stacked predecessor, checked below
+                continue
+            sha, files, codex = self.slice_info(sid)
             if not conveyor.sha_matches(sha, short):
                 raise Refuse(f"{rid}: reviewed {sid} {short}, but its report COMMIT is {sha}")
-            out.append((sid, sha, files))
+            out.append((sid, sha, files, None))
+        for sid, short in stacked:
+            _, sha, files, _, later = self.partial_info(sid, out)
+            if not conveyor.sha_matches(sha, short):
+                raise Refuse(f"{rid}: reviewed {sid} {short}, but its report COMMIT is {sha}")
+            out.insert(0, (sid, sha, files, later))
         return out
 
     def integration(self, rids):
@@ -260,10 +294,10 @@ class Gen:
         picks = {}
         for rid in rids:
             self.report(rid)
-            for sid, sha, files in self.picks(rid):
-                if picks.setdefault(sid, (sha, files))[0] != sha:
+            for sid, sha, files, later in self.picks(rid):
+                if picks.setdefault(sid, (sha, files, later))[0] != sha:
                     raise Refuse(f"{sid}: two different commits named")
-        shas = [sha for sha, _ in picks.values()]
+        shas = [sha for sha, *_ in picks.values()]
         if len(set(shas)) != len(shas):
             raise Refuse("two slices name the same commit")
         order = []  # ponytail: O(n^2) ancestry checks, fine for a handful of picks
@@ -276,7 +310,7 @@ class Gen:
                     break
             else:
                 raise Refuse("picks have no ancestry order")
-        files = sorted({f for _, fs in picks.values() for f in fs})
+        files = sorted({f for _, fs, _ in picks.values() for f in fs})
         groups = self.test_groups(files)
         if not groups:
             raise Refuse(f"no tests module for {', '.join(files)}")
@@ -288,13 +322,18 @@ class Gen:
         iid = self.next_id(INT_NUM, "INT", [s.get("id", "") for s in b["slices"]])
         low, names = iid.lower(), " + ".join(order)
         runs = " | ".join(" ".join(g) for g in groups)
+
+        def pre(s):
+            sha, _, later = picks[s]
+            return (f"{s}.md BLOCKED (stacked: {later}.md names BASE: {s} AT {sha})" if later
+                    else f"{s}.md PASS")
         body = (
             f"@jarvis lane={iid} model=sonnet effort=medium base=main\n"
             f"LANE RULES: read build/conveyor/notes/LANE_RULES.md (CORE + INT). Integration: {names}.\n"
             "CANDIDATE FLOW (CONVINT; do NOT move local main yourself):\n"
             f"0. PREFLIGHT (BLOCKED if any fails): local main == origin/main == {base}; "
             f"{', '.join(f'build/reports/{r}.md' for r in rids)} STATUS PASS; "
-            f"{', '.join(f'{s}.md' for s in order)} PASS naming the COMMITs below.\n"
+            f"{', '.join(pre(s) for s in order)} naming the COMMITs below.\n"
             f"1. In your worktree: git switch -c cand/{low} {base}; cherry-pick in order, each its OWN "
             f"commit only: {', '.join(f'{s} {picks[s][0]}' for s in order)}.\n"
             f"   Expected files only: {', '.join(files)}. Anything else or a conflict: STATUS BLOCKED "
@@ -336,7 +375,47 @@ class Gen:
             if mod != "tests.test_ui" and mod not in mods:
                 mods.append(mod)
             ui = ui or mod == "tests.test_ui"
+        for mod in self.importer_tests(files):
+            if mod == "tests.test_ui":
+                ui = True
+            elif mod not in mods:
+                mods.append(mod)
         return [g for g in (mods, ["tests.test_ui"] if ui else []) if g]
+
+    def importer_tests(self, files):
+        """Sorted tests modules that import a changed jarvis module (static scan of
+        tests/test_*.py), replay tests named after one, and the memory-schema tests when
+        jarvis/memory.py or jarvis/contracts.py changed."""
+        changed = {f[:-3].replace("/", ".").removesuffix(".__init__") for f in files
+                   if f.startswith("jarvis/") and f.endswith(".py")}
+        stems = {Path(f).stem for f in files if f.startswith("jarvis/") and f.endswith(".py")}
+        memory = bool({"jarvis/memory.py", "jarvis/contracts.py"} & set(files))
+        if memory:
+            changed.add("jarvis.memory")
+        if not changed:
+            return []
+        found = []
+        for p in sorted((self.root / "tests").glob("test_*.py")):
+            stem = p.stem
+            try:
+                tree = ast.parse(p.read_text(encoding="utf-8-sig", errors="replace"))
+            except (SyntaxError, ValueError):
+                # ponytail: an unparsable test may import anything; include it (fail-closed)
+                found.append(f"tests.{stem}")
+                continue
+            names = set()
+            for node in ast.walk(tree):
+                if isinstance(node, ast.Import):
+                    names.update(a.name for a in node.names)
+                elif isinstance(node, ast.ImportFrom) and not node.level and node.module:
+                    names.add(node.module)
+                    names.update(f"{node.module}.{a.name}" for a in node.names)
+            hit = any(n == m or n.startswith(m + ".") for n in names for m in changed)
+            core = stem.removeprefix("test_").removesuffix("_replay")
+            if (hit or (stem.endswith("_replay") and core in stems)
+                    or (memory and stem.startswith("test_memory"))):
+                found.append(f"tests.{stem}")
+        return found
 
     def lint(self, b, entry, body):
         ids = {s.get("id") for s in b["slices"]}
@@ -391,14 +470,22 @@ def main(argv=None, git=real_git, out=print):
         p.add_argument("ids", nargs="+")
         if name == "review":
             p.add_argument("--with-partial", action="append", default=[], metavar="ID",
-                           help="a BLOCKED partial predecessor a reviewed slice names as BASE")
+                           help="a BLOCKED predecessor a reviewed slice names as BASE")
+            p.add_argument("--focus", metavar="TEXT", help="what the reviewer must look at (one line)")
         m = p.add_mutually_exclusive_group()
         m.add_argument("--write", action="store_true", help="write the prompt and the backlog entry")
         m.add_argument("--dry-run", action="store_true", help="print only (the default)")
     a = ap.parse_args(argv)
     g = Gen(a.root, git=git, out=out)
+    focus = getattr(a, "focus", None)
+    if a.cmd == "review" and not (focus or "").strip():
+        if a.write:
+            out('REFUSED: focus required (--focus "<text>")')
+            return 2
+        out(f"warning: no --focus; the prompt carries the placeholder {FOCUS_PLACEHOLDER}")
+        focus = None
     try:
-        made = g.review(a.ids, a.with_partial) if a.cmd == "review" else g.integration(a.ids)
+        made = g.review(a.ids, a.with_partial, focus) if a.cmd == "review" else g.integration(a.ids)
         return g.emit(*made, a.write)
     except (Refuse, OSError) as e:
         out(f"REFUSED: {e}")
