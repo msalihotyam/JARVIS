@@ -1,4 +1,5 @@
-"""PM20 Claude writer worker: argv allowlist, stage cwd, env scrub, lifecycle.
+"""PM20 Claude writer worker: argv allowlist, stage cwd, env scrub, lifecycle;
+PM20B per-run settings (deny rules) and the pre-spawn stage re-check.
 
 No real process is ever started: every test injects FakeRunner.
 """
@@ -16,13 +17,18 @@ from jarvis.workers.base import AgentProfile, Worker
 from jarvis.workers.claude import (
     DENIED_TOOLS,
     EMPTY_MCP_CONFIG,
+    RUN_DIR_PREFIX,
     ClaudeWriterWorker,
     WorkerRefused,
+    _fold,
     check_argv,
+    rule_path,
     scrubbed_env,
+    worker_settings,
 )
 
 COMMAND = str(Path(tempfile.gettempdir()).resolve() / "claude-cli-not-run.exe")
+SETTINGS = "C:\\run\\settings.json"
 
 
 class FakeRunner:
@@ -31,8 +37,12 @@ class FakeRunner:
         self.kills = 0
         self.exit_code = exit_code
         self.stdout = stdout
+        self.before = None
 
-    def start(self, argv, cwd, env, stdin):
+    def start(self, argv, cwd, env, stdin, verify_cwd):
+        if self.before is not None:
+            self.before(argv)
+        verify_cwd()
         self.started.append((list(argv), cwd, dict(env), stdin))
         return len(self.started)
 
@@ -50,7 +60,7 @@ class FakeRunner:
 def profile(**overrides) -> AgentProfile:
     values = dict(
         name="writer",
-        tools=frozenset({"Read", "Edit", "Write"}),
+        tools=frozenset({"Edit", "Write"}),
         paths=frozenset({"jarvis/x.py"}),
         network=False,
         max_turns=12,
@@ -66,6 +76,10 @@ def payload(**fields) -> str:
     return "log line\n" + json.dumps(base)
 
 
+def settings_path(argv: list[str]) -> Path:
+    return Path(argv[argv.index("--settings") + 1])
+
+
 class WorkerTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.root = Path(tempfile.mkdtemp(prefix="pm20-")).resolve()
@@ -76,6 +90,7 @@ class WorkerTestCase(unittest.TestCase):
 
     def worker(self, stage=None, *, prof=None, environ=None, **kwargs) -> ClaudeWriterWorker:
         kwargs.setdefault("max_budget_usd", 0.5)
+        kwargs.setdefault("home", self.root / "home")
         return ClaudeWriterWorker(
             prof or profile(),
             self.stage if stage is None else stage,
@@ -89,13 +104,14 @@ class WorkerTestCase(unittest.TestCase):
 class ArgvTests(WorkerTestCase):
     def test_golden_argv(self) -> None:
         self.assertEqual(
-            self.worker().build_argv(),
+            self.worker().build_argv(SETTINGS),
             [
                 COMMAND, "-p", "--output-format", "json",
                 "--permission-mode", "acceptEdits", "--safe-mode",
+                "--settings", SETTINGS,
                 "--strict-mcp-config", "--mcp-config", EMPTY_MCP_CONFIG,
-                "--tools", "Edit,Read,Write",
-                "--disallowedTools", "Bash,NotebookEdit,Task,WebFetch,WebSearch",
+                "--tools", "Edit,Write",
+                "--disallowedTools", "Bash,Glob,Grep,NotebookEdit,Read,Task,WebFetch,WebSearch",
                 "--disable-slash-commands", "--no-chrome", "--no-session-persistence",
                 "--max-turns", "12", "--max-budget-usd", "0.5000",
             ],
@@ -104,25 +120,29 @@ class ArgvTests(WorkerTestCase):
         self.assertEqual(json.loads(EMPTY_MCP_CONFIG), {"mcpServers": {}})
 
     def test_golden_argv_with_model_and_effort(self) -> None:
-        argv = self.worker(model="claude-opus-5-5", effort="high").build_argv()
+        argv = self.worker(model="claude-opus-5-5", effort="high").build_argv(SETTINGS)
         self.assertEqual(argv[-4:], ["--model", "claude-opus-5-5", "--effort", "high"])
-        check_argv(argv, COMMAND)
+        check_argv(argv, COMMAND, SETTINGS)
 
     def test_turns_and_budget_come_from_profile_and_settings(self) -> None:
-        argv = self.worker(prof=profile(max_turns=7), max_budget_usd=2).build_argv()
+        argv = self.worker(prof=profile(max_turns=7), max_budget_usd=2).build_argv(SETTINGS)
         self.assertEqual(argv[argv.index("--max-turns") + 1], "7")
         self.assertEqual(argv[argv.index("--max-budget-usd") + 1], "2.0000")
-        for denied in ("Bash", "WebFetch", "WebSearch"):
-            self.assertNotIn(denied, argv[argv.index("--tools") + 1])
+        for denied in ("Bash", "Glob", "Grep", "Read", "WebFetch", "WebSearch"):
+            self.assertNotIn(denied, argv[argv.index("--tools") + 1].split(","))
             self.assertIn(denied, DENIED_TOOLS)
 
     def test_banned_and_malformed_flags_are_refused(self) -> None:
-        good = self.worker().build_argv()
+        good = self.worker().build_argv(SETTINGS)
         servers = json.dumps({"mcpServers": {"x": {"command": "evil"}}})
+        at = good.index("--settings")
         cases = {
             "skip_permissions": good + ["--dangerously-skip-permissions"],
             "add_dir": good + ["--add-dir", "C:\\"],
-            "settings": good + ["--settings", "{}"],
+            "settings_inline": _replace(good, "--settings", "{}"),
+            "settings_other_file": _replace(good, "--settings", "C:\\run\\other.json"),
+            "settings_twice": good + ["--settings", SETTINGS],
+            "missing_settings": good[:at] + good[at + 2 :],
             "allowed_tools": good + ["--allowedTools", "Bash"],
             "system_prompt": good + ["--append-system-prompt", "x"],
             "resume": good + ["--resume", "abc"],
@@ -132,11 +152,15 @@ class ArgvTests(WorkerTestCase):
             "mcp_servers": _replace(good, "--mcp-config", servers),
             "bypass_mode": _replace(good, "--permission-mode", "bypassPermissions"),
             "default_mode": _replace(good, "--permission-mode", "dontAsk"),
-            "bash_tool": _replace(good, "--tools", "Read,Bash"),
-            "web_tool": _replace(good, "--tools", "Read,WebFetch"),
-            "dup_tool": _replace(good, "--tools", "Read,Read"),
+            "bash_tool": _replace(good, "--tools", "Edit,Bash"),
+            "web_tool": _replace(good, "--tools", "Edit,WebFetch"),
+            "read_tool": _replace(good, "--tools", "Edit,Read"),
+            "glob_tool": _replace(good, "--tools", "Edit,Glob"),
+            "grep_tool": _replace(good, "--tools", "Edit,Grep"),
+            "dup_tool": _replace(good, "--tools", "Edit,Edit"),
             "empty_tools": _replace(good, "--tools", ""),
             "weak_deny": _replace(good, "--disallowedTools", "Bash"),
+            "deny_without_read": _replace(good, "--disallowedTools", "Bash,NotebookEdit,Task,WebFetch,WebSearch"),
             "zero_turns": _replace(good, "--max-turns", "0"),
             "zero_budget": _replace(good, "--max-budget-usd", "0.0000"),
             "flag_model": good + ["--model", "--add-dir"],
@@ -148,18 +172,24 @@ class ArgvTests(WorkerTestCase):
         }
         for name, argv in cases.items():
             with self.subTest(name), self.assertRaises(WorkerRefused):
-                check_argv(argv, COMMAND)
+                check_argv(argv, COMMAND, SETTINGS)
 
     def test_banned_flag_from_build_argv_never_reaches_runner(self) -> None:
-        class Sneaky(ClaudeWriterWorker):
-            def build_argv(self):
-                return super().build_argv() + ["--dangerously-skip-permissions"]
+        seen: list[str] = []
 
-        sneaky = Sneaky(profile(), self.stage, runner=self.runner, command=COMMAND, max_budget_usd=0.5)
+        class Sneaky(ClaudeWriterWorker):
+            def build_argv(self, settings):
+                seen.append(settings)
+                return super().build_argv(settings) + ["--dangerously-skip-permissions"]
+
+        sneaky = Sneaky(
+            profile(), self.stage, runner=self.runner, command=COMMAND, max_budget_usd=0.5, home=self.root / "home"
+        )
         with self.assertRaises(WorkerRefused) as caught:
             sneaky.start("task")
         self.assertEqual(caught.exception.code, "flag_not_allowed")
         self.assertEqual(self.runner.started, [])
+        self.assertFalse(Path(seen[0]).parent.exists())
 
     def test_constructor_refusals(self) -> None:
         cases = {
@@ -169,6 +199,8 @@ class ArgvTests(WorkerTestCase):
             "zero_budget": dict(max_budget_usd=0),
             "bad_model": dict(model="-x"),
             "bad_effort": dict(effort="extreme"),
+            "unsafe_home": dict(home="C:\\Users\\a(b"),
+            "unc_home": dict(home="\\\\srv\\share\\home"),
         }
         for name, overrides in cases.items():
             args = dict(runner=self.runner, command=COMMAND, max_budget_usd=0.5)
@@ -183,6 +215,18 @@ def _replace(argv: list[str], flag: str, value: str) -> list[str]:
     return out
 
 
+def _link_or_skip(case: unittest.TestCase, target: Path, link: Path) -> None:
+    try:
+        os.symlink(target, link, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        try:
+            import _winapi
+
+            _winapi.CreateJunction(str(target), str(link))
+        except (ImportError, OSError):
+            case.skipTest("no symlink or junction support")
+
+
 class RefusalTests(WorkerTestCase):
     def assert_refused(self, worker: ClaudeWriterWorker, code: str, task: str = "task") -> None:
         with self.assertRaises(WorkerRefused) as caught:
@@ -192,14 +236,16 @@ class RefusalTests(WorkerTestCase):
 
     def test_profile_refusals(self) -> None:
         cases = {
-            "profile_tools": profile(tools=frozenset({"Read", "Bash"})),
+            "profile_tools": profile(tools=frozenset({"Edit", "Read"})),
             "profile_network": profile(network=True),
             "budget_sessions_exhausted": profile(budget_sessions=0),
         }
         for code, prof in cases.items():
             with self.subTest(code):
                 self.assert_refused(self.worker(prof=prof), code)
-        self.assert_refused(self.worker(prof=profile(tools=frozenset())), "profile_tools")
+        for tools in (frozenset(), {"Edit", "Bash"}, {"Write", "Glob"}):
+            with self.subTest(tools=sorted(tools)):
+                self.assert_refused(self.worker(prof=profile(tools=frozenset(tools))), "profile_tools")
 
     def test_empty_task_refused(self) -> None:
         self.assert_refused(self.worker(), "task_empty", task="  ")
@@ -230,15 +276,7 @@ class RefusalTests(WorkerTestCase):
         outside = self.root / "outside"
         outside.mkdir()
         link = self.root / "link"
-        try:
-            os.symlink(outside, link, target_is_directory=True)
-        except (OSError, NotImplementedError):
-            try:
-                import _winapi
-
-                _winapi.CreateJunction(str(outside), str(link))
-            except (ImportError, OSError):
-                self.skipTest("no symlink or junction support")
+        _link_or_skip(self, outside, link)
         self.assert_refused(self.worker(link), "stage_escape")
 
     def test_cwd_mismatch_refused(self) -> None:
@@ -249,8 +287,137 @@ class RefusalTests(WorkerTestCase):
             def launch_cwd(self):
                 return other
 
-        drifting = Drifting(profile(), self.stage, runner=self.runner, command=COMMAND, max_budget_usd=0.5)
+        drifting = Drifting(
+            profile(), self.stage, runner=self.runner, command=COMMAND, max_budget_usd=0.5, home=self.root / "home"
+        )
         self.assert_refused(drifting, "cwd_mismatch")
+
+
+class SpawnRecheckTests(WorkerTestCase):
+    """The runner calls verify_cwd right before the OS spawn (TOCTOU)."""
+
+    def start_refused(self, worker: ClaudeWriterWorker, change, code: str) -> None:
+        settings: list[Path] = []
+
+        def before(argv):
+            settings.append(settings_path(argv))
+            change()
+
+        self.runner.before = before
+        with self.assertRaises(WorkerRefused) as caught:
+            worker.start("task")
+        self.assertEqual(caught.exception.code, code)
+        self.assertEqual(self.runner.started, [])
+        self.assertFalse(settings[0].parent.exists())
+
+    def test_stage_removed_before_spawn(self) -> None:
+        self.start_refused(self.worker(), self.stage.rmdir, "stage_missing")
+
+    def test_stage_swapped_for_link_before_spawn(self) -> None:
+        outside = self.root / "outside"
+        outside.mkdir()
+
+        def swap():
+            self.stage.rename(self.root / "stage-old")
+            _link_or_skip(self, outside, self.stage)
+
+        self.start_refused(self.worker(), swap, "stage_escape")
+
+    def test_stage_retargeted_before_spawn(self) -> None:
+        other = self.root / "other"
+        other.mkdir()
+        worker = self.worker()
+
+        def retarget():
+            worker.stage = other
+
+        self.start_refused(worker, retarget, "stage_changed")
+
+    def test_unchanged_stage_spawns(self) -> None:
+        self.runner.before = lambda argv: None
+        self.worker().start("task")
+        self.assertEqual(len(self.runner.started), 1)
+
+
+class SettingsTests(WorkerTestCase):
+    HOME = "C:\\Users\\x"
+
+    def test_rule_path(self) -> None:
+        self.assertEqual(rule_path("C:\\Users\\x"), "//c/Users/x")
+        self.assertEqual(rule_path("D:\\"), "//d")
+        for bad in ("\\\\srv\\share\\x", "rel\\x", "C:rel", "C:\\a(b", "C:\\a*", "C:\\a\\..\\b",
+                    "C:\\a[1]", "C:\\a{b}", "C:\\a!b", "C:\\a?"):  # fmt: skip
+            with self.subTest(bad), self.assertRaises(WorkerRefused) as caught:
+                rule_path(bad)
+            self.assertEqual(caught.exception.code, "rule_path_unsafe")
+
+    def test_golden_settings_stage_outside_home(self) -> None:
+        settings = worker_settings(self.HOME, "D:\\work\\stage", "C:\\Temp\\run")
+        self.assertEqual(settings, worker_settings(self.HOME, "D:\\work\\stage", "C:\\Temp\\run"))
+        self.assertEqual(
+            {key: value for key, value in settings.items() if key != "permissions"},
+            {"disableAllHooks": True, "enableAllProjectMcpServers": False, "enabledMcpjsonServers": []},
+        )
+        permissions = settings["permissions"]
+        self.assertEqual(set(permissions), {"defaultMode", "disableBypassPermissionsMode", "deny"})
+        self.assertEqual(permissions["defaultMode"], "acceptEdits")
+        self.assertEqual(permissions["disableBypassPermissionsMode"], "disable")
+        self.assertNotIn("allow", permissions)
+        deny = permissions["deny"]
+        self.assertEqual(deny[:3], ["Read", "Glob", "Grep"])
+        self.assertEqual(deny[-2:], ["Edit(//c/Temp/run/**)", "Edit(//c/Users/x/**)"])
+        self.assertEqual(len(deny), len(set(deny)))
+        self.assertTrue(all(rule.startswith("Edit(") and rule.endswith(")") for rule in deny[3:]))
+        for name in (".env*", "*.db", "*.sqlite*", "*.key", "*.pem", "id_rsa*", ".git", ".ssh", ".claude",
+                     ".codex", ".mcp.json", ".vscode", "claude.md", "CLAUDE.md", "AGENTS.md",
+                     "AGENTS.override.md", "GEMINI.md"):  # fmt: skip
+            with self.subTest(name):
+                self.assertIn(f"Edit(**/{_fold(name)})", deny)
+                self.assertIn(f"Edit(**/{_fold(name)}/**)", deny)
+        for rule in ("Edit(**/.git)", "Edit(**/.[gG][iI][tT])", "Edit(**/*.[dD][bB]-*/**)", "Edit(./data)",
+                     "Edit(./[dD][aA][tT][aA])", "Edit(./[dD][aA][tT][aA]/**)", "Edit(~/.jarvis/**)",
+                     "Edit(~/.[sS][sS][hH]/**)", "Edit(//c/Users/x/.[cC][lL][aA][uU][dD][eE]/**)",
+                     "Edit(//c/Users/x/.codex)"):  # fmt: skip
+            self.assertIn(rule, deny)
+
+    def test_stage_at_or_above_home_denies_whole_home(self) -> None:
+        for stage in ("C:\\Users\\x", "c:\\users\\X", "C:\\Users"):
+            with self.subTest(stage):
+                deny = worker_settings(self.HOME, stage, "C:\\Temp\\run")["permissions"]["deny"]
+                self.assertEqual(deny[-1], "Edit(//c/Users/x/**)")
+
+    def test_stage_inside_home_keeps_stage_editable(self) -> None:
+        for stage in ("C:\\Users\\x\\repo\\stage", "c:\\users\\X\\repo"):
+            with self.subTest(stage):
+                deny = worker_settings(self.HOME, stage, "C:\\Temp\\run")["permissions"]["deny"]
+                self.assertNotIn("Edit(//c/Users/x/**)", deny)
+                self.assertIn("Edit(//c/Users/x/.claude/**)", deny)
+                self.assertEqual(deny[-1], "Edit(//c/Temp/run/**)")
+
+    def test_unsafe_run_dir_refused(self) -> None:
+        with self.assertRaises(WorkerRefused) as caught:
+            worker_settings(self.HOME, "D:\\stage", "C:\\Temp\\r[1]")
+        self.assertEqual(caught.exception.code, "rule_path_unsafe")
+
+    def test_started_run_passes_its_settings_file(self) -> None:
+        captured: list = []
+
+        def before(argv):
+            path = settings_path(argv)
+            captured.append((path, json.loads(path.read_text(encoding="utf-8"))))
+
+        self.runner.before = before
+        worker = self.worker()
+        run_id = worker.start("task")
+        path, content = captured[0]
+        self.assertEqual(path.name, "settings.json")
+        self.assertTrue(path.parent.name.startswith(RUN_DIR_PREFIX))
+        self.assertFalse(path.is_relative_to(self.stage))
+        self.assertEqual(content, worker_settings(self.root / "home", self.stage, path.parent))
+        self.assertIn(f"Edit({rule_path(self.root / 'home')}/**)", content["permissions"]["deny"])
+        self.assertTrue(path.exists())
+        worker.collect(run_id)
+        self.assertFalse(path.parent.exists())
 
 
 class EnvTests(unittest.TestCase):
@@ -276,12 +443,17 @@ class EnvTests(unittest.TestCase):
                 "CLAUDE_ENV_FILE": "C:\\evil.sh",
                 "CLAUDE_CODE_SHELL": "C:\\evil.exe",
                 "NODE_OPTIONS": "--require C:\\evil.js",
+                "enable_claudeai_mcp_servers": "true",
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "0",
             }
         )
         self.assertEqual(env["CLAUDE_CODE_OAUTH_TOKEN"], "keep")
         self.assertEqual(env["CLAUDE_CONFIG_DIR"], "C:\\cfg")
         self.assertEqual(env["CLAUDE_CODE_DISABLE_AUTO_MEMORY"], "1")
         self.assertEqual(env["CLAUDE_CODE_MAX_SUBAGENT_SPAWN_DEPTH"], "1")
+        self.assertEqual(env["ENABLE_CLAUDEAI_MCP_SERVERS"], "false")
+        self.assertEqual(env["CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"], "1")
+        self.assertEqual(env["DISABLE_AUTOUPDATER"], "1")
         upper = {key.upper() for key in env}
         for gone in (
             "ANTHROPIC_API_KEY", "ANTHROPIC_BASE_URL", "CLAUDE_CODE_USE_BEDROCK",
@@ -291,6 +463,7 @@ class EnvTests(unittest.TestCase):
         ):  # fmt: skip
             self.assertNotIn(gone, upper)
         self.assertNotIn("claude_code_disable_auto_memory", env)
+        self.assertNotIn("enable_claudeai_mcp_servers", env)
         self.assertNotIn("http://user:pw@proxy:8080", env.values())
 
 
