@@ -46,6 +46,7 @@ from jarvis.schedules import (
     Weekday,
     Weekly,
 )
+from jarvis.work_plan import GrantEnvelope
 
 
 def utc_now() -> str:
@@ -10151,3 +10152,36 @@ class ResultVerifier(Protocol):
     def verify(
         self, task: Task, result: ToolResult, session: SessionState
     ) -> VerificationRecord: ...
+
+
+@dataclass(frozen=True)
+class WorkApproval:
+    """PM12: an approval of exactly one plan. ``envelope`` is that plan's
+    GrantEnvelope; a record whose hashes disagree cannot be built. Times are
+    epoch seconds; the approval lapses at the earlier of its own and the
+    plan's expiry."""
+
+    plan_hash: str
+    envelope: GrantEnvelope
+    approver: str
+    approved_at: int
+    expires_at: int
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.envelope, GrantEnvelope):
+            raise ValueError("approval envelope must be a GrantEnvelope")
+        if not isinstance(self.plan_hash, str) or not (
+            self.plan_hash == self.envelope.plan_hash == self.envelope.plan.plan_hash
+        ):
+            raise ValueError("approval plan_hash does not match its envelope")
+        if not isinstance(self.approver, str) or not self.approver:
+            raise ValueError("approval needs an approver")
+        for name in ("approved_at", "expires_at"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                raise ValueError(f"approval {name} must be an int")
+        if self.expires_at <= self.approved_at:
+            raise ValueError("approval expires_at must be after approved_at")
+
+    def valid_at(self, now: int) -> bool:
+        return self.approved_at <= now < min(self.expires_at, self.envelope.plan.expires_at)

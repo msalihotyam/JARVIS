@@ -22,6 +22,7 @@ from jarvis.connectors.base import BaseConnector
 from jarvis.connectors.claude_code import RETRIEVED_MEMORY_NOTICE
 from jarvis.connectors.project_folder import PROJECT_FOLDER_CONNECTOR
 from jarvis.contracts import (
+    WorkApproval,
     project_instruction_delivery,
     PROJECT_FILE_NOTICE,
     normalize_retrieved_text,
@@ -1392,10 +1393,19 @@ class ResumeRefused:
     """PM05: why an explicit resume was refused; the run stays interrupted.
 
     ``code`` is the first failed check, in resume order: ``not_interrupted``,
-    ``policy``, ``scope_narrowed``, ``plan``, ``lease``, ``budget``."""
+    ``policy``, ``scope_narrowed``, ``plan``, ``lease``, ``budget``,
+    ``approval``."""
 
     code: str
     detail: str
+
+
+# PM12: who may approve a plan. Only explicit Core calls carry one; a model
+# has no approver identity. The D9 read-back approval ("readback") is written
+# by Core alone, for small/medium runs, bound to the confirmed brief.
+_PLAN_APPROVERS = frozenset({"operator"})
+# A read-back approval lapses after a day at most, whatever the plan claims.
+_READBACK_TTL_S = 86_400
 
 
 def _lease_fold(target: str) -> str:
@@ -1516,14 +1526,15 @@ class AgentCore:
     # worker is started here, and nothing resumes on its own.
 
     def _project_run_payloads(self, run_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
-        """The (first plan-bearing, latest owned) event payloads: the plan
+        """The (latest plan-bearing, latest owned) event payloads: the plan
         binding and the owner. A clarify-born run binds its plan on a later
-        event (PM11). Notification events carry no boot_id, so they never own
-        a run."""
+        event (PM11), and a replan rebinds it; the PM12 gate approves exactly
+        this latest binding. Notification events carry no boot_id, so they
+        never own a run."""
         events = [json.loads(event.payload_json) for event in self.memory.work_events(run_id)]
         if not events:
             return {}, {}
-        first = next((payload for payload in events if "plan" in payload), events[0])
+        first = next((payload for payload in reversed(events) if "plan" in payload), events[0])
         for payload in reversed(events):
             if "boot_id" in payload:
                 return first, payload
@@ -1566,16 +1577,115 @@ class AgentCore:
         at: datetime,
         extra: dict[str, Any] | None = None,
     ) -> WorkRun:
-        """One legal ledger transition plus its event; illegal ones raise."""
+        """One legal ledger transition plus its event; illegal ones raise.
+        Building needs a valid PM12 approval of the bound plan."""
         run = self.memory.latest_work_run(run_id)
         if run is None:
             raise WorkLedgerError("unknown project run")
+        if extra and "approval" in extra:
+            raise WorkLedgerError("an approval is recorded only by approve_project_plan")
+        if to is RunState.BUILDING:
+            reason = self._approval_gate(run, at)
+            if reason is not None:
+                raise WorkLedgerError(f"approval refused: {reason}")
         moved = advance_run(run, to, at=at)
         kind = EventKind.INTERRUPTED if to is RunState.INTERRUPTED else EventKind.RUN_STATE
         self.memory.append_work_run(moved, event_kind=kind, event_payload={
             **(extra or {}), "from": run.state.value, "to": to.value, "boot_id": boot_id,
         }, prior=run)
         return moved
+
+    def _approval_refusal(
+        self, run: WorkRun, record: Any, bound: dict[str, Any] | None, now: datetime
+    ) -> str | None:
+        """Why ``record`` does not let ``run`` build its ``bound`` plan now,
+        or None. The hash is recomputed from the plan, never trusted."""
+        if bound is None:
+            return "no plan"
+        try:
+            plan = WorkPlan.from_dict(bound["plan"])
+        except (KeyError, TypeError, ValueError):
+            return "no readable plan"
+        if plan.plan_hash != bound.get("plan_hash"):
+            return "the plan does not match its bound hash"
+        if not isinstance(record, dict):
+            return "no approval"
+        if record.get("run_id") != run.run_id or record.get("plan_hash") != plan.plan_hash:
+            return "the approval is for another run or plan"
+        approver = record.get("approver")
+        if approver == "readback":
+            brief = bound.get("brief_hash")
+            if run.size not in (RunSize.SMALL, RunSize.MEDIUM) or not isinstance(brief, str) \
+                    or not brief or record.get("brief_hash") != brief:
+                return "the read-back does not bind this plan"
+        elif approver not in _PLAN_APPROVERS:
+            return "approver not allowed"
+        try:
+            approval = WorkApproval(
+                plan.plan_hash, plan.grant_envelope(), approver,
+                record.get("approved_at"), record.get("expires_at"),
+            )
+        except ValueError:
+            return "malformed approval"
+        if not approval.valid_at(int(now.timestamp())):
+            return "the approval is expired or not yet valid"
+        return None
+
+    def _approval_gate(self, run: WorkRun, now: datetime) -> str | None:
+        """PM12: the latest approval checked against the latest bound plan."""
+        events = [json.loads(event.payload_json) for event in self.memory.work_events(run.run_id)]
+        bound = next((payload for payload in reversed(events) if "plan" in payload), None)
+        record = next((payload["approval"] for payload in reversed(events) if "approval" in payload), None)
+        return self._approval_refusal(run, record, bound, now)
+
+    def approve_project_plan(
+        self,
+        run_id: str,
+        plan_hash: str,
+        *,
+        approver: str,
+        boot_id: str,
+        at: datetime,
+        expires_at: datetime,
+    ) -> WorkRun:
+        """PM12: the explicit approval of a large run's plan (the PM29 card
+        calls this). ``plan_hash`` is the plan the approver saw; a mismatch,
+        an unknown approver or a lapsed time raises and the run stays
+        awaiting approval. On success the run moves to building."""
+        run = self.memory.latest_work_run(run_id)
+        if run is None or run.state is not RunState.AWAITING_APPROVAL:
+            raise WorkLedgerError("only a run awaiting approval can be approved")
+        if approver not in _PLAN_APPROVERS:
+            raise WorkLedgerError("approver not allowed")
+        record = {
+            "run_id": run_id, "plan_hash": plan_hash, "approver": approver,
+            "approved_at": int(at.timestamp()), "expires_at": int(expires_at.timestamp()),
+        }
+        events = [json.loads(event.payload_json) for event in self.memory.work_events(run_id)]
+        bound = next((payload for payload in reversed(events) if "plan" in payload), None)
+        reason = self._approval_refusal(run, record, bound, at)
+        if reason is not None:
+            raise WorkLedgerError(f"approval refused: {reason}")
+        moved = advance_run(run, RunState.BUILDING, at=at)
+        self.memory.append_work_run(moved, event_kind=EventKind.RUN_STATE, event_payload={
+            "approval": record, "from": run.state.value, "to": moved.state.value,
+            "boot_id": boot_id,
+        }, prior=run)
+        return moved
+
+    def reject_project_plan(
+        self, run_id: str, *, approver: str, boot_id: str, at: datetime, reason: str = ""
+    ) -> WorkRun:
+        """PM12: the explicit rejection of a plan; the run ends cancelled."""
+        run = self.memory.latest_work_run(run_id)
+        if run is None or run.state is not RunState.AWAITING_APPROVAL:
+            raise WorkLedgerError("only a run awaiting approval can be rejected")
+        if approver not in _PLAN_APPROVERS:
+            raise WorkLedgerError("approver not allowed")
+        return self.advance_project_run(
+            run_id, RunState.CANCELLED, boot_id=boot_id, at=at,
+            extra={"rejected": True, "approver": approver, "reason": reason},
+        )
 
     def _release_project_leases(
         self, targets: tuple[str, ...], run_id: str, boot_id: str, now: datetime
@@ -1687,6 +1797,11 @@ class AgentCore:
         if verdict != "continue":
             self._release_project_leases(tuple(claimed), run_id, boot_id, now)
             return ResumeRefused("budget", verdict)
+        if run.resume_state is RunState.BUILDING:
+            reason = self._approval_gate(run, now)
+            if reason is not None:
+                self._release_project_leases(tuple(claimed), run_id, boot_id, now)
+                return ResumeRefused("approval", reason)
         try:
             return self.advance_project_run(
                 run_id, run.resume_state, boot_id=boot_id, at=now, extra={"resumed": True},
@@ -1850,18 +1965,40 @@ class AgentCore:
                 "Geçerli bir proje planı oluşturulamadı. 'iptal' yazıp hedef klasörü "
                 "ve kapsamı daraltarak projeyi yeniden tarif edebilirsiniz."
             )
-        to = RunState.AWAITING_APPROVAL if result.size == "large" else RunState.BUILDING
-        moved = advance_run(replace(run, size=RunSize(result.size)), to, at=max(at, run.updated_at))
-        # D9: the plan is bound to the confirmed read-back by its brief hash.
+        at = max(at, run.updated_at)
+        sized = replace(run, size=RunSize(result.size))
+        # D9: the plan is bound to the confirmed read-back by its brief hash;
+        # for small/medium that read-back is the PM12 approval itself, gated
+        # like any other and capped by Core, never by the model's expiry.
+        brief = clarify.brief_hash(state.brief)
+        approval: dict[str, Any] = {}
+        to = RunState.AWAITING_APPROVAL
+        if result.size != "large":
+            record = {
+                "run_id": run.run_id, "plan_hash": result.plan_hash, "approver": "readback",
+                "brief_hash": brief, "approved_at": int(at.timestamp()),
+                "expires_at": min(result.plan.expires_at, int(at.timestamp()) + _READBACK_TTL_S),
+            }
+            bound = {"plan": result.plan.to_dict(), "plan_hash": result.plan_hash, "brief_hash": brief}
+            reason = self._approval_refusal(sized, record, bound, at)
+            if reason is not None:
+                self.advance_project_run(run.run_id, RunState.NEEDS_INPUT, boot_id=boot_id, at=at, extra={
+                    **base, "attempts": result.attempts,
+                    "refusals": [{"code": "approval", "detail": reason}],
+                })
+                return "Plan onaylanamadı (süresi geçmiş). 'iptal' yazıp projeyi yeniden tarif edebilirsiniz."
+            approval, to = {"approval": record}, RunState.BUILDING
+        moved = advance_run(sized, to, at=at)
         self.memory.append_work_run(moved, event_kind=EventKind.RUN_STATE, event_payload={
             **base, "plan": result.plan.to_dict(), "plan_hash": result.plan_hash,
             "size": result.size, "size_reasons": list(result.reasons),
             "project_root": root, "jarvis_repo": facts["jarvis_repo"], "facts": facts,
-            "brief_hash": clarify.brief_hash(state.brief), "attempts": result.attempts,
+            "brief_hash": brief, "attempts": result.attempts, **approval,
             "from": run.state.value, "to": to.value, "boot_id": boot_id,
         }, prior=run)
         if to is RunState.AWAITING_APPROVAL:
             self._clarify_notify(moved, "plan_ready", result.plan_hash)
+            self._clarify_notify(moved, "approval_required", result.plan_hash)
             return "Plan hazır (büyük); onayınız bekleniyor."
         label = "küçük" if result.size == "small" else "orta"
         return f"Plan hazır ({label}); onaylanan özete bağlı olarak inşa aşamasına geçti."

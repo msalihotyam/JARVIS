@@ -9,7 +9,7 @@ from unittest import mock
 from jarvis.core import AgentCore, ResumeRefused
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
-from jarvis.work_controls import Usage
+from jarvis.work_controls import Budget, Usage
 from jarvis.work_ledger import EventKind, RunSize, RunState, WorkEvent, WorkLedgerError, WorkRun
 from jarvis.work_plan import Plan, PlanBudget, PlanCheck, PlanSlice
 
@@ -43,16 +43,20 @@ class WorkResumeTests(unittest.TestCase):
         """A run building under boot "old" whose process then died."""
         self.core.create_project_run(
             "r1", self.plan, project_root=self.root, jarvis_repo=False,
-            size=RunSize.SMALL, boot_id="old", at=T0,
+            size=RunSize.LARGE, boot_id="old", at=T0,
         )
-        self.core.advance_project_run("r1", RunState.BUILDING, boot_id="old", at=T0)
+        self.core.advance_project_run("r1", RunState.AWAITING_APPROVAL, boot_id="old", at=T0)
+        self.core.approve_project_plan(
+            "r1", self.plan.plan_hash, approver="operator", boot_id="old", at=T0,
+            expires_at=T0 + timedelta(days=1),
+        )
         for target in TARGETS:
             self.memory.claim_work_lease(target, "r1", "old", now=T0, lease=LEASE)
 
     def resume(self, **overrides):
         kwargs = dict(
             boot_id="new", now=T0 + timedelta(minutes=2), granted_targets=GRANTED,
-            lease=LEASE, usage=Usage(),
+            lease=LEASE, usage=Usage(), large_budget=Budget(10, 7200, 50),
         )
         kwargs.update(overrides)
         return self.core.resume_project_run("r1", **kwargs)
@@ -142,7 +146,7 @@ class WorkResumeTests(unittest.TestCase):
         self.resume()
         events = self.memory.work_events("r1")
         self.assertEqual([event.seq for event in events], list(range(1, len(events) + 1)))
-        self.assertEqual(len(events), 4)
+        self.assertEqual(len(events), 5)
         with self.assertRaises(WorkLedgerError):
             self.memory.append_work_event(WorkEvent(
                 run_id="r1", seq=1, kind=EventKind.RUN_STATE, at=T0,
