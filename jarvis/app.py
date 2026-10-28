@@ -220,6 +220,7 @@ from jarvis.intent import (
     INTENT_ACTION,
     INTENT_CAPABILITY,
     WARM_SESSIONS,
+    ClaudeClarifyAdapter,
     ClaudeIntentAdapter,
     ClaudeResearchAdapter,
     IntentStatus,
@@ -227,6 +228,7 @@ from jarvis.intent import (
     build_catalog,
     intent_text_refusal,
     model_failure_status,
+    parse_clarify_proposal,
     parse_proposal,
     parse_research,
     model_failure_reason,
@@ -4272,6 +4274,7 @@ class JarvisApp:
         settings: Settings,
         intent_model: ModelAdapter | None = None,
         research_model: ModelAdapter | None = None,
+        clarify_model: ModelAdapter | None = None,
     ) -> None:
         self.core = core
         self.memory = memory
@@ -4282,6 +4285,9 @@ class JarvisApp:
         #: The read-only public Web Research model, or ``None`` when the
         #: composed provider has no verified research route. Never registered.
         self.research_model = research_model
+        #: PM07C: the clarify proposal model (its own prompt, no warm session),
+        #: or ``None``, which falls back to the intent model. Never registered.
+        self.clarify_model = clarify_model
         self._cancelled_text: set[str] = set()
         self.memory_triggers = MEMORY_TRIGGERS
         # PM07B: the clarify dialog's boot identity, turn counter and clock.
@@ -4705,10 +4711,14 @@ class JarvisApp:
         )
 
     def _clarify_proposer(self, model: Any, text: str) -> Callable[[str, dict[str, Any]], Any]:
-        """PM07B: the clarify dialog's ``propose(kind, context)`` on the intent model's call path.
+        """PM07B: the clarify dialog's ``propose(kind, context)``.
 
-        The answer is JSON data only; ``clarify`` validates it. Any failure raises
-        and Core refuses the proposal."""
+        PM07C: the call goes to ``clarify_model`` (its own prompt and process,
+        never the warm intent session) when composed. The answer is parsed by
+        ``parse_clarify_proposal`` and validated by ``clarify``; any failure
+        raises and Core refuses the proposal."""
+        model = self.clarify_model or model
+
         def propose(kind: str, context: dict[str, Any]) -> Any:
             task = Task(
                 objective=json.dumps({"clarify": kind, **context}, ensure_ascii=False),
@@ -4721,7 +4731,7 @@ class JarvisApp:
             answer = result.data.get(MODEL_ANSWER_RESULT_KEY) if result.ok and isinstance(result.data, dict) else None
             if type(answer) is not ModelAnswer or not answer.present or answer.truncated:
                 raise ValueError("no usable clarify proposal")
-            return json.loads(answer.content)
+            return parse_clarify_proposal(kind, answer.content)
         return propose
 
     def _intent_instruction(
@@ -6482,6 +6492,7 @@ def create_app(
     gmail_identity: GmailIdentityBinding | None = None,
     intent_model: ModelAdapter | None = None,
     research_model: ModelAdapter | None = None,
+    clarify_model: ModelAdapter | None = None,
 ) -> JarvisApp:
     """Assemble an application from injected parts. Tests use this.
 
@@ -6523,6 +6534,7 @@ def create_app(
         settings,
         intent_model=intent_model,
         research_model=research_model,
+        clarify_model=clarify_model,
     )
 
 
@@ -6562,6 +6574,16 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     # Web Research: the same seam, the same operator model/effort, one tool
     # (WebSearch). Held by the app and NOT registered, like the understanding call.
     research_model = ClaudeResearchAdapter(
+        allowed_roots=(startup_directory,),
+        default_working_directory=startup_directory,
+        protected_roots=protected_roots,
+        max_budget_usd=settings.claude_call_budget_usd,
+        model=settings.claude_model,
+        effort=settings.claude_effort,
+    )
+    # PM07C: the clarify proposal call - the same seam, its own system prompt,
+    # never the warm intent session. Held by the app and NOT registered.
+    clarify_model = ClaudeClarifyAdapter(
         allowed_roots=(startup_directory,),
         default_working_directory=startup_directory,
         protected_roots=protected_roots,
@@ -6630,6 +6652,7 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
         gmail_identity=gmail_identity,
         intent_model=intent_model,
         research_model=research_model,
+        clarify_model=clarify_model,
     )
 
 
