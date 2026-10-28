@@ -112,6 +112,14 @@ class ClarifyDialogTests(unittest.TestCase):
         self.assertEqual(self.runs(), [])
         self.assertEqual(model.calls, [])
 
+    def test_folder_request_is_not_a_new_project(self):
+        model = FakeModel()
+        for text in ("bu proje için bir klasör kur", "Proje KLASÖRÜ oluştur", "create a project folder",
+                     "make project DIRECTORY", "PROJE DIZINI kur", "make a subfolder for the project"):
+            self.assertIsNone(self.say(text, model), text)
+        self.assertEqual(self.runs(), [])
+        self.assertEqual(model.calls, [])
+
     def test_no_to_confirm_creates_no_run(self):
         model = FakeModel()
         self.assertEqual(self.say(IDEA, model), clarify.CONFIRM_PROMPT)

@@ -178,6 +178,11 @@ _YES = frozenset({"evet", "yes", "olur", "tamam", "onaylıyorum", "onayla", "ba�
 _NO = frozenset({"hayır", "no", "vazgeç", "iptal", "istemiyorum"})
 _BUILD = re.compile(r"\b(yap|oluştur|geliştir|kur|yaz|başlat|build|create|make|develop)")
 _THING = re.compile(r"\b(proje|uygulama|site|oyun|bot|program|app|website)")
+# A folder request ("bu proje için bir klasör kur") belongs to the project
+# folder flow, not to a new project. [iı]: _fold turns an upper-case I into ı.
+# No leading \b, so "subfolder" / "altklasör" count too; an over-match only
+# skips the confirm question.
+_FOLDER = re.compile(r"(klas[öo]r|folder|d[iı]z[iı]n|d[iı]rectory)")
 _LABELS = {
     "goal": "Amaç",
     "users": "Kullanıcılar",
@@ -202,7 +207,7 @@ def looks_like_project(text: object) -> bool:
     if not isinstance(text, str):
         return False
     folded = _fold(text)
-    return bool(_BUILD.search(folded) and _THING.search(folded))
+    return bool(_BUILD.search(folded) and _THING.search(folded) and not _FOLDER.search(folded))
 
 
 def parse_yes_no(text: object) -> str | None:
