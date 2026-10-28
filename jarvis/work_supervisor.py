@@ -6,6 +6,7 @@ DB here. The rules port the orchestrator's playbook (ORCH_RULES O5/O11/O13/O15/
 O23/O33, PM_DECISIONS D3/D8). A model step may only PROPOSE one of
 ALLOWED_PROPOSALS; anything else fails closed to a needs_input question with
 options and a default. Every Decision starts with (action, rule_id, reason).
+Out-of-bounds caller parameters and a malformed situation raise ValueError.
 """
 
 from math import isfinite
@@ -17,8 +18,8 @@ CORE_ACTIONS = ALLOWED_PROPOSALS | {
     "none", "dispatch", "batch", "alarm", "suppress", "non_claude_only", "needs_input",
 }
 FIX_CAP = 2                 # O5/O15: no third fix on one target
-QUOTA_LIMIT_PCT = 90.0      # O23: weekly hard stop
-AHEAD_PP = 3.0              # quota points over the pacing line that count as ahead
+QUOTA_LIMIT_PCT = 90.0      # O23: weekly hard stop (default; caller passes limit_pct)
+AHEAD_PP = 3.0              # default: quota points over the pacing line that count as ahead
 RATE_SLACK = 1.2            # burn rate over target * this counts as ahead
 NIGHT = (2, 8)              # local hours [start, end): only non-Claude workers
 MEM_LOW_GB = 3.0            # conveyor min_free_mem_gb
@@ -62,6 +63,8 @@ def fix_chain(target: str, failed_fixes: int, cap: int = FIX_CAP) -> Decision:
     """O5/O15: after the cap-th failed fix ask one simplification question."""
     if type(failed_fixes) is not int or failed_fixes < 0:
         raise ValueError("failed_fixes must be a nonnegative integer")
+    if type(cap) is not int or not 0 <= cap <= FIX_CAP:
+        raise ValueError(f"cap must be an integer 0..{FIX_CAP}")
     if failed_fixes < cap:
         return Decision("requeue", "O5.fix", f"{target}: fix {failed_fixes + 1}/{cap}")
     return Decision(
@@ -91,20 +94,24 @@ def filter_alarms(alarms, finished=frozenset(), alarmed=frozenset()) -> list[Dec
 def plan_integration(picks, int_running: bool = False, oldest_wait_s: float = 0,
                      max_batch: int = INT_MAX_BATCH,
                      min_batch: int = INT_MIN_BATCH) -> Decision:
-    """O11/O13: split out blocked picks, keep manual-key picks apart, batch small."""
+    """O11/O13: split out blocked picks, manual-key picks in their own INT LAST,
+    batch small. A pick without `manual: False` counts as manual."""
     names = [p["name"] for p in picks]
-    if len(set(names)) != len(names) or not all(isinstance(n, str) and n for n in names):
+    if len(set(names)) != len(names) or not all(type(n) is str and n for n in names):
         raise ValueError("pick names must be unique nonempty strings")
     if type(max_batch) is not int or max_batch < 1:
         raise ValueError("max_batch must be a positive integer")
+    if type(min_batch) is not int or min_batch < 1:
+        raise ValueError("min_batch must be a positive integer")
     if int_running is not False:
         return Decision("wait", "O13.running", "an integration is running; do not stack")
-    ready = [p for p in picks if p.get("status") == "pass"]
-    held = [p["name"] for p in picks if p.get("status") != "pass"]
+    passed = [type(p.get("status")) is str and p.get("status") == "pass" for p in picks]
+    ready = [p for p, ok in zip(picks, passed) if ok]
+    held = [p["name"] for p, ok in zip(picks, passed) if not ok]
     if not ready:
         return Decision("wait", "O11.none_ready", "no pick has passed")
     groups = []
-    for manual in (True, False):
+    for manual in (False, True):
         part = [p["name"] for p in ready if (p.get("manual") is not False) is manual]
         groups += [tuple(part[i:i + max_batch]) for i in range(0, len(part), max_batch)]
     groups = tuple(groups)
@@ -119,13 +126,20 @@ def plan_integration(picks, int_running: bool = False, oldest_wait_s: float = 0,
 
 
 def quota_pacing(used_pct, line_pct, hour, rate_pct_h=None, target_pct_h=None,
-                 limit_pct: float = QUOTA_LIMIT_PCT) -> Decision:
+                 limit_pct: float = QUOTA_LIMIT_PCT, ahead_pp: float = AHEAD_PP) -> Decision:
     """O23/D3: hard stop at the limit; only non-Claude workers when ahead or at night.
 
-    used_pct may be one reading or several; the highest counts (fail closed)."""
+    used_pct may be one reading or several; the highest counts (fail closed).
+    rate_pct_h/target_pct_h are optional as a pair: both None skips the rate rule;
+    anything else must be a rate >= 0 and a target in (0, 100], or the run pauses.
+    line_pct None means no pacing line; a supplied line outside 0..100 pauses."""
     readings = used_pct if isinstance(used_pct, (tuple, list)) else (used_pct,)
     values = [_num(v) for v in readings]
-    limit = _num(limit_pct)
+    limit, ahead = _num(limit_pct), _num(ahead_pp)
+    if limit is not None and limit > 100:
+        raise ValueError("limit_pct must be <= 100")
+    if ahead is None or ahead < 0:
+        raise ValueError("ahead_pp must be a finite number >= 0")
     if not values or None in values or min(values) < 0 or limit is None or limit <= 0:
         return Decision("pause", "O23.unknown", "quota reading or limit missing or invalid")
     used = max(values)
@@ -133,13 +147,18 @@ def quota_pacing(used_pct, line_pct, hour, rate_pct_h=None, target_pct_h=None,
         return Decision("pause", "O23.limit", f"quota {used:g}% >= {limit:g}%")
     if type(hour) is not int or not 0 <= hour <= 23:
         return Decision("pause", "O23.unknown", "hour missing or invalid")
+    rate, target = _num(rate_pct_h), _num(target_pct_h)
+    if (rate_pct_h is not None or target_pct_h is not None) and (
+            rate is None or target is None or rate < 0 or not 0 < target <= 100):
+        return Decision("pause", "O23.unknown", "burn rate or target invalid")
     line = _num(line_pct)
+    if line_pct is not None and (line is None or not 0 <= line <= 100):
+        return Decision("pause", "O23.unknown", "pacing line invalid")
     if line is None:
         return Decision("non_claude_only", "pace.unknown_line", "no pacing line")
-    if used - line > AHEAD_PP:
+    if used - line > ahead:
         return Decision("non_claude_only", "pace.ahead", f"quota {used:g}% vs line {line:g}%")
-    rate, target = _num(rate_pct_h), _num(target_pct_h)
-    if rate is not None and target is not None and rate > target * RATE_SLACK:
+    if rate is not None and rate > target * RATE_SLACK:
         return Decision("non_claude_only", "pace.rate", f"{rate:g}%/h vs target {target:g}%/h")
     if NIGHT[0] <= hour < NIGHT[1]:
         return Decision("non_claude_only", "pace.night", f"night hour {hour}")
@@ -152,6 +171,8 @@ def memory_hold(free_gb, held: bool, ok_for_s=0, low_gb: float = MEM_LOW_GB,
 
     The caller's next `held` is `decision.action == "wait"`."""
     free, low_gb, margin_gb = _num(free_gb), _num(low_gb), _num(margin_gb)
+    if low_gb is not None and low_gb <= 0:
+        raise ValueError("low_gb must be > 0")
     if free is None or low_gb is None or margin_gb is None or margin_gb < 0:
         return Decision("wait", "mem.unknown", "free memory or threshold unknown")
     if free < low_gb:
@@ -165,45 +186,79 @@ def memory_hold(free_gb, held: bool, ok_for_s=0, low_gb: float = MEM_LOW_GB,
 
 def gate_proposal(proposal) -> Decision:
     """D8: Core executes only allowlisted model proposals; the rest -> needs_input."""
-    if isinstance(proposal, str):
+    # type() is str, not isinstance: a str subclass can override __eq__/__hash__.
+    if type(proposal) is str:
         proposal = {"action": proposal}
     action = proposal.get("action") if isinstance(proposal, Mapping) else None
     reason = proposal.get("reason", "") if isinstance(proposal, Mapping) else ""
-    reason = reason[:_REASON_MAX] if isinstance(reason, str) else ""
-    if isinstance(action, str) and action in ALLOWED_PROPOSALS:
+    reason = reason[:_REASON_MAX] if type(reason) is str else ""
+    if type(action) is str and action in ALLOWED_PROPOSALS:
         return Decision(action, "D8.proposal", reason or "model proposal")
-    return _needs_input("D8.refused", f"refused model proposal {str(action)[:40]!r}")
+    shown = repr(action[:40]) if type(action) is str else type(action).__name__
+    return _needs_input("D8.refused", f"refused model proposal {shown}")
 
 
-_KEYS = frozenset({"operator_pause", "quota", "memory", "alarm", "fix", "integration",
-                   "proposal"})
+def _alarm(item, cause, finished=(), alarmed=()) -> Decision:
+    return filter_alarms([(item, cause)], finished, alarmed)[0]
+
+
+_RULES = {"quota": quota_pacing, "memory": memory_hold, "alarm": _alarm,
+          "fix": fix_chain, "integration": plan_integration}
+_KEYS = frozenset(_RULES) | {"operator_pause", "proposal"}
+
+# The ONE precedence table: (situation key, action; None = any action). supervise
+# evaluates every present key, then returns the first row that matches. Memory is
+# always checked; quota non_claude_only never hides alarm/fix/integration/proposal.
+PRECEDENCE = (
+    ("operator_pause", "pause"),
+    ("quota", "pause"),
+    ("memory", "wait"),
+    ("alarm", "alarm"),
+    ("fix", None),
+    ("integration", None),
+    ("proposal", None),
+    ("quota", "non_claude_only"),
+    ("memory", "dispatch"),
+    ("quota", "dispatch"),
+    ("alarm", "suppress"),      # a suppressed alarm hides nothing
+)
+
+
+def _evaluate(situation: Mapping) -> dict:
+    found = {}
+    if situation.get("operator_pause"):
+        found["operator_pause"] = Decision("pause", "operator.pause", "Salih asked for a pause")
+    for key, rule in _RULES.items():
+        if key in situation:
+            if not isinstance(situation[key], Mapping):
+                raise ValueError(f"situation[{key!r}] must be a mapping")
+            found[key] = rule(**situation[key])
+    if "proposal" in situation:
+        found["proposal"] = gate_proposal(situation["proposal"])
+    return found
 
 
 def supervise(situation: Mapping) -> Decision:
-    """One decision. Precedence: operator pause, quota, memory, alarm, fix chain,
-    integration, model proposal. Quota/memory gates win unless they say dispatch."""
-    unknown = set(situation) - _KEYS
-    if unknown:
-        return _needs_input("D8.unknown", "unknown situation keys: " + ", ".join(sorted(unknown)))
-    if situation.get("operator_pause"):
-        return Decision("pause", "operator.pause", "Salih asked for a pause")
-    gate = None
-    if "quota" in situation:
-        gate = quota_pacing(**situation["quota"])
-        if gate.action != "dispatch":
-            return gate
-    if "memory" in situation:
-        gate = memory_hold(**situation["memory"])
-        if gate.action != "dispatch":
-            return gate
-    if "alarm" in situation:
-        a = situation["alarm"]
-        return filter_alarms([(a["item"], a["cause"])], a.get("finished", ()),
-                             a.get("alarmed", ()))[0]
-    if "fix" in situation:
-        return fix_chain(**situation["fix"])
-    if "integration" in situation:
-        return plan_integration(**situation["integration"])
-    if "proposal" in situation:
-        return gate_proposal(situation["proposal"])
-    return gate or Decision("none", "idle", "nothing to decide")
+    """One decision by PRECEDENCE; no row matches -> none/idle.
+
+    Unknown top-level keys -> needs_input. A non-Mapping situation or sub-situation,
+    missing/extra/non-str sub-keys, out-of-bounds values or any error raised while
+    evaluating raise ValueError (never another type); the caller must not dispatch
+    on an exception."""
+    if not isinstance(situation, Mapping):
+        raise ValueError("situation must be a mapping")
+    try:
+        unknown = set(situation) - _KEYS
+        if unknown:
+            keys = ", ".join(sorted(map(repr, unknown)))
+            return _needs_input("D8.unknown", f"unknown situation keys: {keys}"[:_REASON_MAX])
+        found = _evaluate(situation)
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"malformed situation: {type(exc).__name__}") from None
+    for key, action in PRECEDENCE:
+        d = found.get(key)
+        if d is not None and action in (None, d.action):
+            return d
+    return Decision("none", "idle", "nothing to decide")

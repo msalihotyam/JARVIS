@@ -7,7 +7,7 @@ The fixture is inline because tests/data is gitignored. No clock, no I/O.
 import unittest
 
 from jarvis.work_supervisor import (
-    ALLOWED_PROPOSALS, CORE_ACTIONS, Decision, filter_alarms, fix_chain,
+    ALLOWED_PROPOSALS, CORE_ACTIONS, PRECEDENCE, Decision, filter_alarms, fix_chain,
     gate_proposal, memory_hold, plan_integration, quota_pacing, supervise,
 )
 
@@ -69,8 +69,8 @@ class IntegrationTests(unittest.TestCase):
         picks = [_pick(f"A{i}") for i in range(7)] + [_pick("CONVSAFE", manual=True)]
         d = plan_integration(picks)
         self.assertEqual((d.action, d.rule_id), ("batch", "O11.batch"))
-        self.assertEqual(d.groups[0], ("CONVSAFE",))
-        self.assertEqual([len(g) for g in d.groups[1:]], [6, 1])
+        self.assertEqual(d.groups[-1], ("CONVSAFE",))
+        self.assertEqual([len(g) for g in d.groups[:-1]], [6, 1])
 
     def test_small_batch_waits_until_old(self):
         picks = [_pick("A"), _pick("B")]
@@ -85,7 +85,7 @@ class IntegrationTests(unittest.TestCase):
 
     def test_missing_manual_key_counts_as_manual(self):
         d = plan_integration([{"name": "A", "status": "pass"}, _pick("B"), _pick("C")])
-        self.assertEqual(d.groups, (("A",), ("B", "C")))
+        self.assertEqual(d.groups, (("B", "C"), ("A",)))
 
     def test_bad_names_raise(self):
         for picks in ([_pick("A"), _pick("A")], [_pick("")], [_pick(None)]):
@@ -267,8 +267,24 @@ FIXTURE = [
     ("273", {"proposal": "ask_salih"}, "ask_salih"),
 ]
 # 136: the orchestrator moved a 2-pick INT forward after 47 min (O11 threshold is 60).
-# 355: the orchestrator paused overnight; the later night plan (396) runs non-Claude.
+# 355: hour 1 is outside NIGHT (2, 8); the branch is pace.ahead (51 vs 44.6) and the
+# orchestrator paused overnight instead; the later night plan (396) runs non-Claude.
 KNOWN_MISSES = {"136", "355"}
+# 370/406/424 were recorded without a pacing line, so they hit pace.unknown_line;
+# pace.rate and pace.night with a line are covered in QuotaTests.
+RULE_IDS = {
+    "122": "O5.cap", "129": "O5.fix", "151": "O5.fix", "187": "O5.fix", "190": "O5.cap",
+    "204": "O5.fix", "389": "O5.cap", "400": "O33.finished", "284a": "O33.duplicate",
+    "284b": "O33.new", "228a": "O33.finished", "228b": "O33.new", "387": "O11.split",
+    "395": "O11.batch", "419": "O13.running", "136": "O11.small", "140": "O23.limit",
+    "271": "pace.on_line", "287": "pace.night", "355": "pace.ahead",
+    "370": "pace.unknown_line", "406": "pace.unknown_line", "424": "pace.unknown_line",
+    "101": "mem.hold", "102": "mem.ok", "117": "mem.hold", "128": "mem.hysteresis",
+    "130": "mem.ok", "215": "mem.hysteresis", "312": "mem.hysteresis",
+    "399": "mem.hysteresis", "439": "mem.ok", "447": "mem.hysteresis",
+    "64": "operator.pause", "163": "operator.pause", "220": "operator.pause",
+    "206": "D8.proposal", "273": "D8.proposal",
+}
 
 
 class ReplayTests(unittest.TestCase):
@@ -279,15 +295,194 @@ class ReplayTests(unittest.TestCase):
         self.assertEqual(len(FIXTURE), 38)
         self.assertEqual(misses, KNOWN_MISSES)
         self.assertGreaterEqual(agreement, 0.9)  # 36/38 = 94.7 %
+        self.assertEqual({ref: d.rule_id for ref, d, _ in decisions}, RULE_IDS)
         for _, d, _ in decisions:
             self.assertIsInstance(d, Decision)
             self.assertIn(d.action, CORE_ACTIONS)
             self.assertTrue(d.rule_id and d.reason)
+        groups = {ref: d.groups for ref, d, _ in decisions if d.groups}
+        self.assertEqual(groups, {"387": (("CONVCHERRY", "ORCHGENFIX2"),),
+                                  "395": (("PM10", "PM10FIX", "PM10FIX2", "PM10FIX3", "PM22"),)})
 
     def test_proposals_never_leave_allowlist(self):
         for ref, s, _ in FIXTURE:
             if "proposal" in s:
                 self.assertIn(supervise(s).action, ALLOWED_PROPOSALS | {"needs_input"})
+
+
+class IntegrationOrderTests(unittest.TestCase):
+    """O13: auto INT groups first, manual-key groups LAST."""
+
+    def test_truthy_non_bool_manual_counts_as_manual(self):
+        for manual in (1, "yes", 0, None, "false"):
+            d = plan_integration([{"name": "A", "status": "pass", "manual": manual},
+                                  _pick("B")], oldest_wait_s=3600)
+            self.assertEqual(d.groups, (("B",), ("A",)), manual)
+
+    def test_all_manual_groups_follow_all_auto(self):
+        picks = [_pick(f"M{i}", manual=True) for i in range(7)] + [_pick("A"), _pick("B")]
+        d = plan_integration(picks)
+        self.assertEqual(d.groups, (("A", "B"), tuple(f"M{i}" for i in range(6)), ("M6",)))
+
+    def test_split_keeps_manual_last(self):
+        d = plan_integration([_pick("M", manual=True), _pick("X", "blocked"), _pick("A")])
+        self.assertEqual((d.action, d.groups), ("split", (("A",), ("M",))))
+
+
+class QuotaRateTests(unittest.TestCase):
+    """O23.unknown: a supplied-but-invalid rate/target pauses; both absent is optional."""
+
+    def test_invalid_rate_or_target_pauses(self):
+        for rate, target in (("0.6", 0.5), (True, 0.5), (float("nan"), 0.5),
+                             (float("inf"), 0.5), (-1, 0.5), (10**400, 0.5),
+                             (0.4, "0.5"), (0.4, True), (0.4, 0), (0.4, -1),
+                             (0.4, None), (None, 0.5)):
+            for line, hour in ((50, 12), (None, 12), (50, 3)):
+                d = quota_pacing(50, line, hour, rate, target)
+                self.assertEqual((d.action, d.rule_id), ("pause", "O23.unknown"),
+                                 (rate, target, line, hour))
+        self.assertEqual(supervise(_q(50, 50, 12, "0.6", 0.5)).rule_id, "O23.unknown")
+
+    def test_absent_pair_stays_optional(self):
+        self.assertEqual(quota_pacing(50, 50, 12).rule_id, "pace.on_line")
+        self.assertEqual(supervise(_q(50, 50, 12)).rule_id, "pace.on_line")
+        self.assertEqual(quota_pacing(50, 50, 12, 0, 0.5).rule_id, "pace.on_line")
+
+
+class PrecedenceTests(unittest.TestCase):
+    """memory hold > quota non_claude_only > dispatch, as one table."""
+
+    def test_table_covers_every_gate_action(self):
+        self.assertEqual(PRECEDENCE[0], ("operator_pause", "pause"))
+        for key, actions in (("quota", ("pause", "non_claude_only", "dispatch")),
+                             ("memory", ("wait", "dispatch")), ("alarm", ("alarm", "suppress"))):
+            for action in actions:
+                self.assertIn((key, action), PRECEDENCE)
+        for key in ("fix", "integration", "proposal"):
+            self.assertIn((key, None), PRECEDENCE)
+        rows = [r for r in PRECEDENCE if r[0] in ("quota", "memory")]
+        self.assertEqual(rows, [("quota", "pause"), ("memory", "wait"),
+                                ("quota", "non_claude_only"), ("memory", "dispatch"),
+                                ("quota", "dispatch")])
+
+    def test_memory_always_checked(self):
+        ahead = _q(51, 44.6, 12)
+        self.assertEqual(supervise({**ahead, **_m(2.0, False)}).rule_id, "mem.hold")
+        self.assertEqual(supervise({**ahead, **_m(None, False)}).rule_id, "mem.unknown")
+        self.assertEqual(supervise({**ahead, **_m(5.0, False)}).rule_id, "pace.ahead")
+        self.assertEqual(supervise({**_q(50, 50, 12), **_m(4.0, True, 600)}).rule_id,
+                         "mem.hysteresis")
+        self.assertEqual(supervise({**_q(95, 50, 12), **_m(2.0, False)}).rule_id,
+                         "O23.limit")
+
+    def test_non_claude_only_hides_no_work_decision(self):
+        ahead = _q(51, 44.6, 12)
+        for extra, rule_id in ((_f("X", 0), "O5.fix"), (_f("X", 2), "O5.cap"),
+                               (_a("A", "stuck"), "O33.new"),
+                               ({"integration": {"picks": [_pick("A")], "int_running": True}},
+                                "O13.running"),
+                               ({"proposal": "requeue"}, "D8.proposal"),
+                               (_a("A", "stuck", finished={"A"}), "pace.ahead")):
+            self.assertEqual(supervise({**ahead, **_m(5.0, False), **extra}).rule_id,
+                             rule_id, extra)
+
+    def test_suppressed_alarm_hides_nothing(self):
+        d = supervise({**_a("A", "stuck", alarmed={"stuck"}), **_f("X", 0)})
+        self.assertEqual(d.rule_id, "O5.fix")
+
+
+class _Evil(str):
+    def __eq__(self, other):
+        return True
+
+    def __hash__(self):
+        return hash("wait")
+
+
+class StrSubclassTests(unittest.TestCase):
+    def test_str_subclass_action_or_proposal_refused(self):
+        for bad in ({"action": _Evil("delete")}, _Evil("wait"), {"action": {"action": "wait"}}):
+            self.assertEqual(gate_proposal(bad).rule_id, "D8.refused")
+            self.assertEqual(supervise({"proposal": bad}).rule_id, "D8.refused")
+
+    def test_str_subclass_reason_dropped(self):
+        d = gate_proposal({"action": "wait", "reason": _Evil("x" * 500)})
+        self.assertEqual((d.action, d.reason), ("wait", "model proposal"))
+
+    def test_extra_fields_never_change_action(self):
+        d = gate_proposal({"action": "wait", "cmd": "push", "nested": {"action": "push"}})
+        self.assertEqual(d.action, "wait")
+
+
+class BoundTests(unittest.TestCase):
+    def test_out_of_bounds_params_raise(self):
+        cases = [("fix", {"target": "X", "failed_fixes": 0, "cap": c}) for c in (3, -1, True, 2.0)]
+        cases += [("quota", {"used_pct": 50, "line_pct": 50, "hour": 12, "limit_pct": v})
+                  for v in (101, 100.5)]
+        cases += [("quota", {"used_pct": 50, "line_pct": 50, "hour": 12, "ahead_pp": v})
+                  for v in (-1, float("nan"), "3", True)]
+        cases += [("memory", {"free_gb": 4, "held": False, "low_gb": v}) for v in (0, -1)]
+        cases += [("integration", {"picks": [_pick("A")], "min_batch": v})
+                  for v in (0, -1, 1.5, True)]
+        rules = {"fix": fix_chain, "quota": quota_pacing, "memory": memory_hold,
+                 "integration": plan_integration}
+        for key, args in cases:
+            with self.assertRaises(ValueError, msg=(key, args)):
+                rules[key](**args)
+            with self.assertRaises(ValueError, msg=(key, args)):
+                supervise({key: args})
+
+    def test_in_bounds_edges_and_tunable_ahead(self):
+        self.assertEqual(quota_pacing(50, 50, 12, limit_pct=100).action, "dispatch")
+        self.assertEqual(fix_chain("X", 0, cap=0).action, "ask_salih")
+        self.assertEqual(quota_pacing(51, 44.6, 12, ahead_pp=10).action, "dispatch")
+        self.assertEqual(quota_pacing(45, 44.6, 12, ahead_pp=0).rule_id, "pace.ahead")
+
+
+class ShapeTests(unittest.TestCase):
+    def test_malformed_situation_raises_value_error(self):
+        bad = [None, [], "quota", {"quota": None}, {"quota": "x"}, {"memory": []},
+               {"alarm": {}}, {"memory": {"free_gb": 4}}, {"fix": {"target": "X"}},
+               {"memory": {"free_gb": 4, "held": False, "x": 1}}, {"memory": {1: 2}},
+               {"integration": {"picks": None}}, {"integration": {"picks": [None]}},
+               {"integration": {"picks": [{"status": "pass"}]}},
+               {"integration": {"picks": "AB"}}, _a("A", ["unhashable"])]
+        for situation in bad:
+            with self.assertRaises(ValueError, msg=situation):
+                supervise(situation)
+
+    def test_any_evaluation_error_raises_value_error(self):
+        class BadGet(dict):
+            def get(self, *a):
+                raise TypeError("boom")
+
+        class BadBool:
+            def __bool__(self):
+                raise RuntimeError("boom")
+
+        class BadHash:
+            def __hash__(self):
+                raise RuntimeError("boom")
+
+        for situation in ({"proposal": BadGet(action="wait")}, {"operator_pause": BadBool()},
+                          _a("A", BadHash())):
+            with self.assertRaises(ValueError, msg=situation):
+                supervise(situation)
+
+    def test_non_str_status_is_not_pass(self):
+        self.assertEqual(plan_integration([_pick("A", _Evil("x"))]).rule_id, "O11.none_ready")
+        d = plan_integration([_pick("A", _Evil("x")), _pick("B")], oldest_wait_s=3600)
+        self.assertEqual((d.action, d.groups), ("split", (("B",),)))
+
+    def test_out_of_range_line_or_target_pauses(self):
+        for line, target in ((1000, None), (-5, None), ("50", None), (50, 0.99e308), (50, 101)):
+            rate = None if target is None else 0.4
+            d = quota_pacing(50, line, 12, rate, target)
+            self.assertEqual((d.action, d.rule_id), ("pause", "O23.unknown"), (line, target))
+
+    def test_mixed_unknown_keys_need_input(self):
+        d = supervise({1: "x", "y": 2, "quota": None})
+        self.assertEqual((d.action, d.rule_id), ("needs_input", "D8.unknown"))
 
 
 if __name__ == "__main__":
