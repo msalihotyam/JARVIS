@@ -6,6 +6,8 @@ from tests.test_work_plan import example
 
 def plan(**changes):
     data = example()
+    # PM31FIX F3: a root a.py is a JARVIS root shadow
+    data["targets"] = data["slices"][0]["targets"] = ["src/a.py"]
     data.update(changes)
     return Plan.from_dict(data)
 
@@ -98,8 +100,10 @@ class ValidateTests(unittest.TestCase):
                                 jarvis_repo=True, repo_prefix=prefix)
             # example()'s own slice target is checked under the prefix too
             self.assertEqual({code}, {r.code for r in refusals}, (prefix, target))
-            # the same target with no prefix passes: the prefix is what refuses it
-            self.assertEqual([], codes(with_targets(target), jarvis_repo=True), (prefix, target))
+            # the same name under a benign folder passes: the prefix is what refuses it
+            # (PM31FIX F3: with no prefix a root *.py is itself a shadow and refused)
+            self.assertEqual([], codes(with_targets("pkg/sub/" + target), jarvis_repo=True),
+                             (prefix, target))
         self.assertEqual([], validate(with_targets("work_classify.py"), "projects/demo",
                                       jarvis_repo=True, repo_prefix="jarvis/"))
 
@@ -158,7 +162,7 @@ class ValidateTests(unittest.TestCase):
         targets = ["src/", "src\\", "src\\pkg/", "src/app.py"]
         self.assertEqual({"src/": "subtree", "src\\": "subtree",
                           "src\\pkg/": "subtree", "src/app.py": "file",
-                          "a.py": "file"},
+                          "src/a.py": "file"},
                          scope(with_targets(*targets), "projects/demo",
                                jarvis_repo=False))
         self.assertIsNone(scope(with_targets("src/", "data/"), "projects/demo",

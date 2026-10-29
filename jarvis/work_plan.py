@@ -7,10 +7,14 @@ uses compact UTF-8 JSON, and admits integers only for numeric schema fields.
 Expiry is an explicit UTC Unix timestamp; no clock or environment is consulted.
 """
 
+import ast
 from dataclasses import asdict, dataclass, fields
+import functools
 import hashlib
 import json
+from pathlib import Path
 import re
+import sys
 import unicodedata
 from urllib.parse import unquote
 
@@ -308,7 +312,10 @@ _SELF_FILES = ("jarvis/memory.py", "jarvis/contracts.py", "jarvis/memory_filter.
                "jarvis/work_ledger.py", "jarvis/work_regress.py",
                "jarvis/work_scout.py", "jarvis/write_scope.py",
                "jarvis/write_stage.py", "jarvis/policy_proxy.py",
-               "jarvis/lifecycle.py", "jarvis/core.py", "jarvis/dispatch.py")
+               "jarvis/lifecycle.py", "jarvis/core.py", "jarvis/dispatch.py",
+               # PM31FIX: entry points and the hosts of approval gates
+               "jarvis/__main__.py", "jarvis/cli.py", "jarvis/ui/backend.py",
+               "jarvis/ui/bridge.py")
 #: PM31 I12 self-dev profile: closed JARVIS-repo hard-deny set, refused
 #: whatever the approval. Lowercase; "/" ends a subtree; every entry matches
 #: at any folder depth (a root above the checkout, a nested JARVIS/ prefix).
@@ -325,10 +332,16 @@ SELF_DENY = (
 #: unpin the gate they cover.
 _SELF_TESTS = ("test_work_", "test_write_", "test_conveyor", "test_memory",
                "test_contracts", "test_settings", "test_trusted_exec",
-               "test_owned_process")
+               "test_owned_process",
+               # PM31FIX: tests pinning the CONVSAFE scripts and test discipline
+               "test_test_parallel", "test_ci", "test_v21ci", "test_clock_audit",
+               "test_load_sensitive", "test_windows_scripts", "dev-helper")
 #: D7: a JARVIS-repo run is always shadow; there is no switch to turn it off.
 SHADOW_MODE = True
 _SHADOW_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
+#: PM31FIX: the I12 import closure is read from this (the running) checkout.
+_ROOT = Path(__file__).resolve().parent.parent
+_STDLIB = frozenset(n.lower() for n in sys.stdlib_module_names)
 
 
 @dataclass(frozen=True)
@@ -360,16 +373,105 @@ def _self_denied(parts):
                for p, n in zip(parts, parts[1:]))
 
 
-def _self_target(lowered):
+def _tails(parts):
+    return ["/".join(parts[i:]) for i in range(len(parts))]
+
+
+def _named(lowered):
     parts = lowered.split("/")
     # A same-named package dir, .pyd/.pyc or __pycache__ entry shadows the .py;
     # every tail is checked so a root above the checkout still matches.
-    tails = ["/".join(parts[i:]) for i in range(len(parts))]
     return ("__pycache__" in parts or _self_denied(parts)
             or any(p.startswith("agents") for p in parts)
             or any(t == f[:-3] or t.startswith((f[:-3] + "/", f[:-3] + "."))
-                   for t in tails for f in _SELF_FILES)
+                   for t in _tails(parts) for f in _SELF_FILES)
             or any(w in p for p in parts for w in _SELF_WORDS))
+
+
+def _module_file(root, dotted):
+    path = root.joinpath(*dotted.split("."))
+    return next((f for f in (path / "__init__.py", path.with_suffix(".py"))
+                 if f.is_file()), None)
+
+
+def _imports(file, dotted):
+    """Static jarvis.*/tests.* names one file imports (module and module.name)."""
+    package = dotted.split(".")[:None if file.name == "__init__.py" else -1]
+    found = set()
+    for node in ast.walk(ast.parse(file.read_bytes())):
+        if isinstance(node, ast.Import):
+            found.update(a.name for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            base = package[:len(package) - node.level + 1] if node.level else []
+            module = ".".join(base + ([node.module] if node.module else []))
+            found.add(module)
+            found.update(f"{module}.{a.name}" for a in node.names if a.name != "*")
+    return {m for m in found if m.split(".")[0] in ("jarvis", "tests")}
+
+
+@functools.lru_cache(maxsize=None)
+def _closure(root):
+    """Lowercase stems of the authority modules, their static jarvis.* import
+    closure (unresolved names too) and every test importing one; None when it
+    cannot be computed (missing authority file, syntax error, unreadable)."""
+    try:
+        if not all((root / f).is_file() for f in _SELF_FILES):
+            return None
+        todo = [".".join(p.relative_to(root).with_suffix("").parts).removesuffix(".__init__")
+                for p in (root / "jarvis").rglob("*.py")
+                if _named(p.relative_to(root).as_posix().lower())]
+        modules, stems = set(), set()
+        while todo:
+            name = todo.pop()
+            if name in modules:
+                continue
+            modules.add(name)
+            parts = name.split(".")
+            todo.extend(".".join(parts[:i]) for i in range(1, len(parts)))
+            file = _module_file(root, name)
+            stems.add(name.replace(".", "/") if file is None
+                      else file.relative_to(root).with_suffix("").as_posix())
+            if file is not None:
+                todo.extend(m for m in _imports(file, name) if m.split(".")[0] == "jarvis")
+        deps = {("tests." + p.stem).removesuffix(".__init__"): _imports(
+            p, ("tests." + p.stem).removesuffix(".__init__"))
+            for p in (root / "tests").glob("*.py")}
+        bad = {"tests", "tests.helpers"} | {n for n in deps if n[6:].startswith(_SELF_TESTS)}
+
+        def hit(m):  # the bare packages are imported by everything
+            return m not in ("jarvis", "tests") and (m in bad or (
+                m.split(".")[0] == "jarvis"
+                and (m in modules or _named(m.replace(".", "/").lower()))))
+        while True:
+            grow = {n for n, imported in deps.items() if any(map(hit, imported))}
+            grow |= {m for n in bad for m in deps.get(n, ()) if m in deps}
+            if grow <= bad:
+                break
+            bad |= grow
+        stems |= {"tests/__init__" if n == "tests" else n.replace(".", "/") for n in bad}
+        return frozenset({s.lower() for s in stems} | {"tests/fixtures"})
+    except (OSError, SyntaxError, ValueError, RecursionError):
+        return None
+
+
+def _self_target(lowered, root=True):
+    stems = _closure(_ROOT)
+    if stems is None:  # fail closed: every JARVIS-repo target is refused
+        return True
+    parts = lowered.split("/")
+    return (_named(lowered)
+            or any(t == s or t.startswith((s + "/", s + "."))
+                   for t in _tails(parts) for s in stems)
+            # F3: sys.path[0] shadows: a root module or package, a stdlib
+            # name at the root (when the path may be repo-relative), a site
+            # hook anywhere.
+            or (root and len(parts) == 1 and re.search(r"\.py[cdiw]?$", parts[0]) is not None)
+            or (root and len(parts) == 2 and parts[1].split(".")[0] == "__init__")
+            or (root and parts[0].split(".")[0] in _STDLIB)
+            # unittest discover -s tests puts tests/ first on sys.path
+            or any(a == "tests" and b.split(".")[0] in _STDLIB
+                   for a, b in zip(parts, parts[1:]))
+            or any(p.split(".")[0] in ("sitecustomize", "usercustomize") for p in parts))
 
 
 def shadow_candidate(run_id, slice_id, *, jarvis_repo):
@@ -381,7 +483,8 @@ def shadow_candidate(run_id, slice_id, *, jarvis_repo):
     if jarvis_repo is not True:
         raise ValueError("shadow export is only for the JARVIS repo")
     for value in (run_id, slice_id):
-        if type(value) is not str or not _SHADOW_ID.fullmatch(value):
+        if (type(value) is not str or not _SHADOW_ID.fullmatch(value)
+                or _DEVICES.fullmatch(value.lower())):
             raise ValueError("invalid shadow id")
     if {run_id.casefold(), slice_id.casefold()} & {"main", "master", "head"}:
         raise ValueError("shadow id names a protected ref")
@@ -393,7 +496,7 @@ def shadow_candidate(run_id, slice_id, *, jarvis_repo):
                             f"INTEGRATION LANE NEEDS: shadow slice {slice_id} of run {run_id}\n")}
 
 
-def _target_refusal(target, jarvis_repo):
+def _target_refusal(target, jarvis_repo, root=True):
     # Category C: control, format (zero-width joiners git may ignore), unassigned.
     if (type(target) is not str or not target
             or any(unicodedata.category(c)[0] == "C" for c in target)):
@@ -420,7 +523,7 @@ def _target_refusal(target, jarvis_repo):
         return Refusal("protected_path", target)
     # The pure validator cannot see a folder's files, so in the JARVIS repo
     # every subtree may contain a self-target and is refused (fail closed).
-    if jarvis_repo and (subtree or _self_target(lowered)):
+    if jarvis_repo and (subtree or _self_target(lowered, root)):
         return Refusal("self_target", target)
     # %XX escapes and NFKC lookalikes ("．．", fullwidth letters) are not literal.
     if canonical != target:
@@ -441,6 +544,9 @@ def validate(plan, project_root, *, jarvis_repo, repo_prefix=None):
     absolute, escaping, device-like or otherwise unrecognised is refused (fail
     closed). A folder target (trailing / or \\) is a subtree scope, see scope().
     """
+    if repo_prefix is not None and (type(repo_prefix) is not str or (
+            repo_prefix and not repo_prefix.endswith("/"))):
+        raise ValueError("repo_prefix must be '' or end with '/'")
     if type(plan) is not Plan:
         return [Refusal("unknown_plan", type(plan).__name__)]
     refusals = []
@@ -461,7 +567,8 @@ def validate(plan, project_root, *, jarvis_repo, repo_prefix=None):
     for item in plan.slices:
         targets.extend(item.targets)
     for target in dict.fromkeys(targets):
-        refusal = _target_refusal(target, jarvis_repo) or (
+        # with a non-empty prefix the raw target is not repo-root relative
+        refusal = _target_refusal(target, jarvis_repo, not repo_prefix) or (
             repo_prefix is not None and _target_refusal(repo_prefix + target, True))
         if refusal:
             refusals.append(refusal)

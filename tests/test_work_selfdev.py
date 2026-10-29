@@ -1,5 +1,8 @@
 import inspect
+from pathlib import Path
+import tempfile
 import unittest
+from unittest import mock
 
 import jarvis.work_plan as work_plan
 from jarvis.work_plan import (SELF_DENY, SHADOW_MODE, Plan, classify,
@@ -12,6 +15,7 @@ REFUSED = {"self_target", "protected_path"}
 def plan(*targets):
     data = example()
     data["targets"] = list(targets)
+    data["slices"][0]["targets"] = list(targets)  # the example's a.py is a root shadow
     return Plan.from_dict(data)
 
 
@@ -74,6 +78,99 @@ class SelfDenyProfileTest(unittest.TestCase):
         self.assertIn("jarvis_repo", reasons)
 
 
+def refused(test, target, prefix=None):
+    got = codes(target, prefix)
+    test.assertTrue(got and got <= REFUSED | {"path_escape"}, (prefix, target, got))
+
+
+def tree(root, extra=None):
+    for name in work_plan._SELF_FILES + ("tests/__init__.py",):
+        (root / name).parent.mkdir(parents=True, exist_ok=True)
+        (root / name).write_text("", encoding="utf-8")
+    for name, text in (extra or {}).items():
+        (root / name).write_text(text, encoding="utf-8")
+
+
+class ImportClosureTest(unittest.TestCase):
+    # PM31FIX F6: hard-coded, not derived from SELF_DENY or the closure
+    INVENTORY = (
+        "scripts/conveyor.py", "scripts/test_parallel.py", "scripts/ci.ps1",
+        "scripts/quality.ps1", ".github/workflows/ci.yml", ".claude/settings.json",
+        "CLAUDE.md", "AGENTS.md", "uv.lock", "data/jarvis.db", ".env", "x.pem",
+        "jarvis/memory.py", "jarvis/policy_proxy.py", "jarvis/browser.py",
+        "jarvis/connectors/claude_code.py", "jarvis/connectors/__init__.py",
+        "jarvis/__init__.py", "jarvis/contracts.py", "tests/__init__.py",
+        "tests/helpers.py", "tests/fixtures/x.json", "tests/test_execution_journal.py",
+        "tests/test_test_parallel_infra.py", "tests/test_clock_audit.py",
+        "json.py", "sitecustomize.py", "usercustomize.py", "contracts/__init__.py",
+        "jarvis/cli.py", "jarvis/__main__.py", "jarvis/ui/backend.py", "jarvis/ui/bridge.py",
+        "tests/test_windows_scripts.py", "tests/dev-helper-tests.ps1", "tests/tempfile.py",
+        "TESTS/Shutil.py", "tests/sqlite3/__init__.py")
+
+    def test_independent_inventory_is_refused(self):
+        for target in self.INVENTORY:
+            refused(self, target)
+
+    def test_spelling_variants_of_closure_members(self):
+        for target in ("jarvis\\browser.py", "JARVIS/jarvis/browser.py",
+                       "Jarvis/Connectors/Claude_Code.PY", "JSON.PY", "SiteCustomize.py",
+                       "TESTS/Helpers.py", "ｊｓｏｎ.py", "jarvis/browser/__init__.py",
+                       "jarvis/browser.pyc", "jarvis/connectors/claude_code.cp313-win_amd64.pyd",
+                       "json.cp313-win_amd64.pyd", "re/__init__.py", "x/sitecustomize.py"):
+            refused(self, target)
+        refused(self, "browser.py", "jarvis/")
+        refused(self, "helpers.py", "tests/")
+        refused(self, "fixtures/a.txt", "tests/")
+        refused(self, "tempfile.py", "tests/")
+        refused(self, "cli.py", "jarvis/")
+
+    def test_slice_target_only_is_refused(self):
+        data = example()
+        data["slices"][0]["targets"] = ["jarvis/browser.py"]
+        got = {r.code for r in validate(Plan.from_dict(data), "projects/demo",
+                                        jarvis_repo=True)}
+        self.assertIn("self_target", got)
+
+    def test_prefix_and_jarvis_repo_types(self):
+        self.assertEqual(set(), codes("README.md", ""))
+        refused(self, "router_tr.py", "")  # "" means repo root: a root module shadow
+        for prefix in ("jarvis", 1, b"jarvis/"):
+            with self.assertRaises(ValueError, msg=prefix):
+                codes("memory.py", prefix)
+        for flag in (1, None, "yes"):
+            got = {r.code for r in validate(plan("jarvis/browser.py"), "projects/demo",
+                                            jarvis_repo=flag)}
+            self.assertTrue({"unknown_fact", "self_target"} <= got, (flag, got))
+        # the hand list stays prefixed-proof too
+        for name in work_plan._SELF_FILES:
+            refused(self, name.split("/", 1)[1], "jarvis/")
+
+    def test_closure_follows_imports_and_fails_closed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            tree(root, {"jarvis/memory.py": "from jarvis import extra\nimport jarvis.gone\n",
+                        "jarvis/extra.py": "from .deep import x\n",
+                        "jarvis/deep.py": "", "jarvis/free.py": "",
+                        "tests/test_a.py": "import jarvis.deep\n",
+                        "tests/test_b.py": "import jarvis.free\n"})
+            stems = work_plan._closure(root)
+            for stem in ("jarvis/extra", "jarvis/deep", "jarvis/gone", "tests/test_a",
+                         "tests/__init__", "tests/fixtures"):
+                self.assertIn(stem, stems)
+            self.assertNotIn("jarvis/free", stems)
+            self.assertNotIn("tests/test_b", stems)
+        for broken in ({"jarvis/memory.py": "def (:\n"}, None):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                tree(root, broken)
+                if broken is None:
+                    (root / work_plan._SELF_FILES[0]).unlink()
+                self.assertIsNone(work_plan._closure(root))
+                with mock.patch.object(work_plan, "_ROOT", root):
+                    self.assertIn("self_target", codes("README.md"))
+        self.assertEqual(set(), codes("README.md"))
+
+
 class ShadowModeTest(unittest.TestCase):
     def test_candidate_is_a_branch_never_main_or_the_checkout(self):
         self.assertIs(True, SHADOW_MODE)
@@ -90,7 +187,9 @@ class ShadowModeTest(unittest.TestCase):
                              ("MASTER", "s1", True), ("run7", "HEAD", True),
                              ("run7", "../main", True), ("run7", "a/b", True),
                              ("run7", "-x", True), ("run7", "", True), (None, "s1", True),
-                             ("run7", "s" * 65, True), ("run7", "s1\n", True)):
+                             ("run7", "s" * 65, True), ("run7", "s1\n", True),
+                             ("CON", "s1", True), ("run7", "nul", True),
+                             ("COM1", "s1", True), ("run7", "lpt9", True)):
             with self.assertRaises(ValueError, msg=(run, sid, jr)):
                 shadow_candidate(run, sid, jarvis_repo=jr)
 
