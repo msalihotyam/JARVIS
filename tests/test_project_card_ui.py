@@ -1,16 +1,21 @@
 """PM29: the project run card - a read-only mirror of the newest project run
 whose actions are Core calls that Core re-checks."""
 
+import json
+import sqlite3
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from unittest import mock
+
+from PySide6.QtCore import QUrl
 
 from jarvis.core import AgentCore
 from jarvis.registry import ToolRegistry
 from jarvis.ui.bridge import _PROJECT_CARD_LABELS, _RUN_STATE_LABELS
 from jarvis.work_ledger import (
-    WAIT_RUN_STATES, EventKind, RunSize, RunState, WorkEvent, WorkRun, advance_run, event_payload_json,
+    RUN_TRANSITIONS, TERMINAL_RUN_STATES, WAIT_RUN_STATES, EventKind, RunSize, RunState, WorkEvent, WorkRun, advance_run, event_payload_json,
 )
 from jarvis.work_plan import Plan, PlanBudget, PlanCheck, PlanSlice
 from tests.test_scheduler_runner import setUpModule, tearDownModule  # noqa: F401
@@ -20,19 +25,25 @@ T0 = datetime(2026, 10, 27, 9, 0, tzinfo=timezone.utc)
 
 
 class FakeStore:
-    """Just the three ledger reads the card makes."""
+    """Just the three ledger reads the card makes; like the real store,
+    work_runs_open() leaves terminal runs out."""
 
     def __init__(self, run: WorkRun, events=()):
         self.run, self.events = run, list(events)
 
     def work_runs_open(self):
-        return [self.run]
+        return [] if self.run.state in TERMINAL_RUN_STATES else [self.run]
 
     def latest_work_run(self, run_id):
-        return self.run
+        return self.run if run_id == self.run.run_id else None
 
     def work_events(self, run_id):
-        return self.events
+        return self.events if run_id == self.run.run_id else []
+
+
+class BrokenStore:
+    def work_runs_open(self):
+        raise sqlite3.OperationalError("database is locked")
 
 
 class FakeSink:
@@ -83,6 +94,16 @@ class ProjectCardTests(UiTestCase):
             }, prior=run)
         self.ui.refreshProjectCard()
 
+    def event(self, seq: int, run_id: str = "r", **payload) -> WorkEvent:
+        return WorkEvent(run_id, seq, EventKind.RUN_STATE, T0, step_key=f"s{seq}",
+                         payload_json=event_payload_json(payload))
+
+    def card_from(self, store, ui=None) -> dict:
+        ui = ui or self.ui
+        with mock.patch.object(ui, "_conversation_db", return_value=store):
+            ui.refreshProjectCard()
+        return ui.projectCard
+
     def test_every_run_state_maps_to_a_label_and_flags(self):
         self.assertEqual(set(RunState), set(_RUN_STATE_LABELS))
         payload = event_payload_json({"project_root": self.target, "plan_hash": "h", "checks": "3/3 geçti",
@@ -92,6 +113,7 @@ class ProjectCardTests(UiTestCase):
                 with self.subTest(state=state, size=size):
                     resume = RunState.BUILDING if state in WAIT_RUN_STATES else None
                     run = WorkRun("r", state, T0, T0, size=size, resume_state=resume)
+                    self.ui._project_last = "r"     # a terminal run is read back by id
                     event = WorkEvent("r", 1, EventKind.RUN_STATE, T0, step_key="s1", payload_json=payload)
                     with mock.patch.object(self.ui, "_conversation_db", return_value=FakeStore(run, [event])):
                         card = self.ui._project_card_snapshot()
@@ -103,6 +125,7 @@ class ProjectCardTests(UiTestCase):
                     self.assertEqual(state not in (RunState.DONE, RunState.FAILED, RunState.CANCELLED),
                                      card["canCancel"])
                     self.assertEqual(state is RunState.DONE, card["canShowResult"])
+                    self.assertEqual(RunState.PAUSED in RUN_TRANSITIONS[state], card["canPause"])
                     self.assertEqual(("s1", "3/3 geçti", "2 dosya", "python app.py"),
                                      (card["currentSlice"], card["checks"], card["diffSummary"], card["runHint"]))
 
@@ -171,6 +194,152 @@ class ProjectCardTests(UiTestCase):
         self.assertTrue(self.ui.cancelProjectRun())
         pump(50)
         self.assertFalse(find(card, "projectCancel").property("enabled"))
+
+    def test_terminal_run_stays_on_the_card_live_and_after_restart(self):
+        store = FakeStore(WorkRun("r", RunState.BUILDING, T0, T0, size=RunSize.SMALL),
+                          [self.event(1, project_root=self.target)])
+        self.assertEqual("building", self.card_from(store)["state"])
+        for state in (RunState.DONE, RunState.FAILED, RunState.CANCELLED):
+            with self.subTest(state=state):
+                store.run = WorkRun("r", state, T0, T0, size=RunSize.SMALL)
+                self.assertEqual(state.value, self.card_from(store)["state"])
+                # restart: a new bridge on the same preferences reads the id back
+                self.assertEqual(state.value, self.card_from(store, self.bridge())["state"])
+
+    def test_real_ledger_cancel_outside_the_card_keeps_the_run(self):
+        self.run_at("small", RunSize.SMALL)
+        self.core.advance_project_run("small", RunState.CANCELLED, boot_id="b", at=T0)
+        self.assertEqual([], self.memory.work_runs_open())
+        self.ui.refreshProjectCard()
+        self.assertEqual(("small", "cancelled"), (self.ui.projectCard["runId"], self.ui.projectCard["state"]))
+        restarted = self.bridge()
+        restarted.refreshProjectCard()
+        self.assertEqual(("small", "cancelled"), (restarted.projectCard["runId"], restarted.projectCard["state"]))
+
+    def test_broken_sidecar_is_ignored(self):
+        store = FakeStore(WorkRun("r", RunState.DONE, T0, T0), [self.event(1, project_root=self.target)])
+        sidecar = self.ui._project_card_file()
+        for raw in ("{not json", json.dumps({"version": 2, "run_id": "r"}), json.dumps({"version": 1, "run_id": 7}),
+                    json.dumps({"version": 1, "run_id": "r" * 201}), json.dumps(["r"])):
+            with self.subTest(raw=raw):
+                sidecar.write_text(raw, encoding="utf-8")
+                self.assertEqual({}, self.card_from(store, self.bridge()))
+        sidecar.write_bytes(b"\xff\xfe\x00")
+        self.assertEqual({}, self.card_from(store, self.bridge()))
+        sidecar.write_text(json.dumps({"version": 1, "run_id": "r"}), encoding="utf-8")
+        self.assertEqual("done", self.card_from(store, self.bridge())["state"])
+
+    def test_pause_follows_the_ledger_transitions(self):
+        for state, allowed in ((RunState.NEEDS_INPUT, True), (RunState.BLOCKED_BUDGET, True),
+                               (RunState.BUILDING, True), (RunState.PAUSED, False), (RunState.DONE, False)):
+            with self.subTest(state=state):
+                resume = RunState.BUILDING if state in WAIT_RUN_STATES else None
+                self.ui._project_last = "r"
+                run = WorkRun("r", state, T0, T0, size=RunSize.SMALL, resume_state=resume)
+                self.assertEqual(allowed, self.card_from(FakeStore(run))["canPause"])
+
+    def test_any_core_exception_is_a_refusal(self):
+        self.run_at("small", RunSize.SMALL)
+        for error in (sqlite3.OperationalError("locked"), OSError("disk"), RuntimeError("boom"), KeyError("x")):
+            with self.subTest(error=type(error).__name__):
+                with mock.patch.object(self.core, "advance_project_run", side_effect=error):
+                    self.assertFalse(self.ui.pauseProjectRun())
+                    self.assertFalse(self.ui.cancelProjectRun())
+                self.assertEqual(_PROJECT_CARD_LABELS["refused"], self.ui.projectCard["notice"])
+                self.assertEqual(RunState.BUILDING, RunState(self.memory.latest_work_run("small").state))
+                self.assertEqual("building", self.ui.projectCard["state"])
+
+    def test_refusal_leaves_the_ledger_unchanged(self):
+        self.run_at("small", RunSize.SMALL)
+        before = self.memory.work_events("small")
+        self.assertFalse(self.ui.approveProjectPlan())
+        self.assertFalse(self.ui.rejectProjectPlan())
+        self.assertEqual(before, self.memory.work_events("small"))
+        self.assertEqual("building", self.ui.projectCard["state"])
+
+    def test_size_refusal_outside_building(self):
+        self.core.create_project_run("med", self.plan, project_root=self.target, jarvis_repo=False,
+                                     size=RunSize.MEDIUM, boot_id="b", at=T0)
+        self.ui.refreshProjectCard()
+        state = self.ui.projectCard["state"]
+        self.assertNotEqual("building", state)
+        self.assertFalse(self.ui.projectCard["canApprove"])
+        self.assertFalse(self.ui.approveProjectPlan())
+        self.assertEqual(state, RunState(self.memory.latest_work_run("med").state).value)
+
+    def test_show_result_opens_the_bound_root_only_if_it_is_a_folder(self):
+        other = Path(self.target) / "other"
+        other.mkdir()
+        store = FakeStore(WorkRun("r", RunState.DONE, T0, T0),
+                          [self.event(1, project_root=self.target), self.event(2, project_root=str(other))])
+        self.ui._project_last = "r"
+        self.assertTrue(self.card_from(store)["canShowResult"])
+        with mock.patch.object(self.ui, "_conversation_db", return_value=store), \
+                mock.patch("jarvis.ui.bridge.QDesktopServices") as desktop:
+            desktop.openUrl.return_value = True
+            self.assertTrue(self.ui.showProjectResult())
+        desktop.openUrl.assert_called_once_with(QUrl.fromLocalFile(self.target))
+        for root in (str(Path(self.target) / "gone"), "relative/dir", 7, ""):
+            with self.subTest(root=root):
+                self.ui._project_events = {}
+                store = FakeStore(WorkRun("r", RunState.DONE, T0, T0), [self.event(1, project_root=root)])
+                # polling never touches the filesystem; the click checks is_dir()
+                with mock.patch.object(Path, "is_dir", side_effect=AssertionError("fs call on poll")):
+                    self.assertEqual(isinstance(root, str) and Path(root).is_absolute(),
+                                     self.card_from(store)["canShowResult"])
+                with mock.patch.object(self.ui, "_conversation_db", return_value=store), \
+                        mock.patch("jarvis.ui.bridge.QDesktopServices") as desktop:
+                    self.assertFalse(self.ui.showProjectResult())
+                desktop.openUrl.assert_not_called()
+
+    def test_replan_rebinds_the_root_and_open_failure_is_false(self):
+        other = Path(self.target) / "replanned"
+        other.mkdir()
+        store = FakeStore(WorkRun("r", RunState.DONE, T0, T0),
+                          [self.event(1, project_root=str(Path(self.target) / "gone")),
+                           self.event(2, project_root=str(other), plan={})])
+        self.ui._project_last = "r"
+        self.assertEqual(str(other), self.card_from(store)["projectRoot"])
+        with mock.patch.object(self.ui, "_conversation_db", return_value=store), \
+                mock.patch("jarvis.ui.bridge.QDesktopServices") as desktop:
+            desktop.openUrl.side_effect = RuntimeError("no handler")
+            self.assertFalse(self.ui.showProjectResult())
+        desktop.openUrl.assert_called_once_with(QUrl.fromLocalFile(str(other)))
+
+    def test_ended_run_is_not_refetched_and_notice_follows_the_run(self):
+        store = FakeStore(WorkRun("r", RunState.DONE, T0, T0), [self.event(1, checks="3/3")])
+        self.ui._project_last = "r"
+        self.card_from(store)
+        self.ui._project_card_notice = _PROJECT_CARD_LABELS["refused"]
+        with mock.patch.object(store, "work_events", side_effect=AssertionError("refetched")):
+            self.assertEqual(("3/3", _PROJECT_CARD_LABELS["refused"]),
+                             (self.card_from(store)["checks"], self.ui.projectCard["notice"]))
+        other = FakeStore(WorkRun("x", RunState.BUILDING, T0, T0), [self.event(1, run_id="x")])
+        self.assertEqual(("x", ""), (self.card_from(other)["runId"], self.ui.projectCard["notice"]))
+
+    def test_polling_parses_only_new_events(self):
+        store = FakeStore(WorkRun("r", RunState.BUILDING, T0, T0), [self.event(1, checks="1/3")])
+        events = store.events
+        self.assertEqual("1/3", self.card_from(store)["checks"])
+        events[0] = self.event(1, checks="rewritten")       # same seq: not parsed again
+        self.assertEqual("1/3", self.card_from(store)["checks"])
+        events.append(self.event(2, checks="3/3"))
+        self.assertEqual(("3/3", "s2"), (self.card_from(store)["checks"], self.ui.projectCard["currentSlice"]))
+        other = FakeStore(WorkRun("x", RunState.BUILDING, T0, T0), [self.event(1, run_id="x")])
+        self.assertEqual("", self.card_from(other)["checks"])   # another run starts clean
+
+    def test_refresh_survives_store_errors(self):
+        self.run_at("small", RunSize.SMALL)
+        self.assertEqual({}, self.card_from(BrokenStore()))
+        self.ui.refreshProjectCard()
+        self.assertEqual("small", self.ui.projectCard["runId"])
+
+    def test_card_notice_is_not_the_projects_notice(self):
+        self.run_at("small", RunSize.SMALL)
+        projects = self.ui.projectNotice
+        self.assertFalse(self.ui.approveProjectPlan())
+        self.assertEqual(projects, self.ui.projectNotice)
+        self.assertEqual(_PROJECT_CARD_LABELS["refused"], self.ui.projectCard["notice"])
 
 
 if __name__ == "__main__":

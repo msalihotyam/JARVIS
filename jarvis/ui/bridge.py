@@ -32,7 +32,7 @@ from PySide6.QtCore import (Property, QCoreApplication, QDateTime, QLocale, QObj
 from PySide6.QtGui import QDesktopServices, QWindow
 import shiboken6
 
-from jarvis.work_ledger import ACTIVE_RUN_STATES, TERMINAL_RUN_STATES, RunSize, RunState, WorkLedgerError
+from jarvis.work_ledger import RUN_TRANSITIONS, TERMINAL_RUN_STATES, RunSize, RunState
 
 from jarvis.context_items import (
     DEFAULT_RESPONSE_MODE,
@@ -424,8 +424,10 @@ class Bridge(QObject):
         self.project_clock = lambda: datetime.now(timezone.utc)
         self._project_boot = f"ui-{uuid4().hex}"
         self._project_card: dict = {}
-        self._project_notice = ""
-        self._project_last = ""
+        self._project_card_notice = ""     # own name: _project_notice is the Gate 6A projects notice
+        self._project_last: str | None = None   # None = not yet read from the sidecar
+        self._project_root = ""             # raw Core-validated root of the shown run, never display text
+        self._project_events: dict[str, Any] = {}
         self._telemetry_timer.timeout.connect(self.refreshProjectCard)
         # Current weather for the clock card (jarvis.ui.weather): the operator's
         # fixed place, its own thread (never the chat worker), every ~5 minutes,
@@ -1391,25 +1393,23 @@ class Bridge(QObject):
         if store is None:
             return {}
         runs = sorted(store.work_runs_open(), key=lambda r: r.updated_at)
-        run = runs[-1] if runs else (store.latest_work_run(self._project_last) if self._project_last else None)
+        if runs:
+            run = runs[-1]
+        else:
+            # A run that ended (DONE, FAILED, ...) leaves work_runs_open(): keep
+            # showing the last one seen, also across a restart (sidecar).
+            last = self._project_last_run_id()
+            run = store.latest_work_run(last) if last else None
         if run is None:
             return {}
+        self._project_remember(run.run_id)
         state = RunState(run.state)
         large = run.size == RunSize.LARGE
-        found: dict[str, Any] = {}
-        current = ""
-        for event in store.work_events(run.run_id):
-            current = event.step_key or current
-            try:
-                payload = json.loads(event.payload_json or "{}")
-            except ValueError:
-                continue
-            if isinstance(payload, dict):
-                for key in ("checks", "verdict", "diff_summary", "plan_hash", "project_root", "brief"):
-                    if key in payload:
-                        found[key] = payload[key]
+        found, current = self._project_event_fields(store, run.run_id, state in TERMINAL_RUN_STATES)
         brief = found.get("brief")
-        root = _card_text(found.get("project_root"), 400)
+        raw_root = found.get("project_root")
+        self._project_root = raw_root if isinstance(raw_root, str) else ""
+        root = _card_text(raw_root, 400)
         return {
             "runId": run.run_id, "state": state.value, "stateLabel": _RUN_STATE_LABELS[state],
             "size": run.size.value if run.size else "",
@@ -1420,13 +1420,83 @@ class Bridge(QObject):
             "planHash": _card_text(found.get("plan_hash"), 128), "projectRoot": root,
             "canApprove": large and state is RunState.AWAITING_APPROVAL,
             "canReject": large and state is RunState.AWAITING_APPROVAL,
-            "canPause": state in ACTIVE_RUN_STATES,
+            "canPause": RunState.PAUSED in RUN_TRANSITIONS.get(state, ()),
             "canCancel": state not in TERMINAL_RUN_STATES,
-            "canShowResult": state is RunState.DONE and bool(root),
-            "notice": self._project_notice,
+            # No filesystem call on the poll: is_dir() runs only on the click.
+            "canShowResult": state is RunState.DONE and self._project_root_path() is not None,
+            "notice": self._project_card_notice,
             "notifications": self._project_notifications(),
             "labels": _PROJECT_CARD_LABELS,
         }
+
+    def _project_event_fields(self, store, run_id: str, ended: bool) -> tuple[dict[str, Any], str]:
+        """The card's fields from the run's events, parsing only events newer
+        than the last seq seen for this run; an ended run already read is not
+        fetched again."""
+        cache = self._project_events
+        if cache.get("run_id") != run_id:
+            cache = self._project_events = {"run_id": run_id, "seq": 0, "found": {}, "current": "", "ended": False}
+        if cache["ended"]:
+            return cache["found"], cache["current"]
+        cache["ended"] = ended
+        # ponytail: the store has no after-seq read, so rows are still fetched;
+        # only new ones are parsed. Add work_events(run_id, after_seq) if runs get huge.
+        for event in store.work_events(run_id):
+            if event.seq <= cache["seq"]:
+                continue
+            cache["seq"] = event.seq
+            cache["current"] = event.step_key or cache["current"]
+            try:
+                payload = json.loads(event.payload_json or "{}")
+            except ValueError:
+                continue
+            if isinstance(payload, dict):
+                for key in ("checks", "verdict", "diff_summary", "plan_hash", "brief"):
+                    if key in payload:
+                        cache["found"][key] = payload[key]
+                # The root Core binds is the one on the latest plan event (a
+                # replan may rebind it); other payloads never redirect "show result".
+                if "project_root" in payload and ("plan" in payload or "project_root" not in cache["found"]):
+                    cache["found"]["project_root"] = payload["project_root"]
+        return cache["found"], cache["current"]
+
+    def _project_card_file(self) -> Path:
+        return self.prefs.path.with_suffix(".project-card.json")
+
+    def _project_last_run_id(self) -> str:
+        if self._project_last is None:
+            self._project_last = ""
+            try:
+                raw = json.loads(self._project_card_file().read_text(encoding="utf-8"))
+            except (OSError, ValueError, UnicodeDecodeError):
+                raw = None
+            run_id = raw.get("run_id") if isinstance(raw, dict) and raw.get("version") == 1 else None
+            if isinstance(run_id, str) and 0 < len(run_id) <= 200:
+                self._project_last = run_id
+        return self._project_last
+
+    def _project_remember(self, run_id: str) -> None:
+        if run_id == self._project_last_run_id():
+            return
+        self._project_last = run_id
+        self._project_card_notice = ""          # a refusal belongs to the run it was about
+        try:
+            path = self._project_card_file()
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"version": 1, "run_id": run_id}), encoding="utf-8")
+        except OSError:
+            log.debug("project card run id not saved", exc_info=True)
+
+    def _project_root_path(self) -> Path | None:
+        root = Path(self._project_root) if self._project_root else None
+        return root if root is not None and root.is_absolute() else None
+
+    def _project_result_dir(self) -> Path | None:
+        root = self._project_root_path()
+        try:
+            return root if root is not None and root.is_dir() else None
+        except (OSError, ValueError):
+            return None
 
     @staticmethod
     def _project_notifications() -> list[str]:
@@ -1453,10 +1523,9 @@ class Bridge(QObject):
             try:
                 action(core, run_id, self.project_clock())
                 ok = True
-            except (WorkLedgerError, ValueError):
-                log.info("project action refused for %s", run_id)
-        self._project_last = run_id or self._project_last
-        self._project_notice = "" if ok else _PROJECT_CARD_LABELS["refused"]
+            except Exception:                   # Core refused or failed: never a false success
+                log.info("project action refused for %s", run_id, exc_info=True)
+        self._project_card_notice = "" if ok else _PROJECT_CARD_LABELS["refused"]
         self.refreshProjectCard()
         return ok
 
@@ -1484,10 +1553,15 @@ class Bridge(QObject):
 
     @Slot(result=bool)
     def showProjectResult(self) -> bool:
-        card = self._project_card
-        if not card.get("canShowResult"):
+        self.refreshProjectCard()
+        root = self._project_result_dir()
+        if not self._project_card.get("canShowResult") or root is None:
             return False
-        return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(card["projectRoot"])))
+        try:
+            return bool(QDesktopServices.openUrl(QUrl.fromLocalFile(str(root))))
+        except Exception:                       # no false success, no crash
+            log.info("project result not opened", exc_info=True)
+            return False
 
     # -- projects (Gate 6A): the window's view of the Gate 1-5 project model --
     #
