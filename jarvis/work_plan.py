@@ -300,7 +300,35 @@ _SELF_FILES = ("jarvis/memory.py", "jarvis/contracts.py", "jarvis/memory_filter.
                "jarvis/settings.py", "jarvis/gmail_cli.py", "jarvis/app.py",
                "jarvis/work_plan.py", "jarvis/trusted_exec.py",
                "jarvis/owned_process.py", "jarvis/memory_guard.py",
-               "jarvis/__init__.py")
+               "jarvis/__init__.py",
+               # PM31: the project-mode authority chain and its runtime core.
+               "jarvis/work_planner.py", "jarvis/work_driver.py",
+               "jarvis/work_review.py", "jarvis/work_checks.py",
+               "jarvis/work_controls.py", "jarvis/work_evidence.py",
+               "jarvis/work_ledger.py", "jarvis/work_regress.py",
+               "jarvis/work_scout.py", "jarvis/write_scope.py",
+               "jarvis/write_stage.py", "jarvis/policy_proxy.py",
+               "jarvis/lifecycle.py", "jarvis/core.py", "jarvis/dispatch.py")
+#: PM31 I12 self-dev profile: closed JARVIS-repo hard-deny set, refused
+#: whatever the approval. Lowercase; "/" ends a subtree; every entry matches
+#: at any folder depth (a root above the checkout, a nested JARVIS/ prefix).
+#: CONVSAFE mirrors scripts/conveyor.py PROTECTED_*.
+SELF_DENY = (
+    "scripts/conveyor.py", "scripts/test_parallel.py", "scripts/ci.ps1",
+    "scripts/quality.ps1", ".github/workflows/", ".claude/",
+    "scripts/", "dev/", "packaging/", "build/", "data/", "jarvis/workers/",
+    "uv.lock", "pyproject.toml", "dev.ps1", ".gitignore", ".gitattributes",
+    "claude.md", "agents.md", "jarvis_runbook.md", "architecture.md",
+    "project_context.md", "jarvis_active_state.md",
+    "jarvis_v2plus_roadmap_and_decisions.md", "contracts.py")
+#: Tests that pin authority behaviour (tests/<prefix>*): rewriting them would
+#: unpin the gate they cover.
+_SELF_TESTS = ("test_work_", "test_write_", "test_conveyor", "test_memory",
+               "test_contracts", "test_settings", "test_trusted_exec",
+               "test_owned_process")
+#: D7: a JARVIS-repo run is always shadow; there is no switch to turn it off.
+SHADOW_MODE = True
+_SHADOW_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 
 
 @dataclass(frozen=True)
@@ -319,13 +347,50 @@ def _protected(lowered):
                    for p in parts))
 
 
+def _self_denied(parts):
+    # Every tail is checked, so a checkout-folder prefix (JARVIS/scripts/..)
+    # or a root overlap cannot hide a denied path (CDXINT109).
+    for i in range(len(parts)):
+        tail = "/".join(parts[i:])
+        for entry in SELF_DENY:
+            name = entry.rstrip("/")
+            if tail == name or tail.startswith(name + "/"):
+                return True
+    return any(p == "tests" and n.startswith(_SELF_TESTS)
+               for p, n in zip(parts, parts[1:]))
+
+
 def _self_target(lowered):
     parts = lowered.split("/")
-    # A same-named package dir, .pyd/.pyc or __pycache__ entry shadows the .py.
-    return (parts[0] in ("scripts", ".claude") or "__pycache__" in parts
-            or any(lowered == f[:-3] or lowered.startswith((f[:-3] + "/", f[:-3] + "."))
-                   for f in _SELF_FILES)
+    # A same-named package dir, .pyd/.pyc or __pycache__ entry shadows the .py;
+    # every tail is checked so a root above the checkout still matches.
+    tails = ["/".join(parts[i:]) for i in range(len(parts))]
+    return ("__pycache__" in parts or _self_denied(parts)
+            or any(p.startswith("agents") for p in parts)
+            or any(t == f[:-3] or t.startswith((f[:-3] + "/", f[:-3] + "."))
+                   for t in tails for f in _SELF_FILES)
             or any(w in p for p in parts for w in _SELF_WORDS))
+
+
+def shadow_candidate(run_id, slice_id, *, jarvis_repo):
+    """D7 export of an accepted JARVIS-repo slice for the conveyor.
+
+    Project mode never applies a JARVIS-repo slice to the canonical checkout
+    or main and has no push path: the slice leaves as a candidate branch plus
+    a report stub, and only the conveyor two-key gate may push main."""
+    if jarvis_repo is not True:
+        raise ValueError("shadow export is only for the JARVIS repo")
+    for value in (run_id, slice_id):
+        if type(value) is not str or not _SHADOW_ID.fullmatch(value):
+            raise ValueError("invalid shadow id")
+    if {run_id.casefold(), slice_id.casefold()} & {"main", "master", "head"}:
+        raise ValueError("shadow id names a protected ref")
+    branch = f"pm-shadow/{run_id}/{slice_id}"
+    return {"branch": branch, "applies_to": "branch", "canonical_checkout": False,
+            "push": False,
+            "report_stub": (f"STATUS: PASS\nBRANCH: {branch}\n"
+                            "COMMIT: (conveyor fills)\nPUSHED: no\n"
+                            f"INTEGRATION LANE NEEDS: shadow slice {slice_id} of run {run_id}\n")}
 
 
 def _target_refusal(target, jarvis_repo):
