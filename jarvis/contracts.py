@@ -10126,6 +10126,11 @@ class MemoryStore(Protocol):
         """Latest snapshot of every run not in a terminal state, by run_id."""
         ...
 
+    def work_runs_recent(self, limit: int) -> list[WorkRun]:
+        """Latest snapshot of the ``limit`` most recently changed runs,
+        terminal ones included, newest first. Read-only."""
+        ...
+
     def append_work_event(
         self,
         event: WorkEvent,

@@ -11887,6 +11887,23 @@ class SQLiteMemoryStore:
         runs = [_work_run_from_row(row) for row in rows]
         return [run for run in runs if run.state not in TERMINAL_RUN_STATES]
 
+    def work_runs_recent(self, limit: int) -> list[WorkRun]:
+        """Latest snapshot of the ``limit`` most recently changed runs,
+        terminal ones included, newest first (the highest snapshot_id is the
+        last append, so ties cannot happen)."""
+        if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+            raise ValueError("limit must be a positive int")
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT * FROM work_run
+                WHERE snapshot_id IN (SELECT MAX(snapshot_id) FROM work_run GROUP BY run_id)
+                ORDER BY snapshot_id DESC LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        return [_work_run_from_row(row) for row in rows]
+
     def append_work_step(self, step: WorkStep) -> None:
         """Append a step snapshot; the latest snapshot per key is the step's state."""
         if not isinstance(step, WorkStep):

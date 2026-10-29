@@ -425,7 +425,7 @@ class Bridge(QObject):
         self._project_boot = f"ui-{uuid4().hex}"
         self._project_card: dict = {}
         self._project_card_notice = ""     # own name: _project_notice is the Gate 6A projects notice
-        self._project_last: str | None = None   # None = not yet read from the sidecar
+        self._project_last = ""            # run id the card last showed (resets the notice)
         self._project_root = ""             # raw Core-validated root of the shown run, never display text
         self._project_events: dict[str, Any] = {}
         self._telemetry_timer.timeout.connect(self.refreshProjectCard)
@@ -1392,17 +1392,16 @@ class Bridge(QObject):
         store = self._conversation_db()
         if store is None:
             return {}
-        runs = sorted(store.work_runs_open(), key=lambda r: r.updated_at)
-        if runs:
-            run = runs[-1]
-        else:
-            # A run that ended (DONE, FAILED, ...) leaves work_runs_open(): keep
-            # showing the last one seen, also across a restart (sidecar).
-            last = self._project_last_run_id()
-            run = store.latest_work_run(last) if last else None
-        if run is None:
+        # The run with the newest ledger write, open or ended, in write order:
+        # a run that started and ended between two polls or while the app was
+        # closed still shows, and an old INTERRUPTED/waiting run cannot hide it.
+        recent = store.work_runs_recent(1)
+        if not recent:
             return {}
-        self._project_remember(run.run_id)
+        run = recent[0]
+        if run.run_id != self._project_last:
+            self._project_last = run.run_id
+            self._project_card_notice = ""      # a refusal belongs to the run it was about
         state = RunState(run.state)
         large = run.size == RunSize.LARGE
         found, current = self._project_event_fields(store, run.run_id, state in TERMINAL_RUN_STATES)
@@ -1459,33 +1458,6 @@ class Bridge(QObject):
                 if "project_root" in payload and ("plan" in payload or "project_root" not in cache["found"]):
                     cache["found"]["project_root"] = payload["project_root"]
         return cache["found"], cache["current"]
-
-    def _project_card_file(self) -> Path:
-        return self.prefs.path.with_suffix(".project-card.json")
-
-    def _project_last_run_id(self) -> str:
-        if self._project_last is None:
-            self._project_last = ""
-            try:
-                raw = json.loads(self._project_card_file().read_text(encoding="utf-8"))
-            except (OSError, ValueError, UnicodeDecodeError):
-                raw = None
-            run_id = raw.get("run_id") if isinstance(raw, dict) and raw.get("version") == 1 else None
-            if isinstance(run_id, str) and 0 < len(run_id) <= 200:
-                self._project_last = run_id
-        return self._project_last
-
-    def _project_remember(self, run_id: str) -> None:
-        if run_id == self._project_last_run_id():
-            return
-        self._project_last = run_id
-        self._project_card_notice = ""          # a refusal belongs to the run it was about
-        try:
-            path = self._project_card_file()
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps({"version": 1, "run_id": run_id}), encoding="utf-8")
-        except OSError:
-            log.debug("project card run id not saved", exc_info=True)
 
     def _project_root_path(self) -> Path | None:
         root = Path(self._project_root) if self._project_root else None
