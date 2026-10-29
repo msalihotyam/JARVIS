@@ -5,10 +5,16 @@ alarm history) and execute the returned Decision. No clock, process, network or
 DB here. The rules port the orchestrator's playbook (ORCH_RULES O5/O11/O13/O15/
 O23/O33, PM_DECISIONS D3/D8). A model step may only PROPOSE one of
 ALLOWED_PROPOSALS; anything else fails closed to a needs_input question with
-options and a default. Every Decision starts with (action, rule_id, reason).
-Out-of-bounds caller parameters and a malformed situation raise ValueError.
+options and a default. Every Decision starts with (action, rule_id, reason) and
+supervise() ends it with a worker constraint from CONSTRAINTS.
+
+supervise() takes ONE complete, typed Situation; Situation.from_dict is the only
+dict parser. A missing or invalid gate (operator_pause, policy, quota, memory)
+pauses and never dispatches. Night/pacing thresholds are caller config (Policy).
+Out-of-bounds rule parameters and malformed work items raise ValueError.
 """
 
+from dataclasses import dataclass
 from math import isfinite
 from typing import Mapping, NamedTuple
 
@@ -17,18 +23,22 @@ ALLOWED_PROPOSALS = frozenset({"pause", "ask_salih", "requeue", "split", "wait"}
 CORE_ACTIONS = ALLOWED_PROPOSALS | {
     "none", "dispatch", "batch", "alarm", "suppress", "non_claude_only", "needs_input",
 }
+CONSTRAINTS = ("any", "non_claude_only", "none")   # loosest -> strictest worker set
 FIX_CAP = 2                 # O5/O15: no third fix on one target
-QUOTA_LIMIT_PCT = 90.0      # O23: weekly hard stop (default; caller passes limit_pct)
-AHEAD_PP = 3.0              # default: quota points over the pacing line that count as ahead
-RATE_SLACK = 1.2            # burn rate over target * this counts as ahead
-NIGHT = (2, 8)              # local hours [start, end): only non-Claude workers
+# DEFAULT_POLICY values (Salih's setting this week); callers pass their own Policy.
+QUOTA_LIMIT_PCT = 100.0     # O23: weekly hard stop
+CLAUDE_AT_NIGHT = True      # Claude workers allowed during NIGHT
+AHEAD_PP = 3.0              # quota points over the pacing line that count as ahead
+NIGHT = (2, 8)              # local hours [start, end)
 MEM_LOW_GB = 3.0            # conveyor min_free_mem_gb
 MEM_MARGIN_GB = 1.5         # release at low + margin ...
 MEM_OK_S = 300              # ... held continuously this long
+RATE_SLACK = 1.2            # burn rate over target * this counts as ahead
 INT_WAIT_S = 3600           # O11: a PASS waiting this long gets a small INT
 INT_MIN_BATCH = 3
 INT_MAX_BATCH = 6
 _REASON_MAX = 200
+_ANY_WORKER = frozenset({"dispatch", "requeue", "split", "batch"})
 
 
 class Decision(NamedTuple):
@@ -39,6 +49,7 @@ class Decision(NamedTuple):
     options: tuple = ()
     default: str = ""
     groups: tuple = ()
+    constraint: str = "none"    # set by supervise(); "none" = start no worker
 
 
 def _num(value) -> float | None:
@@ -51,6 +62,52 @@ def _num(value) -> float | None:
     return value if isfinite(value) else None
 
 
+@dataclass(frozen=True)
+class Policy:
+    """Caller config (Salih's setting). Every field required; checked on build
+    and again by every rule that reads it."""
+    limit_pct: float
+    ahead_pp: float
+    night: tuple
+    claude_at_night: bool
+    mem_low_gb: float
+    mem_margin_gb: float
+
+    def __post_init__(self):
+        self.check()
+
+    def check(self):
+        limit, ahead = _num(self.limit_pct), _num(self.ahead_pp)
+        low, margin, night = _num(self.mem_low_gb), _num(self.mem_margin_gb), self.night
+        if limit is None or not 0 < limit <= 100:
+            raise ValueError("limit_pct must be a number in (0, 100]")
+        if ahead is None or not 0 <= ahead <= 100:
+            raise ValueError("ahead_pp must be a number in [0, 100]")
+        # ponytail: one window, no wraparound (22, 6); add a second window if needed.
+        if (type(night) is not tuple or len(night) != 2
+                or any(type(h) is not int for h in night)
+                or not 0 <= night[0] <= night[1] <= 24):
+            raise ValueError("night must be (start, end) ints, 0 <= start <= end <= 24")
+        if type(self.claude_at_night) is not bool:
+            raise ValueError("claude_at_night must be a bool")
+        if low is None or low <= 0:
+            raise ValueError("mem_low_gb must be a finite number > 0")
+        if margin is None or margin < 0:
+            raise ValueError("mem_margin_gb must be a finite number >= 0")
+
+
+DEFAULT_POLICY = Policy(QUOTA_LIMIT_PCT, AHEAD_PP, NIGHT, CLAUDE_AT_NIGHT,
+                        MEM_LOW_GB, MEM_MARGIN_GB)
+
+
+def _policy(policy) -> Policy:
+    # type() is Policy, not isinstance: a subclass could override check().
+    if type(policy) is not Policy:
+        raise ValueError("policy must be a Policy")
+    Policy.check(policy)    # a frozen dataclass can still be mutated via object.__setattr__
+    return policy
+
+
 def _needs_input(rule_id: str, reason: str) -> Decision:
     return Decision(
         "needs_input", rule_id, reason,
@@ -61,6 +118,8 @@ def _needs_input(rule_id: str, reason: str) -> Decision:
 
 def fix_chain(target: str, failed_fixes: int, cap: int = FIX_CAP) -> Decision:
     """O5/O15: after the cap-th failed fix ask one simplification question."""
+    if type(target) is not str or not target:
+        raise ValueError("target must be a nonempty string")
     if type(failed_fixes) is not int or failed_fixes < 0:
         raise ValueError("failed_fixes must be a nonnegative integer")
     if type(cap) is not int or not 0 <= cap <= FIX_CAP:
@@ -125,24 +184,21 @@ def plan_integration(picks, int_running: bool = False, oldest_wait_s: float = 0,
     return Decision("batch", "O11.batch", f"{len(ready)} picks in {len(groups)} INT", groups=groups)
 
 
-def quota_pacing(used_pct, line_pct, hour, rate_pct_h=None, target_pct_h=None,
-                 limit_pct: float = QUOTA_LIMIT_PCT, ahead_pp: float = AHEAD_PP) -> Decision:
-    """O23/D3: hard stop at the limit; only non-Claude workers when ahead or at night.
+def quota_pacing(policy: Policy, used_pct, line_pct, hour, rate_pct_h=None,
+                 target_pct_h=None) -> Decision:
+    """O23/D3: hard stop at policy.limit_pct; only non-Claude workers when ahead,
+    and at policy.night unless policy.claude_at_night.
 
     used_pct may be one reading or several; the highest counts (fail closed).
     rate_pct_h/target_pct_h are optional as a pair: both None skips the rate rule;
     anything else must be a rate >= 0 and a target in (0, 100], or the run pauses.
     line_pct None means no pacing line; a supplied line outside 0..100 pauses."""
+    policy = _policy(policy)
     readings = used_pct if isinstance(used_pct, (tuple, list)) else (used_pct,)
     values = [_num(v) for v in readings]
-    limit, ahead = _num(limit_pct), _num(ahead_pp)
-    if limit is not None and limit > 100:
-        raise ValueError("limit_pct must be <= 100")
-    if ahead is None or ahead < 0:
-        raise ValueError("ahead_pp must be a finite number >= 0")
-    if not values or None in values or min(values) < 0 or limit is None or limit <= 0:
-        return Decision("pause", "O23.unknown", "quota reading or limit missing or invalid")
-    used = max(values)
+    if not values or None in values or min(values) < 0:
+        return Decision("pause", "O23.unknown", "quota reading missing or invalid")
+    used, limit = max(values), _num(policy.limit_pct)
     if used >= limit:
         return Decision("pause", "O23.limit", f"quota {used:g}% >= {limit:g}%")
     if type(hour) is not int or not 0 <= hour <= 23:
@@ -156,31 +212,30 @@ def quota_pacing(used_pct, line_pct, hour, rate_pct_h=None, target_pct_h=None,
         return Decision("pause", "O23.unknown", "pacing line invalid")
     if line is None:
         return Decision("non_claude_only", "pace.unknown_line", "no pacing line")
-    if used - line > ahead:
+    if used - line > _num(policy.ahead_pp):
         return Decision("non_claude_only", "pace.ahead", f"quota {used:g}% vs line {line:g}%")
     if rate is not None and rate > target * RATE_SLACK:
         return Decision("non_claude_only", "pace.rate", f"{rate:g}%/h vs target {target:g}%/h")
-    if NIGHT[0] <= hour < NIGHT[1]:
+    start, end = policy.night
+    if not policy.claude_at_night and start <= hour < end:
         return Decision("non_claude_only", "pace.night", f"night hour {hour}")
     return Decision("dispatch", "pace.on_line", f"quota {used:g}% vs line {line:g}%")
 
 
-def memory_hold(free_gb, held: bool, ok_for_s=0, low_gb: float = MEM_LOW_GB,
-                margin_gb: float = MEM_MARGIN_GB) -> Decision:
-    """No new worker below low_gb; a hold releases at low+margin held MEM_OK_S.
-
-    The caller's next `held` is `decision.action == "wait"`."""
-    free, low_gb, margin_gb = _num(free_gb), _num(low_gb), _num(margin_gb)
-    if low_gb is not None and low_gb <= 0:
-        raise ValueError("low_gb must be > 0")
-    if free is None or low_gb is None or margin_gb is None or margin_gb < 0:
-        return Decision("wait", "mem.unknown", "free memory or threshold unknown")
-    if free < low_gb:
-        return Decision("wait", "mem.hold", f"free {free:g} GB < {low_gb:g} GB")
+def memory_hold(policy: Policy, free_gb, held: bool, ok_for_s=0) -> Decision:
+    """No new worker below policy.mem_low_gb; a hold releases at low+margin held
+    MEM_OK_S. The caller's next `held` is `decision.action == "wait"`."""
+    policy = _policy(policy)
+    free, low = _num(free_gb), _num(policy.mem_low_gb)
+    release = low + _num(policy.mem_margin_gb)
+    if free is None:
+        return Decision("wait", "mem.unknown", "free memory unknown")
+    if free < low:
+        return Decision("wait", "mem.hold", f"free {free:g} GB < {low:g} GB")
     ok = _num(ok_for_s)
-    if held is not False and (free < low_gb + margin_gb or ok is None or ok < MEM_OK_S):
+    if held is not False and (free < release or ok is None or ok < MEM_OK_S):
         return Decision("wait", "mem.hysteresis", f"free {free:g} GB, release at "
-                        f"{low_gb + margin_gb:g} GB for {MEM_OK_S}s")
+                        f"{release:g} GB for {MEM_OK_S}s")
     return Decision("dispatch", "mem.ok", f"free {free:g} GB")
 
 
@@ -202,63 +257,149 @@ def _alarm(item, cause, finished=(), alarmed=()) -> Decision:
     return filter_alarms([(item, cause)], finished, alarmed)[0]
 
 
-_RULES = {"quota": quota_pacing, "memory": memory_hold, "alarm": _alarm,
-          "fix": fix_chain, "integration": plan_integration}
-_KEYS = frozenset(_RULES) | {"operator_pause", "proposal"}
+_GATES = ("operator_pause", "policy", "quota", "memory")
+_WORK = {"alarm": _alarm, "fix": fix_chain, "integration": plan_integration,
+         "proposal": gate_proposal}
 
-# The ONE precedence table: (situation key, action; None = any action). supervise
-# evaluates every present key, then returns the first row that matches. Memory is
-# always checked; quota non_claude_only never hides alarm/fix/integration/proposal.
+
+@dataclass(frozen=True)
+class Situation:
+    """Everything supervise() reads. The gates are required: None (absent) pauses.
+    A work item None is absent. `unknown` lists rejected dict keys (needs_input)."""
+    operator_pause: object = None
+    policy: object = None
+    quota: object = None
+    memory: object = None
+    alarm: object = None
+    fix: object = None
+    integration: object = None
+    proposal: object = None
+    unknown: tuple = ()
+
+    @classmethod
+    def from_dict(cls, data) -> "Situation":
+        """The ONE dict parser. An absent gate stays None (supervise pauses); a
+        work key present as None, or any parse error, raises ValueError."""
+        if not isinstance(data, Mapping):
+            raise ValueError("situation must be a mapping")
+        try:
+            fields = _GATES + tuple(_WORK)
+            unknown = tuple(sorted(repr(k) for k in data
+                                   if type(k) is not str or k not in fields))
+            kw = {k: data[k] for k in fields if k in data}
+            for key in _WORK:
+                if key in kw and kw[key] is None:
+                    raise ValueError(f"situation[{key!r}] must not be None")
+            return cls(**kw, unknown=unknown)
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"malformed situation: {type(exc).__name__}") from None
+
+
+# The ONE precedence table: (finding, action; None = any action), first match wins.
+# The non_claude_only row returns nothing itself: it tightens the constraint of the
+# decision a later row returns, so fix/alarm/integration/proposal can never lift it
+# (H6). Memory ok is never a row; quota then decides.
 PRECEDENCE = (
     ("operator_pause", "pause"),
-    ("quota", "pause"),
+    ("gate", None),                 # missing/invalid gate: pause or needs_input
     ("memory", "wait"),
-    ("alarm", "alarm"),
+    ("quota", "pause"),
+    ("quota", "non_claude_only"),   # constraining row
+    ("alarm", "alarm"),             # a suppressed alarm hides nothing
     ("fix", None),
     ("integration", None),
     ("proposal", None),
-    ("quota", "non_claude_only"),
-    ("memory", "dispatch"),
     ("quota", "dispatch"),
-    ("alarm", "suppress"),      # a suppressed alarm hides nothing
 )
 
 
-def _evaluate(situation: Mapping) -> dict:
+def _gates(s: Situation) -> dict:
+    """Operator pause and the required gates; the first fault ends the scan."""
+    pause = s.operator_pause
+    if pause is True:
+        return {"operator_pause": Decision("pause", "operator.pause", "Salih asked for a pause")}
+    if pause is None:
+        return {"gate": Decision("pause", "gate.missing", "operator_pause missing")}
+    # type() is bool: never call __bool__ on an operator flag.
+    if type(pause) is not bool:
+        return {"gate": _needs_input(
+            "operator.invalid", f"operator_pause must be a bool, not {type(pause).__name__}")}
+    if s.policy is None:
+        return {"gate": Decision("pause", "gate.missing", "policy missing")}
+    try:
+        policy = _policy(s.policy)
+    except ValueError as exc:
+        return {"gate": Decision("pause", "gate.invalid", f"policy invalid: {exc}")}
     found = {}
-    if situation.get("operator_pause"):
-        found["operator_pause"] = Decision("pause", "operator.pause", "Salih asked for a pause")
-    for key, rule in _RULES.items():
-        if key in situation:
-            if not isinstance(situation[key], Mapping):
-                raise ValueError(f"situation[{key!r}] must be a mapping")
-            found[key] = rule(**situation[key])
-    if "proposal" in situation:
-        found["proposal"] = gate_proposal(situation["proposal"])
+    for key, rule in (("memory", memory_hold), ("quota", quota_pacing)):
+        sub = getattr(s, key)
+        if sub is None:
+            return {"gate": Decision("pause", "gate.missing", f"{key} missing")}
+        if not isinstance(sub, Mapping):
+            return {"gate": Decision("pause", "gate.invalid", f"{key} must be a mapping")}
+        try:
+            found[key] = rule(policy, **sub)
+        except Exception as exc:
+            return {"gate": Decision("pause", "gate.invalid",
+                                     f"{key} invalid: {type(exc).__name__}")}
     return found
 
 
-def supervise(situation: Mapping) -> Decision:
-    """One decision by PRECEDENCE; no row matches -> none/idle.
+def _final(d: Decision, constraint: str) -> Decision:
+    own = ("non_claude_only" if d.action == "non_claude_only"
+           else "any" if d.action in _ANY_WORKER else "none")
+    return d._replace(constraint=max(own, constraint, key=CONSTRAINTS.index))
 
-    Unknown top-level keys -> needs_input. A non-Mapping situation or sub-situation,
-    missing/extra/non-str sub-keys, out-of-bounds values or any error raised while
-    evaluating raise ValueError (never another type); the caller must not dispatch
-    on an exception."""
-    if not isinstance(situation, Mapping):
-        raise ValueError("situation must be a mapping")
+
+def _decide(s: Situation) -> Decision:
+    unknown = s.unknown
+    if type(unknown) is not tuple or unknown:
+        keys = ", ".join(map(str, unknown)) if type(unknown) is tuple else type(unknown).__name__
+        return _needs_input("D8.unknown", f"unknown situation keys: {keys}"[:_REASON_MAX])
+    found = _gates(s)
+    if "operator_pause" not in found and "gate" not in found:
+        for key, rule in _WORK.items():
+            sub = getattr(s, key)
+            if sub is None:
+                continue
+            if key == "proposal":
+                found[key] = rule(sub)
+            elif not isinstance(sub, Mapping):
+                raise ValueError(f"situation.{key} must be a mapping")
+            elif key == "integration" and ("int_running" not in sub or
+                                           "min_batch" in sub or "max_batch" in sub):
+                # Fail closed: the caller must say whether INT runs; batch sizes are
+                # module constants, never per-call.
+                raise ValueError("situation.integration needs int_running and no batch sizes")
+            else:
+                found[key] = rule(**sub)
+    constraint = "any"
+    for key, action in PRECEDENCE:
+        d = found.get(key)
+        if d is None or action not in (None, d.action):
+            continue
+        if action == "non_claude_only":
+            constraint = "non_claude_only"
+            continue
+        return _final(d, constraint)
+    return _final(found["quota"], constraint)   # non_claude_only and no work
+
+
+def supervise(situation: Situation) -> Decision:
+    """One decision by PRECEDENCE, with its worker constraint.
+
+    A non-Situation (build one with Situation.from_dict) or unknown keys ->
+    needs_input. A missing/invalid gate -> pause (an invalid operator_pause ->
+    needs_input). Malformed work items or any error raised while evaluating them
+    raise ValueError (never another type); the caller must not dispatch on it."""
+    if type(situation) is not Situation:
+        return _needs_input("D8.not_situation",
+                            "supervise takes a Situation; build it with Situation.from_dict")
     try:
-        unknown = set(situation) - _KEYS
-        if unknown:
-            keys = ", ".join(sorted(map(repr, unknown)))
-            return _needs_input("D8.unknown", f"unknown situation keys: {keys}"[:_REASON_MAX])
-        found = _evaluate(situation)
+        return _decide(situation)
     except ValueError:
         raise
     except Exception as exc:
         raise ValueError(f"malformed situation: {type(exc).__name__}") from None
-    for key, action in PRECEDENCE:
-        d = found.get(key)
-        if d is not None and action in (None, d.action):
-            return d
-    return Decision("none", "idle", "nothing to decide")
