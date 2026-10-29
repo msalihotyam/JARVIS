@@ -1437,7 +1437,6 @@ class Bridge(QObject):
             cache = self._project_events = {"run_id": run_id, "seq": 0, "found": {}, "current": "", "ended": False}
         if cache["ended"]:
             return cache["found"], cache["current"]
-        cache["ended"] = ended
         # ponytail: the store has no after-seq read, so rows are still fetched;
         # only new ones are parsed. Add work_events(run_id, after_seq) if runs get huge.
         for event in store.work_events(run_id):
@@ -1457,6 +1456,8 @@ class Bridge(QObject):
                 # replan may rebind it); other payloads never redirect "show result".
                 if "project_root" in payload and ("plan" in payload or "project_root" not in cache["found"]):
                     cache["found"]["project_root"] = payload["project_root"]
+        # Only a read that succeeded ends the run's fetching: a failed one is retried on the next poll.
+        cache["ended"] = ended
         return cache["found"], cache["current"]
 
     def _project_root_path(self) -> Path | None:

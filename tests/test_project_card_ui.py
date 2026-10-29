@@ -349,6 +349,14 @@ class ProjectCardTests(UiTestCase):
         other = FakeStore(WorkRun("x", RunState.BUILDING, T0, T0), [self.event(1, run_id="x")])
         self.assertEqual(("x", ""), (self.card_from(other)["runId"], self.ui.projectCard["notice"]))
 
+    def test_failed_first_read_of_an_ended_run_is_retried(self):
+        store = FakeStore(WorkRun("r", RunState.DONE, T0, T0),
+                          [self.event(1, checks="3/3", plan={}, project_root=self.target)])
+        with mock.patch.object(store, "work_events", side_effect=sqlite3.OperationalError("database is locked")):
+            self.assertEqual({}, self.card_from(store))
+        card = self.card_from(store)
+        self.assertEqual(("3/3", self.target, True), (card["checks"], card["projectRoot"], card["canShowResult"]))
+
     def test_polling_parses_only_new_events(self):
         store = FakeStore(WorkRun("r", RunState.BUILDING, T0, T0), [self.event(1, checks="1/3")])
         events = store.events
