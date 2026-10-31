@@ -180,6 +180,10 @@ PACE_MARGIN = 2  # paced: usage <= pace_line + this -> max lanes, else min_lanes
 MIN_LANES = 2  # pace.json min_lanes default (not written; capped by the lane cap when not set)
 INT_RE = re.compile(r"(?i)^int(?![a-z])")  # integration lanes (INT7, int-x): one at a time
 RESET_DROP = 40  # usage falling this many points between two readings = the quota was reset
+# CONVUSAGE: one bogus reading (2026-10-30: a stray 90 % beside a real ~12 %) must not hold or reset
+RESET_MIN_AGE_S = 6 * 86400  # a pace window younger than this never resets (the quota is weekly)
+SPIKE_WINDOW_S = 6 * 3600  # a RESET_DROP rise within this of the last accepted value needs confirming
+SPIKE_CONFIRM_S = 1800  # by another source, or by the same source again this much later
 PACE_BAD_ID = "pace-invalid"  # attention ids (and ack files)
 RESET_ALERT_ID = "quota-reset-alert"
 RESET_DONE_ID = "quota-reset"
@@ -2051,7 +2055,10 @@ class Conveyor:
         row (claude has no usage command; written when a lane finishes) and the live
         "seven_pct" of every build/lanes/<family>.json; ties take the higher %. Readings
         older than USAGE_FRESH_S and unreadable files are ignored; None when nothing is
-        fresh. The winner's source ("ledger" / "live:<family>") goes to self.usage_source."""
+        fresh. The winner's source ("ledger" / "live:<family>") goes to self.usage_source.
+        A winner RESET_DROP+ above the last accepted value (pager "usage_ok") within
+        SPIKE_WINDOW_S is held back (the last accepted value is returned) until another
+        source confirms the rise or the same source reports it again SPIKE_CONFIRM_S later."""
         cands = []
         f = self.root / "build" / "ledger" / "slices.jsonl"
         try:
@@ -2082,7 +2089,27 @@ class Conveyor:
             if isinstance(pct, (int, float)) and not isinstance(pct, bool) and 0 <= pct <= 100 \
                     and 0 <= self.now() - ts <= USAGE_FRESH_S:
                 cands.append((ts, pct, f"live:{f.stem}"))
-        ts, pct, self.usage_source = max(cands, default=(None, None, None))
+        ts, pct, src = max(cands, default=(None, None, None))
+        ok, spike = self.pager_flag("usage_ok"), self.pager_flag("usage_spike")  # [pct, ts, seen_at, src]
+        if not (isinstance(ok, list) and len(ok) == 4):
+            ok = None
+        if not (isinstance(spike, list) and len(spike) == 2):
+            spike = None
+        if pct is not None and ok and pct - ok[0] >= RESET_DROP and self.now() - ok[2] < SPIKE_WINDOW_S:
+            confirmed = any(s != src and q - ok[0] >= RESET_DROP and t > ok[1] for t, q, s in cands) \
+                or (spike is not None and spike[0] == src and ts - spike[1] >= SPIKE_CONFIRM_S)
+            if not confirmed:
+                if spike is None or spike[0] != src:
+                    self.pager_flag("usage_spike", [src, ts])
+                # seen_at moves on while held, so a held spike never ages into acceptance
+                self.pager_flag("usage_ok", [ok[0], ok[1], self.now(), ok[3]])
+                self.usage_source = ok[3]
+                return ok[0]
+        if pct is not None:
+            self.pager_flag("usage_ok", [pct, ts, self.now(), src])
+            if spike is not None:
+                self.pager_flag("usage_spike", False)  # a non-spike reading ends the pending spike
+        self.usage_source = src
         return pct
 
     def busy_names(self, lanes, agents):
@@ -2198,7 +2225,16 @@ class Conveyor:
         u, prev = self.usage, self.pager_flag("last_usage")
         p, err = self.load_pace()
         if u is not None:
-            if isinstance(prev, (int, float)) and prev - u >= RESET_DROP:
+            ws = None if err else p.get("window_start")
+            try:
+                young = self.now() - datetime.fromisoformat(ws).timestamp() < RESET_MIN_AGE_S
+            except (TypeError, ValueError, OverflowError):
+                young = False  # no readable window: a drop resets as before
+            if isinstance(prev, (int, float)) and prev - u >= RESET_DROP and young:
+                if self.pager_flag("reset_refused") != ws:  # one event per pace window
+                    self.event("quota_reset_refused", before=prev, after=u, window_start=ws)
+                    self.pager_flag("reset_refused", ws)
+            elif isinstance(prev, (int, float)) and prev - u >= RESET_DROP:
                 p, err = {**p, "mode": "paced", "window_start": iso(self.now())}, None
                 keep = [*PACE_DEFAULTS, *(k for k in ("max_lanes", "min_lanes", "test_pool_tokens",
                                                       "claude_version") if k in p)]

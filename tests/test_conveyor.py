@@ -1667,6 +1667,72 @@ class TestPaceGovernor(TestUsageGuard):
         self.assertEqual(self.pace_file()["mode"], "full_burn")
         self.assertNotIn(conveyor.RESET_DONE_ID, self.attn())
 
+    def resets(self):
+        return [e["event"] for e in self.events() if e["event"].startswith("quota_reset")]
+
+    def test_bogus_spike_neither_holds_nor_resets(self):  # CONVUSAGE: the 2026-10-30 incident
+        self.paced(days_ago=1)
+        self.ledger(10, age=7 * 3600)
+        self.c.pass_once()
+        before = self.pace_file()
+        self.t += 60
+        self.live("opus", {"seven_pct": 90})  # a stray session's bogus reading, newest
+        self.drop("a.md", HDR.format("A"))
+        self.c.pass_once()
+        self.assertEqual((self.status()["usage_pct"], self.status()["usage_hold"]), (10, False))
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        for pct in (30, 90, 30, 90, 30, 90):  # flips minutes apart: never a confirmed rise or a reset
+            self.t += 120
+            self.live("opus", {"seven_pct": pct})
+            self.c.pass_once()
+        self.assertEqual(self.status()["usage_pct"], 30)
+        self.assertEqual(self.resets(), [])
+        self.assertEqual(self.pace_file(), before)
+
+    def test_old_window_drop_resets_once(self):
+        self.paced(days_ago=6.5)
+        self.ledger(98)
+        self.c.pass_once()
+        self.t += 3600
+        self.ledger(1)
+        self.c.pass_once()
+        start = conveyor.iso(self.t)
+        self.t += 60
+        self.c.pass_once()
+        (ev,) = [e for e in self.events() if e["event"] == "quota_reset"]
+        self.assertEqual((ev["before"], ev["after"]), (98, 1))
+        self.assertEqual(self.pace_file()["window_start"], start)
+
+    def test_young_window_drop_refused_once(self):
+        self.paced(days_ago=1)
+        self.ledger(98)
+        self.c.pass_once()
+        before = self.pace_file()
+        for _ in range(3):
+            self.t += 600
+            self.ledger(1)
+            self.c.pass_once()
+            self.t += 600
+            self.ledger(98)
+            self.live("opus", {"seven_pct": 98})  # a second source confirms the rise at once
+            self.c.pass_once()
+            self.assertEqual(self.status()["usage_pct"], 98)
+        self.assertEqual(self.pace_file(), before)
+        self.assertEqual(self.resets(), ["quota_reset_refused"])
+
+    def test_spike_confirmed_by_same_source_later(self):
+        self.ledger(10)
+        self.c.pass_once()
+        self.t += 60
+        self.live("opus", {"seven_pct": 90})
+        self.assertEqual((self.c.usage_pct(), self.c.usage_source), (10, "ledger"))
+        self.t += conveyor.SPIKE_CONFIRM_S - 120
+        self.live("opus", {"seven_pct": 91})
+        self.assertEqual(self.c.usage_pct(), 10)  # too soon: still held
+        self.t += 120
+        self.live("opus", {"seven_pct": 91})
+        self.assertEqual((self.c.usage_pct(), self.c.usage_source), (91, "live:opus"))
+
     def test_hand_edit_is_reread_every_pass(self):
         self.ledger(60)
         self.c.pass_once()
