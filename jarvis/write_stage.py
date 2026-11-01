@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import re
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -38,11 +39,10 @@ class Stage:
 
 
 class StageManager:
-    """Manage linked worktrees beneath a caller-selected staging directory.
+    """Manage independent repositories beneath a caller-selected staging directory.
 
-New project repositories are retained permanently; cleanup only removes linked
-worktrees whose commits are already reachable from the target's HEAD. Branches
-are retained as recovery refs. This is not a diff-scope or approval gate.
+Stage and per-run repositories own their objects. Legacy apply and cleanup
+remain separate migration steps. This is not a diff-scope or approval gate.
 """
 
     def __init__(self, root: Path, *, timeout: float = 30):
@@ -120,8 +120,42 @@ are retained as recovery refs. This is not a diff-scope or approval gate.
             raise StageError("invalid base")
         sha = self._git(target, "rev-parse", "--verify", "--end-of-options", f"{base}^{{commit}}").decode().strip()
         path.parent.mkdir(parents=True, exist_ok=True)
-        self._git(target, "worktree", "add", "-b", branch, str(path), sha)
+        ref, current, _ = self._integration(target, run)
+        owned = self.root.parent / (self.root.name + "-repos") / run
+        if owned.resolve() != owned:
+            raise StageError("run repository traverses a link")
+        if owned.exists():
+            for entry in (owned, owned / ".git", owned / ".git" / "objects"):
+                try:
+                    info = os.lstat(entry)
+                except OSError as exc:
+                    raise StageError("invalid run repository") from exc
+                if (not stat.S_ISDIR(info.st_mode)
+                        or getattr(info, "st_file_attributes", 0) & 0x400):
+                    raise StageError("invalid run repository")
+        else:
+            owned.mkdir(parents=True)
+            self._git(owned, "init", "--template=")
+            self._git(owned, "config", "gc.auto", "0")
+            self._seed(target, owned, sha)
+            if current and current != sha:
+                self._seed(target, owned, current)
+            self._git(owned, "update-ref", ref, current or sha)
+        if current is None:
+            self._git(target, "update-ref", ref, sha, "0" * len(sha))
+        path.mkdir()
+        self._git(path, "init", "--template=")
+        self._seed(target, path, sha)
+        self._git(path, "symbolic-ref", "HEAD", f"refs/heads/{branch}")
+        self._git(path, "update-ref", "HEAD", sha)
+        self._git(path, "read-tree", "-u", "--reset", sha)
         return Stage(target, path, branch, sha)
+
+    def _seed(self, source: Path, destination: Path, sha: str) -> None:
+        """Copy trusted history without links, remotes or alternates."""
+        pack = self._git(source, "pack-objects", "--revs", "--stdout",
+                         input=f"{sha}\n".encode())
+        self._git(destination, "index-pack", "--stdin", input=pack)
 
     def create_repo(self, path: Path) -> Path:
         """Initialize a new project with an empty baseline; never reuse a folder."""
@@ -141,11 +175,29 @@ are retained as recovery refs. This is not a diff-scope or approval gate.
                 or stage.path != expected or stage.path.resolve() != expected
                 or stage.target.resolve() == stage.path):
             raise StageError("stage identity mismatch")
-        common = self._git(stage.path, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
-        target_common = self._git(stage.target, "rev-parse", "--path-format=absolute", "--git-common-dir").strip()
-        branch = self._git(stage.path, "symbolic-ref", "--short", "HEAD").decode().strip()
-        if common != target_common or branch != stage.branch:
-            raise StageError("stage repository or branch mismatch")
+        try:
+            for entry in (stage.path.parent, stage.path, stage.path / ".git",
+                          stage.path / ".git" / "objects",
+                          stage.path / ".git" / "objects" / "info"):
+                info = os.lstat(entry)
+                if (not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode)
+                        or getattr(info, "st_file_attributes", 0) & 0x400):
+                    raise StageError("stage contains a link or non-directory")
+            head = stage.path / ".git" / "HEAD"
+            info = os.lstat(head)
+            if (not stat.S_ISREG(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0) & 0x400):
+                raise StageError("stage HEAD is not a regular file")
+            if head.read_bytes().decode("utf-8") != f"ref: refs/heads/{stage.branch}\n":
+                raise StageError("stage branch mismatch")
+            try:
+                os.lstat(stage.path / ".git" / "objects" / "info" / "alternates")
+            except FileNotFoundError:
+                pass
+            else:
+                raise StageError("stage alternates refused")
+        except (OSError, UnicodeError) as exc:
+            raise StageError("invalid stage metadata") from exc
 
     def diff(self, stage: Stage) -> bytes:
         """Return a binary-capable patch; refuse to silently omit new files."""

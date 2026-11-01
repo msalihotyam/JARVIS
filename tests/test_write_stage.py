@@ -2,6 +2,8 @@
 
 import os
 import subprocess
+import stat
+import sys
 import tempfile
 import unittest
 from dataclasses import replace
@@ -31,6 +33,101 @@ class StageTests(unittest.TestCase):
         self.manager._git(path, "update-ref", "HEAD", sha, parent)
         return sha
 
+    def test_independent_stage_and_run_repository(self):
+        (self.repo / "base.txt").write_text("baseline")
+        self.commit(self.repo)
+        stage = self.stage()
+        owned = self.manager.root.parent / (self.manager.root.name + "-repos") / "run1"
+        for repo in (stage.path, owned):
+            self.assertTrue((repo / ".git" / "objects").is_dir())
+            self.assertFalse((repo / ".git" / "objects" / "info" / "alternates").exists())
+            for entry in (repo / ".git").rglob("*"):
+                if entry.is_file():
+                    content = entry.read_bytes()
+                    for target in (str(self.repo), self.repo.as_posix()):
+                        self.assertFalse(target.encode() in content, str(entry)[:80])
+        self.assertEqual((stage.path / "base.txt").read_text(), "baseline")
+        self.assertEqual(list(owned.iterdir()), [owned / ".git"])
+        self.assertEqual(self.manager._git(owned, "config", "gc.auto"), b"0\n")
+        self.assertEqual(self.manager._git(owned, "rev-parse", "jarvis/run1/main").decode().strip(), stage.base)
+        self.assertEqual(self.rev("jarvis/run1/main"), stage.base)
+        before = {p.relative_to(self.repo): p.read_bytes()
+                  for p in (self.repo / ".git").rglob("*") if p.is_file()}
+        for entry in (stage.path / ".git" / "objects").rglob("*"):
+            if entry.is_file():
+                entry.chmod(stat.S_IWRITE | stat.S_IREAD)
+                entry.write_bytes(b"worker overwrite")
+        (stage.path / ".git" / "objects" / "worker").write_bytes(b"worker new object")
+        after = {p.relative_to(self.repo): p.read_bytes()
+                 for p in (self.repo / ".git").rglob("*") if p.is_file()}
+        self.assertTrue(before == after, "target metadata changed after stage object writes")
+
+    def test_new_run_repository_seeds_existing_integration(self):
+        stage = self.stage()
+        commit = self.change(stage, "accepted.txt")
+        self.manager.apply(stage, commit)
+        manager = StageManager(self.home / "other-stages")
+        next_stage = manager.create(self.repo, "run1", "slice2")
+        owned = self.home / "other-stages-repos" / "run1"
+        self.assertEqual(manager._git(owned, "rev-parse", "jarvis/run1/main").decode().strip(), commit)
+        self.assertEqual(next_stage.base, stage.base)
+
+    def test_validate_is_python_only_and_refuses_metadata_tampering(self):
+        stage = self.stage()
+        with patch.object(self.manager, "_git", side_effect=AssertionError("git during validate")):
+            self.manager._validate(stage)
+            alternates = stage.path / ".git" / "objects" / "info" / "alternates"
+            alternates.write_text("")
+            with self.assertRaisesRegex(StageError, "alternates"):
+                self.manager._validate(stage)
+            alternates.unlink()
+            head = stage.path / ".git" / "HEAD"
+            original = head.read_bytes()
+            for value in (b"ref: refs/heads/wrong\n", stage.base.encode() + b"\n",
+                          original.rstrip(b"\n")):
+                head.write_bytes(value)
+                with self.assertRaises(StageError):
+                    self.manager._validate(stage)
+            head.write_bytes(original)
+            metadata = stage.path / ".git"
+            saved = stage.path / "saved-git"
+            metadata.rename(saved)
+            metadata.write_text("gitdir: " + str(self.repo / ".git"))
+            with self.assertRaises(StageError):
+                self.manager._validate(stage)
+            metadata.unlink()
+            saved.rename(metadata)
+            real_lstat = os.lstat
+
+            def reparse(path, *args, **kwargs):
+                result = real_lstat(path, *args, **kwargs)
+                if Path(path) == metadata:
+                    from types import SimpleNamespace
+                    return SimpleNamespace(st_mode=result.st_mode, st_file_attributes=0x400)
+                return result
+
+            with patch("jarvis.write_stage.os.lstat", side_effect=reparse):
+                with self.assertRaises(StageError):
+                    self.manager._validate(stage)
+
+    def test_validate_refuses_stage_symlink(self):
+        stage = self.stage()
+        real_lstat = os.lstat
+        for linked in (stage.path, stage.path / ".git"):
+            def symlink_info(path, *args, **kwargs):
+                info = real_lstat(path, *args, **kwargs)
+                if Path(path) == linked:
+                    from types import SimpleNamespace
+                    return SimpleNamespace(st_mode=stat.S_IFLNK | 0o777,
+                                           st_file_attributes=0)
+                return info
+
+            with self.subTest(linked=linked), patch.object(
+                    self.manager, "_git", side_effect=AssertionError("git during validate")):
+                with patch("jarvis.write_stage.os.lstat", side_effect=symlink_info):
+                    with self.assertRaises(StageError):
+                        self.manager._validate(stage)
+
     def test_new_repo_has_empty_baseline(self):
         self.assertEqual(self.manager._git(self.repo, "ls-tree", "HEAD"), b"")
         with self.assertRaises(StageError):
@@ -41,9 +138,10 @@ class StageTests(unittest.TestCase):
         self.assertEqual(stage.branch, "jarvis/run1/slice1")
         self.manager.assert_apply_ready(stage)
         self.assertEqual(self.manager.diff(stage), b"")
-        self.manager.cleanup(stage)
-        self.assertFalse(stage.path.exists())
-        self.assertEqual(self.manager._git(self.repo, "rev-parse", stage.branch).decode().strip(), stage.base)
+        with self.assertRaises(StageError):
+            self.manager.cleanup(stage)
+        self.assertTrue(stage.path.exists())
+        self.assertEqual(self.manager._git(stage.path, "rev-parse", stage.branch).decode().strip(), stage.base)
 
     def test_diff_includes_index_working_tree_and_commits(self):
         stage = self.stage()
@@ -91,9 +189,11 @@ class StageTests(unittest.TestCase):
         with self.assertRaises(StageError):
             self.manager.cleanup(stage)
         self.assertEqual(self.manager._git(stage.path, "rev-parse", "HEAD").decode().strip(), sha)
+        self.publish(stage)
         self.manager._git(self.repo, "merge", "--ff-only", stage.branch)
-        self.manager.cleanup(stage)
-        self.assertFalse(stage.path.exists())
+        with self.assertRaises(StageError):
+            self.manager.cleanup(stage)
+        self.assertTrue(stage.path.exists())
 
     def test_hidden_index_refuses_cleanup(self):
         (self.repo / "file.txt").write_text("base")
@@ -110,8 +210,9 @@ class StageTests(unittest.TestCase):
         stage = self.stage()
         (stage.path / "__pycache__").mkdir()
         (stage.path / "__pycache__" / "x.pyc").write_bytes(b"\0")
-        self.manager.cleanup(stage)
-        self.assertFalse(stage.path.exists())
+        with self.assertRaises(StageError):
+            self.manager.cleanup(stage)
+        self.assertTrue(stage.path.exists())
 
     def test_ignored_target_files_allow_apply(self):
         (self.repo / ".gitignore").write_text("build/\n")
@@ -153,7 +254,8 @@ class StageTests(unittest.TestCase):
     def test_planted_post_checkout_hook_does_not_run(self):
         marker = self.home / "hook-ran"
         hook = self.repo / ".git" / "hooks" / "post-checkout"
-        hook.write_text(f'#!/bin/sh\necho ran > "{marker.as_posix()}"\n', newline="\n")
+        hook.write_text(f"#!{Path(sys.executable).as_posix()}\nfrom pathlib import Path\n"
+                        f"Path({str(marker)!r}).write_text('ran')\n", encoding="utf-8", newline="\n")
         hook.chmod(0o755)
         self.stage()
         self.assertFalse(marker.exists())
@@ -161,7 +263,10 @@ class StageTests(unittest.TestCase):
                          if pair[1] != "core.hooksPath=" for arg in pair)
         with patch("jarvis.write_stage.GIT_PIN", unpinned):
             self.manager.create(self.repo, "run1", "control")
-        self.assertTrue(marker.exists(), "control: the hook runs without the pin")
+        self.assertFalse(marker.exists(), "independent stages never inherit target hooks")
+        with patch("jarvis.write_stage.GIT_PIN", unpinned):
+            self.manager._git(self.repo, "checkout", "HEAD")
+        self.assertTrue(marker.exists(), "control: target checkout runs its hook")
 
     def test_git_error_carries_capped_stderr_tail(self):
         failed = subprocess.CompletedProcess([], 1, b"", b"\xff" + b"x" * 1000 + b"END")
@@ -196,7 +301,8 @@ class StageTests(unittest.TestCase):
         self.assertIn("core.hooksPath=", GIT_PIN)
         with patch("jarvis.write_stage.subprocess.run", wraps=__import__("subprocess").run) as run:
             stage = self.stage()
-            self.manager.cleanup(stage)
+            with self.assertRaises(StageError):
+                self.manager.cleanup(stage)
         for call in run.call_args_list:
             argv = call.args[0]
             self.assertIn("core.hooksPath=", argv)
@@ -207,9 +313,18 @@ class StageTests(unittest.TestCase):
     def rev(self, ref):
         return self.manager._git(self.repo, "rev-parse", ref).decode().strip()
 
+    def publish(self, stage):
+        # The legacy apply API still expects target-local objects and a slice ref.
+        # Verified worker import belongs to the subsequent redesign slices.
+        sha = self.manager._git(stage.path, "rev-parse", "HEAD").decode().strip()
+        self.manager._seed(stage.path, self.repo, sha)
+        self.manager._git(self.repo, "update-ref", f"refs/heads/{stage.branch}", sha)
+
     def change(self, stage, name):
         (stage.path / name).write_text(name + "\n")
-        return self.commit(stage.path)
+        sha = self.commit(stage.path)
+        self.publish(stage)
+        return sha
 
     def test_apply_creates_checkpoint_and_undo_restores_exact_tree(self):
         stage = self.stage()
