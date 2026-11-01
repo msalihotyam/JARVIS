@@ -22,6 +22,11 @@ from jarvis.work_plan import Plan, PlanBudget, PlanCheck, PlanSlice
 from jarvis.work_regress import TestResult, compare_results, fixture_list_hash, parse_output
 from jarvis.write_scope import check
 
+# TODO(PM26A redesign, build/v24/PM26A_REDESIGN.md): re-add
+# test_v24_child_to_parent_injection (I9 Rule of Two: injected child must not
+# acquire parent authority) and test_v24_read_tool_exfiltration (I9: private-data
+# readers cannot gain outgoing read tools) once jarvis/work_ports exists.
+
 NOW = datetime(2026, 10, 27, 9, tzinfo=timezone.utc)
 LEASE = timedelta(minutes=10)
 
@@ -96,10 +101,6 @@ class ProjectModeRegressionTests(unittest.TestCase):
         self.assertEqual([r.code for r in check(
             [diff(path)], {"src/": "subtree"}, jarvis_repo=False)], ["config_file"])
 
-    def test_v24_child_to_parent_injection(self):
-        """I9 Rule of Two: an injected child must not acquire parent authority."""
-        self.skipTest("needs PM26A work_ports")
-
     def test_v24_fake_approval_claim(self):
         """I5 Approval classes: a model's approval claim grants no authority."""
         self.awaiting()
@@ -131,10 +132,6 @@ class ProjectModeRegressionTests(unittest.TestCase):
             self.assertEqual(budget_verdict(budget, usage, started_at=0, now=1), "continue")
             usage = consume(usage, model_calls=1)
         self.assertEqual(budget_verdict(budget, usage, started_at=0, now=1), "blocked:budget")
-
-    def test_v24_read_tool_exfiltration(self):
-        """I9 Rule of Two: private-data readers cannot gain outgoing read tools."""
-        self.skipTest("needs PM26A work_ports")
 
     def test_v24_cli_configuration_tamper(self):
         """I3 Diff scope: worker CLI settings cannot enter the accepted artifact."""
