@@ -219,8 +219,22 @@ READER_SYSTEM = (
     "blocked (the lane stopped on a blocker it reported); stalled (no or incomplete report, "
     "no progress); needs_orchestrator (the orchestrator should act: re-dispatch, small fix, "
     "unclear report); needs_salih (only a human decision or action can unblock it: approval, "
-    "credentials, scope or risk decision). summary: Turkish, one short sentence, at most "
-    "100 characters. next: the single next step, at most 100 characters. Both non-empty.")
+    "credentials, scope or risk decision). summary: one short sentence, at most 100 characters. "
+    "next: the single next step, at most 100 characters. Both non-empty. Write BOTH summary AND "
+    "next in Turkish, in the Latin script only: never Korean, Chinese, Japanese, Russian or Arabic.")
+# Hangul, CJK (ideographs, kana, bopomofo, symbols, full/halfwidth forms), Cyrillic, Arabic:
+# a reading in one of these is invalid (one came back in Korean on 2026-11-01). Lone surrogates
+# too: they cannot be encoded, so one in a reading would break every later status.json write.
+# U+FEFF (BOM) sits next to Arabic presentation forms but is not a script: left out.
+READER_FOREIGN_RE = re.compile(
+    "[ᄀ-ᇿ⺀-⿿　-䶿一-鿿ꥠ-꥿가-퟿"
+    "豈-﫿︰-﹏＀-￯\U0001aff0-\U0001b16f\U0001f200-\U0001f2ff"
+    "\U00020000-\U0003ffff"
+    "Ѐ-ԯᲀ-᲏ᴫᵸⷠ-ⷿꙀ-ꚟ︮︯"
+    "\U0001e030-\U0001e08f"
+    "؀-ۿݐ-ݿࡰ-ࣿﭐ-﷿ﹰ-﻾"
+    "\U00010e60-\U00010e7f\U00010ec0-\U00010eff\U0001ee00-\U0001eeff"
+    "\ud800-\udfff]")
 PUSH_RETRY_S = 600  # a blocked approval is re-checked at most once per 10 min
 APPROVAL_RE = re.compile(r"push-([0-9a-f]{7,40})(?:-([A-Za-z0-9._-]+))?")
 REQUIRED_WORKFLOWS = ("tests",)  # .github/workflows/tests.yml (runs on ci/** pushes)
@@ -612,14 +626,14 @@ def single_object(text):
         text = fences[0]
     try:  # strict=False: a raw newline inside a string is still the model's answer
         return json.loads(text, strict=False)  # bare JSON: a list or string is not wrapped prose
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: absurdly deep nesting
         pass
     dec, objs, i = json.JSONDecoder(strict=False), [], 0
     while (i := text.find("{", i)) >= 0:
         try:
             obj, i = dec.raw_decode(text, i)
             objs.append(obj)
-        except ValueError:
+        except (ValueError, RecursionError):
             i += 1
     return objs[0] if len(objs) == 1 else None
 
@@ -635,12 +649,17 @@ def reply_text(resp):
 def parse_reading(resp):
     """Strict {kind, summary, next} from a Messages API response, else None. A summary or
     next over 140 characters is clipped, not rejected: Haiku cannot count Turkish
-    characters exactly, and every 'reader: invalid output' of 2026-10-09 came from that."""
+    characters exactly, and every 'reader: invalid output' of 2026-10-09 came from that.
+    A foreign script anywhere in either field (checked before the clip) is invalid, and so
+    is a field with no letter or digit (zero-width or control characters only)."""
     text = reply_text(resp)
     r = single_object(text) if text is not None else None
-    if not isinstance(r, dict) or set(r) != {"kind", "summary", "next"} or r["kind"] not in READER_KINDS:
+    if not isinstance(r, dict) or set(r) != {"kind", "summary", "next"}:
         return None
-    if not all(isinstance(r[k], str) and r[k].strip() for k in ("summary", "next")):
+    if not isinstance(r["kind"], str) or r["kind"] not in READER_KINDS:
+        return None
+    if not all(isinstance(r[k], str) and any(c.isalnum() for c in r[k])
+               and not READER_FOREIGN_RE.search(r[k]) for k in ("summary", "next")):
         return None
     return {**r, **{k: r[k] if len(r[k]) <= 140 else r[k][:139] + "…" for k in ("summary", "next")}}
 
@@ -1254,28 +1273,23 @@ class Conveyor:
                 self.event("reader_error", lane=name, status="budget")
                 return
             # no assistant prefill (Haiku 5.5 rejects it with 400): JSON only by instruction
-            body = {"model": READER_MODEL, "max_tokens": 300,
+            body = {"model": READER_MODEL, "max_tokens": 1024,
                     "output_config": {"effort": READER_EFFORT}, "system": READER_SYSTEM,
                     "messages": [{"role": "user", "content": clip(text or STUCK_NOTE)}]}
-            status, resp = self.post(key, body)
-            if status != 200 or not isinstance(resp, dict):
-                err = resp.get("error") if isinstance(resp, dict) else None
-                extra = {}
-                if isinstance(err, dict):  # only the API's own error fields, never request/headers/key
-                    extra = {"error_type": str(err.get("type"))[:60],
-                             "error_message": str(err.get("message")).replace(key, "")[:200]}
-                self.event("reader_error", lane=name,
-                           status=status if isinstance(status, int) else str(status)[:40], **extra)
+            resp = self.reader_call(name, key, body)
+            if resp is None:
                 return
-            use = resp.get("usage") if isinstance(resp.get("usage"), dict) else {}
-            tin, tout = (int(use.get(k) or 0) for k in ("input_tokens", "output_tokens"))
-            usd = round(tin * READER_USD_PER_TOKEN[0] + tout * READER_USD_PER_TOKEN[1], 6)
-            led = self.root / "build" / "ledger"
-            led.mkdir(parents=True, exist_ok=True)
-            with open(led / "api.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps({"ts": iso(self.now()), "model": READER_MODEL, "lane": name,
-                                    "input_tokens": tin, "output_tokens": tout, "est_usd": usd}) + "\n")
             r = parse_reading(resp)
+            # one retry on invalid or empty output, unless the first call reached the cap;
+            # a failed retry keeps the first reply as the invalid output to record
+            if r is None and self.api_spent(month) < READER_MONTHLY_USD:
+                try:
+                    again = self.reader_call(name, key, body)
+                except Exception as e:
+                    self.event("reader_error", lane=name, status=type(e).__name__)
+                    again = None
+                if again is not None:
+                    resp, r = again, parse_reading(again)
             extra = {}
             if r is None:  # why: a redacted snippet of what the model said, and why it stopped
                 r = {"kind": "needs_orchestrator", "summary": "reader: invalid output", "next": ""}
@@ -1285,6 +1299,31 @@ class Conveyor:
             self.event("reader", lane=name, reading=r, **extra)
         except Exception as e:  # advisory: the conveyor goes on
             self.event("reader_error", lane=name, status=type(e).__name__)
+
+    def reader_call(self, name, key, body):
+        """One Messages API call. The reply dict with its cost on the ledger, or None after a
+        reader_error event. Every answered call is a ledger row: the monthly cap counts retries."""
+        status, resp = self.post(key, body)
+        if status != 200 or not isinstance(resp, dict):
+            err = resp.get("error") if isinstance(resp, dict) else None
+            extra = {}
+            if isinstance(err, dict):  # only the API's own error fields, never request/headers/key
+                extra = {"error_type": str(err.get("type"))[:60],
+                         "error_message": str(err.get("message")).replace(key, "")[:200]}
+            self.event("reader_error", lane=name,
+                       status=status if isinstance(status, int) else str(status)[:40], **extra)
+            return None
+        use = resp.get("usage") if isinstance(resp.get("usage"), dict) else {}
+        # odd usage counts as 0, never negative or raising: the call still gets its ledger row
+        tin, tout = (int(v) if isinstance(v := use.get(k), (int, float)) and 0 < v < 1e12 else 0
+                     for k in ("input_tokens", "output_tokens"))
+        usd = round(tin * READER_USD_PER_TOKEN[0] + tout * READER_USD_PER_TOKEN[1], 6)
+        led = self.root / "build" / "ledger"
+        led.mkdir(parents=True, exist_ok=True)
+        with open(led / "api.jsonl", "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": iso(self.now()), "model": READER_MODEL, "lane": name,
+                                "input_tokens": tin, "output_tokens": tout, "est_usd": usd}) + "\n")
+        return resp
 
     def codex_commit(self, name, ln, report):
         """Commit a PASS codex lane's worktree outside its sandbox: only the slice's granted
@@ -1755,7 +1794,7 @@ class Conveyor:
             text = note + "\n\n" + text
         cwd = a.get("cwd") if a.get("cwd") and Path(a["cwd"]).is_dir() else str(self.root)
         resume = ["--bg", "--resume", sid, "--name", name, "--model", ln["model"], "--effort",
-                  ln["effort"], "--settings", str(self.root / SETTINGS), text]
+                  ln["effort"], "--settings", str(self.root / SETTINGS), "--strict-mcp-config", text]
         for args, opt in ((["stop", ln["id"]], {}), (resume, {"cwd": cwd})):
             try:
                 rc, out = self.run(args, **opt)
@@ -1883,7 +1922,7 @@ class Conveyor:
             return None
         try:
             rc, out = self.run(["--bg", "--name", name, "--model", model,
-                                "--effort", effort, "--settings", SETTINGS, text])
+                                "--effort", effort, "--settings", SETTINGS, "--strict-mcp-config", text])
         except Exception as e:  # e.g. a timeout: like a failed start, nothing recorded
             self.error(f"dispatch {name}: {type(e).__name__}")
             return None

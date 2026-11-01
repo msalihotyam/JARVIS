@@ -208,9 +208,10 @@ class Base(unittest.TestCase):
 
     def fake_post(self, key, body):
         self.posts.append(body)
-        if isinstance(self.reply, Exception):
-            raise self.reply
-        return self.reply
+        reply = self.reply.pop(0) if isinstance(self.reply, list) else self.reply  # list: one per call
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
 
     def tearDown(self):
         self.tmp.cleanup()
@@ -375,9 +376,10 @@ class TestInbox(Base):
         self.drop("a.md", HDR.format("A") + "do things")
         self.c.pass_once()
         (call,) = self.fake.bg_calls()
-        self.assertEqual(call[:9], ["--bg", "--name", "A", "--model", "opus", "--effort", "high",
-                                    "--settings", conveyor.SETTINGS])
-        self.assertEqual(call[9], HDR.format("A") + "do things")
+        self.assertEqual(call[:10], ["--bg", "--name", "A", "--model", "opus", "--effort", "high",
+                                     "--settings", conveyor.SETTINGS, "--strict-mcp-config"])
+        self.assertEqual(call[10], HDR.format("A") + "do things")
+        self.assertEqual((call.count("--strict-mcp-config"), call.count("--settings")), (1, 1))
         self.assertEqual(list((self.base / "inbox").glob("*.md")), [])
         self.assertEqual(len(list((self.base / "inbox" / "started").glob("*-A.md"))), 1)
         self.assertEqual([e["event"] for e in self.events()], ["dispatch"])
@@ -539,7 +541,7 @@ class TestBacklog(Base):
         self.assertEqual(self.fake.bg_names(), ["A", "C"])
         call = self.fake.bg_calls()[0]
         self.assertEqual(call[4], "sonnet")
-        self.assertEqual(call[9], "@jarvis lane=A model=sonnet effort=medium base=main\nTASK A\nbody\n")
+        self.assertEqual(call[10], "@jarvis lane=A model=sonnet effort=medium base=main\nTASK A\nbody\n")
         self.assertEqual(self.view()["B"], "waiting_deps")
         self.report("A", "PASS")
         self.c.pass_once()
@@ -552,7 +554,7 @@ class TestBacklog(Base):
         (self.base / "prompts" / "A.md").write_text(
             "@jarvis lane=X model=haiku effort=low base=abc1234\nTASK\n", encoding="utf-8")
         self.c.pass_once()
-        self.assertEqual(self.fake.bg_calls()[0][9], "@jarvis lane=A model=opus effort=high base=abc1234\nTASK\n")
+        self.assertEqual(self.fake.bg_calls()[0][10], "@jarvis lane=A model=opus effort=high base=abc1234\nTASK\n")
 
     def test_failed_dependency_is_not_done(self):
         self.backlog({"id": "A"}, {"id": "B", "depends_on": ["A"]})
@@ -896,7 +898,7 @@ class TestRedispatch(Base):
         self.t += 2
         self.c.pass_once()
         self.assertEqual(self.fake.bg_names(), ["A", "A"])
-        text = self.fake.bg_calls()[1][9]
+        text = self.fake.bg_calls()[1][10]
         self.assertTrue(text.startswith(HDR.format("A") + conveyor.CONTINUE))
         self.assertTrue(text.endswith("do things\n"))
         ln = self.lanes()["A"]
@@ -1127,7 +1129,10 @@ class TestBlockedLane(Base):
         note = conveyor.fact_note(self.git, self.c.worktree_of(self.a), "1234567", "A")  # CTXRESUME
         self.assertEqual(self.resumes(), [[
             "--bg", "--resume", sid, "--name", "A", "--model", "opus", "--effort", "high",
-            "--settings", str(self.root / conveyor.SETTINGS), note + "\n\n" + conveyor.NUDGE]])
+            "--settings", str(self.root / conveyor.SETTINGS), "--strict-mcp-config",
+            note + "\n\n" + conveyor.NUDGE]])
+        self.assertEqual((self.resumes()[0].count("--strict-mcp-config"), self.resumes()[0].count("--settings")),
+                         (1, 1))
         self.assertTrue(note.startswith(conveyor.FACT_HEAD + "\nbranch: unknown (branch: rc 1)\n"))
         stop = self.fake.calls.index(["stop", self.a["id"]])
         self.assertLess(stop, self.fake.calls.index(self.resumes()[0]))  # stopped first
@@ -2419,7 +2424,7 @@ class TestReader(Base):
         rep = self.finish_a()
         (body,) = self.posts
         self.assertEqual((body["model"], body["max_tokens"], body["output_config"]),
-                         ("claude-haiku-5-5", 300, {"effort": "low"}))
+                         ("claude-haiku-5-5", 1024, {"effort": "low"}))
         self.assertNotIn("temperature", body)
         self.assertEqual(body["system"], conveyor.READER_SYSTEM)
         self.assertEqual(body["messages"], [{"role": "user", "content": rep.read_text(encoding="utf-8")}])
@@ -2496,6 +2501,122 @@ class TestReader(Base):
         r = conveyor.parse_reading(answer(shapes["long summary"])[1])
         self.assertEqual(r["summary"], long_tr[:139] + "…")
         self.assertEqual(r["kind"], "needs_orchestrator")
+
+    GOOD = {"kind": "pass", "summary": "testler yeşil", "next": "entegre et"}
+
+    def ledger_rows(self):
+        text = (self.root / "build" / "ledger" / "api.jsonl").read_text(encoding="utf-8")
+        return [json.loads(x) for x in text.splitlines()]
+
+    def test_korean_summary_retried_once_then_turkish_accepted(self):
+        self.reply = [answer({**self.GOOD, "summary": "테스트 통과"}), answer(self.GOOD)]
+        self.finish_a()
+        self.assertEqual(len(self.posts), 2)
+        self.assertEqual(self.posts[0], self.posts[1])  # the same request
+        (e,) = [e for e in self.events() if e["event"] == "reader"]
+        self.assertEqual(e["reading"], self.GOOD)
+        self.assertNotIn("raw", e)
+        self.assertEqual(len(self.ledger_rows()), 2)
+
+    def test_foreign_script_is_invalid_in_either_field(self):
+        for script in ("한", "ᄒ", "ㅎ", "ﾡ", "㉠", "漢", "か", "カ", "ㄅ", "。", "Ａ", "𠀀",
+                       "я", "ѐ", "Ԁ", "ع", "ﺍ", "ݐ", "س"):
+            for field in ("summary", "next"):
+                obj = {**self.GOOD, field: "tamam " + script}
+                self.assertIsNone(conveyor.parse_reading(answer(obj)[1]), (script, field))
+
+    def test_homoglyph_escaped_and_past_clip_foreign_are_invalid(self):
+        for obj in ({**self.GOOD, "summary": "testlеr"},  # one Cyrillic e
+                    {**self.GOOD, "next": "x" * 200 + "한"}):  # beyond the 140-char clip
+            self.assertIsNone(conveyor.parse_reading(answer(obj)[1]))
+        raw = '{"kind": "pass", "summary": "\\ud55c", "next": "n"}'  # JSON escape of Hangul
+        self.assertIsNone(conveyor.parse_reading(answer(raw)[1]))
+
+    def test_turkish_latin_text_is_valid(self):
+        obj = {**self.GOOD, "summary": "çğıİöşü ÇĞÖŞÜ → 12 test… (A-1)", "next": "entegre et"}
+        self.assertEqual(conveyor.parse_reading(answer(obj)[1]), obj)
+
+    def test_rare_script_blocks_are_invalid(self):
+        for script in ("\U00010ec0", "\U0001e030", "ᴫ", "ᵸ", "︮", "\U0001aff0",
+                       "⿰", "\U0001f200"):
+            obj = {**self.GOOD, "summary": "tamam " + script}
+            self.assertIsNone(conveyor.parse_reading(answer(obj)[1]), ascii(script))
+
+    def test_leading_bom_is_not_a_foreign_script(self):
+        obj = {**self.GOOD, "summary": "﻿Tamam"}
+        self.assertEqual(conveyor.parse_reading(answer(obj)[1]), obj)
+
+    def test_lone_surrogate_and_invisible_only_fields_are_invalid(self):
+        for field in ("\\ud83d", "tamam \\ud83d", "\\u200b", "\\u0000", "  ", "..."):
+            raw = '{"kind": "pass", "summary": "' + field + '", "next": "n"}'
+            self.assertIsNone(conveyor.parse_reading(answer(raw)[1]), field)
+
+    def test_deep_nesting_retried_then_recorded_invalid(self):
+        for deep in ("[" * 100000, '{"a":' * 100000):
+            self.assertIsNone(conveyor.parse_reading(answer(deep)[1]))
+        self.reply = [answer("[" * 100000), answer("[" * 100000)]
+        self.finish_a()
+        self.assertEqual(len(self.posts), 2)
+        (e,) = [e for e in self.events() if e["event"] == "reader"]
+        self.assertEqual(e["reading"]["summary"], "reader: invalid output")
+
+    def test_odd_usage_still_writes_a_ledger_row_never_negative(self):
+        odd = ("abc", -5, float("inf"), float("nan"), [1], None)
+        for v in odd:
+            self.reply = (200, {**answer(self.GOOD)[1], "usage": {"input_tokens": v, "output_tokens": v}})
+            self.assertIsNotNone(self.c.reader_call("A", KEY, {}), repr(v))
+        self.assertEqual([r["est_usd"] for r in self.ledger_rows()], [0] * len(odd))
+
+    def test_empty_max_tokens_twice_records_invalid_after_two_calls(self):
+        empty = (200, {**answer("")[1], "stop_reason": "max_tokens"})
+        self.reply = [empty, empty]
+        self.finish_a()
+        self.assertEqual(len(self.posts), 2)
+        (e,) = [e for e in self.events() if e["event"] == "reader"]
+        self.assertEqual(e["reading"]["summary"], "reader: invalid output")
+        self.assertEqual((e["stop_reason"], e["raw"]), ("max_tokens", ""))
+        self.assertEqual(self.lane_a()["reading"]["kind"], "needs_orchestrator")
+        self.assertEqual(len(self.ledger_rows()), 2)
+
+    def test_truncated_json_retried_and_no_content_retried(self):
+        cut = (200, {**answer('{"kind": "pass", "summ')[1], "stop_reason": "max_tokens"})
+        self.reply = [cut, (200, {"content": [], "usage": {}})]
+        self.finish_a()
+        self.assertEqual(len(self.posts), 2)
+        (e,) = [e for e in self.events() if e["event"] == "reader"]
+        self.assertEqual(e["reading"]["summary"], "reader: invalid output")
+
+    def test_valid_reading_makes_one_call(self):
+        self.finish_a()
+        self.assertEqual((len(self.posts), len(self.ledger_rows())), (1, 1))
+
+    def test_cap_counts_both_calls(self):
+        tin, tout = 1000, 50
+        bad = answer("", tin, tout)
+        self.reply = [bad, bad]
+        self.finish_a()
+        one = round(tin * conveyor.READER_USD_PER_TOKEN[0] + tout * conveyor.READER_USD_PER_TOKEN[1], 6)
+        self.assertEqual([r["est_usd"] for r in self.ledger_rows()], [one, one])
+        self.assertAlmostEqual(self.c.api_spent(conveyor.iso(self.t)[:7]), 2 * one)
+
+    def test_no_retry_when_first_call_reaches_cap(self):
+        price = conveyor.READER_USD_PER_TOKEN[0]
+        self.reply = [answer("", round(conveyor.READER_MONTHLY_USD / price) + 1, 0), answer(self.GOOD)]
+        self.finish_a()
+        self.assertEqual(len(self.posts), 1)
+        (e,) = [e for e in self.events() if e["event"] == "reader"]
+        self.assertEqual(e["reading"]["summary"], "reader: invalid output")
+
+    def test_failed_retry_records_first_invalid_output(self):
+        for second, status in (((500, None), 500), (OSError("net"), "OSError")):
+            with self.subTest(status=status):
+                self.posts.clear()
+                self.reply = [answer("not json"), second]
+                self.c.read_report("A", ln := {}, "rapor")
+                self.assertEqual(len(self.posts), 2)
+                self.assertEqual(ln["reading"]["summary"], "reader: invalid output")
+                self.assertEqual(self.events()[-1]["raw"], "not json")
+                self.assertEqual(self.events()[-2]["status"], status)
 
     def test_invalid_output_logs_redacted_snippet(self):
         raw = ('{"kind": "pass", "summary": "s", "next": "n"} ' * 2 + KEY + " sk-ant-api03-OTHER_key-x "
@@ -2656,7 +2777,7 @@ class TestReader(Base):
             self.report(n, "BLOCKED")
             self.t += 700
             self.c.pass_once()
-        self.assertEqual(len(self.posts), 4)
+        self.assertEqual(len(self.posts), 5)  # A, B (401), C (raises), D garbage + its one retry
         for body in self.posts:
             self.assertNotIn(KEY, json.dumps(body))
         files = self.all_files_text()
