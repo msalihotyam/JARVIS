@@ -4,13 +4,17 @@ import os
 import shutil
 import struct
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
+import zlib
 from pathlib import Path
 from unittest.mock import patch
 
-from jarvis.stage_git import ALLOWED, StageGitError, _check, _extract_tar, export_commit, run, tree_of
+from jarvis.stage_git import (
+    ALLOWED, StageGitError, _check, _extract_tar, _pipe, export_commit, import_commit, run, tree_of,
+)
 
 FILES = {
     ".gitattributes": b"*.txt export-subst ident\n*.dat text eol=crlf\nskip.txt export-ignore\n",
@@ -318,6 +322,257 @@ class StageGitTests(unittest.TestCase):
                 _extract_tar(buffer.getvalue(), dest)
         self.assertEqual(sorted(os.listdir(self.home)), ["hooks", "repo", "x"])
         self.assertFalse(self.marker.exists())
+
+
+class ImportCommitTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory(dir=os.environ["TEMP"])
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name).resolve()
+        self.stage = self.home / "stage"
+        self.own = self.home / "own"
+        self.stage.mkdir()
+        self.own.mkdir()
+        self.git(self.stage, "init", "-q")
+        self.write("a.txt", b"a\n")
+        self.write("protected.txt", b"p\n")
+        self.git(self.stage, "add", "-A")
+        self.git(self.stage, "commit", "-q", "-m", "base")
+        self.base = self.rev("HEAD")
+        self.base_tree = self.rev("HEAD^{tree}")
+        self.git(self.own, "init", "-q")
+        self.git(self.own, "config", "gc.auto", "0")
+        pack = self.git(self.stage, "pack-objects", "--revs", "--stdout", "-q", input=f"{self.base}\n".encode())
+        self.git(self.own, "index-pack", "--stdin", input=pack)
+        self.git(self.own, "update-ref", "refs/jarvis/base", self.base)
+        self.write("a.txt", b"changed\n")
+        self.write("protected.txt", b"EVIL\n")
+        self.git(self.stage, "commit", "-qam", "work")
+        self.tip = self.rev("HEAD")
+        self.tip_tree = self.rev("HEAD^{tree}")
+
+    def git(self, repo, *args, input=None):
+        env = {key: value for key, value in os.environ.items() if not key.startswith("GIT_")}
+        env.update(GIT_CONFIG_NOSYSTEM="1", GIT_CONFIG_GLOBAL=os.devnull, GIT_AUTHOR_NAME="t",
+                   GIT_AUTHOR_EMAIL="t@t", GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t")
+        return subprocess.run([shutil.which("git"), "-C", str(repo), *args], input=input, env=env,
+                              capture_output=True, check=True).stdout
+
+    def rev(self, name):
+        return self.git(self.stage, "rev-parse", name).decode().strip()
+
+    def write(self, name, data):
+        (self.stage / name).write_bytes(data)
+
+    def blob(self, data):
+        return self.git(self.stage, "hash-object", "-w", "--stdin", input=data).decode().strip()
+
+    def loose(self, oid, repo=None):
+        return (repo or self.stage) / ".git" / "objects" / oid[:2] / oid[2:]
+
+    def present(self, oid):
+        return subprocess.run(
+            [shutil.which("git"), "-C", str(self.own), "cat-file", "-e", oid], capture_output=True,
+        ).returncode == 0
+
+    def forge(self, oid, kind, body):
+        """The stage's loose file for ``oid`` now holds other bytes: the worker can write them."""
+        path = self.loose(oid)
+        path.parent.mkdir(exist_ok=True)
+        if path.exists():
+            path.chmod(0o644)
+        path.write_bytes(zlib.compress(f"{kind} {len(body)}\0".encode() + body))
+
+    def commit_body(self, tree, message, *parents):
+        lines = [f"tree {tree}", *(f"parent {parent}" for parent in parents),
+                 "author a <a@a> 1 +0000", "committer a <a@a> 1 +0000", "", message, ""]
+        return "\n".join(lines).encode()
+
+    def refused(self, pattern, commit=None, **kwargs):
+        commit = commit or self.tip
+        with self.assertRaisesRegex(StageGitError, pattern):
+            import_commit(self.stage, self.own, commit, self.base, **kwargs)
+        self.assertFalse(self.present(commit))
+
+    def test_clean_commit_is_accepted_and_no_git_touches_the_stage(self):
+        popen = subprocess.Popen
+        calls = []
+
+        def spy(argv, *args, **kwargs):
+            calls.append((argv, kwargs.get("cwd")))
+            return popen(argv, *args, **kwargs)
+
+        with patch("subprocess.Popen", side_effect=spy):
+            import_commit(self.stage, self.own, self.tip, self.base)
+        self.assertEqual(self.git(self.own, "diff-tree", "-r", "--name-status", self.base, self.tip),
+                         b"M\ta.txt\nM\tprotected.txt\n")
+        self.assertEqual(self.git(self.own, "for-each-ref", "--format=%(refname)"), b"refs/jarvis/base\n")
+        self.assertEqual(len([argv for argv, _ in calls if "pack-objects" in argv]), 1)
+        stage = str(self.stage).casefold()
+        for argv, cwd in calls:
+            self.assertNotIn(stage, " ".join(argv).casefold())
+            self.assertNotIn(stage, str(cwd).casefold())
+
+    def test_forged_blob_is_refused(self):
+        self.forge(self.blob(b"changed\n"), "blob", b"something else\n")
+        self.refused("did not receive expected object")
+
+    def test_forged_tip_tree_is_refused(self):
+        self.loose(self.tip_tree).chmod(0o644)
+        self.loose(self.tip_tree).write_bytes(self.loose(self.base_tree).read_bytes())
+        self.refused("did not receive expected object")
+
+    def test_forged_commit_passes_index_pack_and_is_still_refused(self):
+        self.forge(self.tip, "commit", self.commit_body(self.tip_tree, "forged", self.base))
+        self.refused("^git cat-file exited")
+
+    def test_claimed_tag_is_refused(self):
+        self.git(self.stage, "tag", "-a", "-m", "x", "t1", self.tip)
+        self.git(self.stage, "tag", "-a", "-m", "y", "t2", "t1")
+        for tag in ("t1", "t2"):
+            with self.subTest(tag), self.assertRaisesRegex(StageGitError, "not a commit"):
+                import_commit(self.stage, self.own, self.rev(tag), self.base)
+
+    def test_oversized_config_is_refused_before_reading_it(self):
+        os.truncate(self.stage / ".git" / "config", 1024 * 1024 + 1)
+        self.refused("too large")
+        with self.assertRaisesRegex(StageGitError, "too large"):
+            run(self.stage, "rev-parse", "HEAD")
+
+    def test_commit_already_in_own_repository_with_missing_objects_is_refused(self):
+        planted = self.commit_body("1" * 40, "planted", self.base)
+        oid = self.git(self.own, "hash-object", "-w", "--literally", "-t", "commit", "--stdin",
+                       input=planted).decode().strip()
+        self.forge(oid, "commit", self.commit_body(self.base_tree, "other", self.base))
+        with self.assertRaisesRegex(StageGitError, "^git rev-list exited"):
+            import_commit(self.stage, self.own, oid, self.base)
+
+    def test_commit_not_on_base_is_refused(self):
+        orphan = self.git(self.stage, "commit-tree", self.tip_tree, "-m", "orphan").decode().strip()
+        with self.assertRaisesRegex(StageGitError, "^git merge-base exited 1"):
+            import_commit(self.stage, self.own, orphan, self.base)
+
+    def test_forged_base_tree_cannot_hide_a_change(self):
+        evil = self.blob(b"EVIL\n")
+        forged_tree = self.git(
+            self.stage, "mktree",
+            input=(f"100644 blob {self.blob(b'a' + bytes([10]))}\ta.txt\n"
+                   f"100644 blob {evil}\tprotected.txt\n").encode(),
+        ).decode().strip()
+        self.loose(self.base_tree).chmod(0o644)
+        self.loose(self.base_tree).write_bytes(self.loose(forged_tree).read_bytes())
+        # Control: Git in the stage itself now reports only a.txt, so the forgery works.
+        self.assertEqual(self.git(self.stage, "-c", "core.commitGraph=false", "diff-tree", "-r", "--name-status",
+                                  self.base, self.tip), b"M\ta.txt\n")
+        self.refused("did not receive expected object")
+
+    def test_planted_commands_do_not_fire_and_their_controls_do(self):
+        markers = {name: self.home / name for name in ("hook", "fsmonitor", "filter", "planted")}
+        command = {name: f"echo x >> '{path.as_posix()}'" for name, path in markers.items()}
+        git_dir = self.stage / ".git"
+        hook = git_dir / "hooks" / "pre-commit"
+        hook.parent.mkdir(exist_ok=True)
+        hook.write_bytes(f"#!/bin/sh\n{command['hook']}\n".encode())
+        hook.chmod(0o755)
+        with open(git_dir / "config", "a", encoding="ascii") as config:
+            config.write(f"[core]\n\tfsmonitor = \"{command['fsmonitor']}\"\n"
+                         f"\tpackedGitLimit = 1\n\tsshCommand = \"{command['planted']}\"\n"
+                         f"\tgitProxy = \"{command['planted']}\"\n"
+                         f"[filter \"evil\"]\n\tclean = \"{command['filter']}; cat\"\n"
+                         f"\tsmudge = \"{command['filter']}; cat\"\n\trequired = true\n"
+                         f"[pack]\n\twindow = 0\n")
+        (git_dir / "info").mkdir(exist_ok=True)
+        (git_dir / "info" / "attributes").write_bytes(b"* filter=evil\n")
+        import_commit(self.stage, self.own, self.tip, self.base)
+        self.assertTrue(self.present(self.tip))
+        self.assertEqual([name for name, path in markers.items() if path.exists()], [])
+        # Controls: ordinary Git in the stage does run each of them.
+        self.git(self.stage, "status")
+        self.assertTrue(markers["fsmonitor"].exists())
+        self.write("new.txt", b"n\n")
+        self.git(self.stage, "add", "new.txt")
+        self.assertTrue(markers["filter"].exists())
+        self.git(self.stage, "commit", "-qm", "control")
+        self.assertTrue(markers["hook"].exists())
+
+    def test_size_cap_refuses_the_pack(self):
+        self.refused("exceeds maximum allowed size", max_bytes=64)
+
+    def test_alternates_in_the_stage_are_refused(self):
+        (self.stage / ".git" / "objects" / "info" / "alternates").write_bytes(b"C:/elsewhere\n")
+        self.refused("redirects")
+
+    def test_dot_git_entry_is_refused_by_strict(self):
+        entry = self.git(self.stage, "mktree", "--missing", input=(
+            f"040000 tree {self.base_tree}\t.git\n").encode()).decode().strip()
+        commit = self.git(self.stage, "commit-tree", entry, "-p", self.base, "-m", "dotgit").decode().strip()
+        self.refused("fsck error", commit)
+
+    def test_object_format_comes_from_own_repository(self):
+        sha256 = self.home / "sha256"
+        sha256.mkdir()
+        self.git(sha256, "init", "-q", "--object-format=sha256")
+        (sha256 / "a.txt").write_bytes(b"a\n")
+        self.git(sha256, "add", "-A")
+        self.git(sha256, "commit", "-q", "-m", "work")
+        long_tip = self.git(sha256, "rev-parse", "HEAD").decode().strip()
+        self.assertEqual(len(long_tip), 64)
+        with self.assertRaisesRegex(StageGitError, "object format mismatch"):
+            import_commit(sha256, self.own, long_tip, self.base)
+        with self.assertRaisesRegex(StageGitError, "object format mismatch"):
+            import_commit(self.stage, self.own, long_tip, long_tip)
+        # A short claim is read through a sha1 view whatever the stage says it is.
+        with self.assertRaisesRegex(StageGitError, "^git pack-objects exited"):
+            import_commit(sha256, self.own, self.tip, self.base)
+
+    def test_stage_config_cannot_choose_the_object_format(self):
+        with open(self.stage / ".git" / "config", "a", encoding="ascii") as config:
+            config.write("[core]\n\trepositoryformatversion = 1\n[extensions]\n\tobjectformat = sha256\n")
+        import_commit(self.stage, self.own, self.tip, self.base)
+        self.assertTrue(self.present(self.tip))
+
+    def test_only_full_object_ids_and_a_positive_cap_reach_git(self):
+        with patch("subprocess.Popen", side_effect=AssertionError("spawned")):
+            for bad in ("main", "HEAD", "--all", self.tip[:12], self.tip.upper(), self.tip + "\n", None):
+                with self.subTest(bad=bad), self.assertRaises(ValueError):
+                    import_commit(self.stage, self.own, bad, self.base)
+                with self.subTest(base=bad), self.assertRaises(ValueError):
+                    import_commit(self.stage, self.own, self.tip, bad)
+            for cap in (0, -1, True, 1.5, "64"):
+                with self.subTest(cap=cap), self.assertRaises(ValueError):
+                    import_commit(self.stage, self.own, self.tip, self.base, max_bytes=cap)
+
+    def test_other_pack_and_index_forms_are_refused(self):
+        for args in (("pack-objects", "--revs", "--stdout"), ("pack-objects", "--all", "--stdout", "-q"),
+                     ("pack-objects", "--revs", "--stdout", "-q", "base"),
+                     ("index-pack", "--strict", "--stdin"),
+                     ("index-pack", "--strict", "--max-input-size=0", "--stdin"),
+                     ("index-pack", "--strict", "--max-input-size=64", "--fix-thin"),
+                     ("index-pack", "--strict", "--max-input-size=64", "--stdin", "--keep"),
+                     ("index-pack", "--max-input-size=64", "--max-input-size=64", "--stdin")):
+            with self.subTest(args=args), self.assertRaises(ValueError):
+                _check(args)
+
+    def test_timeout_kills_both_sides(self):
+        hang = [sys.executable, "-I", "-c", "import time; time.sleep(600)"]
+        drain = [sys.executable, "-I", "-c", "import sys; sys.stdin.buffer.read()"]
+        for producer, consumer in ((hang, drain), (drain, hang), (hang, hang)):
+            popen = subprocess.Popen
+            started = []
+
+            def spy(argv, *args, **kwargs):
+                started.append(popen(argv, *args, **kwargs))
+                return started[-1]
+
+            scratch = self.home / f"scratch{len(producer)}"
+            shutil.rmtree(scratch, ignore_errors=True)
+            scratch.mkdir()
+            with patch("subprocess.Popen", side_effect=spy), \
+                    self.assertRaisesRegex(StageGitError, "TimeoutExpired"):
+                _pipe(producer, consumer, b"", dict(os.environ), scratch, 0.5)
+            self.assertEqual(len(started), 2)
+            self.assertTrue(all(process.poll() is not None for process in started))
+            shutil.rmtree(scratch, ignore_errors=True)
 
 
 if __name__ == "__main__":

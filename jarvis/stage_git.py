@@ -13,6 +13,15 @@ redirect Git elsewhere (gitfile, commondir, alternates, a multi-pack-index,
 config includes, links or junctions). The worker is assumed dead by then: the
 check is not race-free against a live writer. Anything else is refused before a
 process exists.
+
+``import_commit`` is how a worker's commit enters JARVIS's own repository once
+the worker has started: no Git has the stage as repository, cwd or GIT_DIR.
+``pack-objects`` runs in a view that reaches the stage's objects through one
+alternates line and is an untrusted byte source; ``index-pack --strict`` in
+JARVIS's repository computes every id itself. The object format comes from
+JARVIS's repository, never the stage, and the tip is only a claim until the
+checks after the pipe pass. Only Git subprocesses are bounded by a timeout: the
+``_git_dir`` walk and the Python archive extraction are not.
 """
 
 from __future__ import annotations
@@ -24,6 +33,7 @@ import stat
 import subprocess
 import tarfile
 import tempfile
+import time
 import unicodedata
 from pathlib import Path
 
@@ -33,6 +43,7 @@ from jarvis.trusted_exec import (
 
 ALLOWED = frozenset({
     "rev-parse", "cat-file", "ls-tree", "diff-tree", "update-ref", "for-each-ref", "archive",
+    "pack-objects", "index-pack", "rev-list", "merge-base",
 })
 # Long options that run a command, read or write a file, switch repositories or convert
 # content. Git accepts any unique prefix (--ext means --ext-diff), so a prefix of one of
@@ -47,6 +58,8 @@ _PINS = (
     "-c", "help.format=man", "-c", "help.autocorrect=0",
     # A multi-pack-index names its packs by path, "../" included: never read one (CDXINT128).
     "-c", "core.multiPackIndex=false",
+    # Both are stage-writable answers to "what is reachable", read through alternates: walk the objects.
+    "-c", "core.commitGraph=false", "-c", "pack.useBitmaps=false",
     "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false", "-c", "diff.external=",
     "-c", "diff.submodule=short", "-c", "core.useReplaceRefs=false", "-c", "core.autocrlf=false",
     "-c", "protocol.allow=never", "-c", "maintenance.auto=false", "-c", "gc.auto=0",
@@ -66,6 +79,13 @@ _GPG = ("gpg.program", "gpg.openpgp.program", "gpg.x509.program", "gpg.ssh.progr
 # info/attributes beats the archived tree's .gitattributes: bytes leave exactly as committed.
 _VIEW_ATTRIBUTES = b"* -filter -text -eol -ident -export-subst -export-ignore -working-tree-encoding\n"
 _OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+_OID_LENGTH = {"sha1": 40, "sha256": 64}
+_PACK_OBJECTS = ("pack-objects", "--revs", "--stdout", "-q")
+# ponytail: one cap on the stored pack, not on what it expands to: a 16 KiB delta bomb under a
+# 1 MiB cap measured ~2 GiB of index-pack memory, bounded only by the timeout. Job Object memory
+# limit if that ever bites; per-task budgets if a real worker commit ever nears the cap.
+_MAX_PACK = 256 * 1024 * 1024
+_MAX_CONFIG = 1024 * 1024
 _RESERVED = frozenset({
     "CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
     *(f"{port}{n}" for port in ("COM", "LPT") for n in (*"123456789", "¹", "²", "³")),
@@ -106,6 +126,13 @@ def _check(args: tuple) -> None:
                     break
     if args[0] == "archive" and (len(args) != 3 or args[1] != "--format=tar" or not _OID.fullmatch(args[2])):
         raise ValueError("archive takes exactly --format=tar and one object id")
+    if args[0] == "pack-objects" and args != _PACK_OBJECTS:
+        raise ValueError("pack-objects takes exactly the import form")
+    # --max-input-size=0 means no limit.
+    if args[0] == "index-pack" and (
+            len(args) != 4 or args[1] != "--strict" or args[3] != "--stdin"
+            or not re.fullmatch(r"--max-input-size=[1-9][0-9]*", args[2])):
+        raise ValueError("index-pack takes exactly the import form")
 
 
 def _linked(info: os.stat_result) -> bool:
@@ -138,7 +165,12 @@ def _git_dir(repo: Path) -> Path:
         if pack.is_dir() and any(name.casefold().startswith("multi-pack-index") for name in os.listdir(pack)):
             raise StageGitError("repository has a multi-pack-index")
         for name in ("config", "config.worktree"):
-            data = (git_dir / name).read_bytes() if (git_dir / name).is_file() else b""
+            data = b""
+            if (git_dir / name).is_file():
+                with (git_dir / name).open("rb") as handle:
+                    data = handle.read(_MAX_CONFIG + 1)
+            if len(data) > _MAX_CONFIG:
+                raise StageGitError("repository configuration is too large")
             if _INCLUDE.search(data):
                 raise StageGitError("repository configuration includes another file")
             if _REFSTORAGE.search(data):
@@ -148,8 +180,8 @@ def _git_dir(repo: Path) -> Path:
     return git_dir
 
 
-def _spawn(git, repo: Path, scratch: Path, location: tuple, args: tuple,
-           input: bytes | None, timeout: float) -> bytes:
+def _launch(scratch: Path) -> tuple[dict, tuple]:
+    """The environment and command-line pins every Git process starts with."""
     empty, absent = scratch / "empty", scratch / "absent"
     env = trusted_environment(forced={
         "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": str(empty), "GIT_ATTR_NOSYSTEM": "1",
@@ -161,6 +193,12 @@ def _spawn(git, repo: Path, scratch: Path, location: tuple, args: tuple,
             "-c", f"core.excludesFile={empty}", "-c", f"diff.orderFile={empty}",
             "-c", f"mailmap.file={absent}",
             *(item for key in _GPG for item in ("-c", f"{key}={absent}")), *_PINS)
+    return env, pins
+
+
+def _spawn(git, repo: Path, scratch: Path, location: tuple, args: tuple,
+           input: bytes | None, timeout: float) -> bytes:
+    env, pins = _launch(scratch)
     forced = ("--no-ext-diff", "--no-textconv") if args[0] == "diff-tree" else ()
     try:
         result = subprocess.run(
@@ -176,11 +214,9 @@ def _spawn(git, repo: Path, scratch: Path, location: tuple, args: tuple,
     return result.stdout
 
 
-def _view(git, repo: Path, git_dir: Path, location: tuple, scratch: Path, timeout: float) -> Path:
-    """A bare repository of JARVIS's own that borrows ``repo``'s objects via alternates."""
-    form = _spawn(git, repo, scratch, location, ("rev-parse", "--show-object-format"), None,
-                  timeout).decode("ascii", "replace").strip()
-    if form not in ("sha1", "sha256") or not (git_dir / "objects").is_dir():
+def _view(git_dir: Path, form: str, scratch: Path) -> Path:
+    """A bare ``form`` repository of JARVIS's own that borrows ``git_dir``'s objects via alternates."""
+    if form not in _OID_LENGTH or not (git_dir / "objects").is_dir():
         raise StageGitError("repository object store not found")
     view = scratch / "view"
     for directory in ("objects/info", "refs", "info"):
@@ -214,8 +250,92 @@ def run(repo: str | os.PathLike, *args: str, input: bytes | None = None, timeout
         (scratch / "empty").write_bytes(b"")
         location = (f"--git-dir={git_dir}", f"--work-tree={repo}")
         if args[0] == "archive":
-            location = (f"--git-dir={_view(git, repo, git_dir, location, scratch, timeout)}",)
+            form = _spawn(git, repo, scratch, location, ("rev-parse", "--show-object-format"), None,
+                          timeout).decode("ascii", "replace").strip()
+            location = (f"--git-dir={_view(git_dir, form, scratch)}",)
         return _spawn(git, repo, scratch, location, args, input, timeout)
+
+
+def _pipe(producer: list, consumer: list, revs: bytes, env: dict, scratch: Path, timeout: float) -> None:
+    """``producer < revs | consumer`` without a shell; the timeout kills both, any failure raises."""
+    (scratch / "revs").write_bytes(revs)
+    errors = scratch / "producer.err", scratch / "consumer.err"
+    common = {"env": env, "shell": False, "cwd": scratch, "creationflags": NO_CONSOLE_WINDOW}
+    started = []
+    try:
+        with open(scratch / "revs", "rb") as stdin, open(errors[0], "wb") as out, open(errors[1], "wb") as err:
+            started.append(subprocess.Popen(producer, stdin=stdin, stdout=subprocess.PIPE, stderr=out, **common))
+            started.append(subprocess.Popen(consumer, stdin=started[0].stdout, stdout=subprocess.DEVNULL,
+                                            stderr=err, **common))
+            # Only the consumer holds the read end now: if it dies the producer gets a broken pipe.
+            started[0].stdout.close()
+            deadline = time.monotonic() + timeout
+            for process in started:
+                process.wait(max(0, deadline - time.monotonic()))
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise StageGitError(f"git import failed: {type(exc).__name__}") from exc
+    finally:
+        for process in started:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+        if started:
+            started[0].stdout.close()
+    failures = [
+        f"git {name} exited {process.returncode}: "
+        + error.read_bytes().decode("utf-8", "replace").strip()[-500:]
+        for name, process, error in zip(("pack-objects", "index-pack"), started, errors)
+        if process.returncode
+    ]
+    if failures:
+        raise StageGitError("; ".join(failures))
+
+
+def import_commit(stage: str | os.PathLike, jarvis: str | os.PathLike, commit: str, base: str, *,
+                  max_bytes: int = _MAX_PACK, timeout: float = 120) -> None:
+    """Copy ``commit`` and what ``base`` lacks from a dead worker's ``stage`` into ``jarvis``.
+
+    ``base`` must already be in ``jarvis``. Raises ValueError before spawning for anything
+    but full object ids and a positive int cap, StageGitError for every refused import. A
+    refused import can leave an unreferenced pack behind; an accepted one sets no ref.
+    """
+    if not all(isinstance(oid, str) and _OID.fullmatch(oid) for oid in (commit, base)):
+        raise ValueError("commit and base must be full object ids")
+    if type(max_bytes) is not int:
+        raise ValueError("max_bytes must be an int")
+    consumer = ("index-pack", "--strict", f"--max-input-size={max_bytes}", "--stdin")
+    _check(_PACK_OBJECTS)
+    _check(consumer)
+    stage, jarvis = Path(stage).absolute(), Path(jarvis).absolute()
+    stage_dir, jarvis_dir = _git_dir(stage), _git_dir(jarvis)
+    form = run(jarvis, "rev-parse", "--show-object-format", timeout=timeout).decode("ascii", "replace").strip()
+    if {len(commit), len(base)} != {_OID_LENGTH.get(form)}:
+        raise StageGitError(f"object format mismatch: JARVIS's repository is {form}")
+    workspace = (stage, jarvis)
+    git = resolve_trusted_executable("git", workspace=workspace)
+    if git is None:
+        raise StageGitError("trusted git is unavailable")
+    # A killed producer can outlive its handle on the temp files for a moment.
+    with tempfile.TemporaryDirectory(prefix="jarvis-git-", ignore_cleanup_errors=True) as name:
+        scratch = Path(name)
+        (scratch / "hooks").mkdir()
+        (scratch / "empty").write_bytes(b"")
+        view = _view(stage_dir, form, scratch)
+        env, pins = _launch(scratch)
+        try:
+            argv0 = git.argv0(workspace=workspace)
+        except TrustedExecutableError as exc:
+            raise StageGitError(f"git import failed: {type(exc).__name__}") from exc
+        _pipe([argv0, "--no-pager", *pins, f"--git-dir={view}", *_PACK_OBJECTS],
+              [argv0, "--no-pager", *pins, f"--git-dir={jarvis_dir}", *consumer],
+              f"{commit}\n^{base}\n".encode(), env, scratch, timeout)
+    # index-pack accepts a pack without the claimed tip, and a forged object can stop it from
+    # checking the rest: only these three say the claimed commit arrived whole on top of base.
+    # -t, not -e with ^{commit}: that peels, so it would pass a claimed tag.
+    if run(jarvis, "cat-file", "-t", commit, timeout=timeout).strip() != b"commit":
+        raise StageGitError("claimed object is not a commit")
+    run(jarvis, "rev-list", "--objects", "--quiet", commit, f"^{base}", timeout=timeout)
+    run(jarvis, "merge-base", "--is-ancestor", base, commit, timeout=timeout)
 
 
 def tree_of(repo: str | os.PathLike, commit: str, *, timeout: float = 30) -> str:
