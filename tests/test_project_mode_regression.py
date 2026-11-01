@@ -33,7 +33,7 @@ def diff(path):
 
 class ProjectModeRegressionTests(unittest.TestCase):
     def setUp(self):
-        temp = tempfile.TemporaryDirectory(dir=Path(__file__).resolve().parents[1] / ".codex-tmp")
+        temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)
         self.root = Path(temp.name)
         self.memory = SQLiteMemoryStore(self.root / "regression.sqlite")
@@ -62,24 +62,23 @@ class ProjectModeRegressionTests(unittest.TestCase):
             expires_at=NOW + timedelta(days=1),
         )
 
-    def policy_resume(self):
+    def refused_resume(self, code, *, granted, gate_open):
         self.approved()
         self.core.recover_project_runs("new", now=NOW + timedelta(minutes=1))
         before = self.memory.work_events("r")
-        self.core.execution_gate = lambda: False
+        self.core.execution_gate = lambda: gate_open
         result = self.core.resume_project_run(
             "r", boot_id="new", now=NOW + timedelta(minutes=2),
-            granted_targets=frozenset({"src/"}), lease=LEASE, usage=Usage(),
+            granted_targets=frozenset(granted), lease=LEASE, usage=Usage(),
             large_budget=Budget(10, 7200, 50),
         )
         self.assertIsInstance(result, ResumeRefused)
-        self.assertEqual(result.code, "policy")
+        self.assertEqual(result.code, code)
         self.assertIs(self.memory.latest_work_run("r").state, RunState.INTERRUPTED)
         self.assertEqual(self.memory.work_events("r"), before)
 
-    def changed_plan(self):
+    def changed_plan(self, other):
         self.approved()
-        other = replace(self.plan, goal="a different goal")
         self.assertNotEqual(other.plan_hash, self.plan.plan_hash)
         run = self.memory.latest_work_run("r")
         self.memory.append_work_run(
@@ -114,12 +113,15 @@ class ProjectModeRegressionTests(unittest.TestCase):
         self.assertIs(self.memory.latest_work_run("r").state, RunState.AWAITING_APPROVAL)
 
     def test_v24_plan_change_after_approval(self):
-        """I4 Envelope: an old approval cannot authorize a changed child plan."""
-        self.changed_plan()
+        """I4 Envelope: an old approval cannot authorize a changed target and step."""
+        self.changed_plan(replace(
+            self.plan, targets=("src/b.py",),
+            slices=(PlanSlice("s1", "repair source", ("src/b.py",), ("c1",)),),
+        ))
 
     def test_v24_resume_after_policy_change(self):
-        """I11 Crash safety: explicit resume revalidates current Core policy."""
-        self.policy_resume()
+        """I11 Crash safety: explicit resume revalidates the currently granted scope."""
+        self.refused_resume("scope_narrowed", granted={"other/"}, gate_open=True)
 
     def test_v24_loop_trigger(self):
         """I10 Budgets and watchdog: repeated model calls exhaust the global cap."""
@@ -186,11 +188,11 @@ class ProjectModeRegressionTests(unittest.TestCase):
 
     def test_writer_plan_change_after_approval(self):
         """I4 Envelope: changing the writer goal invalidates the approved hash."""
-        self.changed_plan()
+        self.changed_plan(replace(self.plan, goal="a different goal"))
 
     def test_writer_resume_after_policy_change(self):
         """I11 Crash safety: a policy freeze prevents restarting a writer run."""
-        self.policy_resume()
+        self.refused_resume("policy", granted={"src/"}, gate_open=False)
 
     def test_config_file_in_diff(self):
         """I3 Diff scope: agent instructions remain forbidden inside a granted subtree."""
