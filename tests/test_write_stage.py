@@ -1,5 +1,6 @@
 """Offline staging tests: every repository lives beneath TEMP."""
 
+import itertools
 import os
 import subprocess
 import stat
@@ -21,6 +22,62 @@ class StageTests(unittest.TestCase):
         self.home = Path(self.tmp.name).resolve()
         self.manager = StageManager(self.home / "stages")
         self.repo = self.manager.create_repo(self.home / "project")
+        self.clock = itertools.count(1_000_000_000, 1000)
+
+    def dirty(self, file):
+        # A new mtime makes the index entry stat-dirty, so status must re-read
+        # the file and would run its clean filter.
+        moment = next(self.clock)
+        os.utime(file, (moment, moment))
+
+    def plain(self, repo, *args):
+        """Ordinary Git without the manager's pins: the firing control."""
+        return subprocess.run(
+            [self.manager.git.argv0(workspace=(repo,)), "-C", str(repo), *args],
+            env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
+            capture_output=True, check=True).stdout
+
+    def plant(self, repo, name="planted", kinds=("filter", "diff")):
+        """Commit a driver probe, then configure the driver; return its marker."""
+        marker = self.home / f"{repo.name}-ran"
+        attributes = " ".join(f"{kind}={name}" for kind in kinds)
+        (repo / ".gitattributes").write_text(f"*.txt {attributes}\n", encoding="utf-8")
+        # A native executable with no shell syntax: as a filter it executes
+        # base.txt from stdin, as a textconv it executes the file it is given.
+        (repo / "base.txt").write_text(
+            "from pathlib import Path\n" + f"Path({str(marker)!r}).write_text('ran')\n"
+            + "print('filtered')\n", encoding="utf-8")
+        # Committed before the driver exists, so unfiltered content equals the
+        # blob and a pinned status stays clean.
+        self.commit(repo)
+        command = Path(sys.executable).as_posix()
+        if "filter" in kinds:
+            self.plain(repo, "config", f"filter.{name}.clean", command)
+            self.plain(repo, "config", f"filter.{name}.smudge", command)
+        if "diff" in kinds:
+            self.plain(repo, "config", f"diff.{name}.textconv", command)
+        return marker
+
+    def control_fires(self, repo, marker, *args):
+        self.dirty(repo / "base.txt")
+        self.plain(repo, *(args or ("status", "--porcelain")))
+        self.assertTrue(marker.exists(), "control: the probe must fire without the guard")
+        marker.unlink()
+
+    def tracked_repo(self, name):
+        repo = self.manager.create_repo(self.home / name)
+        (repo / "base.txt").write_text("base\n")
+        self.commit(repo)
+        return repo
+
+    def poison(self, repo, data):
+        with open(repo / ".git" / "config", "ab") as config:
+            config.write(data)
+
+    def argvs(self, call):
+        with patch("jarvis.write_stage.subprocess.run", wraps=subprocess.run) as run:
+            call()
+        return [item.args[0] for item in run.call_args_list]
 
     def stage(self):
         return self.manager.create(self.repo, "run1", "slice1")
@@ -269,37 +326,212 @@ class StageTests(unittest.TestCase):
             self.manager.diff(stage, max_bytes=1)
 
     def test_target_filter_never_fires_in_manager_calls(self):
-        marker = self.home / "filter-ran"
-        # A native executable with no shell syntax: the control executes the
-        # Python source supplied on stdin as base.txt, then emits filtered data.
-        command = Path(sys.executable).as_posix()
-        self.manager._git(self.repo, "config", "filter.planted.clean", command)
-        self.manager._git(self.repo, "config", "filter.planted.smudge", command)
-        self.manager._git(self.repo, "config", "diff.planted.textconv", command)
-        (self.repo / ".gitattributes").write_text("*.txt filter=planted diff=planted\n")
-        (self.repo / "base.txt").write_text(
-            "from pathlib import Path\n" + f"Path({str(marker)!r}).write_text('ran')\n"
-            + "print('filtered')\n", encoding="utf-8")
-        # Firing control: ordinary Git add uses the planted clean filter.
-        git = [self.manager.git.argv0(workspace=(self.repo,)), "-C", str(self.repo)]
-        subprocess.run([*git, "config", "filter.planted.required", "true"],
-                       check=True, capture_output=True)
-        control = subprocess.run([*git, "add", "--all"], capture_output=True)
-        self.assertTrue(control.returncode == 0, repr(control.stderr[:80]))
-        self.assertTrue(marker.exists(), "control: clean filter must fire")
-        marker.unlink()
-        self.commit(self.repo)
-        stage = self.stage()
+        marker = self.plant(self.repo)
+        self.control_fires(self.repo, marker)
+
+        def silent(call):
+            # Every call meets a stat-dirty file, so an unpinned status would filter.
+            self.dirty(self.repo / "base.txt")
+            result = call()
+            self.assertFalse(marker.exists(), "a planted driver fired")
+            return result
+
+        stage = silent(self.stage)
         (stage.path / "new.txt").write_text("new")
         commit = self.commit(stage.path)
-        artifact = self.manager.diff(stage)
+        artifact = silent(lambda: self.manager.diff(stage))
         self.assertTrue(b"+new" in artifact, repr(artifact[:80]))
-        self.manager.assert_apply_ready(stage)
+        silent(lambda: self.manager.assert_apply_ready(stage))
         self.publish(stage)
-        self.manager.apply(stage, commit)
-        self.manager.undo(self.repo, "run1")
-        self.manager.cleanup(stage)
-        self.assertFalse(marker.exists())
+        silent(lambda: self.manager.apply(stage, commit))
+        silent(lambda: self.manager.undo(self.repo, "run1"))
+        silent(lambda: self.manager.cleanup(stage))
+        silent(lambda: self.manager._git(self.repo, "status"))
+
+    def test_equals_in_filter_driver_name_is_refused_by_every_target_call(self):
+        stage = self.stage()
+        marker = self.plant(self.repo, "a=b", kinds=("filter",))
+        self.control_fires(self.repo, marker)
+        for call in (lambda: self.manager._git(self.repo, "status"),
+                     lambda: self.manager._clean(self.repo),
+                     lambda: self.manager.assert_apply_ready(stage),
+                     lambda: self.manager.create(self.repo, "run2", "slice2"),
+                     lambda: self.manager._repository(self.repo),
+                     lambda: self.manager.undo(self.repo, "run1")):
+            self.dirty(self.repo / "base.txt")
+            with self.assertRaisesRegex(StageError, "driver name"):
+                call()
+            self.assertFalse(marker.exists(), "a planted driver fired")
+
+    def test_equals_in_textconv_driver_name_is_refused(self):
+        marker = self.plant(self.repo, "a=b", kinds=("diff",))
+        with open(self.repo / "base.txt", "a", encoding="utf-8") as file:
+            file.write("# changed\n")
+        self.control_fires(self.repo, marker, "diff")
+        with self.assertRaisesRegex(StageError, "driver name"):
+            self.manager._git(self.repo, "diff")
+        self.assertFalse(marker.exists(), "a planted driver fired")
+
+    def test_safe_textconv_driver_is_pinned(self):
+        marker = self.plant(self.repo, kinds=("diff",))
+        with open(self.repo / "base.txt", "a", encoding="utf-8") as file:
+            file.write("# changed\n")
+        self.commit(self.repo)
+        # show, not diff: the diff.external pin already stops plain "git diff"
+        # before textconv, so only show proves the textconv pin itself.
+        self.control_fires(self.repo, marker, "show", "HEAD")
+        try:
+            self.manager._git(self.repo, "show", "HEAD")
+        except StageError:
+            pass  # An emptied textconv may fail the diff; it must not run the driver.
+        self.assertFalse(marker.exists(), "a planted driver fired")
+
+    def test_safe_diff_command_driver_is_pinned(self):
+        marker = self.plant(self.repo, kinds=("diff",))
+        self.plain(self.repo, "config", "diff.planted.command", Path(sys.executable).as_posix())
+        with open(self.repo / "base.txt", "a", encoding="utf-8") as file:
+            file.write("# changed\n")
+        self.control_fires(self.repo, marker, "diff")
+        # The empty pin fails this diff closed, like the diff.external pin.
+        try:
+            self.manager._git(self.repo, "diff")
+        except StageError:
+            pass
+        self.assertFalse(marker.exists(), "a planted driver fired")
+
+    def test_committed_gitlink_with_staged_deletion_is_refused(self):
+        outer = self.manager.create_repo(self.home / "outer")
+        self.manager.create_repo(outer / "inner")
+        self.commit(outer)
+        self.plain(outer, "rm", "--cached", "inner")
+        # Excluded, so only the staged deletion could reveal the gitlink.
+        (outer / ".git" / "info").mkdir(exist_ok=True)
+        (outer / ".git" / "info" / "exclude").write_text("inner/\n")
+        with self.assertRaisesRegex(StageError, "submodule gitlink"):
+            self.manager._clean(outer)
+
+    def test_gitlink_staged_but_never_committed_is_refused(self):
+        outer = self.manager.create_repo(self.home / "outer")
+        self.manager.create_repo(outer / "inner")
+        self.plain(outer, "add", "inner")
+        with self.assertRaisesRegex(StageError, "repository contains a submodule gitlink"):
+            self.manager._clean(outer)
+
+    def test_pins_travel_whole_through_the_environment(self):
+        self.plant(self.repo)
+        with patch("jarvis.write_stage.subprocess.run", wraps=subprocess.run) as run:
+            self.manager._git(self.repo, "rev-parse", "HEAD")
+        call = run.call_args_list[-1]
+        env = call.kwargs["env"]
+        pins = {env[f"GIT_CONFIG_KEY_{index}"]: env[f"GIT_CONFIG_VALUE_{index}"]
+                for index in range(int(env["GIT_CONFIG_COUNT"]))}
+        for key in ("filter.planted.clean", "filter.planted.smudge",
+                    "filter.planted.process", "diff.planted.textconv"):
+            self.assertEqual(pins[key], "", key)
+        self.assertEqual(pins["filter.planted.required"], "false")
+        self.assertFalse(any("planted" in item for item in call.args[0]), "pin left in argv")
+
+    def test_unusual_but_safe_driver_names_are_pinned(self):
+        for index, name in enumerate(("a.b", "MiXeD", "ünï")):
+            with self.subTest(index=index):
+                repo = self.manager.create_repo(self.home / f"names{index}")
+                marker = self.plant(repo, name, kinds=("filter",))
+                self.control_fires(repo, marker)
+                self.dirty(repo / "base.txt")
+                self.manager._git(repo, "status")
+                self.assertFalse(marker.exists(), "a planted driver fired")
+
+    def test_unsafe_names_in_config_are_refused(self):
+        for index, (data, expected) in enumerate((
+                (b'[filter "a\x01b"]\n\tclean = x\n', "driver name"),
+                (b'[filter "a\tb"]\n\tsmudge = x\n', "driver name"),
+                (b'[filter "a\x7fb"]\n\tprocess = x\n', "driver name"),
+                (b'[diff "a=b"]\n\tcommand = x\n', "driver name"),
+                (b'[filter "a\xffb"]\n\tclean = x\n', "UnicodeDecodeError"))):
+            with self.subTest(index=index):
+                repo = self.tracked_repo(f"unsafe{index}")
+                self.poison(repo, data)
+                with self.assertRaisesRegex(StageError, expected):
+                    self.manager._git(repo, "status")
+
+    def test_section_only_filter_key_names_no_driver(self):
+        repo = self.tracked_repo("section")
+        self.poison(repo, b"[filter]\n\tclean = x\n")
+        self.manager._git(repo, "status")
+
+    def test_unsafe_names_only_in_attributes_are_refused(self):
+        for name, path, line in (
+                ("plain", ".gitattributes", b"*.txt filter=a=b\n"),
+                ("macro", ".gitattributes", b"[attr]evil filter=a=b\n*.txt evil\n"),
+                ("nested", "sub/.gitattributes", b"*.txt filter=a=b\n"),
+                ("info", ".git/info/attributes", b"base.txt filter=a=b\n"),
+                ("textconv", ".gitattributes", b"*.txt diff=a=b\n"),
+                ("control", ".gitattributes", b"*.txt filter=a\x01b\n")):
+            with self.subTest(name=name):
+                repo = self.tracked_repo(f"attr-{name}")
+                (repo / "sub").mkdir()
+                (repo / "sub" / "file.txt").write_text("file\n")
+                (repo / path).parent.mkdir(exist_ok=True)
+                (repo / path).write_bytes(line)
+                self.commit(repo)
+                with self.assertRaisesRegex(StageError, "driver name"):
+                    self.manager._clean(repo)
+
+    def test_submodule_gitlink_is_refused_before_its_driver_can_run(self):
+        for index, rel in enumerate(("inner", "sub/inner")):
+            with self.subTest(rel=rel):
+                outer = self.manager.create_repo(self.home / f"outer{index}")
+                stage = self.manager.create(outer, f"run{index}", "slice1")
+                (outer / rel).parent.mkdir(exist_ok=True)
+                inner = self.manager.create_repo(outer / rel)
+                marker = self.plant(inner)
+                self.commit(outer)
+                self.control_fires(inner, marker)
+                self.dirty(inner / "base.txt")
+                self.plain(outer, "status", "--porcelain", "--ignore-submodules=none")
+                self.assertTrue(marker.exists(), "control: status must descend and fire")
+                marker.unlink()
+                for call in (lambda: self.manager._clean(outer),
+                             lambda: self.manager.assert_apply_ready(stage)):
+                    self.dirty(inner / "base.txt")
+                    with self.assertRaisesRegex(StageError, "submodule"):
+                        call()
+                    self.assertFalse(marker.exists(), "a submodule driver fired")
+
+    def test_gitlink_is_read_before_status_and_status_ignores_submodules(self):
+        calls = self.argvs(lambda: self.manager._clean(self.repo))
+        listed = next(i for i, argv in enumerate(calls) if "ls-files" in argv)
+        status = next(i for i, argv in enumerate(calls) if "status" in argv)
+        self.assertLess(listed, status)
+        self.assertIn("-s", calls[listed])
+        self.assertIn("--ignore-submodules=all", calls[status])
+
+    def test_subdirectory_of_target_is_preflighted_and_refused(self):
+        sub = self.repo / "sub"
+        sub.mkdir()
+        with self.assertRaisesRegex(StageError, "repository root"):
+            self.manager._clean(sub)
+        marker = self.plant(self.repo, "a=b", kinds=("filter",))
+        self.control_fires(self.repo, marker)
+        for call in (lambda: self.manager._git(sub, "status"),
+                     lambda: self.manager._clean(sub)):
+            self.dirty(self.repo / "base.txt")
+            with self.assertRaisesRegex(StageError, "driver name"):
+                call()
+            self.assertFalse(marker.exists(), "a planted driver fired")
+
+    def test_git_environment_failure_is_a_stage_error(self):
+        with patch("jarvis.write_stage.subprocess.run", side_effect=OSError("gone")):
+            with self.assertRaisesRegex(StageError, "OSError"):
+                self.manager._git(self.repo, "status")
+
+    def test_delete_wraps_os_and_recursion_errors(self):
+        doomed = self.home / "doomed"
+        doomed.mkdir()
+        for error in (PermissionError, RecursionError):
+            with patch("jarvis.write_stage.os.scandir", side_effect=error("stop")):
+                with self.assertRaisesRegex(StageError, error.__name__):
+                    self.manager._delete(doomed)
 
     def test_cleanup_does_not_follow_symlink_or_junction(self):
         outside = self.home / "outside"

@@ -30,6 +30,7 @@ GIT_PIN = (
     "-c", "core.multiPackIndex=false", "-c", "pack.useBitmaps=false",
     "-c", "gc.auto=0", "-c", "maintenance.auto=false",
 )
+UNSAFE_DRIVER_NAME = re.compile(r"[=\x00-\x1f\x7f-\x9f]")
 
 
 class StageError(RuntimeError):
@@ -68,8 +69,10 @@ remain separate migration steps. This is not a diff-scope or approval gate.
             "GIT_NO_LAZY_FETCH": "1",
         })
         try:
-            pins = list(GIT_PIN)
-            if (cwd / ".git").exists():
+            pins: dict[str, str] = {}
+            # Only init may run where no repository exists yet. A subdirectory
+            # of a repository has no .git of its own and still gets the preflight.
+            if args[0] != "init" or (cwd / ".git").exists():
                 # No includes are read by this query. Refuse them before the real
                 # command; pin every locally named filter and textconv driver.
                 config = subprocess.run(
@@ -85,14 +88,27 @@ remain separate migration steps. This is not a diff-scope or approval gate.
                     key = entry.split(b"\n", 1)[0].decode("utf-8", "strict")
                     if key.lower().startswith(("include.", "includeif.", "extensions.worktreeconfig")):
                         raise StageError("repository configuration includes another file")
-                    if key.lower().startswith("filter."):
-                        name = key.rsplit(".", 1)[0]
-                        pins.extend(("-c", f"{name}.clean=", "-c", f"{name}.smudge=",
-                                     "-c", f"{name}.process=", "-c", f"{name}.required=false"))
-                    if key.lower().startswith("diff.") and key.lower().endswith(".textconv"):
-                        pins.extend(("-c", f"{key}=", "-c", f"{key.rsplit('.', 1)[0]}.cachetextconv=false"))
+                    section = key.split(".", 1)[0].lower()
+                    if section not in ("filter", "diff") or key.count(".") < 2:
+                        continue  # filter.clean or diff.external names no driver.
+                    driver = key[:key.rfind(".")]
+                    self._refuse_driver_name(driver.split(".", 1)[1])
+                    if section == "filter":
+                        pins.update({f"{driver}.clean": "", f"{driver}.smudge": "",
+                                     f"{driver}.process": "", f"{driver}.required": "false"})
+                    elif key.lower().endswith(".textconv"):
+                        pins.update({key: "", f"{driver}.cachetextconv": "false"})
+                    elif key.lower().endswith(".command"):
+                        # Empty fails a diff closed, as the diff.external pin does.
+                        pins[key] = ""
+            # Git splits "-c k=v" at the first "=", so a name holding one would
+            # pin the wrong key. These variables carry each key whole.
+            env = {**env, "GIT_CONFIG_COUNT": str(len(pins))}
+            for index, (key, value) in enumerate(pins.items()):
+                env[f"GIT_CONFIG_KEY_{index}"] = key
+                env[f"GIT_CONFIG_VALUE_{index}"] = value
             result = subprocess.run(
-                [self.git.argv0(workspace=(self.root, cwd)), *pins,
+                [self.git.argv0(workspace=(self.root, cwd)), *GIT_PIN,
                  "-C", str(cwd), *args], input=input, capture_output=True,
                 timeout=self.timeout, env=env, shell=False,
                 creationflags=NO_CONSOLE_WINDOW,
@@ -103,6 +119,11 @@ remain separate migration steps. This is not a diff-scope or approval gate.
             tail = result.stderr.decode("utf-8", "replace").strip()[-80:]
             raise StageError(f"git {args[0]} exited {result.returncode}: {tail}")
         return result.stdout
+
+    @staticmethod
+    def _refuse_driver_name(name: str) -> None:
+        if UNSAFE_DRIVER_NAME.search(name):
+            raise StageError("repository names an unsafe filter or diff driver name")
 
     @staticmethod
     def _identifier(value: str) -> str:
@@ -131,8 +152,26 @@ remain separate migration steps. This is not a diff-scope or approval gate.
         """Refuse tracked or untracked changes; ignored files are tolerated."""
         if Path(path).absolute().is_relative_to(self.root):
             raise StageError("stage cleanliness is not queried after worker start")
+        # ls-files only lists below its cwd, so this must be the root.
+        path = self._repository(path)
+        # A submodule's own config is never preflighted or pinned, so any Git
+        # command that descends into one could run its drivers. Refuse first.
+        index = self._git(path, "ls-files", "-s", "-z").split(b"\0")
+        if any(entry.startswith(b"160000 ") for entry in index):
+            raise StageError("repository contains a submodule gitlink")
+        # The status below ignores submodules, so it cannot see a gitlink whose
+        # deletion is staged; that one survives only in HEAD.
+        committed = self._git(path, "ls-tree", "-r", "-z", "HEAD").split(b"\0")
+        if any(entry.startswith(b"160000 ") for entry in committed):
+            raise StageError("repository commits a submodule gitlink")
+        tracked = b"\0".join(entry.split(b"\t", 1)[1] for entry in index if entry)
+        if tracked:
+            attributes = self._git(path, "check-attr", "-z", "--stdin", "filter", "diff",
+                                   input=tracked + b"\0").split(b"\0")
+            for value in attributes[2::3]:
+                self._refuse_driver_name(value.decode("utf-8", "replace"))
         changes = self._git(path, "status", "--porcelain=v1", "--untracked-files=all",
-                            "--ignore-submodules=none").decode("utf-8", "replace").splitlines()
+                            "--ignore-submodules=all").decode("utf-8", "replace").splitlines()
         if changes:
             raise StageError(f"repository contains {len(changes)} dirty or untracked files: "
                              + "; ".join(changes)[:500])
@@ -359,6 +398,13 @@ remain separate migration steps. This is not a diff-scope or approval gate.
 
     @classmethod
     def _delete(cls, path: Path) -> None:
+        try:
+            cls._remove(path)
+        except (OSError, RecursionError) as exc:
+            raise StageError(f"stage delete failed: {type(exc).__name__}") from exc
+
+    @classmethod
+    def _remove(cls, path: Path) -> None:
         info = os.lstat(path)
         linked = stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400
         if linked:
@@ -370,7 +416,7 @@ remain separate migration steps. This is not a diff-scope or approval gate.
             with os.scandir(path) as entries:
                 children = [Path(entry.path) for entry in entries]
             for child in children:
-                cls._delete(child)
+                cls._remove(child)
             path.rmdir()
         else:
             # Git's object files can be read-only on Windows.
