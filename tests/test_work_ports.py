@@ -1,6 +1,8 @@
 """PM26A S3: the judgement ports read only the commit pinned in the JARVIS repo."""
 
+import hashlib
 import inspect
+import json
 import os
 import stat
 import tempfile
@@ -13,7 +15,7 @@ from unittest import mock
 from jarvis import stage_git, work_driver, work_ports
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.work_checks import CheckResult
-from jarvis.work_ledger import EventKind, StepState, WorkStep, step_key
+from jarvis.work_ledger import EventKind, RunState, StepState, WorkRun, WorkStep, step_key
 from jarvis.work_ports import _changes, build_ports
 from jarvis.work_regress import TestResult
 from jarvis.write_stage import StageError, StageManager
@@ -373,13 +375,14 @@ class WiringTests(Base):
         self.assertNotIn("scope_check", accept)
         self.assertIn("ports.run_checks", accept)
 
-    def test_apply_applied_and_undo_fail_closed_until_s4(self):
+    def test_apply_needs_an_intent_and_a_fresh_stage_has_no_effect(self):
         stage = self.based_stage()
-        for call in (lambda: self.ports.apply(stage, None),
-                     lambda: self.ports.applied(stage, "key"),
-                     lambda: self.ports.undo(stage, "key")):
-            with self.assertRaisesRegex(StageError, "S4"):
-                call()
+        self.commit_in(stage.path, "allowed.txt", "allowed\n")
+        self.assertEqual(self.ports.scope_check(stage), [])
+        with self.assertRaisesRegex(StageError, "no apply intent"):
+            self.ports.apply(stage, None)
+        self.assertIs(self.ports.applied(stage, "key"), False)
+        self.assertIsNone(self.ports.undo(stage, "key"))
 
     def test_ports_never_reach_git_except_through_stage_git(self):
         source = inspect.getsource(work_ports)
@@ -409,3 +412,329 @@ class WiringTests(Base):
         self.ports.append_event(EventKind.PROGRESS, self.step.key,
                                 {"gate": "apply", "passed": True, "idempotency_key": "k"})
         self.assertEqual(self.ports.apply_intent(self.step), ("k", True))
+
+
+REF = f"refs/heads/jarvis/{RUN}/main"
+OTHER = "refs/heads/other"
+
+
+def _put(path, text):
+    Path(path).write_bytes(text.encode())  # no CRLF translation: git reads these bytes
+
+
+class ApplyBase(Base):
+    def setUp(self):
+        super().setUp()
+        self.stage = self.based_stage()
+        self.commit_in(self.stage.path, "allowed.txt", "allowed\n")
+        self.assertEqual(self.ports.scope_check(self.stage), [])
+        self.B, self.C = self.stage.base, self.pinned(self.stage)
+        self.X = self.commit_in(self.repo, "z.txt", "z\n")
+        self.intent()
+
+    def intent(self, key="k"):
+        self.ports.append_event(EventKind.PROGRESS, self.step.key,
+                                {"gate": "apply_intent", "idempotency_key": key}, idempotency_key=key)
+
+    def ref(self, name=REF):
+        return self.git(self.repo, "for-each-ref", "--format=%(objectname)", name).strip() or None
+
+    def symref(self):
+        return self.git(self.repo, "for-each-ref", "--format=%(symref)", REF).strip()
+
+    def record(self, which, key="k"):
+        return f"refs/jarvis/applied/{RUN}/{hashlib.sha256(key.encode()).hexdigest()}/{which}"
+
+    def state(self, key="k"):
+        return self.ref(), self.ref(self.record("old", key)), self.ref(self.record("new", key))
+
+    def set_state(self, ref, old, new):
+        self.git(self.repo, "update-ref", REF, ref)
+        for which, oid in (("old", old), ("new", new)):
+            if oid:
+                self.git(self.repo, "update-ref", self.record(which), oid)
+            elif self.ref(self.record(which)):
+                self.git(self.repo, "update-ref", "-d", self.record(which))
+
+    def import_c(self):
+        stage_git.import_commit(self.jarvis_repo(self.stage), self.repo, self.C, self.B)
+
+    def linked(self):
+        self.git(self.repo, "worktree", "add", "--detach", str(self.home / "wt"))
+        return Path(self.repo) / ".git" / "worktrees" / "wt"
+
+    def racing(self, *commands):
+        """Run git commands after every pre-check, immediately before the transaction."""
+        real = work_ports._transact
+
+        def race(repo, *lines):
+            for command in commands:
+                self.git(self.repo, *command)
+            real(repo, *lines)
+        return mock.patch.object(work_ports, "_transact", race)
+
+
+class ApplyTests(ApplyBase):
+    def test_good_apply_moves_the_ref_and_writes_both_records(self):
+        self.assertEqual(self.state(), (self.B, None, None))
+        self.assertEqual(self.ports.apply(self.stage, None), self.C)
+        self.assertEqual(self.state(), (self.C, self.B, self.C))
+        self.assertIs(self.ports.applied(self.stage, "k"), True)
+
+    def test_ref_not_at_base_is_refused_with_no_record(self):
+        self.git(self.repo, "update-ref", REF, self.X)
+        with self.assertRaisesRegex(StageError, "re-run"):
+            self.ports.apply(self.stage, None)
+        self.assertEqual(self.state(), (self.X, None, None))
+
+    def test_stale_old_refuses_all_with_no_record(self):
+        with self.racing(("update-ref", REF, self.X)), self.assertRaises(StageError):
+            self.ports.apply(self.stage, None)
+        self.assertEqual(self.state(), (self.X, None, None))
+
+    def test_stale_new_refuses_undo_and_keeps_the_records(self):
+        self.ports.apply(self.stage, None)
+        with self.racing(("update-ref", REF, self.X)), self.assertRaises(StageError):
+            self.ports.undo(self.stage, "k")
+        self.assertEqual(self.state(), (self.X, self.B, self.C))
+
+    def test_no_deref_replaces_a_late_symref_and_leaves_its_referent(self):
+        with self.racing(("update-ref", OTHER, self.B), ("symbolic-ref", REF, OTHER)):
+            self.ports.apply(self.stage, None)
+        self.assertEqual(self.ref(OTHER), self.B)
+        self.assertEqual(self.symref(), "")
+        self.assertEqual(self.state(), (self.C, self.B, self.C))
+
+    def test_replay_is_refused(self):
+        self.ports.apply(self.stage, None)
+        with self.assertRaises(StageError):
+            self.ports.apply(self.stage, None)
+        self.assertEqual(self.state(), (self.C, self.B, self.C))
+        self.git(self.repo, "update-ref", REF, self.B)
+        with self.assertRaises(StageError):
+            self.ports.apply(self.stage, None)
+        self.assertEqual(self.state(), (self.B, self.B, self.C))
+
+    def test_undo_restores_recorded_old_and_removes_records(self):
+        self.ports.apply(self.stage, None)
+        self.ports.undo(self.stage, "k")
+        self.assertEqual(self.state(), (self.B, None, None))
+        self.assertIs(self.ports.applied(self.stage, "k"), False)
+
+    def test_undo_with_no_record_is_a_noop_only_at_base(self):
+        self.assertIsNone(self.ports.undo(self.stage, "k"))
+        self.assertEqual(self.state(), (self.B, None, None))
+        self.import_c()
+        for moved in (self.X, self.C):
+            self.git(self.repo, "update-ref", REF, moved)
+            with self.assertRaisesRegex(StageError, "not at the stage base"):
+                self.ports.undo(self.stage, "k")
+            self.assertEqual(self.state(), (moved, None, None))
+
+    def test_apply_refused_when_main_worktree_has_the_ref_checked_out(self):
+        self.git(self.repo, "symbolic-ref", "HEAD", REF)
+        with self.assertRaisesRegex(StageError, "checked out"):
+            self.ports.apply(self.stage, None)
+        self.assertEqual(self.state(), (self.B, None, None))
+
+    def test_undo_refused_when_main_worktree_has_the_ref_checked_out(self):
+        self.ports.apply(self.stage, None)
+        self.git(self.repo, "symbolic-ref", "HEAD", REF)
+        with self.assertRaisesRegex(StageError, "checked out"):
+            self.ports.undo(self.stage, "k")
+        self.assertEqual(self.state(), (self.C, self.B, self.C))
+
+    def test_linked_worktree_checkout_refuses_apply_and_undo(self):
+        wt = self.linked()
+        _put(wt / "HEAD", f"ref: {REF}\n")
+        with self.assertRaisesRegex(StageError, "checked out"):
+            self.ports.apply(self.stage, None)
+        self.assertEqual(self.state(), (self.B, None, None))
+        _put(wt / "HEAD", self.B + "\n")
+        self.ports.apply(self.stage, None)
+        _put(wt / "HEAD", f"ref: {REF}\n")
+        with self.assertRaisesRegex(StageError, "checked out"):
+            self.ports.undo(self.stage, "k")
+        self.assertEqual(self.state(), (self.C, self.B, self.C))
+
+    # Each unreadable worktree HEAD must refuse apply and undo with nothing moved.
+    def linked_refused(self, corrupt, pattern="."):
+        wt = self.linked()
+        head, gitdir = (wt / "HEAD").read_bytes(), (wt / "gitdir").read_bytes()
+        corrupt(wt)
+        with self.assertRaisesRegex(StageError, pattern):
+            self.ports.apply(self.stage, None)
+        self.assertEqual(self.state(), (self.B, None, None))
+        if (wt / "HEAD").is_dir():
+            (wt / "HEAD").rmdir()
+        (wt / "HEAD").write_bytes(head)
+        (wt / "gitdir").write_bytes(gitdir)
+        self.ports.apply(self.stage, None)
+        corrupt(wt)
+        with self.assertRaisesRegex(StageError, pattern):
+            self.ports.undo(self.stage, "k")
+        self.assertEqual(self.state(), (self.C, self.B, self.C))
+
+    def test_garbage_worktree_head_fails_closed(self):
+        self.linked_refused(lambda wt: _put(wt / "HEAD", "not a ref\n"))
+
+    def test_directory_worktree_head_fails_closed(self):
+        def corrupt(wt):
+            (wt / "HEAD").unlink()
+            (wt / "HEAD").mkdir()
+        self.linked_refused(corrupt)
+
+    def test_missing_worktree_head_fails_closed(self):
+        self.linked_refused(lambda wt: (wt / "HEAD").unlink())
+
+    def test_over_deep_symref_chain_fails_closed(self):
+        heads = Path(self.repo) / ".git" / "refs" / "heads"
+
+        def corrupt(wt):
+            for link in range(8):
+                _put(heads / f"c{link}", f"ref: refs/heads/c{link + 1}\n")
+            _put(heads / "c8", self.B + "\n")
+            _put(wt / "HEAD", "ref: refs/heads/c0\n")
+        self.linked_refused(corrupt)
+
+    def test_unborn_zero_worktree_head_fails_closed(self):
+        self.linked_refused(lambda wt: _put(wt / "HEAD", "ref: refs/heads/nowhere\n"), "unreadable")
+
+    def test_unlisted_worktree_record_fails_closed(self):
+        self.linked_refused(lambda wt: (wt / "gitdir").unlink(), "do not match|unreadable")
+
+    def test_case_variant_checked_out_name_is_refused(self):
+        self.linked_refused(lambda wt: _put(wt / "HEAD", f"ref: {REF.replace('jarvis', 'JARVIS').upper()}\n"
+                                            .replace("REFS/HEADS", "refs/heads")),
+                            "checked out|unreadable")
+
+    def test_symbolic_integration_ref_fails_closed_in_apply(self):
+        self.git(self.repo, "update-ref", OTHER, self.B)
+        self.git(self.repo, "symbolic-ref", REF, OTHER)
+        with self.assertRaisesRegex(StageError, "symbolic"):
+            self.ports.apply(self.stage, None)
+        self.assertEqual(self.symref(), OTHER)
+        self.assertEqual(self.state(), (self.B, None, None))
+
+    def test_symbolic_integration_ref_fails_closed_in_undo_and_applied(self):
+        self.ports.apply(self.stage, None)
+        self.git(self.repo, "update-ref", OTHER, self.C)
+        self.git(self.repo, "symbolic-ref", REF, OTHER)
+        for call in (self.ports.undo, self.ports.applied):
+            with self.assertRaisesRegex(StageError, "symbolic"):
+                call(self.stage, "k")
+        self.assertEqual(self.symref(), OTHER)
+        self.assertEqual(self.ref(OTHER), self.C)
+        self.assertEqual(self.state(), (self.C, self.B, self.C))
+
+    def test_dangling_symbolic_ref_fails_closed(self):
+        self.git(self.repo, "symbolic-ref", REF, "refs/heads/nowhere")
+        for call in (lambda: self.ports.apply(self.stage, None),
+                     lambda: self.ports.undo(self.stage, "k"),
+                     lambda: self.ports.applied(self.stage, "k")):
+            with self.assertRaises(StageError):
+                call()
+
+    def test_each_partial_or_mismatched_combination_raises(self):
+        self.import_c()
+        B, C, X = self.B, self.C, self.X
+        for combo in ((B, B, None), (B, None, C), (C, B, None), (C, None, C), (B, B, C),
+                      (C, None, None), (X, B, C), (C, X, C)):
+            with self.subTest(combo=[oid and oid[:6] for oid in combo]):
+                self.set_state(*combo)
+                for call in (self.ports.applied, self.ports.undo):
+                    with self.assertRaises(StageError):
+                        call(self.stage, "k")
+                self.assertEqual(self.state(), combo)
+
+    def test_c_reachable_with_no_record_is_not_applied(self):
+        self.import_c()
+        self.git(self.repo, "update-ref", OTHER, self.C)
+        self.assertIs(self.ports.applied(self.stage, "k"), False)
+
+    def test_commit_without_its_objects_in_the_target_is_refused(self):
+        # The object transfer "succeeds" but delivers only the commit: its tree is missing.
+        def commit_only(*args, **kwargs):
+            raw = self.manager._git(self.jarvis_repo(self.stage), "cat-file", "commit", self.C)
+            self.manager._git(self.repo, "hash-object", "-t", "commit", "-w", "--stdin", input=raw)
+
+        with mock.patch.object(stage_git, "_pipe", commit_only), self.assertRaises(StageError):
+            self.ports.apply(self.stage, None)
+        self.assertEqual(self.state(), (self.B, None, None))
+
+
+class ResumeTests(ApplyBase):
+    def drive(self):
+        ports = self.build()
+        ports.route, ports.worker = (lambda step: "w"), (lambda name: None)
+        ports.budget_exhausted = lambda: True
+        ports.apply = mock.Mock(side_effect=AssertionError("a resume never applies"))
+        step = WorkStep(RUN, self.step.key, 1, "one", StepState.ACCEPTING, self.clock())
+        _, steps = work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), (step,), ports)
+        return steps[0]
+
+    def gates(self, name):
+        payloads = [json.loads(e.payload_json) for e in SQLiteMemoryStore(self.db).work_events(RUN)]
+        return [p for p in payloads if p.get("gate") == name]
+
+    def assert_resume_raises(self):
+        with self.assertRaises(StageError):
+            self.drive()
+        self.assertEqual(self.gates("apply"), [])
+
+    def test_crash_before_commit_is_a_recorded_failed_attempt(self):
+        step = self.drive()
+        self.assertIsNot(step.state, StepState.ACCEPTED)
+        self.assertEqual([g["findings"] for g in self.gates("apply")], [["resume:not_applied"]])
+        self.assertEqual(self.state(), (self.B, None, None))
+
+    def test_crash_after_commit_before_receipt_verifies_without_a_second_apply(self):
+        self.ports.apply(self.stage, None)
+        step = self.drive()
+        self.assertIs(step.state, StepState.ACCEPTED)
+        self.assertEqual([g["ref"] for g in self.gates("apply")], ["verified"])
+        self.assertEqual(self.state(), (self.C, self.B, self.C))
+
+    def test_crash_with_a_partial_record_raises(self):
+        self.ports.apply(self.stage, None)
+        self.set_state(self.C, self.B, None)
+        self.assert_resume_raises()
+        self.assertEqual(self.state(), (self.C, self.B, None))
+
+    def test_torn_undo_ref_moved_records_left_raises(self):
+        self.ports.apply(self.stage, None)
+        self.set_state(self.B, self.B, self.C)
+        self.assert_resume_raises()
+        self.assertEqual(self.state(), (self.B, self.B, self.C))
+
+    def test_torn_undo_records_removed_ref_not_moved_raises(self):
+        self.ports.apply(self.stage, None)
+        self.set_state(self.C, None, None)
+        self.assert_resume_raises()
+        self.assertEqual(self.state(), (self.C, None, None))
+
+    def test_accept_path_applies_and_receipts(self):
+        findings, ok = work_driver._accept(self.step, self.stage, self.ports)
+        self.assertEqual((findings, ok), ((), True))
+        key, receipted = self.ports.apply_intent(self.step)
+        self.assertIs(receipted, True)
+        self.assertEqual(self.state(key), (self.C, self.B, self.C))
+        self.assertEqual([g["ref"] for g in self.gates("apply")], [self.C])
+
+    def test_apply_refused_for_a_moved_ref_stops_for_the_operator(self):
+        self.git(self.repo, "update-ref", REF, self.X)
+        with self.assertRaises(StageError):
+            work_driver._accept(self.step, self.stage, self.ports)
+        key, receipted = self.ports.apply_intent(self.step)
+        self.assertIs(receipted, False)
+        self.assertEqual(self.state(key), (self.X, None, None))
+        with self.assertRaises(StageError):
+            self.ports.applied(self.stage, key)
+
+    def test_apply_refused_at_base_is_a_failed_attempt(self):
+        _put(self.linked() / "HEAD", "not a ref\n")
+        findings, ok = work_driver._accept(self.step, self.stage, self.ports)
+        self.assertIs(ok, False)
+        self.assertEqual(findings[0]["detail"], "gate_error:StageError")
+        key, _ = self.ports.apply_intent(self.step)
+        self.assertEqual(self.state(key), (self.B, None, None))

@@ -43,7 +43,7 @@ from jarvis.trusted_exec import (
 
 ALLOWED = frozenset({
     "rev-parse", "cat-file", "ls-tree", "diff-tree", "update-ref", "for-each-ref", "archive",
-    "pack-objects", "index-pack", "rev-list", "merge-base",
+    "pack-objects", "index-pack", "rev-list", "merge-base", "worktree",
 })
 # Long options that run a command, read or write a file, switch repositories or convert
 # content. Git accepts any unique prefix (--ext means --ext-diff), so a prefix of one of
@@ -126,6 +126,8 @@ def _check(args: tuple) -> None:
                     break
     if args[0] == "archive" and (len(args) != 3 or args[1] != "--format=tar" or not _OID.fullmatch(args[2])):
         raise ValueError("archive takes exactly --format=tar and one object id")
+    if args[0] == "worktree" and args != ("worktree", "list", "--porcelain", "-z"):
+        raise ValueError("worktree takes exactly the read-only list form")
     if args[0] == "pack-objects" and args != _PACK_OBJECTS:
         raise ValueError("pack-objects takes exactly the import form")
     # --max-input-size=0 means no limit.

@@ -11,11 +11,15 @@ scope comes from diff-tree in the JARVIS repo; checks, regression and the
 fixture hash run on a git-free export of the pinned commit; review, evidence
 and the tree hash read the pinned commit. All git goes through stage_git.run.
 
-apply, applied and undo fail closed until S4 wires them.
+S4: apply moves the pin onto refs/heads/jarvis/<run>/main in the target in one
+atomic update-ref transaction with its record, refs/jarvis/applied/<run>/
+<sha256(key)>/{old,new}. applied reads only that record; undo restores the
+recorded old under the same expected-value transaction.
 """
 
 import hashlib
 import json
+import os
 import re
 import tempfile
 import types
@@ -98,6 +102,49 @@ def _changes(repo, base, commit):
     except (ValueError, KeyError) as exc:
         raise StageError("unparseable git diff") from exc
     return changes
+
+
+def _ref(repo, ref):
+    """The value of a plain ref, None when absent; a symbolic ref fails closed."""
+    lines = _git(repo, "for-each-ref", "--format=%(refname) %(objectname) %(symref)",
+                 ref).decode("utf-8", "replace").splitlines()
+    if not lines:
+        return None
+    fields = lines[0].split(" ")
+    if len(lines) != 1 or len(fields) != 3 or fields[0] != ref:
+        raise StageError("unexpected ref listing")
+    if fields[2]:
+        raise StageError(f"symbolic ref refused: {ref}")
+    return _oid(fields[1])
+
+
+def _refuse_checked_out(target, ref):
+    """Raise when any worktree of target has ref checked out, or may have it."""
+    # git reports a garbage, directory, missing or over-deep worktree HEAD as rc 0 with a
+    # zero HEAD, and skips an unreadable worktree record, so neither reads as "not checked out".
+    records = _git(target, "worktree", "list", "--porcelain", "-z").split(b"\0\0")
+    try:
+        linked = len(os.listdir(Path(target) / ".git" / "worktrees"))
+    except FileNotFoundError:
+        linked = 0
+    except OSError as exc:
+        raise StageError("unreadable worktree records") from exc
+    if records.pop() or len(records) != 1 + linked:
+        raise StageError("worktree records do not match git's listing")
+    for record in records:
+        attrs = record.decode("utf-8", "surrogateescape").split("\0")
+        head = next((a[5:] for a in attrs if a.startswith("HEAD ")), "")
+        branches = [a[7:] for a in attrs if a.startswith("branch ")]
+        if not _OID.fullmatch(head) or not head.strip("0") or not (branches or "detached" in attrs):
+            raise StageError("unreadable worktree HEAD")
+        # NTFS and APFS fold ref names: HEAD naming Int moves when int moves.
+        if any(branch.casefold() == ref.casefold() for branch in branches):
+            raise StageError(f"integration ref is checked out: {ref}")
+
+
+def _transact(repo, *lines):
+    body = "\n".join(("start", *lines, "prepare", "commit")) + "\n"
+    _git(repo, "update-ref", "--no-deref", "--stdin", input=body.encode())
 
 
 def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock, lease,
@@ -260,14 +307,60 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
                         for e in events() if e.step_key == step.key)
         return found, receipted
 
+    def _pending_key(stage):
+        # The newest intent of the step that owns this stage (attempts only grow).
+        history = events()
+        owners = {e.step_key for e in history
+                  if _payload(e).get("gate") == "stage" and _payload(e).get("branch") == stage.branch}
+        for event in reversed(history):
+            payload = _payload(event)
+            if event.step_key in owners and payload.get("gate") == "apply_intent":
+                return payload["idempotency_key"]
+        raise StageError("no apply intent recorded for this stage")
+
+    def _refs(stage, key):
+        run, _ = _identity(manager, stage)
+        return f"refs/heads/jarvis/{run}/main", f"refs/jarvis/applied/{run}/{_sha256(key.encode())}"
+
     def apply(stage, receipt):
-        raise StageError("S4")
+        repo, commit = _judged(stage)
+        ref, records = _refs(stage, _pending_key(stage))
+        # Early refusal only; the transaction's expected old is the authority.
+        if _ref(target, ref) != stage.base:
+            raise StageError(f"{ref} is not at the stage base; re-run")
+        _refuse_checked_out(target, ref)
+        try:
+            stage_git.import_commit(repo, target, commit, stage.base)
+        except (stage_git.StageGitError, ValueError) as exc:
+            raise StageError(str(exc)) from exc
+        _transact(target, f"update {ref} {commit} {stage.base}",
+                  f"create {records}/old {stage.base}", f"create {records}/new {commit}")
+        return commit
 
     def applied(stage, key):
-        raise StageError("S4")
+        ref, records = _refs(stage, key)
+        old, new, current = _ref(target, f"{records}/old"), _ref(target, f"{records}/new"), _ref(target, ref)
+        if old is None and new is None and current == stage.base:
+            return False
+        if old is not None and new == current and old == stage.base:
+            return True
+        raise StageError("apply record does not match the integration ref; operator decides")
 
     def undo(stage, key):
-        raise StageError("S4")
+        ref, records = _refs(stage, key)
+        old, new = _ref(target, f"{records}/old"), _ref(target, f"{records}/new")
+        if old is None and new is None:
+            if _ref(target, ref) != stage.base:
+                raise StageError(f"no apply record and {ref} is not at the stage base")
+            return
+        if old is None or new is None:
+            raise StageError("partial apply record; operator decides")
+        # --no-deref would overwrite a symbolic ref, so read it here as apply does.
+        if old != stage.base or _ref(target, ref) != new:
+            raise StageError("apply record does not match the integration ref; operator decides")
+        _refuse_checked_out(target, ref)
+        _transact(target, f"update {ref} {old} {new}",
+                  f"delete {records}/old {old}", f"delete {records}/new {new}")
 
     return types.SimpleNamespace(
         clock=clock, append_event=append_event, notify=notify, lease_claim=lease_claim,
