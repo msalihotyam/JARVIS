@@ -1,8 +1,7 @@
 """Local staging primitives; callers own leases, scope gates and integration.
 
-No app wiring, network operations, branch deletion or forced cleanup. Diffs
-include committed, indexed and working-tree changes relative to a pinned base;
-untracked files must be indexed by the worker before an artifact is extracted.
+No app wiring or network operations. Diffs contain verified committed changes
+only; worker index and working-tree edits are not part of the claimed commit.
 """
 
 from __future__ import annotations
@@ -14,6 +13,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
+from jarvis import stage_git
+
 from jarvis.trusted_exec import (
     NO_CONSOLE_WINDOW, resolve_trusted_executable, trusted_environment,
 )
@@ -23,11 +24,16 @@ GIT_PIN = (
     "-c", "diff.relative=false", "-c", "status.showUntrackedFiles=all",
     "-c", "core.fsmonitor=false", "-c", "core.untrackedCache=false",
     "-c", "core.hooksPath=", "-c", "core.quotePath=true", "-c", "core.excludesFile=",
+    "-c", "core.attributesFile=", "-c", "core.autocrlf=false",
+    "-c", "diff.external=", "-c", "diff.trustExitCode=false",
+    "-c", "core.useReplaceRefs=false", "-c", "core.commitGraph=false",
+    "-c", "core.multiPackIndex=false", "-c", "pack.useBitmaps=false",
+    "-c", "gc.auto=0", "-c", "maintenance.auto=false",
 )
 
 
 class StageError(RuntimeError):
-    """A Git failure or an unsafe stage operation (nothing is discarded)."""
+    """A Git failure or an unsafe stage operation."""
 
 
 @dataclass(frozen=True)
@@ -58,18 +64,43 @@ remain separate migration steps. This is not a diff-scope or approval gate.
             "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "JARVIS",
             "GIT_AUTHOR_EMAIL": "jarvis@localhost", "GIT_COMMITTER_NAME": "JARVIS",
             "GIT_COMMITTER_EMAIL": "jarvis@localhost",
+            "GIT_ATTR_NOSYSTEM": "1", "GIT_NO_REPLACE_OBJECTS": "1",
+            "GIT_NO_LAZY_FETCH": "1",
         })
         try:
+            pins = list(GIT_PIN)
+            if (cwd / ".git").exists():
+                # No includes are read by this query. Refuse them before the real
+                # command; pin every locally named filter and textconv driver.
+                config = subprocess.run(
+                    [self.git.argv0(workspace=(self.root, cwd)), *GIT_PIN,
+                     "-C", str(cwd), "config", "--local", "--no-includes", "--null", "--list"],
+                    input=None, capture_output=True, timeout=self.timeout, env=env, shell=False,
+                    creationflags=NO_CONSOLE_WINDOW,
+                )
+                if config.returncode:
+                    tail = config.stderr.decode("utf-8", "replace").strip()[-80:]
+                    raise StageError(f"git {args[0]} exited {config.returncode}: {tail}")
+                for entry in config.stdout.split(b"\0"):
+                    key = entry.split(b"\n", 1)[0].decode("utf-8", "strict")
+                    if key.lower().startswith(("include.", "includeif.", "extensions.worktreeconfig")):
+                        raise StageError("repository configuration includes another file")
+                    if key.lower().startswith("filter."):
+                        name = key.rsplit(".", 1)[0]
+                        pins.extend(("-c", f"{name}.clean=", "-c", f"{name}.smudge=",
+                                     "-c", f"{name}.process=", "-c", f"{name}.required=false"))
+                    if key.lower().startswith("diff.") and key.lower().endswith(".textconv"):
+                        pins.extend(("-c", f"{key}=", "-c", f"{key.rsplit('.', 1)[0]}.cachetextconv=false"))
             result = subprocess.run(
-                [self.git.argv0(workspace=(self.root, cwd)), *GIT_PIN,
+                [self.git.argv0(workspace=(self.root, cwd)), *pins,
                  "-C", str(cwd), *args], input=input, capture_output=True,
                 timeout=self.timeout, env=env, shell=False,
                 creationflags=NO_CONSOLE_WINDOW,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except (OSError, UnicodeError, subprocess.TimeoutExpired) as exc:
             raise StageError(f"git {args[0]} failed: {type(exc).__name__}") from exc
         if result.returncode:
-            tail = result.stderr.decode("utf-8", "replace").strip()[-500:]
+            tail = result.stderr.decode("utf-8", "replace").strip()[-80:]
             raise StageError(f"git {args[0]} exited {result.returncode}: {tail}")
         return result.stdout
 
@@ -98,6 +129,8 @@ remain separate migration steps. This is not a diff-scope or approval gate.
 
     def _clean(self, path: Path) -> None:
         """Refuse tracked or untracked changes; ignored files are tolerated."""
+        if Path(path).absolute().is_relative_to(self.root):
+            raise StageError("stage cleanliness is not queried after worker start")
         changes = self._git(path, "status", "--porcelain=v1", "--untracked-files=all",
                             "--ignore-submodules=none").decode("utf-8", "replace").splitlines()
         if changes:
@@ -199,13 +232,73 @@ remain separate migration steps. This is not a diff-scope or approval gate.
         except (OSError, UnicodeError) as exc:
             raise StageError("invalid stage metadata") from exc
 
-    def diff(self, stage: Stage) -> bytes:
-        """Return a binary-capable patch; refuse to silently omit new files."""
+    def _claim(self, stage: Stage) -> str:
+        """Read a bounded tip claim without invoking Git in the worker repo."""
+        path = stage.path / ".git" / "refs" / "heads"
+        try:
+            info = os.lstat(path.parent)
+            if (not stat.S_ISDIR(info.st_mode)
+                    or getattr(info, "st_file_attributes", 0) & 0x400):
+                raise StageError("stage refs traverses a link")
+            for part in stage.branch.split("/"):
+                info = os.lstat(path)
+                if not stat.S_ISDIR(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                    raise StageError("stage ref traverses a link")
+                path /= part
+            info = os.lstat(path)
+            if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                raise StageError("stage ref is not a regular file")
+            with path.open("rb") as handle:
+                claim = handle.read(66)
+        except FileNotFoundError:
+            # packed-refs is a claim too, never an authority for object contents.
+            path = stage.path / ".git" / "packed-refs"
+            try:
+                info = os.lstat(path)
+                if not stat.S_ISREG(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400:
+                    raise StageError("invalid packed refs")
+                with path.open("rb") as handle:
+                    data = handle.read(1024 * 1024 + 1)
+                if len(data) > 1024 * 1024:
+                    raise StageError("packed refs too large")
+                matches = [line.split(b" ")[0] for line in data.splitlines()
+                           if line.endswith(b" refs/heads/" + stage.branch.encode())]
+                if len(matches) != 1:
+                    raise StageError("stage tip is missing or ambiguous")
+                claim = matches[0] + b"\n"
+            except OSError as exc:
+                raise StageError("stage tip is missing") from exc
+        except OSError as exc:
+            raise StageError("invalid stage tip") from exc
+        if not re.fullmatch(rb"(?:[0-9a-f]{40}|[0-9a-f]{64})\n", claim):
+            raise StageError("invalid stage tip claim")
+        return claim.rstrip(b"\n").decode("ascii")
+
+    def diff(self, stage: Stage, *, max_bytes: int = 256 * 1024 * 1024) -> bytes:
+        """Return base..C after verified import; index/worktree edits are excluded.
+
+        The worker must have stopped. This is not OS confinement of that worker.
+        """
         self._validate(stage)
-        if self._git(stage.path, "ls-files", "--others", "--exclude-standard", "-z"):
-            raise StageError("untracked files must be indexed before diff extraction")
-        return self._git(stage.path, "diff", "--binary", "--no-ext-diff", "--no-textconv",
-                         "--no-renames", "--ignore-submodules=none", stage.base, "--")
+        commit = self._claim(stage)
+        owned = self.root.parent / (self.root.name + "-repos") / stage.branch.split("/")[1]
+        try:
+            stage_git.import_commit(stage.path, owned, commit, stage.base,
+                                    max_bytes=max_bytes, timeout=self.timeout)
+            raw = stage_git.run(owned, "diff-tree", "-r", "--raw", "--no-commit-id",
+                                "--no-renames", stage.base, commit, timeout=self.timeout)
+            for line in raw.splitlines():
+                modes = line.split()[:2]
+                if len(modes) != 2:
+                    raise StageError("invalid file mode record")
+                old, new = modes[0].lstrip(b":"), modes[1]
+                if (any(mode not in (b"000000", b"100644", b"100755") for mode in (old, new))
+                        or old != new and b"000000" not in (old, new)):
+                    raise StageError("unexpected file-mode change")
+            return stage_git.run(owned, "diff-tree", "-r", "-p", "--binary", "--no-renames",
+                                 "--no-commit-id", stage.base, commit, timeout=self.timeout)
+        except (stage_git.StageGitError, ValueError) as exc:
+            raise StageError(f"stage import/diff refused: {str(exc)[:80]}") from exc
 
     def assert_apply_ready(self, stage: Stage) -> None:
         """Preflight only: integration must recheck atomically when applying."""
@@ -260,7 +353,26 @@ remain separate migration steps. This is not a diff-scope or approval gate.
         return sha
 
     def cleanup(self, stage: Stage) -> None:
+        """Delete a stopped worker's disposable stage without following links."""
         self._validate(stage)
-        self._clean(stage.path)
-        self._git(stage.target, "merge-base", "--is-ancestor", stage.branch, "HEAD")
-        self._git(stage.target, "worktree", "remove", str(stage.path))
+        self._delete(stage.path)
+
+    @classmethod
+    def _delete(cls, path: Path) -> None:
+        info = os.lstat(path)
+        linked = stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & 0x400
+        if linked:
+            if stat.S_ISDIR(info.st_mode) and not stat.S_ISLNK(info.st_mode):
+                path.rmdir()  # Windows junction: remove only the reparse point.
+            else:
+                path.unlink()
+        elif stat.S_ISDIR(info.st_mode):
+            with os.scandir(path) as entries:
+                children = [Path(entry.path) for entry in entries]
+            for child in children:
+                cls._delete(child)
+            path.rmdir()
+        else:
+            # Git's object files can be read-only on Windows.
+            path.chmod(stat.S_IREAD | stat.S_IWRITE)
+            path.unlink()

@@ -6,6 +6,7 @@ import stat
 import sys
 import tempfile
 import unittest
+import zlib
 from dataclasses import replace
 from pathlib import Path
 from unittest.mock import patch
@@ -128,6 +129,22 @@ class StageTests(unittest.TestCase):
                     with self.assertRaises(StageError):
                         self.manager._validate(stage)
 
+    def test_tip_claim_refuses_linked_refs_before_reading(self):
+        from types import SimpleNamespace
+        stage = self.stage()
+        refs = stage.path / ".git" / "refs"
+        real_lstat = os.lstat
+        for mode, attrs in ((stat.S_IFLNK | 0o777, 0), (stat.S_IFDIR | 0o777, 0x400)):
+            def linked(path, *args, **kwargs):
+                if Path(path) == refs:
+                    return SimpleNamespace(st_mode=mode, st_file_attributes=attrs)
+                return real_lstat(path, *args, **kwargs)
+
+            with patch("jarvis.write_stage.os.lstat", side_effect=linked), patch.object(
+                    Path, "open", side_effect=AssertionError("outside ref read")):
+                with self.assertRaisesRegex(StageError, "refs traverses"):
+                    self.manager._claim(stage)
+
     def test_new_repo_has_empty_baseline(self):
         self.assertEqual(self.manager._git(self.repo, "ls-tree", "HEAD"), b"")
         with self.assertRaises(StageError):
@@ -138,12 +155,10 @@ class StageTests(unittest.TestCase):
         self.assertEqual(stage.branch, "jarvis/run1/slice1")
         self.manager.assert_apply_ready(stage)
         self.assertEqual(self.manager.diff(stage), b"")
-        with self.assertRaises(StageError):
-            self.manager.cleanup(stage)
-        self.assertTrue(stage.path.exists())
-        self.assertEqual(self.manager._git(stage.path, "rev-parse", stage.branch).decode().strip(), stage.base)
+        self.manager.cleanup(stage)
+        self.assertFalse(stage.path.exists())
 
-    def test_diff_includes_index_working_tree_and_commits(self):
+    def test_diff_contains_only_verified_commits(self):
         stage = self.stage()
         (stage.path / "first.txt").write_text("committed\n")
         self.commit(stage.path)
@@ -151,15 +166,179 @@ class StageTests(unittest.TestCase):
         self.manager._git(stage.path, "add", "second.txt")
         (stage.path / "first.txt").write_text("working\n")
         artifact = self.manager.diff(stage)
-        self.assertIn(b"+working", artifact)
-        self.assertIn(b"+indexed", artifact)
+        self.assertTrue(b"+committed" in artifact, repr(artifact[:80]))
+        self.assertFalse(b"+working" in artifact, repr(artifact[:80]))
+        self.assertFalse(b"+indexed" in artifact, repr(artifact[:80]))
         self.assertFalse((self.repo / "first.txt").exists())
 
-    def test_untracked_diff_refused(self):
+    def test_untracked_edits_are_not_part_of_commit(self):
         stage = self.stage()
         (stage.path / "new.txt").write_text("keep")
-        with self.assertRaisesRegex(StageError, "untracked"):
+        self.assertEqual(self.manager.diff(stage), b"")
+        self.assertEqual((stage.path / "new.txt").read_text(), "keep")
+
+    def test_no_git_uses_stage_after_worker_start(self):
+        stage = self.stage()
+        self.change(stage, "committed.txt")
+        with patch("subprocess.run", wraps=subprocess.run) as run, patch(
+                "subprocess.Popen", wraps=subprocess.Popen) as popen:
+            artifact = self.manager.diff(stage)
+            self.assertTrue(b"+committed.txt" in artifact, repr(artifact[:80]))
+            with self.assertRaisesRegex(StageError, "cleanliness"):
+                self.manager._clean(stage.path)
+            self.manager.assert_apply_ready(stage)
+            commit = self.rev(stage.branch)
+            self.manager.apply(stage, commit)
+            self.manager.undo(self.repo, "run1")
+            self.manager.cleanup(stage)
+        for call in [*run.call_args_list, *popen.call_args_list]:
+            argv = call.args[0]
+            locations = [call.kwargs.get("cwd"), call.kwargs.get("env", {}).get("GIT_DIR")]
+            for i, arg in enumerate(argv):
+                if arg in ("-C", "--git-dir"):
+                    locations.append(argv[i + 1])
+                elif arg.startswith("--git-dir="):
+                    locations.append(arg.split("=", 1)[1])
+            for location in locations:
+                if location is not None:
+                    self.assertNotEqual(Path(location).absolute(), stage.path)
+                    self.assertNotEqual(Path(location).absolute(), stage.path / ".git")
+
+    def test_stage_include_is_never_reached(self):
+        stage = self.stage()
+        included = self.home / "bad-config"
+        included.write_text("this is invalid git configuration")
+        config = stage.path / ".git" / "config"
+        with config.open("a") as handle:
+            handle.write('[include]\n path = "' + included.as_posix() + '"\n')
+        control = subprocess.run([self.manager.git.argv0(workspace=(stage.path,)),
+                                  "-C", str(stage.path), "rev-parse", "HEAD"], capture_output=True)
+        self.assertNotEqual(control.returncode, 0)
+        self.assertIn(b"bad config", control.stderr.lower())
+        with patch("subprocess.run", wraps=subprocess.run) as run, patch(
+                "subprocess.Popen", wraps=subprocess.Popen) as popen:
+            with self.assertRaisesRegex(StageError, "includes"):
+                self.manager.diff(stage)
+            self.manager.assert_apply_ready(stage)
+            self.manager.cleanup(stage)
+        for call in [*run.call_args_list, *popen.call_args_list]:
+            self.assertNotIn(str(stage.path), call.args[0])
+        self.assertFalse(stage.path.exists())
+
+    def test_corrupt_or_missing_stage_object_refused(self):
+        for kind in ("corrupt", "missing"):
+            with self.subTest(kind=kind):
+                stage = self.manager.create(self.repo, kind, "slice")
+                (stage.path / "file.txt").write_text("original content")
+                self.commit(stage.path)
+                oid = self.manager._git(stage.path, "rev-parse", "HEAD:file.txt").decode().strip()
+                obj = stage.path / ".git" / "objects" / oid[:2] / oid[2:]
+                obj.chmod(stat.S_IREAD | stat.S_IWRITE)
+                if kind == "corrupt":
+                    obj.write_bytes(zlib.compress(b"blob 4\0evil"))
+                else:
+                    obj.unlink()
+                with self.assertRaises(StageError):
+                    self.manager.diff(stage)
+
+    def test_wrong_parent_refused(self):
+        stage = self.stage()
+        tree = self.manager._git(stage.path, "mktree", input=b"").decode().strip()
+        commit = self.manager._git(stage.path, "commit-tree", tree, input=b"orphan").decode().strip()
+        self.manager._git(stage.path, "update-ref", "HEAD", commit)
+        with self.assertRaises(StageError):
             self.manager.diff(stage)
+
+    def test_unexpected_file_mode_change_refused(self):
+        (self.repo / "file.txt").write_text("base")
+        self.commit(self.repo)
+        stage = self.stage()
+        self.manager._git(stage.path, "update-index", "--chmod=+x", "file.txt")
+        tree = self.manager._git(stage.path, "write-tree").decode().strip()
+        commit = self.manager._git(stage.path, "commit-tree", tree, "-p", stage.base,
+                                   input=b"mode change").decode().strip()
+        self.manager._git(stage.path, "update-ref", "HEAD", commit)
+        with self.assertRaisesRegex(StageError, "file-mode"):
+            self.manager.diff(stage)
+
+    def test_oversized_import_refused(self):
+        stage = self.stage()
+        (stage.path / "large.txt").write_bytes(bytes(range(256)) * 32)
+        self.commit(stage.path)
+        with self.assertRaises(StageError):
+            self.manager.diff(stage, max_bytes=1)
+
+    def test_target_filter_never_fires_in_manager_calls(self):
+        marker = self.home / "filter-ran"
+        # A native executable with no shell syntax: the control executes the
+        # Python source supplied on stdin as base.txt, then emits filtered data.
+        command = Path(sys.executable).as_posix()
+        self.manager._git(self.repo, "config", "filter.planted.clean", command)
+        self.manager._git(self.repo, "config", "filter.planted.smudge", command)
+        self.manager._git(self.repo, "config", "diff.planted.textconv", command)
+        (self.repo / ".gitattributes").write_text("*.txt filter=planted diff=planted\n")
+        (self.repo / "base.txt").write_text(
+            "from pathlib import Path\n" + f"Path({str(marker)!r}).write_text('ran')\n"
+            + "print('filtered')\n", encoding="utf-8")
+        # Firing control: ordinary Git add uses the planted clean filter.
+        git = [self.manager.git.argv0(workspace=(self.repo,)), "-C", str(self.repo)]
+        subprocess.run([*git, "config", "filter.planted.required", "true"],
+                       check=True, capture_output=True)
+        control = subprocess.run([*git, "add", "--all"], capture_output=True)
+        self.assertTrue(control.returncode == 0, repr(control.stderr[:80]))
+        self.assertTrue(marker.exists(), "control: clean filter must fire")
+        marker.unlink()
+        self.commit(self.repo)
+        stage = self.stage()
+        (stage.path / "new.txt").write_text("new")
+        commit = self.commit(stage.path)
+        artifact = self.manager.diff(stage)
+        self.assertTrue(b"+new" in artifact, repr(artifact[:80]))
+        self.manager.assert_apply_ready(stage)
+        self.publish(stage)
+        self.manager.apply(stage, commit)
+        self.manager.undo(self.repo, "run1")
+        self.manager.cleanup(stage)
+        self.assertFalse(marker.exists())
+
+    def test_cleanup_does_not_follow_symlink_or_junction(self):
+        outside = self.home / "outside"
+        outside.mkdir()
+        sentinel = outside / "keep.txt"
+        sentinel.write_text("keep")
+        stage = self.stage()
+        link = stage.path / "escape"
+        try:
+            link.symlink_to(outside, target_is_directory=True)
+        except OSError:
+            # Exercise the symlink branch even where Windows denies link creation.
+            from types import SimpleNamespace
+            info = SimpleNamespace(st_mode=stat.S_IFLNK | 0o777, st_file_attributes=0)
+            with patch("jarvis.write_stage.os.lstat", return_value=info), patch.object(
+                    Path, "unlink") as unlink, patch("jarvis.write_stage.os.scandir") as scan:
+                self.manager._delete(link)
+            unlink.assert_called_once_with()
+            scan.assert_not_called()
+        self.manager.cleanup(stage)
+        self.assertFalse(stage.path.exists())
+        self.assertEqual(sentinel.read_text(), "keep")
+        stage = self.manager.create(self.repo, "run1", "junction")
+        link = stage.path / "escape"
+        if os.name == "nt":
+            # One shell end to end; verified paths are inside this temp workspace.
+            self.assertTrue(link.absolute().is_relative_to(self.home))
+            self.assertTrue(outside.absolute().is_relative_to(self.home))
+            result = subprocess.run(["cmd", "/c", "mklink", "/J", str(link), str(outside)],
+                                    capture_output=True)
+            if result.returncode == 0:
+                self.manager.cleanup(stage)
+                self.assertFalse(stage.path.exists())
+                self.assertEqual(sentinel.read_text(), "keep")
+                return
+            print("junction creation denied; symlink deletion path tested")
+        self.manager.cleanup(stage)
+        self.assertFalse(stage.path.exists())
+        self.assertEqual(sentinel.read_text(), "keep")
 
     def test_dirty_target_refuses_apply(self):
         stage = self.stage()
@@ -175,34 +354,29 @@ class StageTests(unittest.TestCase):
         with self.assertRaisesRegex(StageError, "advanced"):
             self.manager.assert_apply_ready(stage)
 
-    def test_dirty_cleanup_preserves_files(self):
+    def test_dirty_cleanup_deletes_disposable_stage(self):
         stage = self.stage()
-        (stage.path / "new.txt").write_text("keep")
-        with self.assertRaises(StageError):
-            self.manager.cleanup(stage)
-        self.assertTrue((stage.path / "new.txt").exists())
+        (stage.path / "new.txt").write_text("discard")
+        self.manager.cleanup(stage)
+        self.assertFalse(stage.path.exists())
 
-    def test_unmerged_cleanup_preserves_commits(self):
+    def test_unmerged_cleanup_deletes_disposable_stage(self):
         stage = self.stage()
-        (stage.path / "new.txt").write_text("keep")
-        sha = self.commit(stage.path)
-        with self.assertRaises(StageError):
-            self.manager.cleanup(stage)
-        self.assertEqual(self.manager._git(stage.path, "rev-parse", "HEAD").decode().strip(), sha)
-        self.publish(stage)
-        self.manager._git(self.repo, "merge", "--ff-only", stage.branch)
-        with self.assertRaises(StageError):
-            self.manager.cleanup(stage)
-        self.assertTrue(stage.path.exists())
+        (stage.path / "new.txt").write_text("discard")
+        self.commit(stage.path)
+        self.manager.cleanup(stage)
+        self.assertFalse(stage.path.exists())
+        self.assertEqual(self.rev("HEAD"), stage.base)
 
-    def test_hidden_index_refuses_cleanup(self):
+    def test_hidden_index_does_not_block_disposable_cleanup(self):
         (self.repo / "file.txt").write_text("base")
         self.commit(self.repo)
         stage = self.stage()
         self.manager._git(stage.path, "update-index", "--assume-unchanged", "file.txt")
         (stage.path / "file.txt").write_text("hidden edit")
-        with self.assertRaisesRegex(StageError, "hidden"):
-            self.manager.cleanup(stage)
+        self.manager.cleanup(stage)
+        self.assertFalse(stage.path.exists())
+        self.assertEqual((self.repo / "file.txt").read_text(), "base")
 
     def test_ignored_files_do_not_block_cleanup(self):
         (self.repo / ".gitignore").write_text("__pycache__/\n")
@@ -210,9 +384,8 @@ class StageTests(unittest.TestCase):
         stage = self.stage()
         (stage.path / "__pycache__").mkdir()
         (stage.path / "__pycache__" / "x.pyc").write_bytes(b"\0")
-        with self.assertRaises(StageError):
-            self.manager.cleanup(stage)
-        self.assertTrue(stage.path.exists())
+        self.manager.cleanup(stage)
+        self.assertFalse(stage.path.exists())
 
     def test_ignored_target_files_allow_apply(self):
         (self.repo / ".gitignore").write_text("build/\n")
@@ -229,9 +402,9 @@ class StageTests(unittest.TestCase):
         stage = self.stage()
         (stage.path / ".gitignore").write_text("*\n")
         (stage.path / "work.py").write_text("keep")
-        with self.assertRaisesRegex(StageError, "ignored .gitignore"):
-            self.manager.cleanup(stage)
-        self.assertTrue((stage.path / "work.py").exists())
+        self.manager.cleanup(stage)
+        self.assertFalse(stage.path.exists())
+        stage = self.manager.create(self.repo, "run1", "target-check")
         excludes = self.home / "excludes"
         excludes.write_text("*\n")
         self.manager._git(self.repo, "config", "core.excludesFile", excludes.as_posix())
@@ -239,17 +412,15 @@ class StageTests(unittest.TestCase):
         with self.assertRaisesRegex(StageError, "untracked"):
             self.manager.assert_apply_ready(stage)
 
-    def test_cleanup_lists_tracked_and_untracked_changes(self):
+    def test_cleanup_deletes_tracked_and_untracked_changes(self):
         (self.repo / "tracked.txt").write_text("base")
         self.commit(self.repo)
         stage = self.stage()
         (stage.path / "tracked.txt").write_text("edit")
         (stage.path / "fresh.txt").write_text("new")
-        with self.assertRaises(StageError) as caught:
-            self.manager.cleanup(stage)
-        self.assertIn("tracked.txt", str(caught.exception))
-        self.assertIn("fresh.txt", str(caught.exception))
-        self.assertTrue((stage.path / "fresh.txt").exists())
+        self.manager.cleanup(stage)
+        self.assertFalse(stage.path.exists())
+        self.assertEqual((self.repo / "tracked.txt").read_text(), "base")
 
     def test_planted_post_checkout_hook_does_not_run(self):
         marker = self.home / "hook-ran"
@@ -270,12 +441,13 @@ class StageTests(unittest.TestCase):
 
     def test_git_error_carries_capped_stderr_tail(self):
         failed = subprocess.CompletedProcess([], 1, b"", b"\xff" + b"x" * 1000 + b"END")
-        with patch("jarvis.write_stage.subprocess.run", return_value=failed):
+        with patch("jarvis.write_stage.subprocess.run", side_effect=[
+                subprocess.CompletedProcess([], 0, b"", b""), failed]):
             with self.assertRaises(StageError) as caught:
                 self.manager._git(self.repo, "status")
         message = str(caught.exception)
         self.assertTrue(message.endswith("END"))
-        self.assertLessEqual(len(message), len("git status exited 1: ") + 500)
+        self.assertLessEqual(len(message), len("git status exited 1: ") + 80)
         with self.assertRaisesRegex(StageError, "fatal"):
             self.manager.create(self.repo, "run", "slice", base="missing-ref")
 
@@ -301,8 +473,7 @@ class StageTests(unittest.TestCase):
         self.assertIn("core.hooksPath=", GIT_PIN)
         with patch("jarvis.write_stage.subprocess.run", wraps=__import__("subprocess").run) as run:
             stage = self.stage()
-            with self.assertRaises(StageError):
-                self.manager.cleanup(stage)
+            self.manager.cleanup(stage)
         for call in run.call_args_list:
             argv = call.args[0]
             self.assertIn("core.hooksPath=", argv)
