@@ -1,0 +1,411 @@
+"""PM26A S3: the judgement ports read only the commit pinned in the JARVIS repo."""
+
+import inspect
+import os
+import stat
+import tempfile
+import types
+import unittest
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from unittest import mock
+
+from jarvis import stage_git, work_driver, work_ports
+from jarvis.memory import SQLiteMemoryStore
+from jarvis.work_checks import CheckResult
+from jarvis.work_ledger import EventKind, StepState, WorkStep, step_key
+from jarvis.work_ports import _changes, build_ports
+from jarvis.work_regress import TestResult
+from jarvis.write_stage import StageError, StageManager
+
+RUN = "run1"
+T0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
+ACCEPTED = types.SimpleNamespace(outcome="accepted", logged=(), blocking=(), reason="")
+
+
+def _check(stdout, *, exit_code=0, timed_out=False, truncated=False):
+    return CheckResult(("python", "-m", "unittest"), "unittest", exit_code, 0.1, stdout, "",
+                       truncated, timed_out)
+
+
+class Base(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(dir=os.environ.get("TEMP"),
+                                           ignore_cleanup_errors=True)
+        self.addCleanup(temp.cleanup)
+        self.home = Path(temp.name)
+        self.ticks = 0
+        self.manager = StageManager(self.home / "stages")
+        self.repo = self.manager.create_repo(self.home / "project")
+        self.db = self.home / "work.db"
+        self.check_outputs = ["Ran 3 tests in 0.1s\n\nOK\n"] * 8
+        self.check_effect = None
+        self.exported = []
+        self.hashed = []
+        self.diffs = []
+        self.ports = self.build()
+        self.step = WorkStep(RUN, step_key(RUN, 1, "one"), 1, "one", StepState.PENDING,
+                             self.clock())
+
+    def clock(self):
+        self.ticks += 1
+        return T0 + timedelta(seconds=self.ticks)
+
+    def git(self, cwd, *args, input=None):
+        data = input.encode() if input is not None else None
+        return self.manager._git(cwd, *args, input=data).decode("utf-8", "replace")
+
+    def build(self, targets=None):
+        def fake_run_check(argv, *, stage, jarvis_repo):
+            allowed = stage / "allowed.txt"
+            self.exported.append((stage, (stage / ".git").exists(),
+                                  allowed.read_text() if allowed.exists() else None))
+            if self.check_effect:
+                self.check_effect(stage)
+            return _check(self.check_outputs.pop(0))
+
+        def fixture_hash(directory):
+            allowed = directory / "allowed.txt"
+            self.hashed.append((directory, (directory / ".git").exists(),
+                                allowed.read_text() if allowed.exists() else None))
+            return "a" * 64
+
+        def review(stage, diff):
+            self.diffs.append(diff)
+            return ACCEPTED
+
+        return build_ports(
+            store=SQLiteMemoryStore(self.db), manager=self.manager, target=self.repo,
+            lease_target="project/", run_id=RUN, boot_id="boot-1", clock=self.clock,
+            lease=timedelta(minutes=5), targets=targets or {"allowed.txt": "file"},
+            jarvis_repo=False, checks=[("python", "-m", "unittest")],
+            base_result=TestResult(3, frozenset()), locked_fixture_hash="a" * 64,
+            fixture_hash=fixture_hash, review=review, plan_hash="p" * 64, worker=None,
+            route=None, task=None, budget_exhausted=None, needs_input=None, verify_cwd=None,
+            link_rescan=None, run_check=fake_run_check)
+
+    def commit_in(self, path, name, text):
+        file = Path(path) / name
+        file.parent.mkdir(parents=True, exist_ok=True)
+        file.write_text(text)
+        self.git(path, "add", "--all")
+        tree = self.git(path, "write-tree").strip()
+        parent = self.git(path, "rev-parse", "HEAD").strip()
+        sha = self.git(path, "commit-tree", tree, "-p", parent, input="test change\n").strip()
+        self.git(path, "update-ref", "HEAD", sha, parent)
+        return sha
+
+    def based_stage(self):
+        self.commit_in(self.repo, "keep.txt", "keep\n")
+        self.commit_in(self.repo, "sub/x.txt", "x\n")
+        return self.ports.stage_create(self.step)
+
+    def jarvis_repo(self, stage):
+        return self.manager.root.parent / (self.manager.root.name + "-repos") / RUN
+
+    def pin_ref(self, stage):
+        return f"refs/jarvis/judged/{RUN}/{self.step.key}"
+
+    def pinned(self, stage):
+        return stage_git.run(self.jarvis_repo(stage), "for-each-ref", "--format=%(objectname)",
+                             self.pin_ref(stage)).decode("ascii").strip()
+
+    def common_dir(self, stage):
+        common = Path(self.git(stage.path, "rev-parse", "--git-common-dir").strip())
+        return common if common.is_absolute() else stage.path / common
+
+    def ref_file(self, stage):
+        return self.common_dir(stage) / "refs" / "heads" / stage.branch
+
+    def later_results(self, stage):
+        results = self.ports.run_checks(stage)
+        verdict = self.ports.regress(results)
+        findings = self.ports.review(stage)
+        receipt = self.ports.evidence(self.step, stage, results, verdict)
+        return (verdict.passed, findings, receipt.diff_sha, receipt.verdict,
+                self.ports.tree_hash(stage))
+
+
+class ScopeTests(Base):
+    def test_scope_is_judged_from_the_jarvis_repo(self):
+        stage = self.based_stage()
+        tip = self.commit_in(stage.path, "allowed.txt", "ok\n")
+        (stage.path / "uncommitted.txt").write_text("never judged\n")
+        self.assertEqual(self.ports.scope_check(stage), [])
+        self.assertEqual(self.pinned(stage), tip)
+        repo = self.jarvis_repo(stage)
+        self.assertEqual(stage_git.run(repo, "cat-file", "-t", tip).strip(), b"commit")
+        self.assertEqual(_changes(repo, stage.base, tip)[0]["path"], "allowed.txt")
+
+    def test_out_of_scope_commit_is_refused_and_pinned_for_later_rejection(self):
+        stage = self.based_stage()
+        tip = self.commit_in(stage.path, "other.txt", "no\n")
+        self.assertEqual([r.code for r in self.ports.scope_check(stage)], ["out_of_scope"])
+        self.assertEqual(self.pinned(stage), tip)
+
+    def test_change_dicts_cover_status_mode_size_and_binary(self):
+        stage = self.based_stage()
+        (stage.path / "keep.txt").unlink()
+        (stage.path / "sub" / "x.txt").write_bytes(b"changed\n")
+        (stage.path / "blob.bin").write_bytes(b"\0\1\2\3")
+        tip = self.commit_in(stage.path, "new.txt", "new\n")
+        self.ports.scope_check(stage)
+        changes = {c["path"]: c for c in _changes(self.jarvis_repo(stage), stage.base, tip)}
+        self.assertEqual(sorted(changes), ["blob.bin", "keep.txt", "new.txt", "sub/x.txt"])
+        self.assertEqual(changes["keep.txt"]["status"], "D")
+        self.assertEqual(changes["keep.txt"]["new_mode"], "000000")
+        self.assertEqual(changes["keep.txt"]["size"], 0)
+        self.assertEqual(changes["sub/x.txt"]["status"], "M")
+        self.assertEqual(changes["sub/x.txt"]["size"], 8)
+        self.assertEqual(changes["new.txt"]["status"], "A")
+        self.assertEqual(changes["new.txt"]["old_mode"], "000000")
+        self.assertIs(changes["new.txt"]["binary"], False)
+        self.assertIs(changes["blob.bin"]["binary"], True)
+        self.assertIsNone(changes["new.txt"]["old_path"])
+        self.assertIs(changes["new.txt"]["reparse"], False)
+
+    def test_symlink_mode_is_a_reparse_change(self):
+        stage = self.based_stage()
+        blob = self.git(stage.path, "hash-object", "-w", "--stdin", input="target").strip()
+        tree = self.git(stage.path, "mktree",
+                        input=f"120000 blob {blob}\tlink\n").strip()
+        tip = self.git(stage.path, "commit-tree", tree, "-p", stage.base,
+                       input="link\n").strip()
+        self.git(stage.path, "update-ref", "HEAD", tip)
+        self.ports = self.build(targets={"link": "file", "keep.txt": "file", "sub/x.txt": "file"})
+        self.assertIn("symlink", [r.code for r in self.ports.scope_check(stage)])
+        change = [c for c in _changes(self.jarvis_repo(stage), stage.base, tip)
+                  if c["path"] == "link"][0]
+        self.assertIs(change["reparse"], True)
+
+    def test_each_attempt_earns_its_own_pin_and_a_refusal_leaves_none(self):
+        stage = self.based_stage()
+        first = self.commit_in(stage.path, "allowed.txt", "one\n")
+        self.ports.scope_check(stage)
+        self.assertEqual(self.pinned(stage), first)
+        second = self.commit_in(stage.path, "allowed.txt", "two\n")
+        self.ports.scope_check(stage)
+        self.assertEqual(self.pinned(stage), second)
+        self.ref_file(stage).write_text("not a commit\n")
+        with self.assertRaises(StageError):
+            self.ports.scope_check(stage)
+        self.assertEqual(self.pinned(stage), "")
+        with self.assertRaises(StageError):
+            self.ports.tree_hash(stage)
+
+    def test_worker_git_config_in_the_stage_never_runs(self):
+        stage = self.based_stage()
+        marker = self.home / "marker"
+        script = self.home / "evil.cmd"
+        script.write_text(f"@echo x>{marker}\r\n")
+        self.git(stage.path, "config", "core.fsmonitor", str(script))
+        self.git(stage.path, "config", "core.sshCommand", str(script))
+        self.commit_in(stage.path, "allowed.txt", "ok\n")
+        marker.unlink(missing_ok=True)
+        self.assertEqual(self.ports.scope_check(stage), [])
+        self.later_results(stage)
+        self.assertFalse(marker.exists())
+
+
+class StageRefTests(Base):
+    def assert_refused_without_pin(self, stage):
+        with self.assertRaises(StageError):
+            self.ports.scope_check(stage)
+        self.assertEqual(self.pinned(stage), "")
+
+    def test_packed_ref_is_read(self):
+        stage = self.based_stage()
+        tip = self.commit_in(stage.path, "allowed.txt", "ok\n")
+        self.ref_file(stage).unlink()
+        (self.common_dir(stage) / "packed-refs").write_text(
+            f"# pack-refs with: peeled fully-peeled sorted\n{tip} refs/heads/{stage.branch}\n")
+        self.assertEqual(self.ports.scope_check(stage), [])
+        self.assertEqual(self.pinned(stage), tip)
+
+    def test_unparseable_ref_is_refused(self):
+        stage = self.based_stage()
+        self.commit_in(stage.path, "allowed.txt", "ok\n")
+        self.ref_file(stage).write_text("garbage\n")
+        self.assert_refused_without_pin(stage)
+
+    def test_symbolic_ref_is_refused(self):
+        stage = self.based_stage()
+        self.commit_in(stage.path, "allowed.txt", "ok\n")
+        self.ref_file(stage).write_text("ref: refs/heads/main\n")
+        self.assert_refused_without_pin(stage)
+
+    def test_missing_ref_is_refused(self):
+        stage = self.based_stage()
+        self.ref_file(stage).unlink()
+        self.assert_refused_without_pin(stage)
+
+    def test_claim_of_absent_object_is_refused(self):
+        stage = self.based_stage()
+        self.ref_file(stage).write_text("1" * 40 + "\n")
+        self.assert_refused_without_pin(stage)
+
+
+class PinTests(Base):
+    def judged_stage(self, text="ok\n"):
+        stage = self.based_stage()
+        self.commit_in(stage.path, "allowed.txt", text)
+        self.assertEqual(self.ports.scope_check(stage), [])
+        return stage
+
+    def destroy_stage_objects(self, stage):
+        for file in (self.common_dir(stage) / "objects").rglob("*"):
+            if file.is_file():
+                file.chmod(stat.S_IWRITE)
+                file.unlink()
+
+    def test_replacing_the_stage_tip_and_objects_changes_no_later_port(self):
+        stage = self.judged_stage()
+        pinned = self.pinned(stage)
+        before = self.later_results(stage)
+        self.commit_in(stage.path, "allowed.txt", "replaced\n")
+        self.commit_in(stage.path, "other.txt", "planted\n")
+        self.assertEqual(self.later_results(stage), before)
+        self.destroy_stage_objects(stage)
+        self.assertEqual(self.later_results(stage), before)
+        self.assertEqual(self.pinned(stage), pinned)
+        self.assertEqual(self.exported[-1][2], "ok\n")
+        self.assertEqual(self.diffs[-1], self.diffs[0])
+        self.assertIn("+ok", self.diffs[0])
+
+    def test_a_garbage_stage_ref_after_the_pin_changes_nothing(self):
+        stage = self.judged_stage()
+        before = self.later_results(stage)
+        self.ref_file(stage).write_text("garbage\n")
+        self.assertEqual(self.later_results(stage), before)
+
+    def test_only_scope_check_touches_the_stage(self):
+        stage = self.based_stage()
+        self.commit_in(stage.path, "allowed.txt", "ok\n")
+        with mock.patch.object(stage_git, "import_commit",
+                               wraps=stage_git.import_commit) as imported, \
+                mock.patch.object(self.manager, "_claim",
+                                  wraps=self.manager._claim) as claimed:
+            self.ports.scope_check(stage)
+            self.assertEqual((imported.call_count, claimed.call_count), (1, 1))
+            with mock.patch.object(stage_git, "run", wraps=stage_git.run) as git_run, \
+                    mock.patch.object(self.manager, "_git", wraps=self.manager._git) as stage_side:
+                self.later_results(stage)
+            self.assertEqual((imported.call_count, claimed.call_count), (1, 1))
+            self.assertGreater(git_run.call_count, 0)
+            self.assertEqual({Path(c.args[0]) for c in git_run.call_args_list},
+                             {self.jarvis_repo(stage)})
+            self.assertEqual(stage_side.call_count, 0)
+
+    def test_regression_refuses_a_crash_after_a_clean_summary_and_truncated_output(self):
+        stage = self.based_stage()
+        self.commit_in(stage.path, "allowed.txt", "ok\n")
+        self.ports.scope_check(stage)
+        self.ports.run_checks(stage)
+        clean = "Ran 3 tests in 0.1s\n\nOK\n"
+        self.assertIs(self.ports.regress([_check(clean)]).passed, True)
+        self.assertIs(self.ports.regress([_check(clean, exit_code=1)]).passed, False)
+        self.assertIs(self.ports.regress([_check(clean, truncated=True)]).passed, False)
+
+    def test_every_later_port_refuses_a_missing_pin(self):
+        stage = self.based_stage()
+        self.commit_in(stage.path, "allowed.txt", "ok\n")
+        verdict = types.SimpleNamespace(passed=True)
+        for call in (lambda: self.ports.run_checks(stage),
+                     lambda: self.ports.review(stage),
+                     lambda: self.ports.evidence(self.step, stage, [_check("x")], verdict),
+                     lambda: self.ports.tree_hash(stage)):
+            with self.assertRaises(StageError):
+                call()
+        self.assertEqual((self.exported, self.diffs), ([], []))
+
+    def test_regression_refuses_a_pin_that_vanished_after_the_checks(self):
+        stage = self.judged_stage()
+        results = self.ports.run_checks(stage)
+        stage_git.run(self.jarvis_repo(stage), "update-ref", "--no-deref", "--stdin",
+                      input=f"delete {self.pin_ref(stage)}\n".encode())
+        with self.assertRaises(StageError):
+            self.ports.regress(results)
+
+
+class ExportTests(Base):
+    def judged_stage(self):
+        stage = self.based_stage()
+        self.commit_in(stage.path, "allowed.txt", "ok\n")
+        self.assertEqual(self.ports.scope_check(stage), [])
+        (stage.path / "allowed.txt").write_text("edited after the pin\n")
+        return stage
+
+    def test_checks_run_on_a_git_free_export(self):
+        stage = self.judged_stage()
+        self.ports.run_checks(stage)
+        directory, has_git, text = self.exported[0]
+        self.assertNotEqual(directory, stage.path)
+        self.assertFalse(has_git)
+        self.assertEqual(text, "ok\n")
+        self.assertFalse(directory.exists())
+
+    def test_fixture_hash_is_over_a_fresh_export(self):
+        stage = self.judged_stage()
+        self.check_effect = lambda tree: (tree / "allowed.txt").write_text("rewritten by a test\n")
+        verdict = self.ports.regress(self.ports.run_checks(stage))
+        directory, has_git, text = self.hashed[0]
+        self.assertIs(verdict.passed, True)
+        self.assertNotEqual(directory, stage.path)
+        self.assertNotEqual(directory, self.exported[0][0])
+        self.assertFalse(has_git)
+        self.assertEqual(text, "ok\n")
+        self.assertFalse(directory.exists())
+
+    def test_regression_reads_the_check_output(self):
+        stage = self.judged_stage()
+        self.check_outputs = ["FAIL: test_x (m.T.test_x)\n\nRan 3 tests in 0.1s\n\n"
+                              "FAILED (failures=1)\n"]
+        self.assertIs(self.ports.regress(self.ports.run_checks(stage)).passed, False)
+
+
+class WiringTests(Base):
+    def test_driver_runs_scope_before_any_other_judgement(self):
+        body = inspect.getsource(work_driver._slice_body)
+        self.assertLess(body.index("_scope(stage, ports)"), body.index("_accept("))
+        scope = inspect.getsource(work_driver._scope)
+        self.assertIn("ports.scope_check", scope)
+        accept = inspect.getsource(work_driver._accept)
+        self.assertNotIn("scope_check", accept)
+        self.assertIn("ports.run_checks", accept)
+
+    def test_apply_applied_and_undo_fail_closed_until_s4(self):
+        stage = self.based_stage()
+        for call in (lambda: self.ports.apply(stage, None),
+                     lambda: self.ports.applied(stage, "key"),
+                     lambda: self.ports.undo(stage, "key")):
+            with self.assertRaisesRegex(StageError, "S4"):
+                call()
+
+    def test_ports_never_reach_git_except_through_stage_git(self):
+        source = inspect.getsource(work_ports)
+        for banned in ("manager._git", "subprocess", "zlib", "manager.apply", "manager.undo",
+                       "_integration"):
+            self.assertNotIn(banned, source)
+
+    def test_a_restart_reattaches_to_the_recorded_stage(self):
+        stage = self.based_stage()
+        again = self.build().stage_create(self.step)
+        self.assertEqual(again, stage)
+        store = SQLiteMemoryStore(self.db)
+        gates = [e for e in store.work_events(RUN) if '"gate":"stage"' in e.payload_json
+                 or '"gate": "stage"' in e.payload_json]
+        self.assertEqual(len(gates), 1)
+
+    def test_lease_is_held_and_released_under_the_run(self):
+        self.assertTrue(self.ports.lease_claim(self.step))
+        self.ports.lease_release(self.step)
+        self.assertTrue(self.ports.lease_claim(self.step))
+
+    def test_apply_intent_reports_key_and_receipt(self):
+        self.assertIsNone(self.ports.apply_intent(self.step))
+        self.ports.append_event(EventKind.PROGRESS, self.step.key,
+                                {"gate": "apply_intent", "idempotency_key": "k"})
+        self.assertEqual(self.ports.apply_intent(self.step), ("k", False))
+        self.ports.append_event(EventKind.PROGRESS, self.step.key,
+                                {"gate": "apply", "passed": True, "idempotency_key": "k"})
+        self.assertEqual(self.ports.apply_intent(self.step), ("k", True))
