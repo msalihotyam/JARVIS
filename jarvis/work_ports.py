@@ -109,6 +109,17 @@ def _ref(repo, ref):
     lines = _git(repo, "for-each-ref", "--format=%(refname) %(objectname) %(symref)",
                  ref).decode("utf-8", "replace").splitlines()
     if not lines:
+        # for-each-ref skips a broken ref with rc 0, so absence needs checks that fail on one.
+        try:
+            _git(repo, "update-ref", "--no-deref", "--stdin",
+                 input=f"start\nverify {ref}\nprepare\nabort\n".encode())
+            resolved = _git(repo, "rev-parse", "--revs-only", "--end-of-options", ref)
+            # A named lookup binary-searches a "sorted" packed-refs and can step over a bad line.
+            _git(repo, "for-each-ref", "--format=%(refname)")
+        except StageError as exc:
+            raise StageError(f"broken ref refused: {ref}: {exc}") from exc
+        if resolved.strip():  # the transaction misses a zero OID file
+            raise StageError(f"broken ref refused: {ref}")
         return None
     fields = lines[0].split(" ")
     if len(lines) != 1 or len(fields) != 3 or fields[0] != ref:
@@ -190,7 +201,9 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
                               payload["branch"], payload["base"])
                 _identity(manager, stage)
                 return stage
-        stage = manager.create(target, run_id, step.key)
+        # A later slice builds on what the earlier ones applied; only the first starts at HEAD.
+        current = _ref(target, f"refs/heads/jarvis/{run_id}/main")
+        stage = manager.create(target, run_id, step.key, base=current or "HEAD")
         append_event(EventKind.PROGRESS, step.key, {
             "gate": "stage", "target": str(stage.target), "path": str(stage.path),
             "branch": stage.branch, "base": stage.base})
@@ -324,6 +337,8 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
 
     def apply(stage, receipt):
         repo, commit = _judged(stage)
+        if commit == stage.base:
+            raise StageError("nothing to apply")
         ref, records = _refs(stage, _pending_key(stage))
         # Early refusal only; the transaction's expected old is the authority.
         if _ref(target, ref) != stage.base:
@@ -333,6 +348,7 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
             stage_git.import_commit(repo, target, commit, stage.base)
         except (stage_git.StageGitError, ValueError) as exc:
             raise StageError(str(exc)) from exc
+        _refuse_checked_out(target, ref)  # a checkout may have appeared during the import
         _transact(target, f"update {ref} {commit} {stage.base}",
                   f"create {records}/old {stage.base}", f"create {records}/new {commit}")
         return commit
@@ -342,7 +358,7 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
         old, new, current = _ref(target, f"{records}/old"), _ref(target, f"{records}/new"), _ref(target, ref)
         if old is None and new is None and current == stage.base:
             return False
-        if old is not None and new == current and old == stage.base:
+        if old is not None and new is not None and new == current and old == stage.base:
             return True
         raise StageError("apply record does not match the integration ref; operator decides")
 

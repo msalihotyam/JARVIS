@@ -19,6 +19,7 @@ from jarvis.work_ledger import EventKind, RunState, StepState, WorkRun, WorkStep
 from jarvis.work_ports import _changes, build_ports
 from jarvis.work_regress import TestResult
 from jarvis.write_stage import StageError, StageManager
+from jarvis.workers.base import WorkerResult
 
 RUN = "run1"
 T0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
@@ -558,7 +559,7 @@ class ApplyTests(ApplyBase):
         self.assertEqual(self.state(), (self.C, self.B, self.C))
 
     # Each unreadable worktree HEAD must refuse apply and undo with nothing moved.
-    def linked_refused(self, corrupt, pattern="."):
+    def linked_refused(self, corrupt, pattern):
         wt = self.linked()
         head, gitdir = (wt / "HEAD").read_bytes(), (wt / "gitdir").read_bytes()
         corrupt(wt)
@@ -576,16 +577,16 @@ class ApplyTests(ApplyBase):
         self.assertEqual(self.state(), (self.C, self.B, self.C))
 
     def test_garbage_worktree_head_fails_closed(self):
-        self.linked_refused(lambda wt: _put(wt / "HEAD", "not a ref\n"))
+        self.linked_refused(lambda wt: _put(wt / "HEAD", "not a ref\n"), "unreadable worktree HEAD")
 
     def test_directory_worktree_head_fails_closed(self):
         def corrupt(wt):
             (wt / "HEAD").unlink()
             (wt / "HEAD").mkdir()
-        self.linked_refused(corrupt)
+        self.linked_refused(corrupt, "unreadable worktree HEAD")
 
     def test_missing_worktree_head_fails_closed(self):
-        self.linked_refused(lambda wt: (wt / "HEAD").unlink())
+        self.linked_refused(lambda wt: (wt / "HEAD").unlink(), "unreadable worktree HEAD")
 
     def test_over_deep_symref_chain_fails_closed(self):
         heads = Path(self.repo) / ".git" / "refs" / "heads"
@@ -595,18 +596,24 @@ class ApplyTests(ApplyBase):
                 _put(heads / f"c{link}", f"ref: refs/heads/c{link + 1}\n")
             _put(heads / "c8", self.B + "\n")
             _put(wt / "HEAD", "ref: refs/heads/c0\n")
-        self.linked_refused(corrupt)
+        self.linked_refused(corrupt, "unreadable worktree HEAD")
 
     def test_unborn_zero_worktree_head_fails_closed(self):
-        self.linked_refused(lambda wt: _put(wt / "HEAD", "ref: refs/heads/nowhere\n"), "unreadable")
+        self.linked_refused(lambda wt: _put(wt / "HEAD", "ref: refs/heads/nowhere\n"), "unreadable worktree HEAD")
 
     def test_unlisted_worktree_record_fails_closed(self):
-        self.linked_refused(lambda wt: (wt / "gitdir").unlink(), "do not match|unreadable")
+        self.linked_refused(lambda wt: (wt / "gitdir").unlink(), "do not match")
 
     def test_case_variant_checked_out_name_is_refused(self):
-        self.linked_refused(lambda wt: _put(wt / "HEAD", f"ref: {REF.replace('jarvis', 'JARVIS').upper()}\n"
-                                            .replace("REFS/HEADS", "refs/heads")),
-                            "checked out|unreadable")
+        variant = REF.replace("jarvis", "JARVIS").replace(RUN, RUN.upper()).replace("main", "MAIN")
+        loose = Path(self.repo) / ".git" / variant
+
+        def corrupt(wt):
+            if not loose.exists():  # a case-sensitive filesystem needs the variant made
+                loose.parent.mkdir(parents=True, exist_ok=True)
+                _put(loose, self.ref() + "\n")
+            _put(wt / "HEAD", f"ref: {variant}\n")
+        self.linked_refused(corrupt, "checked out")
 
     def test_symbolic_integration_ref_fails_closed_in_apply(self):
         self.git(self.repo, "update-ref", OTHER, self.B)
@@ -738,3 +745,209 @@ class ResumeTests(ApplyBase):
         self.assertEqual(findings[0]["detail"], "gate_error:StageError")
         key, _ = self.ports.apply_intent(self.step)
         self.assertEqual(self.state(key), (self.B, None, None))
+
+
+BROKEN = {"garbage": "garbage\n", "empty": "", "short": "abcdef0123\n", "zero": "0" * 40 + "\n",
+          "dangling": "ref: refs/heads/nowhere\n"}
+
+
+class ApplyFixTests(ApplyBase):
+    def test_commit_equal_to_base_applies_nothing(self):
+        self.git(self.jarvis_repo(self.stage), "update-ref", self.pin_ref(self.stage), self.B)
+        with (mock.patch.object(work_ports, "_transact") as transact,
+              mock.patch.object(stage_git, "import_commit") as imported,
+              self.assertRaisesRegex(StageError, "nothing to apply")):
+            self.ports.apply(self.stage, None)
+        transact.assert_not_called()
+        imported.assert_not_called()
+        self.assertEqual(self.state(), (self.B, None, None))
+
+    def test_checkout_during_import_refuses_before_the_transaction(self):
+        real = stage_git.import_commit
+
+        def checkout_then_import(*args, **kwargs):
+            self.git(self.repo, "symbolic-ref", "HEAD", REF)
+            return real(*args, **kwargs)
+        with (mock.patch.object(stage_git, "import_commit", checkout_then_import),
+              self.assertRaisesRegex(StageError, "checked out")):
+            self.ports.apply(self.stage, None)
+        self.assertEqual(self.state(), (self.B, None, None))
+
+    def test_absent_ref_and_absent_new_is_not_applied(self):
+        self.git(self.repo, "update-ref", self.record("old"), self.B)
+        self.git(self.repo, "update-ref", "-d", REF)
+        with self.assertRaisesRegex(StageError, "does not match"):
+            self.ports.applied(self.stage, "k")
+        with self.assertRaisesRegex(StageError, "partial"):
+            self.ports.undo(self.stage, "k")
+        self.assertEqual(self.state(), (None, self.B, None))
+
+    def test_absent_ref_with_no_records_is_not_at_base(self):
+        self.git(self.repo, "update-ref", "-d", REF)
+        with self.assertRaisesRegex(StageError, "does not match"):
+            self.ports.applied(self.stage, "k")
+        with self.assertRaisesRegex(StageError, "not at the stage base"):
+            self.ports.undo(self.stage, "k")
+
+    def test_absent_ref_with_both_records_is_not_applied(self):
+        self.import_c()
+        self.git(self.repo, "update-ref", self.record("old"), self.B)
+        self.git(self.repo, "update-ref", self.record("new"), self.C)
+        self.git(self.repo, "update-ref", "-d", REF)
+        for call in (self.ports.applied, self.ports.undo):
+            with self.assertRaisesRegex(StageError, "does not match"):
+                call(self.stage, "k")
+        self.assertEqual(self.state(), (None, self.B, self.C))
+
+
+class BrokenRefTests(ApplyBase):
+    def calls(self):
+        return (lambda: self.ports.applied(self.stage, "k"),
+                lambda: self.ports.undo(self.stage, "k"))
+
+    def assert_refused(self, ref, *calls):
+        path = Path(self.repo) / ".git" / ref
+        original = path.read_bytes() if path.exists() else None
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for shape, text in BROKEN.items():
+            with self.subTest(ref=ref, shape=shape):
+                _put(path, text)
+                before = path.read_bytes()
+                for call in calls:
+                    with self.assertRaisesRegex(StageError, "broken ref refused"):
+                        call()
+                    self.assertEqual(path.read_bytes(), before)
+        if original is None:
+            path.unlink()
+        else:
+            path.write_bytes(original)
+
+    def test_broken_integration_ref_before_apply(self):
+        self.assert_refused(REF, lambda: self.ports.apply(self.stage, None), *self.calls())
+        self.assertEqual(self.state(), (self.B, None, None))
+
+    def test_broken_integration_ref_after_apply(self):
+        self.ports.apply(self.stage, None)
+        self.assert_refused(REF, *self.calls())
+        self.assertEqual(self.state(), (self.C, self.B, self.C))
+
+    def test_broken_lone_record_is_not_absent(self):
+        for which in ("old", "new"):
+            self.assert_refused(self.record(which), *self.calls())
+        self.assertEqual(self.state(), (self.B, None, None))
+
+    def test_broken_record_after_apply(self):
+        self.ports.apply(self.stage, None)
+        for which in ("old", "new"):
+            self.assert_refused(self.record(which), *self.calls())
+        self.assertEqual(self.state(), (self.C, self.B, self.C))
+
+    def test_broken_record_stops_apply_moving_the_ref(self):
+        path = Path(self.repo) / ".git" / self.record("old")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for shape in ("garbage", "empty", "short", "dangling"):
+            with self.subTest(shape=shape):
+                _put(path, BROKEN[shape])
+                with self.assertRaises(StageError):
+                    self.ports.apply(self.stage, None)
+                self.assertEqual(self.ref(), self.B)
+
+    def test_packed_garbage_line_refuses(self):
+        packed = Path(self.repo) / ".git" / "packed-refs"
+        self.assertFalse(packed.exists())
+        _put(packed, f"# pack-refs with: peeled fully-peeled sorted \nzzzz {self.record('old')}\n")
+        for call in self.calls():
+            with self.assertRaisesRegex(StageError, "broken ref refused"):
+                call()
+        packed.unlink()
+
+    def test_record_that_is_a_directory_with_a_child_refuses(self):
+        self.git(self.repo, "update-ref", self.record("old") + "/child", self.B)
+        with self.assertRaisesRegex(StageError, "unexpected ref listing"):
+            self.ports.applied(self.stage, "k")
+
+    def test_empty_directory_at_a_record_is_absent(self):
+        (Path(self.repo) / ".git" / self.record("old")).mkdir(parents=True)
+        self.assertIs(self.ports.applied(self.stage, "k"), False)
+
+
+class SliceChainTests(Base):
+    def chain(self, count, after_first=None):
+        head = self.commit_in(self.repo, "keep.txt", "keep\n")
+        self.check_outputs *= count
+        ports = self.build(targets={f"s{n}.txt": "file" for n in range(1, count + 1)})
+        tips, stages = [], []
+
+        def start(task):
+            step, stage = task
+            stages.append(stage)
+            tips.append(self.commit_in(stage.path, f"s{step.ordinal}.txt", "s\n"))
+            if step.ordinal == 1 and after_first:
+                after_first()
+            return "id"
+        fake = types.SimpleNamespace(
+            start=start, stop=lambda run_id: None,
+            collect=lambda run_id: WorkerResult("completed", "s", (), ()))
+        ports.route = lambda step: "w"
+        ports.worker = lambda name: fake
+        ports.task = lambda step, stage, findings: (step, stage)
+        ports.budget_exhausted = lambda: False
+        ports.needs_input = lambda result: False
+        ports.verify_cwd = lambda stage: None
+        ports.link_rescan = lambda stage: ()
+        steps = [WorkStep(RUN, step_key(RUN, n, f"s{n}"), n, f"s{n}", StepState.PENDING, self.clock())
+                 for n in range(1, count + 1)]
+        _, done = work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), steps, ports)
+        self.assertEqual([step.state for step in done], [StepState.ACCEPTED] * count)
+        self.assertEqual(len(stages), count)
+        return head, ports, done, tips, stages
+
+    def tip(self):
+        return work_ports._ref(self.repo, REF)
+
+    def test_second_slice_applies_on_the_integration_tip_and_undoes(self):
+        head, ports, done, tips, stages = self.chain(2)
+        self.assertEqual(stages[0].base, head)
+        self.assertEqual(stages[1].base, tips[0])
+        self.assertEqual(self.tip(), tips[1])
+        key, receipted = ports.apply_intent(done[1])
+        self.assertIs(receipted, True)
+        self.assertIs(ports.applied(stages[1], key), True)
+        ports.undo(stages[1], key)
+        self.assertEqual(self.tip(), tips[0])
+        self.assertIs(ports.applied(stages[1], key), False)
+        first, _ = ports.apply_intent(done[0])
+        self.assertIs(ports.applied(stages[0], first), True)
+
+    def test_third_slice_builds_on_the_second(self):
+        _, _, _, tips, stages = self.chain(3)
+        self.assertEqual(stages[2].base, tips[1])
+        self.assertEqual(self.tip(), tips[2])
+
+    def test_head_moving_between_slices_does_not_change_the_base(self):
+        _, _, _, tips, stages = self.chain(
+            2, after_first=lambda: self.commit_in(self.repo, "z.txt", "z\n"))
+        self.assertEqual(stages[1].base, tips[0])
+        self.assertEqual(self.tip(), tips[1])
+
+    def test_reattach_keeps_the_recorded_base(self):
+        _, ports, done, tips, stages = self.chain(2)
+        again = ports.stage_create(done[1])
+        self.assertEqual((again.base, again.branch), (tips[0], stages[1].branch))
+
+    def test_broken_or_symbolic_integration_ref_stops_stage_create(self):
+        head = self.commit_in(self.repo, "keep.txt", "keep\n")
+        path = Path(self.repo) / ".git" / REF
+        path.parent.mkdir(parents=True, exist_ok=True)
+        for shape, text in BROKEN.items():
+            with self.subTest(shape=shape):
+                _put(path, text)
+                before = path.read_bytes()
+                with self.assertRaisesRegex(StageError, "broken ref refused"):
+                    self.ports.stage_create(self.step)
+                self.assertEqual(path.read_bytes(), before)
+        path.unlink()
+        self.git(self.repo, "update-ref", OTHER, head)
+        self.git(self.repo, "symbolic-ref", REF, OTHER)
+        with self.assertRaisesRegex(StageError, "symbolic"):
+            self.ports.stage_create(self.step)
