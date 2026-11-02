@@ -106,23 +106,32 @@ def _changes(repo, base, commit):
 
 def _ref(repo, ref):
     """The value of a plain ref, None when absent; a symbolic ref fails closed."""
-    lines = _git(repo, "for-each-ref", "--format=%(refname) %(objectname) %(symref)",
-                 ref).decode("utf-8", "replace").splitlines()
+    listing = ("for-each-ref", "--format=%(refname) %(objectname) %(symref)")
+    lines = _git(repo, *listing, ref).decode("utf-8", "replace").splitlines()
     if not lines:
         # for-each-ref skips a broken ref with rc 0, so absence needs checks that fail on one.
         try:
-            _git(repo, "update-ref", "--no-deref", "--stdin",
-                 input=f"start\nverify {ref}\nprepare\nabort\n".encode())
-            resolved = _git(repo, "rev-parse", "--revs-only", "--end-of-options", ref)
+            # The full name tells ref itself from what rev-parse would guess, like refs/tags/<ref>.
+            named = _git(repo, "rev-parse", "--revs-only", "--symbolic-full-name",
+                         "--end-of-options", ref).decode("utf-8", "replace").strip()
             # A named lookup binary-searches a "sorted" packed-refs and can step over a bad line.
-            _git(repo, "for-each-ref", "--format=%(refname)")
+            rows = _git(repo, *listing).decode("utf-8", "replace").splitlines()
+            # rev-parse steps past a zero OID file to a same-named tag, and the transaction misses it.
+            present = named == ref or (Path(repo) / ".git" / ref).is_file()
+            if not present:
+                _git(repo, "update-ref", "--no-deref", "--stdin",
+                     input=f"start\nverify {ref}\nprepare\nabort\n".encode())
         except StageError as exc:
             raise StageError(f"broken ref refused: {ref}: {exc}") from exc
-        if resolved.strip():  # the transaction misses a zero OID file
+        if not present:
+            return None
+        # ref exists but the named listing missed it: a broken file, listed nowhere, or a loose
+        # ref under a directory another branch spelled in another case, listed by that name.
+        lines = [row for row in rows if row.split(" ")[0].casefold() == ref.casefold()]
+        if not lines:
             raise StageError(f"broken ref refused: {ref}")
-        return None
     fields = lines[0].split(" ")
-    if len(lines) != 1 or len(fields) != 3 or fields[0] != ref:
+    if len(lines) != 1 or len(fields) != 3 or fields[0].casefold() != ref.casefold():
         raise StageError("unexpected ref listing")
     if fields[2]:
         raise StageError(f"symbolic ref refused: {ref}")
@@ -134,13 +143,14 @@ def _refuse_checked_out(target, ref):
     # git reports a garbage, directory, missing or over-deep worktree HEAD as rc 0 with a
     # zero HEAD, and skips an unreadable worktree record, so neither reads as "not checked out".
     records = _git(target, "worktree", "list", "--porcelain", "-z").split(b"\0\0")
+    gitdir = Path(target) / ".git"
     try:
-        linked = len(os.listdir(Path(target) / ".git" / "worktrees"))
+        linked = os.listdir(gitdir / "worktrees")
     except FileNotFoundError:
-        linked = 0
+        linked = []
     except OSError as exc:
         raise StageError("unreadable worktree records") from exc
-    if records.pop() or len(records) != 1 + linked:
+    if records.pop() or len(records) != 1 + len(linked):
         raise StageError("worktree records do not match git's listing")
     for record in records:
         attrs = record.decode("utf-8", "surrogateescape").split("\0")
@@ -151,6 +161,17 @@ def _refuse_checked_out(target, ref):
         # NTFS and APFS fold ref names: HEAD naming Int moves when int moves.
         if any(branch.casefold() == ref.casefold() for branch in branches):
             raise StageError(f"integration ref is checked out: {ref}")
+    # A paused rebase lists as detached, and finishing it force-moves the branch it names.
+    for base in (gitdir, *(gitdir / "worktrees" / name for name in linked)):
+        for state in ("rebase-merge", "rebase-apply"):
+            try:
+                head = (base / state / "head-name").read_bytes()
+            except (FileNotFoundError, NotADirectoryError):
+                continue
+            except OSError as exc:
+                raise StageError("unreadable rebase state") from exc
+            if head.decode("utf-8", "surrogateescape").strip().casefold() == ref.casefold():
+                raise StageError(f"integration ref is checked out: {ref}")
 
 
 def _transact(repo, *lines):
@@ -168,6 +189,9 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
     review(stage, diff) returns a work_review.GateDecision; fixture_hash(dir)
     hashes the fixtures of a git-free export of the judged commit.
     """
+    # run_id reaches ref names and update-ref's stdin, so a newline would inject transaction lines.
+    if not isinstance(run_id, str) or not re.fullmatch(_ID, run_id):
+        raise StageError("invalid run or slice identifier")
     target = Path(target)
     notifier = NotificationCore(write=store.append_work_event, events=store.work_events)
 
