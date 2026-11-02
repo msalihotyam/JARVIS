@@ -4,7 +4,9 @@ import hashlib
 import inspect
 import json
 import os
+import shutil
 import stat
+import subprocess
 import tempfile
 import types
 import unittest
@@ -58,7 +60,7 @@ class Base(unittest.TestCase):
         data = input.encode() if input is not None else None
         return self.manager._git(cwd, *args, input=data).decode("utf-8", "replace")
 
-    def build(self, targets=None):
+    def build(self, targets=None, run_id=RUN):
         def fake_run_check(argv, *, stage, jarvis_repo):
             allowed = stage / "allowed.txt"
             self.exported.append((stage, (stage / ".git").exists(),
@@ -79,7 +81,7 @@ class Base(unittest.TestCase):
 
         return build_ports(
             store=SQLiteMemoryStore(self.db), manager=self.manager, target=self.repo,
-            lease_target="project/", run_id=RUN, boot_id="boot-1", clock=self.clock,
+            lease_target="project/", run_id=run_id, boot_id="boot-1", clock=self.clock,
             lease=timedelta(minutes=5), targets=targets or {"allowed.txt": "file"},
             jarvis_repo=False, checks=[("python", "-m", "unittest")],
             base_result=TestResult(3, frozenset()), locked_fixture_hash="a" * 64,
@@ -534,8 +536,10 @@ class ApplyTests(ApplyBase):
 
     def test_apply_refused_when_main_worktree_has_the_ref_checked_out(self):
         self.git(self.repo, "symbolic-ref", "HEAD", REF)
-        with self.assertRaisesRegex(StageError, "checked out"):
+        with (mock.patch.object(stage_git, "import_commit") as imported,
+              self.assertRaisesRegex(StageError, "checked out")):
             self.ports.apply(self.stage, None)
+        imported.assert_not_called()  # refused before any object reaches the target
         self.assertEqual(self.state(), (self.B, None, None))
 
     def test_undo_refused_when_main_worktree_has_the_ref_checked_out(self):
@@ -861,6 +865,15 @@ class BrokenRefTests(ApplyBase):
                 call()
         packed.unlink()
 
+    def test_absent_record_with_a_stale_lock_is_not_proven_absent(self):
+        lock = Path(self.repo) / ".git" / (self.record("old") + ".lock")
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        _put(lock, "")
+        with self.assertRaisesRegex(StageError, "broken ref refused"):
+            self.ports.applied(self.stage, "k")
+        lock.unlink()
+        self.assertIs(self.ports.applied(self.stage, "k"), False)
+
     def test_record_that_is_a_directory_with_a_child_refuses(self):
         self.git(self.repo, "update-ref", self.record("old") + "/child", self.B)
         with self.assertRaisesRegex(StageError, "unexpected ref listing"):
@@ -951,3 +964,117 @@ class SliceChainTests(Base):
         self.git(self.repo, "symbolic-ref", REF, OTHER)
         with self.assertRaisesRegex(StageError, "symbolic"):
             self.ports.stage_create(self.step)
+
+
+class RunIdTests(Base):
+    def test_bad_run_id_fails_before_any_target_write(self):
+        head = self.git(self.repo, "rev-parse", "HEAD").strip()
+        victim = "refs/heads/victim"
+        injected = f"run1/main\nupdate {victim} {head}\nprepare\ncommit\n"
+        before = self.git(self.repo, "for-each-ref")
+        for run_id in (injected, "run1\n", "", 7, None, "run/1", "-run", "r" * 65):
+            with self.subTest(run_id=run_id):
+                with self.assertRaisesRegex(StageError, "invalid run"):
+                    self.build(run_id=run_id)
+                self.assertEqual(self.git(self.repo, "for-each-ref", victim), "")
+                self.assertEqual(self.git(self.repo, "for-each-ref"), before)
+
+    def test_longest_run_id_builds(self):
+        self.build(run_id="r" * 64)
+
+
+class RefExactTests(Base):
+    VARIANT = REF.replace("jarvis", "JARVIS")
+
+    def head(self):
+        return self.git(self.repo, "rev-parse", "HEAD").strip()
+
+    def put(self, ref, text):
+        path = Path(self.repo) / ".git" / ref
+        path.parent.mkdir(parents=True, exist_ok=True)
+        _put(path, text)
+
+    def test_valid_ref_under_a_case_variant_directory_is_its_value(self):
+        self.put(self.VARIANT, self.head() + "\n")
+        self.assertEqual(work_ports._ref(self.repo, REF), self.head())
+
+    def test_broken_shapes_under_a_case_variant_directory_refuse(self):
+        for shape, text in BROKEN.items():
+            with self.subTest(shape=shape):
+                self.put(self.VARIANT, text)
+                with self.assertRaisesRegex(StageError, "broken ref refused"):
+                    work_ports._ref(self.repo, REF)
+
+    def test_symbolic_ref_under_a_case_variant_directory_refuses(self):
+        self.git(self.repo, "update-ref", OTHER, self.head())
+        self.put(self.VARIANT, f"ref: {OTHER}\n")
+        with self.assertRaisesRegex(StageError, "ref refused"):
+            work_ports._ref(self.repo, REF)
+
+    def test_case_variant_only_in_packed_refs_is_absent(self):
+        _put(Path(self.repo) / ".git" / "packed-refs",
+             f"# pack-refs with: peeled fully-peeled sorted \n{self.head()} {self.VARIANT}\n")
+        self.assertIsNone(work_ports._ref(self.repo, REF))
+
+    def test_tag_named_like_an_absent_ref_is_absent(self):
+        self.git(self.repo, "update-ref", f"refs/tags/{REF}", self.head())
+        self.assertIsNone(work_ports._ref(self.repo, REF))
+        self.assertEqual(self.ports.stage_create(self.step).base, self.head())
+
+    def test_tag_named_like_a_broken_ref_does_not_hide_it(self):
+        self.git(self.repo, "update-ref", f"refs/tags/{REF}", self.head())
+        for shape, text in BROKEN.items():
+            with self.subTest(shape=shape):
+                self.put(REF, text)
+                with self.assertRaisesRegex(StageError, "broken ref refused"):
+                    work_ports._ref(self.repo, REF)
+
+
+class RebaseTests(ApplyBase):
+    def assert_refused(self, gitdir, state, name, call):
+        pause = gitdir / state
+        pause.mkdir()
+        _put(pause / "head-name", name + "\n")
+        before = self.state()
+        with self.assertRaisesRegex(StageError, "checked out"):
+            call()
+        self.assertEqual(self.state(), before)
+        shutil.rmtree(pause)
+
+    def test_paused_rebase_of_the_ref_refuses_apply_and_undo(self):
+        main, linked = Path(self.repo) / ".git", self.linked()
+        for call, setup in ((lambda: self.ports.apply(self.stage, None), None),
+                            (lambda: self.ports.undo(self.stage, "k"),
+                             lambda: self.ports.apply(self.stage, None))):
+            if setup:
+                setup()
+            for gitdir in (main, linked):
+                for state in ("rebase-merge", "rebase-apply"):
+                    with self.subTest(gitdir=gitdir.name, state=state):
+                        self.assert_refused(gitdir, state, REF, call)
+
+    def test_case_variant_name_refuses(self):
+        self.assert_refused(Path(self.repo) / ".git", "rebase-merge", REF.upper(),
+                            lambda: self.ports.apply(self.stage, None))
+
+    def test_paused_rebase_of_another_ref_does_not_refuse(self):
+        pause = Path(self.repo) / ".git" / "rebase-merge"
+        pause.mkdir()
+        _put(pause / "head-name", OTHER + "\n")
+        self.assertEqual(self.ports.apply(self.stage, None), self.C)
+        self.ports.undo(self.stage, "k")
+        self.assertEqual(self.ref(), self.B)
+
+    def test_real_paused_rebase_in_a_linked_worktree_refuses(self):
+        wt = self.home / "wt"
+        # The short name: a full refname would make git detach instead of checking the branch out.
+        self.git(self.repo, "worktree", "add", str(wt), REF.removeprefix("refs/heads/"))
+        self.commit_in(wt, "clash.txt", "ours\n")
+        onto = self.commit_in(self.repo, "clash.txt", "theirs\n")
+        rebase = subprocess.run(
+            ["git", "-C", str(wt), "-c", "user.name=t", "-c", "user.email=t@t", "rebase", onto],
+            capture_output=True)
+        self.assertNotEqual(rebase.returncode, 0)
+        self.assertNotIn(REF, self.git(self.repo, "worktree", "list", "--porcelain"))
+        with self.assertRaisesRegex(StageError, "checked out"):
+            work_ports._refuse_checked_out(self.repo, REF)
