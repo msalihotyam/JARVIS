@@ -36,6 +36,11 @@ from jarvis.write_stage import Stage, StageError
 _OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _ID = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
 _BRANCH = re.compile(rf"jarvis/({_ID})/({_ID})")
+# Casefolded. These pass _ID but name git refs, update-ref's stdin verbs or Windows devices.
+_RESERVED = frozenset({
+    "head", "fetch_head", "orig_head", "merge_head", "refs", "main", "update", "start", "delete",
+    "prepare", "commit", "verify", "create", "option", "con", "prn", "aux", "nul",
+    *(f"com{n}" for n in range(1, 10)), *(f"lpt{n}" for n in range(1, 10))})
 
 
 def _payload(event):
@@ -190,7 +195,8 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
     hashes the fixtures of a git-free export of the judged commit.
     """
     # run_id reaches ref names and update-ref's stdin, so a newline would inject transaction lines.
-    if not isinstance(run_id, str) or not re.fullmatch(_ID, run_id):
+    if (not isinstance(run_id, str) or not re.fullmatch(_ID, run_id)
+            or run_id.casefold() in _RESERVED):
         raise StageError("invalid run or slice identifier")
     target = Path(target)
     notifier = NotificationCore(write=store.append_work_event, events=store.work_events)
@@ -227,6 +233,19 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
                 return stage
         # A later slice builds on what the earlier ones applied; only the first starts at HEAD.
         current = _ref(target, f"refs/heads/jarvis/{run_id}/main")
+        # The ledger says where the ref must be; anything else would drop or absorb foreign work.
+        history = [_payload(event) for event in events()]
+        receipts = [p for p in history if p.get("gate") == "apply" and p.get("passed") is True]
+        stages = [p for p in history if p.get("gate") == "stage"]
+        expected = stages[0]["base"] if stages else None
+        if receipts:
+            # A resumed apply's receipt holds "verified", not an OID; its apply record has the tip.
+            expected = str(receipts[-1].get("ref"))
+            if not _OID.fullmatch(expected):
+                key = _sha256(receipts[-1]["idempotency_key"].encode())
+                expected = _ref(target, f"refs/jarvis/applied/{run_id}/{key}/new")
+        if current != expected or (current is None and stages):
+            raise StageError("integration ref does not match the ledger; operator")
         stage = manager.create(target, run_id, step.key, base=current or "HEAD")
         append_event(EventKind.PROGRESS, step.key, {
             "gate": "stage", "target": str(stage.target), "path": str(stage.path),
@@ -361,7 +380,11 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
 
     def apply(stage, receipt):
         repo, commit = _judged(stage)
-        if commit == stage.base:
+        try:
+            empty = stage_git.tree_of(repo, commit) == stage_git.tree_of(repo, stage.base)
+        except (stage_git.StageGitError, ValueError) as exc:
+            raise StageError(str(exc)) from exc
+        if empty:
             raise StageError("nothing to apply")
         ref, records = _refs(stage, _pending_key(stage))
         # Early refusal only; the transaction's expected old is the authority.
