@@ -484,6 +484,47 @@ class ApplyTests(ApplyBase):
         self.assertEqual(self.state(), (self.C, self.B, self.C))
         self.assertIs(self.ports.applied(self.stage, "k"), True)
 
+    def test_same_tree_commit_is_nothing_to_apply(self):
+        self.git(self.stage.path, "read-tree", "-u", "--reset", self.B)
+        tree = self.git(self.stage.path, "rev-parse", f"{self.B}^{{tree}}").strip()
+        empty = self.git(self.stage.path, "commit-tree", tree, "-p", self.B, input="empty\n").strip()
+        self.git(self.stage.path, "update-ref", "HEAD", empty)
+        self.assertEqual(self.ports.scope_check(self.stage), [])
+        self.assertEqual(self.pinned(self.stage), empty)
+        self.assertNotEqual(empty, self.B)
+        with self.assertRaisesRegex(StageError, "nothing to apply"):
+            self.ports.apply(self.stage, None)
+        self.assertEqual(self.state(), (self.B, None, None))
+
+    def second_after_verified_receipt(self):
+        self.assertEqual(self.ports.apply(self.stage, None), self.C)
+        work_driver._receipt(self.step, "k", "verified", self.ports)
+        return WorkStep(RUN, step_key(RUN, 2, "two"), 2, "two", StepState.PENDING, self.clock())
+
+    def test_resumed_receipt_is_checked_against_the_apply_record(self):
+        second = self.second_after_verified_receipt()
+        self.assertEqual(self.ports.stage_create(second).base, self.C)
+
+    def test_resumed_receipt_refuses_a_moved_ref(self):
+        second = self.second_after_verified_receipt()
+        self.git(self.repo, "update-ref", REF, self.B)
+        with self.assertRaisesRegex(StageError, "does not match the ledger"):
+            self.ports.stage_create(second)
+
+    def test_resumed_receipt_refuses_a_missing_record(self):
+        second = self.second_after_verified_receipt()
+        self.git(self.repo, "update-ref", "-d", self.record("new"))
+        with self.assertRaisesRegex(StageError, "does not match the ledger"):
+            self.ports.stage_create(second)
+
+    def test_resumed_receipt_refuses_a_missing_ref_and_record(self):
+        second = self.second_after_verified_receipt()
+        self.git(self.repo, "update-ref", "-d", self.record("new"))
+        self.git(self.repo, "update-ref", "-d", REF)
+        with self.assertRaisesRegex(StageError, "does not match the ledger"):
+            self.ports.stage_create(second)
+        self.assertEqual(self.ref(), None)
+
     def test_ref_not_at_base_is_refused_with_no_record(self):
         self.git(self.repo, "update-ref", REF, self.X)
         with self.assertRaisesRegex(StageError, "re-run"):
@@ -885,7 +926,7 @@ class BrokenRefTests(ApplyBase):
 
 
 class SliceChainTests(Base):
-    def chain(self, count, after_first=None):
+    def rig(self, count, after_first=None):
         head = self.commit_in(self.repo, "keep.txt", "keep\n")
         self.check_outputs *= count
         ports = self.build(targets={f"s{n}.txt": "file" for n in range(1, count + 1)})
@@ -910,6 +951,10 @@ class SliceChainTests(Base):
         ports.link_rescan = lambda stage: ()
         steps = [WorkStep(RUN, step_key(RUN, n, f"s{n}"), n, f"s{n}", StepState.PENDING, self.clock())
                  for n in range(1, count + 1)]
+        return head, ports, steps, tips, stages
+
+    def chain(self, count, after_first=None):
+        head, ports, steps, tips, stages = self.rig(count, after_first)
         _, done = work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), steps, ports)
         self.assertEqual([step.state for step in done], [StepState.ACCEPTED] * count)
         self.assertEqual(len(stages), count)
@@ -948,6 +993,66 @@ class SliceChainTests(Base):
         again = ports.stage_create(done[1])
         self.assertEqual((again.base, again.branch), (tips[0], stages[1].branch))
 
+    def assert_move_between_slices_fails_closed(self, move):
+        head, ports, steps, tips, stages = self.rig(2)
+        real, seen = ports.stage_create, {}
+
+        def stage_create(step):
+            if step.ordinal == 2:
+                move(head, tips[0])
+                seen["refs"] = self.git(self.repo, "for-each-ref")
+                seen["stages"] = sorted(p.name for p in stages[0].path.parent.iterdir())
+            return real(step)
+        ports.stage_create = stage_create
+        with self.assertRaisesRegex(StageError, "does not match the ledger"):
+            work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), steps, ports)
+        self.assertEqual(len(stages), 1)  # slice 2's worker never started
+        self.assertEqual(self.git(self.repo, "for-each-ref"), seen["refs"])
+        self.assertEqual(sorted(p.name for p in stages[0].path.parent.iterdir()), seen["stages"])
+
+    def test_ref_rewound_between_slices_fails_closed(self):
+        self.assert_move_between_slices_fails_closed(
+            lambda head, tip: self.git(self.repo, "update-ref", REF, head))
+
+    def test_ref_deleted_between_slices_fails_closed(self):
+        self.assert_move_between_slices_fails_closed(
+            lambda head, tip: self.git(self.repo, "update-ref", "-d", REF))
+
+    def test_ref_deleted_and_head_moved_between_slices_fails_closed(self):
+        def move(head, tip):
+            self.git(self.repo, "update-ref", "-d", REF)
+            self.commit_in(self.repo, "z.txt", "z\n")
+        self.assert_move_between_slices_fails_closed(move)
+
+    def test_foreign_commit_on_the_tip_between_slices_fails_closed(self):
+        def move(head, tip):
+            tree = self.git(self.repo, "rev-parse", f"{tip}^{{tree}}").strip()
+            foreign = self.git(self.repo, "commit-tree", tree, "-p", tip, input="foreign\n").strip()
+            self.git(self.repo, "update-ref", REF, foreign)
+        self.assert_move_between_slices_fails_closed(move)
+
+    def test_first_slice_refuses_a_ref_the_ledger_never_recorded(self):
+        head = self.commit_in(self.repo, "keep.txt", "keep\n")
+        self.git(self.repo, "update-ref", REF, head)
+        before = self.git(self.repo, "for-each-ref")
+        with self.assertRaisesRegex(StageError, "does not match the ledger"):
+            self.ports.stage_create(self.step)
+        self.assertEqual(self.git(self.repo, "for-each-ref"), before)
+
+    def test_without_a_receipt_the_ref_must_stay_at_the_recorded_start(self):
+        head = self.commit_in(self.repo, "keep.txt", "keep\n")
+        self.ports.stage_create(self.step)
+        # A failed apply gate is not a receipt.
+        self.ports.append_event(EventKind.PROGRESS, self.step.key,
+                                {"gate": "apply", "passed": False, "findings": ["x"]})
+        second = WorkStep(RUN, step_key(RUN, 2, "two"), 2, "two", StepState.PENDING, self.clock())
+        third = WorkStep(RUN, step_key(RUN, 3, "three"), 3, "three", StepState.PENDING, self.clock())
+        self.assertEqual(self.ports.stage_create(second).base, head)
+        self.git(self.repo, "update-ref", "-d", REF)
+        with self.assertRaisesRegex(StageError, "does not match the ledger"):
+            self.ports.stage_create(third)
+        self.assertEqual(self.git(self.repo, "for-each-ref", REF), "")
+
     def test_broken_or_symbolic_integration_ref_stops_stage_create(self):
         head = self.commit_in(self.repo, "keep.txt", "keep\n")
         path = Path(self.repo) / ".git" / REF
@@ -972,7 +1077,14 @@ class RunIdTests(Base):
         victim = "refs/heads/victim"
         injected = f"run1/main\nupdate {victim} {head}\nprepare\ncommit\n"
         before = self.git(self.repo, "for-each-ref")
-        for run_id in (injected, "run1\n", "", 7, None, "run/1", "-run", "r" * 65):
+        words = ("HEAD", "FETCH_HEAD", "ORIG_HEAD", "MERGE_HEAD", "refs", "main", "update", "start",
+                 "delete", "prepare", "commit", "verify", "create", "option", "CON", "PRN", "AUX", "NUL",
+                 *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10)))
+        for run_id in (injected, "run1\n", "", 7, None, "run/1", "-run", "r" * 65,
+                       "run 1", " run1", "run1\t", "run\x01", "run\x1b", "run\x00", "run\x7f",
+                       "r\u00fcn", "\u0130", "\u0663", "run\u200b1", "\ufeffrun",
+                       *words, *(w.lower() for w in words), *(w.upper() for w in words),
+                       "Head", "Main", "cOn", "Lpt9"):
             with self.subTest(run_id=run_id):
                 with self.assertRaisesRegex(StageError, "invalid run"):
                     self.build(run_id=run_id)
@@ -981,6 +1093,11 @@ class RunIdTests(Base):
 
     def test_longest_run_id_builds(self):
         self.build(run_id="r" * 64)
+
+    def test_near_misses_of_reserved_words_build(self):
+        for run_id in ("COM10", "LPT10", "console", "HEADER", "mainline", "run-main"):
+            with self.subTest(run_id=run_id):
+                self.build(run_id=run_id)
 
 
 class RefExactTests(Base):
