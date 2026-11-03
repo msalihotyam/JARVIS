@@ -75,7 +75,7 @@ REPLACE_GAP_S = 0.2  # ... this far apart, then skipped with one error event
 STATUS_STALE_S = 600  # status.json older than this: a status_stale attention item
 API_PAGE_WINDOW_S = 600  # 2+ lanes on API errors this close together: an account/network page
 API_PAGE_EVERY_S = 7200  # ... repeated this often while it lasts, night hours included
-ORCH_STALE_S = 5400  # build/orch/heartbeat older than this: the orchestrator is not touring
+HEARTBEAT_GRACE_S = 20 * 60  # the orchestrator is late this long after its planned wake (hb_watch.py GRACE)
 BUDGET_MSGS = 90  # assistant messages before the one wrap-up nudge
 BUDGET_CHECK_S = 600
 BUDGET_NUDGE = "commit the coherent part, list the rest in OPEN ISSUES, write the report"
@@ -166,6 +166,7 @@ BELOW_NORMAL, NORMAL = 0x4000, 0x20  # Windows priority classes of the conveyor'
 PRIORITY = {"present": BELOW_NORMAL, "away": NORMAL}
 POWER_PLANS = {"present": "JarvisWatch", "away": "JarvisFocus"}  # "{plan}" in power_switch_cmd
 POWER_SWITCH_ID = "power-switch"  # attention id (and ack file) of a failed power switch
+URGENT_PAGE_IDS = {"outage", "status_stale", POWER_SWITCH_ID}  # page Salih (+ breaker, needs_salih)
 POWER_QUERY_TIMEOUT_S = 15  # power_switch_query_cmd; a timeout means "unreadable": no switch
 # Active plans the switch may override, by GUID (powercfg names are localized/codepage-mangled):
 # LaptopControl JarvisWatch / JarvisFocus (PowerProfileApplyService.cs ProfileSchemeGuids) and the
@@ -955,6 +956,7 @@ class Conveyor:
         self.lanes_bad = None  # why lanes.json could not be read this pass: nothing saves over it
         self.archive_seen = {}  # lane -> last session-archive skip/failure logged (SESSIONSWEEP)
         self.quiet = set()  # attention ids that never page (attention() refills it)
+        self.salih = set()  # attention ids the reader classed needs_salih (attention() refills it)
         self.beat_ts = 0
         self.popen = popen
         self.ledger_proc = None  # (Popen, start ts) of the usage ledger subprocess still running
@@ -1189,7 +1191,8 @@ class Conveyor:
     def pager_watch(self, lanes):
         """Status-only pages (no command, no link), night hours included: 2+ lanes held or
         STUCK on API errors within API_PAGE_WINDOW_S -> at once and every API_PAGE_EVERY_S
-        while it lasts; build/orch/heartbeat older than ORCH_STALE_S -> once per stale episode."""
+        while it lasts; the orchestrator's planned wake + HEARTBEAT_GRACE_S passed -> once per heartbeat
+        value, shared with hb_watch.py through its hb_alert_sent."""
         now = self.now()
         ts = sorted(ln["api_err_ts"] for ln in lanes.values() if ln.get("api_err_ts") and (
             (ln.get("paused") and not ln.get("finished"))
@@ -1201,17 +1204,37 @@ class Conveyor:
                 self.pager_flag("api_outage", {"since": (f or {}).get("since", now), "paged": now})
         elif f:
             self.pager_flag("api_outage", False)
+        wake = self.orch_wake()
+        if wake and now > wake[0] + HEARTBEAT_GRACE_S and self.pager_flag("orch_stale") != wake[1]:
+            self.pager_flag("orch_stale", wake[1])
+            sent = self.root / "build" / "orch" / "hb_alert_sent"
+            try:
+                paged = sent.read_text(encoding="utf-8", errors="replace").strip() == wake[1]
+            except OSError:
+                paged = False
+            if not paged:  # hb_watch has not paged this value; the claim stops it paging it too
+                self.page("Orkestratör planlı uyanışını kaçırdı; sohbete 'devam' yazın")
+                try:
+                    sent.write_text(wake[1], encoding="utf-8")
+                except OSError:
+                    pass
+
+    def orch_wake(self):
+        """(epoch of the orchestrator's next planned wake, heartbeat value), parsed as hb_watch.py does
+        (old format: mtime + 60 min). Never late while build/orch/chain_off exists (stopped on
+        purpose). None without a heartbeat file: nothing to watch."""
+        orch = self.root / "build" / "orch"
+        if (orch / "chain_off").exists():
+            return float("inf"), "chain_off"
         try:
-            age = now - (self.root / "build" / "orch" / "heartbeat").stat().st_mtime
+            raw = (orch / "heartbeat").read_text(encoding="utf-8", errors="replace").strip()
+            mtime = (orch / "heartbeat").stat().st_mtime
         except OSError:
-            age = None  # no orchestrator heartbeat file: nothing to watch
-        stale = self.pager_flag("orch_stale")
-        if age is not None and age > ORCH_STALE_S:
-            if not stale:
-                self.page("Orkestratör 90 dk tur atmadı; sohbete 'devam' yazın")
-                self.pager_flag("orch_stale", now)
-        elif stale:
-            self.pager_flag("orch_stale", False)
+            return None
+        try:
+            return float(raw.split()[0]), raw
+        except (ValueError, IndexError):
+            return mtime + 60 * 60, raw or str(mtime)
 
     def started_ts(self, ln):
         if "started_ts" in ln:
@@ -2584,6 +2607,38 @@ class Conveyor:
         # CONVAUTO: a BLOCKED integration lane whose fix-forward re-run <INT>-R is done counts as done
         return ok(sid) or bool(INT_RE.match(sid)) and ok(f"{sid}-R")
 
+    def int_pushed(self, dep, lanes):
+        """CONVINTDEP: local main == origin/main, and it and the last push event hold the SHA of the
+        finished integration lane `dep` (or of its re-run). Pushes fast-forward, so the last one covers
+        the earlier ones (a stacked push too). Anything unknown: False, the dependent stays queued."""
+        name = f"{dep}-R" if self.slice_done(f"{dep}-R", lanes) else dep
+        try:
+            ln = lanes.get(name) or {}
+            found = ln.get("report") or (self.find_report(name) or [None])[0]
+            if not found:
+                return False
+            sha = self.main_and_ci(Path(found).read_text(encoding="utf-8-sig", errors="replace"))[1]
+            main = self.main_head()
+            rc, origin = self.cmd(["git", "rev-parse", "--verify", "refs/remotes/origin/main"])
+            if not sha or not main or rc != 0 or origin.strip() != main:
+                return False
+            lines = (self.base / "events.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
+            push = next((r for r in map(self.push_record, reversed(lines)) if r), None)
+            return bool(push) and all(sha == x or self.is_ancestor(sha, x) for x in (main, push["sha"]))
+        except (OSError, RuntimeError):
+            return False
+
+    @staticmethod
+    def push_record(line):
+        """The events.jsonl line as a dict if it is a well-formed push event, else None."""
+        if '"push"' not in line:
+            return None
+        try:
+            rec = json.loads(line)
+        except ValueError:
+            return None
+        return rec if isinstance(rec, dict) and rec.get("event") == "push" and rec.get("sha") else None
+
     def pick_slice(self, slices, lanes, busy, skip=()):
         """First dispatchable slice (or None) and a {id: state} view of the backlog;
         a ready slice in skip (its worker's cap is full this pass) is not chosen."""
@@ -2611,6 +2666,9 @@ class Conveyor:
                 view[sid] = "dead"  # BREAKERV2: a lane of its auto-fix chain failed, the chain stops
             elif not all(self.slice_done(d, lanes, bool(INT_RE.match(sid))) for d in s.get("depends_on", [])):
                 view[sid] = "waiting_deps"
+            elif not INT_RE.match(sid) and not all(self.int_pushed(d, lanes) for d in s.get("depends_on", [])
+                                                   if INT_RE.match(d)):
+                view[sid] = "waiting_deps"  # CONVINTDEP: finished is not yet on origin
             elif any(files_overlap(s.get("files", []), rf) for rf in run_files):
                 view[sid] = "overlap"
             elif sid in busy:
@@ -2635,6 +2693,8 @@ class Conveyor:
         hdr = re.match(r"﻿?@jarvis(\s|$)", first)
         m = re.search(r"(?:^|\s)base=([0-9a-f]{7,40}|main)(?:\s|$)", first) if hdr else None
         base = m.group(1) if m else "main"
+        if base == "main" and any(INT_RE.match(d) for d in s.get("depends_on", [])) and not INT_RE.match(s["id"]):
+            base = self.main_head() or base  # CONVINTDEP: the main int_pushed verified this pass
         return (f"@jarvis lane={s['id']} model={s['model']} effort={s['effort']} base={base}\n"
                 + (rest if hdr else body)), base
 
@@ -2740,7 +2800,7 @@ class Conveyor:
         STATUS (bad, STUCK or unknown), a running lane blocked too long, a non-pass reading, and the backlog
         running dry. Routine ids (self.quiet: a PASS needing only the orchestrator, FINDINGS,
         cleanup refused, preserved) stay on the board but never page (backstop)."""
-        items, self.quiet = [], set()
+        items, self.quiet, self.salih = [], set(), set()
         for n, ln in lanes.items():
             if not ln.get("finished") and ln.get("blocked_attention"):  # CONV9, see unblock()
                 items.append((n, f"lane blocked, needs orchestrator: blocked since "
@@ -2768,6 +2828,8 @@ class Conveyor:
                 lead = "reader says needs_salih" if r["kind"] == "needs_salih" else f"reader {r['kind']}"
                 why.append(f"{lead}: {r.get('summary', '')}")
                 loud = loud or r["kind"] != "needs_orchestrator"
+                if r["kind"] == "needs_salih":
+                    self.salih.add(n)
             if ln.get("auto_refused"):
                 why.append(f"auto-approval refused: {ln['auto_refused']}")
                 loud = True
@@ -2850,18 +2912,34 @@ class Conveyor:
         return [i for i in items if not self.acked(i[0], i[2])]
 
     def backstop(self, items):
-        """Page Salih once per attention item the orchestrator left unacked ATTENTION_PAGE_S.
-        At night (NIGHT_HOURS) the page waits for the morning, unless the breaker is open."""
+        """Page Salih once per urgent or needs_salih item left unacked ATTENTION_PAGE_S (the breaker at
+        once). The orchestrator's own items, routine ones included, stay silent until its planned wake +
+        HEARTBEAT_GRACE_S has passed, then one combined page per heartbeat value. Without a heartbeat
+        file nobody watches them: they page one by one as before (routine ones never). At night
+        (NIGHT_HOURS) the page waits for the morning, unless the breaker is open."""
         if local_hour(self.now()) in NIGHT_HOURS and not self.breaker:
             return
-        done = self.pager_flag("backstop") or {}
+        done, now = self.pager_flag("backstop") or {}, self.now()
+        wake, routine = self.orch_wake(), []
         for i, why, since in items:
-            if i in self.quiet:  # CONVPAGE: routine, the board is enough
+            if i in (DRY_ID, CLEANUP_REGISTRY_ID):  # never page here: board / rm_registry's own page
                 continue
-            if self.now() - since >= ATTENTION_PAGE_S and done.get(i) != since:
-                self.page(f"Orkestratör {ATTENTION_PAGE_S // 60} dk tepki vermedi: {i}: {why}")
+            if i == BREAKER_ID:
+                due, text = True, f"Devre kesici açık: {why}"
+            elif i in URGENT_PAGE_IDS or i in self.salih or not wake and i not in self.quiet:
+                due, text = now - since >= ATTENTION_PAGE_S, \
+                    f"Orkestratör {ATTENTION_PAGE_S // 60} dk tepki vermedi: {i}: {why}"
+            else:
+                if wake and now - since >= ATTENTION_PAGE_S:
+                    routine.append(i)
+                continue
+            if due and done.get(i) != since:
+                self.page(text)
                 done[i] = since
                 self.pager_flag("backstop", done)
+        if routine and now > wake[0] + HEARTBEAT_GRACE_S and self.pager_flag("backstop_combined") != wake[1]:
+            self.page(f"Orkestratör uyanmadı, {len(routine)} madde bekliyor: {', '.join(routine[:5])}")
+            self.pager_flag("backstop_combined", wake[1])
 
     def write_status(self, lanes, items):
         status = {

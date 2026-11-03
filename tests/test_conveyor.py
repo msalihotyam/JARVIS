@@ -2816,6 +2816,34 @@ class TestReader(Base):
         self.c.pass_once()
         self.assertEqual(len(self.pushes), 1)  # A escalates; the dry item stays quiet
         self.assertIn("A: reader says needs_salih: karar", self.pushes[0])
+
+    def planned_wake(self, due):
+        hb = self.root / "build" / "orch" / "heartbeat"
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.write_text(str(due))
+
+    def test_needs_orchestrator_stays_silent_before_the_planned_wake_then_one_combined_page(self):
+        self.reply = answer({"kind": "needs_orchestrator", "summary": "bak", "next": "n"})
+        self.finish_a()
+        self.planned_wake(self.t + 4 * 3600)
+        self.t += 3 * 3600
+        self.c.pass_once()
+        self.assertEqual(self.pushes, [])
+        self.t += 3600 + conveyor.HEARTBEAT_GRACE_S + 60
+        self.c.pass_once()
+        self.c.pass_once()
+        combined = [p for p in self.pushes if "madde bekliyor" in p]
+        self.assertEqual(len(combined), 1)
+        self.assertIn("A", combined[0])
+
+    def test_needs_salih_pages_at_31_minutes_even_with_a_future_wake(self):
+        self.reply = answer({"kind": "needs_salih", "summary": "karar", "next": "n"})
+        self.finish_a()
+        self.planned_wake(self.t + 4 * 3600)
+        self.t += 31 * 60
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 1)
+        self.assertIn("A: reader says needs_salih: karar", self.pushes[0])
         self.t += conveyor.ATTENTION_PAGE_S + 3600
         self.c.pass_once()
         self.assertEqual(len(self.pushes), 1)  # once per item
@@ -5262,9 +5290,7 @@ class TestNightQuiet(AutopilotBase):
             self.report(n, "BLOCKED")
         self.c.pass_once()
         self.assertEqual(self.status()["breaker"], "open")
-        self.t += conveyor.ATTENTION_PAGE_S
-        self.c.pass_once()
-        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(len(self.pushes), 1)  # at once, no ATTENTION_PAGE_S wait
         self.assertIn("breaker", self.pushes[0])
 
 
@@ -5729,6 +5755,8 @@ class TestCIHandoff(AutopilotBase):
         self.git.ci(SHA_B)
         self.c.pass_once()
         self.assertEqual(self.lanes()["INT1-R"]["status"], "GREEN")
+        self.assertNotIn("G", self.fake.bg_names())  # CONVINTDEP: dispatched before this pass's push
+        self.c.pass_once()
         self.assertIn("G", self.fake.bg_names())
 
     def test_gh_unreadable_keeps_waiting_never_green(self):
@@ -6578,10 +6606,200 @@ class TestConvSafe(AutopilotBase):
         hb = self.root / "build" / "orch" / "heartbeat"
         hb.parent.mkdir(parents=True, exist_ok=True)
         hb.write_text("")
-        os.utime(hb, (self.t - conveyor.ORCH_STALE_S - 60,) * 2)
+        os.utime(hb, (self.t - 3600 - conveyor.HEARTBEAT_GRACE_S - 60,) * 2)  # old format: mtime + 60 min
         self.c.pager_watch({})
         self.c.pager_watch({})
         self.assertEqual(len(pages("devam")), 1)
+
+
+class PageBase(Base):
+    """CONVPAGE2: what reaches Salih's phone, read from the durable queue before any flush."""
+
+    def beat(self, text, mtime=None):
+        hb = self.root / "build" / "orch" / "heartbeat"
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.write_text(text)
+        if mtime is not None:
+            os.utime(hb, (mtime, mtime))
+        return hb
+
+    def pages(self, word=""):
+        try:
+            queued = json.loads(self.c.pager_file.read_text(encoding="utf-8")).get("pending", [])
+        except OSError:
+            queued = []
+        return [p for p in queued if word in p]
+
+
+class TestOrchStalePage(PageBase):
+    def test_pages_once_per_value_only_after_due_plus_grace(self):
+        due = self.t + 3600
+        hb = self.beat(str(due))
+        self.c.pager_watch({})
+        self.assertEqual(self.pages(), [])
+        self.t = due + 19 * 60
+        self.c.pager_watch({})
+        self.assertEqual(self.pages(), [])
+        self.t = due + 21 * 60
+        self.c.pager_watch({})
+        self.c.pager_watch({})
+        self.assertEqual(len(self.pages("planlı uyanış")), 1)
+        self.assertEqual(hb.read_text(), str(due))  # the orchestrator's file is never written
+        self.assertEqual((hb.parent / "hb_alert_sent").read_text(encoding="utf-8"), str(due))  # hb_watch: already
+        self.beat(str(due + 30))
+        self.c.pager_watch({})
+        self.c.pager_watch({})
+        self.assertEqual(len(self.pages("planlı uyanış")), 2)
+
+    def test_old_format_falls_back_to_mtime_plus_an_hour(self):
+        self.beat("", mtime=self.t - 3600 - 19 * 60)
+        self.c.pager_watch({})
+        self.assertEqual(self.pages(), [])
+        self.t += 2 * 60
+        self.c.pager_watch({})
+        self.assertEqual(len(self.pages("planlı uyanış")), 1)
+
+    def test_a_value_hb_watch_already_paged_is_not_paged_again(self):
+        hb = self.beat(str(self.t - 3600))
+        (hb.parent / "hb_alert_sent").write_text(str(self.t - 3600), encoding="utf-8")
+        self.c.pager_watch({})
+        self.assertEqual(self.pages(), [])
+
+    def test_chain_off_and_no_heartbeat_never_page(self):
+        self.c.pager_watch({})
+        self.assertEqual(self.pages(), [])
+        hb = self.beat(str(self.t - 3600))
+        (hb.parent / "chain_off").write_text("")
+        self.c.pager_watch({})
+        self.assertEqual(self.pages(), [])
+
+
+class TestBackstopPage(PageBase):
+    def test_orchestrator_item_is_silent_before_the_wake_then_one_combined_page_per_value(self):
+        due = self.t + 3600
+        self.beat(str(due))
+        items = [("A", "reader blocked: x", self.t - 3 * 3600), ("B", "findings", self.t - 3 * 3600)]
+        self.c.quiet = {"B"}
+        self.c.backstop(items)
+        self.t = due + 19 * 60
+        self.c.backstop(items)
+        self.assertEqual(self.pages(), [])
+        self.t = due + 21 * 60
+        self.c.backstop(items)
+        self.c.backstop(items)
+        (page,) = self.pages()
+        self.assertIn("2 madde bekliyor: A, B", page)
+        self.beat(str(self.t - 3600))
+        self.c.backstop(items)
+        self.c.backstop(items)
+        self.assertEqual(len(self.pages("madde bekliyor")), 2)
+
+    def test_needs_salih_and_urgent_items_page_after_the_wait_despite_a_future_wake(self):
+        self.beat(str(self.t + 6 * 3600))
+        ids = ["A", "outage", "status_stale", conveyor.POWER_SWITCH_ID]
+        self.c.salih = {"A"}
+        self.c.backstop([(i, "why", self.t - 29 * 60) for i in ids])
+        self.assertEqual(self.pages(), [])
+        items = [(i, "why", self.t - 31 * 60) for i in ids]
+        self.c.backstop(items)
+        self.c.backstop(items)
+        self.assertEqual(len(self.pages()), 4)
+        for i in ids:
+            self.assertEqual(len(self.pages(f"{i}: why")), 1)
+
+    def test_breaker_pages_at_once_even_at_night(self):
+        self.beat(str(self.t + 6 * 3600))
+        self.hour = 3
+        self.c.breaker = {"reason": "kota", "since": self.t}
+        items = [(conveyor.BREAKER_ID, "kota", self.t)]
+        self.c.backstop(items)
+        self.c.backstop(items)
+        self.assertEqual(len(self.pages("Devre kesici açık: kota")), 1)
+
+    def test_night_holds_needs_salih_until_morning(self):
+        self.beat(str(self.t + 6 * 3600))
+        self.c.salih = {"A"}
+        items = [("A", "why", self.t - 31 * 60)]
+        self.hour = 3
+        self.c.backstop(items)
+        self.assertEqual(self.pages(), [])
+        self.hour = 8
+        self.c.backstop(items)
+        self.assertEqual(len(self.pages("A: why")), 1)
+
+    def test_without_a_heartbeat_loud_items_page_one_by_one_and_quiet_ones_never(self):
+        self.c.quiet = {"B"}
+        self.c.backstop([(i, "why", self.t - 31 * 60) for i in "AB"])
+        self.assertEqual(len(self.pages()), 1)
+        self.assertEqual(len(self.pages("A: why")), 1)
+
+
+class TestIntDependent(AutopilotBase):
+    """CONVINTDEP: a dependent of an INT lane waits for the push, and its prompt names the main it verified."""
+
+    def setUp(self):
+        super().setUp()
+        self.git = self.c.cmd = StackGit([ORIGIN, SHA_A, SHA_B])
+        self.backlog({"id": "INT1", "files": ["@main-checkout"]}, {"id": "G", "depends_on": ["INT1"]})
+        self.c.pass_once()
+        self.assertIn("INT1", self.fake.bg_names())
+        self.git.main = SHA_A
+        self.t += 60
+        self.finish("INT1", "CI_PENDING", f"NEW MAIN SHA: {SHA_A}\nCI: pushed ci/int1, run in progress\n")
+
+    def green_without_push(self):
+        with mock.patch.object(self.c, "push_gate", lambda *a, **k: None):
+            self.git.ci(SHA_A)
+            self.c.pass_once()
+            self.c.pass_once()
+        self.assertEqual((self.lanes()["INT1"]["status"], self.git.pushes()), ("GREEN", []))
+
+    def test_green_without_a_push_does_not_dispatch_the_dependent(self):
+        self.green_without_push()
+        self.assertEqual(self.view()["G"], "waiting_deps")
+        self.assertNotIn("G", self.fake.bg_names())
+
+    def test_push_with_main_holding_the_sha_dispatches_once_with_the_sha(self):
+        self.git.ci(SHA_A)
+        self.c.pass_once()
+        self.assertEqual(self.git.origin, SHA_A)
+        self.assertNotIn("G", self.fake.bg_names())
+        self.c.pass_once()
+        (call,) = [c for c in self.fake.bg_calls() if c[2] == "G"]
+        self.assertTrue(any(f"base={SHA_A}" in str(a) for a in call), call)
+        self.c.event("push", sha=SHA_A, ci_run="dup", approval="dup")  # the same event again
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names().count("G"), 1)
+
+    def test_failed_push_leaves_the_dependent_queued(self):
+        self.git.fail[("git", "push")] = (1, "rejected")
+        self.git.ci(SHA_A)
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.git.origin, ORIGIN)
+        self.assertEqual(self.view()["G"], "waiting_deps")
+        self.assertNotIn("G", self.fake.bg_names())
+
+    def test_a_push_event_alone_is_not_enough_main_must_equal_origin_and_hold_the_sha(self):
+        self.green_without_push()
+        self.c.event("push", sha=SHA_A, ci_run="r", approval="a")  # recorded, origin never moved
+        with mock.patch.object(self.c, "push_gate", lambda *a, **k: None):
+            self.c.pass_once()
+        self.assertNotIn("G", self.fake.bg_names())
+        self.git.origin = ORIGIN
+        self.git.main = ORIGIN  # main == origin, but neither holds the SHA
+        with mock.patch.object(self.c, "push_gate", lambda *a, **k: None):
+            self.c.pass_once()
+        self.assertNotIn("G", self.fake.bg_names())
+
+    def test_a_push_event_older_than_the_sha_is_not_enough(self):
+        self.green_without_push()
+        self.git.origin = SHA_A  # main == origin holds the SHA, but no push event records it
+        self.c.event("push", sha=ORIGIN, ci_run="r", approval="a")
+        with mock.patch.object(self.c, "push_gate", lambda *a, **k: None):
+            self.c.pass_once()
+        self.assertNotIn("G", self.fake.bg_names())
 
 
 if __name__ == "__main__":
