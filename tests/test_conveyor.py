@@ -7556,15 +7556,46 @@ class TestChain(AutopilotBase):
         self.git.fail.update({
             self.PIN + ("rev-parse", "--verify", "--quiet", f"{self.SHA}^{{commit}}"): (0, self.SHA + "\n"),
             ("git", "merge-base", "--is-ancestor", self.SHA, ORIGIN): (1, ""),
-            self.PIN + ("merge-base", self.SHA, ORIGIN): (0, "d" * 40 + "\n"),
-            self.PIN + ("rev-list",): (0, self.SHA + "\n"),
             self.PIN + ("diff", "--name-only"): (0, "\0".join(files) + "\0"),
         })
 
-    def start(self, **kw):
-        self.backlog({"id": "SRC", "files": ["scripts/a.py"], "chain": ["CLREV", "INT"], **kw})
+    def src_prompt(self, s):
+        (self.base / "prompts").mkdir(parents=True, exist_ok=True)
+        (self.base / "prompts" / f"{s['id']}.md").write_text(
+            f"@jarvis lane={s['id']} model=sonnet effort=medium base={self.git.main}\nTASK {s['id']}\nbody\n"
+            + "".join(f"{f} (new)\n" for f in s["files"]), encoding="utf-8")
+
+    def start(self, *others, **kw):
+        s = {"id": "SRC", "files": ["scripts/a.py"], "chain": ["CLREV", "INT"], **kw}
+        self.git.fail.setdefault(self.PIN + ("rev-list",), (0, f"{self.SHA} {self.git.main}\n"))
+        self.src_prompt(s)
+        self.backlog(s, *others)
         self.c.pass_once()
         self.t += 60
+
+    def other(self):  # waits for SRC, so it can only dispatch in the pass that sees SRC finish
+        return {"id": "OTHER", "files": ["scripts/c.py"], "depends_on": ["SRC"]}
+
+    def src_ln(self):
+        self.report("SRC", "PASS", extra=self.PICK)
+        return {"status": "PASS", "base": self.git.main,
+                "report": str(self.root / ".claude/worktrees/wt/build/reports/SRC.md")}
+
+    def raising_parents(self, exc, times=10 ** 6):
+        real, left = self.c.cmd, [times]
+
+        def cmd(args, *a, **k):
+            if "--parents" in args and left[0]:
+                left[0] -= 1
+                raise exc
+            return real(args, *a, **k)
+        self.c.cmd = cmd
+        return real
+
+    def failing_write(self, name):
+        real = self.c.write_atomic
+        self.c.write_atomic = lambda p, t, *a, **k: False if Path(p).name == name else real(p, t, *a, **k)
+        return real
 
     def state(self):
         f = self.base / "autopilot.json"
@@ -7691,7 +7722,8 @@ class TestChain(AutopilotBase):
         self.start()
         self.report("SRC", "PASS", extra=self.PICK, mtime=self.t)
         s = next(x for x in self.c.load_backlog()[0] if x["id"] == "SRC")
-        ln = {"status": "PASS", "report": str(self.root / ".claude/worktrees/wt/build/reports/SRC.md")}
+        ln = {"status": "PASS", "base": self.git.main,
+              "report": str(self.root / ".claude/worktrees/wt/build/reports/SRC.md")}
         first, second = {"since": 0}, {"since": 0}
         self.assertIsNone(self.c.chain_step(s, ln, {"SRC": ln}, first, {"SRC"}))
         raw = self.prompt("CLREV-SRC").read_bytes()
@@ -7768,7 +7800,8 @@ class TestChain(AutopilotBase):
         self.assertEqual((new["model"], new["effort"], new["files"], new["depends_on"]),
                          ("sonnet", "medium", ["@main-checkout"], ["CLREV-SRC"]))
         text = self.prompt("INT-SRC").read_text(encoding="utf-8")
-        for want in (self.SHA, f"base={ORIGIN}", "ci/int-src", "Expected files only: scripts/a.py."):
+        for want in (self.SHA, f"base={ORIGIN}", "ci/int-src", "Expected files only: scripts/a.py.",
+                     "Paths under build/reports/ are not counted"):
             self.assertIn(want, text)
         self.assertEqual(self.state()["chain"][f"SRC@{self.SHA}"]["steps"], ["CLREV-SRC", "INT-SRC"])
         self.assertIn("INT-SRC", self.fake.bg_names())
@@ -7782,6 +7815,294 @@ class TestChain(AutopilotBase):
         self.assertEqual(self.ids(), ["INT-SRC"])
         self.assertEqual(self.state()["chain_slices"][0]["depends_on"], ["SRC"])
         self.no_authority()
+
+    # (a) nothing the chain raises aborts the pass
+    def test_timeout_defers_other_lane_dispatches_then_retries(self):
+        self.start(self.other())
+        real = self.raising_parents(subprocess.TimeoutExpired("git", 120))
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.nothing()
+        self.assertIn("OTHER", self.lanes())
+        self.assertNotIn("chain_refused", self.lanes()["SRC"])
+        self.assertTrue(self.state())
+        self.c.cmd = real
+        self.c.pass_once()
+        self.assertEqual(self.ids(), ["CLREV-SRC"])
+
+    def test_anything_raised_by_the_walk_stays_inside_the_pass(self):
+        self.start(self.other())
+
+        def boom(*a):
+            raise TypeError("boom")
+        self.c.chain_walk = boom
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.assertIn("OTHER", self.lanes())
+        self.assertTrue(self.state())
+        self.assertIn("TypeError", json.dumps(self.ev("error")))
+        self.assertEqual(self.ids(), [])
+
+    def test_deferred_source_does_not_lose_the_next_ones_chain(self):
+        b = {"id": "B", "files": ["scripts/b.py"], "chain": ["CLREV"]}
+        self.src_prompt(b)
+        self.commit(files=("scripts/b.py",))
+        self.start(b)
+        self.c.pass_once()
+        self.raising_parents(subprocess.TimeoutExpired("git", 120), times=1)
+        self.report("SRC", "PASS", mtime=self.t, extra=self.PICK)
+        self.report("B", "PASS", mtime=self.t, extra=self.PICK)
+        self.c.pass_once()
+        self.assertEqual(self.ids(), ["CLREV-B"])
+        self.assertEqual((len(self.ev("chain")), self.ev("chain_refused")), (1, []))
+
+    def test_git_failure_defers_then_retries(self):
+        self.start()
+        good = dict(self.git.fail)
+        self.report("SRC", "PASS", mtime=self.t, extra=self.PICK)
+        for key, bad in ((("git", "rev-parse", "--verify", "refs/remotes/origin/main"), (1, "")),
+                         (("git", "merge-base", "--is-ancestor", self.SHA, ORIGIN), (128, "")),
+                         (self.PIN + ("rev-list",), (128, "")),
+                         (self.PIN + ("diff", "--name-only"), (128, ""))):
+            with self.subTest(key=key[-1]):
+                self.git.fail[key] = bad
+                self.c.pass_once()
+                self.t += 60
+                self.nothing()
+                self.assertNotIn("chain_refused", self.lanes()["SRC"])
+                self.git.fail = dict(good)
+        self.c.pass_once()
+        self.assertEqual(self.ids(), ["CLREV-SRC"])
+
+    def bad_template(self, raw):
+        (self.tpl / "CLREV.md").write_bytes(raw + (self.tpl / "CLREV.md").read_bytes())
+        self.start(self.other())
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.c.pass_once()
+        self.refused("template CLREV.md unreadable")
+        self.assertFalse(self.prompt("CLREV-SRC").exists())
+        self.assertIn("OTHER", self.lanes())
+
+    def test_undecodable_template_refused_once_other_lane_dispatches(self):
+        self.bad_template(b"\xff\xfe")
+
+    def test_bom_template_refused_once_other_lane_dispatches(self):
+        self.bad_template(b"\xef\xbb\xbf")
+
+    def test_malformed_chain_record_refused_and_nothing_written(self):
+        key = f"SRC@{self.SHA}"
+        s = {"id": "SRC", "files": ["scripts/a.py"], "chain": ["CLREV", "INT"], "tier": "T1"}
+        ln = self.src_ln()
+        for rec in ({"steps": [{}]}, {"steps": []}, {"steps": ["SRC"], "at": 1},
+                    {"steps": ["CLREV-SRC", "INT-SRC", "X"], "at": 1}, {"steps": ["CLREV-SRC"]},
+                    {"at": 1}, 3, [], None):
+            with self.subTest(rec=rec):
+                ap = {"chain": {key: rec}}
+                why = self.c.chain_step(s, ln, {}, ap, set())
+                self.assertIn("malformed chain record", why or "")
+                self.assertEqual(ap, {"chain": {key: rec}})
+                self.assertFalse(self.prompt("CLREV-SRC").exists())
+
+    def test_malformed_chain_record_refused_once_in_the_pass(self):
+        self.start(self.other())
+        ap = self.state()
+        ap["chain"] = {f"SRC@{self.SHA}": {"steps": [{}]}}
+        (self.base / "autopilot.json").write_text(json.dumps(ap), encoding="utf-8")
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.c.pass_once()
+        self.refused("malformed chain record")
+        self.assertIn("OTHER", self.lanes())
+        self.assertFalse(self.prompt("CLREV-SRC").exists())
+
+    # (b) the facts are sha^..sha of a non-merge whose parent is the slice's base
+    def test_commit_not_a_single_child_of_base_refused(self):
+        for parents in (f"{self.SHA} {MAIN} {'e' * 40}\n", f"{self.SHA}\n", f"{self.SHA} {'e' * 40}\n"):
+            with self.subTest(parents=parents[40:60]):
+                self.git.fail[self.PIN + ("rev-list",)] = (0, parents)
+                main, why = self.c.chain_verify({"files": ["scripts/a.py"]}, {"base": MAIN}, self.SHA)
+                self.assertIsNone(main)
+                self.assertIn("only commit", why)
+
+    def test_merge_commit_refused_in_the_pass(self):
+        self.git.fail[self.PIN + ("rev-list",)] = (0, f"{self.SHA} {MAIN} {'e' * 40}\n")
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.refused("only commit")
+        self.assertFalse(self.prompt("CLREV-SRC").exists())
+
+    def test_base_must_be_a_full_sha_and_no_merge_base_fallback(self):
+        for base in (None, "main", MAIN[:7]):
+            with self.subTest(base=base):
+                main, why = self.c.chain_verify({"files": ["scripts/a.py"]}, {"base": base}, self.SHA)
+                self.assertIsNone(main)
+                self.assertIn("not a full sha", why)
+        self.assertEqual([c for c in self.git.calls if "merge-base" in c and "--is-ancestor" not in c], [])
+
+    def test_files_come_from_the_commit_alone(self):
+        self.git.fail[self.PIN + ("rev-list",)] = (0, f"{self.SHA} {MAIN}\n")
+        main, files = self.c.chain_verify({"files": ["scripts/a.py"]}, {"base": MAIN}, self.SHA)
+        self.assertEqual((main, files), (ORIGIN, ["scripts/a.py"]))
+        diff = [c for c in self.git.calls if "--name-only" in c]
+        self.assertEqual([list(c)[-2:] for c in diff], [[f"{self.SHA}^", self.SHA]])
+
+    # (c) a file name that is not plainly safe never reaches a prompt
+    def test_unsafe_file_name_refused_even_under_a_glob_grant(self):
+        self.git.fail[self.PIN + ("rev-list",)] = (0, f"{self.SHA} {MAIN}\n")
+        grant = {"files": ["scripts/*", "build/reports/*"]}
+        for name in ("scripts/a b.py", "scripts/a..b.py", "scripts/ä.py", "scripts/a\nb.py",
+                     "scripts/{ID}.py", "build/reports/x y.md"):
+            with self.subTest(name=name):
+                self.commit(files=(name,))
+                main, why = self.c.chain_verify(grant, {"base": MAIN}, self.SHA)
+                self.assertIsNone(main)
+                self.assertIn("unsafe file name", why)
+                self.assertNotIn(name, why)
+
+    def test_unsafe_report_path_refused_in_the_pass(self):
+        self.commit(files=("scripts/a.py", "build/reports/x y.md"))
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.refused("unsafe file name")
+        self.assertFalse(self.prompt("CLREV-SRC").exists())
+
+    # (d) any finding line stops the chain, MINOR too
+    def test_source_finding_refused(self):
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK + "MAJOR: broken\n")
+        self.refused("finding")
+        self.assertFalse(self.prompt("CLREV-SRC").exists())
+
+    def test_review_minor_finding_stops_before_int(self):
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.c.pass_once()
+        self.t += 60
+        self.finish("CLREV-SRC", "PASS", extra=self.PICK + "MINOR: x\n")
+        self.refused("finding", ids=["CLREV-SRC"])
+        self.assertFalse(self.prompt("INT-SRC").exists())
+
+    def test_finding_line_forms(self):
+        f = self.root / "findings.md"
+        for text, want in (("FINDINGS: a", True), ("FINDINGS:", True), ("FINDING 1 MAJOR x", True),
+                           ("MAJOR 4 (Codex) x", True), ("MINOR (mine): x", True), ("- BLOCKER: x", True),
+                           ("F1 MAJOR: data loss in x", True), ("CHECK 4 FAILED, MAJOR M1 y", True),
+                           ("| MAJOR | x |", True), ("Severity: MAJOR", True), ("STATUS: PASS (MINOR: x)", True),
+                           ("FINDINGS: none\n  F1 MAJOR: x", True), ("no MAJOR but MINOR: x", True),
+                           ("no BLOCKER, MINOR: x", True), ("PASS = no REAL BLOCKER/MAJOR", False),
+                           ("FINDINGS: none", False), ("BLOCKER: n/a", False), ("OPEN ISSUES: none", False)):
+            with self.subTest(text=text):
+                f.write_text(f"STATUS: PASS\n{text}\n", encoding="utf-8")
+                self.assertEqual(conveyor.chain_findings({"report": str(f)}), want)
+        self.assertTrue(conveyor.chain_findings({"report": str(self.root / "absent.md")}))
+
+    # (e) both writes are atomic, the event comes only after they persist
+    def test_autopilot_write_failure_no_event_then_same_prompt_once(self):
+        self.start()
+        real = self.failing_write("autopilot.json")
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.assertEqual((self.ev("chain"), self.ids()), ([], []))
+        text = self.prompt("CLREV-SRC").read_bytes()
+        self.c.write_atomic = real
+        self.c.pass_once()
+        self.assertEqual((len(self.ev("chain")), self.ids()), (1, ["CLREV-SRC"]))
+        self.assertEqual(self.prompt("CLREV-SRC").read_bytes(), text)
+
+    def test_prompt_write_failure_defers_with_no_record(self):
+        self.start()
+        real = self.failing_write("CLREV-SRC.md")
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.nothing()
+        self.assertFalse(self.prompt("CLREV-SRC").exists())
+        self.assertNotIn("chain", self.state())
+        self.assertNotIn("chain_refused", self.lanes()["SRC"])
+        self.c.write_atomic = real
+        self.c.pass_once()
+        self.assertEqual(self.ids(), ["CLREV-SRC"])
+
+    # the fix review's hits
+    def rendered_wrong(self, old, new):
+        p = self.tpl / "CLREV.md"
+        p.write_text(p.read_text(encoding="utf-8").replace(old, new), encoding="utf-8")
+        self.start(self.other())
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.refused("rendered wrong")
+        self.assertFalse(self.prompt("CLREV-SRC").exists())
+        self.assertIn("OTHER", self.lanes())
+
+    def test_template_with_another_lane_id_refused(self):
+        self.rendered_wrong("lane={ID}", "lane=OTHER")
+
+    def test_template_with_unknown_placeholder_refused(self):
+        self.rendered_wrong("Read-only lane.", "{BOGUS} Read-only lane.")
+
+    def test_template_without_the_sha_refused(self):
+        self.rendered_wrong("{SHA}", "x")
+
+    def test_git_failure_on_commit_lookup_defers(self):
+        self.start()
+        key = self.PIN + ("rev-parse", "--verify", "--quiet", f"{self.SHA}^{{commit}}")
+        good = self.git.fail[key]
+        self.git.fail[key] = (128, "fatal")
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.nothing()
+        self.assertNotIn("chain_refused", self.lanes()["SRC"])
+        self.git.fail[key] = good
+        self.c.pass_once()
+        self.assertEqual(self.ids(), ["CLREV-SRC"])
+
+    def test_locked_report_defers_absent_report_does_not(self):
+        with self.assertRaises(OSError):  # a directory: the read fails with something other than "no such file"
+            conveyor.chain_findings({"report": str(self.root)})
+        self.assertIsNone(conveyor.chain_commit({"report": str(self.root / "absent.md")}))
+        self.start()
+        with mock.patch.object(conveyor, "chain_commit", side_effect=PermissionError("locked")):
+            self.finish("SRC", "PASS", extra=self.PICK)
+        self.nothing()
+        self.assertNotIn("chain_refused", self.lanes()["SRC"])
+        self.c.pass_once()
+        self.assertEqual(self.ids(), ["CLREV-SRC"])
+
+    def locked_events(self, *kinds):
+        real = self.c.event
+
+        def event(kind, **kw):
+            if kind in kinds:
+                raise OSError("events.jsonl locked")
+            return real(kind, **kw)
+        self.c.event = event
+        return real
+
+    def test_chain_event_write_failure_keeps_step_and_pass(self):
+        self.start(self.other())
+        self.locked_events("chain")
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.assertEqual(self.ids(), ["CLREV-SRC"])
+        self.assertIn("OTHER", self.lanes())
+
+    def test_refusal_event_write_failure_keeps_pass_and_refuses_once_later(self):
+        self.commit(files=("scripts/other.py",))
+        self.start(self.other())
+        real = self.locked_events("chain_refused", "error")
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.assertNotIn("chain_refused", self.lanes()["SRC"])
+        self.assertIn("OTHER", self.lanes())
+        self.c.event = real
+        self.c.pass_once()
+        self.refused("outside the grant")
+
+    def test_non_list_chain_slices_turns_autopilot_off(self):
+        self.start()
+        self.assertIsNotNone(self.c.auto_state())
+        for bad in ({}, ""):
+            with self.subTest(bad=bad):
+                self.c.auto_file.write_text(json.dumps({**self.state(), "chain_slices": bad}), encoding="utf-8")
+                self.assertIsNone(self.c.auto_state())
+
+    def test_chain_slice_needs_a_full_base_in_its_prompt_header(self):
+        s = {"id": "SRC", "files": ["scripts/a.py"], "chain": ["CLREV"]}
+        for base, bad in (("main", True), ("1234567", True), (self.git.main, False)):
+            with self.subTest(base=base):
+                why = conveyor.lint_slice(s, f"@jarvis lane=SRC model=sonnet effort=medium base={base}\nTASK SRC\n",
+                                          lambda p: True, set())
+                self.assertEqual("full 40-hex" in (why or ""), bad)
 
 
 if __name__ == "__main__":

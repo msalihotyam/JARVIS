@@ -7,5 +7,5 @@ CHECKS:
  3 The tests assert the behaviour (they fail if it breaks).
  4 Run the focused tests of the touched modules on a clean detached checkout of {SHA}: python scripts/test_parallel.py <modules> (FOREGROUND, Bash timeout=600000, %TEMP% file, read its tail); uvx ruff@0.16.0 check <touched .py> --select E4,E7,E9,F.
 OUTPUT: build/reports/{ID}.md. First line STATUS: PASS or STATUS: BLOCKED. Name the reviewed sha on exactly one line "COMMIT: {SHA}".
-List findings as BLOCKER/MAJOR/MINOR. PASS = no REAL BLOCKER/MAJOR; else BLOCKED + one fix slice.
+List findings as BLOCKER/MAJOR/MINOR. PASS = no REAL BLOCKER/MAJOR; else BLOCKED + one fix slice. A line with FINDING(S)/BLOCKER/MAJOR/MINOR anywhere in it stops the chain for the orchestrator, MINOR too; with no finding write none, or only "FINDINGS: none".
 Hard rules: READ-ONLY on source; never commit or push; never touch uv.lock; no reset/restore/stash/clean/checkout of main; no live calls; never open data/jarvis.db. GREEN MEANS STOP.

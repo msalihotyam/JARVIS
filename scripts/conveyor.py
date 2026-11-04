@@ -247,6 +247,12 @@ SCHEMA_LINE = "SCHEMA_VERSION = 10"  # jarvis/memory.py; rollback targets read s
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 CHAIN_GOOD = GOOD - {"GREEN"}  # CONVCHAIN1: a lane's own finish; GREEN is an INT's CI verdict
 CHAIN_COMMIT_RE = re.compile(r"(?m)^[ \t]*COMMIT:(.*)$")  # anchored: "FIX COMMIT:" does not count
+CHAIN_NAME_RE = re.compile(r"[A-Za-z0-9._/-]+")  # CONVCHAIN1FIXA: the only file names a generated prompt may carry
+CHAIN_WORD = r"(?:FINDINGS?|BLOCKERS?|MAJORS?|MINORS?)"
+# capitals anywhere in a line ("F1 MAJOR: x", "| MAJOR |", "Severity: MAJOR", "STATUS: PASS (MINOR: x)"), any case at its start
+CHAIN_FINDING_RE = re.compile(rf"\b{CHAIN_WORD}\b|(?i:^[\s>#*`\-\[(\d.)]*{CHAIN_WORD}\b)")
+CHAIN_CLEAN_RE = re.compile(rf"(?i)^[\s>#*`\-\[(\d.)]*{CHAIN_WORD}[ \t]*:[ \t]*(.*)$")  # value in NONE_WORDS - {{""}} is clean
+CHAIN_NO_RE = re.compile(rf"(?i)\bno\s+(?:real\s+)?{CHAIN_WORD}(?:\s*(?:/|or)\s*{CHAIN_WORD})*")  # verdict "no REAL BLOCKER/MAJOR"
 MIN_FREE_GB = 10  # below this on the repo drive no lane is dispatched
 DISK_ID = "disk-low"  # attention id (and ack file) of a low-disk episode
 PRUNE_TIMEOUT_S = 120  # well below STALE_LOCK_S: a prune never makes the lock look stale
@@ -871,14 +877,39 @@ def validate_slice(s):
     return None
 
 
+def chain_report(ln):
+    """CONVCHAIN1FIXA: a lane's report text, None if it has none; a read that fails otherwise
+    (a locked file) raises, so chain_walk defers instead of refusing for good."""
+    p = ln.get("report")
+    if not p:
+        return None
+    try:
+        return Path(p).read_text(encoding="utf-8-sig", errors="replace")
+    except FileNotFoundError:
+        return None
+
 def chain_commit(ln):
     """CONVCHAIN1: the single COMMIT sha a lane's report names, or None."""
-    try:
-        text = Path(ln.get("report") or "").read_text(encoding="utf-8-sig", errors="replace")
-    except OSError:
+    text = chain_report(ln)
+    if text is None:
         return None
     found = [x.strip() for x in CHAIN_COMMIT_RE.findall(text)]
     return found[0] if len(found) == 1 and SHA_RE.fullmatch(found[0]) else None
+
+
+def chain_findings(ln):
+    """CONVCHAIN1FIXA: the lane's report has a finding line of any severity, or cannot be read.
+    Only "<word>: none" (NONE_WORDS) is clean; an empty "FINDINGS:" may head a list, so it counts."""
+    text = chain_report(ln)
+    if text is None:
+        return True
+    for line in text.splitlines():
+        clean = CHAIN_CLEAN_RE.match(line)
+        if clean and clean[1].strip().rstrip(".").lower() in NONE_WORDS - {""}:
+            continue
+        if CHAIN_FINDING_RE.search(CHAIN_NO_RE.sub("", line)):
+            return True
+    return False
 
 
 def trial_args(advisor):
@@ -904,6 +935,10 @@ def lint_slice(s, prompt_text, exists, known_ids):
     if not prompt_text.lstrip("﻿").strip():
         return "prompt empty"
     sid, files = s["id"], s.get("files", [])
+    if s.get("chain"):  # CONVCHAIN1FIXA: chain_verify needs the lane's parent sha; refuse now, not after the lane ran
+        hdr = check_header(prompt_text)[0]
+        if not hdr or not SHA_RE.fullmatch(hdr["base"]):
+            return "a chain slice needs a full 40-hex base in its prompt header"
     is_int = bool(INT_RE.match(sid))
     if is_int and files != ["@main-checkout"]:
         return 'integration id needs files ["@main-checkout"]'
@@ -1001,6 +1036,7 @@ class Conveyor:
         self.auto_file = self.base / "autopilot.json"
         self.breaker = None  # {"reason", "since"} while open (autopilot.json), else None
         self.chain_dead = set()  # slice ids of failed auto-fix chains: never dispatched (BREAKERV2)
+        self.chain_pending = []  # "chain" events of this pass, written once autopilot.json is saved
         self.band = []  # status.json "band" lines (breaker, auto-approval)
         self.lanes_bad = None  # why lanes.json could not be read this pass: nothing saves over it
         self.archive_seen = {}  # lane -> last session-archive skip/failure logged (SESSIONSWEEP)
@@ -3288,7 +3324,13 @@ class Conveyor:
             self.open_breaker(ap, f"{len(ap['bad'])} lanes finished BLOCKED/STOP/FAIL within 2 h: "
                                   + ", ".join(x[0] for x in ap["bad"]))
         self.breaker = ap.get("breaker")
-        self.chain_walk(lanes, ap)
+        try:
+            self.chain_walk(lanes, ap)
+        except Exception as e:  # CONVCHAIN1FIXA: nothing the chain raises may stop the pass or lose ap
+            try:
+                self.error(f"chain: {type(e).__name__}: {e}"[:300])
+            except OSError:  # events.jsonl locked too: the pass goes on
+                pass
         self.chain_dead = {s for c in chains.values()
                            if any(lanes.get(x, {}).get("finished") and lanes[x].get("status")
                                   not in GOOD | {CI_PENDING} for x in chain_ids(c))
@@ -3296,10 +3338,18 @@ class Conveyor:
         last = ap.get("last_auto")
         self.band = (["breaker: open"] if self.breaker else []) + \
             ([f"auto-approved {last[0][:7]}"] if last and self.now() - last[1] < AUTO_LINE_S else [])
+        pending, self.chain_pending = self.chain_pending, []
         try:
-            self.write_atomic(self.auto_file, json.dumps(ap, indent=2))
+            saved = self.write_atomic(self.auto_file, json.dumps(ap, indent=2))
         except OSError as e:  # e.g. a sharing violation: the next pass re-reads the old state
+            saved = False
             self.error(f"autopilot.json: {e}")
+        if saved:  # a failed write replays the step next pass, so its one event comes then
+            try:
+                for p in pending:
+                    self.event("chain", **p)
+            except OSError:  # events.jsonl locked: the step is saved; the log misses it, the pass goes on
+                pass
 
     def auto_state(self):
         """autopilot.json as a dict of the expected shape; a fresh state when missing; None
@@ -3318,9 +3368,9 @@ class Conveyor:
                 isinstance(k, str) and isinstance(v, dict) for k, v in ap.get("ci_rerun", {}).items()) and all(
                 isinstance(x[0], str) and isinstance(x[1], num) for x in ap.get("bad", [])) and all(
                 isinstance(c, dict) for c in ap.get("chains", {}).values()) and not any(
-                validate_slice(s) for s in ap.get("slices", [])) and not any(
-                validate_slice(s) for s in ap.get("chain_slices", [])) and all(
-                isinstance(c["steps"], list) for c in ap.get("chain", {}).values()) and (
+                validate_slice(s) for s in ap.get("slices", [])) and isinstance(ap.get("chain_slices", []), list) and not any(
+                validate_slice(s) for s in ap.get("chain_slices", [])) and isinstance(
+                ap.get("chain", {}), dict) and (  # chain_step checks each record: one bad one refuses that slice
                 ap.get("last_auto") is None or isinstance(ap["last_auto"][0], str)
                 and isinstance(ap["last_auto"][1], num))
         except (AttributeError, KeyError, TypeError, IndexError):
@@ -3331,6 +3381,7 @@ class Conveyor:
         """CONVCHAIN1: write the next pre-approved step of each finished backlog slice carrying
         "chain". Creates no authority: it only adds slices; approvals and pushes stay with their
         gate. Breaker or PAUSE defers (no refusal, a later pass retries)."""
+        self.chain_pending = []
         if self.breaker or (self.base / "PAUSE").exists():
             return
         slices, _ = self.load_backlog()
@@ -3343,41 +3394,51 @@ class Conveyor:
                 continue
             try:
                 why = self.chain_step(s, ln, lanes, ap, ids)
-            except (OSError, RuntimeError) as e:  # fail closed
-                why = str(e)
-            if why:
-                ln["chain_refused"], ln["chain_refused_at"] = why, self.now()
+            except (subprocess.TimeoutExpired, OSError, RuntimeError) as e:  # git or disk may clear: next pass retries
+                self.error(f"chain {s['id']}: {e}"[:300])
+                continue
+            except Exception as e:  # a bad record or template: fail closed, this slice only
+                why = f"{type(e).__name__}: {e}"[:200]
+            if why:  # the event first: if it cannot be written the flag stays off and the next pass refuses
                 self.event("chain_refused", src=s["id"], reason=why)
+                ln["chain_refused"], ln["chain_refused_at"] = why, self.now()
 
     def chain_verify(self, s, ln, sha):
-        """(origin/main, files the commit changes outside build/reports) or (None, why refused)."""
-        if self.cmd([*GIT_PIN, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"])[0]:
+        """(origin/main, files sha^..sha changes outside build/reports) or (None, why refused);
+        RuntimeError when git cannot answer now (chain_walk retries next pass)."""
+        rc = self.cmd([*GIT_PIN, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"])[0]
+        if rc == 1:  # with --verify --quiet, 1 is "no such commit"; anything else is git failing: defer
             return None, f"commit {sha[:7]} not found"
+        if rc:
+            raise RuntimeError(f"commit {sha[:7]} unreadable (git rc {rc})")
         rc, out = self.cmd(["git", "rev-parse", "--verify", "refs/remotes/origin/main"])
         main = out.strip()
         if rc or not SHA_RE.fullmatch(main):
-            return None, "origin/main unreadable"
+            raise RuntimeError("origin/main unreadable")
         if self.is_ancestor(sha, main):
             return None, f"{sha[:7]} is already on origin/main"
-        start = ln.get("base") or ""
-        if not re.fullmatch(r"[0-9a-f]{7,40}", start):
-            rc, out = self.cmd([*GIT_PIN, "merge-base", sha, main])
-            start = out.strip()
-            if rc or not SHA_RE.fullmatch(start):
-                return None, f"no merge base for {sha[:7]}"
-        rc, out = self.cmd([*GIT_PIN, "rev-list", f"{start}..{sha}"])
-        if rc or out.split() != [sha]:  # INT picks only SHA and CLREV reviews only SHA^..SHA
-            return None, f"{sha[:7]} is not the slice's only commit since {start[:7]}"
-        rc, out = self.cmd([*GIT_PIN, "diff", "--name-only", "--ignore-submodules=none",
-                            "--no-renames", "-z", start, sha])
+        base = ln.get("base") or ""
+        if not SHA_RE.fullmatch(base):
+            return None, "slice base is not a full sha"
+        rc, out = self.cmd([*GIT_PIN, "rev-list", "--parents", "-n", "1", sha])
         if rc:
-            return None, f"diff of {sha[:7]} failed"
-        files = sorted(p for p in out.split("\0") if p and not p.startswith("build/reports/"))
-        outside = [p for p in files if not p.isprintable() or not any(  # a newline must not reach the prompt
+            raise RuntimeError(f"parents of {sha[:7]} unreadable")
+        if out.split() != [sha, base]:  # a merge, a root or another parent: INT picks and CLREV reviews only sha^..sha
+            return None, f"{sha[:7]} is not the slice's only commit on its base {base[:7]}"
+        rc, out = self.cmd([*GIT_PIN, "diff", "--name-only", "--ignore-submodules=none",
+                            "--no-renames", "-z", f"{sha}^", sha])
+        if rc:
+            raise RuntimeError(f"diff of {sha[:7]} failed")
+        names = [p for p in out.split("\0") if p]
+        if any(not CHAIN_NAME_RE.fullmatch(p) or ".." in p for p in names):  # checked before the exclusion
+            return None, f"{sha[:7]} changes an unsafe file name"
+        files = sorted(p for p in names if not p.startswith("build/reports/"))
+        outside = [p for p in files if not any(
             p == g or (p.count("/") == g.count("/") and fnmatch.fnmatchcase(p, g)) for g in s.get("files", []))]
-        if not files or outside:
-            return None, "files outside the grant: " + ", ".join(map(repr, outside[:3])) if outside \
-                else f"{sha[:7]} changes no file"
+        if outside:
+            return None, "files outside the grant: " + ", ".join(map(repr, outside[:3]))
+        if not files:
+            return None, f"{sha[:7]} changes no file"
         return main, files
 
     def chain_step(self, s, ln, lanes, ap, ids):
@@ -3389,16 +3450,27 @@ class Conveyor:
         if not sha:
             return 'report needs exactly one "COMMIT: <40 hex>" line'
         key = f"{src}@{sha}"
-        rec = ap.get("chain", {}).get(key)
-        done = rec["steps"] if rec else []
-        if len(done) >= len(s["chain"]):
+        chain = ap.get("chain", {})
+        rec = chain.get(key)
+        wanted = [f"{x}-{src}" for x in s["chain"]]
+        done = []
+        if key in chain:
+            done = rec.get("steps") if isinstance(rec, dict) else None
+            if (not isinstance(done, list) or not done or done != wanted[:len(done)]
+                    or not isinstance(rec.get("at"), (int, float))):
+                return f"malformed chain record {key}"
+        if len(done) >= len(wanted):
             return None
+        if chain_findings(ln):
+            return f"{src} report has a finding line"
         if done:
             prev = lanes.get(done[-1])
             if not prev or not prev.get("finished"):
                 return None  # not dispatched yet, or still running
             if prev.get("status") != "PASS" or chain_commit(prev) != sha:
                 return f"{done[-1]} did not PASS naming {sha[:7]}"
+            if chain_findings(prev):
+                return f"{done[-1]} report has a finding line"
         step = s["chain"][len(done)]
         nid = f"{step}-{src}"
         main, files = self.chain_verify(s, ln, sha)
@@ -3410,6 +3482,10 @@ class Conveyor:
             tpl = (self.root / "scripts" / "chain_templates" / f"{step}.md").read_text(encoding="utf-8")
         except OSError:
             return f"template {step}.md missing"
+        except UnicodeDecodeError:
+            return f"template {step}.md unreadable"
+        if tpl.startswith("﻿"):
+            return f"template {step}.md unreadable"
         text = fill(tpl, SRC=src, ID=nid, SHA=sha, MAIN=main, TIER=s["tier"], BRANCH=nid.lower(),
                     FILES=", ".join(files))
         new = {"id": nid, "title": f"{step} of {src}", "tier": s["tier"],
@@ -3419,18 +3495,22 @@ class Conveyor:
                "depends_on": [done[-1] if done else src], "prompt": f"build/conveyor/prompts/{nid}.md"}
         if s.get("approved") is True:  # the orchestrator approved the chain with its source slice
             new["approved"] = True
+        hdr, why = check_header(text, main)
         bad = validate_slice(new) or lint_slice(new, text, lambda p: (self.root / p).exists(),
-                                                ids | set(lanes) | {src, *done}) or check_header(text, main)[1]
+                                                ids | set(lanes) | {src, *done}) or why
         if bad:
             return f"generated {nid}: {bad}"
+        if hdr["lane"] != nid or sha not in text or re.search(r"\{[A-Z_]+\}", text):
+            return f"template {step}.md rendered wrong"
         dest = self.root / new["prompt"]
         if dest.exists() and dest.read_text(encoding="utf-8") != text:
             return f"{new['prompt']} exists with other text"
         dest.parent.mkdir(parents=True, exist_ok=True)
-        dest.write_text(text, encoding="utf-8")
+        if not self.write_atomic(dest, text):
+            raise OSError(f"{new['prompt']} not written")
         ap["chain_slices"] = ap.get("chain_slices", []) + [new]
         ap.setdefault("chain", {})[key] = {"steps": done + [nid], "at": rec["at"] if rec else self.now()}
-        self.event("chain", src=src, step=step, id=nid, sha=sha)
+        self.chain_pending.append(dict(src=src, step=step, id=nid, sha=sha))
         return None
 
     def open_breaker(self, ap, reason):
