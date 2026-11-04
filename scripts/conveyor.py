@@ -403,6 +403,8 @@ MEM_RELEASE_S = 60 * 60
 FINDINGS_RE = re.compile(r"(?m)^[\s>#*`-]*FINDINGS:\s*(.*)$")
 CDX_DRY_RE = re.compile(r"(CDX|DRY)")  # audit lanes: BLOCKED is a finding, not a breaker failure
 CHAIN_SUFFIX_RE = re.compile(r"(?i)(-\d+)?-AFX$|-R$|-S$")  # auto-fix chain lanes: same root (BREAKERV2)
+CHAIN_KEY1 = "chain INT: orchestrator key 1"
+CHAIN_MARK = "written by the pre-approved chain"  # line 2 of chain_templates/INT.md
 TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
 ID_RE = re.compile(r"[A-Za-z0-9_-]+")
 
@@ -872,8 +874,11 @@ def validate_slice(s):
         return "bad subagent_model"
     if s.get("worker") in ("codex", "jules") and ("advisor" in s or "subagent_model" in s):
         return "advisor/subagent_model need a Claude lane"  # no flag or env reaches that worker
-    if "chain" in s and s["chain"] not in (["CLREV"], ["INT"], ["CLREV", "INT"]):
-        return "bad chain"
+    if "chain" in s:
+        if s["chain"] not in (["CLREV"], ["INT"], ["CLREV", "INT"], ["CLREV", "CDX", "INT"]):
+            return "bad chain"
+        if s["tier"] == "T2" and "INT" in s["chain"] and s["chain"] != ["CLREV", "CDX", "INT"]:
+            return "T2 chain with INT needs CLREV and CDX"
     return None
 
 
@@ -887,6 +892,18 @@ def chain_report(ln):
         return Path(p).read_text(encoding="utf-8-sig", errors="replace")
     except FileNotFoundError:
         return None
+
+def chain_int_ids(ap):
+    """CONVCHAIN1FIXB: every generated INT id, from both records, so losing one cannot hide an INT.
+    A record's key names its source whatever shape the record has, so a malformed one still counts."""
+    chain = ap.get("chain")
+    chain = chain if isinstance(chain, dict) else {}
+    steps = [f"INT-{k.split('@')[0]}".upper() for k in chain]
+    steps += [x for r in chain.values() if isinstance(r, dict) and isinstance(r.get("steps"), list) for x in r["steps"]]
+    slices = ap.get("chain_slices")
+    steps += [s.get("id") for s in (slices if isinstance(slices, list) else ()) if isinstance(s, dict)]
+    return {x.upper() for x in steps if isinstance(x, str) and INT_RE.match(x)}
+
 
 def chain_commit(ln):
     """CONVCHAIN1: the single COMMIT sha a lane's report names, or None."""
@@ -3061,7 +3078,7 @@ class Conveyor:
                     self.salih.add(n)
             if ln.get("auto_refused"):
                 why.append(f"auto-approval refused: {ln['auto_refused']}")
-                loud = True
+                loud = loud or ln["auto_refused"] != CHAIN_KEY1  # for the orchestrator, no page
             if why and ln.get("auto_fix"):
                 why.append(ln["auto_fix"])
             if ln.get("findings"):  # CONVHEAL: a PASS with findings -> fix lanes (no page, no breaker)
@@ -3444,8 +3461,8 @@ class Conveyor:
     def chain_step(self, s, ln, lanes, ap, ids):
         """One source slice: None (nothing to do, or its next step written) or why it is refused."""
         src = s["id"]
-        if INT_RE.match(src) or re.match(r"(?i)clrev", src) or CHAIN_SUFFIX_RE.search(src):
-            return "an INT, CLREV or AFX lane is never chained"
+        if INT_RE.match(src) or re.match(r"(?i)clrev|cdx", src) or CHAIN_SUFFIX_RE.search(src):
+            return "an INT, CLREV, CDX or AFX lane is never chained"
         sha = chain_commit(ln)
         if not sha:
             return 'report needs exactly one "COMMIT: <40 hex>" line'
@@ -3463,14 +3480,14 @@ class Conveyor:
             return None
         if chain_findings(ln):
             return f"{src} report has a finding line"
-        if done:
-            prev = lanes.get(done[-1])
+        for d in done:  # every earlier step, so the INT stands on all of its reviews
+            prev = lanes.get(d)
             if not prev or not prev.get("finished"):
                 return None  # not dispatched yet, or still running
             if prev.get("status") != "PASS" or chain_commit(prev) != sha:
-                return f"{done[-1]} did not PASS naming {sha[:7]}"
+                return f"{d} did not PASS naming {sha[:7]}"
             if chain_findings(prev):
-                return f"{done[-1]} report has a finding line"
+                return f"{d} report has a finding line"
         step = s["chain"][len(done)]
         nid = f"{step}-{src}"
         main, files = self.chain_verify(s, ln, sha)
@@ -3488,10 +3505,9 @@ class Conveyor:
             return f"template {step}.md unreadable"
         text = fill(tpl, SRC=src, ID=nid, SHA=sha, MAIN=main, TIER=s["tier"], BRANCH=nid.lower(),
                     FILES=", ".join(files))
-        new = {"id": nid, "title": f"{step} of {src}", "tier": s["tier"],
-               "model": "opus" if step == "CLREV" else "sonnet",
-               "effort": "high" if step == "CLREV" else "medium",
-               "files": [f"build/reports/{nid}.md"] if step == "CLREV" else ["@main-checkout"],
+        model, effort = {"CLREV": ("opus", "high"), "CDX": ("opus", "medium"), "INT": ("sonnet", "medium")}[step]
+        new = {"id": nid, "title": f"{step} of {src}", "tier": s["tier"], "model": model, "effort": effort,
+               "files": ["@main-checkout"] if step == "INT" else [f"build/reports/{nid}.md"],
                "depends_on": [done[-1] if done else src], "prompt": f"build/conveyor/prompts/{nid}.md"}
         if s.get("approved") is True:  # the orchestrator approved the chain with its source slice
             new["approved"] = True
@@ -3508,9 +3524,14 @@ class Conveyor:
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not self.write_atomic(dest, text):
             raise OSError(f"{new['prompt']} not written")
+        record = {"steps": done + [nid], "at": rec["at"] if rec else self.now()}
+        event = dict(src=src, step=step, id=nid, sha=sha)
+        if step == "INT" and "CDX" not in s["chain"]:  # non-T2 only (validate_slice)
+            record["g3"] = event["g3"] = ("low-risk exception: separate-session review" if "CLREV" in s["chain"]
+                                          else "low-risk exception: no review")
         ap["chain_slices"] = ap.get("chain_slices", []) + [new]
-        ap.setdefault("chain", {})[key] = {"steps": done + [nid], "at": rec["at"] if rec else self.now()}
-        self.chain_pending.append(dict(src=src, step=step, id=nid, sha=sha))
+        ap.setdefault("chain", {})[key] = record
+        self.chain_pending.append(event)
         return None
 
     def open_breaker(self, ap, reason):
@@ -3552,7 +3573,7 @@ class Conveyor:
         push-<sha40>-<ci>, only when approval_for finds no reason to refuse. A refusal is an
         attention item on the lane; push_gate still runs every key-2 check before a push."""
         try:
-            why, approval, url = self.approval_for(name, ln, lanes)
+            why, approval, url = self.approval_for(name, ln, lanes, ap)
             if why is None:
                 self.approvals.mkdir(parents=True, exist_ok=True)
                 with open(self.approvals / approval, "x", encoding="utf-8") as f:
@@ -3572,9 +3593,10 @@ class Conveyor:
         ap["last_auto"] = [approval[len("push-"):len("push-") + 40], self.now()]
         self.event("auto_approve", lane=name, approval=approval, ci_run=url)
 
-    def approval_for(self, name, ln, lanes):
+    def approval_for(self, name, ln, lanes, ap):
         """(None, approval name, CI run url) when lane `name`'s report earns an automatic key 1,
-        else (reason, None, None). Fail closed: exactly one 'STATUS: GREEN' line, one 'NEW
+        else (reason, None, None). A chain-generated INT or its rerun never earns one (CONVCHAIN1FIXB:
+        the chain creates no authority). Fail closed: exactly one 'STATUS: GREEN' line, one 'NEW
         MAIN SHA: <40 hex>' line, one ci/* branch and one CI run URL; no other integration
         lane unfinished; then every gate check (push_checks: local main is that sha, fast-
         forward, CI success for that sha on that branch, no uv.lock, SCHEMA_VERSION 10) passes
@@ -3582,6 +3604,11 @@ class Conveyor:
         CONV12 handoff (ci_wait found CI success): the single STATUS line is 'STATUS: CI_PENDING',
         sha and branch are the ones waited for, the run is the one ci_wait saw, and a running
         integration lane is fine (it stacks on this sha; push_checks keeps the order)."""
+        # ponytail: prefix, not root_id: a rerun may be INT-SRC-R2 or INT-SRCR2; a distinct INT-SRC2 stops for the key too
+        prompt = self.base / "prompts" / f"{root_id(name)}.md"  # survives losing autopilot.json
+        if (any(name.upper().startswith(i) for i in chain_int_ids(ap))
+                or (prompt.exists() and CHAIN_MARK in prompt.read_text(encoding="utf-8", errors="replace"))):
+            return CHAIN_KEY1, None, None
         # CONVBOM: drop every BOM so a "﻿STATUS:" line still counts toward the single-line check
         text = Path(ln["report"]).read_text(encoding="utf-8-sig", errors="replace").replace("﻿", "")
         ci = ln.get("ci") or {}

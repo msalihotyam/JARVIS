@@ -7778,7 +7778,7 @@ class TestChain(AutopilotBase):
         self.assertEqual(self.prompt("CLREV-SRC").read_text(encoding="utf-8"), "other")
 
     def test_int_clrev_afx_lane_never_chained(self):
-        for name in ("INT5", "CLREV5", "X-AFX"):
+        for name in ("INT5", "CLREV5", "CDX5", "X-AFX"):
             why = self.c.chain_step({"id": name, "chain": ["INT"]}, {}, {}, {}, set())
             self.assertIn("never chained", why, name)
 
@@ -8103,6 +8103,152 @@ class TestChain(AutopilotBase):
                 why = conveyor.lint_slice(s, f"@jarvis lane=SRC model=sonnet effort=medium base={base}\nTASK SRC\n",
                                           lambda p: True, set())
                 self.assertEqual("full 40-hex" in (why or ""), bad)
+
+    # CONVCHAIN1FIXB: the chain creates no authority (B2) and a T2 chain needs a Codex review (G3)
+    T2_CHAIN = {"tier": "T2", "approved": True, "chain": ["CLREV", "CDX", "INT"]}
+
+    def cand(self):
+        self.git = self.c.cmd = CandGit()
+        self.commit()
+        self.git.main = self.git.origin
+
+    def step_ln(self, name, status="PASS", extra=None):
+        self.report(name, "PASS", extra=self.PICK if extra is None else extra)
+        return {"finished": True, "status": status, "base": self.git.main,
+                "report": str(self.root / ".claude/worktrees/wt/build/reports" / f"{name}.md")}
+
+    def direct(self, lanes, done=(), **kw):
+        s = {"id": "SRC", "tier": "T1", "files": ["scripts/a.py"], **self.T2_CHAIN, **kw}
+        self.git.fail.setdefault(self.PIN + ("rev-list",), (0, f"{self.SHA} {self.git.main}\n"))
+        self.src_prompt(s)
+        self.c.chain_pending = []
+        ap = {"chain": {f"SRC@{self.SHA}": {"steps": list(done), "at": 1}}} if done else {}
+        return self.c.chain_step(s, self.src_ln(), lanes, ap, set()), ap
+
+    def to_green(self, **kw):
+        self.cand()
+        self.start(**{**self.T2_CHAIN, **kw})
+        for name in ("SRC", "CLREV-SRC", "CDX-SRC"):
+            self.finish(name, "PASS", extra=self.PICK)
+        self.assertIn("INT-SRC", self.ids())
+        self.finish("INT-SRC", "CI_PENDING", f"CANDIDATE SHA: {SHA_B}\nCI: pushed ci/int-src, run in progress\n")
+        self.git.ci(SHA_B)
+        self.c.pass_once()
+        self.assertEqual(self.lanes()["INT-SRC"]["status"], "GREEN")
+
+    def test_generated_int_stops_at_green_with_no_authority_then_the_orchestrator_key_pushes_it(self):
+        self.to_green()
+        self.assertEqual(self.approvals(), [])
+        self.assertEqual(self.git.pushes(), [])
+        (item,) = [a for a in self.status()["attention"] if a["id"] == "INT-SRC"]
+        self.assertIn(conveyor.CHAIN_KEY1, item["reason"])
+        self.assertEqual([p for p in self.pushes if "INT-SRC" in str(p)], [])
+        approvals = self.root / "build" / "approvals"
+        approvals.mkdir(parents=True, exist_ok=True)
+        (approvals / f"push-{SHA_B}-int-src").write_text("orchestrator\n", encoding="utf-8")
+        self.c.pass_once()
+        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{SHA_B}:refs/heads/main"]])
+
+    def test_approval_for_refuses_every_chain_int_form_and_malformed_state(self):
+        rec = {"steps": ["CLREV-SRC", "INT-SRC"], "at": 1}
+        for ap in ({"chain": {f"SRC@{self.SHA}": rec}}, {"chain_slices": [{"id": "INT-SRC"}]},
+                   {"chain": "junk", "chain_slices": [5, {"id": "INT-SRC"}]},
+                   {"chain": {"a": "junk", "b": {"steps": 5}, f"SRC@{self.SHA}": rec}, "chain_slices": "junk"},
+                   {"chain": {f"SRC@{self.SHA}": "junk"}}, {"chain": {f"SRC@{self.SHA}": {"steps": "INT-SRC", "at": 1}}}):
+            for name in ("INT-SRC", "INT-SRC-R", "INT-SRC-S", "int-src", "INT-SRC-R2", "INT-SRCR2", "INT-SRC-2"):
+                with self.subTest(ap=str(ap)[:80], name=name):
+                    self.assertEqual(self.c.approval_for(name, {}, {}, ap), (conveyor.CHAIN_KEY1, None, None))
+
+    def test_a_lost_autopilot_file_still_refuses_the_key_by_the_prompt_the_chain_wrote(self):
+        text = (Path(conveyor.__file__).parent / "chain_templates" / "INT.md").read_text(encoding="utf-8")
+        self.assertIn(conveyor.CHAIN_MARK, text)
+        self.prompt("INT-SRC").parent.mkdir(parents=True, exist_ok=True)
+        self.prompt("INT-SRC").write_text(text, encoding="utf-8")
+        for name in ("INT-SRC", "INT-SRC-R"):
+            self.assertEqual(self.c.approval_for(name, {}, {}, {}), (conveyor.CHAIN_KEY1, None, None))
+
+    def test_t2_chain_with_int_needs_clrev_and_cdx_in_that_order(self):
+        base = {"id": "SRC", "title": "t", "tier": "T2", "model": "opus", "effort": "high",
+                "files": ["scripts/a.py"], "prompt": "build/conveyor/prompts/SRC.md"}
+        for chain in (["CLREV", "INT"], ["INT"]):
+            self.assertIn("needs CLREV and CDX", conveyor.validate_slice({**base, "chain": chain}) or "")
+        for chain in (["CDX", "CLREV", "INT"], ["CDX", "INT"], ["INT", "CLREV"], ["CLREV", "CDX"]):
+            self.assertIn("bad chain", conveyor.validate_slice({**base, "chain": chain}) or "")
+        for tier, chain in (("T2", ["CLREV", "CDX", "INT"]), ("T1", ["CLREV", "INT"]), ("T1", ["INT"])):
+            self.assertIsNone(conveyor.validate_slice({**base, "tier": tier, "chain": chain}))
+
+    def test_fake_pass_report_with_a_lane_status_not_pass_writes_no_int(self):
+        lanes = {"CLREV-SRC": self.step_ln("CLREV-SRC"), "CDX-SRC": self.step_ln("CDX-SRC", status="MISSING")}
+        why, ap = self.direct(lanes, done=("CLREV-SRC", "CDX-SRC"))
+        self.assertIn("CDX-SRC did not PASS naming", why)
+        self.assertNotIn("chain_slices", ap)
+
+    def test_clrev_bad_but_cdx_good_writes_no_int(self):
+        lanes = {"CLREV-SRC": self.step_ln("CLREV-SRC", status="BLOCKED"), "CDX-SRC": self.step_ln("CDX-SRC")}
+        why, ap = self.direct(lanes, done=("CLREV-SRC", "CDX-SRC"))
+        self.assertIn("CLREV-SRC did not PASS naming", why)
+        self.assertNotIn("chain_slices", ap)
+
+    def test_review_naming_another_sha_writes_no_int(self):
+        lanes = {"CLREV-SRC": self.step_ln("CLREV-SRC"),
+                 "CDX-SRC": self.step_ln("CDX-SRC", extra=f"COMMIT: {'d' * 40}\n")}
+        why, ap = self.direct(lanes, done=("CLREV-SRC", "CDX-SRC"))
+        self.assertIn("CDX-SRC did not PASS naming", why)
+        self.assertNotIn("chain_slices", ap)
+
+    def test_review_with_a_finding_line_writes_no_int(self):
+        lanes = {"CLREV-SRC": self.step_ln("CLREV-SRC"),
+                 "CDX-SRC": self.step_ln("CDX-SRC", extra=self.PICK + "MINOR: a nit\n")}
+        why, ap = self.direct(lanes, done=("CLREV-SRC", "CDX-SRC"))
+        self.assertIn("CDX-SRC report has a finding line", why)
+        self.assertNotIn("chain_slices", ap)
+
+    def test_missing_or_unfinished_cdx_waits_and_writes_no_int(self):
+        for cdx in ({}, {"CDX-SRC": {"finished": False}}):
+            with self.subTest(cdx=cdx):
+                why, ap = self.direct({"CLREV-SRC": self.step_ln("CLREV-SRC"), **cdx}, done=("CLREV-SRC", "CDX-SRC"))
+                self.assertIsNone(why)
+                self.assertNotIn("chain_slices", ap)
+                self.assertEqual(ap["chain"][f"SRC@{self.SHA}"]["steps"], ["CLREV-SRC", "CDX-SRC"])
+
+    def test_source_commit_changed_after_the_reviews_writes_no_int(self):
+        other = "d" * 40
+        self.c.chain_verify = lambda s, ln, sha: (self.git.main, ["scripts/a.py"])
+        self.git.fail.setdefault(self.PIN + ("rev-list",), (0, f"{other} {self.git.main}\n"))
+        self.report("SRC", "PASS", extra=f"COMMIT: {other}\n")
+        ln = {"status": "PASS", "base": self.git.main,
+              "report": str(self.root / ".claude/worktrees/wt/build/reports/SRC.md")}
+        ap = {"chain": {f"SRC@{self.SHA}": {"steps": ["CLREV-SRC", "CDX-SRC"], "at": 1}}}
+        s = {"id": "SRC", "tier": "T2", "files": ["scripts/a.py"], **self.T2_CHAIN}
+        lanes = {"CLREV-SRC": self.step_ln("CLREV-SRC"), "CDX-SRC": self.step_ln("CDX-SRC")}
+        why = self.c.chain_step(s, ln, lanes, ap, set())
+        self.assertIn("CLREV-SRC already exists", why)
+        self.assertNotIn("chain_slices", ap)
+
+    def test_cdx_step_is_written_from_its_template_and_a_t2_int_records_no_exception(self):
+        why, ap = self.direct({"CLREV-SRC": self.step_ln("CLREV-SRC")}, done=("CLREV-SRC",))
+        self.assertIsNone(why)
+        (new,) = ap["chain_slices"]
+        self.assertEqual((new["id"], new["model"], new["effort"], new["files"]),
+                         ("CDX-SRC", "opus", "medium", ["build/reports/CDX-SRC.md"]))
+        self.assertIn(f"COMMIT: {self.SHA}", self.prompt("CDX-SRC").read_text(encoding="utf-8"))
+        self.assertIn("run.ps1", self.prompt("CDX-SRC").read_text(encoding="utf-8"))
+        why, ap = self.direct({"CLREV-SRC": self.step_ln("CLREV-SRC"), "CDX-SRC": self.step_ln("CDX-SRC")},
+                              done=("CLREV-SRC", "CDX-SRC"))
+        self.assertIsNone(why)
+        self.assertNotIn("g3", ap["chain"][f"SRC@{self.SHA}"])
+        self.assertNotIn("g3", self.c.chain_pending[0])
+
+    def test_non_t2_int_records_the_g3_exception(self):
+        for chain, done, lanes, want in (
+                (["CLREV", "INT"], ("CLREV-SRC",), {"CLREV-SRC": self.step_ln("CLREV-SRC")}, "separate-session"),
+                (["INT"], (), {}, "no review")):
+            with self.subTest(chain=chain):
+                why, ap = self.direct(lanes, done=done, chain=chain, approved=False)
+                self.assertIsNone(why)
+                self.assertEqual(ap["chain_slices"][-1]["id"], "INT-SRC")
+                self.assertIn(want, ap["chain"][f"SRC@{self.SHA}"]["g3"])
+                self.assertIn(want, self.c.chain_pending[0]["g3"])
 
 
 if __name__ == "__main__":
