@@ -15,6 +15,7 @@ triggers anything.
 See JARVIS_RUNBOOK.md "Konveyor".
 """
 import calendar
+import fnmatch
 import json
 import os
 import posixpath
@@ -244,6 +245,8 @@ APPROVAL_RE = re.compile(r"push-([0-9a-f]{7,40})(?:-([A-Za-z0-9._-]+))?")
 REQUIRED_WORKFLOWS = ("tests",)  # .github/workflows/tests.yml (runs on ci/** pushes)
 SCHEMA_LINE = "SCHEMA_VERSION = 10"  # jarvis/memory.py; rollback targets read schema 10
 SHA_RE = re.compile(r"[0-9a-f]{40}")
+CHAIN_GOOD = GOOD - {"GREEN"}  # CONVCHAIN1: a lane's own finish; GREEN is an INT's CI verdict
+CHAIN_COMMIT_RE = re.compile(r"(?m)^[ \t]*COMMIT:(.*)$")  # anchored: "FIX COMMIT:" does not count
 MIN_FREE_GB = 10  # below this on the repo drive no lane is dispatched
 DISK_ID = "disk-low"  # attention id (and ack file) of a low-disk episode
 PRUNE_TIMEOUT_S = 120  # well below STALE_LOCK_S: a prune never makes the lock look stale
@@ -863,7 +866,19 @@ def validate_slice(s):
         return "bad subagent_model"
     if s.get("worker") in ("codex", "jules") and ("advisor" in s or "subagent_model" in s):
         return "advisor/subagent_model need a Claude lane"  # no flag or env reaches that worker
+    if "chain" in s and s["chain"] not in (["CLREV"], ["INT"], ["CLREV", "INT"]):
+        return "bad chain"
     return None
+
+
+def chain_commit(ln):
+    """CONVCHAIN1: the single COMMIT sha a lane's report names, or None."""
+    try:
+        text = Path(ln.get("report") or "").read_text(encoding="utf-8-sig", errors="replace")
+    except OSError:
+        return None
+    found = [x.strip() for x in CHAIN_COMMIT_RE.findall(text)]
+    return found[0] if len(found) == 1 and SHA_RE.fullmatch(found[0]) else None
 
 
 def trial_args(advisor):
@@ -2724,7 +2739,8 @@ class Conveyor:
     # ---- backlog ------------------------------------------------------
     def load_backlog(self):
         """(valid slices, errors): the autopilot's fix-forward slices first, then backlog.json."""
-        good = list((self.auto_state() or {}).get("slices", []))
+        ap = self.auto_state() or {}
+        good = list(ap.get("slices", [])) + list(ap.get("chain_slices", []))
         self.lint_ids = set()  # backlog.json slices get lint_slice; the autopilot's are generated
         f = self.base / "backlog.json"
         if not f.exists():
@@ -3014,9 +3030,12 @@ class Conveyor:
                 why.append(ln["auto_fix"])
             if ln.get("findings"):  # CONVHEAL: a PASS with findings -> fix lanes (no page, no breaker)
                 why.append(f"FINDINGS: {ln['findings']}")
+            if ln.get("chain_refused"):  # CONVCHAIN1: for the orchestrator, no page
+                why.append(f"chain refused: {ln['chain_refused']}")
             if why:
                 # BREAKERV2: a failed auto-fix chain re-raises its lane, an older ack hides nothing
-                items.append((n, "; ".join(why), max(self.since(ln) or 0, ln.get("chain_failed") or 0)))
+                items.append((n, "; ".join(why), max(self.since(ln) or 0, ln.get("chain_failed") or 0,
+                                                     ln.get("chain_refused_at") or 0)))
                 if not loud:
                     self.quiet.add(n)
         for n, ln in lanes.items():  # CONV11: one item per preserved lane, until acked
@@ -3269,6 +3288,7 @@ class Conveyor:
             self.open_breaker(ap, f"{len(ap['bad'])} lanes finished BLOCKED/STOP/FAIL within 2 h: "
                                   + ", ".join(x[0] for x in ap["bad"]))
         self.breaker = ap.get("breaker")
+        self.chain_walk(lanes, ap)
         self.chain_dead = {s for c in chains.values()
                            if any(lanes.get(x, {}).get("finished") and lanes[x].get("status")
                                   not in GOOD | {CI_PENDING} for x in chain_ids(c))
@@ -3298,12 +3318,120 @@ class Conveyor:
                 isinstance(k, str) and isinstance(v, dict) for k, v in ap.get("ci_rerun", {}).items()) and all(
                 isinstance(x[0], str) and isinstance(x[1], num) for x in ap.get("bad", [])) and all(
                 isinstance(c, dict) for c in ap.get("chains", {}).values()) and not any(
-                validate_slice(s) for s in ap.get("slices", [])) and (
+                validate_slice(s) for s in ap.get("slices", [])) and not any(
+                validate_slice(s) for s in ap.get("chain_slices", [])) and all(
+                isinstance(c["steps"], list) for c in ap.get("chain", {}).values()) and (
                 ap.get("last_auto") is None or isinstance(ap["last_auto"][0], str)
                 and isinstance(ap["last_auto"][1], num))
         except (AttributeError, KeyError, TypeError, IndexError):
             ok = False
         return ap if ok else None
+
+    def chain_walk(self, lanes, ap):
+        """CONVCHAIN1: write the next pre-approved step of each finished backlog slice carrying
+        "chain". Creates no authority: it only adds slices; approvals and pushes stay with their
+        gate. Breaker or PAUSE defers (no refusal, a later pass retries)."""
+        if self.breaker or (self.base / "PAUSE").exists():
+            return
+        slices, _ = self.load_backlog()
+        ids = {s["id"] for s in slices}
+        for s in slices:
+            ln = lanes.get(s["id"])
+            if (s["id"] not in self.lint_ids or not s.get("chain") or not ln
+                    or ln.get("status") not in CHAIN_GOOD or ln.get("chain_refused")
+                    or (ln.get("finished_ts") or 0) < ap["since"]):
+                continue
+            try:
+                why = self.chain_step(s, ln, lanes, ap, ids)
+            except (OSError, RuntimeError) as e:  # fail closed
+                why = str(e)
+            if why:
+                ln["chain_refused"], ln["chain_refused_at"] = why, self.now()
+                self.event("chain_refused", src=s["id"], reason=why)
+
+    def chain_verify(self, s, ln, sha):
+        """(origin/main, files the commit changes outside build/reports) or (None, why refused)."""
+        if self.cmd([*GIT_PIN, "rev-parse", "--verify", "--quiet", f"{sha}^{{commit}}"])[0]:
+            return None, f"commit {sha[:7]} not found"
+        rc, out = self.cmd(["git", "rev-parse", "--verify", "refs/remotes/origin/main"])
+        main = out.strip()
+        if rc or not SHA_RE.fullmatch(main):
+            return None, "origin/main unreadable"
+        if self.is_ancestor(sha, main):
+            return None, f"{sha[:7]} is already on origin/main"
+        start = ln.get("base") or ""
+        if not re.fullmatch(r"[0-9a-f]{7,40}", start):
+            rc, out = self.cmd([*GIT_PIN, "merge-base", sha, main])
+            start = out.strip()
+            if rc or not SHA_RE.fullmatch(start):
+                return None, f"no merge base for {sha[:7]}"
+        rc, out = self.cmd([*GIT_PIN, "rev-list", f"{start}..{sha}"])
+        if rc or out.split() != [sha]:  # INT picks only SHA and CLREV reviews only SHA^..SHA
+            return None, f"{sha[:7]} is not the slice's only commit since {start[:7]}"
+        rc, out = self.cmd([*GIT_PIN, "diff", "--name-only", "--ignore-submodules=none",
+                            "--no-renames", "-z", start, sha])
+        if rc:
+            return None, f"diff of {sha[:7]} failed"
+        files = sorted(p for p in out.split("\0") if p and not p.startswith("build/reports/"))
+        outside = [p for p in files if not p.isprintable() or not any(  # a newline must not reach the prompt
+            p == g or (p.count("/") == g.count("/") and fnmatch.fnmatchcase(p, g)) for g in s.get("files", []))]
+        if not files or outside:
+            return None, "files outside the grant: " + ", ".join(map(repr, outside[:3])) if outside \
+                else f"{sha[:7]} changes no file"
+        return main, files
+
+    def chain_step(self, s, ln, lanes, ap, ids):
+        """One source slice: None (nothing to do, or its next step written) or why it is refused."""
+        src = s["id"]
+        if INT_RE.match(src) or re.match(r"(?i)clrev", src) or CHAIN_SUFFIX_RE.search(src):
+            return "an INT, CLREV or AFX lane is never chained"
+        sha = chain_commit(ln)
+        if not sha:
+            return 'report needs exactly one "COMMIT: <40 hex>" line'
+        key = f"{src}@{sha}"
+        rec = ap.get("chain", {}).get(key)
+        done = rec["steps"] if rec else []
+        if len(done) >= len(s["chain"]):
+            return None
+        if done:
+            prev = lanes.get(done[-1])
+            if not prev or not prev.get("finished"):
+                return None  # not dispatched yet, or still running
+            if prev.get("status") != "PASS" or chain_commit(prev) != sha:
+                return f"{done[-1]} did not PASS naming {sha[:7]}"
+        step = s["chain"][len(done)]
+        nid = f"{step}-{src}"
+        main, files = self.chain_verify(s, ln, sha)
+        if main is None:
+            return files
+        if nid in lanes or nid in ids or self.find_report(nid):
+            return f"{nid} already exists"
+        try:
+            tpl = (self.root / "scripts" / "chain_templates" / f"{step}.md").read_text(encoding="utf-8")
+        except OSError:
+            return f"template {step}.md missing"
+        text = fill(tpl, SRC=src, ID=nid, SHA=sha, MAIN=main, TIER=s["tier"], BRANCH=nid.lower(),
+                    FILES=", ".join(files))
+        new = {"id": nid, "title": f"{step} of {src}", "tier": s["tier"],
+               "model": "opus" if step == "CLREV" else "sonnet",
+               "effort": "high" if step == "CLREV" else "medium",
+               "files": [f"build/reports/{nid}.md"] if step == "CLREV" else ["@main-checkout"],
+               "depends_on": [done[-1] if done else src], "prompt": f"build/conveyor/prompts/{nid}.md"}
+        if s.get("approved") is True:  # the orchestrator approved the chain with its source slice
+            new["approved"] = True
+        bad = validate_slice(new) or lint_slice(new, text, lambda p: (self.root / p).exists(),
+                                                ids | set(lanes) | {src, *done}) or check_header(text, main)[1]
+        if bad:
+            return f"generated {nid}: {bad}"
+        dest = self.root / new["prompt"]
+        if dest.exists() and dest.read_text(encoding="utf-8") != text:
+            return f"{new['prompt']} exists with other text"
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text, encoding="utf-8")
+        ap["chain_slices"] = ap.get("chain_slices", []) + [new]
+        ap.setdefault("chain", {})[key] = {"steps": done + [nid], "at": rec["at"] if rec else self.now()}
+        self.event("chain", src=src, step=step, id=nid, sha=sha)
+        return None
 
     def open_breaker(self, ap, reason):
         if not ap.get("breaker"):

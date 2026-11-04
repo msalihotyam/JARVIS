@@ -7538,5 +7538,251 @@ class TestTempWatch(Base):
             self.assertIn('Conveyor(prune=real_cmd, temp_watch=os.environ.get("TEMP"))', f.read())
 
 
+class TestChain(AutopilotBase):
+    """CONVCHAIN1: the pre-approved chain writes the next step and creates no authority."""
+    SHA = "c" * 40
+    PICK = f"COMMIT: {SHA}\n"
+    PIN = tuple(conveyor.GIT_PIN)
+
+    def setUp(self):
+        super().setUp()
+        self.tpl = self.root / "scripts" / "chain_templates"
+        self.tpl.mkdir(parents=True)
+        for f in (Path(conveyor.__file__).parent / "chain_templates").glob("*.md"):
+            (self.tpl / f.name).write_bytes(f.read_bytes())
+        self.commit()
+
+    def commit(self, files=("scripts/a.py",)):
+        self.git.fail.update({
+            self.PIN + ("rev-parse", "--verify", "--quiet", f"{self.SHA}^{{commit}}"): (0, self.SHA + "\n"),
+            ("git", "merge-base", "--is-ancestor", self.SHA, ORIGIN): (1, ""),
+            self.PIN + ("merge-base", self.SHA, ORIGIN): (0, "d" * 40 + "\n"),
+            self.PIN + ("rev-list",): (0, self.SHA + "\n"),
+            self.PIN + ("diff", "--name-only"): (0, "\0".join(files) + "\0"),
+        })
+
+    def start(self, **kw):
+        self.backlog({"id": "SRC", "files": ["scripts/a.py"], "chain": ["CLREV", "INT"], **kw})
+        self.c.pass_once()
+        self.t += 60
+
+    def state(self):
+        f = self.base / "autopilot.json"
+        return json.loads(f.read_text(encoding="utf-8")) if f.exists() else {}
+
+    def ids(self):
+        return [s["id"] for s in self.state().get("chain_slices", [])]
+
+    def prompt(self, nid):
+        return self.base / "prompts" / f"{nid}.md"
+
+    def no_authority(self):
+        self.assertEqual(self.approvals(), [])
+        self.assertEqual(self.git.pushes(), [])
+
+    def refused(self, frag, ids=()):
+        e = self.ev("chain_refused")
+        self.assertEqual(len(e), 1, str(e)[:80])
+        self.assertIn(frag, e[0]["reason"])
+        self.assertEqual(self.ids(), list(ids))
+        self.assertIn("chain refused", json.dumps(self.status()))
+        self.assertEqual([p for p in self.pushes if "chain" in str(p)], [])  # orchestrator-only: no page
+        self.no_authority()
+
+    def nothing(self):
+        self.assertEqual((self.ev("chain"), self.ev("chain_refused"), self.ids()), ([], [], []))
+        self.no_authority()
+
+    def test_no_chain_field_nothing(self):
+        self.backlog({"id": "SRC", "files": ["scripts/a.py"]})
+        self.c.pass_once()
+        self.t += 60
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.nothing()
+        self.assertFalse({"chain", "chain_slices"} & set(self.state()))
+
+    def test_blocked_or_ci_pending_nothing(self):
+        for status in ("BLOCKED", "CI_PENDING"):
+            with self.subTest(status):
+                self.start(id=f"S{status[0]}")
+                self.finish(f"S{status[0]}", status, extra=self.PICK)
+                self.nothing()
+
+    def test_green_is_not_good(self):
+        self.start()
+        lanes = self.lanes()
+        lanes["SRC"].update(status="GREEN", finished_ts=self.t, finished=True)
+        ap = {"since": 0}
+        self.c.chain_walk(lanes, ap)
+        self.assertEqual(ap, {"since": 0})
+        self.nothing()
+
+    def test_two_commit_lines_refused_once(self):
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK + f"COMMIT: {'e' * 40}\n")
+        self.refused("exactly one")
+        self.c.pass_once()
+        self.refused("exactly one")
+
+    def test_file_outside_grant_refused(self):
+        self.commit(files=("scripts/a.py", "scripts/secret.py"))
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.refused("files outside the grant")
+
+    def test_commit_already_on_main_refused(self):
+        self.git.fail[("git", "merge-base", "--is-ancestor", self.SHA, ORIGIN)] = (0, "")
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.refused("already on origin/main")
+
+    def test_commit_missing_refused(self):
+        self.git.fail[self.PIN + ("rev-parse", "--verify", "--quiet", f"{self.SHA}^{{commit}}")] = (1, "")
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.refused("not found")
+
+    def test_several_commits_refused(self):
+        self.git.fail[self.PIN + ("rev-list",)] = (0, f"{'e' * 40}\n{self.SHA}\n")
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.refused("only commit")
+
+    def test_breaker_open_defers_then_recovers(self):
+        self.start()
+        ap = self.state()
+        ap["breaker"] = {"reason": "x", "since": self.t}
+        (self.base / "autopilot.json").write_text(json.dumps(ap), encoding="utf-8")
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.nothing()
+        reset = self.base / "breaker-reset"
+        reset.write_text("")
+        os.utime(reset, (self.t, self.t))
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.ids(), ["CLREV-SRC"])
+
+    def test_pause_defers_then_recovers(self):
+        self.start()
+        (self.base / "PAUSE").write_text("")
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.nothing()
+        (self.base / "PAUSE").unlink()
+        self.c.pass_once()
+        self.assertEqual(self.ids(), ["CLREV-SRC"])
+
+    def test_malformed_autopilot_nothing(self):
+        self.start()
+        (self.base / "autopilot.json").write_text("{broken", encoding="utf-8")
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.assertEqual((self.base / "autopilot.json").read_text(encoding="utf-8"), "{broken")
+        self.assertEqual((self.ev("chain"), self.ev("chain_refused")), ([], []))
+        self.assertFalse(self.prompt("CLREV-SRC").exists())
+        self.no_authority()
+
+    def test_second_pass_no_duplicate(self):
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.c.pass_once()
+        self.assertEqual(len(self.ev("chain")), 1)
+        self.assertEqual(self.ids(), ["CLREV-SRC"])
+
+    def test_crash_rerun_same_bytes_nothing_new(self):
+        self.start()
+        self.report("SRC", "PASS", extra=self.PICK, mtime=self.t)
+        s = next(x for x in self.c.load_backlog()[0] if x["id"] == "SRC")
+        ln = {"status": "PASS", "report": str(self.root / ".claude/worktrees/wt/build/reports/SRC.md")}
+        first, second = {"since": 0}, {"since": 0}
+        self.assertIsNone(self.c.chain_step(s, ln, {"SRC": ln}, first, {"SRC"}))
+        raw = self.prompt("CLREV-SRC").read_bytes()
+        self.assertIsNone(self.c.chain_step(s, ln, {"SRC": ln}, second, {"SRC"}))
+        self.assertEqual(self.prompt("CLREV-SRC").read_bytes(), raw)
+        self.assertEqual(second, first)
+
+    def test_clrev_blocked_no_int(self):
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.finish("CLREV-SRC", "BLOCKED", extra=self.PICK)
+        self.refused("did not PASS", ids=["CLREV-SRC"])
+        self.assertFalse(self.prompt("INT-SRC").exists())
+
+    def test_clrev_pass_naming_other_sha_no_int(self):
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.finish("CLREV-SRC", "PASS", extra=f"COMMIT: {'e' * 40}\n")
+        self.refused("did not PASS", ids=["CLREV-SRC"])
+        self.assertFalse(self.prompt("INT-SRC").exists())
+
+    def test_invalid_chain_makes_slice_invalid(self):
+        good = {"id": "X", "title": "t", "tier": "T1", "model": "sonnet", "effort": "medium", "files": ["a"],
+                "depends_on": [], "prompt": "build/conveyor/prompts/X.md"}
+        self.assertFalse(conveyor.validate_slice(good))
+        self.assertFalse(conveyor.validate_slice({**good, "chain": ["CLREV", "INT"]}))
+        for bad in ("INT", [], ["X"], ["INT", "CLREV"], ["CLREV", "CLREV"], None):
+            self.assertTrue(conveyor.validate_slice({**good, "chain": bad}), repr(bad))
+        self.start(chain=["X"])
+        self.assertNotIn("SRC", self.fake.bg_names())
+
+    def test_template_missing_refused(self):
+        (self.tpl / "CLREV.md").unlink()
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.refused("template CLREV.md missing")
+
+    def test_generated_slice_failing_lint_refused_nothing_written(self):
+        (self.tpl / "INT.md").write_text("@jarvis lane={ID} model=sonnet effort=medium base={MAIN}\nTASK {SHA}\n",
+                                         encoding="utf-8")
+        self.start(chain=["INT"])
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.refused("generated INT-SRC")
+        self.assertFalse(self.prompt("INT-SRC").exists())
+
+    def test_existing_other_prompt_refused(self):
+        self.prompt("CLREV-SRC").parent.mkdir(parents=True, exist_ok=True)
+        self.prompt("CLREV-SRC").write_text("other", encoding="utf-8")
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.refused("exists with other text")
+        self.assertEqual(self.prompt("CLREV-SRC").read_text(encoding="utf-8"), "other")
+
+    def test_int_clrev_afx_lane_never_chained(self):
+        for name in ("INT5", "CLREV5", "X-AFX"):
+            why = self.c.chain_step({"id": name, "chain": ["INT"]}, {}, {}, {}, set())
+            self.assertIn("never chained", why, name)
+
+    def test_clrev_then_int_happy_path_no_authority(self):
+        self.commit(files=("scripts/a.py", "build/reports/SRC.md"))
+        self.git.main = self.git.origin
+        self.start()
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.assertEqual(self.ev("chain")[0]["id"], "CLREV-SRC")
+        self.assertEqual((self.ev("chain")[0]["src"], self.ev("chain")[0]["sha"]), ("SRC", self.SHA))
+        clrev = self.state()["chain_slices"][0]
+        self.assertEqual((clrev["model"], clrev["effort"], clrev["files"], clrev["depends_on"]),
+                         ("opus", "high", ["build/reports/CLREV-SRC.md"], ["SRC"]))
+        self.assertIn(self.SHA, self.prompt("CLREV-SRC").read_text(encoding="utf-8"))
+        self.assertIn("CLREV-SRC", self.fake.bg_names())
+        self.finish("CLREV-SRC", "PASS", extra=self.PICK)
+        self.assertEqual(self.ids(), ["CLREV-SRC", "INT-SRC"])
+        new = self.state()["chain_slices"][1]
+        self.assertEqual((new["model"], new["effort"], new["files"], new["depends_on"]),
+                         ("sonnet", "medium", ["@main-checkout"], ["CLREV-SRC"]))
+        text = self.prompt("INT-SRC").read_text(encoding="utf-8")
+        for want in (self.SHA, f"base={ORIGIN}", "ci/int-src", "Expected files only: scripts/a.py."):
+            self.assertIn(want, text)
+        self.assertEqual(self.state()["chain"][f"SRC@{self.SHA}"]["steps"], ["CLREV-SRC", "INT-SRC"])
+        self.assertIn("INT-SRC", self.fake.bg_names())
+        self.c.pass_once()
+        self.assertEqual(len(self.ev("chain")), 2)
+        self.no_authority()
+
+    def test_int_only_chain_depends_on_source(self):
+        self.start(chain=["INT"])
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.assertEqual(self.ids(), ["INT-SRC"])
+        self.assertEqual(self.state()["chain_slices"][0]["depends_on"], ["SRC"])
+        self.no_authority()
+
+
 if __name__ == "__main__":
     unittest.main()
