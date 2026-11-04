@@ -42,6 +42,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import Mock, call
 
 from jarvis.browser import (
     BROWSER_CAPABILITY_METHODS,
@@ -58,6 +59,7 @@ from jarvis.browser_cdp import (
     BrowserCommandFailed,
     BrowserPolicy,
     browser_arguments,
+    guarded_navigate,
     owning_policy,
     read_current_tab,
     release_browser_policies,
@@ -563,6 +565,41 @@ class WorkerTests(LifecycleCase):
             time.sleep(0.02)
         self.assertFalse(policy.alive, "an unmediatable target did not end mediation")
         self.assertIn("Target.closeTarget", [m for m, _ in self.browser.sent])
+
+
+class NavigationCleanupTests(unittest.TestCase):
+    def test_navigation_send_failure_preserves_error_and_drains_requests(self) -> None:
+        connection = Mock()
+        original = RuntimeError("navigation send failed")
+        connection.send.side_effect = original
+        connection.take_buffered.return_value = [{"requestId": "buffered-request"}]
+
+        with self.assertRaises(RuntimeError) as raised:
+            guarded_navigate(
+                connection, "session", tab_id="tab", url="https://example.test/",
+                origin="https://example.test",
+            )
+
+        self.assertIs(original, raised.exception)
+        connection.take_buffered.assert_called_once_with("Fetch.requestPaused")
+        self.assertEqual(
+            [
+                call("Page.enable", session_id="session"),
+                call(
+                    "Fetch.enable",
+                    {"patterns": [{"urlPattern": "*", "requestStage": "Request"}]},
+                    session_id="session",
+                ),
+                call(
+                    "Fetch.failRequest",
+                    {"requestId": "buffered-request", "errorReason": "BlockedByClient"},
+                    session_id="session",
+                ),
+                call("Fetch.disable", session_id="session"),
+                call("Page.disable", session_id="session"),
+            ],
+            connection.command.call_args_list,
+        )
 
 
 class FailClosedTests(LifecycleCase):

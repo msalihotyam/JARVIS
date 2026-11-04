@@ -1222,6 +1222,10 @@ def guarded_navigate(
     #: continued or failed. Empty means nothing is owed: either none has been
     #: delivered, or the last one's disposition was acknowledged.
     current = ""
+    #: Request ids the settle phase has taken OUT of the buffer and not
+    #: yet had a disposition acknowledged for. The cleanup below settles
+    #: them, because ``take_buffered`` can no longer find them.
+    owed: list[str] = []
     try:
         pending = connection.send("Page.navigate", {"url": url}, session_id=session_id)
         guarded: tuple[str, str] | None = None
@@ -1230,10 +1234,6 @@ def guarded_navigate(
         #: Origins the page asked for and did not get. Recorded, not raised:
         #: a refused subresource is the gate working, not a failed navigation.
         subresources_refused: list[str] = []
-        #: Request ids the settle phase has taken OUT of the buffer and not
-        #: yet had a disposition acknowledged for. The cleanup below settles
-        #: them, because ``take_buffered`` can no longer find them.
-        owed: list[str] = []
         for _ in range(BROWSER_MAX_NAVIGATION_EVENTS):
             if guarded is not None and guarded in committed:
                 # The document committed; the page now asks for what it needs.
