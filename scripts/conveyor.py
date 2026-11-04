@@ -358,6 +358,7 @@ EFFORTS = ("medium", "high", "xhigh", "max")
 LANE_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 SHA_HDR_RE = re.compile(r"^[0-9a-f]{7,40}$")
 HEADER_KEYS = ("lane", "model", "effort", "base")
+MODEL_RANK = {"haiku": 0, "sonnet": 1, "opus": 2, "fable": 3}  # an advisor must rank >= the lane's model
 JS_WS = "\t\n\v\f\r    -     　﻿"  # JS \s
 BG_ID_RE = re.compile(r"backgrounded\s*\S\s*([0-9a-f]{8})")
 STATUS_RE = re.compile(r"STATUS:[\s*`]*((?i:CI_PENDING)(?!\w)|[A-Za-z]+)")
@@ -434,12 +435,14 @@ def claude_exe():
     return shutil.which("claude") or str(Path.home() / ".local/bin/claude.exe")
 
 
-def real_runner(args, timeout=120, cwd=None):
-    """Run claude with args (in cwd, default the repo root); return (returncode, combined output)."""
+def real_runner(args, timeout=120, cwd=None, env=None):
+    """Run claude with args (in cwd, default the repo root); return (returncode, combined output).
+    env: extra variables on top of this process's; None inherits it unchanged."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     # stdin=DEVNULL: under pythonw claude otherwise blocks reading stdin
     p = subprocess.run([claude_exe(), *args], cwd=cwd or ROOT, capture_output=True,
                        stdin=subprocess.DEVNULL,
+                       env={**os.environ, **env} if env else None,
                        timeout=timeout, creationflags=flags)
     out = (p.stdout or b"") + (p.stderr or b"")
     return p.returncode, out.decode("utf-8", "replace")
@@ -841,7 +844,26 @@ def validate_slice(s):
         return "bad class"
     if s.get("worker") == "jules" and s.get("linux_ok") is not True:
         return "jules needs linux_ok: true (no UI/Windows tests)"
+    if "advisor" in s:
+        if s["advisor"] not in ("sonnet", "opus", "fable"):
+            return "bad advisor"
+        if MODEL_RANK[s["advisor"]] < MODEL_RANK[s["model"]]:  # the CLI refuses it at launch
+            return f"advisor {s['advisor']} ranks below model {s['model']}"
+    if "subagent_model" in s and s["subagent_model"] not in ("haiku", "sonnet"):
+        return "bad subagent_model"
+    if s.get("worker") in ("codex", "jules") and ("advisor" in s or "subagent_model" in s):
+        return "advisor/subagent_model need a Claude lane"  # no flag or env reaches that worker
     return None
+
+
+def trial_args(advisor):
+    """The trial's launch flag: none without an advisor, so that argv stays as it was."""
+    return ["--advisor", advisor] if advisor else []
+
+
+def trial_env(subagent_model):
+    """self.run kwargs for the trial's lane env: none without a subagent model."""
+    return {"env": {"CLAUDE_CODE_SUBAGENT_MODEL": subagent_model}} if subagent_model else {}
 
 
 # the whole token up to whitespace, minus a closing backtick and an end-of-sentence mark
@@ -1817,8 +1839,10 @@ class Conveyor:
             text = note + "\n\n" + text
         cwd = a.get("cwd") if a.get("cwd") and Path(a["cwd"]).is_dir() else str(self.root)
         resume = ["--bg", "--resume", sid, "--name", name, "--model", ln["model"], "--effort",
-                  ln["effort"], "--settings", str(self.root / SETTINGS), "--strict-mcp-config", text]
-        for args, opt in ((["stop", ln["id"]], {}), (resume, {"cwd": cwd})):
+                  ln["effort"], *trial_args(ln.get("advisor")),
+                  "--settings", str(self.root / SETTINGS), "--strict-mcp-config", text]
+        for args, opt in ((["stop", ln["id"]], {}),
+                          (resume, {"cwd": cwd, **trial_env(ln.get("subagent_model"))})):
             try:
                 rc, out = self.run(args, **opt)
             except Exception as e:  # e.g. a timeout: logged, the lane goes on
@@ -1914,7 +1938,8 @@ class Conveyor:
         except Exception as e:  # e.g. a timeout: logged like a failed stop
             rc, out = type(e).__name__, ""
         self.event("stop", lane=name, id=ln["id"], rc=rc, output=out[-300:])
-        sid = self.start(name, ln["model"], ln["effort"], header + CONTINUE + rest)
+        sid = self.start(name, ln["model"], ln["effort"], header + CONTINUE + rest,
+                         advisor=ln.get("advisor"), subagent_model=ln.get("subagent_model"))
         if sid:
             self.event("redispatch", lane=name, old_id=ln["id"], id=sid)
             ln.setdefault("prev_ids", []).append(ln["id"])
@@ -1939,13 +1964,14 @@ class Conveyor:
         and run the full suite), whatever max_lanes allows."""
         return bool(INT_RE.match(name)) and any(INT_RE.match(n) for n in self.running(lanes))
 
-    def start(self, name, model, effort, text):
+    def start(self, name, model, effort, text, advisor=None, subagent_model=None):
         """`claude --bg` one lane; returns its short id or None."""
         if self.cc_hold():  # every dispatch path ends here; not an error, the lane is not failed
             return None
         try:
-            rc, out = self.run(["--bg", "--name", name, "--model", model,
-                                "--effort", effort, "--settings", SETTINGS, "--strict-mcp-config", text])
+            rc, out = self.run(["--bg", "--name", name, "--model", model, "--effort", effort,
+                                *trial_args(advisor), "--settings", SETTINGS, "--strict-mcp-config", text],
+                               **trial_env(subagent_model))
         except Exception as e:  # e.g. a timeout: like a failed start, nothing recorded
             self.error(f"dispatch {name}: {type(e).__name__}")
             return None
@@ -2097,7 +2123,7 @@ class Conveyor:
             self.event("finish", lane=name, id=ln["id"], state=st, status="MISSING")
 
     def record(self, lanes, name, sid, model, effort, base, prompt, files=None, slice_=False,
-               worker=None):
+               worker=None, **trial):
         old = lanes.get(name)  # a same-name earlier lane: its sessions stay known for cleanup
         prev = [*old.get("prev_ids", []), old["id"]] if old and "cleanup" not in old and "preserved" not in old else []
         lanes[name] = {"id": sid, "prev_ids": prev, "model": model, "effort": effort, "base": base,
@@ -2110,6 +2136,7 @@ class Conveyor:
             lanes[name]["main_at_start"] = self.main_head()
         if worker:
             lanes[name]["worker"] = worker
+        lanes[name].update(trial)  # advisor, subagent_model: nudge and re-dispatch launch with them too
         self.save_lanes(lanes)  # a started session is never lost to a later crash
 
     def usage_pct(self):
@@ -2695,8 +2722,12 @@ class Conveyor:
         base = m.group(1) if m else "main"
         if base == "main" and any(INT_RE.match(d) for d in s.get("depends_on", [])) and not INT_RE.match(s["id"]):
             base = self.main_head() or base  # CONVINTDEP: the main int_pushed verified this pass
+        # line 2, not the header: check_header refuses any other key on the @jarvis line
+        note = (f"NOTE: this lane runs with CLAUDE_CODE_SUBAGENT_MODEL={s['subagent_model']}: the default "
+                "subagent model; an agent's own model: frontmatter and a per-spawn model still win.\n"
+                if "subagent_model" in s else "")
         return (f"@jarvis lane={s['id']} model={s['model']} effort={s['effort']} base={base}\n"
-                + (rest if hdr else body)), base
+                + note + (rest if hdr else body)), base
 
     def slice_lint(self, s):
         """Why the lint would drop this slice's header, else None (an unreadable prompt: None,
@@ -2745,11 +2776,14 @@ class Conveyor:
             if s.get("worker") == "auto":
                 self.event("route", lane=name, worker=worker, reason=why)
             codex = worker == "codex"
+            # what this launch really applies: an auto slice routed away from Claude gets neither
+            trial = {} if worker in ("codex", "jules") else \
+                {k: s[k] for k in ("advisor", "subagent_model") if k in s}
             if worker == "jules":
                 sid = self.start_jules(name, base, text, s.get("files", []))
             else:
                 sid = self.start_codex(name, base, text) if codex else \
-                    self.start(name, s["model"], s["effort"], text)
+                    self.start(name, s["model"], s["effort"], text, **trial)
             if not sid:
                 slices = [x for x in slices if x is not s]  # retry next pass
                 continue
@@ -2757,14 +2791,14 @@ class Conveyor:
             dest.write_text(text, encoding="utf-8")
             self.record(lanes, name, sid, s["model"], s["effort"], base, dest,
                         files=s.get("files", []), slice_=True,
-                        worker=worker if worker in ("codex", "jules") else None)
+                        worker=worker if worker in ("codex", "jules") else None, **trial)
             if worker in ("codex", "jules"):  # H4: pid / session + base survive a conveyor restart
                 lanes[name][worker] = getattr(getattr(self, worker), "info", {}).get(sid)
                 self.save_lanes(lanes)
             busy.add(name)
             started = True
             self.event("dispatch", lane=name, id=sid, model=s["model"], effort=s["effort"],
-                       file=dest.name, backlog=True, tier=s["tier"])
+                       file=dest.name, backlog=True, tier=s["tier"], **trial)
 
     def reject(self, f, reason):
         """Move (never delete) a prompt with an invalid header to inbox/rejected/ and

@@ -6802,5 +6802,176 @@ class TestIntDependent(AutopilotBase):
         self.assertNotIn("G", self.fake.bg_names())
 
 
+class EnvClaude(FakeClaude):
+    """FakeClaude that also records the keyword arguments of every call."""
+
+    def __init__(self):
+        super().__init__()
+        self.kwargs = []
+
+    def __call__(self, args, timeout=120, cwd=None, **kw):
+        self.kwargs.append((args, {"cwd": cwd, **kw} if cwd else kw))
+        return super().__call__(args, timeout, cwd)
+
+    def kw_of(self, name):
+        return [kw for args, kw in self.kwargs if args[0] == "--bg" and name in args[:4]]
+
+
+class TestAdvisorTrial(Base):  # CONVADVISOR
+    FIELDS = {"advisor": "opus", "subagent_model": "haiku"}
+    VAR = "CLAUDE_CODE_SUBAGENT_MODEL"
+
+    def setUp(self):
+        super().setUp()
+        self.fake = self.c.run = EnvClaude()
+
+    def slice_(self, **kw):
+        return {"id": "A", "model": "sonnet", "effort": "medium", "tier": "T1", "prompt": "p.md", **kw}
+
+    def dispatches(self):
+        return [e for e in self.events() if e["event"] == "dispatch"]
+
+    def test_no_field_launches_and_records_exactly_as_today(self):
+        self.backlog({"id": "A"})
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [[
+            "--bg", "--name", "A", "--model", "sonnet", "--effort", "medium",
+            "--settings", conveyor.SETTINGS, "--strict-mcp-config",
+            "@jarvis lane=A model=sonnet effort=medium base=main\nTASK A\nbody\n"]])
+        self.assertEqual(self.fake.kw_of("A"), [{}])
+        (ev,) = self.dispatches()
+        self.assertFalse({"advisor", "subagent_model"} & set(ev))
+        self.assertFalse({"advisor", "subagent_model"} & set(self.lanes()["A"]))
+
+    def test_advisor_flag_follows_effort_and_the_prompt_stays_last(self):
+        self.backlog({"id": "A", "advisor": "opus"})
+        self.c.pass_once()
+        (call,) = self.fake.bg_calls()
+        self.assertEqual(call[5:9], ["--effort", "medium", "--advisor", "opus"])
+        self.assertTrue(call[-1].startswith("@jarvis lane=A "))
+        self.assertEqual(self.fake.kw_of("A"), [{}])
+        (ev,) = self.dispatches()
+        self.assertEqual(ev["advisor"], "opus")
+        self.assertNotIn("subagent_model", ev)
+        self.assertEqual(self.lanes()["A"]["advisor"], "opus")
+
+    def test_advisor_ranking_below_the_model_makes_the_backlog_invalid(self):
+        self.backlog({"id": "A", "model": "opus", "advisor": "sonnet"})
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), [])
+        self.assertIn("advisor sonnet ranks below model opus", self.c.pager_flag("backlog_invalid")[0])
+
+    def test_validation_table(self):
+        for model, advisor, ok in (("haiku", "sonnet", True), ("sonnet", "sonnet", True),
+                                   ("sonnet", "opus", True), ("opus", "opus", True),
+                                   ("opus", "fable", True), ("fable", "fable", True),
+                                   ("opus", "sonnet", False), ("fable", "opus", False),
+                                   ("haiku", "haiku", False), ("sonnet", None, False),
+                                   ("sonnet", ["opus"], False), ("sonnet", "gpt", False)):
+            with self.subTest(model=model, advisor=advisor):
+                why = conveyor.validate_slice(self.slice_(model=model, advisor=advisor))
+                self.assertIs(why is None, ok, why)
+        for value, ok in (("haiku", True), ("sonnet", True), ("opus", False), (None, False), (["haiku"], False)):
+            with self.subTest(subagent_model=value):
+                why = conveyor.validate_slice(self.slice_(subagent_model=value))
+                self.assertIs(why is None, ok, why)
+        self.assertEqual(set(conveyor.FAMILIES), set(conveyor.MODEL_RANK))  # no valid model lacks a rank
+
+    def test_fields_on_a_worker_they_cannot_reach_are_refused(self):
+        for worker, extra in (("codex", {}), ("jules", {"linux_ok": True})):
+            for field in self.FIELDS.items():
+                with self.subTest(worker=worker, field=field):
+                    s = self.slice_(worker=worker, **extra, **dict([field]))
+                    self.assertEqual(conveyor.validate_slice(s), "advisor/subagent_model need a Claude lane")
+        self.assertIsNone(conveyor.validate_slice(self.slice_(worker="claude", **self.FIELDS)))
+
+    def test_auto_slice_routed_to_codex_applies_and_records_neither(self):
+        self.backlog({"id": "A", "worker": "auto", **self.FIELDS})
+        with (mock.patch.object(self.c, "route", lambda s: ("codex", "test")),
+              mock.patch.object(self.c, "start_codex", lambda n, b, t: "cx-" + n),
+              mock.patch.object(self.c, "start", side_effect=AssertionError)):
+            self.c.pass_once()
+        (ev,) = self.dispatches()
+        self.assertEqual(ev["id"], "cx-A")
+        self.assertFalse({"advisor", "subagent_model"} & set(ev))
+        self.assertFalse({"advisor", "subagent_model"} & set(self.lanes()["A"]))
+
+    def test_subagent_model_is_env_for_that_lane_only_with_a_note_after_the_header(self):
+        self.backlog({"id": "A", "subagent_model": "haiku"}, {"id": "B"})
+        self.c.pass_once()
+        self.assertEqual(self.fake.kw_of("A"), [{"env": {self.VAR: "haiku"}}])
+        self.assertEqual(self.fake.kw_of("B"), [{}])
+        a, b = self.fake.bg_calls()
+        self.assertNotIn("--advisor", a)
+        lines = a[-1].splitlines()
+        self.assertIsNotNone(conveyor.check_header(lines[0])[0])  # the note never breaks the header lint
+        self.assertTrue(lines[1].startswith(f"NOTE: this lane runs with {self.VAR}=haiku: "))
+        self.assertIn("frontmatter", lines[1])
+        self.assertNotIn(self.VAR, b[-1])
+        ev = {e["lane"]: e for e in self.dispatches()}
+        self.assertEqual(ev["A"]["subagent_model"], "haiku")
+        self.assertNotIn("advisor", ev["A"])
+        self.assertNotIn("subagent_model", ev["B"])
+        self.assertEqual(self.lanes()["A"]["subagent_model"], "haiku")
+
+    def blocked_lane(self, **fields):
+        self.backlog({"id": "A", **fields})
+        self.c.pass_once()
+        a = self.fake.agent("A")
+        wt = self.root / ".claude" / "worktrees" / "a"
+        wt.mkdir(parents=True)
+        f = wt / "x.py"
+        f.write_text("x")
+        os.utime(f, (self.t - 9000, self.t - 9000))
+        return a, wt
+
+    def test_nudge_resumes_with_the_lanes_advisor_and_env(self):
+        a, wt = self.blocked_lane(**self.FIELDS)
+        a.update(state="blocked", status="idle", cwd=str(wt))
+        self.c.pass_once()
+        self.net = True
+        self.t += 600
+        self.c.pass_once()
+        ((call, kw),) = [(c, k) for c, k in self.fake.kwargs if c[:2] == ["--bg", "--resume"]]
+        self.assertEqual(call[5:11], ["--model", "sonnet", "--effort", "medium", "--advisor", "opus"])
+        self.assertEqual(kw, {"cwd": str(wt), "env": {self.VAR: "haiku"}})
+
+    def test_nudge_without_the_fields_stays_as_today(self):
+        a, wt = self.blocked_lane()
+        a.update(state="blocked", status="idle", cwd=str(wt))
+        self.c.pass_once()
+        self.net = True
+        self.t += 600
+        self.c.pass_once()
+        ((call, kw),) = [(c, k) for c, k in self.fake.kwargs if c[:2] == ["--bg", "--resume"]]
+        self.assertNotIn("--advisor", call)
+        self.assertEqual(kw, {"cwd": str(wt)})
+
+    def test_redispatch_keeps_the_advisor_the_env_and_a_single_note(self):
+        a, wt = self.blocked_lane(**self.FIELDS)
+        a["cwd"] = str(wt)
+        del a["pid"]
+        self.c.pass_once()  # respawn
+        a.update(pid=7, status="idle")
+        self.t += 601
+        self.c.pass_once()
+        first, second = self.fake.bg_calls()
+        self.assertEqual(second[7:9], ["--advisor", "opus"])
+        self.assertEqual(self.fake.kw_of("A")[1], {"env": {self.VAR: "haiku"}})
+        self.assertEqual(second[-1].count(self.VAR), 1)
+        self.assertEqual(self.lanes()["A"]["advisor"], "opus")  # a later nudge still has it
+
+    def test_real_runner_merges_the_lane_env_over_the_inherited_one(self):
+        done = mock.Mock(returncode=0, stdout="", stderr="")
+        with (mock.patch.object(conveyor.subprocess, "run", return_value=done) as run,
+              mock.patch.dict(os.environ, {"CONV_TRIAL_PROBE": "kept"})):
+            conveyor.real_runner(["agents"], env={self.VAR: "haiku"})
+            env = run.call_args.kwargs["env"]
+            self.assertEqual((env[self.VAR], env["CONV_TRIAL_PROBE"]), ("haiku", "kept"))
+            self.assertNotIn(self.VAR, os.environ)
+            conveyor.real_runner(["agents"])
+            self.assertIsNone(run.call_args.kwargs["env"])  # no env: inherits, exactly as before
+
+
 if __name__ == "__main__":
     unittest.main()
