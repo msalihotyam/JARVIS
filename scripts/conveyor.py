@@ -178,6 +178,8 @@ SESSION_EXE = "claude.exe"  # a lane's session pid is touched only when it is th
 COMMIT_PCT_RANGE = (80, 97)  # pace.json max_commit_pct (memory guard: no new lane above it) clamp
 PACED_LIMIT = 97  # paced mode: no new lanes at or above this % of the weekly plan
 PACE_MARGIN = 2  # paced: usage <= pace_line + this -> max lanes, else min_lanes (Salih 2026-10-12)
+KEEP_MAX = 30  # CONVRESERVE: pace.json salih_keep_pct (written by the orchestrator only) 0..KEEP_MAX
+KEEP_ASK_BEFORE_S = 12 * 3600  # Salih is asked once, this long before window_start + days (Thursday 10:00)
 MIN_LANES = 2  # pace.json min_lanes default (not written; capped by the lane cap when not set)
 INT_RE = re.compile(r"(?i)^int(?![a-z])")  # integration lanes (INT7, int-x): one at a time
 RESET_DROP = 40  # usage falling this many points between two readings = the quota was reset
@@ -2284,6 +2286,12 @@ class Conveyor:
             for k in ("codex_max", "jules_max"):  # CONVCAP: rejected, not clamped; 0 stops that worker
                 if isinstance(p[k], bool) or not isinstance(p[k], int) or not 0 <= p[k] <= MAX_LANES_CAP:
                     raise ValueError(f"{k} {p[k]!r}")
+            if "salih_keep_pct" in p and (isinstance(p["salih_keep_pct"], bool) or
+                                          not isinstance(p["salih_keep_pct"], int) or
+                                          not 0 <= p["salih_keep_pct"] <= KEEP_MAX):
+                raise ValueError(f"salih_keep_pct {p['salih_keep_pct']!r}")
+            if "salih_keep_window" in p and not isinstance(p["salih_keep_window"], str):
+                raise ValueError(f"salih_keep_window {p['salih_keep_window']!r}")
             if p.get("min_lanes", 0) > p.get("max_lanes", MAX_LANES_CAP):
                 raise ValueError(f"min_lanes {p['min_lanes']} > max_lanes {p['max_lanes']}")
             p["max_commit_pct"] = min(COMMIT_PCT_RANGE[1], max(COMMIT_PCT_RANGE[0], p["max_commit_pct"]))
@@ -2325,7 +2333,9 @@ class Conveyor:
                     self.pager_flag("reset_refused", ws)
             elif isinstance(prev, (int, float)) and prev - u >= RESET_DROP:
                 p, err = {**p, "mode": "paced", "window_start": iso(self.now())}, None
-                keep = [*PACE_DEFAULTS, *(k for k in ("max_lanes", "min_lanes", "test_pool_tokens",
+                p.pop("salih_keep_pct", None)  # CONVRESERVE: the keep expires with the window
+                p.pop("salih_keep_window", None)
+                keep =[*PACE_DEFAULTS, *(k for k in ("max_lanes", "min_lanes", "test_pool_tokens",
                                                       "claude_version") if k in p)]
                 (self.base / "pace.json").write_text(
                     json.dumps({k: p[k] for k in keep}, indent=2), encoding="utf-8")
@@ -2345,8 +2355,13 @@ class Conveyor:
         if self.sense_presence(p["away_after_min"]):
             self.power_switch(p)
         line, top = None, p.get("max_lanes") or p[f"lanes_{self.presence}"]
+        ws_keep, kp = p.get("window_start"), p.get("salih_keep_pct")
+        # CONVRESERVE: the orchestrator's keep counts only inside the window it was written for
+        keep = kp if isinstance(ws_keep, str) and p.get("salih_keep_window") == ws_keep \
+            and isinstance(kp, int) and not isinstance(kp, bool) else None
+        held = keep or 0  # 0: no keep, or a keep of 0 (answered, nothing held back)
         if p["mode"] == "full_burn":
-            limit, n, band = p["full_burn_limit_pct"], top, "full_burn"
+            limit, n, band = (p["full_burn_limit_pct"] if keep is None else min(p["full_burn_limit_pct"], 100 - held)), top, "full_burn"
             if u is not None and u >= p["reset_alert_pct"] and not self.pager_flag("reset_alert"):
                 self.page(f"Haftalık kota %{round(u)}: sıfırlama hakkını şimdi kullanabilirsin")
                 self.pager_flag("reset_alert", [round(u), self.now()])
@@ -2354,8 +2369,8 @@ class Conveyor:
             self.pager_flag("reset_alert", False)  # re-armed for the next full_burn episode
             start = datetime.fromisoformat(p["window_start"]).timestamp()
             line = 100 * max(0.0, self.now() - start) / 86400 / p["days"]
-            limit = PACED_LIMIT
-            floor = p.get("min_lanes", min(MIN_LANES, top))  # a hand-set min_lanes wins
+            limit = min(PACED_LIMIT, 100 - held)
+            floor =p.get("min_lanes", min(MIN_LANES, top))  # a hand-set min_lanes wins
             if u is None:
                 n, band = min(MAX_LANES, top), "unknown"  # no reading: no hold, at most 3
             elif u <= line + PACE_MARGIN:
@@ -2364,8 +2379,21 @@ class Conveyor:
             else:
                 n, band = floor, f"paced: ahead of line -> min {floor}"
         self.usage_hold = u is not None and u >= limit
+        tag = " (Salih payi)" if held else ""
         if self.usage_hold and p["mode"] == "paced":
-            band = f"paced: hold at {PACED_LIMIT} %"
+            band = f"paced: hold at {limit} %{tag}"
+        elif self.usage_hold and held:
+            band = f"full_burn: hold at {limit} %{tag}"
+        if u is not None and keep is None and not err and isinstance(ws_keep, str):
+            # CONVRESERVE: one ask per window, 12 h before it ends (Thursday 10:00 for a 22:00 window)
+            try:
+                ask_at = datetime.fromisoformat(ws_keep).timestamp() + p["days"] * 86400 - KEEP_ASK_BEFORE_S
+            except (ValueError, OverflowError):
+                ask_at = None
+            if ask_at is not None and self.now() >= ask_at and self.pager_flag("keep_ask") != ws_keep:
+                self.page(f"Kota bugun 22:00'de sifirlaniyor, %{round(u)} kullanildi. Bugun icinde "
+                          "sana lazim mi? Orkestratore yaz; cevap yoksa tamami kullanilir.")
+                self.pager_flag("keep_ask", ws_keep)
         self.max_lanes = 0 if self.usage_hold else n
         self.codex_max, self.jules_max = p["codex_max"], p["jules_max"]  # usage_hold stops them via hold()
         m = self.memory

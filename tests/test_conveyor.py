@@ -1592,6 +1592,129 @@ class TestPaceGovernor(TestUsageGuard):
         self.assertEqual(self.status()["pace"]["limit_pct"], 97)
         self.assertEqual(self.status()["pace"]["band"], "paced: hold at 97 %")
 
+    # ---- CONVRESERVE: Salih's keep ---------------------------------------
+    def keep(self, pct=10, days_ago=7, window=None, **kw):
+        ws = conveyor.iso(self.t - days_ago * 86400)
+        self.pace(mode="paced", window_start=ws, salih_keep_pct=pct,
+                  salih_keep_window=ws if window is None else window, **kw)
+
+    def test_keep_bad_values_are_pace_invalid(self):  # negative first
+        for bad in ({"salih_keep_pct": True}, {"salih_keep_pct": 31}, {"salih_keep_pct": -1},
+                    {"salih_keep_pct": "10"}, {"salih_keep_pct": 10.0}, {"salih_keep_pct": None},
+                    {"salih_keep_window": 5}, {"salih_keep_window": None}, {"salih_keep_window": ["x"]}):
+            self.fresh()
+            self.keep()
+            cfg = {**self.pace_file(), **bad}
+            (self.base / "pace.json").write_text(json.dumps(cfg), encoding="utf-8")
+            self.assertEqual(self.lanes_for(90), 2, bad)  # invalid -> paced from now (line 0): min_lanes floor
+            p = self.status()["pace"]
+            self.assertTrue(p["error"], bad)
+            self.assertEqual(p["limit_pct"], conveyor.PACED_LIMIT, bad)
+
+    def test_keep_for_another_window_is_ignored(self):
+        self.keep(window="2000-01-01T00:00:00+00:00")
+        self.assertEqual(self.lanes_for(96.9), 3)
+        p = self.status()["pace"]
+        self.assertEqual(p["limit_pct"], 97)
+        self.assertNotIn("Salih", p["band"])
+        self.assertIsNone(p["error"])
+        self.fresh()
+        self.keep(window="2000-01-01T00:00:00+00:00")
+        self.assertEqual(self.lanes_for(97), 0)
+        self.assertEqual(self.status()["pace"]["band"], "paced: hold at 97 %")
+
+    def test_keep_holds_paced_below_the_default_limit(self):
+        self.keep(10)
+        self.assertEqual(self.lanes_for(89.9), 3)
+        self.fresh()
+        self.keep(10)
+        self.assertEqual(self.lanes_for(90), 0)
+        p = self.status()["pace"]
+        self.assertTrue(self.status()["usage_hold"])
+        self.assertEqual((p["limit_pct"], p["band"]), (90, "paced: hold at 90 % (Salih payi)"))
+
+    def test_keep_zero_changes_nothing(self):
+        self.keep(0)
+        self.assertEqual(self.lanes_for(96.9), 3)
+        self.fresh()
+        self.keep(0)
+        self.assertEqual(self.lanes_for(97), 0)
+        self.assertEqual(self.status()["pace"]["band"], "paced: hold at 97 %")
+
+    def test_keep_holds_full_burn_but_never_raises_its_limit(self):
+        ws = conveyor.iso(self.t - 86400)
+        self.pace(salih_keep_pct=5, salih_keep_window=ws, window_start=ws)  # full_burn 98 -> 95
+        self.assertEqual(self.lanes_for(94.9), 3)
+        self.fresh()
+        self.pace(salih_keep_pct=5, salih_keep_window=ws, window_start=ws)
+        self.assertEqual(self.lanes_for(95), 0)
+        self.assertEqual(self.status()["pace"]["band"], "full_burn: hold at 95 % (Salih payi)")
+        self.fresh()
+        self.pace(salih_keep_pct=5, salih_keep_window=ws, window_start=ws, full_burn_limit_pct=90)
+        self.assertEqual(self.lanes_for(90), 0)  # the lower configured limit wins
+        self.assertEqual(self.status()["pace"]["limit_pct"], 90)
+
+    def test_keep_ask_not_before_reset_day(self):
+        self.paced(days_ago=6.49)
+        self.ledger(40)
+        self.c.pass_once()
+        self.assertEqual(self.pushes, [])
+
+    def test_keep_ask_once_per_window(self):
+        self.paced(days_ago=6.5)
+        self.ledger(40)
+        self.c.pass_once()
+        self.assertEqual(self.pushes, ["Kota bugun 22:00'de sifirlaniyor, %40 kullanildi. Bugun icinde "
+                                       "sana lazim mi? Orkestratore yaz; cevap yoksa tamami kullanilir."])
+        for _ in range(3):
+            self.t += conveyor.PAGE_GAP_S
+            self.c.pass_once()
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_keep_ask_in_full_burn_too(self):
+        ws = conveyor.iso(self.t - 6.6 * 86400)
+        self.pace(window_start=ws)
+        self.ledger(40)
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_keep_ask_skipped_when_answered_or_unreadable(self):
+        self.keep(10, days_ago=6.6)  # answered for this window
+        self.ledger(40)
+        self.c.pass_once()
+        self.fresh()
+        self.keep(0, days_ago=6.6)  # a keep of 0 is an answer too
+        self.ledger(40)
+        self.c.pass_once()
+        self.fresh()
+        self.pace(window_start=None)  # full_burn without a window: nothing to ask about
+        self.ledger(40)
+        self.c.pass_once()
+        self.assertEqual(self.pushes, [])
+
+    def test_keep_ask_again_after_an_expired_keep_and_a_new_window(self):
+        self.keep(10, days_ago=6.6, window="2000-01-01T00:00:00+00:00")  # expired: still asks
+        self.ledger(40)
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 1)
+        self.t += 7 * 86400  # next window, same flag store
+        self.paced(days_ago=6.6)
+        self.ledger(41)
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 2)
+
+    def test_reset_drops_the_keep(self):
+        self.keep(10, days_ago=6)
+        self.ledger(96)
+        self.c.pass_once()
+        self.t += 3600
+        self.ledger(56)
+        self.c.pass_once()
+        cfg = self.pace_file()
+        self.assertNotIn("salih_keep_pct", cfg)
+        self.assertNotIn("salih_keep_window", cfg)
+        self.assertEqual(cfg["window_start"], conveyor.iso(self.t))
+
     def test_pace_bands_at_boundaries(self):
         for pct, want in ((52, 3), (52.1, 2), (57, 2), (57.1, 2), (62, 2), (62.1, 2), (96.9, 2)):
             self.fresh()
@@ -1643,7 +1766,7 @@ class TestPaceGovernor(TestUsageGuard):
         self.assertIn(conveyor.RESET_ALERT_ID, self.attn())
 
     def test_no_reset_alert_in_paced_mode(self):
-        self.paced(days_ago=7)
+        self.paced(days_ago=6)  # before the CONVRESERVE keep ask (6.5 days): only the alert could push
         self.ledger(96)
         self.c.pass_once()
         self.assertEqual(self.pushes, [])
