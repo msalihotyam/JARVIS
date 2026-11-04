@@ -33,7 +33,36 @@ def _check(stdout, *, exit_code=0, timed_out=False, truncated=False):
                        truncated, timed_out)
 
 
+def _commit(manager, path, name, text):
+    def run(*args, input=None):
+        data = input.encode() if input is not None else None
+        return manager._git(path, *args, input=data).decode("utf-8", "replace")
+    file = Path(path) / name
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_text(text)
+    run("add", "--all")
+    tree = run("write-tree").strip()
+    parent = run("rev-parse", "HEAD").strip()
+    sha = run("commit-tree", tree, "-p", parent, input="test change\n").strip()
+    run("update-ref", "HEAD", sha, parent)
+    return sha
+
+
 class Base(unittest.TestCase):
+    BASED = False  # True: the template repo already holds keep.txt and sub/x.txt (see based_stage)
+
+    @classmethod
+    def setUpClass(cls):
+        # TESTFIX2: build the project repo once per class; every test copies it into its own temp dir.
+        template = tempfile.TemporaryDirectory(dir=os.environ.get("TEMP"),
+                                               ignore_cleanup_errors=True)
+        cls.addClassCleanup(template.cleanup)
+        manager = StageManager(Path(template.name) / "stages")
+        cls._template = manager.create_repo(Path(template.name) / "project")
+        if cls.BASED:
+            _commit(manager, cls._template, "keep.txt", "keep\n")
+            _commit(manager, cls._template, "sub/x.txt", "x\n")
+
     def setUp(self):
         temp = tempfile.TemporaryDirectory(dir=os.environ.get("TEMP"),
                                            ignore_cleanup_errors=True)
@@ -41,7 +70,8 @@ class Base(unittest.TestCase):
         self.home = Path(temp.name)
         self.ticks = 0
         self.manager = StageManager(self.home / "stages")
-        self.repo = self.manager.create_repo(self.home / "project")
+        self.repo = self.home / "project"
+        shutil.copytree(self._template, self.repo)
         self.db = self.home / "work.db"
         self.check_outputs = ["Ran 3 tests in 0.1s\n\nOK\n"] * 8
         self.check_effect = None
@@ -90,19 +120,12 @@ class Base(unittest.TestCase):
             link_rescan=None, run_check=fake_run_check)
 
     def commit_in(self, path, name, text):
-        file = Path(path) / name
-        file.parent.mkdir(parents=True, exist_ok=True)
-        file.write_text(text)
-        self.git(path, "add", "--all")
-        tree = self.git(path, "write-tree").strip()
-        parent = self.git(path, "rev-parse", "HEAD").strip()
-        sha = self.git(path, "commit-tree", tree, "-p", parent, input="test change\n").strip()
-        self.git(path, "update-ref", "HEAD", sha, parent)
-        return sha
+        return _commit(self.manager, path, name, text)
 
     def based_stage(self):
-        self.commit_in(self.repo, "keep.txt", "keep\n")
-        self.commit_in(self.repo, "sub/x.txt", "x\n")
+        if not self.BASED:
+            self.commit_in(self.repo, "keep.txt", "keep\n")
+            self.commit_in(self.repo, "sub/x.txt", "x\n")
         return self.ports.stage_create(self.step)
 
     def jarvis_repo(self, stage):
@@ -436,6 +459,8 @@ def _put(path, text):
 
 
 class ApplyBase(Base):
+    BASED = True
+
     def setUp(self):
         super().setUp()
         self.stage = self.based_stage()
