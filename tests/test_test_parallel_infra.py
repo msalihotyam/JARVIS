@@ -417,6 +417,63 @@ class PlanningTests(unittest.TestCase):
         self.assertIsNone(unit.seconds)
 
 
+class _Planned(Exception):
+    """main() got past the plan: stops it before it would run anything."""
+
+
+class MissingRecordGuardTests(unittest.TestCase):
+    """TESTFIX1: main() itself, up to the first step after the plan."""
+
+    DISCOVERY = {"modules": {"test_gap": {"split": True, "classes": {"A": ["tests.test_gap.A.test_a"]}}},
+                 "serial": ["tests.test_gap.A.test_a"], "errors": []}
+
+    def plan(self, argv, records, ci=False):
+        """(main's exit code, None when it got past the plan; its output; the units shard_plan saw)."""
+        out = io.TextIOWrapper(io.BytesIO(), encoding="utf-8")  # main() reconfigures its streams
+        env = {k: v for k, v in os.environ.items() if k != "CI"}
+        if ci:
+            env["CI"] = "true"
+        with (mock.patch.dict(os.environ, env, clear=True), mock.patch.object(tp, "SHARDED", False),
+              mock.patch.object(tp, "discover", lambda selected: ["test_gap"]),
+              mock.patch.object(tp, "ui_modules", lambda names: set()),
+              mock.patch.object(tp, "discover_tests", lambda python, names, serial: self.DISCOVERY),
+              mock.patch.object(tp, "load_durations", lambda path=None, key="classes": records if key == "classes" else {}),
+              mock.patch.object(tp, "pool_for", side_effect=_Planned),
+              mock.patch.object(tp, "shard_plan", wraps=tp.shard_plan) as split,
+              contextlib.redirect_stdout(out), contextlib.redirect_stderr(out)):
+            try:
+                code = tp.main(argv)
+            except _Planned:
+                code = None
+        out.flush()
+        return code, out.buffer.getvalue().decode("utf-8"), split.call_args[0][0] if split.called else None
+
+    def test_a_module_without_a_record_fails_the_plan_naming_it(self):
+        for argv, ci in (([], True), (["--shard", "1/2"], False), (["--require-durations"], False)):
+            with self.subTest(argv=argv, ci=ci):
+                code, text, split = self.plan(argv, {}, ci)
+                self.assertEqual(1, code, text)
+                self.assertIn("test_gap", text)
+                self.assertIn("add it to scripts/test_durations.json", text)
+                self.assertIsNone(split)
+
+    def test_locally_without_the_flag_a_missing_record_still_plans(self):
+        code, text, _ = self.plan([], {})
+        self.assertIsNone(code, text)
+        self.assertNotIn("test_durations.json", text)
+
+    def test_all_recorded_leaves_the_plan_unchanged_and_a_recorded_zero_is_a_record(self):
+        for seconds in (0.0, 40.0):
+            with self.subTest(seconds=seconds):
+                records = {"tests.test_gap.A": seconds}
+                code, text, split = self.plan(["--shard", "1/1", "--require-durations"], records)
+                self.assertIsNone(code, text)
+                self.assertNotIn("test_durations.json", text)
+                plain = tp.build_units(self.DISCOVERY, set(), records, {})
+                self.assertEqual([(u.module, u.ids, u.seconds) for u in plain],
+                                 [(u.module, u.ids, u.seconds) for u in split])
+
+
 class LoadSensitiveTests(Temp):
     def run_with(self, text):
         state = self.dir / "STATE.md"

@@ -54,7 +54,7 @@ The serial run stays the reference when a result is disputed.
 
     python scripts/test_parallel.py [--workers N] [--ui-workers K] [--durations N] [--no-rerun]
                                     [--python PATH] [--shard I/N] [--report PATH] [--no-ui-lock]
-                                    [--write-durations PATH] [modules ...]
+                                    [--require-durations] [--write-durations PATH] [modules ...]
     python scripts/test_parallel.py --aggregate DIR --shards N [--durations N] [--write-durations PATH]
 """
 
@@ -302,6 +302,17 @@ def build_units(discovery: dict, ui: set[str], durations: dict[str, float], test
                 ids = [t for attr in chunk for t in members[attr]]
                 units.append(Unit(module, chunk, ids, load, module in ui))
     return units
+
+
+def missing_records_message(units: list[Unit]) -> str:
+    """TESTFIX1: the plan's failure text when a module has no duration record, else "". Such a
+    module is one unknown unit on the flat timeout floor, the class that timed out INT100. A
+    recorded 0 is a record (a module skipped on windows-latest): only None counts."""
+    missing = sorted({u.module for u in units if u.seconds is None})
+    if not missing:
+        return ""
+    return ("no duration record for these test modules, add it to scripts/test_durations.json "
+            "(without one a module runs as a single unit on the flat 600 s timeout):\n  " + "\n  ".join(missing))
 
 
 def shard_plan(units: list[Unit], shards: int) -> list[list[Unit]]:
@@ -909,6 +920,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--aggregate", default="", help="check and combine the shard reports in this directory")
     parser.add_argument("--shards", type=int, default=0, help="with --aggregate: the number of shards")
     parser.add_argument("--no-ui-lock", action="store_true", help="do not wait for the machine-wide UI test lock (a deliberate manual run)")
+    parser.add_argument("--require-durations", action="store_true",
+                        help="fail the plan when a module has no duration record (always on under CI or --shard)")
     parser.add_argument("--_discover-child", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--_serial", action="store_true", help=argparse.SUPPRESS)
     parser.add_argument("--_no-serial", action="store_true", help=argparse.SUPPRESS)
@@ -948,6 +961,11 @@ def main(argv: list[str] | None = None) -> int:
         _print_set_difference("the serial discover -s tests set", collections.Counter(discovery["serial"]), expected)
         return 1
     units = build_units(discovery, ui_modules(names), load_durations(), load_durations(key="tests"))
+    if args.require_durations or os.environ.get("CI") or SHARDED:  # before the split: every shard fails alike
+        message = missing_records_message(units)
+        if message:
+            print(message, flush=True)
+            return 1
     if shard is not None:
         units = shard_plan(units, shard[1])[shard[0] - 1]
     # The union of dispatched ids equals the discovered set exactly (the whole suite, or this shard's plan).
