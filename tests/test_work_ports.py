@@ -20,7 +20,7 @@ from jarvis.work_checks import CheckResult
 from jarvis.work_ledger import EventKind, RunState, StepState, WorkRun, WorkStep, step_key
 from jarvis.work_ports import _changes, build_ports
 from jarvis.work_regress import TestResult
-from jarvis.write_stage import StageError, StageManager
+from jarvis.write_stage import Stage, StageError, StageManager
 from jarvis.workers.base import WorkerResult
 
 RUN = "run1"
@@ -248,6 +248,16 @@ class StageRefTests(Base):
         stage = self.based_stage()
         self.ref_file(stage).write_text("1" * 40 + "\n")
         self.assert_refused_without_pin(stage)
+
+    def test_none_stage_path_or_target_refuses(self):
+        # A ledger null reaches _identity; Path(None) raised TypeError, not the refusal.
+        good = {"target": self.repo, "path": self.manager.root / RUN / "one",
+                "branch": f"jarvis/{RUN}/one", "base": "a" * 40}
+        self.assertEqual(work_ports._identity(self.manager, Stage(**good)), (RUN, "one"))
+        for field in ("path", "target"):
+            with self.subTest(field=field):
+                with self.assertRaisesRegex(StageError, "identity mismatch"):
+                    self.ports.undo(Stage(**{**good, field: None}), "key")
 
 
 class PinTests(Base):

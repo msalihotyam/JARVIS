@@ -1,3 +1,4 @@
+# pyright: strict
 """PM26A S3: production ports for jarvis.work_driver, judged on JARVIS's side.
 
 The worker owns every byte of the stage: its config, refs, objects and hooks.
@@ -17,21 +18,34 @@ atomic update-ref transaction with its record, refs/jarvis/applied/<run>/
 recorded old under the same expected-value transaction.
 """
 
+from __future__ import annotations
+
 import hashlib
 import json
 import os
 import re
 import tempfile
 import types
-from pathlib import Path
+from pathlib import Path, PurePath
+from typing import TYPE_CHECKING, Any, Protocol, TypeVar
 
 from jarvis import stage_git, write_scope
 from jarvis.notify import NotificationCore
-from jarvis.work_checks import run_check as _run_check
+from jarvis.work_checks import CheckResult, run_check as _run_check
 from jarvis.work_evidence import EvidenceReceipt
-from jarvis.work_ledger import EventKind, WorkEvent, event_payload_json
+from jarvis.work_ledger import EventKind, WorkEvent, WorkStep, event_payload_json
 from jarvis.work_regress import RegressionVerdict, TestResult, compare_results, parse_output
-from jarvis.write_stage import Stage, StageError
+from jarvis.write_stage import Stage, StageError, StageManager
+
+if TYPE_CHECKING:
+    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from datetime import datetime, timedelta
+
+    from jarvis.contracts import MemoryStore
+    from jarvis.work_review import GateDecision
+
+_T = TypeVar("_T")
+_Repo = str | os.PathLike[str]
 
 _OID = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 _ID = r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}"
@@ -43,22 +57,34 @@ _RESERVED = frozenset({
     *(f"com{n}" for n in range(1, 10)), *(f"lpt{n}" for n in range(1, 10))})
 
 
-def _payload(event):
+class _StageFields(Protocol):
+    """A stage as _identity sees it: rebuilt from the ledger, so no field is trusted yet."""
+
+    @property
+    def target(self) -> object: ...
+    @property
+    def path(self) -> object: ...
+    @property
+    def branch(self) -> object: ...
+    @property
+    def base(self) -> object: ...
+
+def _payload(event: WorkEvent) -> dict[str, Any]:
     return json.loads(event.payload_json)
 
 
-def _sha256(data):
+def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def _git(repo, *args, input=None):
+def _git(repo: _Repo, *args: str, input: bytes | None = None) -> bytes:
     try:
-        return stage_git.run(repo, *args, input=input)
+        return stage_git.run(repo, *args, input=input)  # pyright: ignore[reportUnknownMemberType]
     except (stage_git.StageGitError, ValueError) as exc:
         raise StageError(str(exc)) from exc
 
 
-def _oid(value):
+def _oid(value: object) -> str:
     if isinstance(value, bytes):
         value = value.decode("ascii", "replace").strip()
     if not isinstance(value, str) or not _OID.fullmatch(value):
@@ -66,34 +92,39 @@ def _oid(value):
     return value
 
 
-def _identity(manager, stage):
+def _identity(manager: StageManager, stage: _StageFields) -> tuple[str, str]:
     """Return (run, slice) when the stage is exactly what the manager derives."""
-    match = _BRANCH.fullmatch(stage.branch) if isinstance(stage.branch, str) else None
-    expected = Path(manager.root) / match[1] / match[2] if match else None
+    branch, path, target = stage.branch, stage.path, stage.target
+    match = _BRANCH.fullmatch(branch) if isinstance(branch, str) else None
+    # A None path would raise TypeError from Path() instead of refusing.
     if (match is None
             or match[2].casefold() == "main"
             or not _OID.fullmatch(str(stage.base))
-            or Path(stage.path) != expected
-            or Path(stage.path).resolve() != expected.resolve()
-            or Path(stage.target).resolve() == Path(stage.path).resolve()):
+            or not isinstance(path, (str, PurePath))
+            or not isinstance(target, (str, PurePath))):
+        raise StageError("stage identity mismatch")
+    expected = Path(manager.root) / match[1] / match[2]
+    if (Path(path) != expected
+            or Path(path).resolve() != expected.resolve()
+            or Path(target).resolve() == Path(path).resolve()):
         raise StageError("stage identity mismatch")
     return match[1], match[2]
 
 
-def _changes(repo, base, commit):
+def _changes(repo: _Repo, base: str, commit: str) -> list[dict[str, object]]:
     """Rebuild write_scope.check change dicts from the JARVIS repo."""
     raw = _git(repo, "diff-tree", "-r", "-z", "--raw", "--no-renames",
                "--end-of-options", base, commit).split(b"\0")
     numstat = _git(repo, "diff-tree", "-r", "-z", "--numstat", "--no-renames",
                    "--end-of-options", base, commit).split(b"\0")
     try:
-        binary = {}
+        binary: dict[bytes, bool] = {}
         for line in numstat[:-1]:
             added, deleted, path = line.split(b"\t", 2)
             binary[path] = added == b"-" and deleted == b"-"
         if raw[-1] or len(raw) % 2 != 1:
             raise ValueError("odd raw diff")
-        changes = []
+        changes: list[dict[str, object]] = []
         for meta, path in zip(raw[:-1:2], raw[1:-1:2]):
             old, new, _, oid, status = meta.decode("ascii").split(" ")
             old = old.removeprefix(":")
@@ -109,7 +140,7 @@ def _changes(repo, base, commit):
     return changes
 
 
-def _ref(repo, ref):
+def _ref(repo: _Repo, ref: str) -> str | None:
     """The value of a plain ref, None when absent; a symbolic ref fails closed."""
     listing = ("for-each-ref", "--format=%(refname) %(objectname) %(symref)")
     lines = _git(repo, *listing, ref).decode("utf-8", "replace").splitlines()
@@ -143,14 +174,14 @@ def _ref(repo, ref):
     return _oid(fields[1])
 
 
-def _refuse_checked_out(target, ref):
+def _refuse_checked_out(target: _Repo, ref: str) -> None:
     """Raise when any worktree of target has ref checked out, or may have it."""
     # git reports a garbage, directory, missing or over-deep worktree HEAD as rc 0 with a
     # zero HEAD, and skips an unreadable worktree record, so neither reads as "not checked out".
     records = _git(target, "worktree", "list", "--porcelain", "-z").split(b"\0\0")
     gitdir = Path(target) / ".git"
     try:
-        linked = os.listdir(gitdir / "worktrees")
+        linked: list[str] = os.listdir(gitdir / "worktrees")
     except FileNotFoundError:
         linked = []
     except OSError as exc:
@@ -179,15 +210,22 @@ def _refuse_checked_out(target, ref):
                 raise StageError(f"integration ref is checked out: {ref}")
 
 
-def _transact(repo, *lines):
+def _transact(repo: _Repo, *lines: str) -> None:
     body = "\n".join(("start", *lines, "prepare", "commit")) + "\n"
     _git(repo, "update-ref", "--no-deref", "--stdin", input=body.encode())
 
 
-def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock, lease,
-                targets, jarvis_repo, checks, base_result, locked_fixture_hash,
-                fixture_hash, review, plan_hash, worker, route, task, budget_exhausted,
-                needs_input, verify_cwd, link_rescan, run_check=_run_check, binary_targets=()):
+def build_ports(*, store: MemoryStore, manager: StageManager, target: _Repo, lease_target: str,
+                run_id: object, boot_id: str, clock: Callable[[], datetime], lease: timedelta,
+                targets: dict[str, str], jarvis_repo: bool, checks: Sequence[Sequence[str]],
+                base_result: TestResult, locked_fixture_hash: str,
+                fixture_hash: Callable[[Path], str], review: Callable[[Stage, str], GateDecision],
+                plan_hash: str, worker: Callable[..., object], route: Callable[..., object],
+                task: Callable[..., object], budget_exhausted: Callable[[], object],
+                needs_input: Callable[..., object], verify_cwd: Callable[[Stage], object],
+                link_rescan: Callable[[Stage], Iterable[str]],
+                run_check: Callable[..., CheckResult] = _run_check,
+                binary_targets: Iterable[str] = ()) -> types.SimpleNamespace:
     """Return the ports object jarvis.work_driver.drive expects.
 
     lease_target is the literal relative name the lease is held under.
@@ -208,21 +246,22 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
         history = events()
         return history[-1].seq + 1 if history else 1
 
-    def append_event(kind, step_key, payload, idempotency_key=None):
+    def append_event(kind: EventKind, step_key: str | None, payload: Mapping[str, object],
+                     idempotency_key: str | None = None):
         event = WorkEvent(run_id, next_seq(), kind, clock(), step_key, event_payload_json(payload))
         return store.append_work_event(event, idempotency_key=idempotency_key)
 
-    def notify(point, dedupe_key, step_key):
+    def notify(point: str, dedupe_key: str, step_key: str | None):
         return notifier.notify(run_id, point, dedupe_key, seq=next_seq(), at=clock(),
                                step_key=step_key)
 
-    def lease_claim(step):
+    def lease_claim(step: WorkStep):
         return store.claim_work_lease(lease_target, run_id, boot_id, now=clock(), lease=lease)
 
-    def lease_release(step):
+    def lease_release(step: WorkStep):
         store.release_work_lease(lease_target, run_id, boot_id, now=clock())
 
-    def stage_create(step):
+    def stage_create(step: WorkStep):
         # A resumed step reattaches to its recorded stage; a slice never gets two.
         for event in reversed(events()):
             payload = _payload(event)
@@ -252,12 +291,12 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
             "branch": stage.branch, "base": stage.base})
         return stage
 
-    def _pin(stage):
+    def _pin(stage: Stage):
         run, slice_id = _identity(manager, stage)
         root = Path(manager.root)
         return root.parent / (root.name + "-repos") / run, f"refs/jarvis/judged/{run}/{slice_id}"
 
-    def _judged(stage):
+    def _judged(stage: Stage):
         # The only way a later port learns what was judged; never the stage.
         repo, ref = _pin(stage)
         try:
@@ -266,61 +305,63 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
         except StageError as exc:
             raise StageError("no judged commit pinned for this stage") from exc
 
-    def scope_check(stage):
+    def scope_check(stage: Stage) -> list[write_scope.Refusal]:
         repo, ref = _pin(stage)
         # This attempt's pin is earned below; a refused import leaves none.
         _git(repo, "update-ref", "--no-deref", "--stdin", input=f"delete {ref}\n".encode())
-        manager._validate(stage)
-        claim = manager._claim(stage)
+        manager._validate(stage)  # pyright: ignore[reportPrivateUsage]
+        claim = manager._claim(stage)  # pyright: ignore[reportPrivateUsage]
         try:
-            stage_git.import_commit(stage.path, repo, claim, stage.base)
+            stage_git.import_commit(stage.path, repo, claim, stage.base)  # pyright: ignore[reportUnknownMemberType]
         except (stage_git.StageGitError, ValueError) as exc:
             raise StageError(str(exc)) from exc
         _git(repo, "update-ref", "--no-deref", "--stdin", input=f"update {ref} {claim}\n".encode())
-        return write_scope.check(_changes(repo, stage.base, claim), targets,
+        return write_scope.check(_changes(repo, stage.base, claim), targets,  # pyright: ignore[reportUnknownMemberType, reportUnknownVariableType]
                                  jarvis_repo=jarvis_repo, binary_targets=binary_targets)
 
-    def _with_export(stage, use):
+    def _with_export(stage: Stage, use: Callable[[Path], _T]) -> _T:
         # Fresh per call: a check that rewrites its export cannot reach the hash.
         repo, commit = _judged(stage)
         with tempfile.TemporaryDirectory(prefix="jarvis-export-",
                                          ignore_cleanup_errors=True) as tmp:
             tree = Path(tmp) / "tree"
             try:
-                stage_git.export_commit(repo, commit, tree)
+                stage_git.export_commit(repo, commit, tree)  # pyright: ignore[reportUnknownMemberType]
             except (stage_git.StageGitError, ValueError, OSError) as exc:
                 raise StageError(str(exc)) from exc
             return use(tree)
 
-    def _judged_diff(stage):
+    def _judged_diff(stage: Stage):
         repo, commit = _judged(stage)
         return _git(repo, "diff-tree", "-r", "-p", "--binary", "--full-index", "--no-renames",
                     "--end-of-options", _oid(stage.base), commit)
 
-    stage_holder = [None]
+    stage_holder: list[Stage | None] = [None]
 
-    def run_checks(stage):
+    def run_checks(stage: Stage):
         stage_holder[0] = stage
         return _with_export(stage, lambda tree: tuple(
             run_check(list(argv), stage=tree, jarvis_repo=jarvis_repo) for argv in checks))
 
-    def regress(results):
-        results = [r for r in results if not isinstance(r, RegressionVerdict)]
-        if (not results or stage_holder[0] is None
+    def regress(results: Iterable[CheckResult | RegressionVerdict]):
+        checked = [r for r in results if not isinstance(r, RegressionVerdict)]
+        if (not checked or stage_holder[0] is None
                 or any(r.runner is None or r.timed_out or r.truncated or r.exit_code is None
-                       for r in results)):
+                       for r in checked)):
             return RegressionVerdict(False, frozenset(), ("unparseable",))
-        parsed = [parse_output(r.stdout + r.stderr, r.runner) for r in results]
+        # The filter never fires: the guard above refused a None runner; it narrows the type.
+        parsed = [parse_output(r.stdout + r.stderr, r.runner) for r in checked
+                  if r.runner is not None]
         # A clean summary from a process that then crashed is not a pass.
-        if any(r.exit_code != 0 and not p.failed_ids for r, p in zip(results, parsed)):
+        if any(r.exit_code != 0 and not p.failed_ids for r, p in zip(checked, parsed)):
             return RegressionVerdict(False, frozenset(), ("unparseable",))
         stage_result = TestResult(sum(p.total for p in parsed),
-                                  frozenset().union(*(p.failed_ids for p in parsed)))
+                                  frozenset[str]().union(*(p.failed_ids for p in parsed)))
         return compare_results(base_result, stage_result,
                                locked_fixture_hash=locked_fixture_hash,
                                stage_fixture_hash=_with_export(stage_holder[0], fixture_hash))
 
-    def review_port(stage):
+    def review_port(stage: Stage):
         decision = review(stage, _judged_diff(stage).decode("utf-8", "replace"))
         if decision.outcome == "accepted":
             return [{"severity": "MINOR", "detail": f"{f.file}:{f.line}:{f.text}"}
@@ -330,23 +371,25 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
                     for f in decision.blocking]
         return [{"severity": "BLOCKER", "detail": f"{decision.outcome}:{decision.reason}"}]
 
-    def evidence(step, stage, results, verdict):
+    def evidence(step: WorkStep, stage: Stage, results: Sequence[CheckResult],
+                 verdict: RegressionVerdict):
         output = b"".join((r.stdout + r.stderr).encode("utf-8", "replace") for r in results)
         return EvidenceReceipt(
             plan_hash=plan_hash, diff_sha=_sha256(_judged_diff(stage)),
             check_argv=tuple(" ".join(r.argv) for r in results),
-            exit_code=max(r.exit_code for r in results), output_sha=_sha256(output),
+            exit_code=max(r.exit_code for r in results),  # pyright: ignore[reportArgumentType, reportUnknownArgumentType]
+            output_sha=_sha256(output),
             base_result={"total": base_result.total, "failed_ids": sorted(base_result.failed_ids)},
             verdict="passed" if verdict.passed is True else "failed")
 
-    def tree_hash(stage):
+    def tree_hash(stage: Stage):
         repo, commit = _judged(stage)
         try:
-            return stage_git.tree_of(repo, commit)
+            return stage_git.tree_of(repo, commit)  # pyright: ignore[reportUnknownMemberType]
         except (stage_git.StageGitError, ValueError) as exc:
             raise StageError(str(exc)) from exc
 
-    def apply_intent(step):
+    def apply_intent(step: WorkStep):
         attempt, found = 1, None
         for event in events():
             if event.step_key != step.key:
@@ -363,7 +406,7 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
                         for e in events() if e.step_key == step.key)
         return found, receipted
 
-    def _pending_key(stage):
+    def _pending_key(stage: Stage):
         # The newest intent of the step that owns this stage (attempts only grow).
         history = events()
         owners = {e.step_key for e in history
@@ -374,14 +417,14 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
                 return payload["idempotency_key"]
         raise StageError("no apply intent recorded for this stage")
 
-    def _refs(stage, key):
+    def _refs(stage: Stage, key: str):
         run, _ = _identity(manager, stage)
         return f"refs/heads/jarvis/{run}/main", f"refs/jarvis/applied/{run}/{_sha256(key.encode())}"
 
-    def apply(stage, receipt):
+    def apply(stage: Stage, receipt: object):
         repo, commit = _judged(stage)
         try:
-            empty = stage_git.tree_of(repo, commit) == stage_git.tree_of(repo, stage.base)
+            empty = stage_git.tree_of(repo, commit) == stage_git.tree_of(repo, stage.base)  # pyright: ignore[reportUnknownMemberType]
         except (stage_git.StageGitError, ValueError) as exc:
             raise StageError(str(exc)) from exc
         if empty:
@@ -392,7 +435,7 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
             raise StageError(f"{ref} is not at the stage base; re-run")
         _refuse_checked_out(target, ref)
         try:
-            stage_git.import_commit(repo, target, commit, stage.base)
+            stage_git.import_commit(repo, target, commit, stage.base)  # pyright: ignore[reportUnknownMemberType]
         except (stage_git.StageGitError, ValueError) as exc:
             raise StageError(str(exc)) from exc
         _refuse_checked_out(target, ref)  # a checkout may have appeared during the import
@@ -400,7 +443,7 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
                   f"create {records}/old {stage.base}", f"create {records}/new {commit}")
         return commit
 
-    def applied(stage, key):
+    def applied(stage: Stage, key: str):
         ref, records = _refs(stage, key)
         old, new, current = _ref(target, f"{records}/old"), _ref(target, f"{records}/new"), _ref(target, ref)
         if old is None and new is None and current == stage.base:
@@ -409,7 +452,7 @@ def build_ports(*, store, manager, target, lease_target, run_id, boot_id, clock,
             return True
         raise StageError("apply record does not match the integration ref; operator decides")
 
-    def undo(stage, key):
+    def undo(stage: Stage, key: str):
         ref, records = _refs(stage, key)
         old, new = _ref(target, f"{records}/old"), _ref(target, f"{records}/new")
         if old is None and new is None:
