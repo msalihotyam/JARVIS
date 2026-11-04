@@ -1,3 +1,4 @@
+# pyright: strict
 """Local staging primitives; callers own leases, scope gates and integration.
 
 No app wiring or network operations. Diffs contain verified committed changes
@@ -60,6 +61,9 @@ remain separate migration steps. This is not a diff-scope or approval gate.
             raise StageError("trusted git is unavailable")
 
     def _git(self, cwd: Path, *args: str, input: bytes | None = None) -> bytes:
+        git = self.git
+        if git is None:
+            raise StageError("trusted git is unavailable")
         env = trusted_environment(forced={
             "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull,
             "GIT_TERMINAL_PROMPT": "0", "GIT_AUTHOR_NAME": "JARVIS",
@@ -76,7 +80,7 @@ remain separate migration steps. This is not a diff-scope or approval gate.
                 # No includes are read by this query. Refuse them before the real
                 # command; pin every locally named filter and textconv driver.
                 config = subprocess.run(
-                    [self.git.argv0(workspace=(self.root, cwd)), *GIT_PIN,
+                    [git.argv0(workspace=(self.root, cwd)), *GIT_PIN,
                      "-C", str(cwd), "config", "--local", "--no-includes", "--null", "--list"],
                     input=None, capture_output=True, timeout=self.timeout, env=env, shell=False,
                     creationflags=NO_CONSOLE_WINDOW,
@@ -108,7 +112,7 @@ remain separate migration steps. This is not a diff-scope or approval gate.
                 env[f"GIT_CONFIG_KEY_{index}"] = key
                 env[f"GIT_CONFIG_VALUE_{index}"] = value
             result = subprocess.run(
-                [self.git.argv0(workspace=(self.root, cwd)), *GIT_PIN,
+                [git.argv0(workspace=(self.root, cwd)), *GIT_PIN,
                  "-C", str(cwd), *args], input=input, capture_output=True,
                 timeout=self.timeout, env=env, shell=False,
                 creationflags=NO_CONSOLE_WINDOW,
@@ -126,7 +130,7 @@ remain separate migration steps. This is not a diff-scope or approval gate.
             raise StageError("repository names an unsafe filter or diff driver name")
 
     @staticmethod
-    def _identifier(value: str) -> str:
+    def _identifier(value: object) -> str:
         if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", value):
             raise StageError("invalid run or slice identifier")
         return value

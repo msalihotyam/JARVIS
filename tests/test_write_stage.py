@@ -37,6 +37,16 @@ class StageTests(unittest.TestCase):
             env={**os.environ, "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": os.devnull},
             capture_output=True, check=True).stdout
 
+    def test_git_refuses_when_trusted_git_is_gone(self):
+        fresh = self.home / "fresh"
+        fresh.mkdir()
+        self.manager.git = None
+        # "init" reaches only the command spawn; any other command reaches the config scan first.
+        for cwd, args in ((fresh, ("init",)), (self.repo, ("status",))):
+            with self.subTest(args), self.assertRaisesRegex(StageError, "trusted git is unavailable"):
+                self.manager._git(cwd, *args)
+        self.assertEqual(os.listdir(fresh), [])
+
     def plant(self, repo, name="planted", kinds=("filter", "diff")):
         """Commit a driver probe, then configure the driver; return its marker."""
         marker = self.home / f"{repo.name}-ran"

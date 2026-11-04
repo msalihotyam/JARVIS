@@ -323,6 +323,16 @@ class StageGitTests(unittest.TestCase):
         self.assertEqual(sorted(os.listdir(self.home)), ["hooks", "repo", "x"])
         self.assertFalse(self.marker.exists())
 
+    def test_extractor_refuses_member_without_readable_content(self):
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as archive:
+            archive.addfile(tarfile.TarInfo("a"), io.BytesIO(b""))
+        dest = self.home / "none"
+        dest.mkdir()
+        with patch.object(tarfile.TarFile, "extractfile", return_value=None), self.assertRaises(StageGitError):
+            _extract_tar(buffer.getvalue(), dest)
+        self.assertEqual(os.listdir(dest), [])
+
 
 class ImportCommitTests(unittest.TestCase):
     def setUp(self):

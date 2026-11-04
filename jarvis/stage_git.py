@@ -1,3 +1,4 @@
+# pyright: strict
 """The one hardened Git helper for stage and target repositories (PM26A).
 
 A worker can write the repository it worked in, ``.git/config``, hooks and
@@ -36,9 +37,11 @@ import tempfile
 import time
 import unicodedata
 from pathlib import Path
+from typing import TypedDict, TypeGuard
 
 from jarvis.trusted_exec import (
-    NO_CONSOLE_WINDOW, TrustedExecutableError, resolve_trusted_executable, trusted_environment,
+    NO_CONSOLE_WINDOW, TrustedExecutable, TrustedExecutableError, resolve_trusted_executable,
+    trusted_environment,
 )
 
 ALLOWED = frozenset({
@@ -96,8 +99,12 @@ class StageGitError(RuntimeError):
     """A Git failure or a refused repository or export; the repository itself is never changed by it."""
 
 
-def _check(args: tuple) -> None:
-    if not args or not all(isinstance(arg, str) for arg in args) or args[0] not in ALLOWED:
+def _all_text(args: tuple[object, ...]) -> TypeGuard[tuple[str, ...]]:
+    return all(isinstance(arg, str) for arg in args)
+
+
+def _check(args: tuple[object, ...]) -> None:
+    if not args or not _all_text(args) or args[0] not in ALLOWED:
         raise ValueError("git subcommand is not allowed")
     # `git <sub> --help` runs `git help`, which starts the repository's help.format viewer
     # (web.browser, browser.<tool>.cmd, man.viewer); -h and "help" are refused with it.
@@ -151,7 +158,7 @@ def _git_dir(repo: Path) -> Path:
         if _linked(os.lstat(repo)) or _linked(info) or not stat.S_ISDIR(info.st_mode):
             raise StageGitError("repository has no plain .git directory")
         # ponytail: walks every file under .git on each call; fine for stage repos, cache per run if slow.
-        pending = [git_dir]
+        pending: list[str | Path] = [git_dir]
         while pending:
             with os.scandir(pending.pop()) as entries:
                 for entry in entries:
@@ -182,7 +189,7 @@ def _git_dir(repo: Path) -> Path:
     return git_dir
 
 
-def _launch(scratch: Path) -> tuple[dict, tuple]:
+def _launch(scratch: Path) -> tuple[dict[str, str], tuple[str, ...]]:
     """The environment and command-line pins every Git process starts with."""
     empty, absent = scratch / "empty", scratch / "absent"
     env = trusted_environment(forced={
@@ -198,7 +205,7 @@ def _launch(scratch: Path) -> tuple[dict, tuple]:
     return env, pins
 
 
-def _spawn(git, repo: Path, scratch: Path, location: tuple, args: tuple,
+def _spawn(git: TrustedExecutable, repo: Path, scratch: Path, location: tuple[str, ...], args: tuple[str, ...],
            input: bytes | None, timeout: float) -> bytes:
     env, pins = _launch(scratch)
     forced = ("--no-ext-diff", "--no-textconv") if args[0] == "diff-tree" else ()
@@ -232,7 +239,7 @@ def _view(git_dir: Path, form: str, scratch: Path) -> Path:
     return view
 
 
-def run(repo: str | os.PathLike, *args: str, input: bytes | None = None, timeout: float = 30) -> bytes:
+def run(repo: str | os.PathLike[str], *args: str, input: bytes | None = None, timeout: float = 30) -> bytes:
     """Run one allowlisted plumbing command in ``repo`` and return its stdout.
 
     ``archive`` takes exactly ``--format=tar <object id>`` and runs in the
@@ -258,19 +265,28 @@ def run(repo: str | os.PathLike, *args: str, input: bytes | None = None, timeout
         return _spawn(git, repo, scratch, location, args, input, timeout)
 
 
-def _pipe(producer: list, consumer: list, revs: bytes, env: dict, scratch: Path, timeout: float) -> None:
+class _PopenOptions(TypedDict):
+    env: dict[str, str]
+    shell: bool
+    cwd: Path
+    creationflags: int
+
+
+def _pipe(producer: list[str], consumer: list[str], revs: bytes, env: dict[str, str], scratch: Path,
+          timeout: float) -> None:
     """``producer < revs | consumer`` without a shell; the timeout kills both, any failure raises."""
     (scratch / "revs").write_bytes(revs)
     errors = scratch / "producer.err", scratch / "consumer.err"
-    common = {"env": env, "shell": False, "cwd": scratch, "creationflags": NO_CONSOLE_WINDOW}
-    started = []
+    common: _PopenOptions = {"env": env, "shell": False, "cwd": scratch, "creationflags": NO_CONSOLE_WINDOW}
+    started: list[subprocess.Popen[bytes]] = []
     try:
         with open(scratch / "revs", "rb") as stdin, open(errors[0], "wb") as out, open(errors[1], "wb") as err:
             started.append(subprocess.Popen(producer, stdin=stdin, stdout=subprocess.PIPE, stderr=out, **common))
             started.append(subprocess.Popen(consumer, stdin=started[0].stdout, stdout=subprocess.DEVNULL,
                                             stderr=err, **common))
             # Only the consumer holds the read end now: if it dies the producer gets a broken pipe.
-            started[0].stdout.close()
+            if started[0].stdout is not None:
+                started[0].stdout.close()
             deadline = time.monotonic() + timeout
             for process in started:
                 process.wait(max(0, deadline - time.monotonic()))
@@ -281,7 +297,7 @@ def _pipe(producer: list, consumer: list, revs: bytes, env: dict, scratch: Path,
             if process.poll() is None:
                 process.kill()
                 process.wait()
-        if started:
+        if started and started[0].stdout is not None:
             started[0].stdout.close()
     failures = [
         f"git {name} exited {process.returncode}: "
@@ -293,7 +309,7 @@ def _pipe(producer: list, consumer: list, revs: bytes, env: dict, scratch: Path,
         raise StageGitError("; ".join(failures))
 
 
-def import_commit(stage: str | os.PathLike, jarvis: str | os.PathLike, commit: str, base: str, *,
+def import_commit(stage: str | os.PathLike[str], jarvis: str | os.PathLike[str], commit: object, base: object, *,
                   max_bytes: int = _MAX_PACK, timeout: float = 120) -> None:
     """Copy ``commit`` and what ``base`` lacks from a dead worker's ``stage`` into ``jarvis``.
 
@@ -301,7 +317,8 @@ def import_commit(stage: str | os.PathLike, jarvis: str | os.PathLike, commit: s
     but full object ids and a positive int cap, StageGitError for every refused import. A
     refused import can leave an unreferenced pack behind; an accepted one sets no ref.
     """
-    if not all(isinstance(oid, str) and _OID.fullmatch(oid) for oid in (commit, base)):
+    if not (isinstance(commit, str) and isinstance(base, str)
+            and _OID.fullmatch(commit) and _OID.fullmatch(base)):
         raise ValueError("commit and base must be full object ids")
     if type(max_bytes) is not int:
         raise ValueError("max_bytes must be an int")
@@ -340,7 +357,7 @@ def import_commit(stage: str | os.PathLike, jarvis: str | os.PathLike, commit: s
     run(jarvis, "merge-base", "--is-ancestor", base, commit, timeout=timeout)
 
 
-def tree_of(repo: str | os.PathLike, commit: str, *, timeout: float = 30) -> str:
+def tree_of(repo: str | os.PathLike[str], commit: object, *, timeout: float = 30) -> str:
     """The tree id of ``commit`` (replace refs ignored)."""
     if not isinstance(commit, str) or not commit or commit.startswith("-"):
         raise ValueError("invalid commit")
@@ -351,7 +368,7 @@ def tree_of(repo: str | os.PathLike, commit: str, *, timeout: float = 30) -> str
     return tree
 
 
-def export_commit(repo: str | os.PathLike, commit: str, dest: str | os.PathLike, *,
+def export_commit(repo: str | os.PathLike[str], commit: str, dest: str | os.PathLike[str], *,
                   timeout: float = 120) -> Path:
     """Write ``commit``'s tree byte for byte into an empty ``dest`` (no ``.git``); return dest.
 
@@ -393,7 +410,7 @@ def _extract_tar(data: bytes, dest: Path) -> None:
     # Every path made so far, case-folded -> its spelling: A/one then a/two would merge on
     # Windows (WindowsPath equality ignores case, so the resolve check below cannot see it).
     spelled: dict[str, str] = {}
-    made: set[tuple] = set()
+    made: set[tuple[str, ...]] = set()
     try:
         with tarfile.open(fileobj=io.BytesIO(data), mode="r:") as archive:
             for member in archive:
@@ -415,7 +432,10 @@ def _extract_tar(data: bytes, dest: Path) -> None:
                 if folder.resolve() != folder:
                     raise StageGitError(f"archive member escapes the destination: {member.name!r}")
                 if not member.isdir():
+                    source = archive.extractfile(member)
+                    if source is None:
+                        raise StageGitError(f"archive member has no readable content: {member.name!r}")
                     with open(root.joinpath(*parts), "xb") as handle:
-                        handle.write(archive.extractfile(member).read())
+                        handle.write(source.read())
     except (tarfile.TarError, OSError) as exc:
         raise StageGitError(f"archive extraction failed: {type(exc).__name__}") from exc
