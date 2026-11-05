@@ -520,7 +520,7 @@ class TestInbox(Base):
                                   "usage_hold", "pace", "disk_hold", "disk_free_gb",
                                   "memory_hold", "memory", "presence", "lanes",
                                   "preserved", "backlog", "breaker", "band", "attention",
-                                  "outage_hold"})
+                                  "outage_hold", "uv_prune_hold"})
         self.assertFalse(s["paused"])
         self.assertIsNone(s["last_error"])
         (lane,) = s["lanes"]
@@ -4790,6 +4790,33 @@ class TestPushGate(Base):
         self.c.pass_once()
         self.assertEqual(self.pushes, ["main 1234567 GitHub'a gönderildi"])
 
+    def test_pause_defers_an_approved_push_without_refusal(self):
+        name = f"push-{MAIN}-p2b"
+        self.approve()
+        (self.base / "PAUSE").write_text("")
+        self.c.pass_once()
+        self.t += conveyor.PUSH_RETRY_S + 1
+        self.c.pass_once()
+        self.assertEqual(self.git.pushes(), [])
+        self.assertTrue((self.root / "build" / "approvals" / name).exists())
+        self.assertFalse([e for e in self.events() if e["event"] == "push_blocked"])
+        self.assertNotIn(name, self.attn())
+        self.assertEqual([e["reason"] for e in self.events() if e["event"] == "push_deferred_pause"], ["PAUSE"])
+        (self.base / "PAUSE").unlink()
+        self.c.pass_once()
+        self.assertEqual(len(self.git.pushes()), 1)
+
+    def test_open_breaker_defers_an_approved_push(self):
+        self.approve()
+        self.c.breaker = {"reason": "x", "since": self.t}
+        self.c.push_gate()
+        self.c.push_gate()
+        self.assertEqual(self.git.pushes(), [])
+        self.assertEqual([e["reason"] for e in self.events() if e["event"] == "push_deferred_pause"], ["breaker"])
+        self.c.breaker = None
+        self.c.push_gate()
+        self.assertEqual(len(self.git.pushes()), 1)
+
     def test_no_approval_no_git(self):
         self.c.pass_once()
         self.assertEqual(self.git.calls, [])
@@ -4986,6 +5013,26 @@ class TestAutoApproval(AutopilotBase):
         self.finish("INT9", "GREEN", GREEN)
         self.assertEqual((d / "done" / f"push-{MAIN}-p2b").read_text(encoding="utf-8"), "orchestrator\n")
         self.assertEqual(len(self.git.pushes()), 1)
+
+    def test_pause_holds_auto_approval_and_an_orchestrator_key(self):
+        self.int_lane()
+        (self.base / "PAUSE").write_text("")
+        self.finish("INT9", "GREEN", GREEN)
+        self.assertEqual(self.approvals(), [])
+        self.assertEqual(self.git.pushes(), [])
+        self.assertEqual(len(self.ev("push_deferred_pause")), 1)
+        self.assertEqual(self.attn(), {} if isinstance(self.attn(), dict) else [])
+        d = self.root / "build" / "approvals"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / "push-orch").write_text("orchestrator\n", encoding="utf-8")
+        self.c.pass_once()
+        self.assertTrue((d / "push-orch").exists())
+        self.assertEqual(len(self.ev("push_deferred_pause")), 1)
+        (d / "push-orch").unlink()
+        (self.base / "PAUSE").unlink()
+        self.c.pass_once()
+        self.assertEqual(len(self.git.pushes()), 1)
+        self.assertTrue(self.approvals())
 
     def test_each_refusal_reason(self):
         cases = {
@@ -7114,9 +7161,14 @@ class TestDiskHousekeeping(Base):
     def disk_pushes(self):
         return [p for p in self.pushes if "Disk" in p]
 
-    def record_prune(self, args, timeout=120):
+    def record_prune(self, args):
         self.pruned.append(args)
-        return 0, ""
+        self.proc = FakeProc(args)
+        self.proc.pid = 4242 + len(self.pruned)
+        return self.proc
+
+    def image(self, name):
+        self.git.fail[("tasklist",)] = (0, f'"{name}","{self.proc.pid}","Console","1","10 K"\n')
 
     def test_warning_only_below_min_plus_five(self):
         for free in (50e9, 15e9):  # exactly MIN + 5 does not warn
@@ -7141,11 +7193,85 @@ class TestDiskHousekeeping(Base):
     def test_prune_at_most_once_per_day(self):
         self.c.prune = self.record_prune
         self.c.pass_once()
-        self.c.pass_once()
+        self.c.pass_once()  # still running: polled, not started again
         self.assertEqual(self.pruned, [["uv", "cache", "prune", "--quiet"]])
+        self.assertEqual(self.kinds("uv_pruned"), [])
+        self.proc.rc = 0
+        self.c.pass_once()
+        self.assertEqual([e["rc"] for e in self.kinds("uv_pruned")], [0])
+        self.c.pass_once()
+        self.assertEqual(len(self.pruned), 1)
         self.t += 86400
         self.c.pass_once()
         self.assertEqual(len(self.pruned), 2)
+
+    def test_prune_holds_dispatch_while_it_runs_and_releases_when_done(self):
+        self.c.prune = self.record_prune
+        self.c.pass_once()
+        self.assertTrue(self.c.hold())
+        self.backlog({"id": "A"})
+        self.c.pass_once()
+        self.assertNotIn("A", self.lanes())
+        self.proc.rc = 0
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertFalse(self.c.hold())
+        self.assertIn("A", self.lanes())
+
+    def test_prune_timeout_kills_only_a_uv_image(self):
+        for name, killed in (("python.exe", False), ("uv.exe", True), (None, False)):
+            with self.subTest(name=name):
+                self.c.prune = self.record_prune
+                self.c.uv_prune({}, [])
+                if name:
+                    self.image(name)
+                else:
+                    self.git.fail.pop(("tasklist",), None)  # tasklist cannot tell: unknown image
+                self.t += conveyor.PRUNE_TIMEOUT_S - 1
+                self.c.uv_prune({}, [])
+                self.assertFalse(self.proc.killed if hasattr(self.proc, "killed") else False)
+                self.t += 2
+                with mock.patch.object(conveyor.os, "kill") as kill:
+                    self.c.uv_prune({}, [])
+                kill.assert_not_called()
+                self.assertEqual(getattr(self.proc, "killed", False), killed)
+                ev = self.kinds("uv_prune_failed")[-1]
+                self.assertEqual((ev["reason"], ev["killed"]), ("timeout", killed))
+                self.assertFalse(self.c.pager_flag("uv_prune_run"))
+                self.t += 86400
+
+    def test_prune_after_a_restart_never_kills_another_image(self):
+        self.c.prune = self.record_prune
+        self.c.uv_prune({}, [])
+        self.c.prune_proc = None  # a restart loses the handle; only the pid persists
+        self.image("python.exe")  # the pid was reused
+        with mock.patch.object(conveyor.os, "kill") as kill:
+            self.c.uv_prune({}, [])
+            self.t += conveyor.PRUNE_TIMEOUT_S + 1
+            self.c.uv_prune({}, [])
+        kill.assert_not_called()
+        self.assertEqual(self.kinds("uv_pruned")[0]["stale"], True)
+        self.assertFalse(self.c.pager_flag("uv_prune_run"))
+
+    def test_prune_after_a_restart_kills_its_own_uv_past_the_timeout(self):
+        self.c.prune = self.record_prune
+        self.c.uv_prune({}, [])
+        pid = self.proc.pid
+        self.c.prune_proc = None
+        self.image("uv.exe")
+        with mock.patch.object(conveyor.os, "kill") as kill:
+            self.c.uv_prune({}, [])
+            kill.assert_not_called()
+            self.t += conveyor.PRUNE_TIMEOUT_S + 1
+            self.c.uv_prune({}, [])
+        kill.assert_called_once_with(pid, 9)
+        self.assertEqual(self.kinds("uv_prune_failed")[0]["killed"], True)
+
+    def test_prune_with_a_stale_pid_is_finished(self):
+        self.c.pager_flag("uv_prune_run", {"pid": "x", "start": self.t})
+        self.c.uv_prune({}, [])
+        self.assertEqual(self.kinds("uv_pruned")[0]["stale"], True)
+        self.assertFalse(self.c.pager_flag("uv_prune_run"))
 
     def test_prune_never_while_a_lane_runs_and_that_keeps_the_day(self):
         self.c.prune = self.record_prune
@@ -7187,14 +7313,13 @@ class TestDiskHousekeeping(Base):
         self.c.uv_prune(lanes, [{"id": "x", "pid": 1, "status": "idle"}])
         self.assertEqual(len(self.pruned), 1)
 
-    def test_prune_timeout_is_well_below_the_stale_lock_and_beat_comes_first(self):
-        order, timeouts = [], []
+    def test_prune_starts_detached_after_a_beat(self):
+        order = []
         beat = self.c.beat
 
-        def prune(args, timeout=None):
-            order.append("prune")
-            timeouts.append(timeout)
-            return 0, ""
+        def prune(*args, **kw):
+            order.append(("prune", args, kw))
+            return self.record_prune(*args)
 
         def counted():
             order.append("beat")
@@ -7203,25 +7328,25 @@ class TestDiskHousekeeping(Base):
         self.c.prune = prune
         self.c.beat = counted
         self.c.uv_prune({}, [])
-        self.assertEqual(order[:2], ["beat", "prune"])
-        self.assertLessEqual(timeouts[0], conveyor.STALE_LOCK_S / 2)
+        self.assertEqual(order[:2], ["beat", ("prune", (["uv", "cache", "prune", "--quiet"],), {})])
+        self.assertEqual(self.c.pager_flag("uv_prune_run")["pid"], self.proc.pid)
+        self.assertTrue(self.c.hold())
 
     def test_prune_failure_is_only_an_event_and_not_retried_that_day(self):
         calls = []
 
-        def boom(args, timeout=120):
+        def boom(args):
             calls.append(args)
-            if len(calls) == 1:
-                return 1, "broken"
-            raise TimeoutError
+            raise OSError
 
         self.c.prune = boom
         self.assertTrue(self.c.pass_once())
         self.c.pass_once()
         self.assertEqual(len(calls), 1)
+        self.assertFalse(self.c.hold())
         self.t += 86400
         self.assertTrue(self.c.pass_once())
-        self.assertEqual([e["rc"] for e in self.kinds("uv_prune_failed")], [1, "TimeoutError"])
+        self.assertEqual([e["rc"] for e in self.kinds("uv_prune_failed")], ["OSError", "OSError"])
 
     def test_prune_off_by_default(self):
         c = Conveyor(self.root, self.fake, now=lambda: self.t)
@@ -7380,17 +7505,32 @@ class TestTempWatch(Base):
         self.assertNotIn(str(deep), self.big())
         self.assertEqual([e["reasons"] for e in self.kinds("temp_watch_partial")], [["depth"]])
 
-    def test_entry_limit_is_a_partial_event(self):
+    def walk_to_end(self):
+        state = self.c.base / "temp_walk.json"
+        for _ in range(50):
+            self.c.temp_walk()
+            if not state.exists():
+                return
+        self.fail("the walk never finished a cycle")
+
+    def test_entry_limit_resumes_across_passes_and_ends_with_a_cycle(self):
         for i in range(10):
             self.file("f%d" % i, 1)
         with mock.patch.object(conveyor, "TEMP_WATCH_ENTRIES", 3):
             self.c.temp_walk()
-        self.assertEqual([(e["reasons"], e["entries"]) for e in self.kinds("temp_watch_partial")],
-                         [(["entries"], 4)])
+            self.assertTrue((self.c.base / "temp_walk.json").exists())
+            self.assertEqual(self.kinds("temp_watch_cycle"), [])
+            self.walk_to_end()
+        self.assertEqual(self.kinds("temp_watch_partial"), [])
+        self.assertEqual([e["entries"] for e in self.kinds("temp_watch_cycle")], [10])
+        self.c.temp_walk()  # the next cycle starts over from the root
+        self.assertEqual(len(self.kinds("temp_watch_cycle")), 2)
 
-    def test_time_limit_is_a_partial_event(self):
-        for i in range(20):
-            self.file("f%d" % i, 1)
+    def test_time_limit_resumes_and_finds_a_big_file_beyond_the_first_budget(self):
+        for i in range(30):
+            self.file("f%02d" % i, 1)
+        self.file("z.bin", 500)
+        start = self.t
 
         def clock():
             self.t += 1
@@ -7398,7 +7538,23 @@ class TestTempWatch(Base):
 
         self.c.now = clock
         self.c.temp_walk()
-        self.assertEqual([e["reasons"] for e in self.kinds("temp_watch_partial")], [["time"]])
+        self.assertTrue((self.c.base / "temp_walk.json").exists())
+        self.assertFalse(self.big())
+        self.walk_to_end()
+        self.assertTrue(self.big())
+        self.assertEqual(self.kinds("temp_watch_partial"), [])
+        cyc = self.kinds("temp_watch_cycle")
+        self.assertEqual(len(cyc), 1)
+        self.assertEqual(cyc[0]["entries"], 31)
+        self.assertEqual(cyc[0]["hours"], round((self.t - start) / 3600, 1))
+
+    def test_corrupt_walk_state_restarts_the_cycle_with_one_event(self):
+        self.file("f0", 1)
+        (self.c.base / "temp_walk.json").write_text("{bad", encoding="utf-8")
+        self.c.temp_walk()
+        self.assertEqual([e["error"] for e in self.kinds("temp_watch_error")],
+                         ["state unreadable, cycle restarted"])
+        self.assertEqual([e["entries"] for e in self.kinds("temp_watch_cycle")], [1])
 
     def test_a_locked_subdir_is_one_event_and_the_walk_goes_on(self):
         locked = self.temp / "locked"
@@ -7535,7 +7691,7 @@ class TestTempWatch(Base):
 
     def test_main_wires_the_prune_and_the_watch(self):
         with open(conveyor.__file__, encoding="utf-8") as f:
-            self.assertIn('Conveyor(prune=real_cmd, temp_watch=os.environ.get("TEMP"))', f.read())
+            self.assertIn('Conveyor(prune=start_detached, temp_watch=os.environ.get("TEMP"))', f.read())
 
 
 class TestChain(AutopilotBase):

@@ -253,7 +253,7 @@ CHAIN_FINDING_RE = re.compile(r"[\s\-*|#>]*(?:F\d+|BLOCKER|MAJOR|MINOR|NIT|HIGH|
 CHAIN_CODEX_RE = re.compile(r"CODEX RUN: rc=0 calls=[12]")  # the marker chain_templates/CDX.md mandates
 MIN_FREE_GB = 10  # below this on the repo drive no lane is dispatched
 DISK_ID = "disk-low"  # attention id (and ack file) of a low-disk episode
-PRUNE_TIMEOUT_S = 120  # well below STALE_LOCK_S: a prune never makes the lock look stale
+PRUNE_TIMEOUT_S = 1800  # a detached prune running longer is killed (only if its image is uv)
 TEMP_WATCH_EVERY_S = 3600
 TEMP_WATCH_DEPTH = 8
 TEMP_WATCH_ENTRIES = 50000
@@ -582,6 +582,14 @@ def real_procs():
         return WinProcs()
     except (OSError, AttributeError):  # off Windows: every priority call fails (logged)
         return None
+
+
+def start_detached(args):
+    """Start args detached without waiting; the conveyor polls the returned Popen each pass."""
+    flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    return subprocess.Popen([shutil.which(args[0]) or args[0], *args[1:]], cwd=ROOT,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, creationflags=flags)
 
 
 def real_cmd(args, timeout=120):
@@ -1053,6 +1061,7 @@ class Conveyor:
         self.cc_ok = None  # version gate result, decided once per pass (None: not yet)
         self.auto_file = self.base / "autopilot.json"
         self.breaker = None  # {"reason", "since"} while open (autopilot.json), else None
+        self.prune_proc = None  # this process's detached uv prune handle; pager flag uv_prune_run persists it
         self.chain_dead = set()  # slice ids of failed auto-fix chains: never dispatched (BREAKERV2)
         self.chain_pending = []  # "chain" events of this pass, written once autopilot.json is saved
         self.band = []  # status.json "band" lines (breaker, auto-approval)
@@ -2305,7 +2314,12 @@ class Conveyor:
     def uv_prune(self, lanes, agents):
         """`uv cache prune` once per local day, only with no lane running; failure is an event.
         Any unfinished lane counts, a "missing" one too (running() leaves those out), and so does
-        a live session of a finished lane (busy_names leaves those out)."""
+        a live session of a finished lane (busy_names leaves those out). It starts detached; each
+        pass polls it and hold() keeps dispatch off while it runs."""
+        run = self.pager_flag("uv_prune_run")
+        if run:
+            self.uv_prune_poll(run)
+            return
         day = iso(self.now())[:10]
         if (not self.prune or self.pager_flag("uv_pruned") == day
                 or any(not ln.get("finished") for ln in lanes.values())
@@ -2315,12 +2329,57 @@ class Conveyor:
         self.pager_flag("uv_pruned", day)
         self.beat()
         try:
-            rc, out = self.prune(["uv", "cache", "prune", "--quiet"], timeout=PRUNE_TIMEOUT_S)
+            self.prune_proc = self.prune(["uv", "cache", "prune", "--quiet"])
+            self.pager_flag("uv_prune_run", {"pid": self.prune_proc.pid, "start": self.now()})
         except Exception as e:
-            rc, out = type(e).__name__, ""
-        if rc != 0:
-            self.event("uv_prune_failed", rc=rc, output=out[-300:])
+            self.prune_proc = None
+            self.event("uv_prune_failed", rc=type(e).__name__)
         self.beat()
+
+    def uv_prune_poll(self, run):
+        """Done -> uv_pruned; after a restart (no handle) a pid that is not uv any more counts as
+        finished; over PRUNE_TIMEOUT_S it is killed only when tasklist names it uv."""
+        pid = run.get("pid") if isinstance(run, dict) else None
+        proc = self.prune_proc if self.prune_proc is not None and self.prune_proc.pid == pid else None
+        if not isinstance(pid, int) or isinstance(pid, bool):
+            return self.uv_prune_done(rc=None, stale=True)
+        if proc is not None:
+            rc = proc.poll()
+            if rc is not None:
+                return self.uv_prune_done(rc=rc)
+        else:
+            image = self.pid_image(pid)
+            if image is not None and image.lower() not in ("uv.exe", "uv"):  # gone or pid reused
+                return self.uv_prune_done(rc=None, stale=True)
+        start = run.get("start")
+        if isinstance(start, (int, float)) and self.now() - start <= PRUNE_TIMEOUT_S:
+            return  # still running: dispatch holds
+        image = self.pid_image(pid)
+        killed = image is not None and image.lower() in ("uv.exe", "uv")
+        if killed:
+            try:
+                proc.kill() if proc is not None else os.kill(pid, 9)
+            except OSError:
+                killed = False
+        self.event("uv_prune_failed", reason="timeout", pid=pid, image=image, killed=killed)
+        self.uv_prune_done()
+
+    def uv_prune_done(self, **kw):
+        if kw:
+            self.event("uv_pruned", **kw)
+        self.pager_flag("uv_prune_run", False)
+        self.prune_proc = None
+
+    def pid_image(self, pid):
+        """Image name of a live pid, "" when there is none, None when tasklist could not tell."""
+        try:
+            rc, out = self.cmd(["tasklist", "/FI", "PID eq %d" % pid, "/FO", "CSV", "/NH"])
+        except Exception:
+            return None
+        if rc != 0:
+            return None
+        line = out.strip().splitlines()[0] if out.strip() else ""
+        return line.split('","')[0].strip('"') if line.startswith('"') else ""
 
     def temp_watch_tick(self):
         """At most hourly read-only walk of TEMP: never deletes, never opens a file, never raises."""
@@ -2335,8 +2394,30 @@ class Conveyor:
             except Exception:
                 pass
 
+    def temp_walk_state(self, state_file, root):
+        """The persisted cycle, or a new one; a corrupt or foreign state restarts with one event."""
+        new = {"stack": [[root, 0, 0]], "entries": 0, "start": self.now()}
+        if not state_file.exists():
+            return new
+        under = root.rstrip("\\/") + os.sep
+        try:
+            s = json.loads(state_file.read_text(encoding="utf-8"))
+            ok = (s["root"] == root and type(s["entries"]) is int and type(s["start"]) in (int, float)
+                  and type(s["stack"]) is list
+                  and all(type(p) is str and type(d) is int and type(k) is int and 0 <= d <= TEMP_WATCH_DEPTH
+                          and k >= 0 and os.path.normpath(p) == p and (p == root or p.startswith(under))
+                          for p, d, k in s["stack"]))
+        except Exception:
+            ok = False
+        if ok:
+            return s
+        self.event("temp_watch_error", error="state unreadable, cycle restarted")
+        return new
+
     def temp_walk(self):
-        """Report big regular files under self.temp_watch; a link or junction is never followed."""
+        """Report big regular files under self.temp_watch; a link or junction is never followed.
+        Each tick walks TEMP_WATCH_BUDGET_S; the pending-dir stack persists in temp_walk.json so
+        the next tick resumes, and an emptied stack ends the cycle with one temp_watch_cycle."""
         def is_link(st):
             return (stat.S_ISLNK(st.st_mode)
                     or getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
@@ -2345,19 +2426,26 @@ class Conveyor:
         if is_link(os.lstat(root)):
             self.event("temp_watch_error", error="root is a link or junction")
             return
-        start, seen, stop, reasons, errors, stack = self.now(), 0, None, set(), [], [(root, 0)]
-        paged = 0
+        state_file = self.base / "temp_walk.json"
+        state = self.temp_walk_state(state_file, root)
+        stack = state["stack"]
+        start, seen, stop, reasons, errors, paged = self.now(), 0, None, set(), [], 0
         while stack and not stop:
-            path, depth = stack.pop(int(start // 3600) % len(stack))  # hourly order: a cap starves no subtree
+            path, depth, skip = stack.pop()
             try:
+                if path != root and is_link(os.lstat(path)):  # swapped for a link since it was queued
+                    continue
                 with os.scandir(path) as entries:
-                    for entry in entries:
-                        seen += 1
-                        stop = ("entries" if seen > TEMP_WATCH_ENTRIES
+                    # ponytail: resume skips by index; entries added or removed meanwhile may shift a few
+                    for i, entry in enumerate(entries):
+                        if i < skip:
+                            continue
+                        stop = ("entries" if seen >= TEMP_WATCH_ENTRIES
                                 else "time" if self.now() - start > TEMP_WATCH_BUDGET_S else None)
                         if stop:
-                            reasons.add(stop)
+                            stack.append([path, depth, i])  # resumed here next tick
                             break
+                        seen += 1
                         try:
                             st = entry.stat(follow_symlinks=False)
                             if entry.is_symlink() or entry.is_junction() or is_link(st):
@@ -2367,7 +2455,7 @@ class Conveyor:
                             continue
                         if stat.S_ISDIR(st.st_mode):
                             if depth < TEMP_WATCH_DEPTH:
-                                stack.append((entry.path, depth + 1))
+                                stack.append([entry.path, depth + 1, 0])
                             else:
                                 reasons.add("depth")
                         elif stat.S_ISREG(st.st_mode) and st.st_size >= TEMP_BIG_BYTES:
@@ -2377,6 +2465,14 @@ class Conveyor:
                                 paged += self.temp_big(entry.path, st.st_size)  # now: a later stop keeps it
             except OSError as e:
                 errors.append(repr(e)[:200])
+        entries = state["entries"] + seen
+        if stack:
+            self.write_atomic(state_file, json.dumps(
+                {"root": root, "stack": stack, "entries": entries, "start": state["start"]}))
+        else:
+            self.event("temp_watch_cycle", entries=entries,
+                       hours=round((self.now() - state["start"]) / 3600, 1))
+            state_file.unlink(missing_ok=True)
         if reasons:
             self.event("temp_watch_partial", reasons=sorted(reasons), entries=seen)
         if errors:
@@ -2413,7 +2509,8 @@ class Conveyor:
         throttled = self.mem_released is not None and self.now() - self.mem_released < MEM_RELEASE_S \
             and self.now() - self.last_start < MEM_GAP_S
         return (self.base / "PAUSE").exists() or self.disk_hold() or self.usage_hold \
-            or self.mem_hold or throttled or bool(self.pager_flag("outage")) or self.cc_hold()
+            or self.mem_hold or throttled or bool(self.pager_flag("outage")) or self.cc_hold() \
+            or bool(self.pager_flag("uv_prune_run"))  # uv prune: nothing starts while it runs
 
     def cc_version(self):
         """Installed Claude Code version ("2.1.123") or None when unreadable (rc, timeout, text)."""
@@ -3204,6 +3301,7 @@ class Conveyor:
             "disk_free_gb": self.free_gb and round(self.free_gb, 1),
             "memory_hold": self.mem_hold,
             "outage_hold": bool(self.pager_flag("outage")),
+            "uv_prune_hold": bool(self.pager_flag("uv_prune_run")),
             "memory": self.memory and {"free_gb": round(self.memory[0], 1),
                                        "commit_pct": round(self.memory[1], 1)},
             "presence": {"state": self.presence,
@@ -3334,7 +3432,10 @@ class Conveyor:
             if not INT_RE.match(name) or role == "afx" or name.endswith("-AFX"):
                 continue  # a fix lane (also one started by hand) never gets key 1 or a chain
             if st == "GREEN":
-                self.auto_approve(name, ln, lanes, ap)
+                if self.push_deferred(ap.get("breaker")):
+                    ln.pop("ap", None)  # a later pass retries
+                else:
+                    self.auto_approve(name, ln, lanes, ap)
             elif st == "BLOCKED" and role is None and not name.endswith("-R"):
                 self.auto_fix(name, ln, chains, ap)
         ap["bad"] = [x for x in ap.get("bad", []) if self.now() - x[1] < BREAKER_WINDOW_S]
@@ -4038,11 +4139,26 @@ class Conveyor:
         return slices, listing
 
     # ---- push gate: verified main to GitHub under two keys ---------------
+    def push_deferred(self, breaker):
+        """PAUSE or an open breaker: no approval is written and nothing is pushed, with no refusal
+        and no attention; a later pass retries. One push_deferred_pause event per period."""
+        paused = (self.base / "PAUSE").exists()
+        if not (paused or breaker):
+            if self.pager_flag("push_deferred"):
+                self.pager_flag("push_deferred", False)
+            return False
+        if not self.pager_flag("push_deferred"):
+            self.pager_flag("push_deferred", True)
+            self.event("push_deferred_pause", reason="PAUSE" if paused else "breaker")
+        return True
+
     def push_gate(self, lanes=None):
         """For each build/approvals/push-<sha>[-<ci>] (key 1, the orchestrator's) whose
         checks all pass (key 2, push_checks): `git push origin <sha>:refs/heads/main`,
         never --force, then move the approval to done/. A blocked approval is an
         attention item and is re-checked at most once per PUSH_RETRY_S."""
+        if self.push_deferred(self.breaker):
+            return  # approvals stay; a later pass retries
         lanes = self.load_lanes() if lanes is None else lanes
         state = self.load_json(self.push_file, {})
         files = sorted(f for f in self.approvals.glob("push-*") if f.is_file())
@@ -4923,4 +5039,4 @@ def archive_cli(c, dry_run):
 if __name__ == "__main__":
     if "--archive-sessions" in sys.argv:
         sys.exit(archive_cli(Conveyor(), "--dry-run" in sys.argv))
-    sys.exit(Conveyor(prune=real_cmd, temp_watch=os.environ.get("TEMP")).loop(once="--once" in sys.argv))
+    sys.exit(Conveyor(prune=start_detached, temp_watch=os.environ.get("TEMP")).loop(once="--once" in sys.argv))
