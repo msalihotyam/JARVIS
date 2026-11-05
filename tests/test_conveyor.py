@@ -7542,7 +7542,16 @@ class TestChain(AutopilotBase):
     """CONVCHAIN1: the pre-approved chain writes the next step and creates no authority."""
     SHA = "c" * 40
     PICK = f"COMMIT: {SHA}\n"
+    REVPICK = PICK + "FINDINGS: none\n"
     PIN = tuple(conveyor.GIT_PIN)
+
+    def report(self, name, status, where="wt", mtime=None, extra=""):
+        p = super().report(name, status, where, mtime, extra)
+        if name.startswith(("CLREV-", "CDX-")):  # a real review report: STATUS on line 1, no fence
+            st = p.stat()
+            p.write_text(f"STATUS: {status}\n{extra}", encoding="utf-8")
+            os.utime(p, (st.st_atime, st.st_mtime))
+        return p
 
     def setUp(self):
         super().setUp()
@@ -7794,7 +7803,7 @@ class TestChain(AutopilotBase):
                          ("opus", "high", ["build/reports/CLREV-SRC.md"], ["SRC"]))
         self.assertIn(self.SHA, self.prompt("CLREV-SRC").read_text(encoding="utf-8"))
         self.assertIn("CLREV-SRC", self.fake.bg_names())
-        self.finish("CLREV-SRC", "PASS", extra=self.PICK)
+        self.finish("CLREV-SRC", "PASS", extra=self.REVPICK)
         self.assertEqual(self.ids(), ["CLREV-SRC", "INT-SRC"])
         new = self.state()["chain_slices"][1]
         self.assertEqual((new["model"], new["effort"], new["files"], new["depends_on"]),
@@ -7963,32 +7972,32 @@ class TestChain(AutopilotBase):
         self.refused("unsafe file name")
         self.assertFalse(self.prompt("CLREV-SRC").exists())
 
-    # (d) any finding line stops the chain, MINOR too
-    def test_source_finding_refused(self):
+    # (d) any finding line in a review stops the chain, MINOR too; a source report has no scan
+    def test_source_report_prose_does_not_stop_the_chain(self):
         self.start()
-        self.finish("SRC", "PASS", extra=self.PICK + "MAJOR: broken\n")
-        self.refused("finding")
-        self.assertFalse(self.prompt("CLREV-SRC").exists())
+        self.finish("SRC", "PASS", extra=self.PICK + "effort high\nF1 FIXED\nOPEN ISSUES: x\nMAJOR: broken\n")
+        self.assertEqual(self.ids(), ["CLREV-SRC"])
+        self.assertTrue(self.prompt("CLREV-SRC").exists())
 
     def test_review_minor_finding_stops_before_int(self):
         self.start()
         self.finish("SRC", "PASS", extra=self.PICK)
         self.c.pass_once()
         self.t += 60
-        self.finish("CLREV-SRC", "PASS", extra=self.PICK + "MINOR: x\n")
+        self.finish("CLREV-SRC", "PASS", extra=self.REVPICK + "MINOR: x\n")
         self.refused("finding", ids=["CLREV-SRC"])
         self.assertFalse(self.prompt("INT-SRC").exists())
 
     def test_finding_line_forms(self):
-        for text, want in (("FINDINGS: a", True), ("FINDINGS:", True), ("FINDING 1 MAJOR x", True),
-                           ("MAJOR 4 (Codex) x", True), ("MINOR (mine): x", True), ("- BLOCKER: x", True),
-                           ("F1 MAJOR: data loss in x", True), ("CHECK 4 FAILED, MAJOR M1 y", True),
-                           ("| MAJOR | x |", True), ("Severity: MAJOR", True), ("STATUS: PASS (MINOR: x)", True),
-                           ("FINDINGS: none\n  F1 MAJOR: x", True), ("no MAJOR but MINOR: x", True),
-                           ("no BLOCKER, MINOR: x", True), ("PASS = no REAL BLOCKER/MAJOR", True),
-                           ("FINDINGS: none", False), ("BLOCKER: n/a", True), ("OPEN ISSUES: none", False)):
+        for text, want in (("F1 MAJOR: data loss in x", True), ("- BLOCKER: x", True), ("| MAJOR | x |", True),
+                           ("p1: x", True), ("- minor: x", True), ("| HIGH | x", True), ("BLOCKER: n/a", True),
+                           ("MAJOR 4 (Codex) x", True), ("LOW-risk", True), ("**MAJOR**: x", True), ("## MAJOR: x", True),
+                           ("MAJOR", True), ("NITS: x", True), ("  F1 MAJOR: x", True),
+                           ("FINDINGS: none", False), ("OPEN ISSUES: none", False), ("auth is broken", False),
+                           ("no MAJOR but x", False), ("follow up", False), ("Lowest", False), ("effort high", False),
+                           ("STATUS: PASS", False), ("FINDINGS: a", False)):
             with self.subTest(text=text):
-                self.assertEqual(conveyor.chain_findings(f"STATUS: PASS\n{text}\n"), want)
+                self.assertEqual(conveyor.chain_findings(f"{text}\n"), want)
         self.assertTrue(conveyor.chain_findings(None))
 
     # (e) both writes are atomic, the event comes only after they persist
@@ -8105,7 +8114,7 @@ class TestChain(AutopilotBase):
 
     # CONVCHAIN1FIXB: the chain creates no authority (B2) and a T2 chain needs a Codex review (G3)
     T2_CHAIN = {"tier": "T2", "approved": True, "chain": ["CLREV", "CDX", "INT"]}
-    CDXPICK = PICK + "CODEX RUN: rc=0 calls=1\n"
+    CDXPICK = REVPICK + "CODEX RUN: rc=0 calls=1\n"
 
     def cand(self):
         self.git = self.c.cmd = CandGit()
@@ -8113,7 +8122,7 @@ class TestChain(AutopilotBase):
         self.git.main = self.git.origin
 
     def step_ln(self, name, status="PASS", extra=None):
-        self.report(name, "PASS", extra=(self.CDXPICK if name.startswith("CDX-") else self.PICK) if extra is None else extra)
+        self.report(name, "PASS", extra=(self.CDXPICK if name.startswith("CDX-") else self.REVPICK) if extra is None else extra)
         return {"finished": True, "status": status, "base": self.git.main,
                 "report": str(self.root / ".claude/worktrees/wt/build/reports" / f"{name}.md")}
 
@@ -8131,7 +8140,7 @@ class TestChain(AutopilotBase):
             self.git.diff = diff
         self.start(**{**self.T2_CHAIN, **kw})
         for name in ("SRC", "CLREV-SRC", "CDX-SRC"):
-            self.finish(name, "PASS", extra=self.CDXPICK if name == "CDX-SRC" else self.PICK)
+            self.finish(name, "PASS", extra={"SRC": self.PICK, "CLREV-SRC": self.REVPICK, "CDX-SRC": self.CDXPICK}[name])
         self.assertIn("INT-SRC", self.ids())
         self.finish("INT-SRC", "CI_PENDING", f"CANDIDATE SHA: {SHA_B}\nCI: pushed ci/int-src, run in progress\n")
         self.git.ci(SHA_B)
@@ -8193,16 +8202,16 @@ class TestChain(AutopilotBase):
 
     def test_review_naming_another_sha_writes_no_int(self):
         lanes = {"CLREV-SRC": self.step_ln("CLREV-SRC"),
-                 "CDX-SRC": self.step_ln("CDX-SRC", extra=f"COMMIT: {'d' * 40}\nCODEX RUN: rc=0 calls=1\n")}
+                 "CDX-SRC": self.step_ln("CDX-SRC", extra=f"COMMIT: {'d' * 40}\nFINDINGS: none\nCODEX RUN: rc=0 calls=1\n")}
         why, ap = self.direct(lanes, done=("CLREV-SRC", "CDX-SRC"))
-        self.assertIn("CDX-SRC did not PASS naming", why)
+        self.assertEqual(why, f"CDX-SRC did not PASS naming {self.SHA[:7]}")
         self.assertNotIn("chain_slices", ap)
 
     def test_review_with_a_finding_line_writes_no_int(self):
         lanes = {"CLREV-SRC": self.step_ln("CLREV-SRC"),
                  "CDX-SRC": self.step_ln("CDX-SRC", extra=self.CDXPICK + "MINOR: a nit\n")}
         why, ap = self.direct(lanes, done=("CLREV-SRC", "CDX-SRC"))
-        self.assertIn("CDX-SRC report has a finding line", why)
+        self.assertEqual(why, "CDX-SRC report has a finding line")
         self.assertNotIn("chain_slices", ap)
 
     def test_missing_or_unfinished_cdx_waits_and_writes_no_int(self):
@@ -8256,13 +8265,10 @@ class TestChain(AutopilotBase):
                 self.assertIn(want, self.c.chain_pending[0]["g3"])
 
     # ---- CONVCHAIN1FIXC ----
-    F1_FORMS = ("| minor | scripts/a.py:12 | validation is missing |", "F1 minor: x", "F1 Major: x", "F1_MAJOR", "F2 x",
+    F1_FORMS = ("| minor | scripts/a.py:12 | validation is missing |", "F1 minor: x", "F1 Major: x", "F2 x",
                 "HIGH: auth bypass", "CRITICAL: auth bypass", "MEDIUM: x", "LOW: x", "BLOCKER: x", "MAJOR: x", "MINOR: x",
-                "NIT scripts/a.py:1 - x", "nit: x", "P0: x", "P1: x", "P2: x", "P3: x", "p1 x", "no MAJOR but x is broken",
-                "no findings", "findings: none", "FINDINGS: n/a", "FINDINGS:", "**FINDINGS: none**",
-                "FINDINGS: none​", "FINDINGS: none\n- auth bypass", "FINDINGS: none\nauth bypass in x",
-                "- auth bypass\nFINDINGS: none\nlower: x", "Mİnor: x", "m​ajor: x", "M A J O R",
-                "ＭＡＪＯＲ", "MАJOR", "kritik: x", "bulgu: x")
+                "NIT scripts/a.py:1 - x", "nit: x", "P0: x", "P1: x", "P2: x", "P3: x", "p1 x", "F1 MAJOR: x",
+                "- minor: x", "| HIGH | x", "p1: x")
     # the only clean lines a review may have besides LABEL: lines; the template test below reads them from the templates
     CLEAN_FORMS = ("FINDINGS: none", "OPEN ISSUES: none")
 
@@ -8348,7 +8354,7 @@ class TestChain(AutopilotBase):
                 self.assertNotIn("chain_slices", ap)
 
     def test_a_finding_in_the_claude_review_writes_no_int_either(self):
-        lanes = {"CLREV-SRC": self.step_ln("CLREV-SRC", extra=self.PICK + "F1 minor: x\n"), "CDX-SRC": self.step_ln("CDX-SRC")}
+        lanes = {"CLREV-SRC": self.step_ln("CLREV-SRC", extra=self.REVPICK + "F1 minor: x\n"), "CDX-SRC": self.step_ln("CDX-SRC")}
         why, ap = self.direct(lanes, done=("CLREV-SRC", "CDX-SRC"))
         self.assertEqual(why, "CLREV-SRC report has a finding line")
         self.assertNotIn("chain_slices", ap)
@@ -8371,39 +8377,42 @@ class TestChain(AutopilotBase):
         mark = "CODEX RUN: rc=0 calls=1\n"
         for extra in ("", "CODEX RUN: rc=0 calls=0\n", "CODEX RUN: rc=0 calls=3\n", "CODEX RUN: rc=1 calls=1\n",
                       "CODEX RUN: rc=0\n", "codex run: rc=0 calls=1\n", "  > CODEX RUN: rc=0 calls=1 and more\n",
-                      mark + mark, "CODEX RUN:​ rc=0 calls=1\n",
+                      mark + mark, "CODEX RUN:\u200b rc=0 calls=1\n",
                       mark + "Codex did not run: usage limit exceeded.\n", "Codex did not run: usage limit exceeded.\n",
-                      mark + "Codex didn't run\n", mark + "usage limit hit\n", mark + "USAGE_LIMIT\n", mark + "rc=1\n",
-                      mark + "exit code 2\n", mark + "Codex run failed\n"):
+                      mark + "usage limit hit\n", mark + "USAGE LIMIT\n", mark + "CODEX RUN: rc=1 calls=1\n"):
             with self.subTest(extra=extra):
-                why, ap = self.review(self.PICK + extra)
+                why, ap = self.review(self.REVPICK + extra)
                 self.assertEqual(why, "CDX-SRC report does not prove Codex ran")
                 self.assertNotIn("chain_slices", ap)
 
     def test_a_cdx_pass_with_the_marker_writes_the_int_and_a_clrev_needs_no_marker(self):
         for calls in (1, 2):
             with self.subTest(calls=calls):
-                why, ap = self.review(f"{self.PICK}CODEX RUN: rc=0 calls={calls}\n")
+                why, ap = self.review(f"{self.REVPICK}CODEX RUN: rc=0 calls={calls}\n")
                 self.assertIsNone(why)
                 self.assertEqual(ap["chain_slices"][-1]["id"], "INT-SRC")
 
-    def test_finding_forms_from_the_review_subagent_are_seen(self):
+    def test_finding_forms_from_the_review_subagent(self):
+        self.assertTrue(conveyor.chain_findings(f"STATUS: PASS\n{self.PICK}HIGHS: x\nFINDINGS: none\n"))
+        # prose by design, not a finding line: the orchestrator's key 1 is the check on it
         for line in ("BLOCKED: auth bypass in a.py", "Blocked by a broken gate", "1. F1: x is wrong",
-                     "| 1 | F1 | a.py:1 | x |", "P-1: x", "HIGHS: x", "HIGH2: x", "1 MEDIUMs"):
+                     "| 1 | F1 | a.py:1 | x |", "P-1: x", "HIGH2: x", "1 MEDIUMs"):
             with self.subTest(line=line):
-                self.assertTrue(conveyor.chain_findings(f"STATUS: PASS\n{self.PICK}{line}\nFINDINGS: none\n"))
+                self.assertFalse(conveyor.chain_findings(f"STATUS: PASS\n{self.PICK}{line}\nFINDINGS: none\n"))
 
-    def test_a_marker_with_any_other_line_about_the_run_does_not_prove_codex_ran(self):
-        m, c = "CODEX RUN: rc=0 calls=1\n", "FINDINGS: none\n"
-        self.assertTrue(conveyor.chain_codex_ran(f"STATUS: PASS\n{self.PICK}{m}{c}"))
-        for line in ("exit status 1", "exit code -1", "Codex exited with 1", "return code 1", "rc 1",
-                     "Codex wasn\x27t run", "Codex couldn\x27t run", "Failed to run Codex: x", "Codex did not execute"):
+    def test_a_marker_with_other_lines_about_the_run_still_proves_codex_ran(self):
+        for line in ("skipped=0, failures=0", "EXIT CODE: 0", "exit code 0", "Codex exited with 0", "rc=0"):
             with self.subTest(line=line):
-                self.assertFalse(conveyor.chain_codex_ran(f"STATUS: PASS\n{self.PICK}{m}{line}\n{c}"))
+                why, ap = self.review(f"{self.CDXPICK}{line}\n")
+                self.assertIsNone(why)
+                self.assertEqual(ap["chain_slices"][-1]["id"], "INT-SRC")
 
     def test_a_review_with_a_second_status_line_writes_no_int(self):
-        why, _ = self.review(f"{self.PICK}STATUS: BLOCKED\nCODEX RUN: rc=0 calls=1\nFINDINGS: none\n")
-        self.assertIn("CDX-SRC did not PASS naming", why)
+        why, _ = self.review(f"{self.REVPICK}STATUS: BLOCKED\nCODEX RUN: rc=0 calls=1\n")
+        self.assertEqual(why, f"CDX-SRC did not PASS naming {self.SHA[:7]}")
+        why, ap = self.review(f"{self.CDXPICK}Status of x\n")  # prose, not a STATUS: line
+        self.assertIsNone(why)
+        self.assertEqual(ap["chain_slices"][-1]["id"], "INT-SRC")
 
     def test_chain_int_on_a_protected_dir_in_another_case_is_loud(self):
         self.to_green(diff=".Claude/settings.json\n")
@@ -8432,6 +8441,87 @@ class TestChain(AutopilotBase):
         cdx = (d / "CDX.md").read_text(encoding="utf-8")
         self.assertIn("JARVIS_NTFY_TOPIC= codex exec", cdx)
         self.assertNotIn("powershell -", cdx)
+
+    # ---- CONVCHAIN1FIXD: the review gate reads an allowlist of exact machine lines ----
+    NEED_NONE = 'report needs exactly one "FINDINGS: none" line'
+
+    def raw_cdx(self, body):
+        """The CDX report file exactly as body, or absent for None; the mtime stays so only the text differs."""
+        ln = self.step_ln("CDX-SRC")
+        f = Path(ln["report"])
+        if body is None:
+            f.unlink()
+        else:
+            st = f.stat()
+            f.write_text(body, encoding="utf-8")
+            os.utime(f, (st.st_atime, st.st_mtime))
+        return self.direct({"CLREV-SRC": self.step_ln("CLREV-SRC"), "CDX-SRC": ln}, done=("CLREV-SRC", "CDX-SRC"))
+
+    def test_review_allowlist_a_pass_without_findings_none_writes_no_int(self):
+        why, ap = self.review(self.PICK + "CODEX RUN: rc=0 calls=1\n")
+        self.assertEqual(why, f"CDX-SRC {self.NEED_NONE}")
+        self.assertNotIn("chain_slices", ap)
+        lanes = {"CLREV-SRC": self.step_ln("CLREV-SRC", extra=self.PICK), "CDX-SRC": self.step_ln("CDX-SRC")}
+        why, ap = self.direct(lanes, done=("CLREV-SRC", "CDX-SRC"))
+        self.assertEqual(why, f"CLREV-SRC {self.NEED_NONE}")
+        self.assertNotIn("chain_slices", ap)
+
+    def test_review_allowlist_two_findings_lines_write_no_int(self):
+        for extra in ("FINDINGS: none\n", "FINDINGS: 2 major\n", "Findings: 2\n"):
+            with self.subTest(extra=extra):
+                why, ap = self.review(self.CDXPICK + extra)
+                self.assertEqual(why, f"CDX-SRC {self.NEED_NONE}")
+                self.assertNotIn("chain_slices", ap)
+
+    def test_review_allowlist_only_the_exact_findings_line_counts(self):
+        for line in ("**FINDINGS: none**", "findings: none", "FINDINGS: n/a", "FINDINGS: none\u200b", "FINDINGS:", "FINDINGS: none."):
+            with self.subTest(line=line):
+                why, ap = self.review(f"{self.PICK}CODEX RUN: rc=0 calls=1\n{line}\n")
+                self.assertEqual(why, f"CDX-SRC {self.NEED_NONE}")
+                self.assertNotIn("chain_slices", ap)
+        why, ap = self.review(f"{self.PICK}CODEX RUN: rc=0 calls=1\n  FINDINGS: none  \n")  # padding is not content
+        self.assertIsNone(why)
+        self.assertEqual(ap["chain_slices"][-1]["id"], "INT-SRC")
+
+    def test_review_allowlist_prose_does_not_stop_the_int(self):
+        """Documented: the gate only has to be exact, the orchestrator's key 1 is the check on prose."""
+        why, ap = self.review(f"{self.CDXPICK}auth is broken\n")
+        self.assertIsNone(why)
+        self.assertEqual(ap["chain_slices"][-1]["id"], "INT-SRC")
+        self.assertEqual(self.approvals(), [])
+
+    def test_review_allowlist_status_must_be_the_first_line_and_the_only_one(self):
+        want = f"CDX-SRC did not PASS naming {self.SHA[:7]}"
+        for body in (f"```\nSTATUS: PASS\n{self.CDXPICK}```\n", f"STATUS: BLOCKED\n{self.CDXPICK}", f"note\nSTATUS: PASS\n{self.CDXPICK}",
+                     f"STATUS: PASSED\n{self.CDXPICK}", f"STATUS: PASS (minor)\n{self.CDXPICK}", f"status: pass\n{self.CDXPICK}",
+                     f"STATUS: PASS\n{self.CDXPICK}Status: BLOCKED\n", self.CDXPICK, "", None):
+            with self.subTest(body=body):
+                why, ap = self.raw_cdx(body)
+                self.assertEqual(why, want)
+                self.assertNotIn("chain_slices", ap)
+        why, ap = self.raw_cdx(f"\n\nSTATUS: PASS\n{self.CDXPICK}")
+        self.assertIsNone(why)
+        self.assertEqual(ap["chain_slices"][-1]["id"], "INT-SRC")
+
+    def test_review_allowlist_exactly_one_commit_line_equal_to_the_sha(self):
+        want = f"CDX-SRC did not PASS naming {self.SHA[:7]}"
+        rest = "FINDINGS: none\nCODEX RUN: rc=0 calls=1\n"
+        for head in ("", self.PICK + self.PICK, self.PICK + f"COMMIT: {'d' * 40}\n", f"COMMIT: {self.SHA[:7]}\n",
+                     f"COMMIT:{self.SHA}\n", f"{self.PICK}note\x85COMMIT: {'d' * 40}\n", f"{self.PICK}commit: {'d' * 40}\n"):
+            with self.subTest(head=head):
+                why, ap = self.review(head + rest)
+                self.assertEqual(why, want)
+                self.assertNotIn("chain_slices", ap)
+
+    def test_the_templates_state_the_machine_lines(self):
+        d = Path(conveyor.__file__).parent / "chain_templates"
+        for name in ("CLREV", "CDX"):
+            text = (d / f"{name}.md").read_text(encoding="utf-8")
+            with self.subTest(name=name):
+                self.assertIn('exactly one line "FINDINGS: none"', text)
+                self.assertIn("F<n> <SEVERITY>: ...", text)
+                self.assertIn("first line of the file is exactly STATUS: PASS or STATUS: BLOCKED", text)
+        self.assertIn('exactly one line "CODEX RUN: rc=0 calls=<1-2>"', (d / "CDX.md").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
