@@ -1,3 +1,4 @@
+# pyright: strict
 """Pure project driver: runs slices through Core gates via injected ports.
 
 The driver owns no process, database or network. ``ports`` supplies:
@@ -33,14 +34,20 @@ an intent is verified, never applied again: receipted or applied ->
 accepted, otherwise undone and counted as a failed attempt.
 """
 
+from __future__ import annotations
+
 import contextlib
 import re
+from collections.abc import Callable, Iterable, Mapping
+from typing import TYPE_CHECKING, Protocol
 
 from jarvis.work_ledger import (
     MAX_REVISIONS,
     EventKind,
     RunState,
     StepState,
+    WorkRun,
+    WorkStep,
     advance_run,
     advance_step,
     idempotency_key,
@@ -50,34 +57,86 @@ from jarvis.work_ledger import (
 )
 from jarvis.workers.base import WorkerResult
 
+if TYPE_CHECKING:
+    # Types only: the driver stays pure and imports no process/stage code.
+    from datetime import datetime
+
+    from jarvis.work_checks import CheckResult
+    from jarvis.work_evidence import EvidenceReceipt
+    from jarvis.work_regress import RegressionVerdict
+    from jarvis.write_stage import Stage
+
+_Finding = dict[str, str]
+_Findings = tuple[_Finding, ...]
+
+
+class _Worker(Protocol):
+    # collect -> object: the driver re-checks for a WorkerResult (claims are data).
+    def start(self, task: str, /) -> str: ...
+    def collect(self, run_id: str, /) -> object: ...
+    def stop(self, run_id: str, /) -> object: ...
+
+
+class Ports(Protocol):
+    """The injected ports listed in the module docstring.
+
+    Results the driver re-checks fail-closed are typed ``object``.
+    """
+
+    def clock(self) -> datetime: ...
+    def append_event(self, kind: EventKind, step_key: str | None, payload: Mapping[str, object], /,
+                     idempotency_key: str | None = None) -> object: ...
+    def notify(self, point: str, dedupe_key: str, step_key: str | None, /) -> object: ...
+    def lease_claim(self, step: WorkStep, /) -> object: ...
+    def lease_release(self, step: WorkStep, /) -> object: ...
+    def stage_create(self, step: WorkStep, /) -> Stage: ...
+    def route(self, step: WorkStep, /) -> str: ...
+    def worker(self, name: str, /) -> _Worker: ...
+    def task(self, step: WorkStep, stage: Stage, findings: _Findings, /) -> str: ...
+    def budget_exhausted(self) -> object: ...
+    def verify_cwd(self, stage: Stage, /) -> object: ...
+    def needs_input(self, result: WorkerResult, /) -> object: ...
+    def link_rescan(self, stage: Stage, /) -> Iterable[object]: ...
+    def scope_check(self, stage: Stage, /) -> Iterable[object]: ...
+    def run_checks(self, stage: Stage, /) -> Iterable[CheckResult]: ...
+    def regress(self, results: tuple[CheckResult, ...], /) -> RegressionVerdict: ...
+    def review(self, stage: Stage, /) -> Iterable[Mapping[str, object]]: ...
+    def evidence(self, step: WorkStep, stage: Stage, results: tuple[CheckResult, ...],
+                 verdict: RegressionVerdict, /) -> EvidenceReceipt: ...
+    def apply(self, stage: Stage, receipt: EvidenceReceipt, /) -> object: ...
+    def tree_hash(self, stage: Stage, /) -> object: ...
+    def apply_intent(self, step: WorkStep, /) -> tuple[str, object] | None: ...
+    def applied(self, stage: Stage, key: str, /) -> object: ...
+    def undo(self, stage: Stage, key: str, /) -> object: ...
+
 # PM34: MINOR is logged; BLOCKER, MAJOR and any unknown severity block.
 _NON_BLOCKING = frozenset({"MINOR"})
 _REVISABLE = frozenset({StepState.ACCEPTING, StepState.BLOCKED_BY_GATE, StepState.TIMEOUT})
 _TREE_HASH = re.compile(r"[0-9a-f]{40,64}")
 
 
-def drive(run, steps, ports):
+def drive(run: WorkRun, steps: Iterable[WorkStep], ports: Ports) -> tuple[WorkRun, tuple[WorkStep, ...]]:
     """Drive a BUILDING run until it waits, pauses or every slice is done.
 
     Returns ``(run, steps)`` with the final ledger values.
     """
-    steps = {step.key: step for step in steps}
+    by_key = {step.key: step for step in steps}
     while run.state == RunState.BUILDING:
         # Checked first: a resumed run may already hold three failed slices.
-        if run_should_pause(steps.values()):
+        if run_should_pause(by_key.values()):
             run = _run_to(run, RunState.PAUSED, ports)
             break
         # Revisions cut short (budget) resume before fresh slices start.
-        ready = [s for s in steps.values() if s.state in _REVISABLE] + list(runnable_steps(steps.values()))
+        ready = [s for s in by_key.values() if s.state in _REVISABLE] + list(runnable_steps(by_key.values()))
         if not ready:
             break
         step, outcome = _drive_slice(ready[0], ports)
-        steps[step.key] = step
+        by_key[step.key] = step
         if outcome == "budget":
             run = _run_to(run, RunState.BLOCKED_BUDGET, ports)
             ports.notify("blocked:budget", f"budget:{step.key}:{step.attempt}", step.key)
     if run.state == RunState.BUILDING:
-        values = tuple(steps.values())
+        values = tuple(by_key.values())
         if run_waits_for_input(values):
             run = _run_to(run, RunState.NEEDS_INPUT, ports)
         elif values and all(step.state == StepState.ACCEPTED for step in values):
@@ -86,10 +145,10 @@ def drive(run, steps, ports):
         else:
             # Failed slices strand their dependents; the operator decides.
             run = _run_to(run, RunState.PAUSED, ports)
-    return run, tuple(sorted(steps.values(), key=lambda s: s.ordinal))
+    return run, tuple(sorted(by_key.values(), key=lambda s: s.ordinal))
 
 
-def _drive_slice(step, ports):
+def _drive_slice(step: WorkStep, ports: Ports) -> tuple[WorkStep, str]:
     track = [step]
     done = False
     ports.lease_claim(step)
@@ -105,17 +164,17 @@ def _drive_slice(step, ports):
         ports.lease_release(step)
 
 
-def _slice_body(track, ports):
-    def move(to):
+def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
+    def move(to: StepState) -> WorkStep:
         track[0] = _step_to(track[0], to, ports)
         return track[0]
 
-    def accepted():
+    def accepted() -> tuple[WorkStep, str]:
         step = move(StepState.ACCEPTED)
         ports.notify("slice_accepted", f"{step.key}:accepted", step.key)
         return step, "accepted"
 
-    def capped():
+    def capped() -> tuple[WorkStep, str] | None:
         step = track[0]
         if step.revisions < MAX_REVISIONS:
             return None
@@ -128,7 +187,7 @@ def _slice_body(track, ports):
     worker = ports.worker(ports.route(step))
     started = step.state != StepState.PENDING
     # A resumed revision's findings live in the ledger's gate events.
-    findings = (_finding("resume", "see_ledger_gate_events"),) if started else ()
+    findings: _Findings = (_finding("resume", "see_ledger_gate_events"),) if started else ()
     if step.state == StepState.ACCEPTING:
         resumed = _resume_apply(step, stage, ports)
         if resumed is not None:
@@ -149,13 +208,15 @@ def _slice_body(track, ports):
         if not started:
             started = True
             ports.notify("slice_started", f"{step.key}:started:{step.attempt}", step.key)
-        run_id = result = None
+        run_id: str | None = None
+        result: WorkerResult | None = None
         try:
             ports.verify_cwd(stage)
             run_id = worker.start(ports.task(step, stage, findings))
-            result = worker.collect(run_id)
-            if not isinstance(result, WorkerResult):
+            collected = worker.collect(run_id)
+            if not isinstance(collected, WorkerResult):
                 raise TypeError("collect returned no WorkerResult")
+            result = collected
         except Exception as exc:
             if run_id is not None:
                 with contextlib.suppress(Exception):
@@ -185,7 +246,7 @@ def _slice_body(track, ports):
             return outcome
 
 
-def _resume_apply(step, stage, ports):
+def _resume_apply(step: WorkStep, stage: Stage, ports: Ports) -> tuple[_Findings, bool] | None:
     """Settle a recorded apply intent without applying; None if none."""
     intent = ports.apply_intent(step)
     if intent is None:
@@ -202,31 +263,33 @@ def _resume_apply(step, stage, ports):
     return findings, False
 
 
-def _scope(stage, ports):
+def _scope(stage: Stage, ports: Ports) -> list[object]:
     # The post-run link rescan runs before the scope gate reads the diff.
     refusals = list(ports.link_rescan(stage))
     return refusals or list(ports.scope_check(stage))
 
 
-def _accept(step, stage, ports):
+def _accept(step: WorkStep, stage: Stage, ports: Ports) -> tuple[_Findings, bool]:
     """Checks -> regression -> review -> evidence -> apply, all fail-closed."""
-    results = []
+    results: list[CheckResult] = []
+    verdicts: list[RegressionVerdict] = []
 
-    def checks():
+    def checks() -> list[str]:
         results.extend(ports.run_checks(stage))
         if not results:
             return ["no_checks"]
         return [" ".join(r.argv) for r in results if r.timed_out or r.exit_code is None]
 
-    def regression():
+    def regression() -> list[str]:
         verdict = ports.regress(tuple(results))
-        results.append(verdict)
+        verdicts.append(verdict)
         if verdict.passed is not True:
             return list(verdict.new_failures) + list(verdict.reasons) or ["failed"]
         return []
 
-    def review():
-        blocking, minor = [], []
+    def review() -> list[str]:
+        blocking: list[str] = []
+        minor: list[str] = []
         for item in ports.review(stage):
             text = f"{item.get('severity')}:{item.get('detail', '')}"
             (minor if item.get("severity") in _NON_BLOCKING else blocking).append(text)
@@ -238,7 +301,7 @@ def _accept(step, stage, ports):
         findings = _gate(step, name, ports, gate)
         if findings:
             return findings, False
-    verdict = results.pop()
+    verdict = verdicts.pop()
     name = "evidence"
     try:
         receipt = ports.evidence(step, stage, tuple(results), verdict)
@@ -270,7 +333,7 @@ def _accept(step, stage, ports):
     return (), True
 
 
-def _receipt(step, key, ref, ports):
+def _receipt(step: WorkStep, key: str, ref: str, ports: Ports) -> None:
     ports.append_event(
         EventKind.PROGRESS, step.key,
         {"gate": "apply", "passed": True, "idempotency_key": key, "ref": ref},
@@ -278,7 +341,7 @@ def _receipt(step, key, ref, ports):
     )
 
 
-def _gate(step, name, ports, gate):
+def _gate(step: WorkStep, name: str, ports: Ports, gate: Callable[[], Iterable[object]]) -> _Findings:
     try:
         findings = tuple(_finding(name, str(item)) for item in gate())
     except Exception as exc:
@@ -287,7 +350,7 @@ def _gate(step, name, ports, gate):
     return findings
 
 
-def _gate_event(step, name, findings, ports):
+def _gate_event(step: WorkStep, name: str, findings: _Findings, ports: Ports) -> None:
     ports.append_event(EventKind.PROGRESS, step.key, {
         "gate": name,
         "passed": not findings,
@@ -295,17 +358,17 @@ def _gate_event(step, name, findings, ports):
     })
 
 
-def _finding(gate, detail):
+def _finding(gate: str, detail: str) -> _Finding:
     return {"gate": gate, "detail": detail}
 
 
-def _step_to(step, to, ports):
+def _step_to(step: WorkStep, to: StepState, ports: Ports) -> WorkStep:
     step = advance_step(step, to, at=ports.clock())
     ports.append_event(EventKind.STEP_STATE, step.key, {"state": step.state.value, "attempt": step.attempt})
     return step
 
 
-def _run_to(run, to, ports):
+def _run_to(run: WorkRun, to: RunState, ports: Ports) -> WorkRun:
     run = advance_run(run, to, at=ports.clock())
     ports.append_event(EventKind.RUN_STATE, None, {"state": run.state.value})
     return run
