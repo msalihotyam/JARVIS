@@ -21,6 +21,7 @@ import posixpath
 import re
 import shutil
 import socket
+import stat
 import subprocess
 import sys
 import time
@@ -245,6 +246,13 @@ SCHEMA_LINE = "SCHEMA_VERSION = 10"  # jarvis/memory.py; rollback targets read s
 SHA_RE = re.compile(r"[0-9a-f]{40}")
 MIN_FREE_GB = 10  # below this on the repo drive no lane is dispatched
 DISK_ID = "disk-low"  # attention id (and ack file) of a low-disk episode
+PRUNE_TIMEOUT_S = 120  # well below STALE_LOCK_S: a prune never makes the lock look stale
+TEMP_WATCH_EVERY_S = 3600
+TEMP_WATCH_DEPTH = 8
+TEMP_WATCH_ENTRIES = 50000
+TEMP_WATCH_BUDGET_S = 10
+TEMP_BIG_BYTES = 2 ** 31
+TEMP_BIG_PER_WALK = 3  # flush_pages cuts one push at 1000 chars; the rest waits for a later walk  # 2 GiB
 STUCK_NOTE ="(no report: the conveyor marked this lane STUCK - re-dispatched twice, no progress)"
 # Autopilot (CONV7, Salih 2026-10-10 03:56): key 1 for a GREEN integration report, one
 # fix-forward per BLOCKED integration chain, and a breaker on repeated failures. State in
@@ -920,8 +928,10 @@ class Conveyor:
     def __init__(self, root=ROOT, runner=real_runner, now=time.time, send=ntfy_send,
                  post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage,
                  projects=None, mem=real_mem, idle=real_idle, procs=None, net=real_net,
-                 popen=subprocess.Popen, codex=None, jules=None):
+                 popen=subprocess.Popen, codex=None, jules=None, prune=None, temp_watch=None):
         self.root = Path(root)
+        self.prune = prune  # prune and temp_watch are wired only on the real loop: no test reaches them
+        self.temp_watch = temp_watch
         self.codex = codex if codex is not None else CodexWorker(self.root, popen=popen, now=now)
         self.jules = jules if jules is not None else JulesWorker(self.root, now=now, git_cmd=GIT_PIN)
         # session transcripts: <claude config dir>/projects/<project slug>/<sessionId>.jsonl
@@ -1186,6 +1196,7 @@ class Conveyor:
             self.event("memory_unknown")  # unknown memory never holds
         self.govern()
         self.free_gb = self.disk_free_gb()
+        self.disk_warn()
         if agents is not None:
             self.track(lanes, agents)
         self.codex_track(lanes)
@@ -1198,6 +1209,8 @@ class Conveyor:
             self.prioritize(lanes, agents)
         self.save_lanes(lanes)  # before cleanup's slow CLI calls: dispatches are never lost
         self.beat()
+        if agents is not None:
+            self.uv_prune(lanes, agents)  # after the save and dispatch: a lane started now counts
         self.push_gate(lanes)
         items = self.attention(lanes)
         if agents is not None:
@@ -1208,6 +1221,7 @@ class Conveyor:
             items = self.attention(lanes)  # a lane cleanup just preserved shows at once
         self.status_written(lanes, items)
         self.backstop(items)
+        self.temp_watch_tick()
         self.pager_watch(lanes)
         self.flush_pages()
         return agents is not None
@@ -2210,6 +2224,107 @@ class Conveyor:
                  and (a.get("state") or a.get("status")) not in FINISHED}
         names |= {n for n in self.running(lanes) if not lanes[n].get("idle")}
         return names
+
+    def disk_warn(self):
+        """Page once per local day below MIN_FREE_GB + 5; the hold at MIN_FREE_GB is disk_hold."""
+        day = iso(self.now())[:10]
+        if (self.free_gb is not None and self.free_gb < MIN_FREE_GB + 5
+                and self.pager_flag("disk_warned") != day):
+            self.pager_flag("disk_warned", day)
+            self.page("Disk %d GB: konveyör %d GB'ta duracak" % (self.free_gb, MIN_FREE_GB))
+
+    def uv_prune(self, lanes, agents):
+        """`uv cache prune` once per local day, only with no lane running; failure is an event.
+        Any unfinished lane counts, a "missing" one too (running() leaves those out), and so does
+        a live session of a finished lane (busy_names leaves those out)."""
+        day = iso(self.now())[:10]
+        if (not self.prune or self.pager_flag("uv_pruned") == day
+                or any(not ln.get("finished") for ln in lanes.values())
+                or any("pid" in a and a.get("status") != "idle"
+                        and (a.get("state") or a.get("status")) not in FINISHED for a in agents)):
+            return  # a skipped pass does not consume the day
+        self.pager_flag("uv_pruned", day)
+        self.beat()
+        try:
+            rc, out = self.prune(["uv", "cache", "prune", "--quiet"], timeout=PRUNE_TIMEOUT_S)
+        except Exception as e:
+            rc, out = type(e).__name__, ""
+        if rc != 0:
+            self.event("uv_prune_failed", rc=rc, output=out[-300:])
+        self.beat()
+
+    def temp_watch_tick(self):
+        """At most hourly read-only walk of TEMP: never deletes, never opens a file, never raises."""
+        try:
+            if self.temp_watch and self.now() - (self.pager_flag("temp_watched") or 0) >= TEMP_WATCH_EVERY_S:
+                self.pager_flag("temp_watched", self.now())  # before the walk: a failing one waits too
+                self.beat()
+                self.temp_walk()
+        except Exception as e:
+            try:
+                self.event("temp_watch_error", error=repr(e)[:200])
+            except Exception:
+                pass
+
+    def temp_walk(self):
+        """Report big regular files under self.temp_watch; a link or junction is never followed."""
+        def is_link(st):
+            return (stat.S_ISLNK(st.st_mode)
+                    or getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+        root = os.path.normpath(self.temp_watch)
+        if is_link(os.lstat(root)):
+            self.event("temp_watch_error", error="root is a link or junction")
+            return
+        start, seen, stop, reasons, errors, stack = self.now(), 0, None, set(), [], [(root, 0)]
+        paged = 0
+        while stack and not stop:
+            path, depth = stack.pop(int(start // 3600) % len(stack))  # hourly order: a cap starves no subtree
+            try:
+                with os.scandir(path) as entries:
+                    for entry in entries:
+                        seen += 1
+                        stop = ("entries" if seen > TEMP_WATCH_ENTRIES
+                                else "time" if self.now() - start > TEMP_WATCH_BUDGET_S else None)
+                        if stop:
+                            reasons.add(stop)
+                            break
+                        try:
+                            st = entry.stat(follow_symlinks=False)
+                            if entry.is_symlink() or entry.is_junction() or is_link(st):
+                                continue
+                        except (OSError, AttributeError) as e:  # unknown: fail closed, not followed
+                            errors.append(repr(e)[:200])
+                            continue
+                        if stat.S_ISDIR(st.st_mode):
+                            if depth < TEMP_WATCH_DEPTH:
+                                stack.append((entry.path, depth + 1))
+                            else:
+                                reasons.add("depth")
+                        elif stat.S_ISREG(st.st_mode) and st.st_size >= TEMP_BIG_BYTES:
+                            if paged >= TEMP_BIG_PER_WALK:
+                                reasons.add("pages")  # not flagged: a later walk reports it
+                            else:
+                                paged += self.temp_big(entry.path, st.st_size)  # now: a later stop keeps it
+            except OSError as e:
+                errors.append(repr(e)[:200])
+        if reasons:
+            self.event("temp_watch_partial", reasons=sorted(reasons), entries=seen)
+        if errors:
+            self.event("temp_watch_error", error=errors[0], errors=len(errors))
+
+    def temp_big(self, path, size):
+        """One event and one page per path per local day; the flag keeps today's paths only.
+        True when this path was newly reported."""
+        path = path.encode("utf-8", "backslashreplace").decode()  # a surrogate would poison the pager
+        day, gb = iso(self.now())[:10], round(size / 2 ** 30, 1)
+        paths = (self.pager_flag("temp_big") or {}).get(day, [])
+        if path not in paths:
+            self.event("temp_big", path=path, gb=gb)
+            self.pager_flag("temp_big", {day: paths + [path]})
+            self.page("Temp'te büyük dosya: %s (%g GB). Silmek senin kararın." % (path, gb))
+            return True
+        return False
 
     def disk_free_gb(self):
         """Free GB on the repo drive; None (treated as low: fail closed) when unreadable."""
@@ -4548,4 +4663,4 @@ def archive_cli(c, dry_run):
 if __name__ == "__main__":
     if "--archive-sessions" in sys.argv:
         sys.exit(archive_cli(Conveyor(), "--dry-run" in sys.argv))
-    sys.exit(Conveyor().loop(once="--once" in sys.argv))
+    sys.exit(Conveyor(prune=real_cmd, temp_watch=os.environ.get("TEMP")).loop(once="--once" in sys.argv))

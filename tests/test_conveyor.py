@@ -6,6 +6,7 @@ import io
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import tempfile
@@ -7094,6 +7095,447 @@ class TestAdvisorTrial(Base):  # CONVADVISOR
             self.assertNotIn(self.VAR, os.environ)
             conveyor.real_runner(["agents"])
             self.assertIsNone(run.call_args.kwargs["env"])  # no env: inherits, exactly as before
+
+
+class TestDiskHousekeeping(Base):
+    """The day-flagged early warning and uv cache prune."""
+
+    def setUp(self):
+        super().setUp()
+        self.t = 1_800_000_000.0
+        self.base.mkdir(parents=True, exist_ok=True)
+        self.pruned = []
+
+    def kinds(self, kind):
+        if not (self.base / "events.jsonl").exists():
+            return []
+        return [e for e in self.events() if e["event"] == kind]
+
+    def disk_pushes(self):
+        return [p for p in self.pushes if "Disk" in p]
+
+    def record_prune(self, args, timeout=120):
+        self.pruned.append(args)
+        return 0, ""
+
+    def test_warning_only_below_min_plus_five(self):
+        for free in (50e9, 15e9):  # exactly MIN + 5 does not warn
+            self.free = free
+            self.c.pass_once()
+        self.c.disk = mock.Mock(side_effect=OSError)  # an unread disk is not a low disk
+        self.c.pass_once()
+        self.assertEqual(self.disk_pushes(), [])
+
+    def test_warning_once_per_day(self):
+        self.free = 14e9
+        self.c.pass_once()
+        self.t += conveyor.PAGE_GAP_S  # past the gap, or a repeat would join the same push
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(len(self.disk_pushes()), 1)
+        self.assertIn("Disk 14 GB: konveyör 10 GB'ta duracak", self.disk_pushes()[0])
+        self.t += 86400
+        self.c.pass_once()
+        self.assertEqual(len(self.disk_pushes()), 2)
+
+    def test_prune_at_most_once_per_day(self):
+        self.c.prune = self.record_prune
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.pruned, [["uv", "cache", "prune", "--quiet"]])
+        self.t += 86400
+        self.c.pass_once()
+        self.assertEqual(len(self.pruned), 2)
+
+    def test_prune_never_while_a_lane_runs_and_that_keeps_the_day(self):
+        self.c.prune = self.record_prune
+        self.backlog({"id": "A"})
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.pruned, [])
+        lanes = self.lanes()
+        lanes["A"].update(finished=True, finished_ts=self.t)
+        self.c.save_lanes(lanes)
+        self.c.uv_prune(lanes, [])
+        self.assertEqual(len(self.pruned), 1)
+
+    def test_prune_never_with_a_missing_state_lane(self):
+        self.c.prune = self.record_prune
+        lanes = {"M": {"id": "x", "state": "missing"}}
+        self.assertFalse(self.c.running(lanes))  # running() alone would let this one through
+        self.c.uv_prune(lanes, [])
+        self.assertEqual(self.pruned, [])
+
+    def test_prune_never_when_sessions_are_unknown(self):
+        self.c.prune = self.record_prune
+        self.fake.fail_agents = True
+        self.c.pass_once()
+        self.assertEqual(self.pruned, [])
+
+    def test_prune_never_with_a_session_outside_lanes_json(self):
+        self.c.prune = self.record_prune
+        self.c.uv_prune({}, [{"pid": 1, "status": "busy", "state": "working", "name": "me"}])
+        self.assertEqual(self.pruned, [])
+        self.c.uv_prune({}, [{"pid": 1, "status": "idle"}])
+        self.assertEqual(len(self.pruned), 1)
+
+    def test_prune_never_with_a_live_session_of_a_finished_lane(self):
+        self.c.prune = self.record_prune
+        lanes = {"A": {"id": "x", "finished": True}}
+        self.c.uv_prune(lanes, [{"id": "x", "pid": 1, "status": "busy", "state": "working", "name": "A"}])
+        self.assertEqual(self.pruned, [])
+        self.c.uv_prune(lanes, [{"id": "x", "pid": 1, "status": "idle"}])
+        self.assertEqual(len(self.pruned), 1)
+
+    def test_prune_timeout_is_well_below_the_stale_lock_and_beat_comes_first(self):
+        order, timeouts = [], []
+        beat = self.c.beat
+
+        def prune(args, timeout=None):
+            order.append("prune")
+            timeouts.append(timeout)
+            return 0, ""
+
+        def counted():
+            order.append("beat")
+            beat()
+
+        self.c.prune = prune
+        self.c.beat = counted
+        self.c.uv_prune({}, [])
+        self.assertEqual(order[:2], ["beat", "prune"])
+        self.assertLessEqual(timeouts[0], conveyor.STALE_LOCK_S / 2)
+
+    def test_prune_failure_is_only_an_event_and_not_retried_that_day(self):
+        calls = []
+
+        def boom(args, timeout=120):
+            calls.append(args)
+            if len(calls) == 1:
+                return 1, "broken"
+            raise TimeoutError
+
+        self.c.prune = boom
+        self.assertTrue(self.c.pass_once())
+        self.c.pass_once()
+        self.assertEqual(len(calls), 1)
+        self.t += 86400
+        self.assertTrue(self.c.pass_once())
+        self.assertEqual([e["rc"] for e in self.kinds("uv_prune_failed")], [1, "TimeoutError"])
+
+    def test_prune_off_by_default(self):
+        c = Conveyor(self.root, self.fake, now=lambda: self.t)
+        self.assertIsNone(c.prune)
+        c.uv_prune({}, [])
+
+
+class TestTempWatch(Base):
+    """The read-only Temp watch: a tiny threshold stands in for 2 GiB, except in one test."""
+
+    def setUp(self):
+        super().setUp()
+        self.t = 1_800_000_000.0
+        self.base.mkdir(parents=True, exist_ok=True)
+        self.temp = self.root / "tempdir"
+        self.temp.mkdir()
+        self.c.temp_watch = str(self.temp)
+        self.real_big = conveyor.TEMP_BIG_BYTES
+        patcher = mock.patch.object(conveyor, "TEMP_BIG_BYTES", 100)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def link(self, target, at):
+        if sys.platform == "win32":
+            import _winapi
+            _winapi.CreateJunction(str(target), str(at))
+        else:
+            os.symlink(target, at)
+
+    def file(self, name, size=100):
+        p = self.temp / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(b"x" * size)
+        return p
+
+    def kinds(self, kind):
+        if not (self.base / "events.jsonl").exists():
+            return []
+        return [e for e in self.events() if e["event"] == kind]
+
+    def big(self):
+        return [e["path"] for e in self.kinds("temp_big")]
+
+    def pages(self):
+        return sum(p.count("Temp'te") for p in self.pushes)
+
+    def outside_with_big_file(self):
+        outside = self.root / "outside"
+        outside.mkdir(exist_ok=True)
+        (outside / "big.bin").write_bytes(b"x" * 100)
+        return outside
+
+    def entry(self, name, mode=stat.S_IFDIR, size=0, attrs=0, link=False, junction=False):
+        e = mock.Mock(path=os.path.join(str(self.temp), name))
+        e.stat.return_value = mock.Mock(st_mode=mode, st_size=size, st_file_attributes=attrs)
+        e.is_symlink.return_value = link
+        e.is_junction.return_value = junction
+        return e
+
+    def walk_with(self, *entries):
+        """temp_walk with the watched dir listing `entries`; returns the paths scanned."""
+        real, seen = os.scandir, []
+
+        def fake(path="."):
+            seen.append(path)
+            if path == os.path.normpath(str(self.temp)):
+                return contextlib.nullcontext(iter(entries))
+            return real(path)
+
+        with mock.patch.object(conveyor.os, "scandir", fake):
+            self.c.temp_walk()
+        return seen
+
+    def test_big_file_one_event_and_one_page_per_day(self):
+        p = self.file("big.bin")
+        self.c.pass_once()
+        self.assertEqual(self.big(), [str(p)])
+        self.assertEqual(self.pages(), 1)
+        self.assertIn(str(p), self.pushes[0])
+        self.t += 3600
+        self.c.pass_once()
+        self.assertEqual((len(self.big()), self.pages()), (1, 1))
+        self.t += 86400
+        self.c.pass_once()
+        self.assertEqual(len(self.big()), 2)
+        self.assertEqual(list(self.c.pager_flag("temp_big")), [conveyor.iso(self.t)[:10]])
+
+    def test_small_files_give_nothing(self):
+        self.file("small.bin", 99)
+        self.c.pass_once()
+        for kind in ("temp_big", "temp_watch_partial", "temp_watch_error"):
+            self.assertEqual(self.kinds(kind), [], kind)
+        self.assertEqual(self.pages(), 0)
+
+    def test_at_most_once_per_hour(self):
+        self.c.pass_once()
+        self.file("big.bin")
+        self.c.pass_once()
+        self.t += 3599
+        self.c.pass_once()
+        self.assertEqual(self.big(), [])
+        self.t += 1
+        self.c.pass_once()
+        self.assertEqual(len(self.big()), 1)
+
+    def test_a_real_link_to_a_dir_holding_a_big_file_is_not_followed(self):
+        outside = self.outside_with_big_file()
+        self.link(outside, self.temp / "j")
+        self.c.temp_walk()
+        self.assertEqual(self.big(), [])
+        self.assertTrue((outside / "big.bin").exists())
+
+    def test_every_link_signal_alone_stops_the_walk(self):
+        cases = {
+            "symlink dir": dict(link=True),
+            "symlink file": dict(mode=stat.S_IFREG, size=100, link=True),
+            "lnk mode": dict(mode=stat.S_IFLNK),
+            "reparse attr": dict(attrs=stat.FILE_ATTRIBUTE_REPARSE_POINT),
+            "junction": dict(junction=True),
+        }
+        for label, kw in cases.items():
+            with self.subTest(label):
+                e = self.entry("x", **kw)
+                self.assertEqual(self.walk_with(e), [os.path.normpath(str(self.temp))])
+                self.assertEqual(self.big(), [])
+                e.stat.assert_called_with(follow_symlinks=False)
+
+    def test_fails_closed_when_the_link_check_cannot_answer(self):
+        junction_gone = self.entry("a")
+        junction_gone.is_junction.side_effect = AttributeError
+        unreadable = self.entry("b")
+        unreadable.stat.side_effect = OSError
+        self.assertEqual(self.walk_with(junction_gone, unreadable), [os.path.normpath(str(self.temp))])
+        errors = self.kinds("temp_watch_error")
+        self.assertEqual([e["errors"] for e in errors], [2])
+
+    def test_a_root_that_is_a_link_is_refused(self):
+        self.link(self.outside_with_big_file(), self.root / "rootlink")
+        for root in (str(self.root / "rootlink"), str(self.root / "rootlink") + os.sep):
+            with self.subTest(root):
+                before = len(self.kinds("temp_watch_error"))
+                self.c.temp_watch = root
+                self.c.temp_walk()
+                self.assertEqual(self.big(), [])
+                errors = self.kinds("temp_watch_error")
+                self.assertEqual(len(errors), before + 1)
+                self.assertIn("root is a link or junction", errors[-1]["error"])
+
+    def test_depth_limit_is_a_partial_event(self):
+        names = ["d%d" % i for i in range(1, 10)]
+        deep = self.file(os.path.join(*names, "deep.bin"))
+        ok = self.file(os.path.join(*names[:8], "ok.bin"))
+        top = self.file("z.bin")
+        self.c.temp_walk()
+        self.assertEqual(sorted(self.big()), sorted([str(ok), str(top)]))
+        self.assertNotIn(str(deep), self.big())
+        self.assertEqual([e["reasons"] for e in self.kinds("temp_watch_partial")], [["depth"]])
+
+    def test_entry_limit_is_a_partial_event(self):
+        for i in range(10):
+            self.file("f%d" % i, 1)
+        with mock.patch.object(conveyor, "TEMP_WATCH_ENTRIES", 3):
+            self.c.temp_walk()
+        self.assertEqual([(e["reasons"], e["entries"]) for e in self.kinds("temp_watch_partial")],
+                         [(["entries"], 4)])
+
+    def test_time_limit_is_a_partial_event(self):
+        for i in range(20):
+            self.file("f%d" % i, 1)
+
+        def clock():
+            self.t += 1
+            return self.t
+
+        self.c.now = clock
+        self.c.temp_walk()
+        self.assertEqual([e["reasons"] for e in self.kinds("temp_watch_partial")], [["time"]])
+
+    def test_a_locked_subdir_is_one_event_and_the_walk_goes_on(self):
+        locked = self.temp / "locked"
+        locked.mkdir()
+        p = self.file(os.path.join("open", "big.bin"))
+        real = os.scandir
+
+        def fake(path="."):
+            if path == str(locked):
+                raise PermissionError("denied")
+            return real(path)
+
+        with mock.patch.object(conveyor.os, "scandir", fake):
+            self.c.temp_walk()
+        self.assertEqual(self.big(), [str(p)])
+        self.assertEqual([e["errors"] for e in self.kinds("temp_watch_error")], [1])
+
+    def test_a_failing_walk_is_one_event_and_the_pass_continues(self):
+        self.c.temp_walk = mock.Mock(side_effect=PermissionError("denied"))
+        self.c.page("later in the pass")
+        self.c.pass_once()
+        self.assertEqual(len(self.kinds("temp_watch_error")), 1)
+        self.assertIn("later in the pass", " ".join(self.pushes))
+
+    def test_a_missing_root_is_one_event(self):
+        self.c.temp_watch = str(self.temp / "gone")
+        self.c.pass_once()
+        self.assertEqual(len(self.kinds("temp_watch_error")), 1)
+
+    def test_a_raising_event_does_not_leave_the_tick(self):
+        self.c.temp_walk = mock.Mock(side_effect=OSError("walk"))
+        self.c.event = mock.Mock(side_effect=OSError("event"))
+        self.c.temp_watch_tick()
+        self.c.event.assert_called_once()
+
+    def test_the_watch_deletes_and_changes_nothing(self):
+        self.file("big.bin")
+        self.file("small.bin", 1)
+        self.file(os.path.join("sub", "dir", "big2.bin"))
+        self.link(self.outside_with_big_file(), self.temp / "j")
+
+        def listing():
+            return sorted((str(p), os.lstat(p).st_size, os.lstat(p).st_mtime_ns)
+                          for p in self.temp.rglob("*"))
+
+        before = listing()
+        self.c.temp_watch_tick()
+        self.assertEqual(len(self.big()), 2)
+        self.assertEqual(listing(), before)
+
+    def test_off_by_default(self):
+        c = Conveyor(self.root, self.fake, now=lambda: self.t)
+        self.assertIsNone(c.temp_watch)
+        with mock.patch.object(conveyor.os, "scandir") as scandir:
+            c.temp_watch_tick()
+        scandir.assert_not_called()
+
+    def test_a_surrogate_path_does_not_poison_the_pager(self):
+        e = self.entry("bad\udc80.bin", mode=stat.S_IFREG, size=100)
+        self.walk_with(e)
+        self.walk_with(e)
+        self.c.flush_pages()
+        self.assertEqual(len(self.big()), 1)
+        self.assertIn("\\udc80", self.big()[0])
+        self.assertEqual(self.pages(), 1)
+
+    def test_the_real_threshold_needs_no_real_file(self):
+        """os.truncate is not sparse on this NTFS (16 MiB allocated 16 MiB): C11 wins, sizes are faked."""
+        self.assertEqual(self.real_big, 2 ** 31)
+        under = self.entry("under.bin", mode=stat.S_IFREG, size=2 ** 31 - 1)
+        at = self.entry("at.bin", mode=stat.S_IFREG, size=2 ** 31)
+        with mock.patch.object(conveyor, "TEMP_BIG_BYTES", self.real_big):
+            self.walk_with(under, at)
+        self.c.flush_pages()
+        self.assertEqual(self.big(), [at.path])
+        self.assertEqual(self.kinds("temp_big")[0]["gb"], 2.0)
+        self.assertIn("Temp'te büyük dosya: %s (2 GB). Silmek senin kararın." % at.path, self.pushes[0])
+
+    def test_a_burst_of_big_files_is_reported_a_few_per_walk(self):
+        for i in range(conveyor.TEMP_BIG_PER_WALK + 2):
+            self.file("f%d.bin" % i)
+        self.c.temp_walk()
+        self.c.flush_pages()
+        self.assertEqual((len(self.big()), self.pages()), (3, 3))
+        self.assertEqual([e["reasons"] for e in self.kinds("temp_watch_partial")], [["pages"]])
+        self.t += 3600
+        self.c.temp_walk()
+        self.c.flush_pages()
+        self.assertEqual((len(self.big()), self.pages()), (5, 5))
+        self.assertEqual(len(self.kinds("temp_watch_partial")), 1)
+
+    def test_the_entry_limit_does_not_starve_one_subtree_every_hour(self):
+        p = self.file(os.path.join("a", "big.bin"))
+        for i in range(60):
+            self.file(os.path.join("z", "f%d" % i), 1)
+        with mock.patch.object(conveyor, "TEMP_WATCH_ENTRIES", 50):
+            self.c.temp_walk()
+            self.t += 3600
+            self.c.temp_walk()
+        self.assertEqual(self.big(), [str(p)])
+
+    def test_the_tick_beats_and_sets_its_flag_before_the_walk(self):
+        order = []
+
+        def walk():
+            order.append(self.c.pager_flag("temp_watched"))
+            raise OSError("walk")
+
+        self.c.beat = lambda: order.append("beat")
+        self.c.temp_walk = walk
+        self.c.temp_watch_tick()
+        self.c.temp_watch_tick()  # a failing walk waits its hour too
+        self.assertEqual(order, ["beat", self.t])
+
+    def test_the_walk_never_opens_a_file(self):
+        p = self.file("big.bin")
+        real, opened = open, []
+
+        def spy(file, *args, **kwargs):
+            opened.append(str(file))
+            return real(file, *args, **kwargs)
+
+        with mock.patch("builtins.open", spy):
+            self.c.temp_walk()
+        self.assertEqual(self.big(), [str(p)])
+        self.assertNotIn(str(p), opened)
+
+    def test_one_unreadable_entry_does_not_end_the_listing(self):
+        bad = self.entry("bad")
+        bad.stat.side_effect = OSError
+        good = self.entry("good.bin", mode=stat.S_IFREG, size=100)
+        self.walk_with(bad, good)
+        self.assertEqual(self.big(), [good.path])
+
+    def test_main_wires_the_prune_and_the_watch(self):
+        with open(conveyor.__file__, encoding="utf-8") as f:
+            self.assertIn('Conveyor(prune=real_cmd, temp_watch=os.environ.get("TEMP"))', f.read())
 
 
 if __name__ == "__main__":
