@@ -26,6 +26,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime
@@ -248,11 +249,17 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 CHAIN_GOOD = GOOD - {"GREEN"}  # CONVCHAIN1: a lane's own finish; GREEN is an INT's CI verdict
 CHAIN_COMMIT_RE = re.compile(r"(?m)^[ \t]*COMMIT:(.*)$")  # anchored: "FIX COMMIT:" does not count
 CHAIN_NAME_RE = re.compile(r"[A-Za-z0-9._/-]+")  # CONVCHAIN1FIXA: the only file names a generated prompt may carry
-CHAIN_WORD = r"(?:FINDINGS?|BLOCKERS?|MAJORS?|MINORS?)"
-# capitals anywhere in a line ("F1 MAJOR: x", "| MAJOR |", "Severity: MAJOR", "STATUS: PASS (MINOR: x)"), any case at its start
-CHAIN_FINDING_RE = re.compile(rf"\b{CHAIN_WORD}\b|(?i:^[\s>#*`\-\[(\d.)]*{CHAIN_WORD}\b)")
-CHAIN_CLEAN_RE = re.compile(rf"(?i)^[\s>#*`\-\[(\d.)]*{CHAIN_WORD}[ \t]*:[ \t]*(.*)$")  # value in NONE_WORDS - {{""}} is clean
-CHAIN_NO_RE = re.compile(rf"(?i)\bno\s+(?:real\s+)?{CHAIN_WORD}(?:\s*(?:/|or)\s*{CHAIN_WORD})*")  # verdict "no REAL BLOCKER/MAJOR"
+# CONVCHAIN1FIXC: a review report's finding detection fails closed. Both run on chain_norm text: LONG with every
+# non-alphanumeric removed ("F1_MAJOR", "M A J O R"), SHORT with word edges ("low" is not "follow"); no negation is honoured
+CHAIN_LONG_RE = re.compile(r"block(?:er|ing|ed)|major|minor|critical|finding|severity|priority|issue|vulnerab|kritik|bulgu|engelleyici")
+CHAIN_SHORT_RE = re.compile(r"(?<![a-z0-9])(?:nits?|nitpicks?|(?:high|low|medium)s?\d*|p-?[0-3]|sev[-_ ]?\d*|bugs?|defects?|yuksek|dusuk|orta)(?![a-z0-9])"
+                            r"|^[\W\d_]*[fnm]-?\d+(?![a-z0-9])")
+CHAIN_LABEL_RE = re.compile(r"[A-Z][A-Z0-9 _/-]*:")  # the only line form allowed after "FINDINGS: none"
+CHAIN_CODEX_RE = re.compile(r"CODEX RUN: rc=0 calls=[12]")  # the marker chain_templates/CDX.md mandates
+CHAIN_CODEX_LABEL = "LABEL: Codex gpt-6.1-sol, read-only sandbox, tools off"  # the one other line CDX.md lets name Codex
+CHAIN_NO_CODEX_RE = re.compile(r"codex|exit|return[\s_-]*code|(?<![a-z0-9])rc(?![a-z0-9])|n.?t\s+(?:be\s+)?(?:run|ran|execut)|never\s+ran"
+                               r"|failed\s+to\s+run|skipped|usage[\s_-]*limit|rate[\s_-]*limit|quota|calismadi|timed?\s*out")
+CHAIN_STATUS_RE = re.compile(r"(?mi)^\W*status\b")
 MIN_FREE_GB = 10  # below this on the repo drive no lane is dispatched
 DISK_ID = "disk-low"  # attention id (and ack file) of a low-disk episode
 PRUNE_TIMEOUT_S = 120  # well below STALE_LOCK_S: a prune never makes the lock look stale
@@ -905,28 +912,47 @@ def chain_int_ids(ap):
     return {x.upper() for x in steps if isinstance(x, str) and INT_RE.match(x)}
 
 
-def chain_commit(ln):
-    """CONVCHAIN1: the single COMMIT sha a lane's report names, or None."""
-    text = chain_report(ln)
+def chain_commit(text):
+    """CONVCHAIN1: the single COMMIT sha a lane's report text names, or None."""
     if text is None:
         return None
     found = [x.strip() for x in CHAIN_COMMIT_RE.findall(text)]
     return found[0] if len(found) == 1 and SHA_RE.fullmatch(found[0]) else None
 
+def chain_norm(s):
+    """Case, marks and zero-width characters gone, so "Mİnor", "m​ajor" and a fullwidth MAJOR compare as ASCII."""
+    s = unicodedata.normalize("NFKD", s.replace("ı", "i"))
+    return "".join(c for c in s if unicodedata.category(c) not in ("Cf", "Mn")).casefold()
 
-def chain_findings(ln):
-    """CONVCHAIN1FIXA: the lane's report has a finding line of any severity, or cannot be read.
-    Only "<word>: none" (NONE_WORDS) is clean; an empty "FINDINGS:" may head a list, so it counts."""
-    text = chain_report(ln)
+def chain_findings(text):
+    """CONVCHAIN1FIXC: the report text has anything like a finding, or is absent. Clean is only the exact lines
+    "FINDINGS: none" (then nothing but LABEL: lines) and "OPEN ISSUES: none". A fence line is the report's own wrapping.
+    ponytail: a keyword-free prose finding before "FINDINGS: none" passes; a parser needs a fixed report schema."""
     if text is None:
         return True
+    section = False
     for line in text.splitlines():
-        clean = CHAIN_CLEAN_RE.match(line)
-        if clean and clean[1].strip().rstrip(".").lower() in NONE_WORDS - {""}:
+        raw = line.strip()
+        if not raw or raw == "```" or raw == "OPEN ISSUES: none":
             continue
-        if CHAIN_FINDING_RE.search(CHAIN_NO_RE.sub("", line)):
+        if raw == "FINDINGS: none":
+            section = True
+            continue
+        if section and not CHAIN_LABEL_RE.match(line):
+            return True
+        norm = chain_norm(line)
+        if (any(c.isalpha() and not c.isascii() for c in norm)  # a homoglyph, in any script
+                or CHAIN_LONG_RE.search(re.sub(r"[^a-z0-9]", "", norm)) or CHAIN_SHORT_RE.search(norm)):
             return True
     return False
+
+def chain_codex_ran(text):
+    """CONVCHAIN1FIXC: a CDX report proves Codex ran: one marker line, and no other line but the template LABEL names
+    Codex, an exit code or a failed run. ponytail: self-attested, report text cannot prove a process ran."""
+    lines = [x.strip() for x in text.splitlines()]
+    marks = [x for x in lines if CHAIN_CODEX_RE.fullmatch(x)]
+    rest = [x for x in lines if x != CHAIN_CODEX_LABEL and x not in marks]
+    return len(marks) == 1 and not CHAIN_NO_CODEX_RE.search(chain_norm("\n".join(rest)))
 
 
 def trial_args(advisor):
@@ -3463,7 +3489,8 @@ class Conveyor:
         src = s["id"]
         if INT_RE.match(src) or re.match(r"(?i)clrev|cdx", src) or CHAIN_SUFFIX_RE.search(src):
             return "an INT, CLREV, CDX or AFX lane is never chained"
-        sha = chain_commit(ln)
+        src_text = chain_report(ln)  # CONVCHAIN1FIXC: one read per report, so a racing writer cannot split the checks
+        sha = chain_commit(src_text)
         if not sha:
             return 'report needs exactly one "COMMIT: <40 hex>" line'
         key = f"{src}@{sha}"
@@ -3478,16 +3505,21 @@ class Conveyor:
                 return f"malformed chain record {key}"
         if len(done) >= len(wanted):
             return None
-        if chain_findings(ln):
+        if chain_findings(src_text):
             return f"{src} report has a finding line"
         for d in done:  # every earlier step, so the INT stands on all of its reviews
             prev = lanes.get(d)
             if not prev or not prev.get("finished"):
                 return None  # not dispatched yet, or still running
-            if prev.get("status") != "PASS" or chain_commit(prev) != sha:
+            if prev.get("status") != "PASS":
                 return f"{d} did not PASS naming {sha[:7]}"
-            if chain_findings(prev):
+            text = chain_report(prev)
+            if chain_commit(text) != sha or len(CHAIN_STATUS_RE.findall(text)) > 1:
+                return f"{d} did not PASS naming {sha[:7]}"
+            if chain_findings(text):
                 return f"{d} report has a finding line"
+            if d.startswith("CDX-") and not chain_codex_ran(text):
+                return f"{d} report does not prove Codex ran"
         step = s["chain"][len(done)]
         nid = f"{step}-{src}"
         main, files = self.chain_verify(s, ln, sha)
@@ -3604,11 +3636,9 @@ class Conveyor:
         CONV12 handoff (ci_wait found CI success): the single STATUS line is 'STATUS: CI_PENDING',
         sha and branch are the ones waited for, the run is the one ci_wait saw, and a running
         integration lane is fine (it stacks on this sha; push_checks keeps the order)."""
-        # ponytail: prefix, not root_id: a rerun may be INT-SRC-R2 or INT-SRCR2; a distinct INT-SRC2 stops for the key too
-        prompt = self.base / "prompts" / f"{root_id(name)}.md"  # survives losing autopilot.json
-        if (any(name.upper().startswith(i) for i in chain_int_ids(ap))
-                or (prompt.exists() and CHAIN_MARK in prompt.read_text(encoding="utf-8", errors="replace"))):
-            return CHAIN_KEY1, None, None
+        why = self.chain_int_refusal(name, ln, ap)
+        if why:
+            return why, None, None
         # CONVBOM: drop every BOM so a "﻿STATUS:" line still counts toward the single-line check
         text = Path(ln["report"]).read_text(encoding="utf-8-sig", errors="replace").replace("﻿", "")
         ci = ln.get("ci") or {}
@@ -3641,6 +3671,25 @@ class Conveyor:
             return why, None, None
         return None, approval, url
 
+    def chain_int_refusal(self, name, ln, ap):
+        """CONVCHAIN1FIXC: why a chain INT or its rerun gets no key 1 (quiet CHAIN_KEY1; loud with the Salih text when
+        protected paths are hit or unknown), None for any other lane. Never a pass on an error."""
+        try:
+            # ponytail: prefix, not root_id: a rerun may be INT-SRC-R2 or INT-SRCR2; a distinct INT-SRC2 stops for the key too
+            prompt = self.base / "prompts" / f"{root_id(name)}.md"  # survives losing autopilot.json
+            if not (any(name.upper().startswith(i) for i in chain_int_ids(ap))
+                    or (prompt.exists() and CHAIN_MARK in prompt.read_text(encoding="utf-8", errors="replace"))):
+                return None
+            text = Path(ln["report"]).read_text(encoding="utf-8-sig", errors="replace").replace("\ufeff", "")
+            _, sha, _ = self.main_and_ci(text)
+            cisha = (ln.get("ci") or {}).get("sha")
+            if sha and (not cisha or cisha == sha):
+                why = self.protected_change(sha)
+                return f"{CHAIN_KEY1}; {why}" if why else CHAIN_KEY1
+        except Exception:  # an unreadable prompt or report, ln={}: fall through to unknown
+            pass
+        return f"{CHAIN_KEY1}; protected paths unknown, check by hand: needs Salih's manual key 1"
+
     def protected_change(self, sha):
         """Why origin/main..sha needs Salih's manual key 1 (it touches PROTECTED_DIRS,
         PROTECTED_FILES, a skip/allow list or the state file's load-sensitive list), else None.
@@ -3656,7 +3705,8 @@ class Conveyor:
                 if p.startswith('"'):  # a quoted (non-ASCII) path cannot be matched: fail closed
                     return f"protected-path check: quoted path {p}; {manual}"
                 p = p.strip().replace("\\", "/")
-                if p.startswith(PROTECTED_DIRS) or p in PROTECTED_FILES or SKIPLIST_RE.search(p):
+                # lowercased like protected_path(): on Windows a path differing only in case is the same file
+                if p.lower().startswith(PROTECTED_DIRS) or p.lower() in PROTECTED_FILES or SKIPLIST_RE.search(p):
                     return f"the range touches {p}: {manual}"
                 if p == STATE_DOC:
                     lists = []
