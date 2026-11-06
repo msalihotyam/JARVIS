@@ -889,6 +889,7 @@
   "tests.test_motion_6g.LiveMotionTests": 7.366,
   "tests.test_motion_6g.NoForeverTests": 0.02,
   "tests.test_motion_6g.TravelTests": 0.034,
+  "tests.test_n6_root.N6RootTests": 15.517,
   "tests.test_notify.NotificationTests": 0.001,
   "tests.test_notify_sink.SinkTests": 0.0,
   "tests.test_notify_sink.TrayHookTests": 0.013,
