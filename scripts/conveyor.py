@@ -929,7 +929,7 @@ def chain_commit(text):
     """CONVCHAIN1: the single COMMIT sha a lane's report text names, or None."""
     if text is None:
         return None
-    found = [x.strip() for x in CHAIN_COMMIT_RE.findall(text)]
+    found = [(x.split() or [""])[0] for x in CHAIN_COMMIT_RE.findall(text)]  # first token only: "<sha> (parent ...)" is fine
     return found[0] if len(found) == 1 and SHA_RE.fullmatch(found[0]) else None
 
 def chain_labelled(text, label):

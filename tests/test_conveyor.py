@@ -8923,5 +8923,26 @@ class TestChain(AutopilotBase):
         self.assertIn('exactly one line "CODEX RUN: rc=0 calls=<1-2>"', (d / "CDX.md").read_text(encoding="utf-8"))
 
 
+class TestChainCommitToken(unittest.TestCase):  # CHAINCOMMIT
+    SHA = "a" * 40
+
+    def commit(self, text):
+        return conveyor.chain_commit(text)
+
+    def test_short_sha_empty_and_two_lines_refused(self):
+        self.assertIsNone(self.commit("COMMIT: abc1234 (parent x)"))
+        self.assertIsNone(self.commit("COMMIT:"))
+        self.assertIsNone(self.commit("COMMIT:   \n"))
+        self.assertIsNone(self.commit(f"COMMIT: {self.SHA}\nCOMMIT: {self.SHA}"))
+        self.assertIsNone(self.commit(f"FIX COMMIT: {self.SHA}"))
+        self.assertIsNone(self.commit(f"COMMIT: ({self.SHA}) {self.SHA}"))
+
+    def test_first_token_is_the_sha(self):
+        self.assertEqual(self.commit(f"COMMIT: {self.SHA} (parent {'b' * 40})"), self.SHA)
+        self.assertEqual(self.commit(f"COMMIT: {self.SHA}"), self.SHA)
+        self.assertEqual(self.commit(f"STATUS: PASS\nCOMMIT: {self.SHA}\nPARENT: x"), self.SHA)
+        self.assertEqual(self.commit(f"FIX COMMIT: {'c' * 40}\nCOMMIT: {self.SHA}"), self.SHA)
+
+
 if __name__ == "__main__":
     unittest.main()
