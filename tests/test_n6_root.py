@@ -12,7 +12,7 @@ from datetime import timedelta
 from pathlib import Path
 from unittest import mock
 
-from jarvis import memory, n6_root, work_driver
+from jarvis import memory, n6_root, stage_git, work_driver
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.work_ledger import RunState, StepState, WorkRun, WorkStep, step_key
 from jarvis.work_regress import TestResult
@@ -23,7 +23,7 @@ from tests.test_work_ports import ACCEPTED, RUN, T0, _check, _commit
 ROOT = Path(__file__).resolve().parents[1]
 LIVE_DB = ROOT / "data" / "jarvis.db"
 WRITES = {"append_event", "notify", "lease_claim", "lease_release", "stage_create", "worker",
-          "task", "scope_check", "run_checks", "evidence", "apply", "undo", "link_rescan"}
+          "task", "scope_check", "run_checks", "evidence", "apply", "undo", "link_rescan", "applied"}
 
 
 class N6RootTests(unittest.TestCase):
@@ -142,6 +142,88 @@ class N6RootTests(unittest.TestCase):
         self.assertLess(lines[0]["at"], lines[1]["at"])
         with self.assertRaises(ValueError):
             n6.note("   ")
+
+    def snapshot(self):
+        names = sorted(str(path.relative_to(self.home)) for path in self.home.rglob("*")
+                       if not path.name.startswith(("work.db", "notes.jsonl")))
+        return names, stage_git.run(self.repo, "for-each-ref")
+
+    def test_f1_no_sight_call_leaves_a_ref_a_lock_or_a_dir_under_git(self):
+        stage = n6_root.compose(**self.wiring()).stage_create(self.step)  # the write path, first
+        n6 = self.n6()
+        before = self.snapshot()
+        calls = (lambda: n6.ports.clock(), lambda: n6.ports.apply_intent(self.step),
+                 lambda: n6.ports.tree_hash(stage), lambda: n6.git(self.repo, "rev-parse", "HEAD"),
+                 lambda: n6.git(self.repo, "for-each-ref"), lambda: n6.git(stage.path, "rev-list", "HEAD"),
+                 lambda: n6.git(self.repo, "ls-tree", "-r", "HEAD"))
+        for index, call in enumerate(calls):
+            with self.subTest(call=index):
+                try:
+                    call()
+                except Exception:  # tree_hash has no judged pin here; a refusal is not a write
+                    pass
+                self.assertEqual(self.snapshot(), before)
+                self.assertEqual(list(self.home.rglob("*.lock")), [])
+        self.assertNotIn("applied", n6_root.SIGHT_PORTS)
+        with self.assertRaisesRegex(PermissionError, "read-only: applied$"):
+            n6.ports.applied(stage, "key")
+        self.assertEqual(self.snapshot(), before)
+
+    def test_f2_git_refuses_a_committed_protected_file_by_any_name(self):
+        _commit(self.manager, self.repo, ".env", "SECRET=1\n")
+        _commit(self.manager, self.repo, "copy.txt", "SECRET=1\n")  # the same blob, safe name
+        _commit(self.manager, self.repo, "secret.pem", "KEY\n")
+        n6 = self.n6()
+        blob = stage_git.run(self.repo, "rev-parse", "HEAD:.env").decode().strip()
+        for args in (("cat-file", "-p", "HEAD:.env"), ("cat-file", "-p", "HEAD:.ENV"),
+                     ("cat-file", "-p", "HEAD:./.env"), ("cat-file", "-s", "HEAD:.env"),
+                     ("cat-file", "-p", "HEAD:secret.pem"), ("ls-tree", "HEAD", "--", ".env"),
+                     ("rev-parse", "HEAD:.env"), ("cat-file", "-p", blob),
+                     ("cat-file", "blob", "HEAD:keep.txt"), ("diff-tree", "-p", "HEAD~1", "HEAD"),
+                     ("cat-file", "-p", "HEAD:secret.pem^{blob}"), ("for-each-ref", "--format=%(raw)"),
+                     ("cat-file", "--batch"), ("cat-file", "-p", "HEAD:keep.txt", "HEAD:.env"),
+                     ("cat-file", "-s", blob), ("cat-file", "-t", blob), ("cat-file", "-e", blob),
+                     ("cat-file", "-p", "HEAD:copy.txt"), ("cat-file", "-s", "HEAD:copy.txt")):
+            with self.subTest(args=args), self.assertRaises(PermissionError):
+                n6.git(self.repo, *args)
+        self.assertEqual(n6.git(self.repo, "cat-file", "-p", "HEAD:keep.txt").strip(), b"keep")
+        self.assertIn(b".env", n6.git(self.repo, "ls-tree", "--name-only", "HEAD"))
+        self.assertEqual(n6.git(self.repo, "diff-tree", "--name-only", "--no-commit-id", "-r",
+                                "HEAD~1", "HEAD").strip(), b"secret.pem")
+
+    def swap(self, parent):
+        parent.rename(parent.with_name("moved"))
+        elsewhere = parent.with_name("elsewhere")
+        elsewhere.mkdir()
+        if sys.platform == "win32":
+            import _winapi
+            _winapi.CreateJunction(str(elsewhere), str(parent))
+        else:
+            os.symlink(elsewhere, parent, target_is_directory=True)
+        return elsewhere / "notes.jsonl"
+
+    def test_f3_a_junction_swapped_in_before_the_note_is_refused(self):
+        n6 = self.n6()
+        n6.note("first")
+        target = self.swap(n6._notes.parent)
+        with self.assertRaisesRegex(PermissionError, "moved"):
+            n6.note("redirected")
+        self.assertFalse(target.exists())
+
+    def test_f3_a_junction_swapped_in_after_the_name_check_is_refused_on_the_opened_handle(self):
+        n6 = self.n6()
+        n6.note("first")
+        parent, real, swapped = n6._notes.parent, Path.mkdir, []
+
+        def mkdir(path, *args, **kwargs):
+            real(path, *args, **kwargs)
+            if path == parent and not swapped:
+                swapped.append(self.swap(parent))
+        with mock.patch.object(Path, "mkdir", mkdir), \
+                self.assertRaisesRegex(PermissionError, "changed while it was opened"):
+            n6.note("redirected")
+        self.assertTrue(swapped)
+        self.assertEqual(swapped[0].read_text(encoding="utf-8") if swapped[0].exists() else "", "")
 
     def test_the_app_does_not_import_n6_root(self):
         code = "import sys, jarvis.core; assert 'jarvis.n6_root' not in sys.modules"
