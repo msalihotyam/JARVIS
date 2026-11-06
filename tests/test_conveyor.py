@@ -6427,14 +6427,35 @@ class TestLock(Base):
             self.assertTrue(self.c.acquire_lock())
         self.assertEqual(self.info()["pid"], self.c.pid)
 
-    def test_heartbeat_is_written_in_place(self):
-        with mock.patch.object(conveyor.os, "replace", side_effect=AssertionError("os.replace")):
+    def test_heartbeat_is_replaced_atomically_for_readers(self):
+        """CONVLOCK2 F2: tmp + os.replace, so a reader never sees a torn info file."""
+        with mock.patch.object(conveyor.os, "replace", wraps=os.replace) as rep:
             self.assertTrue(self.c.acquire_lock())
             self.t += 61
             self.c.beat()
+        lock = self.base / "conveyor.lock"
+        self.assertEqual(rep.call_args_list[-1], mock.call(lock.with_name("conveyor.lock.tmp"), lock))
         self.assertEqual(self.info(), {"pid": self.c.pid, "heartbeat": self.t})
         self.assertEqual(sorted(p.name for p in self.base.glob("conveyor.*")),
                          ["conveyor.instance", "conveyor.lock"])
+
+    def test_heartbeat_falls_back_in_place_when_replace_is_denied(self):
+        """A reader holding the file on Windows denies os.replace: the beat goes on in place."""
+        with mock.patch.object(conveyor.os, "replace", side_effect=PermissionError("held")):
+            self.assertTrue(self.c.acquire_lock())
+            self.t += 61
+            self.c.beat()
+            self.assertEqual(self.info(), {"pid": self.c.pid, "heartbeat": self.t})
+            self.assertEqual(self.c.loop(once=True), 0)
+        self.assertEqual(self.info()["heartbeat"], 0)
+
+    def test_lock_is_released_when_startup_raises_after_taking_it(self):
+        """CONVLOCK2 F3: a heartbeat error inside acquire_lock never keeps the OS lock."""
+        with mock.patch.object(self.c, "heartbeat", side_effect=OSError("disk full")):
+            with self.assertRaises(OSError):
+                self.c.acquire_lock()
+        self.assertIsNone(self.c.instance_fd)
+        self.assertTrue(self.other().acquire_lock())
 
     def test_torn_read_is_retried_once(self):
         good = json.dumps({"pid": self.c.pid, "heartbeat": self.t})
@@ -7419,6 +7440,22 @@ class TestDiskHousekeeping(Base):
         kill.assert_called_once_with(pid, 9)
         self.assertEqual(self.kinds("uv_prune_failed")[0]["killed"], True)
 
+    def test_prune_kill_rechecks_the_creation_time_at_the_kill(self):
+        """CONVHOUSE3 F1: the pid is reused between the identity check and the kill: no kill."""
+        self.git.fail[("powershell",)] = (0, "133\n")
+        self.c.prune = self.record_prune
+        self.c.uv_prune({}, [])
+        self.c.prune_proc = None
+        self.image("uv.exe")
+        self.t += conveyor.PRUNE_TIMEOUT_S + 1
+        with mock.patch.object(conveyor.os, "kill") as kill, \
+                mock.patch.object(self.c, "pid_created", side_effect=[133, 999]):
+            self.c.uv_prune({}, [])
+        kill.assert_not_called()
+        (ev,) = self.kinds("uv_prune_failed")
+        self.assertEqual(ev["killed"], False)
+        self.assertTrue(self.c.pager_flag("uv_prune_run"))
+
     def test_prune_after_a_restart_never_kills_a_uv_born_later(self):
         """F2: the pid now belongs to another uv.exe (other creation time): cleared, never killed."""
         self.git.fail[("powershell",)] = (0, "100\n")
@@ -7733,6 +7770,67 @@ class TestTempWatch(Base):
         self.assertEqual(self.big(), [])
         errs = [e for e in self.kinds("temp_watch_error") if "ancestor" in e["error"]]
         self.assertEqual(len(errs), 1)
+
+    def test_ancestor_swapped_between_check_and_scandir_is_dropped(self):
+        """CONVHOUSE3 F2: TEMP\\a becomes a junction right as TEMP\\a\\b is opened: never walked."""
+        outside = self.outside_with_big_file()
+        (outside / "b").mkdir()
+        (outside / "b" / "big2.bin").write_bytes(b"x" * 200)
+        (self.temp / "a" / "b").mkdir(parents=True)
+        root, real = os.path.normpath(str(self.temp)), os.scandir
+        target = os.path.join(root, "a", "b")
+
+        def fake(path="."):
+            if path == target and not (self.temp / "a_old").exists():
+                os.rename(self.temp / "a", self.temp / "a_old")
+                self.link(outside, self.temp / "a")
+            return real(path)
+
+        (self.c.base / "temp_walk.json").write_text(json.dumps(
+            {"root": root, "stack": [[target, 2, 0]], "entries": 0, "start": self.t}), encoding="utf-8")
+        with mock.patch.object(conveyor.os, "scandir", fake):
+            self.c.temp_walk()
+        self.assertEqual(self.big(), [])
+        errs = [e for e in self.kinds("temp_watch_error") if "ancestor" in e["error"]]
+        self.assertEqual(len(errs), 1)
+
+    def slow_root(self, cost):
+        """os.scandir whose root listing costs `cost` s per entry."""
+        root, real = os.path.normpath(str(self.temp)), os.scandir
+
+        def fake(path="."):
+            if path != root:
+                return real(path)
+            with real(path) as it:
+                items = list(it)
+
+            def slow():
+                for e in items:
+                    self.t += cost
+                    yield e
+            return contextlib.nullcontext(slow())
+        return mock.patch.object(conveyor.os, "scandir", fake)
+
+    def test_first_entry_slower_than_the_budget_still_advances(self):
+        """CONVHOUSE3 F3: each entry takes more than the budget: one per tick, the cycle ends."""
+        for i in range(3):
+            self.file("f%d" % i, 1)
+        with self.slow_root(conveyor.TEMP_WATCH_BUDGET_S + 1):
+            self.walk_to_end()
+        self.assertEqual([e["entries"] for e in self.kinds("temp_watch_cycle")], [3])
+
+    def test_resumed_prefix_skip_is_on_this_ticks_budget(self):
+        """CONVHOUSE3 F4: the prefix skip is not free: a prefix past the budget leaves one entry."""
+        for i in range(12):
+            self.file("f%02d" % i, 1)
+        root = os.path.normpath(str(self.temp))
+        state = self.c.base / "temp_walk.json"
+        state.write_text(json.dumps(
+            {"root": root, "stack": [[root, 0, 5]], "entries": 5, "start": self.t}), encoding="utf-8")
+        with self.slow_root(4):
+            self.c.temp_walk()
+        saved = json.loads(state.read_text(encoding="utf-8"))
+        self.assertEqual((saved["stack"], saved["entries"]), ([[root, 0, 6]], 6))
 
     def test_huge_directory_resume_always_advances_and_ends(self):
         """F5: skipping the saved prefix costs more than one budget; each tick still advances."""
