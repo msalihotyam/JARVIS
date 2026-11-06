@@ -1099,7 +1099,8 @@ class Conveyor:
         process life. Lock refused or raising: another conveyor is alive (fail closed).
         Lock taken: this is the only conveyor and takes conveyor.lock over at once, whatever
         its heartbeat age. conveyor.lock is only the info/heartbeat file readers see."""
-        if self.instance_fd is None:
+        fresh = self.instance_fd is None
+        if fresh:
             fd = None
             try:
                 self.base.mkdir(parents=True, exist_ok=True)
@@ -1113,13 +1114,19 @@ class Conveyor:
                         pass
                 return False
             self.instance_fd = fd
-            cur = self.read_lock()
-            if isinstance(cur, dict) and cur.get("pid") != self.pid and cur.get("heartbeat"):
-                try:  # best effort, never aborts startup; nothing is killed
-                    self.event("lock_takeover", old_pid=cur.get("pid"), reason="os_lock")
-                except Exception as e:
-                    print(f"conveyor: lock_takeover event failed: {e!r}", file=sys.stderr)
-        self.heartbeat()
+        try:
+            if fresh:
+                cur = self.read_lock()
+                if isinstance(cur, dict) and cur.get("pid") != self.pid and cur.get("heartbeat"):
+                    try:  # best effort, never aborts startup; nothing is killed
+                        self.event("lock_takeover", old_pid=cur.get("pid"), reason="os_lock")
+                    except Exception as e:
+                        print(f"conveyor: lock_takeover event failed: {e!r}", file=sys.stderr)
+            self.heartbeat()
+        except BaseException:
+            if fresh:  # CONVLOCK2 F3: a startup that raises never keeps the OS lock
+                self.release_lock()
+            raise
         return True
 
     def release_lock(self):
@@ -1137,9 +1144,20 @@ class Conveyor:
             pass
 
     def heartbeat(self):
-        """Written in place (never os.replace, which fails on Windows while a reader has it open)."""
         self.beat_ts = self.now()
-        self.lock.write_text(json.dumps({"pid": self.pid, "heartbeat": self.now()}))
+        self.write_info(self.now())
+
+    def write_info(self, beat):
+        """tmp + os.replace, so readers never see a torn file; os.replace is denied on Windows
+        while a reader holds the file: PermissionError -> the old in-place write, never stop beating.
+        The OS lock on conveyor.instance, not this file, is the single instance."""
+        text = json.dumps({"pid": self.pid, "heartbeat": beat})
+        tmp = self.lock.with_name(self.lock.name + ".tmp")
+        try:
+            tmp.write_text(text)
+            os.replace(tmp, self.lock)
+        except PermissionError:
+            self.lock.write_text(text)
 
     def beat(self):
         """The heartbeat inside a long pass, so readers keep seeing a fresh conveyor."""
@@ -2423,7 +2441,8 @@ class Conveyor:
             image = self.pid_image(pid)
             killed = image is None or image.lower() in ("", "uv.exe", "uv")
         else:
-            killed = image is not None and born is not None and born == run.get("created")  # same uv
+            killed = (image is not None and born is not None and born == run.get("created")  # same uv
+                  and self.pid_created(pid) == born)  # CONVHOUSE3 F1: re-read right at the kill
         if killed:
             try:
                 proc.kill() if proc is not None else os.kill(pid, 9)
@@ -2513,26 +2532,27 @@ class Conveyor:
         while stack and not stop:
             path, depth, skip = stack.pop()
             try:
-                if path != root:
-                    rel = path[len(under):].split(os.sep)
-                    if any(is_link(os.lstat(os.path.join(root, *rel[:n]))) for n in range(1, len(rel))):
-                        self.event("temp_watch_error", error="ancestor is a link or junction, entry dropped",
-                                   path=path)
-                        continue
-                    if is_link(os.lstat(path)):  # swapped for a link since it was queued
-                        continue
-                with os.scandir(path) as entries:
-                    # ponytail: resume skips by index; entries added or removed meanwhile may shift a few
+                with os.scandir(path) as entries:  # Windows opens the dir here: check after, not before
+                    if path != root:
+                        rel = path[len(under):].split(os.sep)
+                        if any(is_link(os.lstat(os.path.join(root, *rel[:n]))) for n in range(1, len(rel))):
+                            self.event("temp_watch_error", error="ancestor is a link or junction, entry dropped",
+                                       path=path)
+                            continue
+                        if is_link(os.lstat(path)):  # swapped for a link since it was queued
+                            continue
+                    # ponytail: resume skips by index; entries added or removed meanwhile may shift a few.
+                    # The prefix skip is on this tick's budget and one entry always advances, so once a
+                    # prefix alone exceeds the budget a tick advances one entry (O(n^2) only then);
+                    # resume by name needs a new state field, add it if a real Temp dir gets there.
                     for i, entry in enumerate(entries):
+                        stop = ("entries" if seen >= TEMP_WATCH_ENTRIES
+                                else "time" if seen and self.now() - start > TEMP_WATCH_BUDGET_S else None)
+                        if stop:
+                            stack.append([path, depth, max(i, skip)])  # resumed here next tick
+                            break
                         if i < skip:
                             continue
-                        if i == skip and skip:
-                            start = self.now()  # skipping the prefix is not this tick's budget: it always advances
-                        stop = ("entries" if seen >= TEMP_WATCH_ENTRIES
-                                else "time" if self.now() - start > TEMP_WATCH_BUDGET_S else None)
-                        if stop:
-                            stack.append([path, depth, i])  # resumed here next tick
-                            break
                         seen += 1
                         try:
                             st = entry.stat(follow_symlinks=False)
@@ -5118,7 +5138,7 @@ class Conveyor:
                     except Exception:
                         pass  # the event log itself is unwritable: nowhere left to record it
             if once:  # a zero heartbeat tells readers no conveyor runs; loop() drops the OS lock
-                self.lock.write_text(json.dumps({"pid": self.pid, "heartbeat": 0}))
+                self.write_info(0)
                 return 0
             time.sleep(PASS_S)
             if not self.own_lock():
