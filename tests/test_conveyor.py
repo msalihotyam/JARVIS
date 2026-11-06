@@ -4780,6 +4780,23 @@ class TestPushGate(Base):
         self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{MAIN}:refs/heads/main"]])
         self.assertIn(["git", "branch", "-r", "--contains", MAIN], self.git.calls)
 
+    def test_pause_touched_during_the_loop_stops_the_next_approval(self):
+        """F1: PAUSE appearing while one approval pushes defers the rest of that same loop."""
+        first, second = self.approve(), self.approve("push-1234567")
+        orig = self.c.cmd
+
+        def cmd(args, *a, **kw):
+            if args[:2] == ["git", "push"]:
+                (self.c.base / "PAUSE").touch()
+            return orig(args, *a, **kw)
+
+        self.c.cmd = cmd
+        self.c.pass_once()
+        self.assertEqual(len(self.git.pushes()), 1)
+        self.assertEqual([f.is_file() for f in (first, second)].count(True), 1)  # one waits
+        self.assertFalse([e for e in self.events() if e["event"] == "push_blocked"])
+        self.assertTrue([e for e in self.events() if e["event"] == "push_deferred_pause"])
+
     def test_ntfy_respects_page_gap(self):
         self.c.pager_flag("last_push", self.t - 60)
         self.approve()
@@ -7219,7 +7236,8 @@ class TestDiskHousekeeping(Base):
         self.assertIn("A", self.lanes())
 
     def test_prune_timeout_kills_only_a_uv_image(self):
-        for name, killed in (("python.exe", False), ("uv.exe", True), (None, False)):
+        # F3: with the open handle an unknown image is killed; a spared one keeps dispatch held
+        for name, killed in (("python.exe", False), ("uv.exe", True), (None, True)):
             with self.subTest(name=name):
                 self.c.prune = self.record_prune
                 self.c.uv_prune({}, [])
@@ -7237,7 +7255,9 @@ class TestDiskHousekeeping(Base):
                 self.assertEqual(getattr(self.proc, "killed", False), killed)
                 ev = self.kinds("uv_prune_failed")[-1]
                 self.assertEqual((ev["reason"], ev["killed"]), ("timeout", killed))
-                self.assertFalse(self.c.pager_flag("uv_prune_run"))
+                self.assertEqual(bool(self.c.pager_flag("uv_prune_run")), not killed)
+                self.c.pager_flag("uv_prune_run", False)
+                self.c.prune_proc = None
                 self.t += 86400
 
     def test_prune_after_a_restart_never_kills_another_image(self):
@@ -7254,6 +7274,7 @@ class TestDiskHousekeeping(Base):
         self.assertFalse(self.c.pager_flag("uv_prune_run"))
 
     def test_prune_after_a_restart_kills_its_own_uv_past_the_timeout(self):
+        self.git.fail[("powershell",)] = (0, "133\n")  # same creation time as at start
         self.c.prune = self.record_prune
         self.c.uv_prune({}, [])
         pid = self.proc.pid
@@ -7266,6 +7287,60 @@ class TestDiskHousekeeping(Base):
             self.c.uv_prune({}, [])
         kill.assert_called_once_with(pid, 9)
         self.assertEqual(self.kinds("uv_prune_failed")[0]["killed"], True)
+
+    def test_prune_after_a_restart_never_kills_a_uv_born_later(self):
+        """F2: the pid now belongs to another uv.exe (other creation time): cleared, never killed."""
+        self.git.fail[("powershell",)] = (0, "100\n")
+        self.c.prune = self.record_prune
+        self.c.uv_prune({}, [])
+        self.c.prune_proc = None
+        self.image("uv.exe")
+        self.git.fail[("powershell",)] = (0, "200\n")
+        self.t += conveyor.PRUNE_TIMEOUT_S + 1
+        with mock.patch.object(conveyor.os, "kill") as kill:
+            self.c.uv_prune({}, [])
+        kill.assert_not_called()
+        (ev,) = self.kinds("uv_pruned")
+        self.assertEqual((ev["stale"], ev["reason"]), (True, "identity"))
+        self.assertFalse(self.c.pager_flag("uv_prune_run"))
+        self.assertEqual(self.kinds("uv_prune_failed"), [])
+
+    def test_prune_without_a_recorded_creation_time_is_held_not_killed_or_released(self):
+        """F2/F3: start time unreadable at start: identity unprovable, so neither killed nor cleared."""
+        self.c.prune = self.record_prune
+        self.c.uv_prune({}, [])  # powershell unanswered: created None
+        self.c.prune_proc = None
+        self.image("uv.exe")
+        self.git.fail[("powershell",)] = (0, "133\n")
+        self.t += conveyor.PRUNE_TIMEOUT_S + 1
+        with mock.patch.object(conveyor.os, "kill") as kill:
+            self.c.uv_prune({}, [])
+        kill.assert_not_called()
+        self.assertTrue(self.c.pager_flag("uv_prune_run"))
+        self.assertEqual(self.kinds("uv_pruned"), [])
+
+    def test_prune_with_an_unknown_image_stays_held_then_releases_with_a_page(self):
+        """F3: no handle and tasklist cannot tell: never killed, held 30 more min, then paged."""
+        self.git.fail[("powershell",)] = (0, "133\n")
+        self.c.prune = self.record_prune
+        self.c.uv_prune({}, [])
+        self.c.prune_proc = None
+        self.git.fail.pop(("tasklist",), None)  # unknown image
+        self.t += conveyor.PRUNE_TIMEOUT_S + 1
+        with mock.patch.object(conveyor.os, "kill") as kill:
+            self.c.uv_prune({}, [])
+            self.assertTrue(self.c.pager_flag("uv_prune_run"))
+            self.assertTrue(self.c.hold())
+            self.t += conveyor.PRUNE_TIMEOUT_S - 1
+            self.c.uv_prune({}, [])
+            self.assertTrue(self.c.pager_flag("uv_prune_run"))
+            self.assertFalse([p for p in self.c.load_pager().get("pending", []) if "uv cache prune" in p])
+            self.t += 2
+            self.c.uv_prune({}, [])
+        kill.assert_not_called()
+        self.assertFalse(self.c.pager_flag("uv_prune_run"))
+        self.assertEqual([e["reason"] for e in self.kinds("uv_prune_failed")], ["timeout", "held"])
+        self.assertEqual(len([p for p in self.c.load_pager().get("pending", []) if "uv cache prune" in p]), 1)
 
     def test_prune_with_a_stale_pid_is_finished(self):
         self.c.pager_flag("uv_prune_run", {"pid": "x", "start": self.t})
@@ -7512,6 +7587,43 @@ class TestTempWatch(Base):
             if not state.exists():
                 return
         self.fail("the walk never finished a cycle")
+
+    def test_saved_path_under_an_ancestor_swapped_for_a_junction_is_dropped(self):
+        """F4: TEMP\\a became a link after TEMP\\a\\b was queued: never walked outside TEMP."""
+        outside = self.outside_with_big_file()
+        (outside / "b").mkdir()
+        (outside / "b" / "big2.bin").write_bytes(b"x" * 200)
+        self.link(outside, self.temp / "a")
+        root = os.path.normpath(str(self.temp))
+        (self.c.base / "temp_walk.json").write_text(json.dumps(
+            {"root": root, "stack": [[os.path.join(root, "a", "b"), 2, 0]], "entries": 0,
+             "start": self.t}), encoding="utf-8")
+        self.c.temp_walk()
+        self.assertEqual(self.big(), [])
+        errs = [e for e in self.kinds("temp_watch_error") if "ancestor" in e["error"]]
+        self.assertEqual(len(errs), 1)
+
+    def test_huge_directory_resume_always_advances_and_ends(self):
+        """F5: skipping the saved prefix costs more than one budget; each tick still advances."""
+        for i in range(12):
+            self.file("f%02d" % i, 1)
+        root, real = os.path.normpath(str(self.temp)), os.scandir
+
+        def fake(path="."):
+            if path != root:
+                return real(path)
+            with real(path) as it:
+                items = list(it)
+
+            def slow():
+                for e in items:
+                    self.t += 4  # each entry costs 4 s: a prefix of 3 is past the 10 s budget
+                    yield e
+            return contextlib.nullcontext(slow())
+
+        with mock.patch.object(conveyor.os, "scandir", fake):
+            self.walk_to_end()
+        self.assertEqual([e["entries"] for e in self.kinds("temp_watch_cycle")], [12])
 
     def test_entry_limit_resumes_across_passes_and_ends_with_a_cycle(self):
         for i in range(10):

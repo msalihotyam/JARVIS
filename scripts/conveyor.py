@@ -2330,19 +2330,24 @@ class Conveyor:
         self.beat()
         try:
             self.prune_proc = self.prune(["uv", "cache", "prune", "--quiet"])
-            self.pager_flag("uv_prune_run", {"pid": self.prune_proc.pid, "start": self.now()})
+            pid = self.prune_proc.pid
+            self.pager_flag("uv_prune_run", {"pid": pid, "start": self.now(), "created": self.pid_created(pid)})
         except Exception as e:
             self.prune_proc = None
             self.event("uv_prune_failed", rc=type(e).__name__)
         self.beat()
 
     def uv_prune_poll(self, run):
-        """Done -> uv_pruned; after a restart (no handle) a pid that is not uv any more counts as
-        finished; over PRUNE_TIMEOUT_S it is killed only when tasklist names it uv."""
+        """Done -> uv_pruned. After a restart (no handle) the prune is pid + image + creation
+        time recorded at start: any mismatch counts as finished and is never killed. Over
+        PRUNE_TIMEOUT_S it is killed (its handle, or that same uv); when the kill fails or the
+        identity is unknown dispatch stays held until the pid is gone or PRUNE_TIMEOUT_S more
+        pass, then it is released with a page (never silently)."""
         pid = run.get("pid") if isinstance(run, dict) else None
         proc = self.prune_proc if self.prune_proc is not None and self.prune_proc.pid == pid else None
         if not isinstance(pid, int) or isinstance(pid, bool):
             return self.uv_prune_done(rc=None, stale=True)
+        image = born = None
         if proc is not None:
             rc = proc.poll()
             if rc is not None:
@@ -2351,18 +2356,43 @@ class Conveyor:
             image = self.pid_image(pid)
             if image is not None and image.lower() not in ("uv.exe", "uv"):  # gone or pid reused
                 return self.uv_prune_done(rc=None, stale=True)
+            born = self.pid_created(pid)
+            if born is not None and run.get("created") is not None and born != run.get("created"):
+                # the pid was reused by another uv (no recorded time proves nothing: held below)
+                return self.uv_prune_done(rc=None, stale=True, reason="identity")
         start = run.get("start")
         if isinstance(start, (int, float)) and self.now() - start <= PRUNE_TIMEOUT_S:
             return  # still running: dispatch holds
-        image = self.pid_image(pid)
-        killed = image is not None and image.lower() in ("uv.exe", "uv")
+        held = run.get("held")
+        if isinstance(held, (int, float)):
+            if self.now() - held <= PRUNE_TIMEOUT_S:
+                return  # alive and not killed: still held
+            self.event("uv_prune_failed", reason="held", pid=pid, image=image)
+            self.page("uv cache prune durmadı (pid %d); dispatch 30 dk ek beklemeden sonra serbest" % pid)
+            return self.uv_prune_done()
+        if proc is not None:  # the open handle pins the pid: only a known non-uv image is spared
+            image = self.pid_image(pid)
+            killed = image is None or image.lower() in ("", "uv.exe", "uv")
+        else:
+            killed = image is not None and born is not None and born == run.get("created")  # same uv
         if killed:
             try:
                 proc.kill() if proc is not None else os.kill(pid, 9)
             except OSError:
                 killed = False
         self.event("uv_prune_failed", reason="timeout", pid=pid, image=image, killed=killed)
-        self.uv_prune_done()
+        if killed:
+            return self.uv_prune_done()
+        self.pager_flag("uv_prune_run", dict(run, held=self.now()))
+
+    def pid_created(self, pid):
+        """Creation time of a live pid (FILETIME ticks), None when it could not be read."""
+        try:
+            rc, out = self.cmd(["powershell", "-NoProfile", "-Command",
+                                "(Get-Process -Id %d).StartTime.ToFileTimeUtc()" % pid])
+            return int(out.strip()) if rc == 0 else None
+        except Exception:
+            return None
 
     def uv_prune_done(self, **kw):
         if kw:
@@ -2429,17 +2459,26 @@ class Conveyor:
         state_file = self.base / "temp_walk.json"
         state = self.temp_walk_state(state_file, root)
         stack = state["stack"]
+        under = root.rstrip("\\/") + os.sep
         start, seen, stop, reasons, errors, paged = self.now(), 0, None, set(), [], 0
         while stack and not stop:
             path, depth, skip = stack.pop()
             try:
-                if path != root and is_link(os.lstat(path)):  # swapped for a link since it was queued
-                    continue
+                if path != root:
+                    rel = path[len(under):].split(os.sep)
+                    if any(is_link(os.lstat(os.path.join(root, *rel[:n]))) for n in range(1, len(rel))):
+                        self.event("temp_watch_error", error="ancestor is a link or junction, entry dropped",
+                                   path=path)
+                        continue
+                    if is_link(os.lstat(path)):  # swapped for a link since it was queued
+                        continue
                 with os.scandir(path) as entries:
                     # ponytail: resume skips by index; entries added or removed meanwhile may shift a few
                     for i, entry in enumerate(entries):
                         if i < skip:
                             continue
+                        if i == skip and skip:
+                            start = self.now()  # skipping the prefix is not this tick's budget: it always advances
                         stop = ("entries" if seen >= TEMP_WATCH_ENTRIES
                                 else "time" if self.now() - start > TEMP_WATCH_BUDGET_S else None)
                         if stop:
@@ -4166,6 +4205,10 @@ class Conveyor:
             st = state.get(f.name, {})
             if self.now() - st.get("tried", 0) < PUSH_RETRY_S:
                 continue
+            ap = self.auto_state()  # PAUSE/breaker may appear while earlier approvals pushed
+            if self.push_deferred(self.breaker or (ap.get("breaker") if ap is not None else {
+                    "reason": "build/conveyor/autopilot.json unreadable (fix it by hand)"})):
+                break  # this and later approvals stay; a later pass retries
             st["tried"] = self.now()
             sha = url = None
             try:
