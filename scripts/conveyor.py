@@ -92,6 +92,7 @@ STATUS_STALE_S = 600  # status.json older than this: a status_stale attention it
 API_PAGE_WINDOW_S = 600  # 2+ lanes on API errors this close together: an account/network page
 API_PAGE_EVERY_S = 7200  # ... repeated this often while it lasts, night hours included
 HEARTBEAT_GRACE_S = 20 * 60  # the orchestrator is late this long after its planned wake (hb_watch.py GRACE)
+CONVEYOR_CODE = {"scripts/conveyor.py", "scripts/conveyor_workers.py"}  # always loaded; loads_any adds sys.modules
 BUDGET_MSGS = 90  # assistant messages before the one wrap-up nudge
 BUDGET_CHECK_S = 600
 BUDGET_NUDGE = "commit the coherent part, list the rest in OPEN ISSUES, write the report"
@@ -1370,8 +1371,7 @@ class Conveyor:
     def pager_watch(self, lanes):
         """Status-only pages (no command, no link), night hours included: 2+ lanes held or
         STUCK on API errors within API_PAGE_WINDOW_S -> at once and every API_PAGE_EVERY_S
-        while it lasts; the orchestrator's planned wake + HEARTBEAT_GRACE_S passed -> once per heartbeat
-        value, shared with hb_watch.py through its hb_alert_sent."""
+        while it lasts. PAGEFIX: the orchestrator-stale alarm is hb_watch.py's alone (sleep-aware)."""
         now = self.now()
         ts = sorted(ln["api_err_ts"] for ln in lanes.values() if ln.get("api_err_ts") and (
             (ln.get("paused") and not ln.get("finished"))
@@ -1383,20 +1383,6 @@ class Conveyor:
                 self.pager_flag("api_outage", {"since": (f or {}).get("since", now), "paged": now})
         elif f:
             self.pager_flag("api_outage", False)
-        wake = self.orch_wake()
-        if wake and now > wake[0] + HEARTBEAT_GRACE_S and self.pager_flag("orch_stale") != wake[1]:
-            self.pager_flag("orch_stale", wake[1])
-            sent = self.root / "build" / "orch" / "hb_alert_sent"
-            try:
-                paged = sent.read_text(encoding="utf-8", errors="replace").strip() == wake[1]
-            except OSError:
-                paged = False
-            if not paged:  # hb_watch has not paged this value; the claim stops it paging it too
-                self.page("Orkestratör planlı uyanışını kaçırdı; sohbete 'devam' yazın")
-                try:
-                    sent.write_text(wake[1], encoding="utf-8")
-                except OSError:
-                    pass
 
     def orch_wake(self):
         """(epoch of the orchestrator's next planned wake, heartbeat value), parsed as hb_watch.py does
@@ -3362,14 +3348,14 @@ class Conveyor:
 
     def backstop(self, items):
         """Page Salih once per urgent or needs_salih item left unacked ATTENTION_PAGE_S (the breaker at
-        once). The orchestrator's own items, routine ones included, stay silent until its planned wake +
-        HEARTBEAT_GRACE_S has passed, then one combined page per heartbeat value. Without a heartbeat
-        file nobody watches them: they page one by one as before (routine ones never). At night
+        once). The orchestrator's own routine items never page while a heartbeat exists: a late
+        orchestrator is hb_watch.py's single alarm (PAGEFIX). Without a heartbeat file nobody watches
+        them: they page one by one as before (quiet ones never). At night
         (NIGHT_HOURS) the page waits for the morning, unless the breaker is open."""
         if local_hour(self.now()) in NIGHT_HOURS and not self.breaker:
             return
         done, now = self.pager_flag("backstop") or {}, self.now()
-        wake, routine = self.orch_wake(), []
+        wake = self.orch_wake()
         for i, why, since in items:
             if i in (DRY_ID, CLEANUP_REGISTRY_ID):  # never page here: board / rm_registry's own page
                 continue
@@ -3379,16 +3365,11 @@ class Conveyor:
                 due, text = now - since >= ATTENTION_PAGE_S, \
                     f"Orkestratör {ATTENTION_PAGE_S // 60} dk tepki vermedi: {i}: {why}"
             else:
-                if wake and now - since >= ATTENTION_PAGE_S:
-                    routine.append(i)
                 continue
             if due and done.get(i) != since:
                 self.page(text)
                 done[i] = since
                 self.pager_flag("backstop", done)
-        if routine and now > wake[0] + HEARTBEAT_GRACE_S and self.pager_flag("backstop_combined") != wake[1]:
-            self.page(f"Orkestratör uyanmadı, {len(routine)} madde bekliyor: {', '.join(routine[:5])}")
-            self.pager_flag("backstop_combined", wake[1])
 
     def write_status(self, lanes, items):
         status = {
@@ -4274,6 +4255,7 @@ class Conveyor:
                 break  # this and later approvals stay; a later pass retries
             st["tried"] = self.now()
             sha = url = None
+            self.push_paths = []  # filled by push_checks' diff; never a previous approval's range
             try:
                 why, sha, url = self.push_checks(f.name, lanes)
                 if why is None:
@@ -4292,7 +4274,8 @@ class Conveyor:
                 continue
             state.pop(f.name, None)
             self.event("push", sha=sha, ci_run=url, approval=f.name)
-            self.page(f"main {sha[:7]} GitHub'a gönderildi")
+            if self.loads_any(self.push_paths):
+                self.page(f"main {sha[:7]}: konveyör kodu, panelden yeniden başlat")  # else silent
             done = self.approvals / "done"
             dest = done / f.name
             try:
@@ -4335,6 +4318,18 @@ class Conveyor:
         self.event("fast_forward", sha=sha)
         return None
 
+    def loads_any(self, paths):
+        """PAGEFIX: True when a pushed repo path is code this process runs: the conveyor scripts or any
+        module it imported (jarvis.codex pulls in much of jarvis/ on the first Codex lane)."""
+        loaded = {os.path.normcase(os.path.abspath(f)) for m in list(sys.modules.values())
+                  if isinstance(f := getattr(m, "__file__", None), str)}
+        for p in paths:
+            p = p.strip().replace("\\", "/")
+            if p and (p.lower() in CONVEYOR_CODE
+                      or os.path.normcase(os.path.abspath(self.root / p)) in loaded):
+                return True
+        return False
+
     def push_checks(self, name, lanes=None):
         """(None, full sha, CI run url) when every check passes, else (reason, sha, None).
         CONV12: a CI-handoff lane's exact 40-hex sha may sit under newer local main commits (the
@@ -4374,9 +4369,10 @@ class Conveyor:
         if late:
             n, c = late[0]
             return f"stacked on {n} {c['sha'][:7]} whose CI is {c.get('state') or 'pending'}", sha, None
-        rc, out = self.cmd(["git", "diff", "--name-only", f"{om}..{sha}"])
+        rc, out = self.cmd(["git", "diff", "--name-only", "--no-renames", f"{om}..{sha}"])
         if rc != 0:
             return f"git diff rc={rc}", sha, None
+        self.push_paths = out.splitlines()  # push_gate pages a restart when these are CONVEYOR_CODE
         if any(p.strip().rsplit("/", 1)[-1] == "uv.lock" for p in out.splitlines()):
             return "uv.lock changed", sha, None
         for rev in (om, sha):

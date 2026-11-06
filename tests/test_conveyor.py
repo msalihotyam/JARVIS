@@ -9,6 +9,7 @@ import re
 import stat
 import subprocess
 import sys
+import types
 import tempfile
 import time
 import unittest
@@ -2947,7 +2948,8 @@ class TestReader(Base):
         hb.parent.mkdir(parents=True, exist_ok=True)
         hb.write_text(str(due))
 
-    def test_needs_orchestrator_stays_silent_before_the_planned_wake_then_one_combined_page(self):
+    def test_needs_orchestrator_stays_silent_before_and_after_the_planned_wake(self):
+        """PAGEFIX: a late orchestrator is hb_watch.py's single alarm; the conveyor never pages it."""
         self.reply = answer({"kind": "needs_orchestrator", "summary": "bak", "next": "n"})
         self.finish_a()
         self.planned_wake(self.t + 4 * 3600)
@@ -2957,9 +2959,8 @@ class TestReader(Base):
         self.t += 3600 + conveyor.HEARTBEAT_GRACE_S + 60
         self.c.pass_once()
         self.c.pass_once()
-        combined = [p for p in self.pushes if "madde bekliyor" in p]
-        self.assertEqual(len(combined), 1)
-        self.assertIn("A", combined[0])
+        self.assertEqual(self.pushes, [])
+        self.assertFalse((self.root / "build" / "orch" / "hb_alert_sent").exists())
 
     def test_needs_salih_pages_at_31_minutes_even_with_a_future_wake(self):
         self.reply = answer({"kind": "needs_salih", "summary": "karar", "next": "n"})
@@ -4770,7 +4771,9 @@ class TestPushGate(Base):
         (ev,) = [e for e in self.events() if e["event"] == "push"]
         self.assertEqual(ev["sha"], MAIN)
         self.assertEqual(ev["ci_run"], "https://github.com/x/y/actions/runs/1")
-        self.assertEqual(self.pushes, ["main 1234567 GitHub'a gönderildi"])
+        self.assertEqual(self.pushes, [])  # PAGEFIX: a non-conveyor range is silent
+        pf = self.c.pager_file
+        self.assertEqual(json.loads(pf.read_text(encoding="utf-8")).get("pending", []) if pf.exists() else [], [])
         self.assertEqual(self.attn_ex_dry(), [])
         self.c.pass_once()  # moved: never pushed twice
         self.assertEqual(len(self.git.pushes()), 1)
@@ -4799,6 +4802,7 @@ class TestPushGate(Base):
         self.assertTrue([e for e in self.events() if e["event"] == "push_deferred_pause"])
 
     def test_ntfy_respects_page_gap(self):
+        self.git.diff = "jarvis/core.py\nscripts/conveyor.py\n"
         self.c.pager_flag("last_push", self.t - 60)
         self.approve()
         self.c.pass_once()
@@ -4806,7 +4810,36 @@ class TestPushGate(Base):
         self.assertEqual(self.pushes, [])  # held for the gap
         self.t += conveyor.PAGE_GAP_S
         self.c.pass_once()
-        self.assertEqual(self.pushes, ["main 1234567 GitHub'a gönderildi"])
+        self.c.pass_once()
+        self.assertEqual(self.pushes, ["main 1234567: konveyör kodu, panelden yeniden başlat"])
+
+    def push_with(self, diff):
+        self.git.diff = diff
+        f = self.approve()
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(len(self.git.pushes()), 1)
+        self.assertFalse(f.exists())
+        return self.pushes
+
+    def test_push_of_an_empty_or_non_conveyor_range_is_silent(self):
+        """PAGEFIX: no page unless the running conveyor must restart."""
+        self.assertEqual(self.push_with(""), [])
+
+    def test_push_of_lookalike_paths_is_silent(self):
+        self.assertEqual(self.push_with("jarvis/core.py\ntests/test_conveyor.py\nscripts/conveyor.ps1\n"
+                                        "scripts/old_conveyor.py\n"), [])
+
+    def test_push_of_a_module_the_conveyor_imported_pages_one_restart(self):
+        """jarvis.codex is imported lazily by the Codex worker: a push touching it needs a restart."""
+        fake = types.SimpleNamespace(__file__=str(self.root / "jarvis" / "codex.py"))
+        with mock.patch.dict(sys.modules, {"pagefix_loaded": fake}):
+            self.assertEqual(self.push_with("docs/x.md\njarvis/codex.py\n"),
+                             ["main 1234567: konveyör kodu, panelden yeniden başlat"])
+
+    def test_push_of_workers_in_a_mixed_range_pages_one_restart(self):
+        self.assertEqual(self.push_with("docs/x.md\nScripts\\Conveyor_Workers.py\njarvis/core.py\n"),
+                         ["main 1234567: konveyör kodu, panelden yeniden başlat"])
 
     def test_pause_defers_an_approved_push_without_refusal(self):
         name = f"push-{MAIN}-p2b"
@@ -6912,7 +6945,7 @@ class TestConvSafe(AutopilotBase):
         self.assertEqual(self.fake.bg_names(), [])
         self.assertIn("lanes-invalid", [a["id"] for a in self.status()["attention"]])
 
-    def test_api_outage_and_stale_orchestrator_pages(self):
+    def test_api_outage_pages_and_a_stale_orchestrator_does_not(self):
         def pages(word):
             return [p for p in json.loads(self.c.pager_file.read_text(encoding="utf-8"))["pending"] if word in p]
         lanes = {n: {"paused": True, "api_err_ts": self.t - k} for n, k in (("A", 0), ("B", 300))}
@@ -6928,7 +6961,8 @@ class TestConvSafe(AutopilotBase):
         os.utime(hb, (self.t - 3600 - conveyor.HEARTBEAT_GRACE_S - 60,) * 2)  # old format: mtime + 60 min
         self.c.pager_watch({})
         self.c.pager_watch({})
-        self.assertEqual(len(pages("devam")), 1)
+        self.assertEqual(len(pages("")), 2)  # PAGEFIX: the stale orchestrator adds no page
+        self.assertEqual(pages("devam"), [])
 
 
 class PageBase(Base):
@@ -6951,36 +6985,25 @@ class PageBase(Base):
 
 
 class TestOrchStalePage(PageBase):
-    def test_pages_once_per_value_only_after_due_plus_grace(self):
-        due = self.t + 3600
+    """PAGEFIX: hb_watch.py is the single owner of the orchestrator-stale alarm; no conveyor path pages it."""
+
+    def test_a_stale_wake_with_81_attention_items_pages_nothing(self):
+        due = self.t - 3 * 3600
         hb = self.beat(str(due))
+        items = [(f"item{k}", "reader blocked: x", due - 3600) for k in range(81)]
+        for _ in range(2):
+            self.c.backstop(items)
+            self.c.pager_watch({})
+        self.t += 24 * 3600
+        self.c.backstop(items)
         self.c.pager_watch({})
         self.assertEqual(self.pages(), [])
-        self.t = due + 19 * 60
-        self.c.pager_watch({})
-        self.assertEqual(self.pages(), [])
-        self.t = due + 21 * 60
-        self.c.pager_watch({})
-        self.c.pager_watch({})
-        self.assertEqual(len(self.pages("planlı uyanış")), 1)
         self.assertEqual(hb.read_text(), str(due))  # the orchestrator's file is never written
-        self.assertEqual((hb.parent / "hb_alert_sent").read_text(encoding="utf-8"), str(due))  # hb_watch: already
-        self.beat(str(due + 30))
-        self.c.pager_watch({})
-        self.c.pager_watch({})
-        self.assertEqual(len(self.pages("planlı uyanış")), 2)
+        self.assertFalse((hb.parent / "hb_alert_sent").exists())  # hb_watch's claim is never touched
 
-    def test_old_format_falls_back_to_mtime_plus_an_hour(self):
-        self.beat("", mtime=self.t - 3600 - 19 * 60)
-        self.c.pager_watch({})
-        self.assertEqual(self.pages(), [])
-        self.t += 2 * 60
-        self.c.pager_watch({})
-        self.assertEqual(len(self.pages("planlı uyanış")), 1)
-
-    def test_a_value_hb_watch_already_paged_is_not_paged_again(self):
-        hb = self.beat(str(self.t - 3600))
-        (hb.parent / "hb_alert_sent").write_text(str(self.t - 3600), encoding="utf-8")
+    def test_old_format_stale_heartbeat_pages_nothing(self):
+        self.beat("", mtime=self.t - 3600 - conveyor.HEARTBEAT_GRACE_S - 60)
+        self.c.backstop([("A", "findings", self.t - 3 * 3600)])
         self.c.pager_watch({})
         self.assertEqual(self.pages(), [])
 
@@ -6994,7 +7017,7 @@ class TestOrchStalePage(PageBase):
 
 
 class TestBackstopPage(PageBase):
-    def test_orchestrator_item_is_silent_before_the_wake_then_one_combined_page_per_value(self):
+    def test_orchestrator_item_is_silent_before_and_after_the_wake(self):
         due = self.t + 3600
         self.beat(str(due))
         items = [("A", "reader blocked: x", self.t - 3 * 3600), ("B", "findings", self.t - 3 * 3600)]
@@ -7006,12 +7029,9 @@ class TestBackstopPage(PageBase):
         self.t = due + 21 * 60
         self.c.backstop(items)
         self.c.backstop(items)
-        (page,) = self.pages()
-        self.assertIn("2 madde bekliyor: A, B", page)
         self.beat(str(self.t - 3600))
         self.c.backstop(items)
-        self.c.backstop(items)
-        self.assertEqual(len(self.pages("madde bekliyor")), 2)
+        self.assertEqual(self.pages(), [])  # PAGEFIX: no combined digest
 
     def test_needs_salih_and_urgent_items_page_after_the_wait_despite_a_future_wake(self):
         self.beat(str(self.t + 6 * 3600))
