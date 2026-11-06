@@ -37,7 +37,21 @@ from conveyor_workers import JULES_MAX_S, WORKERS, CodexWorker, JulesWorker  # n
 ROOT =Path(__file__).resolve().parents[1]  # repo root (scripts/ -> repo)
 SETTINGS = "build/conveyor/lanes.settings.json"
 MAX_LANES = 3
-STALE_LOCK_S = 300
+STALE_LOCK_S = 300  # readers only (watchdog/panel): the heartbeat no longer decides exclusion
+LOCK_RETRY_S = 0.5  # one retry of a torn conveyor.lock read
+
+
+def real_instance_lock(fd, unlock=False):
+    """CONVLOCK2: a non-blocking exclusive lock on byte 0 of fd; raises when another handle
+    holds it. The kernel drops it when the handle closes or the process dies, so no aging.
+    os.open fds are non-inheritable, so a lane child never keeps it."""
+    if os.name == "nt":
+        import msvcrt
+        os.lseek(fd, 0, 0)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK if unlock else msvcrt.LK_NBLCK, 1)
+    else:
+        import fcntl
+        fcntl.flock(fd, fcntl.LOCK_UN if unlock else fcntl.LOCK_EX | fcntl.LOCK_NB)
 # CONVSAFE: a pushed range touching these needs Salih's manual key 1 (never auto-approved):
 # CI, its build-time skip/allow lists, the conveyor itself and the Claude config
 PROTECTED_DIRS = (".github/workflows/", ".claude/")
@@ -1004,7 +1018,8 @@ class Conveyor:
     def __init__(self, root=ROOT, runner=real_runner, now=time.time, send=ntfy_send,
                  post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage,
                  projects=None, mem=real_mem, idle=real_idle, procs=None, net=real_net,
-                 popen=subprocess.Popen, codex=None, jules=None, prune=None, temp_watch=None):
+                 popen=subprocess.Popen, codex=None, jules=None, prune=None, temp_watch=None,
+                 instance_lock=real_instance_lock):
         self.root = Path(root)
         self.prune = prune  # prune and temp_watch are wired only on the real loop: no test reaches them
         self.temp_watch = temp_watch
@@ -1042,6 +1057,9 @@ class Conveyor:
         self.inbox = self.base / "inbox"
         self.inbox.mkdir(parents=True, exist_ok=True)
         self.lock = self.base / "conveyor.lock"
+        self.instance = self.base / "conveyor.instance"  # CONVLOCK2: the OS-locked single-instance file
+        self.instance_lock = instance_lock
+        self.instance_fd = None
         self.state_file = self.base / "lanes.json"  # lanes this conveyor owns
         self.pager_file = self.base / "pager.json"
         # a lanes.json / pager.json write that failed (locked): kept here and used instead of
@@ -1076,29 +1094,74 @@ class Conveyor:
 
     # ---- lock -------------------------------------------------------
     def acquire_lock(self):
-        try:
-            cur = json.loads(self.lock.read_text())
-            if cur.get("pid") != self.pid and self.now() - cur.get("heartbeat", 0) < STALE_LOCK_S:
+        """CONVLOCK2: the single instance is the OS lock on conveyor.instance, held for the
+        process life. Lock refused or raising: another conveyor is alive (fail closed).
+        Lock taken: this is the only conveyor and takes conveyor.lock over at once, whatever
+        its heartbeat age. conveyor.lock is only the info/heartbeat file readers see."""
+        if self.instance_fd is None:
+            fd = None
+            try:
+                self.base.mkdir(parents=True, exist_ok=True)
+                fd = os.open(self.instance, os.O_RDWR | os.O_CREAT)
+                self.instance_lock(fd)
+            except Exception:
+                if fd is not None:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
                 return False
-        except (OSError, ValueError):
-            pass
+            self.instance_fd = fd
+            cur = self.read_lock()
+            if isinstance(cur, dict) and cur.get("pid") != self.pid and cur.get("heartbeat"):
+                try:  # best effort, never aborts startup; nothing is killed
+                    self.event("lock_takeover", old_pid=cur.get("pid"), reason="os_lock")
+                except Exception as e:
+                    print(f"conveyor: lock_takeover event failed: {e!r}", file=sys.stderr)
         self.heartbeat()
         return True
 
+    def release_lock(self):
+        """Drops the OS lock (close also drops it; the kernel does on death)."""
+        fd, self.instance_fd = self.instance_fd, None
+        if fd is None:
+            return
+        try:
+            self.instance_lock(fd, unlock=True)
+        except Exception:
+            pass
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
     def heartbeat(self):
+        """Written in place (never os.replace, which fails on Windows while a reader has it open)."""
         self.beat_ts = self.now()
         self.lock.write_text(json.dumps({"pid": self.pid, "heartbeat": self.now()}))
 
     def beat(self):
-        """The heartbeat inside a long pass (a lock older than STALE_LOCK_S is taken over)."""
+        """The heartbeat inside a long pass, so readers keep seeing a fresh conveyor."""
         if self.now() - self.beat_ts >= BEAT_S and self.own_lock():
             self.heartbeat()
 
+    def read_lock(self):
+        """conveyor.lock as JSON; a torn read (a write in progress) is retried once."""
+        for retry in (False, True):
+            try:
+                return json.loads(self.lock.read_text())
+            except FileNotFoundError:
+                return None
+            except (OSError, ValueError):
+                if retry:
+                    return None
+                time.sleep(LOCK_RETRY_S)
+
     def own_lock(self):
-        try:
-            return json.loads(self.lock.read_text()).get("pid") == self.pid
-        except (OSError, ValueError):
-            return False
+        """False only when the info file names another pid (a pre-CONVLOCK2 conveyor took it);
+        a missing or unreadable file is ours, since the OS lock already excludes any successor."""
+        cur = self.read_lock()
+        return not isinstance(cur, dict) or cur.get("pid", self.pid) == self.pid
 
     # ---- persistence ------------------------------------------------
     def load_json(self, path, default):
@@ -5020,7 +5083,13 @@ class Conveyor:
 
     def loop(self, once=False):
         if not self.acquire_lock():
-            return 0  # another instance is alive
+            return 0  # another instance is alive (it holds the OS lock)
+        try:
+            return self._loop(once)
+        finally:
+            self.release_lock()  # once / yielded: the next start takes it at once
+
+    def _loop(self, once):
         flush_errors = set()  # note_pass/flush_pages errors already logged
         while True:
             ok = False
@@ -5052,12 +5121,12 @@ class Conveyor:
                         self.event("flush_error", error=repr(e), file=fn and str(fn), at=at)
                     except Exception:
                         pass  # the event log itself is unwritable: nowhere left to record it
-            if once:  # release: a zero heartbeat is stale at once
+            if once:  # a zero heartbeat tells readers no conveyor runs; loop() drops the OS lock
                 self.lock.write_text(json.dumps({"pid": self.pid, "heartbeat": 0}))
                 return 0
             time.sleep(PASS_S)
             if not self.own_lock():
-                return 0  # someone took the lock over
+                return 0  # the info file names another pid: yield
 
 
 def archive_cli(c, dry_run):

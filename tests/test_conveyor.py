@@ -215,6 +215,7 @@ class Base(unittest.TestCase):
         return reply
 
     def tearDown(self):
+        self.c.release_lock()  # CONVLOCK2: Windows cannot delete the temp dir with the handle open
         self.tmp.cleanup()
 
     def drop(self, fname, text, age=0):
@@ -6334,19 +6335,149 @@ class TestInterimReport(AutopilotBase):
 
 
 class TestLock(Base):
-    def test_live_lock_blocks(self):
-        (self.base / "conveyor.lock").write_text(json.dumps({"pid": -5, "heartbeat": self.t - 60}))
-        self.assertFalse(self.c.acquire_lock())
+    """CONVLOCK2: exclusion is an OS lock on conveyor.instance held for the process life;
+    conveyor.lock is only the info/heartbeat file and never decides who runs."""
 
-    def test_stale_lock_taken_over(self):
-        (self.base / "conveyor.lock").write_text(json.dumps({"pid": -5, "heartbeat": self.t - 301}))
+    def setUp(self):
+        super().setUp()
+        self.others = []
+
+    def tearDown(self):
+        for c in self.others:
+            c.release_lock()  # Windows cannot delete the temp dir with the handle open
+        super().tearDown()
+
+    def other(self, lock=conveyor.real_instance_lock, pid=-7):
+        c = Conveyor(self.root, self.fake, now=lambda: self.t, instance_lock=lock)
+        c.pid = pid  # another process's conveyor
+        self.others.append(c)
+        return c
+
+    def info(self):
+        return json.loads((self.base / "conveyor.lock").read_text())
+
+    def test_second_instance_exits_while_the_first_holds_the_os_lock(self):
+        self.assertTrue(self.c.acquire_lock())
+        second = self.other()
+        self.assertFalse(second.acquire_lock())
+        self.assertEqual(second.loop(once=True), 0)
+        self.assertIsNone(second.instance_fd)
+        self.assertEqual(self.info()["pid"], self.c.pid)  # the loser never wrote the heartbeat
+        self.assertTrue(self.c.own_lock())
+
+    def test_old_heartbeat_age_never_lets_a_second_instance_in(self):
+        self.assertTrue(self.c.acquire_lock())
+        (self.base / "conveyor.lock").write_text(json.dumps({"pid": self.c.pid, "heartbeat": self.t - 10**6}))
+        self.assertFalse(self.other().acquire_lock())
+
+    def test_after_the_first_closes_the_second_acquires_at_once_despite_a_fresh_heartbeat(self):
+        self.assertTrue(self.c.acquire_lock())
+        self.c.release_lock()  # the first conveyor died: the kernel dropped its lock
+        self.assertEqual(self.info(), {"pid": self.c.pid, "heartbeat": self.t})  # still fresh
+        second = self.other()
+        self.assertTrue(second.acquire_lock())
+        self.assertEqual(self.info()["pid"], -7)
+        self.assertTrue(second.own_lock())
+        take = [e for e in self.events() if e["event"] == "lock_takeover"]
+        self.assertEqual([(e["old_pid"], e["reason"]) for e in take], [(self.c.pid, "os_lock")])
+
+    def test_a_lock_call_that_raises_means_exit(self):
+        def broken(fd, unlock=False):
+            raise RuntimeError("no lock primitive")
+        c = self.other(lock=broken)
+        self.assertFalse(c.acquire_lock())
+        self.assertIsNone(c.instance_fd)
+        self.assertEqual(c.loop(once=True), 0)
+        self.assertFalse((self.base / "conveyor.lock").exists())  # never wrote a heartbeat
+
+    def test_an_unopenable_instance_file_means_exit(self):
+        with mock.patch.object(conveyor.os, "open", side_effect=PermissionError("denied")):
+            self.assertFalse(self.c.acquire_lock())
+
+    def test_injected_lock_held_blocks_and_released_admits(self):
+        held = []
+        def fake(fd, unlock=False):
+            if unlock:
+                held.remove(fd)
+            elif held:
+                raise OSError(36, "held")
+            else:
+                held.append(fd)
+        a, b = self.other(lock=fake, pid=-8), self.other(lock=fake)
+        self.assertTrue(a.acquire_lock())
+        self.assertFalse(b.acquire_lock())
+        a.release_lock()
+        self.assertEqual(held, [])
+        self.assertTrue(b.acquire_lock())
+
+    def test_acquire_is_idempotent_and_once_releases(self):
+        self.assertTrue(self.c.acquire_lock())
+        fd = self.c.instance_fd
+        self.assertTrue(self.c.acquire_lock())
+        self.assertEqual(self.c.instance_fd, fd)
+        self.c.release_lock()
+        self.assertEqual(self.c.loop(once=True), 0)
+        self.assertIsNone(self.c.instance_fd)
+        self.assertEqual(self.info()["heartbeat"], 0)
+        self.assertTrue(self.other().acquire_lock())  # the next start takes it at once
+
+    def test_takeover_event_failure_never_aborts_startup(self):
+        (self.base / "conveyor.lock").write_text(json.dumps({"pid": -5, "heartbeat": self.t}))
+        with mock.patch.object(self.c, "event", side_effect=OSError("disk full")):
+            self.assertTrue(self.c.acquire_lock())
+        self.assertEqual(self.info()["pid"], self.c.pid)
+
+    def test_heartbeat_is_written_in_place(self):
+        with mock.patch.object(conveyor.os, "replace", side_effect=AssertionError("os.replace")):
+            self.assertTrue(self.c.acquire_lock())
+            self.t += 61
+            self.c.beat()
+        self.assertEqual(self.info(), {"pid": self.c.pid, "heartbeat": self.t})
+        self.assertEqual(sorted(p.name for p in self.base.glob("conveyor.*")),
+                         ["conveyor.instance", "conveyor.lock"])
+
+    def test_torn_read_is_retried_once(self):
+        good = json.dumps({"pid": self.c.pid, "heartbeat": self.t})
+        with mock.patch.object(conveyor.Path, "read_text", side_effect=["{", good]), \
+                mock.patch.object(conveyor.time, "sleep") as sleep:
+            self.assertTrue(self.c.own_lock())
+        sleep.assert_called_once_with(conveyor.LOCK_RETRY_S)
+        self.assertEqual(conveyor.LOCK_RETRY_S, 0.5)
+        with mock.patch.object(conveyor.Path, "read_text", side_effect=["{", "{"]), \
+                mock.patch.object(conveyor.time, "sleep"):
+            self.assertIsNone(self.c.read_lock())  # torn twice: unreadable
+        with mock.patch.object(conveyor.Path, "read_text", side_effect=["{", "{"]), \
+                mock.patch.object(conveyor.time, "sleep"):
+            self.assertTrue(self.c.own_lock())  # the OS lock decides, not a garbled info file
+        self.assertTrue(self.c.acquire_lock())
+        (self.base / "conveyor.lock").write_text(json.dumps({"pid": -9, "heartbeat": self.t}))
+        self.assertFalse(self.c.own_lock())  # only a foreign pid makes the holder yield
+
+    def test_corrupt_or_missing_info_file_still_acquires(self):
+        self.assertTrue(self.c.acquire_lock())
+        self.c.release_lock()
+        (self.base / "conveyor.lock").write_text("garbage")
+        self.assertTrue(self.c.acquire_lock())
+        self.c.release_lock()
+        (self.base / "conveyor.lock").unlink()
         self.assertTrue(self.c.acquire_lock())
         self.assertTrue(self.c.own_lock())
 
-    def test_corrupt_or_missing_lock(self):
-        self.assertTrue(self.c.acquire_lock())
-        (self.base / "conveyor.lock").write_text("garbage")
-        self.assertTrue(self.c.acquire_lock())
+    def test_real_lock_excludes_a_second_handle_in_one_process(self):
+        path = os.path.join(self.tmp.name, "probe.instance")
+        a = os.open(path, os.O_RDWR | os.O_CREAT)
+        b = os.open(path, os.O_RDWR | os.O_CREAT)
+        try:
+            conveyor.real_instance_lock(a)
+            with self.assertRaises(OSError):
+                conveyor.real_instance_lock(b)
+            os.close(a)
+            a = None
+            conveyor.real_instance_lock(b)  # closing the holder frees it at once
+        finally:
+            for fd in (a, b):
+                if fd is not None:
+                    os.close(fd)
 
 
 class VersionClaude(FakeClaude):
