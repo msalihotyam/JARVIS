@@ -10,7 +10,8 @@ The driver owns no process, database or network. ``ports`` supplies:
 - ``lease_claim(step)`` / ``lease_release(step)``: the slice lease. A claim that
   returns an N6 ``Lease`` (N6-08) fences the slice: each write first calls the
   optional ``lease_check(lease)`` port, a stale epoch raises ``Fenced``, and every
-  event payload carries the epoch.
+  event payload carries the epoch. Ports with ``lease_check`` require that Lease:
+  a claim yielding anything else raises ``Fenced`` before any write (N6-08FIX).
 - ``stage_create(step)`` -> stage; ``route(step)`` -> worker name;
   ``worker(name)`` -> ``jarvis.workers.base.Worker``.
 - ``task(step, stage, findings)`` -> worker task; findings travel as data.
@@ -191,6 +192,11 @@ def _drive_slice(step: WorkStep, ports: Ports) -> tuple[WorkStep, str]:
     track = [step]
     done = False
     claimed = ports.lease_claim(step)
+    if getattr(ports, "lease_check", None) is not None and not isinstance(claimed, Lease):
+        # N6-08FIX F3: N6 ports need a Lease; a failed claim refuses, never runs unfenced.
+        if claimed is not None:  # a non-Lease claim still holds something: give it back
+            ports.lease_release(step)
+        raise Fenced(f"N6 lease claim failed for {step.key}")
     fenced = _FencedPorts(ports, claimed) if isinstance(claimed, Lease) else None
     if fenced is not None:
         ports = cast("Ports", fenced)

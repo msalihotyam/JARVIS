@@ -5605,6 +5605,37 @@ class TestN6Lease(Base):
         self.assertEqual(self.fake.bg_names(), ["A"])
         self.assertEqual(self.attn(), [])
 
+    def test_neg_lease_taken_between_two_starts_skips_the_second(self):
+        # N6-08FIX F4: the lease is re-read just before each start, not once per pass.
+        self.drop("a.md", HDR.format("A") + "x")
+        self.drop("b.md", HDR.format("B") + "y", age=1)
+        start = self.c.start
+
+        def start_then_n6_takes_b(name, *a, **k):
+            sid = start(name, *a, **k)
+            if name == "A":
+                self.lease({"epoch": 1, "owner": "n6", "slice_id": "B",
+                            "expires": self.t + 600, "applied": []})
+            return sid
+
+        self.c.start = start_then_n6_takes_b
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        skips = [e for e in self.events() if e["event"] == "n6_lease_skip"]
+        self.assertEqual([e["slice"] for e in skips], ["B"])
+        self.assertTrue((self.c.inbox / "b.md").exists())
+
+    def test_neg_absurd_expires_numbers_hold_all(self):
+        # N6-08FIX F5: overflowing / non-finite / bool expires and deep nesting never raise.
+        tmpl = '{"epoch": 1, "owner": "n6", "slice_id": "S", "expires": %s, "applied": []}'
+        bad = [tmpl % ("1" + "0" * 400), tmpl % ("-1" + "0" * 400), tmpl % "1e400",
+               tmpl % "Infinity", tmpl % "NaN", tmpl % '"inf"', tmpl % '"nan"',
+               tmpl % "true", tmpl % "false", tmpl % "null", "[" * 100000 + "]" * 100000]
+        for raw in bad:
+            with self.subTest(raw=raw[:60]):
+                p = self.lease(raw)
+                self.assertEqual(conveyor.n6_live_slices(p, self.t), conveyor.N6_HELD_ALL)
+
 
 SHA_A, SHA_B = "a1" + "0" * 38, "b2" + "0" * 38  # two integration commits stacked on ORIGIN
 

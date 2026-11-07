@@ -86,6 +86,35 @@ class N6LeaseTest(unittest.TestCase):
                 self.assertIsNone(acquire(self.path, "mgr-a", "S1", 60, NOW))
                 self.assertEqual(self.path.read_bytes(), raw)
 
+    def test_neg_apply_event_with_pre_renew_lease_keeps_renewed_expiry(self):
+        # N6-08FIX F2: writes keep the file's state, never the caller's stale Lease copy.
+        old = acquire(self.path, "mgr-a", "S1", 60, 0)
+        self.assertEqual(renew(self.path, old, 120, 50).expires, 170)
+        self.assertTrue(apply_event(self.path, old, "ev-1", 55))
+        self.assertEqual(json.loads(self.path.read_text())["expires"], 170)
+        self.assertIsNone(acquire(self.path, "mgr-b", "S2", 60, 70))
+        self.assertEqual(live_slices(self.path, 70), frozenset({"S1"}))
+        self.assertTrue(release(self.path, old, 80))
+        self.assertEqual(json.loads(self.path.read_text())["expires"], 80)
+
+    def test_neg_absurd_expires_numbers_are_held_all(self):
+        # N6-08FIX F5: overflowing / non-finite / bool expires and deep nesting never raise.
+        tmpl = '{"epoch": 1, "owner": "a", "slice_id": "S", "expires": %s, "applied": []}'
+        bad = [tmpl % ("1" + "0" * 400), tmpl % ("-1" + "0" * 400), tmpl % "1e400",
+               tmpl % "Infinity", tmpl % "-Infinity", tmpl % "NaN",
+               tmpl % '"inf"', tmpl % '"nan"', tmpl % "true", tmpl % "false",
+               tmpl % "null", "[" * 100000 + "]" * 100000]
+        self.path.parent.mkdir(parents=True)
+        for raw in bad:
+            with self.subTest(raw=raw[:60]):
+                self.path.write_text(raw, encoding="utf-8")
+                self.assertIs(live_slices(self.path, NOW), HELD_ALL)
+                self.assertIsNone(acquire(self.path, "mgr-a", "S1", 60, NOW))
+        # epoch + 1 past the int digit limit: acquire refuses instead of raising
+        self.path.write_text(tmpl.replace('"epoch": 1', '"epoch": ' + "9" * 4300) % "1.0",
+                             encoding="utf-8")
+        self.assertIsNone(acquire(self.path, "mgr-a", "S1", 60, NOW))
+
     def test_neg_unreadable_lease_file_is_held_all(self):
         self.path.mkdir(parents=True)  # a directory where the file should be
         self.assertIs(live_slices(self.path, NOW), HELD_ALL)

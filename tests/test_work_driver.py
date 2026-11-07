@@ -505,5 +505,18 @@ class LeaseFencingTest(unittest.TestCase):
         rel = ports.log.index(("release", "a"))
         self.assertEqual([e for e in ports.log[rel:] if e[0] == "event" and e[2] is not None], [])
 
+    def test_neg_claim_without_a_lease_refuses_not_unfenced(self):
+        # N6-08FIX F3: N6 ports (lease_check present) whose claim yields no Lease refuse.
+        for claimed in (None, "legacy-token", {"epoch": 1}):
+            with self.subTest(claimed=claimed):
+                ports = LeasedPorts({"a": [result()]}, self.path)
+                ports.lease_claim = lambda step, c=claimed: c
+                with self.assertRaises(Fenced):
+                    run_drive(ports)
+                self.assertEqual([e for e in ports.log if e[0] in ("event", "notify", "start")], [])
+                released = [("release", "a")] if claimed is not None else []
+                self.assertEqual([e for e in ports.log if e[0] == "release"], released)
+
+
 if __name__ == "__main__":
     unittest.main()

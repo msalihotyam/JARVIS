@@ -84,7 +84,12 @@ def _valid(data: object) -> dict[str, object] | None:
         return None
     if not isinstance(state.get("owner"), str) or not isinstance(state.get("slice_id"), str):
         return None
-    if isinstance(expires, bool) or not isinstance(expires, (int, float)) or not math.isfinite(expires):
+    if isinstance(expires, bool) or not isinstance(expires, (int, float)):
+        return None
+    try:
+        if not math.isfinite(expires):
+            return None
+    except OverflowError:  # N6-08FIX F5: an int too large for a float (1 followed by 400 zeros)
         return None
     if not isinstance(applied, list):
         return None
@@ -107,7 +112,7 @@ def _read(path: Path) -> dict[str, object] | None | _Held:
         return HELD_ALL
     try:
         data = cast(object, json.loads(raw))
-    except ValueError:
+    except (ValueError, RecursionError):  # RecursionError: absurdly deep nesting
         return HELD_ALL
     state = _valid(data)
     return HELD_ALL if state is None else state
@@ -159,7 +164,7 @@ def acquire(path: Path | str, owner: str, slice_id: str, ttl_s: float, now: floa
         lease = Lease(owner, slice_id, epoch + 1, now + ttl_s)
         try:
             _write(path, lease, [])
-        except OSError:
+        except (OSError, ValueError):  # ValueError: an epoch past the int digit limit
             return None
         return lease
 
@@ -171,10 +176,10 @@ def renew(path: Path | str, lease: Lease, ttl_s: float, now: float) -> Lease | N
         state = _read(path)
         if not got or not isinstance(state, dict) or not _current(state, lease, now):
             return None
-        renewed = replace(lease, expires=now + ttl_s)
+        renewed = replace(_lease(state), expires=now + ttl_s)  # N6-08FIX F2: the file's state
         try:
-            _write(path, renewed, _applied(state, lease.epoch))
-        except OSError:
+            _write(path, renewed, _applied(state, renewed.epoch))
+        except (OSError, ValueError):
             return None
         return renewed
 
@@ -187,8 +192,9 @@ def release(path: Path | str, lease: Lease, now: float) -> bool:
         if not got or not isinstance(state, dict) or not _current(state, lease, now):
             return False
         try:
-            _write(path, replace(lease, expires=now), _applied(state, lease.epoch))
-        except OSError:
+            held = _lease(state)
+            _write(path, replace(held, expires=now), _applied(state, held.epoch))
+        except (OSError, ValueError):
             return False
         return True
 
@@ -207,12 +213,13 @@ def apply_event(path: Path | str, lease: Lease, event_id: str, now: float) -> bo
         state = _read(path)
         if not got or not isinstance(state, dict) or not _current(state, lease, now):
             raise Fenced(f"stale epoch {lease.epoch} for {lease.slice_id}")
-        applied = _applied(state, lease.epoch)
-        if [lease.epoch, event_id] in applied:
+        held = _lease(state)  # N6-08FIX F2: the file's lease (renewed expiry, int epoch), never the caller's copy
+        applied = _applied(state, held.epoch)
+        if [held.epoch, event_id] in applied:
             return False
         try:
-            _write(path, lease, [*applied, [lease.epoch, event_id]])
-        except OSError as e:
+            _write(path, held, [*applied, [held.epoch, event_id]])
+        except (OSError, ValueError) as e:
             raise Fenced(f"lease write failed: {e}") from e
         return True
 

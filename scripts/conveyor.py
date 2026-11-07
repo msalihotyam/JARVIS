@@ -66,17 +66,21 @@ def n6_live_slices(path, now):
         data = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         return frozenset()
-    except (OSError, UnicodeError, ValueError):
+    except (OSError, UnicodeError, ValueError, RecursionError):
         return N6_HELD_ALL
     if not isinstance(data, dict):
         return N6_HELD_ALL
     epoch, exp, applied = data.get("epoch"), data.get("expires"), data.get("applied")
-    if type(epoch) is not int or epoch < 0 or not isinstance(data.get("owner"), str) \
+    try:  # N6-08FIX F5: an int too large for a float makes isfinite raise OverflowError
+        bad = type(epoch) is not int or epoch < 0 or not isinstance(data.get("owner"), str) \
             or not isinstance(data.get("slice_id"), str) or isinstance(exp, bool) \
             or not isinstance(exp, (int, float)) or not math.isfinite(exp) \
             or not isinstance(applied, list) or not all(
                 isinstance(p, list) and len(p) == 2 and type(p[0]) is int and isinstance(p[1], str)
-                for p in applied):
+                for p in applied)
+    except OverflowError:
+        bad = True
+    if bad:
         return N6_HELD_ALL
     return frozenset({data["slice_id"]}) if exp > now else frozenset()
 # CONVSAFE: a pushed range touching these needs Salih's manual key 1 (never auto-approved):
@@ -3074,6 +3078,9 @@ class Conveyor:
                 continue
             if name in busy or self.int_blocked(name, lanes):
                 continue  # same-name lane still working, or another integration lane; wait
+            if self.n6_fresh(name):  # N6-08FIX F4: a lease taken earlier in this pass
+                held.add(f)
+                continue
             sid = self.start(name, hdr["model"], hdr["effort"], text)
             if not sid:  # CONVHEAL: a stuck prompt never blocks the backlog; attention item
                 held.add(f)
@@ -3096,6 +3103,20 @@ class Conveyor:
             self.pager_flag("dry", False)
         elif self.pager_flag("dry") in (None, False, True):  # True: a v1 flag without a time
             self.pager_flag("dry", self.now())  # the dry episode's attention since
+
+    def n6_fresh(self, name):
+        """N6-08FIX F4: re-read the lease just before a start; True = do not start `name` now."""
+        live = n6_live_slices(self.root / "build" / "n6" / "lease.json", self.now())
+        if live == N6_HELD_ALL:
+            if not self.pager_flag("n6_lease_held"):
+                self.pager_flag("n6_lease_held", self.now())
+                self.event("n6_lease_held")
+            return True
+        self.n6_live = live
+        if name in live:
+            self.n6_skip(name)
+            return True
+        return False
 
     def n6_skip(self, sid):
         """One n6_lease_skip event per slice per live-lease episode."""
@@ -3309,6 +3330,9 @@ class Conveyor:
                 worker, why = "claude", "codex cap full"  # CONVCAP: auto never waits on a full codex cap
             if self.cap_full(lanes, worker):  # CONVCAP: its worker's cap; the next ready slice may go
                 capped.add(name)
+                continue
+            if self.n6_fresh(name):  # N6-08FIX F4: a lease taken earlier in this pass
+                slices = [x for x in slices if x is not s]
                 continue
             if s.get("worker") == "auto":
                 self.event("route", lane=name, worker=worker, reason=why)
