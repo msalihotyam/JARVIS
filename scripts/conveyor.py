@@ -203,7 +203,9 @@ INT_RE = re.compile(r"(?i)^int(?![a-z])")  # integration lanes (INT7, int-x): on
 # a rule id (C1.., C5B, C8b, I4b, F1.., KNOWN-RED); "[only: <types>]" at the end of its first line
 # limits it to those types (untagged = every type). Any doubt -> the lane keeps the full file.
 RULES_PATH = "build/conveyor/notes/LANE_RULES.md"
-RULES_LINE_RE = re.compile(r"(?m)^LANE RULES:[^\r\n]*")
+# LANESPLITFIX: the label may sit mid-line (chain CLREV/CDX line 2); a quoted or word-glued label is not one
+RULES_LINE_RE = re.compile(r"(?<!\S)LANE RULES:")
+RULES_PATH_RE = re.compile(rf"[ \t]+(?:read[ \t]+)?({re.escape(RULES_PATH)})(?![\w/\\̀-ͯ-]|\.\w)")
 RULE_START_RE = re.compile(r"(?:#{1,6} |[CIF]\d+[A-Za-z]?\b|KNOWN-RED\b)")
 RULE_TAG_RE = re.compile(r"[ \t]*\[only: ((?:code|review|int)(?: (?:code|review|int))*)\](?=\r?$)")
 
@@ -2184,12 +2186,14 @@ class Conveyor:
         return m.group(1)
 
     def lane_rules(self, name, text):
-        """LANESPLIT: the prompt with its first "LANE RULES:" line pointing at notes/lanes/<type>.md
-        (LANE_RULES.md trimmed to the lane's type, rewritten only when it differs). No such line,
-        no source, a malformed tag or a failed write -> `text` unchanged (the full file)."""
+        """LANESPLIT: the prompt with the path after its first "LANE RULES:" label (line start or
+        mid-line) pointing at notes/lanes/<type>.md (LANE_RULES.md trimmed to the lane's type,
+        rewritten only when it differs); every other byte kept. No label, a first label not naming
+        RULES_PATH, no source, a malformed tag or a failed write -> `text` unchanged (the full file)."""
         try:
             kind, m = lane_type(name), RULES_LINE_RE.search(text)
-            if kind is None or not m or RULES_PATH not in m.group():
+            p = m and RULES_PATH_RE.match(text, m.end())
+            if kind is None or not p:
                 return text
             notes = self.base / "notes"
             trimmed = trim_rules((notes / "LANE_RULES.md").read_text(encoding="utf-8"), kind)
@@ -2200,8 +2204,7 @@ class Conveyor:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 if not self.write_atomic(dst, trimmed):
                     return text
-            line = m.group().replace(RULES_PATH, f"build/conveyor/notes/lanes/{kind}.md", 1)
-            return text[:m.start()] + line + text[m.end():]
+            return text[:p.start(1)] + f"build/conveyor/notes/lanes/{kind}.md" + text[p.end(1):]
         except Exception:  # fail open: more rules, never fewer
             return text
 
