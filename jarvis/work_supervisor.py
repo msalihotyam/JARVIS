@@ -14,14 +14,17 @@ pauses and never dispatches. Night/pacing thresholds are caller config (Policy).
 Out-of-bounds rule parameters and malformed work items raise ValueError.
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import isfinite
 from typing import Mapping, NamedTuple
+
+from jarvis.work_controls import read_pause
 
 
 ALLOWED_PROPOSALS = frozenset({"pause", "ask_salih", "requeue", "split", "wait"})
 CORE_ACTIONS = ALLOWED_PROPOSALS | {
     "none", "dispatch", "batch", "alarm", "suppress", "non_claude_only", "needs_input",
+    "approval", "push",
 }
 CONSTRAINTS = ("any", "non_claude_only", "none")   # loosest -> strictest worker set
 FIX_CAP = 2                 # O5/O15: no third fix on one target
@@ -257,9 +260,22 @@ def _alarm(item, cause, finished=(), alarmed=()) -> Decision:
     return filter_alarms([(item, cause)], finished, alarmed)[0]
 
 
+def _handoff(kind: str):
+    """N6-09: an approval or push only reaches its own gate when nothing holds it.
+    The Decision grants no authority; the approval/push gate still decides."""
+    def rule(item) -> Decision:
+        ref = item.get("id") if isinstance(item, Mapping) else None
+        if type(ref) is not str or not ref:
+            raise ValueError(f"situation.{kind} needs a nonempty str id")
+        return Decision(kind, f"gate.{kind}", f"{kind} {ref[:40]!r} handed to its own gate")
+    return rule
+
+
 _GATES = ("operator_pause", "policy", "quota", "memory")
 _WORK = {"alarm": _alarm, "fix": fix_chain, "integration": plan_integration,
-         "proposal": gate_proposal}
+         "proposal": gate_proposal, "approval": _handoff("approval"),
+         "push": _handoff("push")}
+_WHOLE_ITEM = frozenset({"proposal", "approval", "push"})
 
 
 @dataclass(frozen=True)
@@ -274,6 +290,8 @@ class Situation:
     fix: object = None
     integration: object = None
     proposal: object = None
+    approval: object = None
+    push: object = None
     unknown: tuple = ()
 
     @classmethod
@@ -311,6 +329,8 @@ PRECEDENCE = (
     ("fix", None),
     ("integration", None),
     ("proposal", None),
+    ("approval", None),             # N6-09: every hold above also holds these two
+    ("push", None),
     ("quota", "dispatch"),
 )
 
@@ -364,7 +384,7 @@ def _decide(s: Situation) -> Decision:
             sub = getattr(s, key)
             if sub is None:
                 continue
-            if key == "proposal":
+            if key in _WHOLE_ITEM:
                 found[key] = rule(sub)
             elif not isinstance(sub, Mapping):
                 raise ValueError(f"situation.{key} must be a mapping")
@@ -387,16 +407,22 @@ def _decide(s: Situation) -> Decision:
     return _final(found["quota"], constraint)   # non_claude_only and no work
 
 
-def supervise(situation: Situation) -> Decision:
+def supervise(situation: Situation, pause_file: object = None) -> Decision:
     """One decision by PRECEDENCE, with its worker constraint.
 
     A non-Situation (build one with Situation.from_dict) or unknown keys ->
     needs_input. A missing/invalid gate -> pause (an invalid operator_pause ->
     needs_input). Malformed work items or any error raised while evaluating them
-    raise ValueError (never another type); the caller must not dispatch on it."""
+    raise ValueError (never another type); the caller must not dispatch on it.
+
+    pause_file (N6-09): the durable pause, read fresh on every call (read_pause).
+    Paused ORs into operator_pause, so a caller's False never lifts it, and then
+    every action, approval and push included, is held."""
     if type(situation) is not Situation:
         return _needs_input("D8.not_situation",
                             "supervise takes a Situation; build it with Situation.from_dict")
+    if pause_file is not None and read_pause(pause_file):
+        situation = replace(situation, operator_pause=True)
     try:
         return _decide(situation)
     except ValueError:
