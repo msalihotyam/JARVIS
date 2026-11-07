@@ -199,6 +199,46 @@ KEEP_MAX = 30  # CONVRESERVE: pace.json salih_keep_pct (written by the orchestra
 KEEP_ASK_BEFORE_S = 12 * 3600  # Salih is asked once, this long before window_start + days (Thursday 10:00)
 MIN_LANES = 2  # pace.json min_lanes default (not written; capped by the lane cap when not set)
 INT_RE = re.compile(r"(?i)^int(?![a-z])")  # integration lanes (INT7, int-x): one at a time
+# LANESPLIT: each lane reads LANE_RULES.md trimmed to its type. A rule block starts at a heading or
+# a rule id (C1.., C5B, C8b, I4b, F1.., KNOWN-RED); "[only: <types>]" at the end of its first line
+# limits it to those types (untagged = every type). Any doubt -> the lane keeps the full file.
+RULES_PATH = "build/conveyor/notes/LANE_RULES.md"
+RULES_LINE_RE = re.compile(r"(?m)^LANE RULES:[^\r\n]*")
+RULE_START_RE = re.compile(r"(?:#{1,6} |[CIF]\d+[A-Za-z]?\b|KNOWN-RED\b)")
+RULE_TAG_RE = re.compile(r"[ \t]*\[only: ((?:code|review|int)(?: (?:code|review|int))*)\](?=\r?$)")
+
+
+def lane_type(name):
+    """LANESPLIT: review (CLREV*, CDX*, chain steps CLREV-/CDX-), int (INT*, DRY*) or code (the
+    rest). A fix-flavoured name (*FIX*, -AFX, -S autofix candidates) -> None = the full file."""
+    if re.search(r"(?i)fix|-afx$|-s$", name):
+        return None
+    if re.match(r"(?i)clrev|cdx", name):
+        return "review"
+    if INT_RE.match(name) or re.match(r"(?i)dry(?![a-z])", name):
+        return "int"
+    return "code"
+
+
+def trim_rules(src, kind):
+    """LANESPLIT: the rule blocks of `src` kept for lane type `kind`, tags stripped, every other
+    byte as in `src`; None (= use the full file) on a malformed or misplaced "[only" tag."""
+    out, keep = [], True
+    for line in src.splitlines(keepends=True):
+        tag = RULE_TAG_RE.search(line)
+        if RULE_START_RE.match(line):
+            keep = tag is None or kind in tag.group(1).split()
+            if tag:
+                line = line[:tag.start()] + line[tag.end():]
+        elif tag:
+            return None  # a tag only counts on a block's first line
+        if "[only" in line:
+            return None  # unknown type, empty list, two tags, bad spelling
+        if keep:
+            out.append(line)
+    return "".join(out)
+
+
 RESET_DROP = 40  # usage falling this many points between two readings = the quota was reset
 # CONVUSAGE: one bogus reading (2026-10-30: a stray 90 % beside a real ~12 %) must not hold or reset
 RESET_MIN_AGE_S = 6 * 86400  # a pace window younger than this never resets (the quota is weekly)
@@ -2129,6 +2169,7 @@ class Conveyor:
         """`claude --bg` one lane; returns its short id or None."""
         if self.cc_hold():  # every dispatch path ends here; not an error, the lane is not failed
             return None
+        text = self.lane_rules(name, text)
         try:
             rc, out = self.run(["--bg", "--name", name, "--model", model, "--effort", effort,
                                 *trial_args(advisor), "--settings", SETTINGS, "--strict-mcp-config", text],
@@ -2141,6 +2182,28 @@ class Conveyor:
             self.error(f"dispatch {name} rc={rc}", output=out[-300:])
             return None
         return m.group(1)
+
+    def lane_rules(self, name, text):
+        """LANESPLIT: the prompt with its first "LANE RULES:" line pointing at notes/lanes/<type>.md
+        (LANE_RULES.md trimmed to the lane's type, rewritten only when it differs). No such line,
+        no source, a malformed tag or a failed write -> `text` unchanged (the full file)."""
+        try:
+            kind, m = lane_type(name), RULES_LINE_RE.search(text)
+            if kind is None or not m or RULES_PATH not in m.group():
+                return text
+            notes = self.base / "notes"
+            trimmed = trim_rules((notes / "LANE_RULES.md").read_text(encoding="utf-8"), kind)
+            if trimmed is None:
+                return text
+            dst = notes / "lanes" / f"{kind}.md"
+            if not dst.exists() or dst.read_text(encoding="utf-8") != trimmed:
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                if not self.write_atomic(dst, trimmed):
+                    return text
+            line = m.group().replace(RULES_PATH, f"build/conveyor/notes/lanes/{kind}.md", 1)
+            return text[:m.start()] + line + text[m.end():]
+        except Exception:  # fail open: more rules, never fewer
+            return text
 
     def route(self, s):
         """ROUTE1 deterministic worker -> (worker, reason). An explicit worker is kept; "auto" is
