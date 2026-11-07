@@ -5,7 +5,9 @@
 data (worktrees, commits, receipts, applied shas, outbox rows, events), so tests need no
 live git. Each leftover gets exactly one action:
 
-- RESUME: only when every needed fact is present and consistent under this owner's live lease.
+- RESUME: only when every needed fact is present and consistent under this owner's live lease,
+  and the receipt is bound to this slice's own plan, check and commit (N6-12FIX2). ``act``
+  re-reads the lease before each slice RESUME; the recovery receipt is written under the lock.
 - HAND_BACK: the slice goes back to the conveyor. Boot records why, then releases the lease
   if it is ours and live. Recording comes first, so a crash between the two keeps the lease held.
 - ATTENTION: the leftover is unknown or not ours. It is left untouched and only recorded.
@@ -53,7 +55,12 @@ class Facts:
     worktrees: frozenset[str] = frozenset()  # slice ids that left a worktree behind
     commits: Mapping[str, str] = field(default_factory=dict[str, str])  # slice -> branch commit sha
     receipts: Mapping[str, str] = field(default_factory=dict[str, str])  # slice -> receipt JSON
-    diffs: Mapping[str, str] = field(default_factory=dict[str, str])  # slice -> sha256 of its judged diff
+    # slice -> (commit sha, sha256 of THAT commit's judged diff); the caller derives it from
+    # the branch commit, never from the receipt. The commit must equal commits[slice].
+    diffs: Mapping[str, tuple[str, str]] = field(default_factory=dict[str, tuple[str, str]])
+    plans: Mapping[str, str] = field(default_factory=dict[str, str])  # slice -> its own plan_hash
+    checks: Mapping[str, tuple[str, ...]] = field(
+        default_factory=dict[str, tuple[str, ...]])  # slice -> its own check argv
     applied: frozenset[str] = frozenset()  # commit shas already integrated (git, as data)
     outbox: tuple[tuple[str, int], ...] = ()  # undelivered (run_id, event_seq) rows
     events: frozenset[tuple[str, int]] = frozenset()  # persisted (run_id, seq) events
@@ -69,15 +76,25 @@ class Report:
     now: float  # the scan time act() judges liveness at
 
 
-def _receipt_ok(raw: str | None, diff: str | None) -> bool:
-    """A passing receipt bound to this slice's diff: digest intact, verdict "passed" (as
-    work_ports.evidence writes it), exit_code 0 and diff_sha equal to the slice's judged diff."""
+def _receipt(sid: str, facts: Facts) -> str:
+    """"ok": a passing receipt bound to THIS slice's work: digest intact, verdict "passed" (as
+    work_ports.evidence writes it), exit_code 0, diff_sha equal to the judged diff of the
+    slice's own commit, plan_hash and check_argv equal to the slice's own plan and check.
+    "other": a verified passing receipt with the judged diff hash that is not bound to this
+    slice's plan, check or commit (other work): never resumed. "bad": anything else."""
     try:
-        receipt = EvidenceReceipt.from_json(raw) if raw is not None and diff else None
-        return (receipt is not None and receipt.verify() and receipt.verdict == "passed"
-                and receipt.exit_code == 0 and receipt.diff_sha == diff)
+        raw = facts.receipts.get(sid)
+        receipt = EvidenceReceipt.from_json(raw) if raw is not None else None
+        commit, diff = facts.diffs.get(sid, ("", ""))
+        if (receipt is None or not diff or not receipt.verify() or receipt.verdict != "passed"
+                or receipt.exit_code != 0 or receipt.diff_sha != diff):
+            return "bad"
+        plan, argv = facts.plans.get(sid, ""), facts.checks.get(sid, ())
+        bound = (commit == facts.commits.get(sid, "") and bool(plan) and receipt.plan_hash == plan
+                 and type(argv) is tuple and bool(argv) and receipt.check_argv == argv)
+        return "ok" if bound else "other"
     except (ValueError, TypeError, RecursionError):
-        return False
+        return "bad"
 
 
 def _slice(sid: str, owner: str, now: float, lease: Lease | None, facts: Facts) -> Item:
@@ -89,11 +106,13 @@ def _slice(sid: str, owner: str, now: float, lease: Lease | None, facts: Facts) 
         return Item("slice", sid, Action.HAND_BACK, f"expired lease epoch {lease.epoch}")
     if lease.owner != owner:
         return Item("slice", sid, Action.ATTENTION, "live lease of another owner")
-    sha = facts.commits.get(sid, "")
+    sha, receipt = facts.commits.get(sid, ""), _receipt(sid, facts)
+    if receipt == "other":  # before missing facts: other work is never handed back (lease kept)
+        return Item("slice", sid, Action.ATTENTION, "receipt of other work")
     missing = [name for name, ok in (
         ("worktree", sid in facts.worktrees),
         ("commit", _SHA.fullmatch(sha) is not None),
-        ("receipt", _receipt_ok(facts.receipts.get(sid), facts.diffs.get(sid))),
+        ("receipt", receipt != "bad"),
     ) if not ok]
     if missing:
         return Item("slice", sid, Action.HAND_BACK, "missing or invalid " + ",".join(missing))
@@ -123,13 +142,24 @@ def scan(lease_path: Path | str, pause_path: Path | str, owner: str, now: float,
 
 def act(report: Report, lease_path: Path | str, now: float,
         record: Callable[[Item], object], resume: Callable[[Item], object]) -> bool:
-    """Carry out each item once. A held report does nothing and returns False."""
+    """Carry out each item once. A held report does nothing and returns False.
+
+    A slice RESUME re-reads the lease file at ``now`` first: if the scanned lease is no longer
+    the file's live lease of that slice (released, expired, re-epoched, HELD_ALL), the item
+    becomes ATTENTION and is only recorded, never resumed from the scan snapshot."""
     if report.hold:
         return False
     lease = report.lease
     for item in report.items:
         if item.action is Action.RESUME:
-            _ = resume(item)
+            state = n6_lease._read(Path(lease_path))  # pyright: ignore[reportPrivateUsage]
+            same = (lease is not None and isinstance(state, dict)  # exact: a release/renew since scan
+                    and n6_lease._lease(state) == lease)  # pyright: ignore[reportPrivateUsage]
+            if item.kind != "slice" or (lease is not None and lease.slice_id == item.ref and same
+                                        and n6_lease.check(lease_path, lease, now)):
+                _ = resume(item)
+            else:
+                _ = record(Item(item.kind, item.ref, Action.ATTENTION, "lease changed since scan"))
             continue
         _ = record(item)  # before the release: a crash here leaves the lease held
         if (item.action is Action.HAND_BACK and lease is not None and lease.slice_id == item.ref
@@ -146,11 +176,11 @@ def apply_once(lease_path: Path | str, lease: Lease, sha: str, now: float,
     The intent key (slice id + epoch + sha) is written to the lease before the apply, so a
     crash after the commit replays as a receipt-only step (git shows ``sha`` applied) and a
     crash before it becomes attention. Neither path ever applies twice. Fenced propagates.
-    The receipt-only path writes only under a live lease of this slice and epoch."""
+    The receipt-only path writes only under a live lease of this slice and epoch, checked and
+    held under the lease lock for the whole write (n6_lease.fenced)."""
     if sha in applied:
-        if not n6_lease.check(lease_path, lease, now):
-            return "attention"  # stale, expired, re-epoched or HELD_ALL: no recovery write
-        _ = receipt()
+        if not n6_lease.fenced(lease_path, lease, now, receipt):
+            return "attention"  # stale, expired, re-epoched, HELD_ALL or locked: no recovery write
         return "receipt"
     if not n6_lease.apply_event(lease_path, lease, f"apply:{lease.slice_id}:{lease.epoch}:{sha}", now):
         return "attention"  # intent recorded earlier but git shows no apply: never guess

@@ -19,7 +19,7 @@ import json
 import math
 import os
 import tempfile
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import cast
@@ -202,6 +202,18 @@ def release(path: Path | str, lease: Lease, now: float) -> bool:
 def check(path: Path | str, lease: Lease, now: float) -> bool:
     """True while ``lease`` is the file's live lease; a stale epoch is False."""
     return _current(_read(Path(path)), lease, now)
+
+
+def fenced(path: Path | str, lease: Lease, now: float, write: Callable[[], object]) -> bool:
+    """Run ``write`` while holding the lease's OS lock, only if ``lease`` is still the file's
+    live lease (same slice, epoch and owner, unexpired). False and no write otherwise, also
+    when another process holds the lock. Nothing can re-epoch the lease during ``write``."""
+    path = Path(path)
+    with _locked(path) as got:
+        if not got or not _current(_read(path), lease, now):
+            return False
+        _ = write()
+        return True
 
 
 def apply_event(path: Path | str, lease: Lease, event_id: str, now: float) -> bool:

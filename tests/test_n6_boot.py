@@ -20,8 +20,8 @@ SHA = "c0" * 20
 DIFF = "d1" * 32  # sha256 of s1's judged diff
 
 
-def receipt(diff=DIFF, exit_code=0, verdict="passed"):
-    return EvidenceReceipt("p", diff, ("x",), exit_code, "o", {}, verdict).to_json()
+def receipt(diff=DIFF, exit_code=0, verdict="passed", plan="p", argv=("x",)):
+    return EvidenceReceipt(plan, diff, argv, exit_code, "o", {}, verdict).to_json()
 
 
 RECEIPT = receipt()
@@ -57,7 +57,8 @@ class N6BootTest(unittest.TestCase):
 
     def facts(self, **kw):
         base = {"known": frozenset({"s1"}), "worktrees": frozenset({"s1"}),
-                "commits": {"s1": SHA}, "receipts": {"s1": RECEIPT}, "diffs": {"s1": DIFF}}
+                "commits": {"s1": SHA}, "receipts": {"s1": RECEIPT}, "diffs": {"s1": (SHA, DIFF)},
+                "plans": {"s1": "p"}, "checks": {"s1": ("x",)}}
         return Facts(**{**base, **kw})
 
     def run_boot(self, facts, owner="me", now=NOW):
@@ -170,7 +171,7 @@ class N6BootTest(unittest.TestCase):
                     "nonzero exit": {"receipts": {"s1": receipt(exit_code=1)}},
                     "other slice's diff": {"receipts": {"s1": receipt(diff="e2" * 32)}},
                     "no expected diff": {"diffs": {}},
-                    "empty expected diff": {"diffs": {"s1": ""}}}
+                    "empty expected diff": {"diffs": {"s1": (SHA, "")}}}
         for name, kw in variants.items():
             with self.subTest(name):
                 self.lease_path.unlink(missing_ok=True)
@@ -180,6 +181,53 @@ class N6BootTest(unittest.TestCase):
                 self.assertEqual([(i.ref, i.action, i.reason) for i in report.items],
                                  [("s1", Action.HAND_BACK, "missing or invalid receipt")])
                 self.assertNotIn("resume", [e[0] for e in log])
+
+    def test_neg_receipt_of_other_work_is_attention_not_resumed(self):
+        # N6-12FIX2 F1: a verified passing receipt with this diff hash but another plan, check
+        # or commit is other work.
+        variants = {"other plan_hash": {"receipts": {"s1": receipt(plan="q")}},
+                    "other check_argv": {"receipts": {"s1": receipt(argv=("y",))}},
+                    "diff not linked to the commit": {"diffs": {"s1": ("ab" * 20, DIFF)}},
+                    "no plan fact": {"plans": {}},
+                    "no check fact": {"checks": {}},
+                    "check fact not a tuple": {"checks": {"s1": ["x"]}}}
+        for name, kw in variants.items():
+            with self.subTest(name):
+                self.lease_path.unlink(missing_ok=True)
+                lease = self.own()
+                report, acted, log = self.run_boot(self.facts(**kw))
+                self.assertTrue(acted)
+                self.assertEqual([(i.ref, i.action, i.reason) for i in report.items],
+                                 [("s1", Action.ATTENTION, "receipt of other work")])
+                self.assertEqual([e[0] for e in log], ["record"])
+                self.assertTrue(n6_lease.check(self.lease_path, lease, NOW))  # not released
+
+    def test_neg_lease_re_epoched_between_scan_and_act_is_not_resumed(self):
+        # N6-12FIX2 F2: act re-reads the lease; the scan snapshot alone never resumes.
+        lease = self.own()
+        report = scan(self.lease_path, self.pause, "me", NOW, self.facts())
+        self.assertEqual([i.action for i in report.items], [Action.RESUME])
+        self.assertTrue(n6_lease.release(self.lease_path, lease, NOW))
+        new = n6_lease.acquire(self.lease_path, "other", "s1", 60.0, NOW)
+        assert new is not None and new.epoch != lease.epoch  # scanned lease unexpired at NOW
+        before, log = self.lease_path.read_bytes(), []
+        self.assertTrue(act(report, self.lease_path, NOW, lambda i: log.append(("record", i)),
+                            lambda i: log.append(("resume", i))))
+        self.assertEqual([(e[0], e[1].action, e[1].reason) for e in log],
+                         [("record", Action.ATTENTION, "lease changed since scan")])
+        self.assertEqual(self.lease_path.read_bytes(), before)
+
+    def test_neg_recovery_receipt_is_not_written_while_the_lock_is_held_elsewhere(self):
+        # N6-12FIX2 F2: the receipt write is fenced under the lease lock.
+        lease, receipts = self.own(), []
+        with n6_lease._locked(self.lease_path) as got:
+            self.assertTrue(got)
+            out = apply_once(self.lease_path, lease, SHA, NOW, frozenset({SHA}),
+                             lambda: self.fail("apply"), lambda: receipts.append(1))
+        self.assertEqual((out, receipts), ("attention", []))
+        out = apply_once(self.lease_path, lease, SHA, NOW, frozenset({SHA}),
+                         lambda: self.fail("apply"), lambda: receipts.append(1))
+        self.assertEqual((out, receipts), ("receipt", [1]))
 
     def test_neg_recovery_receipt_needs_a_live_lease_of_this_slice_and_epoch(self):
         # N6-12FIX F3: the already-applied path never writes under a stale lease.
