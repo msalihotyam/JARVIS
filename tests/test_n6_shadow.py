@@ -52,17 +52,17 @@ class N6ShadowTests(unittest.TestCase):
         got = {r["lane"]: (r["verdict"], r["conveyor"]["verdict"], r["n6"]["verdict"])
                for r in result["records"]}
         self.assertEqual(got, {
-            "N6-01": ("agree", "block", "block"),      # its CDX check blocked it
+            "N6-01": ("excluded", "excluded", "block"),   # CLREV-N6-01 is not in lanes.json
             "CDX-N6-01": ("agree", "block", "block"),
-            "N6-01FIX": ("disagree", "pass", "block"),  # no sha besides the report
-            "N6-02": ("agree", "pass", "pass"),
+            "N6-01FIX": ("unknown", "pass", "unknown"),   # no git head injected
+            "N6-02": ("excluded", "excluded", "unknown"),  # CLREV/INT children pending
             "INT100B": ("agree", "block", "block"),
         })
         records = {r["lane"]: r for r in result["records"]}
-        self.assertEqual(records["N6-01FIX"]["n6"]["reason"], "no sha evidence besides the report")
-        self.assertIn("CDX-N6-01 BLOCKED", records["N6-01"]["conveyor"]["reason"])
-        self.assertEqual(result["totals"],
-                         {"agree": 4, "disagree": 1, "false_pass": 0, "excluded": 0})
+        self.assertEqual(records["N6-01FIX"]["n6"]["reason"], "no independent sha (git head)")
+        self.assertIn("CLREV-N6-01 pending", records["N6-01"]["conveyor"]["reason"])
+        self.assertEqual(result["totals"], {"agree": 2, "disagree": 0, "false_pass": 0,
+                                            "excluded": 2, "unknown": 1})
         self.assertEqual(result["ts"], clock().isoformat())
         self.assertTrue(all(r["n6"]["reason"] and r["conveyor"]["reason"]
                             for r in result["records"]))
@@ -71,7 +71,40 @@ class N6ShadowTests(unittest.TestCase):
         records = self.by_lane(head=lambda lane: FIX_SHA if lane == "N6-01FIX" else None)
         self.assertEqual(records["N6-01FIX"]["verdict"], "agree")
         wrong = self.by_lane(head=lambda lane: "0" * 40)
-        self.assertEqual(wrong["N6-01FIX"]["n6"]["verdict"], "block")
+        self.assertEqual(wrong["N6-01FIX"]["n6"]["verdict"], "unknown")
+
+    def test_neg_report_sha_not_the_head_is_unknown(self) -> None:
+        # The ledger's chain/ci sha is copied from the report, so only the git head counts.
+        for head in (lambda lane: "0" * 40, lambda lane: None):
+            records = self.by_lane(head=head)
+            self.assertEqual(records["N6-01FIX"]["verdict"], "unknown")
+            self.assertEqual(records["N6-01FIX"]["n6"]["verdict"], "unknown")
+            self.assertFalse(any(r["verdict"] in ("agree", "false_pass")
+                                 and r["n6"]["verdict"] == "pass" for r in records.values()))
+
+    def test_neg_pending_chain_child_excludes_the_lane(self) -> None:
+        records = self.by_lane(head=lambda lane: FIX_SHA)
+        self.assertEqual(records["N6-02"]["verdict"], "excluded")
+        self.assertIn("pending", records["N6-02"]["conveyor"]["reason"])
+        lanes = json.loads((self.conveyor / "lanes.json").read_text(encoding="utf-8"))
+        lanes["CLREV-N6-02"] = {"status": "PASS", "finished": False}
+        lanes["INT-N6-02"] = {"status": "PASS", "finished": True}
+        (self.conveyor / "lanes.json").write_text(json.dumps(lanes), encoding="utf-8")
+        self.assertEqual(self.by_lane()["N6-02"]["verdict"], "excluded")
+
+    def test_finished_chain_children_are_judged(self) -> None:
+        lanes = json.loads((self.conveyor / "lanes.json").read_text(encoding="utf-8"))
+        for child in ("CLREV-N6-01", "CLREV-N6-02", "INT-N6-02"):
+            lanes[child] = {"status": "PASS", "finished": True}
+        (self.conveyor / "lanes.json").write_text(json.dumps(lanes), encoding="utf-8")
+        heads = {"N6-02": "ff2a698a09b572c8c55574e6fb6293b744f8f2e0", "N6-01FIX": FIX_SHA,
+                 "N6-01": "83f131420162740a1b123b258d0c0ce50a32f02a"}
+        records = self.by_lane(head=heads.get)
+        self.assertEqual((records["N6-02"]["verdict"], records["N6-02"]["n6"]["verdict"]),
+                         ("agree", "pass"))
+        self.assertEqual((records["N6-01"]["verdict"], records["N6-01"]["n6"]["verdict"]),
+                         ("agree", "block"))
+        self.assertIn("CDX-N6-01 BLOCKED", records["N6-01"]["conveyor"]["reason"])
 
     def test_neg_torn_snapshot_raises(self) -> None:
         lanes = (self.conveyor / "lanes.json").read_text(encoding="utf-8")
@@ -103,7 +136,7 @@ class N6ShadowTests(unittest.TestCase):
         records = self.by_lane()
         self.assertEqual(records["N6-02"]["n6"]["verdict"], "block")
         self.assertNotIn("ROGUE", records)
-        self.assertEqual(records["N6-01FIX"]["n6"]["verdict"], "block")
+        self.assertEqual(records["N6-01FIX"]["n6"]["verdict"], "unknown")
         self.assertFalse(any(r["verdict"] == "false_pass" for r in records.values()))
 
     def test_neg_never_writes_under_build_conveyor(self) -> None:
@@ -111,7 +144,7 @@ class N6ShadowTests(unittest.TestCase):
         refuse = mock.Mock(side_effect=AssertionError("shadow wrote"))
         with mock.patch.object(Path, "write_text", refuse),                 mock.patch.object(Path, "write_bytes", refuse),                 mock.patch.object(Path, "mkdir", refuse),                 mock.patch.object(Path, "touch", refuse):
             result = n6_shadow.compare(self.root, clock=clock, read=guarded)
-        self.assertEqual(result["totals"]["agree"], 4)
+        self.assertEqual(result["totals"]["agree"], 2)
         self.assertEqual(self.conveyor_digest(), before)
         self.assertFalse(hasattr(n6_shadow, "write"))
 

@@ -218,12 +218,52 @@ class N6RootTests(unittest.TestCase):
         def mkdir(path, *args, **kwargs):
             real(path, *args, **kwargs)
             if path == parent and not swapped:
-                swapped.append(self.swap(parent))
-        with mock.patch.object(Path, "mkdir", mkdir), \
-                self.assertRaisesRegex(PermissionError, "changed while it was opened"):
-            n6.note("redirected")
+                try:
+                    swapped.append(self.swap(parent))
+                except OSError:  # the pinned parent cannot be renamed (Windows: no share-delete)
+                    swapped.append(None)
+        with mock.patch.object(Path, "mkdir", mkdir):
+            if sys.platform == "win32":
+                n6.note("redirected")
+            else:
+                with self.assertRaisesRegex(PermissionError, "changed while it was opened"):
+                    n6.note("redirected")
         self.assertTrue(swapped)
-        self.assertEqual(swapped[0].read_text(encoding="utf-8") if swapped[0].exists() else "", "")
+        if swapped[0] is None:  # the swap was blocked, so the note reached the real file
+            self.assertIn("redirected", self.notes.read_text(encoding="utf-8"))
+        else:
+            self.assertEqual(swapped[0].read_text(encoding="utf-8") if swapped[0].exists() else "", "")
+
+    def test_neg_h1_read_refuses_a_hardlink_to_a_protected_file(self):
+        n6 = self.n6()
+        (self.home / ".env").write_text("SECRET=1\n", encoding="utf-8")
+        (self.home / "plain.txt").write_text("plain\n", encoding="utf-8")
+        self.assertEqual(n6.read(self.home / "plain.txt"), "plain\n")
+        os.link(self.home / ".env", self.home / "report.txt")
+        with self.assertRaises(PermissionError):
+            n6.read(self.home / "report.txt")
+
+    def test_neg_h1_read_refuses_a_parent_swapped_after_the_guard(self):
+        n6 = self.n6()
+        (self.home / "plain.txt").write_text("plain\n", encoding="utf-8")
+        moved = mock.patch.object(n6_root, "_final_path", lambda fd, p: str(p) + "-elsewhere")
+        with moved, self.assertRaisesRegex(PermissionError, "changed while it was opened"):
+            n6.read(self.home / "plain.txt")
+
+    def test_neg_h2_a_refused_note_leaves_no_new_dir_or_file(self):
+        n6 = self.n6()
+        tree = lambda: sorted(str(p) for p in self.home.rglob("*"))  # noqa: E731
+        for make_parent in (False, True):
+            with self.subTest(parent_exists=make_parent):
+                if make_parent:
+                    self.notes.parent.mkdir()
+                before = tree()
+                moved = mock.patch.object(n6_root, "_final_path",
+                                          lambda fd, p: str(p) + "-elsewhere")
+                with moved, self.assertRaises(PermissionError):
+                    n6.note("refused")
+                self.assertEqual(tree(), before)
+                self.assertFalse(self.notes.exists())
 
     def test_the_app_does_not_import_n6_root(self):
         code = "import sys, jarvis.core; assert 'jarvis.n6_root' not in sys.modules"
