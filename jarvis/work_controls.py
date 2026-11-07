@@ -6,6 +6,7 @@ paid fallback is represented here. Large-run caps must come from the plan.
 """
 
 from dataclasses import dataclass, replace
+from datetime import datetime, timedelta, timezone
 from math import isfinite
 
 
@@ -89,6 +90,58 @@ def budget_verdict(
             or now - started_at >= budget.wall_seconds):
         return "blocked:budget"
     return "continue"
+
+
+# N6 quota window (N6-04, Salih's rule O65 2026-11-04). The weekly quota resets Thursday
+# 22:00 Istanbul; the whole week is free except the keep share Salih names for the
+# current window (mirrors the conveyor's CONVRESERVE: stop at 100 - keep_pct).
+# ponytail: fixed +03:00 (Istanbul has had no DST since 2016); swap for zoneinfo if that changes.
+ISTANBUL = timezone(timedelta(hours=3), "Europe/Istanbul")
+RESET_WEEKDAY = 3  # Thursday
+RESET_HOUR = 22
+KEEP_MAX = 30  # same ceiling as the conveyor's salih_keep_pct
+
+
+def quota_window_end(window_start: str) -> float:
+    """Epoch of the first Thursday 22:00 Istanbul strictly after ``window_start``.
+
+    ``window_start`` is an ISO string as in pace.json; a naive one is Istanbul time.
+    """
+    try:
+        start = datetime.fromisoformat(window_start)
+    except (TypeError, ValueError):
+        raise ValueError("window_start must be an ISO datetime string") from None
+    if start.tzinfo is None:
+        start = start.replace(tzinfo=ISTANBUL)
+    start = start.astimezone(ISTANBUL)
+    end = start.replace(hour=RESET_HOUR, minute=0, second=0, microsecond=0) + timedelta(
+        days=(RESET_WEEKDAY - start.weekday()) % 7)
+    if end <= start:
+        end += timedelta(days=7)
+    return end.timestamp()
+
+
+def quota_verdict(
+    *, now: float, usage_pct: object, exhausted: object, keep_pct: int | None,
+    keep_window: str | None, window_start: str,
+) -> str:
+    """"continue" or "pause" for N6 work; pure, the caller supplies the clock and readings.
+
+    Continue only when the budget said an explicit ``False`` for exhausted, the usage is
+    a known number and it is below ``100 - keep``. Unknown usage pauses. The keep counts
+    only while ``keep_window`` equals ``window_start`` and the window has not reset yet.
+    """
+    _seconds(now)
+    if keep_pct is not None and (type(keep_pct) is not int or not 0 <= keep_pct <= KEEP_MAX):
+        raise ValueError(f"keep_pct must be an int 0..{KEEP_MAX} or None")
+    end = quota_window_end(window_start)
+    if exhausted is not False:
+        return "pause"
+    if (isinstance(usage_pct, bool) or not isinstance(usage_pct, (int, float))
+            or not isfinite(usage_pct) or usage_pct < 0):
+        return "pause"  # unknown usage
+    live = keep_pct is not None and keep_window == window_start and now < end
+    return "pause" if usage_pct >= 100 - (keep_pct if live else 0) else "continue"
 
 
 def revision_verdict(*, attempts: int, failed_slices: int) -> str:
