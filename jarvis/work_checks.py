@@ -48,9 +48,11 @@ from jarvis.trusted_exec import (
     resolve_trusted_executable,
     trusted_environment,
 )
+from jarvis.work_evidence import InvocationRecord
 from jarvis.work_plan import _CHECK_ARG, _target_refusal
 
-__all__ = ["CHECK_TEMPLATES", "CheckRefused", "CheckResult", "DEAD_PROXY", "run_check"]
+__all__ = ["CHECK_TEMPLATES", "CheckRefused", "CheckResult", "DEAD_PROXY",
+           "invocation_record", "run_check"]
 
 #: template -> (placeholder kind, PM17 runner label). ``module``: a dotted
 #: test module under tests/ or test/; ``path``: a literal stage path; ``None``:
@@ -285,3 +287,23 @@ def run_check(
         stdout=out.decode("utf-8", "replace"), stderr=err.decode("utf-8", "replace"),
         truncated=over[0], timed_out=timed_out,
     )
+
+
+def invocation_record(check_id: str, requested_argv: Sequence[str], result: CheckResult,
+                      commit_sha: str, *, key: bytes) -> str:
+    """Sign the runner's record of one ``run_check`` result (N6-10, B2+).
+
+    ``result.argv[0]`` is the resolved executable, so the record keeps the
+    requested argv and refuses a result whose arguments differ from it.
+    A timeout keeps ``exit_code`` None, which never counts as PASS.
+    """
+    if type(result) is not CheckResult:
+        raise CheckRefused("record_result", "not a CheckResult")
+    requested = tuple(requested_argv)
+    if not requested or tuple(result.argv[1:]) != requested[1:]:
+        raise CheckRefused("record_argv", "the result is for another command")
+    exit_code = None if result.timed_out else result.exit_code
+    try:
+        return InvocationRecord(check_id, requested, commit_sha, exit_code).sign(key)
+    except ValueError as exc:
+        raise CheckRefused("record_invalid", str(exc)) from exc
