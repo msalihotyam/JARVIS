@@ -7414,7 +7414,9 @@ class TestAdvisorTrial(Base):  # CONVADVISOR
             self.assertEqual((env[self.VAR], env["CONV_TRIAL_PROBE"]), ("haiku", "kept"))
             self.assertNotIn(self.VAR, os.environ)
             conveyor.real_runner(["agents"])
-            self.assertIsNone(run.call_args.kwargs["env"])  # no env: inherits, exactly as before
+            env = run.call_args.kwargs["env"]  # PHONECMDFIX2 F1: inherits all but the ntfy topics
+            self.assertEqual(env["CONV_TRIAL_PROBE"], "kept")
+            self.assertFalse(set(conveyor.NTFY_ENV) & {k.upper() for k in env})
 
 
 class TestDiskHousekeeping(Base):
@@ -9424,7 +9426,7 @@ class PhoneCmd(Base):
         self.tick()
         inbox = self.root / "build" / "orch" / "INBOX.jsonl"
         recs = [json.loads(x) for x in inbox.read_text(encoding="utf-8").splitlines()]
-        self.assertEqual([(r["id"], r["text"]) for r in recs], [("n1", "ilk  not"), ("n3", "ikinci")])
+        self.assertEqual([(r["id"], r["text"]) for r in recs], [("n1", "ilk not"), ("n3", "ikinci")])
         self.assertEqual(self.pushes, ["Not alındı (1 okunmamış)", "Not alındı (2 okunmamış)"])
         (self.root / "build" / "orch" / "INBOX.read").write_text("n1\n", encoding="utf-8")
         self.assertEqual(self.c.inbox_unread(), 1)
@@ -9506,18 +9508,18 @@ class PhoneCmd(Base):
         spawned = []
         self.restart_once(spawned)
         self.t += 100
-        self.restart_once(spawned, "r2", "YENİDEN")
+        self.restart_once(spawned, "r2", "  YENİDEN   BAŞLAT ")
         self.assertEqual(len(spawned), 1)
         self.assertEqual(self.pushes[-1], "Son 10 dakikada zaten yeniden başlatıldı")
         self.t += 501
-        self.restart_once(spawned, "r3", "yeniden")
+        self.restart_once(spawned, "r3", "yeniden başlat")
         self.assertEqual(len(spawned), 2)
 
     def test_neg_spawn_failure_pushes_error_and_keeps_running(self):
         def boom(argv):
             raise OSError("breakaway refused")
         self.c.spawn = boom
-        self.msgs(("f1", "yeniden"))
+        self.msgs(("f1", "yeniden başlat"))
         self.tick()
         self.c.restart_go()
         self.assertEqual(self.pushes[-1], "Yeniden başlatma başarısız (OSError); konveyör çalışmaya devam ediyor.")
@@ -9526,7 +9528,7 @@ class PhoneCmd(Base):
         self.assertNotIn("restart_ts", st)
         self.assertEqual([r["error"] for r in self.events("phone_restart_failed")], ["OSError"])
         spawned = []
-        self.restart_once(spawned, "f2", "yeniden")  # not counted against the 10 min window
+        self.restart_once(spawned, "f2", "yeniden başlat")  # not counted against the 10 min window
         self.assertEqual(len(spawned), 1)
 
     def test_neg_helper_argv_has_no_topic(self):
@@ -9535,11 +9537,108 @@ class PhoneCmd(Base):
         line = " ".join(spawned[0])
         self.assertEqual(spawned[0], conveyor.RESTART_ARGV)
         self.assertNotIn(self.TOPIC, line)
-        self.assertNotIn("ntfy", line.lower())
+        self.assertIn("GetEnvironmentVariable('JARVIS_NTFY_TOPIC','User')", line)
         self.assertIn("Stop-ScheduledTask -TaskName 'JARVIS Konveyor'", line)
         self.assertIn("Start-ScheduledTask -TaskName 'JARVIS Konveyor'", line)
         self.assertLess(line.index("Stop-"), line.index("Start-Sleep -Seconds 5"))
         self.assertNotIn(self.TOPIC, (self.base / "phone.json").read_text(encoding="utf-8"))
+
+    # PHONECMDFIX2
+    def test_neg_children_never_inherit_topics(self):
+        os.environ.update(JARVIS_NTFY_TOPIC="notifyTopic_5k2P", jarvis_ntfy_topic="x", KEEP_ME="1")
+        done = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch("subprocess.run", return_value=done) as run, mock.patch("subprocess.Popen") as po:
+            conveyor.real_cmd(["git", "status"])
+            conveyor.real_runner(["x"])
+            conveyor.real_runner(["x"], env={"A": "1"})
+            conveyor.start_detached(["x"])
+            conveyor.restart_detached(["x"])
+        calls = run.call_args_list + po.call_args_list
+        self.assertGreaterEqual(len(calls), 5)
+        for c in calls:
+            keys = {k.upper() for k in c.kwargs["env"]}
+            self.assertFalse(keys & set(conveyor.NTFY_ENV), c)
+            self.assertIn("KEEP_ME", keys)
+
+    def test_neg_note_with_topics_is_redacted(self):
+        os.environ["JARVIS_NTFY_TOPIC"] = "notifyTopic_5k2P"
+        self.msgs(("n1", f"not a {self.TOPIC} b notifyTopic_5k2P c"))
+        self.tick()
+        text = (self.root / "build" / "orch" / "INBOX.jsonl").read_text(encoding="utf-8")
+        self.assertNotIn(self.TOPIC, text)
+        self.assertNotIn("notifyTopic_5k2P", text)
+        self.assertIn("[topic]", text)
+
+    def test_every_title_encodes_in_http_client(self):
+        import http.client
+        for t in ("JARVIS Konveyor", "Durum", "Durdur", "Not", "Yeniden baslat", "Yeniden başlat"):
+            req = conveyor.ntfy_request("abc", "x", t)
+            conn = http.client.HTTPConnection("localhost")  # never connects: putrequest only buffers
+            conn.putrequest("POST", "/x")
+            for k, v in req.header_items():
+                conn.putheader(k, v)
+        conn = http.client.HTTPConnection("localhost")
+        conn.putrequest("POST", "/x")
+        with self.assertRaises(UnicodeEncodeError):
+            conn.putheader("Title", "Yeniden başlat")  # what the raw title did before
+
+    def marker(self, pid, ts):
+        (self.base / "phone.json").write_text(json.dumps({"restart": {"ts": ts, "pid": pid}}), encoding="utf-8")
+
+    def test_neg_failed_confirm_send_keeps_marker_and_retries(self):
+        self.marker(self.c.pid + 1, self.t)
+        self.c.send = lambda text, **kw: "error HTTPError"
+        self.c.heartbeat()
+        self.c.heartbeat()
+        self.c.heartbeat()
+        self.assertIn("restart", self.phone())
+        self.c.send = lambda text, **kw: self.pushes.append(text) or "sent"
+        self.c.heartbeat()
+        self.c.heartbeat()
+        self.assertEqual([p for p in self.pushes if "çalışıyor" in p], [f"Konveyör yeniden başlatıldı ve çalışıyor · PID {self.c.pid}"])
+        self.assertNotIn("restart", self.phone())
+
+    def test_restart_script_verifies_and_reports(self):
+        s = conveyor.RESTART_SCRIPT
+        for want in ("Get-ScheduledTask", "State -eq 'Running'", "$i -le 3",
+                     "[Environment]::GetEnvironmentVariable('JARVIS_NTFY_TOPIC','User')",
+                     "Konveyor telefondan yeniden baslatilamadi; panelden baslat"):
+            self.assertIn(want, s)
+        self.assertNotIn(self.TOPIC, s)
+        self.assertTrue(s.isascii())
+
+    def test_partial_last_line_dropped_cursor_advances(self):
+        self.msgs(("p1", "not bir"), ("p2", "not iki"))
+        self.body += '{"event":"mess'
+        self.tick()
+        st = self.phone()
+        self.assertEqual((st["since"], st["fail"]), ("p2", None))
+        self.assertEqual(len((self.root / "build" / "orch" / "INBOX.jsonl").read_text(encoding="utf-8").splitlines()), 2)
+        self.body = '{"event":"message","id":"p3","message":"not x"}\n{bad\n{"event":"message","id":"p4","message":"not y"}\n'
+        self.tick()
+        self.assertEqual(self.phone()["fail"], "garbage")
+
+    def test_neg_restart_needs_exact_text(self):
+        spawned = []
+        self.c.spawn = lambda argv: spawned.append(list(argv))
+        self.msgs(("u1", "yeniden"), ("u2", "yeniden git"), ("u3", "yeniden başlat lütfen"), ("u4", "yenidenbaşlat"))
+        self.tick()
+        self.c.restart_go()
+        self.assertEqual(spawned, [])
+        self.assertEqual(len(self.events("phone_unknown")), 4)
+
+    def test_neg_old_pid_never_pushes_success(self):
+        self.marker(self.c.pid, self.t)
+        self.c.heartbeat()
+        self.c.heartbeat()
+        self.assertEqual(self.pushes, [])
+
+    def test_neg_stale_marker_dropped_without_push(self):
+        self.marker(self.c.pid + 1, self.t - 601)
+        self.c.heartbeat()
+        self.c.heartbeat()
+        self.assertEqual(self.pushes, [])
+        self.assertNotIn("restart", self.phone())
 
 
 if __name__ == "__main__":

@@ -14,6 +14,7 @@ adds a "reading" to status.json and events and may page; it never approves or
 triggers anything.
 See JARVIS_RUNBOOK.md "Konveyor".
 """
+import base64
 import calendar
 import fnmatch
 import json
@@ -545,12 +546,12 @@ def claude_exe():
 
 def real_runner(args, timeout=120, cwd=None, env=None):
     """Run claude with args (in cwd, default the repo root); return (returncode, combined output).
-    env: extra variables on top of this process's; None inherits it unchanged."""
+    env: extra variables on top of this process's; the ntfy topics are always dropped (child_env)."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     # stdin=DEVNULL: under pythonw claude otherwise blocks reading stdin
     p = subprocess.run([claude_exe(), *args], cwd=cwd or ROOT, capture_output=True,
                        stdin=subprocess.DEVNULL,
-                       env={**os.environ, **env} if env else None,
+                       env=child_env(**(env or {})),
                        timeout=timeout, creationflags=flags)
     out = (p.stdout or b"") + (p.stderr or b"")
     return p.returncode, out.decode("utf-8", "replace")
@@ -673,18 +674,40 @@ def real_procs():
         return None
 
 
+NTFY_ENV = ("JARVIS_NTFY_TOPIC", "JARVIS_NTFY_CMD_TOPIC")
+
+
+def child_env(**extra):
+    """PHONECMDFIX2 F1: the one environment for every child process: this process's plus extra,
+    minus the ntfy topics (case-insensitive, Windows env names), so no child can read or log them."""
+    return {k: v for k, v in {**os.environ, **extra}.items() if k.upper() not in NTFY_ENV}
+
+
 def start_detached(args):
     """Start args detached without waiting; the conveyor polls the returned Popen each pass."""
     flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
     return subprocess.Popen([shutil.which(args[0]) or args[0], *args[1:]], cwd=ROOT,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, creationflags=flags)
+                            stderr=subprocess.DEVNULL, creationflags=flags, env=child_env())
 
 
-# Salih's manual restart, verbatim. No topic and no secret on this command line.
-RESTART_ARGV = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                "Stop-ScheduledTask -TaskName 'JARVIS Konveyor' -TaskPath '\\'; Start-Sleep -Seconds 5; "
-                "Start-ScheduledTask -TaskName 'JARVIS Konveyor' -TaskPath '\\'"]
+# Salih's manual restart, then PHONECMDFIX2 F4: the task must reach Running (3 tries, ~60 s);
+# otherwise the script itself posts one failure push. The topic is read inside the script from
+# the USER environment registry, never from argv or the inherited environment (child_env drops it).
+_TASK = "-TaskName 'JARVIS Konveyor' -TaskPath '\\'"
+RESTART_SCRIPT = "; ".join([
+    f"Stop-ScheduledTask {_TASK} -ErrorAction SilentlyContinue",
+    "Start-Sleep -Seconds 5",
+    "$ok = $false",
+    "for ($i = 1; $i -le 3 -and -not $ok; $i++) { "
+    f"try {{ Start-ScheduledTask {_TASK} -ErrorAction Stop }} catch {{ }}; Start-Sleep -Seconds 20; "
+    f"$ok = ((Get-ScheduledTask {_TASK} -ErrorAction SilentlyContinue).State -eq 'Running') }}",
+    "if (-not $ok) { $t = [Environment]::GetEnvironmentVariable('JARVIS_NTFY_TOPIC','User'); "
+    "if ($t -cmatch '^[A-Za-z0-9_-]{1,64}$') { try { Invoke-RestMethod -Method Post "
+    "-Uri ('https://ntfy.sh/' + $t) -Body 'Konveyor telefondan yeniden baslatilamadi; panelden baslat' "
+    "-Headers @{Title = 'Yeniden baslat'} -TimeoutSec 15 | Out-Null } catch { } } }",
+])
+RESTART_ARGV = ["powershell", "-NoProfile", "-NonInteractive", "-Command", RESTART_SCRIPT]
 
 
 def restart_detached(argv):
@@ -693,13 +716,13 @@ def restart_detached(argv):
              | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000))
     return subprocess.Popen([shutil.which(argv[0]) or argv[0], *argv[1:]], cwd=ROOT,
                             stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, creationflags=flags)
+                            stderr=subprocess.DEVNULL, creationflags=flags, env=child_env())
 
 
 def real_cmd(args, timeout=120):
     """Run git or gh (args[0]) in the canonical checkout; return (returncode, output)."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-    env = {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GCM_INTERACTIVE": "never"}  # never wait on a prompt
+    env = child_env(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")  # never wait on a prompt
     p = subprocess.run([shutil.which(args[0]) or args[0], *args[1:]], cwd=ROOT,
                        capture_output=True, stdin=subprocess.DEVNULL, env=env,
                        timeout=timeout, creationflags=flags)
@@ -717,14 +740,23 @@ def ntfy_poll(topic, since):
         return r.read(1 << 20).decode("utf-8", "replace")
 
 
+def ntfy_request(topic, text, title):
+    """The push request, built offline. PHONECMDFIX2 F3: http.client encodes headers as latin-1,
+    so a non-ASCII title goes as one RFC 2047 encoded-word (ntfy decodes it); controls are dropped."""
+    title = re.sub(r"[\x00-\x1f\x7f]", " ", str(title))
+    if not title.isascii():
+        title = "=?UTF-8?B?" + base64.b64encode(title.encode("utf-8")).decode("ascii") + "?="
+    return urllib.request.Request("https://ntfy.sh/" + topic, data=text.encode("utf-8"),
+                                  headers={"Title": title})
+
+
 def ntfy_send(text, title="JARVIS Konveyor"):
     """Push text to ntfy. Returns a short result; the topic never leaves this function."""
     topic = os.environ.get("JARVIS_NTFY_TOPIC", "")
     if not TOPIC_RE.fullmatch(topic):
         return "no-topic"
-    req = urllib.request.Request("https://ntfy.sh/" + topic, data=text.encode("utf-8"),
-                                 headers={"Title": title})
     try:
+        req = ntfy_request(topic, text, title)
         with urllib.request.urlopen(req, timeout=15):  # nosec B310 - fixed https URL, topic validated
             return "sent"
     except Exception as e:  # never str(e): keep any URL out of the log
@@ -1123,6 +1155,7 @@ class Conveyor:
         self.fetch = fetch  # PHONECMD: ntfy_poll on the real loop only; None -> phone commands off
         self.spawn = spawn  # PHONECMDFIX: restart_detached on the real loop only; None -> restart refused
         self.restart_pending = False  # set by "yeniden"; restart_go spawns after the tick's writes
+        self.restart_done = False  # PHONECMDFIX2: restart_confirm retried per heartbeat until True
         self.beats = 0  # heartbeats of this pid; the 2nd confirms a phone restart
         self.started = now()
         self.prune = prune  # prune and temp_watch are wired only on the real loop: no test reaches them
@@ -1250,9 +1283,9 @@ class Conveyor:
         self.beat_ts = self.now()
         self.write_info(self.now())
         self.beats += 1
-        if self.beats == 2:
+        if self.beats >= 2 and not self.restart_done:
             try:
-                self.restart_confirm()
+                self.restart_done = self.restart_confirm()
             except Exception as e:  # a bad phone.json never stops the heartbeat
                 self.event("phone_restart_confirm_failed", error=type(e).__name__)
 
@@ -1545,7 +1578,8 @@ class Conveyor:
     def phone_tick(self, lanes, items, cap=20):
         """PHONECMD: at most one poll of the private command topic (JARVIS_NTFY_CMD_TOPIC) per pass;
         fetch is wired on the real loop only. New ids are persisted in phone.json BEFORE acting, so
-        each message runs once, across restarts too. A failure backs off (30 s doubling, max 10 min)
+        each message runs AT MOST once, across restarts too (a crash after the write loses it, never
+        repeats it; PHONECMDFIX2 F6: not exactly once). A failure backs off (30 s doubling, max 10 min)
         with one event per failure class; the topic never leaves the env var and ntfy_poll."""
         topic = (os.environ.get("JARVIS_NTFY_CMD_TOPIC") or "").strip()
         if not topic or self.fetch is None:
@@ -1569,8 +1603,14 @@ class Conveyor:
         kind, msgs = (None if TOPIC_RE.fullmatch(topic) else "bad_topic"), []
         if not kind:
             try:
-                body = self.fetch(topic, since)
-                msgs = [json.loads(x) for x in str(body).splitlines() if x.strip()]
+                body = str(self.fetch(topic, since))
+                lines = [x for x in body.splitlines() if x.strip()]
+                if len(lines) > 1 and not body.endswith("\n"):  # PHONECMDFIX2 F5: a cut last line waits; alone it is garbage
+                    try:
+                        json.loads(lines[-1])
+                    except ValueError:
+                        lines.pop()
+                msgs = [json.loads(x) for x in lines]
                 kind = None if all(isinstance(m, dict) for m in msgs) else "garbage"
             except ValueError:  # JSONDecodeError and a garbage body alike
                 kind = "garbage"
@@ -1590,7 +1630,9 @@ class Conveyor:
                 new.append(m)
         if len(new) > cap:
             self.event("phone_dropped", n=len(new) - cap)
-        st.update(since=new[-1]["id"] if new else since, ids=(ids + [m["id"] for m in new])[-500:],
+        done = [m["id"] for m in msgs if m.get("event") == "message" and isinstance(m.get("id"), str)
+                and TOPIC_RE.fullmatch(m["id"])]  # F5: the cursor moves past every parsed message
+        st.update(since=done[-1] if done else since, ids=(ids + [m["id"] for m in new])[-500:],
                   fail=None, fail_n=0, next_ts=0.0)
         if st != raw and not self.write_atomic(f, json.dumps(st)):
             return  # not persisted -> not acted on: the next poll sees them again
@@ -1601,12 +1643,14 @@ class Conveyor:
                 self.event("phone_error", error=type(e).__name__)
 
     def phone_cmd(self, m, lanes, items):
-        """durum / not / durdur / yeniden only. The text is untrusted: never run, never sent to a shell, model,
-        git or prompt; a note is only appended to build/orch/INBOX.jsonl. Anything else: one event."""
+        """durum / not / durdur / "yeniden başlat" only. The text is untrusted: never run, never sent to a shell,
+        model, git or prompt; a note is only appended (redacted) to build/orch/INBOX.jsonl. Anything else: one
+        event. PHONECMDFIX2 F7: restart needs exactly "yeniden başlat" (case-folded, trimmed)."""
         text = m.get("message") if isinstance(m.get("message"), str) else ""
         parts = text.split(None, 1)
-        word = parts[0].replace("İ", "i").replace("I", "i").replace("ı", "i").lower() if parts else ""
-        if word not in ("durum", "not", "durdur", "yeniden"):
+        fold = " ".join(text.replace("İ", "i").replace("I", "i").replace("ı", "i").casefold().split())
+        word = fold.split(" ", 1)[0]
+        if word not in ("durum", "not", "durdur", "yeniden") or word == "yeniden" and fold != "yeniden başlat":
             self.event("phone_unknown")
             return
         self.event("phone_cmd", cmd=word)
@@ -1618,7 +1662,8 @@ class Conveyor:
             (self.base / "PAUSE").write_text("")
             self.send("Konveyör durduruldu. Devam için panelden PAUSE kaldır.", title="Durdur")
         else:
-            note = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", parts[1] if len(parts) > 1 else "").strip()[:4000]
+            note = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", parts[1] if len(parts) > 1 else "")
+            note = redacted(note, "", n=4000)  # PHONECMDFIX2 F2: a topic or key never lands in the file
             if not note:
                 return
             orch = self.root / "build" / "orch"
@@ -1635,13 +1680,13 @@ class Conveyor:
         st = st if isinstance(st, dict) else {}
         last = st.get("restart_ts")
         if self.restart_pending or (isinstance(last, (int, float)) and abs(self.now() - last) < 600):
-            self.send("Son 10 dakikada zaten yeniden başlatıldı", title="Yeniden başlat")
+            self.send("Son 10 dakikada zaten yeniden başlatıldı", title="Yeniden baslat")
             return
         st.update(restart={"ts": self.now(), "pid": self.pid}, restart_ts=self.now())
         if not self.write_atomic(f, json.dumps(st)):
-            self.send("Yeniden başlatma kaydedilemedi; konveyör çalışmaya devam ediyor.", title="Yeniden başlat")
+            self.send("Yeniden başlatma kaydedilemedi; konveyör çalışmaya devam ediyor.", title="Yeniden baslat")
             return
-        self.send("Yeniden başlatılıyor…", title="Yeniden başlat")
+        self.send("Yeniden başlatılıyor…", title="Yeniden baslat")
         self.restart_pending = True
 
     def restart_go(self):
@@ -1663,18 +1708,24 @@ class Conveyor:
             self.write_atomic(f, json.dumps(st))
             self.event("phone_restart_failed", error=type(e).__name__)
             self.send(f"Yeniden başlatma başarısız ({type(e).__name__}); konveyör çalışmaya devam ediyor.",
-                      title="Yeniden başlat")
+                      title="Yeniden baslat")
 
     def restart_confirm(self):
-        """On this pid's 2nd heartbeat: a marker from another pid means the phone restart worked."""
+        """From this pid's 2nd heartbeat on: a marker from another pid means the phone restart worked.
+        Returns True when done (no marker, own marker, stale marker dropped, or push sent); a failed
+        push keeps the marker for the next heartbeat until it is 600 s old (PHONECMDFIX2 F3, CLREV129)."""
         f = self.base / "phone.json"
         st = self.load_json(f, {})
         mark = st.get("restart") if isinstance(st, dict) else None
         if not isinstance(mark, dict) or mark.get("pid") == self.pid:
-            return
-        self.send(f"Konveyör yeniden başlatıldı ve çalışıyor · PID {self.pid}", title="Yeniden başlat")
+            return True  # the old pid never pushes success
+        ts = mark.get("ts")
+        if isinstance(ts, (int, float)) and not isinstance(ts, bool) and 0 <= self.now() - ts <= 600:
+            if self.send(f"Konveyör yeniden başlatıldı ve çalışıyor · PID {self.pid}", title="Yeniden baslat") != "sent":
+                return False
         st.pop("restart")
         self.write_atomic(f, json.dumps(st))
+        return True
 
     def inbox_unread(self):
         """Notes after the id in build/orch/INBOX.read (the orchestrator writes it); absent: all."""
@@ -3864,7 +3915,7 @@ class Conveyor:
                 try:
                     out.parent.mkdir(parents=True, exist_ok=True)
                     with open(out.parent / "usage.log", "wb") as log:
-                        proc = self.popen([sys.executable, str(script), str(out)], cwd=self.root,
+                        proc = self.popen([sys.executable, str(script), str(out)], cwd=self.root, env=child_env(),
                                           stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                                           stderr=log, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
                 except OSError as e:
