@@ -9062,5 +9062,116 @@ class TestChainCommitToken(unittest.TestCase):  # CHAINCOMMIT
         self.assertEqual(self.commit(f"FIX COMMIT: {'c' * 40}\nCOMMIT: {self.SHA}"), self.SHA)
 
 
+class TestLaneSplit(Base):
+    """LANESPLIT: each lane's prompt points at LANE_RULES.md trimmed to its type; any doubt -> full file."""
+    SRC = ("# LANE RULES v2\nRead ONLY this file.\n\n## CORE\n"
+           "C1 Base. [only: code review]\n   more C1\n"
+           "C2 Files. [only: code]\n   - C2 item\n"
+           "C4 Do not stop. [only: code int]\n"
+           "C5 Review. [only: code]\n   C5 SKIP indented\n"
+           "C5B Budget. [only: code]\n"
+           "C7 Report.\n"
+           "C8b Output.\n    continued\n\n"
+           "## INT (INT*, DRY* lanes) [only: int]\nI1 Int one. [only: int]\n\n"
+           "## FIX [only: code]\nF1 Fix. [only: code]\n\n"
+           "KNOWN-RED (O27): a, b [only: code]\nnot blockers ONLY if base.\n\n"
+           "I4b one ci/ branch. [only: int]\n")
+    IDS = {"code": ["#", "##", "C1", "C2", "C4", "C5", "C5B", "C7", "C8b", "##", "F1", "KNOWN-RED"],
+           "review": ["#", "##", "C1", "C7", "C8b"],
+           "int": ["#", "##", "C4", "C7", "C8b", "##", "I1", "I4b"]}
+    LINE = "LANE RULES: build/conveyor/notes/LANE_RULES.md (CORE + FIX; C3)."
+
+    def setUp(self):
+        super().setUp()
+        (self.base / "notes").mkdir(parents=True)
+        self.src(self.SRC)
+
+    def src(self, text):
+        (self.base / "notes" / "LANE_RULES.md").write_text(text, encoding="utf-8")
+
+    def prompt(self, name, line=None):
+        return HDR.format(name) + (self.LINE if line is None else line) + "\nGOAL x\r\nlast"
+
+    def sent(self, name, text):
+        self.assertTrue(self.c.start(name, "opus", "high", text))
+        return self.fake.bg_calls()[-1][-1]
+
+    def copy(self, kind):
+        return (self.base / "notes" / "lanes" / f"{kind}.md").read_text(encoding="utf-8")
+
+    def ids(self, text):
+        return [ln.split()[0] for ln in text.splitlines() if conveyor.RULE_START_RE.match(ln)]
+
+    def test_malformed_tag_keeps_the_full_file(self):
+        for bad in ("C9 x [only: code bogus]\n", "C9 x [only: ]\n", "C9 x [only: code] [only: int]\n",
+                    "C9 x [only:code]\n", "C2 Files.\n   indented [only: code]\n", "C9 x [only: code] tail\n"):
+            with self.subTest(bad=bad):
+                self.src(self.SRC + bad)
+                text = self.prompt("CLREV-A")
+                self.assertEqual(self.sent("CLREV-A", text), text)
+                self.assertIsNone(conveyor.trim_rules(self.SRC + bad, "review"))
+        self.assertFalse((self.base / "notes" / "lanes").exists())
+
+    def test_prompt_without_the_standard_line_is_unchanged(self):
+        for text in (HDR.format("CLREV-A") + "GOAL no rules line\n",
+                     HDR.format("CLREV-A") + "LANE RULES: some/other.md\n" + self.LINE + "\n",
+                     HDR.format("CLREV-A") + "see " + self.LINE + "\n"):
+            with self.subTest(text=text[-40:]):
+                self.assertEqual(self.sent("CLREV-A", text), text)
+
+    def test_missing_source_or_failed_write_keeps_the_full_file(self):
+        (self.base / "notes" / "LANE_RULES.md").unlink()
+        text = self.prompt("A")
+        self.assertEqual(self.sent("A", text), text)
+        self.src(self.SRC)
+        with mock.patch.object(self.c, "write_atomic", return_value=False):
+            self.assertEqual(self.sent("A", text), text)
+        with mock.patch.object(self.c, "write_atomic", side_effect=OSError("disk")):
+            self.assertEqual(self.sent("A", text), text)
+
+    def test_fix_lanes_keep_the_full_file(self):
+        for name in ("A-AFX", "INT5-2-AFX", "INT5-S", "N6-01FIX", "CLREV-N6-01FIX"):
+            with self.subTest(name=name):
+                self.assertIsNone(conveyor.lane_type(name))
+                text = self.prompt(name)
+                self.assertEqual(self.sent(name, text), text)
+
+    def test_each_type_gets_exactly_its_rules(self):
+        for name, kind in (("N6-05", "code"), ("CLREV-N6-04", "review"), ("CDX7", "review"),
+                           ("INT9", "int"), ("int-x", "int"), ("DRY3", "int"), ("DRYRUN", "code")):
+            with self.subTest(name=name):
+                self.assertEqual(conveyor.lane_type(name), kind)
+                out = self.sent(name, self.prompt(name))
+                self.assertEqual(out, self.prompt(name, self.LINE.replace(
+                    "notes/LANE_RULES.md", f"notes/lanes/{kind}.md")))
+                self.assertEqual(self.ids(self.copy(kind)), self.IDS[kind])
+                self.assertNotIn("[only", self.copy(kind))
+
+    def test_only_the_path_changes_and_tags_strip_byte_for_byte(self):
+        line = "LANE RULES: read build/conveyor/notes/LANE_RULES.md."
+        text = HDR.format("A") + line + "\r\nLANE RULES: build/conveyor/notes/LANE_RULES.md\r\nbody\r\n"
+        out = self.sent("A", text)
+        self.assertEqual(out, text.replace("notes/LANE_RULES.md", "notes/lanes/code.md", 1))
+        plain = re.sub(r" \[only: [a-z ]+\]", "", self.SRC)
+        self.assertEqual(conveyor.trim_rules(plain, "review"), plain)  # untagged = every type
+        self.assertEqual(conveyor.trim_rules(self.SRC.replace("\n", "\r\n"), "int"),
+                         conveyor.trim_rules(self.SRC, "int").replace("\n", "\r\n"))
+        self.assertIn("C1 Base.\n   more C1\n", self.copy("code"))
+        self.assertIn("KNOWN-RED (O27): a, b\nnot blockers ONLY if base.\n", self.copy("code"))
+
+    def test_copy_is_regenerated_when_the_source_changes(self):
+        self.sent("CDX1", self.prompt("CDX1"))
+        path = self.base / "notes" / "lanes" / "review.md"
+        mtime = path.stat().st_mtime_ns
+        self.sent("CDX1", self.prompt("CDX1"))
+        self.assertEqual(path.stat().st_mtime_ns, mtime)  # unchanged source: not rewritten
+        self.src(self.SRC.replace("C7 Report.", "C7 Report v2."))
+        self.sent("CDX1", self.prompt("CDX1"))
+        self.assertIn("C7 Report v2.", self.copy("review"))
+        path.write_text("stale", encoding="utf-8")
+        self.sent("CDX1", self.prompt("CDX1"))
+        self.assertEqual(self.ids(self.copy("review")), self.IDS["review"])
+
+
 if __name__ == "__main__":
     unittest.main()
