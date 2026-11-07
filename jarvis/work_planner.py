@@ -15,6 +15,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Callable
 
+from jarvis import n6_deps
 from jarvis.work_controls import budget_for
 from jarvis.work_plan import Plan, Refusal, classify, validate
 
@@ -177,3 +178,11 @@ def plan_project(
             return Planned(result.plan, result.plan_hash, result.size, result.reasons, attempt)
         refusals = result
     return PlanFailed(tuple(refusals), MAX_REASKS + 1)
+
+
+def seed_backlog(path, planned: Planned) -> None:
+    """N6-14: put a checked plan's slices on the cross-run backlog, in plan order.
+
+    PlanSlice carries no dependency or INT flag, so every slice enters with none;
+    the conveyor adds INT slices and their dependents through n6_deps.enqueue."""
+    n6_deps.enqueue(path, [n6_deps.Item(s.slice_id) for s in planned.plan.slices])

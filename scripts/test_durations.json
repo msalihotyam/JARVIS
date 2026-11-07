@@ -890,6 +890,7 @@
   "tests.test_motion_6g.NoForeverTests": 0.02,
   "tests.test_motion_6g.TravelTests": 0.034,
   "tests.test_mutate.MutateTests": 9.5,
+  "tests.test_n6_deps.N6DepsTests": 0.3,
   "tests.test_n6_e8.N6E8ReportTests": 0.3,
   "tests.test_n6_kpi.N6KpiTests": 0.3,
   "tests.test_n6_pause.N6PauseTests": 0.1,
