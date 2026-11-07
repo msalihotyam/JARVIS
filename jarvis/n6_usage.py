@@ -9,6 +9,7 @@ network or the wall clock (the caller reads the source text). Three source forma
 * live    - ``build/lanes/<family>.json``: ``seven_pct`` at ``updated_at``
 * status  - ``build/conveyor/status.json``: ``usage_pct`` at ``updated_at`` + ``pace.window_start``
 
+Timestamps: aware keeps its offset, naive is host-local (``tz``, default Istanbul, injectable).
 Anything malformed, out of range, from the future or stale is UNKNOWN (``None``), never zero:
 the quota function pauses on unknown. ``resolve`` then applies the conveyor's jump guards inside
 the current quota window and returns ``(pct or None, window_start or None)`` for ``quota_verdict``.
@@ -19,7 +20,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, tzinfo
 from math import isfinite
 from typing import cast
 
@@ -53,13 +54,14 @@ class Usage:
 UNKNOWN = Usage(None, None, None)
 
 
-def _ts(value: object) -> float | None:
-    """Epoch of an ISO UTC time such as 2026-10-09T10:24:35.107Z (conveyor ``utc_ts``)."""
+def _ts(value: object, tz: tzinfo = ISTANBUL) -> float | None:
+    """Epoch of an ISO time. An aware value (``...Z``, ``+03:00``) keeps its own offset; a naive one
+    is the conveyor host's LOCAL time (``iso()`` = ``time.localtime``), read in ``tz``, never UTC."""
     if not isinstance(value, str) or len(value) < 19:
         return None
     try:
-        parsed = datetime.strptime(value[:19], "%Y-%m-%dT%H:%M:%S")
-        return parsed.replace(tzinfo=timezone.utc).timestamp()
+        parsed = datetime.fromisoformat(value)
+        return (parsed if parsed.tzinfo else parsed.replace(tzinfo=tz)).timestamp()
     except (ValueError, OverflowError, OSError):
         return None
 
@@ -90,7 +92,7 @@ def _obj(text: str) -> dict[str, object] | None:
     return _dict(data)
 
 
-def parse_ledger(text: str, *, now: float) -> Reading | None:
+def parse_ledger(text: str, *, now: float, tz: tzinfo = ISTANBUL) -> Reading | None:
     """Newest slice-ledger row with a usable weekly %; stale or none -> None."""
     for line in reversed(text.splitlines()):
         row = _obj(line)
@@ -101,7 +103,7 @@ def parse_ledger(text: str, *, now: float) -> Reading | None:
             continue
         # conveyor: end, or start only when end is None; a bad end is not repaired from start
         pct = _pct(week.get("start" if week.get("end") is None else "end"))
-        ts = _ts(row.get("end"))
+        ts = _ts(row.get("end"), tz)
         if pct is None or ts is None:
             continue
         # the newest usable row decides: an older row never stands in for a stale one
@@ -109,21 +111,21 @@ def parse_ledger(text: str, *, now: float) -> Reading | None:
     return None
 
 
-def parse_live(text: str, *, family: str, now: float) -> Reading | None:
+def parse_live(text: str, *, family: str, now: float, tz: tzinfo = ISTANBUL) -> Reading | None:
     d = _obj(text)
     if d is None:
         return None
-    pct, ts = _pct(d.get("seven_pct")), _ts(d.get("updated_at"))
+    pct, ts = _pct(d.get("seven_pct")), _ts(d.get("updated_at"), tz)
     if pct is None or not _fresh(ts, now, USAGE_FRESH_S) or ts is None:
         return None
     return Reading(pct, ts, f"live:{family}")
 
 
-def parse_status(text: str, *, now: float) -> Reading | None:
+def parse_status(text: str, *, now: float, tz: tzinfo = ISTANBUL) -> Reading | None:
     d = _obj(text)
     if d is None:
         return None
-    pct, ts = _pct(d.get("usage_pct")), _ts(d.get("updated_at"))
+    pct, ts = _pct(d.get("usage_pct")), _ts(d.get("updated_at"), tz)
     if pct is None or not _fresh(ts, now, STATUS_FRESH_S) or ts is None:
         return None
     ws = (_dict(d.get("pace")) or {}).get("window_start")

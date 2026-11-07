@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from jarvis import n6_usage as u
 from jarvis.work_controls import quota_verdict
@@ -122,6 +122,70 @@ class UsageReaderTests(unittest.TestCase):
         none = u.resolve([None], now=NOW, window_start=WS)
         self.assertEqual(quota_verdict(now=NOW, usage_pct=none.pct, exhausted=False, keep_pct=20,
                                        keep_window=WS, window_start=WS), "pause")
+
+
+IST = timezone(timedelta(hours=3))
+
+
+def at(y: int, mo: int, d: int, h: int, mi: int, s: int = 0) -> float:
+    return datetime(y, mo, d, h, mi, s, tzinfo=IST).timestamp()
+
+
+class NaiveLocalTimeTests(unittest.TestCase):
+    """The conveyor writes iso() = host-local naive time (+03:00 here); never read it as UTC."""
+
+    def status(self, stamp: str) -> str:
+        return json.dumps({"usage_pct": 55, "updated_at": stamp})
+
+    # ---- negatives first
+    def test_naive_local_reading_four_hours_later_is_stale_unknown(self) -> None:
+        text = self.status("2026-11-07T09:43:49")
+        self.assertIsNone(u.parse_status(text, now=at(2026, 11, 7, 13, 44)))
+        # read 3 h BEFORE it by the local clock: from the future, unknown (UTC misreading would pass)
+        self.assertIsNone(u.parse_status(text, now=at(2026, 11, 7, 6, 44)))
+
+    def test_injected_tz_moves_the_naive_reading(self) -> None:
+        text = self.status("2026-11-07T09:43:49")
+        utc = timezone.utc
+        self.assertIsNone(u.parse_status(text, now=at(2026, 11, 7, 9, 44), tz=utc))  # 09:43 UTC = 12:43 local
+        self.assertIsNotNone(u.parse_status(text, now=at(2026, 11, 7, 12, 44), tz=utc))
+
+    def test_aware_offset_is_kept_not_replaced_by_host_tz(self) -> None:
+        text = self.status("2026-11-07T09:43:49+00:00")  # 12:43 local
+        self.assertIsNone(u.parse_status(text, now=at(2026, 11, 7, 9, 44)))
+        self.assertIsNotNone(u.parse_status(text, now=at(2026, 11, 7, 12, 44)))
+
+    # ---- positives
+    def test_real_shaped_naive_status_is_fresh_at_09_44_local(self) -> None:
+        r = u.parse_status(self.status("2026-11-07T09:43:49"), now=at(2026, 11, 7, 9, 44))
+        assert r is not None
+        self.assertEqual(r.ts, at(2026, 11, 7, 9, 43, 49))
+
+    def test_naive_aware_offset_and_z_agree_on_one_instant(self) -> None:
+        want = at(2026, 11, 7, 9, 43, 49)
+        for stamp in ("2026-11-07T09:43:49", "2026-11-07T09:43:49+03:00", "2026-11-07T06:43:49Z",
+                      "2026-11-07T06:43:49.107Z"):
+            r = u.parse_live(json.dumps({"seven_pct": 3, "updated_at": stamp}), family="a",
+                             now=want + 60)
+            assert r is not None, stamp
+            self.assertAlmostEqual(r.ts, want, delta=1, msg=stamp)
+        row = json.dumps({"end": "2026-11-07T09:43:49", "seven_day": {"end": 9}})
+        got = u.parse_ledger(row, now=want + 60)
+        self.assertEqual(getattr(got, "ts", None), want)
+
+    def test_midnight_and_thursday_2200_boundaries(self) -> None:
+        # naive local just before / after local midnight, and across the Thursday 22:00 reset
+        a = u.parse_status(self.status("2026-11-07T23:59:59"), now=at(2026, 11, 8, 0, 0, 5))
+        b = u.parse_status(self.status("2026-11-08T00:00:01"), now=at(2026, 11, 8, 0, 0, 5))
+        assert a is not None and b is not None
+        self.assertEqual((a.ts, b.ts), (at(2026, 11, 7, 23, 59, 59), at(2026, 11, 8, 0, 0, 1)))
+        ws = "2026-11-05T22:00:00+03:00"  # Thursday 22:00; the window ends Thursday 2026-11-12 22:00
+        before = u.parse_status(json.dumps({"usage_pct": 40, "updated_at": "2026-11-12T21:59:30",
+                                            "pace": {"window_start": ws}}), now=at(2026, 11, 12, 21, 59, 50))
+        assert before is not None
+        self.assertEqual(u.resolve([before], now=at(2026, 11, 12, 21, 59, 50)).pct, 40.0)
+        # at 22:00 the old window is over: the same reading is unknown, not carried into the next
+        self.assertIsNone(u.resolve([before], now=at(2026, 11, 12, 22, 0, 0)).pct)
 
 
 if __name__ == "__main__":
