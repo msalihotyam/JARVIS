@@ -9115,9 +9115,39 @@ class TestLaneSplit(Base):
     def test_prompt_without_the_standard_line_is_unchanged(self):
         for text in (HDR.format("CLREV-A") + "GOAL no rules line\n",
                      HDR.format("CLREV-A") + "LANE RULES: some/other.md\n" + self.LINE + "\n",
-                     HDR.format("CLREV-A") + "see " + self.LINE + "\n"):
+                     HDR.format("CLREV-A") + 'see "' + self.LINE + '"\n',  # quoted label: not one
+                     HDR.format("CLREV-A") + "xLANE RULES: build/conveyor/notes/LANE_RULES.md\n",
+                     HDR.format("CLREV-A") + "LANE RULES: xbuild/conveyor/notes/LANE_RULES.md\n",
+                     HDR.format("CLREV-A") + "LANE RULES: build/conveyor/notes/LANE_RULES.md.bak\n",
+                     HDR.format("CLREV-A") + "LANE RULES: build/conveyor/notes/LANE_RULES.mdx\n",
+                     HDR.format("CLREV-A") + "LANE RULES: build/conveyor/notes/LANE_RULES.md́\n",
+                     HDR.format("CLREV-A") + "LANE RULES: see build/conveyor/notes/LANE_RULES.md\n",
+                     HDR.format("CLREV-A") + "see build/conveyor/notes/LANE_RULES.md\n"):
             with self.subTest(text=text[-40:]):
                 self.assertEqual(self.sent("CLREV-A", text), text)
+
+    def test_mid_line_label_is_found_and_only_its_path_changes(self):
+        """LANESPLITFIX (CLREV-LANESPLIT F1): the real chain CLREV/CDX templates carry the label mid-line."""
+        tpl_dir = Path(conveyor.__file__).resolve().parent / "chain_templates"
+        for step in ("CLREV", "CDX"):
+            with self.subTest(step=step):
+                nid = f"{step}-N6-04"
+                text = conveyor.fill((tpl_dir / f"{step}.md").read_text(encoding="utf-8"), SRC="N6-04",
+                                     ID=nid, SHA="a" * 40, MAIN="b" * 40, TIER="T2", BRANCH=nid.lower(),
+                                     FILES="x.py")
+                self.assertNotRegex(text.splitlines()[1], r"^LANE RULES:")  # the F1 shape: mid-line
+                out = self.sent(nid, text)
+                self.assertEqual(out, text.replace("notes/LANE_RULES.md", "notes/lanes/review.md", 1))
+                self.assertIn("LANE RULES: build/conveyor/notes/lanes/review.md (CORE", out.splitlines()[1])
+                self.assertEqual(self.ids(self.copy("review")), self.IDS["review"])
+        quoted = 'Fix "LANE RULES: build/conveyor/notes/LANE_RULES.md" and xbuild/conveyor/notes/LANE_RULES.md\n'
+        for before, after in (("Read-only lane. ", " (CORE).\n"), ("", ".\r\n"), ("\t", "\n")):
+            with self.subTest(before=before, after=after):
+                rules = before + "LANE RULES: build/conveyor/notes/LANE_RULES.md" + after
+                text = HDR.format("CLREV-B") + quoted + rules + quoted + "tail"
+                self.assertEqual(self.sent("CLREV-B", text),
+                                 HDR.format("CLREV-B") + quoted + rules.replace(
+                                     "notes/LANE_RULES.md", "notes/lanes/review.md") + quoted + "tail")
 
     def test_missing_source_or_failed_write_keeps_the_full_file(self):
         (self.base / "notes" / "LANE_RULES.md").unlink()
