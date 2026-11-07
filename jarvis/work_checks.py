@@ -295,12 +295,15 @@ def invocation_record(check_id: str, requested_argv: Sequence[str], result: Chec
 
     ``result.argv[0]`` is the resolved executable, so the record keeps the
     requested argv and refuses a result whose arguments differ from it.
+    The requested argv must start with an allowlisted template, the same
+    gate ``run_check`` applies, so no foreign ``argv[0]`` is ever signed.
     A timeout keeps ``exit_code`` None, which never counts as PASS.
     """
     if type(result) is not CheckResult:
         raise CheckRefused("record_result", "not a CheckResult")
+    _template(requested_argv)
     requested = tuple(requested_argv)
-    if not requested or tuple(result.argv[1:]) != requested[1:]:
+    if tuple(result.argv[1:]) != requested[1:]:
         raise CheckRefused("record_argv", "the result is for another command")
     exit_code = None if result.timed_out else result.exit_code
     try:

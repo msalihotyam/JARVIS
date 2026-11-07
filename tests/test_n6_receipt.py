@@ -134,6 +134,29 @@ class N6ReceiptTests(unittest.TestCase):
                 self.assertEqual(result.verdict, INVALID)
                 self.assertTrue(result.reasons)
 
+    def test_neg_forged_record_fails_authentication_alone(self):
+        # Each forgery is judged with no second record for its check id, so
+        # only the HMAC check can stop it (CDX-N6-10 F1).
+        plain = hashlib.sha256(InvocationRecord("lint", LINT, SHA, 0)
+                               .canonical_json().encode()).hexdigest()
+        forged = {
+            "other key": signed("lint", LINT, key=b"worker-key"),
+            "plain digest": json.dumps({"record": json.loads(
+                InvocationRecord("lint", LINT, SHA, 0).canonical_json()), "hmac": plain}),
+            "field changed": resign(signed(exit_code=1), exit_code=0),
+            "sha changed": resign(signed(sha=OTHER), commit_sha=SHA),
+        }
+        honest = {"tests": signed("tests"), "lint": signed("lint", LINT)}
+        for name, record in forged.items():
+            with self.subTest(name):
+                with self.assertRaises(ValueError):
+                    InvocationRecord.from_signed(record, KEY)
+                check_id = json.loads(record)["record"]["check_id"]
+                others = [r for cid, r in honest.items() if cid != check_id]
+                result = judge([record, *others])
+                self.assertNotEqual(result.verdict, PASS)
+                self.assertEqual(result.checks[check_id], INVALID)
+
     def test_neg_wrong_command_duplicate_and_failed_runs(self):
         wrong = judge([signed("tests", LINT), signed("lint", LINT)])
         self.assertEqual(wrong.checks["tests"], INVALID)

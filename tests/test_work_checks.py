@@ -55,6 +55,23 @@ class Refusals(_Stage):
             with self.subTest(argv=argv):
                 self.refused(argv, "argv_not_allowlisted")
 
+    def test_neg_record_refuses_a_foreign_executable(self) -> None:
+        tail = ("-m", "unittest", "tests.test_x")
+        result = work_checks.CheckResult(
+            argv=("C:/Python/python.exe", *tail), runner="unittest", exit_code=0,
+            duration_s=0.0, stdout="", stderr="", truncated=False, timed_out=False)
+        sign = lambda argv: work_checks.invocation_record(  # noqa: E731
+            "tests", argv, result, "a" * 40, key=b"k")
+        self.assertTrue(sign(("python", *tail)))
+        for argv0 in ("another-python", "C:/Python/python.exe", "Python", "py", ""):
+            with self.subTest(argv0=argv0), self.assertRaises(CheckRefused) as cm:
+                sign((argv0, *tail))
+            self.assertEqual(cm.exception.code, "argv_not_allowlisted")
+        for bad in ("python -m unittest tests.test_x", ["python", "-m", "unittest", 7]):
+            with self.subTest(argv=bad), self.assertRaises(CheckRefused) as cm:
+                sign(bad)
+            self.assertEqual(cm.exception.code, "not_argv")
+
     def test_placeholder_must_be_a_validated_target(self) -> None:
         for argv in (["python", "-m", "pytest", "../x"], ["python", "-m", "pytest", "-p"],
                      ["python", "-m", "pytest", "-pplugin"], ["ruff", "check", "missing.py"],
