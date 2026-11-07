@@ -559,7 +559,7 @@ class PrecedenceTests(unittest.TestCase):
             ("operator_pause", "pause"), ("gate", None), ("memory", "wait"),
             ("quota", "pause"), ("quota", "non_claude_only"), ("alarm", "alarm"),
             ("fix", None), ("integration", None), ("proposal", None),
-            ("quota", "dispatch")))
+            ("approval", None), ("push", None), ("quota", "dispatch")))
 
     def test_rows_in_order(self):
         work = self.ALL_WORK

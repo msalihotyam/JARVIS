@@ -3,8 +3,13 @@
 Pause uses the ledger's interrupted state and retains the exact phase to resume.
 Wall time includes pauses; reaching a cap prevents starting more work. No API or
 paid fallback is represented here. Large-run caps must come from the plan.
+The one exception is the N6 durable pause file (read_pause / write_pause).
 """
 
+import os
+import tempfile
+import time
+from contextlib import suppress
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 from math import isfinite
@@ -219,3 +224,65 @@ def watchdog_verdict(*, last_progress_at: float, now: float, threshold: float) -
     if threshold == 0 or now < last_progress_at:
         raise ValueError("invalid watchdog clock or threshold")
     return "timeout" if now - last_progress_at > threshold else "continue"
+
+
+# N6 durable pause (N6-09, R03/G12). Production path is outside build/conveyor/ so the
+# conveyor's own PAUSE never aliases it. Only the exact bytes below mean running.
+PAUSE_RUNNING = b"running"
+PAUSE_PAUSED = b"paused"
+N6_PAUSE_FILE = os.path.join("build", "n6", "PAUSE")
+PAUSE_REPLACE_TRIES = 20
+
+
+def _pause_path(path: object) -> str:
+    if not isinstance(path, (str, os.PathLike)):
+        raise ValueError("pause path required")
+    text = os.fspath(path)
+    if not isinstance(text, str) or not text:
+        raise ValueError("pause path required")
+    return text
+
+
+def read_pause(path: object) -> bool:
+    """True means paused. Read fresh on every call and never cached across a restart.
+
+    Only an absent file or the exact bytes ``running`` is running. Any other content
+    (empty, corrupt, binary, a newline, other case) or any read error (a directory at
+    the path, a permission error, ...) is paused: fail closed.
+    """
+    target = _pause_path(path)
+    try:
+        with open(target, "rb") as f:
+            data = f.read(len(PAUSE_RUNNING) + 1)
+    except FileNotFoundError:
+        return os.path.lexists(target)  # a dangling link is present, not absent
+    except OSError:
+        return True
+    return data != PAUSE_RUNNING
+
+
+def write_pause(path: object, *, paused: bool) -> None:
+    """Write the pause state atomically: a temp file in the same folder, then os.replace."""
+    target = _pause_path(path)
+    if type(paused) is not bool:
+        raise ValueError("paused must be a bool")
+    folder = os.path.dirname(os.path.abspath(target))
+    os.makedirs(folder, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=folder, prefix=".pause-")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(PAUSE_PAUSED if paused else PAUSE_RUNNING)
+            f.flush()
+            os.fsync(f.fileno())
+        for attempt in range(PAUSE_REPLACE_TRIES):
+            try:
+                os.replace(tmp, target)
+                break
+            except PermissionError:  # Windows: a reader holds the file open
+                if attempt == PAUSE_REPLACE_TRIES - 1:
+                    raise
+                time.sleep(0.05)
+    except BaseException:
+        with suppress(OSError):
+            os.unlink(tmp)
+        raise
