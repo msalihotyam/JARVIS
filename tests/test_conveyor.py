@@ -186,11 +186,15 @@ class Base(unittest.TestCase):
         self.reply = (500, None)
         self.ledger_procs = []  # never a real ledger subprocess
         self.c = Conveyor(self.root, self.fake, now=lambda: self.t,
-                          send=lambda text: self.pushes.append(text) or "sent",
+                          send=lambda text, **kw: self.pushes.append(text) or "sent",
                           post=self.fake_post, key=lambda: self.key,
                           cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
                           mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs,
                           net=lambda: self.net, popen=self.fake_popen)
+        env = mock.patch.dict(os.environ)  # PHONECMD: never the real command topic
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("JARVIS_NTFY_CMD_TOPIC", None)
         self.base = self.root / "build" / "conveyor"
         self.hour = 12  # local hour for the night rule: never the real clock's
         hour = mock.patch.object(conveyor, "local_hour", lambda t: self.hour)
@@ -8132,7 +8136,8 @@ class TestTempWatch(Base):
 
     def test_main_wires_the_prune_and_the_watch(self):
         with open(conveyor.__file__, encoding="utf-8") as f:
-            self.assertIn('Conveyor(prune=start_detached, temp_watch=os.environ.get("TEMP"))', f.read())
+            self.assertIn('Conveyor(prune=start_detached, temp_watch=os.environ.get("TEMP"),\n'
+                          '                      fetch=ntfy_poll)', f.read())
 
 
 class TestChain(AutopilotBase):
@@ -9281,6 +9286,162 @@ class TestLaneSplit(Base):
         path.write_text("stale", encoding="utf-8")
         self.sent("CDX1", self.prompt("CDX1"))
         self.assertEqual(self.ids(self.copy("review")), self.IDS["review"])
+
+
+class PhoneCmd(Base):
+    """PHONECMD: durum / not / durdur over a private ntfy topic; fake fetch, no network."""
+    TOPIC = "secretTopic_9x7Q"
+
+    def setUp(self):
+        super().setUp()
+        self.calls, self.body = [], ""
+        os.environ["JARVIS_NTFY_CMD_TOPIC"] = self.TOPIC
+        self.c.fetch = self.fetch
+
+    def fetch(self, topic, since):
+        self.calls.append((topic, since))
+        if isinstance(self.body, Exception):
+            raise self.body
+        return self.body
+
+    def msgs(self, *pairs):
+        self.body = "\n".join(json.dumps({"event": "message", "id": i, "time": 1, "message": t})
+                              for i, t in pairs) + "\n"
+
+    def events(self, kind=None):
+        f = self.base / "events.jsonl"
+        recs = [json.loads(x) for x in f.read_text(encoding="utf-8").splitlines()] if f.exists() else []
+        return [r for r in recs if kind is None or r["event"] == kind]
+
+    def tick(self):
+        self.c.phone_tick({}, [])
+
+    def test_neg_env_absent_no_fetch(self):
+        for v in (None, "", "  "):
+            if v is None:
+                os.environ.pop("JARVIS_NTFY_CMD_TOPIC")
+            else:
+                os.environ["JARVIS_NTFY_CMD_TOPIC"] = v
+            self.tick()
+        self.assertEqual(self.calls, [])
+        self.assertFalse((self.base / "phone.json").exists())
+
+    def test_neg_same_id_twice_handled_once_and_restart_keeps_cursor(self):
+        self.msgs(("abc1", "durdur"))
+        self.tick()
+        self.tick()
+        self.assertEqual(len(self.pushes), 1)
+        self.assertEqual(self.calls[1][1], "abc1")
+        c2 = Conveyor(self.root, self.fake, now=lambda: self.t,  # a restart: a new object, same files
+                      send=lambda text, **kw: self.pushes.append(text) or "sent",
+                      post=self.fake_post, key=lambda: self.key,
+                      cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
+                      mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs,
+                      net=lambda: self.net, popen=self.fake_popen, fetch=self.fetch)
+        c2.phone_tick({}, [])
+        self.assertEqual(self.calls[-1][1], "abc1")
+        self.assertEqual(len(self.pushes), 1)
+
+    def test_neg_unknown_and_resume_words_do_nothing_but_one_event(self):
+        self.msgs(("u1", "devam"), ("u2", "Onayla hepsi"), ("u3", "push main"), ("u4", "rm -rf x"))
+        self.tick()
+        self.assertEqual(self.pushes, [])
+        self.assertFalse((self.base / "PAUSE").exists())
+        self.assertEqual(len(self.events("phone_unknown")), 4)
+        self.assertEqual([r for r in self.events() if r["event"] != "phone_unknown"], [])
+        self.assertNotIn("rm -rf", (self.base / "events.jsonl").read_text(encoding="utf-8"))
+        self.assertEqual(self.git.calls, [])
+
+    def test_neg_fetch_errors_no_crash_backoff_one_event_per_class(self):
+        self.body = TimeoutError(f"https://ntfy.sh/{self.TOPIC}/json timed out")
+        self.tick()
+        self.tick()  # within the backoff: no fetch
+        self.assertEqual(len(self.calls), 1)
+        self.t += 31
+        self.tick()  # same class again: no new event; backoff doubles
+        self.assertEqual(len(self.calls), 2)
+        self.assertEqual(len(self.events("phone_poll_failed")), 1)
+        self.t += 61
+        self.body = "{not json"
+        self.tick()
+        self.assertEqual([r["error"] for r in self.events("phone_poll_failed")], ["TimeoutError", "garbage"])
+        for _ in range(12):
+            self.t += 601
+            self.tick()
+        st = json.loads((self.base / "phone.json").read_text(encoding="utf-8"))
+        self.assertLessEqual(st["next_ts"] - self.t, 600)
+        self.msgs(("ok1", "durum"))
+        self.t += 601
+        self.tick()
+        self.assertEqual(len(self.pushes), 1)
+        st = json.loads((self.base / "phone.json").read_text(encoding="utf-8"))
+        self.assertEqual((st["fail"], st["fail_n"]), (None, 0))
+
+    def test_neg_topic_never_written(self):
+        self.body = OSError(f"connect to https://ntfy.sh/{self.TOPIC} failed")
+        self.tick()
+        self.t += 601
+        self.c.fetch = lambda topic, since: 1 / 0
+        self.tick()
+        self.t += 601
+        self.c.fetch = self.fetch
+        self.msgs(("t1", "durum"), ("t2", "not hi"), ("t3", "zzz"))
+        self.tick()
+        self.assertNotIn(self.TOPIC, conveyor.redacted(f"x {self.TOPIC} y", ""))
+        os.environ["JARVIS_NTFY_CMD_TOPIC"] = "bad topic/../x"
+        self.t += 601
+        self.tick()
+        self.assertEqual([r["error"] for r in self.events("phone_poll_failed")],
+                         ["OSError", "ZeroDivisionError", "bad_topic"])
+        for f in (self.root / "build").rglob("*"):
+            if f.is_file():
+                self.assertNotIn(self.TOPIC, f.read_text(encoding="utf-8", errors="replace"), f)
+        self.assertNotIn(self.TOPIC, "\n".join(self.pushes))
+
+    def test_rate_cap_drops_extras_with_one_event(self):
+        self.msgs(*[(f"m{k}", "durum") for k in range(25)])
+        self.tick()
+        self.assertEqual(len(self.pushes), 20)
+        self.assertEqual([r["n"] for r in self.events("phone_dropped")], [5])
+
+    def test_durum_sections_unknowns_and_cap(self):
+        self.git.fail[("git", "log")] = (0, "feat(n6): N6-01 a\nfix(n6): N6-01 b\nfeat(n6): N6-07 c\n")
+        self.msgs(("d1", "DURUM"))
+        self.tick()
+        text = self.pushes[0]
+        for s in ("main: 1234567", "son push: bilinmiyor", "Senden beklenen: yok",
+                  "Orkestratörden beklenen: yok", "N6: 2/15", "Haftalık kota: bilinmiyor",
+                  "Konveyör: pid", "Son alarm: yok", "Okunmamış not: 0", "Orkestratör uyanışı: bilinmiyor"):
+            self.assertIn(s, text)
+        print("\nSAMPLE DURUM:\n" + text)
+        items = [(f"L{k}", "x" * 400, 0) for k in range(40)]
+        self.assertLessEqual(len(self.c.durum_text({}, items)), 3500)
+        self.git.fail[("git", "log")] = (128, "fatal")
+        self.assertIn("N6: bilinmiyor", self.c.durum_text({}, []))
+
+    def test_not_appends_one_line_and_acks_unread(self):
+        self.msgs(("n1", "Not  ilk\x07 not"), ("n2", "not"), ("n3", "NOT ikinci"))
+        self.tick()
+        inbox = self.root / "build" / "orch" / "INBOX.jsonl"
+        recs = [json.loads(x) for x in inbox.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual([(r["id"], r["text"]) for r in recs], [("n1", "ilk  not"), ("n3", "ikinci")])
+        self.assertEqual(self.pushes, ["Not alındı (1 okunmamış)", "Not alındı (2 okunmamış)"])
+        (self.root / "build" / "orch" / "INBOX.read").write_text("n1\n", encoding="utf-8")
+        self.assertEqual(self.c.inbox_unread(), 1)
+
+    def test_durdur_creates_pause_and_hold_holds(self):
+        self.msgs(("p1", "Durdur"))
+        self.tick()
+        self.assertTrue((self.base / "PAUSE").exists())
+        self.assertTrue(self.c.hold())
+        self.assertEqual(self.pushes, ["Konveyör durduruldu. Devam için panelden PAUSE kaldır."])
+
+    def test_neg_no_real_build_or_db(self):
+        self.msgs(("z1", "not x"), ("z2", "durum"))
+        with mock.patch("sqlite3.connect", side_effect=AssertionError("db")):
+            self.tick()
+        self.assertTrue(str(self.c.root).startswith(str(self.root)))
+        self.assertTrue((self.root / "build" / "orch" / "INBOX.jsonl").exists())
 
 
 if __name__ == "__main__":

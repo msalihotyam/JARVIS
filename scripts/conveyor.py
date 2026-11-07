@@ -694,13 +694,21 @@ def real_cmd(args, timeout=120):
     return p.returncode, out.decode("utf-8", "replace")
 
 
-def ntfy_send(text):
+def ntfy_poll(topic, since):
+    """PHONECMD: one poll of the command topic; returns the raw body (JSON lines). Raises on any
+    failure; callers log only the exception's type name, so the topic never leaves here."""
+    req = urllib.request.Request(f"https://ntfy.sh/{topic}/json?poll=1&since={since}")
+    with urllib.request.urlopen(req, timeout=10) as r:  # nosec B310 - fixed https URL, topic validated
+        return r.read(1 << 20).decode("utf-8", "replace")
+
+
+def ntfy_send(text, title="JARVIS Konveyor"):
     """Push text to ntfy. Returns a short result; the topic never leaves this function."""
     topic = os.environ.get("JARVIS_NTFY_TOPIC", "")
     if not TOPIC_RE.fullmatch(topic):
         return "no-topic"
     req = urllib.request.Request("https://ntfy.sh/" + topic, data=text.encode("utf-8"),
-                                 headers={"Title": "JARVIS Konveyor"})
+                                 headers={"Title": title})
     try:
         with urllib.request.urlopen(req, timeout=15):  # nosec B310 - fixed https URL, topic validated
             return "sent"
@@ -787,7 +795,8 @@ def parse_reading(resp):
 def redacted(text, key, n=300):
     """At most n chars of model text for a log: the key, anything key-shaped and the ntfy
     topic removed."""
-    for secret, mark in ((key, "[key]"), (os.environ.get("JARVIS_NTFY_TOPIC", "").strip(), "[topic]")):
+    for secret, mark in ((key, "[key]"), (os.environ.get("JARVIS_NTFY_TOPIC", "").strip(), "[topic]"),
+                         (os.environ.get("JARVIS_NTFY_CMD_TOPIC", "").strip(), "[topic]")):
         if secret:
             text = text.replace(secret, mark)
     return re.sub(r"sk-ant-[A-Za-z0-9_-]+", "[key]", " ".join(text.split()))[:n]
@@ -1094,8 +1103,10 @@ class Conveyor:
                  post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage,
                  projects=None, mem=real_mem, idle=real_idle, procs=None, net=real_net,
                  popen=subprocess.Popen, codex=None, jules=None, prune=None, temp_watch=None,
-                 instance_lock=real_instance_lock):
+                 instance_lock=real_instance_lock, fetch=None):
         self.root = Path(root)
+        self.fetch = fetch  # PHONECMD: ntfy_poll on the real loop only; None -> phone commands off
+        self.started = now()
         self.prune = prune  # prune and temp_watch are wired only on the real loop: no test reaches them
         self.temp_watch = temp_watch
         self.codex = codex if codex is not None else CodexWorker(self.root, popen=popen, now=now)
@@ -1334,6 +1345,8 @@ class Conveyor:
         self.event("page", result=result, lines=len(p["pending"]))
         if result != "no-topic":
             p["last_push"] = self.now()
+        if result == "sent":  # PHONECMD: the durum report shows the last page
+            p["last_page"] = {"text": text[:200], "ts": self.now()}
         if result in ("sent", "no-topic"):
             p["pending"] = []  # on a send error they are retried after the gap
         self.save_pager(p)
@@ -1457,6 +1470,10 @@ class Conveyor:
         self.backstop(items)
         self.temp_watch_tick()
         self.pager_watch(lanes)
+        try:
+            self.phone_tick(lanes, items)
+        except Exception as e:  # never the text: it could carry the topic
+            self.event("phone_error", error=type(e).__name__)
         self.flush_pages()
         return agents is not None
 
@@ -1501,8 +1518,152 @@ class Conveyor:
         except (KeyError, ValueError):
             return 0.0
 
+    def phone_tick(self, lanes, items, cap=20):
+        """PHONECMD: at most one poll of the private command topic (JARVIS_NTFY_CMD_TOPIC) per pass;
+        fetch is wired on the real loop only. New ids are persisted in phone.json BEFORE acting, so
+        each message runs once, across restarts too. A failure backs off (30 s doubling, max 10 min)
+        with one event per failure class; the topic never leaves the env var and ntfy_poll."""
+        topic = (os.environ.get("JARVIS_NTFY_CMD_TOPIC") or "").strip()
+        if not topic or self.fetch is None:
+            return
+        f = self.base / "phone.json"
+        raw = self.load_json(f, {})
+        raw = raw if isinstance(raw, dict) else {}
+        try:
+            n, next_ts = int(raw.get("fail_n", 0)), float(raw.get("next_ts", 0))
+        except (TypeError, ValueError):
+            n, next_ts = 0, 0.0
+        now = self.now()
+        if now < next_ts:
+            return
+        since = raw.get("since")
+        since = since if isinstance(since, str) and TOPIC_RE.fullmatch(since) else str(int(self.started))
+        ids = [i for i in raw.get("ids", []) if isinstance(i, str)] if isinstance(raw.get("ids"), list) else []
+        st = {"since": since, "ids": ids, "fail": raw.get("fail") if isinstance(raw.get("fail"), str) else None,
+              "fail_n": n, "next_ts": next_ts}
+        kind, msgs = (None if TOPIC_RE.fullmatch(topic) else "bad_topic"), []
+        if not kind:
+            try:
+                body = self.fetch(topic, since)
+                msgs = [json.loads(x) for x in str(body).splitlines() if x.strip()]
+                kind = None if all(isinstance(m, dict) for m in msgs) else "garbage"
+            except ValueError:  # JSONDecodeError and a garbage body alike
+                kind = "garbage"
+            except Exception as e:  # the type only: urllib's text can carry the URL
+                kind = type(e).__name__
+        if kind:
+            if st["fail"] != kind:
+                self.event("phone_poll_failed", error=kind)
+            st.update(fail=kind, fail_n=n + 1, next_ts=now + min(600, 30 * 2 ** min(n, 5)))
+            self.write_atomic(f, json.dumps(st))
+            return
+        seen, new = set(ids), []
+        for m in msgs:
+            i = m.get("id")
+            if m.get("event") == "message" and isinstance(i, str) and TOPIC_RE.fullmatch(i) and i not in seen:
+                seen.add(i)
+                new.append(m)
+        if len(new) > cap:
+            self.event("phone_dropped", n=len(new) - cap)
+        st.update(since=new[-1]["id"] if new else since, ids=(ids + [m["id"] for m in new])[-500:],
+                  fail=None, fail_n=0, next_ts=0.0)
+        if st != raw and not self.write_atomic(f, json.dumps(st)):
+            return  # not persisted -> not acted on: the next poll sees them again
+        for m in new[:cap]:
+            try:
+                self.phone_cmd(m, lanes, items)
+            except Exception as e:  # never the text
+                self.event("phone_error", error=type(e).__name__)
+
+    def phone_cmd(self, m, lanes, items):
+        """durum / not / durdur only. The text is untrusted: never run, never sent to a shell, model,
+        git or prompt; a note is only appended to build/orch/INBOX.jsonl. Anything else: one event."""
+        text = m.get("message") if isinstance(m.get("message"), str) else ""
+        parts = text.split(None, 1)
+        word = parts[0].replace("İ", "i").replace("I", "i").replace("ı", "i").lower() if parts else ""
+        if word not in ("durum", "not", "durdur"):
+            self.event("phone_unknown")
+            return
+        self.event("phone_cmd", cmd=word)
+        if word == "durum":
+            self.send(self.durum_text(lanes, items), title="Durum")
+        elif word == "durdur":
+            (self.base / "PAUSE").write_text("")
+            self.send("Konveyör durduruldu. Devam için panelden PAUSE kaldır.", title="Durdur")
+        else:
+            note = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", parts[1] if len(parts) > 1 else "").strip()[:4000]
+            if not note:
+                return
+            orch = self.root / "build" / "orch"
+            orch.mkdir(parents=True, exist_ok=True)
+            with open(orch / "INBOX.jsonl", "a", encoding="utf-8") as fh:  # one write: one whole line
+                fh.write(json.dumps({"id": m["id"], "ts": iso(self.now()), "text": note}, ensure_ascii=False) + "\n")
+            self.send(f"Not alındı ({self.inbox_unread()} okunmamış)", title="Not")
+
+    def inbox_unread(self):
+        """Notes after the id in build/orch/INBOX.read (the orchestrator writes it); absent: all."""
+        orch = self.root / "build" / "orch"
+        try:
+            lines = (orch / "INBOX.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError:
+            return 0
+        ids = []
+        for x in lines:
+            try:
+                ids.append(json.loads(x).get("id"))
+            except (ValueError, AttributeError):
+                ids.append(None)
+        try:
+            read = (orch / "INBOX.read").read_text(encoding="utf-8", errors="replace").strip()
+        except OSError:
+            read = ""
+        pos = max((k for k, i in enumerate(ids) if read and i == read), default=-1)
+        return len(ids) - pos - 1
+
+    def durum_text(self, lanes, items):
+        """The phone's Durum report, from local state only; unknowns read "bilinmiyor"; <= 3500 chars."""
+        now, unk = self.now(), "bilinmiyor"
+        run = self.running(lanes)
+        salih = [f"{i}: {r}"[:150] for i, r, _ in items if i not in self.quiet]
+        orch = [f"{i}: {r}"[:150] for i, r, _ in items if i in self.quiet and i in lanes and (
+            lanes[i].get("status") in GOOD or lanes[i].get("chain_refused"))]
+        try:
+            lines = (self.base / "events.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
+            push = next((r for r in map(self.push_record, reversed(lines[-2000:])) if r), None)
+        except OSError:
+            push = None
+        try:
+            rc, out = self.cmd(["git", "log", "--format=%s", "refs/heads/main"])
+            n6 = "%d/15" % len(set(re.findall(r"\bN6-(\d\d)\b", out))) if rc == 0 else unk
+        except Exception:
+            n6 = unk
+        page = self.load_pager().get("last_page") or {}
+        try:
+            hb = (self.root / "build" / "orch" / "heartbeat").read_text(encoding="utf-8").split()
+            wake = iso(float(hb[0]))
+        except (OSError, ValueError, IndexError, OverflowError):
+            wake = unk
+        sha = self.main_head()
+        use = getattr(self, "usage", None)  # set by pass_once; absent before the first pass
+        L = [f"{len(run)} lane çalışıyor; senden {len(salih)}, orkestratörden {len(orch)} iş bekleniyor",
+             f"main: {sha[:7] if sha else unk}; son push: {push.get('ts', unk) if push else unk}",
+             "Çalışan: " + (", ".join(f"{n} {int((now - self.started_ts(lanes[n])) // 60)} dk"
+                                     for n in run[:10]) or "yok"),
+             "Senden beklenen:" + ("" if salih else " yok")]
+        L += [f"{k}. {s}" for k, s in enumerate(salih[:10], 1)]
+        L.append("Orkestratörden beklenen:" + ("" if orch else " yok"))
+        L += [f"- {s}" for s in orch[:10]]
+        L += [f"N6: {n6}",
+              f"Haftalık kota: {f'%{round(use)}' if isinstance(use, (int, float)) else unk}",
+              f"Konveyör: pid {self.pid}, {int((now - self.started) // 60)} dk açık",
+              (f"Son alarm: {page.get('text', '')} ({iso(page['ts'])})"
+               if isinstance(page, dict) and isinstance(page.get("ts"), (int, float)) else "Son alarm: yok"),
+              f"Okunmamış not: {self.inbox_unread()}",
+              f"Orkestratör uyanışı: {wake}"]
+        return "\n".join(L)[:3500]
+
     def finish(self, name, ln, report, status, **why):
-        quiet = ln.get("finished") and "started_ts" not in ln  # a v0 lane already freed: no page
+        quiet =ln.get("finished") and "started_ts" not in ln  # a v0 lane already freed: no page
         ln["finished"] = True
         ln["status"] = status
         ln["report"] = str(self.collect(name, report))
@@ -5313,4 +5474,5 @@ def archive_cli(c, dry_run):
 if __name__ == "__main__":
     if "--archive-sessions" in sys.argv:
         sys.exit(archive_cli(Conveyor(), "--dry-run" in sys.argv))
-    sys.exit(Conveyor(prune=start_detached, temp_watch=os.environ.get("TEMP")).loop(once="--once" in sys.argv))
+    sys.exit(Conveyor(prune=start_detached, temp_watch=os.environ.get("TEMP"),
+                      fetch=ntfy_poll).loop(once="--once" in sys.argv))
