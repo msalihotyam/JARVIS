@@ -14,8 +14,10 @@ a lane that finished PASS is a block when a chained check it started (ledger ``c
 src == lane) finished blocked, as CDX-N6-01 overrode N6-01. N6 applies the same chain rule.
 
 B2+: N6 says PASS only when the report's first line is ``STATUS: PASS``, the lane state is
-finished PASS, the report has exactly one 40-hex COMMIT and that sha equals independent
-evidence (the ledger, else the injected ``head``); report text alone never yields PASS.
+finished PASS, the report has exactly one 40-hex COMMIT and that sha equals the injected git
+``head`` (the ledger's sha is copied from the report, so it is not evidence); a missing or
+different head is "unknown", never agree. A lane with a chain child absent or unfinished is
+excluded until the conveyor's final verdict exists. Report text alone never yields PASS.
 """
 
 from __future__ import annotations
@@ -32,10 +34,9 @@ from typing import Any, cast
 BLOCK = frozenset({"BLOCKED", "DROPPED", "STUCK", "PARTIAL", "MISSING"})
 # ponytail: CI-set statuses are excluded as orchbot does; judge them once N6 reads CI results.
 EXCLUDED = frozenset({"GREEN", "COMPLETE", "INTEGRATED"})
-VERDICTS = ("agree", "disagree", "false_pass", "excluded")
+VERDICTS = ("agree", "disagree", "false_pass", "excluded", "unknown")
 _LANE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _SHA = re.compile(r"[0-9a-f]{40}")
-_SHA_EVENTS = frozenset({"ci_pending", "ci_result"})
 
 
 class TornSnapshot(ValueError):
@@ -94,14 +95,14 @@ def _blocked_child(snap: Snapshot, lane: str) -> str | None:
     return None
 
 
-def _ledger_sha(snap: Snapshot, lane: str) -> str | None:
-    found = None
+def _pending_child(snap: Snapshot, lane: str) -> str | None:
+    """A chain child absent from lanes.json or unfinished: the final verdict does not exist yet."""
     for event in snap.events:
-        chained = event.get("event") == "chain" and event.get("src") == lane
-        ci = event.get("event") in _SHA_EVENTS and event.get("lane") == lane
-        if (chained or ci) and isinstance(event.get("sha"), str):
-            found = cast(str, event["sha"])
-    return found
+        if event.get("event") == "chain" and event.get("src") == lane:
+            child = snap.lanes.get(str(event.get("id")))
+            if not child or child.get("finished") is not True:
+                return str(event.get("id"))
+    return None
 
 
 def conveyor_verdict(snap: Snapshot, lane: str) -> tuple[str, str]:
@@ -110,6 +111,9 @@ def conveyor_verdict(snap: Snapshot, lane: str) -> tuple[str, str]:
     status = state.get("status")
     if state.get("finished") is not True:
         return "excluded", "lane has not finished"
+    pending = _pending_child(snap, lane)
+    if pending:
+        return "excluded", f"chained check {pending} pending"
     if status in EXCLUDED or (status != "PASS" and status not in BLOCK):
         return "excluded", f"status {status} is not judged in the shadow stage"
     if status in BLOCK:
@@ -120,7 +124,9 @@ def conveyor_verdict(snap: Snapshot, lane: str) -> tuple[str, str]:
 
 def n6_verdict(snap: Snapshot, lane: str,
                head: Callable[[str], str | None]) -> tuple[str, str]:
-    """(pass | block, reason): N6's own decision; PASS needs report, state and sha to agree."""
+    """(pass | block | unknown, reason): N6's own decision; PASS needs report, state and the
+    git head to agree. The sha evidence is only ``head`` (never the ledger, whose chain/ci sha
+    is copied from the report): missing or different is unknown, never pass."""
     report = snap.reports[lane]
     if report is None:
         return "block", "no report"
@@ -133,15 +139,15 @@ def n6_verdict(snap: Snapshot, lane: str,
     commits = [line[len("COMMIT:"):].strip() for line in lines if line.startswith("COMMIT:")]
     if len(commits) != 1 or not _SHA.fullmatch(commits[0]):
         return "block", "report needs exactly one 40-hex COMMIT"
-    evidence = _ledger_sha(snap, lane) or head(lane)
-    if evidence is None:
-        return "block", "no sha evidence besides the report"
-    if evidence != commits[0]:
-        return "block", f"report COMMIT {commits[0][:7]} is not the evidence sha {evidence[:7]}"
     child = _blocked_child(snap, lane)
     if child:
         return "block", f"chained check {child}"
-    return "pass", "report, lane state and sha agree"
+    evidence = head(lane)
+    if evidence is None:
+        return "unknown", "no independent sha (git head)"
+    if evidence != commits[0]:
+        return "unknown", f"report COMMIT {commits[0][:7]} is not the git head {evidence[:7]}"
+    return "pass", "report, lane state and git head agree"
 
 
 def _no_head(_lane: str) -> str | None:
@@ -160,6 +166,8 @@ def compare(root: str | os.PathLike[str], *, clock: Callable[[], datetime],
         n6, n6_reason = n6_verdict(snap, lane, head)
         if conveyor == "excluded":
             verdict = "excluded"
+        elif n6 == "unknown":
+            verdict = "unknown"
         elif n6 == conveyor:
             verdict = "agree"
         else:

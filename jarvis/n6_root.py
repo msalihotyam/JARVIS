@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 import types
 from collections.abc import Callable
 from datetime import datetime
@@ -61,6 +62,30 @@ def _guard(path: str | os.PathLike[str]) -> Path:
     return resolved
 
 
+def _check_opened(fd: int, path: Path, *, directory: bool = False) -> None:
+    """The post-open check on the OPENED handle (memory_import's): ``_guard`` checks the name,
+    so a junction swapped in after it, a protected final path or a hardlink shows only here."""
+    try:
+        final = _final_path(fd, path)
+    except ProtectedPathError as exc:
+        raise PermissionError(f"N6 cannot verify the opened path: {path}") from exc
+    if (os.path.normcase(final) != os.path.normcase(str(path)) or is_protected_path(final)
+            or (not directory and os.fstat(fd).st_nlink > 1)):
+        raise PermissionError(f"N6 path changed while it was opened: {final}")
+
+
+def _open_dir(path: Path) -> int:
+    """A read-only fd on a directory, no side effect; on Windows it is shared without DELETE,
+    so the directory cannot be renamed (or replaced by a junction) while the fd is held. The
+    access includes LIST_DIRECTORY: an attributes-only handle is exempt from share checks."""
+    if sys.platform == "win32":
+        import _winapi
+        import msvcrt
+        handle = _winapi.CreateFile(str(path), 0x1 | 0x80, 0x1 | 0x2, 0, 3, 0x02000000, 0)
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    return os.open(path, os.O_RDONLY)
+
+
 def _check_operands(repo: Path, args: tuple[str, ...]) -> None:
     """Fail closed on any operand that names, or could peel to, a protected path's content."""
     for arg in args:
@@ -107,7 +132,10 @@ class N6:
 
     def read(self, path: str | os.PathLike[str]) -> str:
         """A file, report or local CI result; protected paths are refused."""
-        return _guard(path).read_text(encoding="utf-8")
+        checked = _guard(path)
+        with checked.open(encoding="utf-8") as source:
+            _check_opened(source.fileno(), checked)
+            return source.read()
 
     def events(self, run_id: str) -> tuple[object, ...]:
         return tuple(self._store.work_events(run_id))
@@ -136,18 +164,20 @@ class N6:
         notes = _guard(self._notes)
         if notes != self._notes:
             raise PermissionError(f"N6 notes path moved: {notes}")
-        notes.parent.mkdir(parents=True, exist_ok=True)
-        with notes.open("a", encoding="utf-8") as sink:
-            # The check above is on the name; a junction swapped in before the open shows only
-            # on the OPENED handle (memory_import's post-open check), so check it, then write.
-            try:
-                final = _final_path(sink.fileno(), notes)
-            except ProtectedPathError as exc:
-                raise PermissionError("N6 cannot verify the opened notes path") from exc
-            if (os.path.normcase(final) != os.path.normcase(str(notes))
-                    or is_protected_path(final) or os.fstat(sink.fileno()).st_nlink > 1):
-                raise PermissionError(f"N6 notes path changed while it was opened: {final}")
-            sink.write(json.dumps({"at": self._clock().isoformat(), "text": text}) + "\n")
+        # The nearest existing ancestor is pinned and checked by handle BEFORE mkdir/open("a"),
+        # so a refused path creates nothing; the file itself is checked again once opened.
+        # ponytail: dirs created below the pin (first note only) can still be swapped before
+        # the open; the file check then refuses, leaving at most an empty dir/file, never text.
+        anchor = next(p for p in notes.parents if p.exists())
+        pin = _open_dir(anchor)
+        try:
+            _check_opened(pin, anchor, directory=True)
+            notes.parent.mkdir(parents=True, exist_ok=True)
+            with notes.open("a", encoding="utf-8") as sink:
+                _check_opened(sink.fileno(), notes)
+                sink.write(json.dumps({"at": self._clock().isoformat(), "text": text}) + "\n")
+        finally:
+            os.close(pin)
 
 
 def start(*, notes: str | os.PathLike[str], mode: str = "sight", **wiring: Any) -> N6:
