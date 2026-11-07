@@ -29,6 +29,8 @@ The driver owns no process, database or network. ``ports`` supplies:
 - ``applied(stage, key)`` -> bool: the apply for ``key`` took effect.
 - ``undo(stage, key)``: roll ``key``'s effect back to the checkpoint before
   it; a no-op when nothing of ``key`` is applied, so it is safe to repeat.
+- ``boot_scan()`` (optional) -> ``n6_boot.Report``: called once before the
+  driver acts; a report whose ``hold`` is set stops the driver untouched.
 
 Worker claims are data: only the Core gates accept a slice. Any gate
 error fails closed as a finding, so apply never follows a failed gate.
@@ -126,6 +128,10 @@ def drive(run: WorkRun, steps: Iterable[WorkStep], ports: Ports) -> tuple[WorkRu
     Returns ``(run, steps)`` with the final ledger values.
     """
     by_key = {step.key: step for step in steps}
+    # N6-12: the boot scan runs once before the driver acts; a held report (paused, HELD_ALL) acts on nothing.
+    boot: object = getattr(ports, "boot_scan", None)
+    if callable(boot) and getattr(boot(), "hold", True):
+        return run, tuple(sorted(by_key.values(), key=lambda s: s.ordinal))
     while run.state == RunState.BUILDING:
         # Checked first: a resumed run may already hold three failed slices.
         if run_should_pause(by_key.values()):

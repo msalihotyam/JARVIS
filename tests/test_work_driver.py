@@ -518,5 +518,24 @@ class LeaseFencingTest(unittest.TestCase):
                 self.assertEqual([e for e in ports.log if e[0] == "release"], released)
 
 
+class BootScanTest(unittest.TestCase):
+    """N6-12: ``boot_scan`` runs once before the driver acts; a held report acts on nothing."""
+
+    def test_boot_scan_once_and_hold_acts_on_nothing(self):
+        for hold in ("", "paused", "held_all"):
+            with self.subTest(hold=hold):
+                ports = FakePorts({"a": [result()], "b": [result()]})
+                calls = []
+                ports.boot_scan = lambda: calls.append(1) or type("R", (), {"hold": hold})()
+                run, steps = run_drive(ports)
+                self.assertEqual(calls, [1])
+                if hold:
+                    self.assertIs(run.state, RunState.BUILDING)
+                    self.assertEqual(ports.log, [])
+                    self.assertTrue(all(s.state is StepState.PENDING for s in steps.values()))
+                else:
+                    self.assertIs(run.state, RunState.ACCEPTING)
+
+
 if __name__ == "__main__":
     unittest.main()
