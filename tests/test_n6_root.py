@@ -18,7 +18,7 @@ from jarvis.work_ledger import RunState, StepState, WorkRun, WorkStep, step_key
 from jarvis.work_regress import TestResult
 from jarvis.write_stage import StageManager
 from jarvis.workers.base import WorkerResult
-from tests.test_work_ports import ACCEPTED, RUN, T0, _check, _commit
+from tests.test_work_ports import ACCEPTED, RUN, T0, _check, _commit, booted
 
 ROOT = Path(__file__).resolve().parents[1]
 LIVE_DB = ROOT / "data" / "jarvis.db"
@@ -77,7 +77,7 @@ class N6RootTests(unittest.TestCase):
 
     def test_fake_worker_runs_one_slice_end_to_end_through_the_composed_ports(self):
         ports = n6_root.compose(**self.wiring())
-        run, steps = work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), (self.step,), ports)
+        run, steps = work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), (self.step,), booted(ports))
         self.assertEqual(run.state, RunState.ACCEPTING)
         self.assertEqual([step.state for step in steps], [StepState.ACCEPTED])
         logged = self.store.work_events(RUN)
@@ -102,7 +102,7 @@ class N6RootTests(unittest.TestCase):
     def test_sight_mode_cannot_drive_a_slice_or_write_an_event(self):
         n6 = self.n6()
         with self.assertRaisesRegex(PermissionError, "N6 sight mode is read-only"):
-            work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), (self.step,), n6.ports)
+            work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), (self.step,), booted(n6.ports))
         self.assertEqual(n6.events(RUN), ())
         self.assertFalse((self.home / "stages").exists() and any((self.home / "stages").iterdir()))
         self.assert_never_opened_live_db()

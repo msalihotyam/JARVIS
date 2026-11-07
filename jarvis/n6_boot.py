@@ -53,6 +53,7 @@ class Facts:
     worktrees: frozenset[str] = frozenset()  # slice ids that left a worktree behind
     commits: Mapping[str, str] = field(default_factory=dict[str, str])  # slice -> branch commit sha
     receipts: Mapping[str, str] = field(default_factory=dict[str, str])  # slice -> receipt JSON
+    diffs: Mapping[str, str] = field(default_factory=dict[str, str])  # slice -> sha256 of its judged diff
     applied: frozenset[str] = frozenset()  # commit shas already integrated (git, as data)
     outbox: tuple[tuple[str, int], ...] = ()  # undelivered (run_id, event_seq) rows
     events: frozenset[tuple[str, int]] = frozenset()  # persisted (run_id, seq) events
@@ -64,11 +65,17 @@ class Report:
     hold: str  # "" lets act() run; otherwise why nothing may act ("paused", "held_all")
     lease: Lease | None
     items: tuple[Item, ...]
+    lease_path: Path  # what act() releases on a HAND_BACK
+    now: float  # the scan time act() judges liveness at
 
 
-def _receipt_ok(raw: str | None) -> bool:
+def _receipt_ok(raw: str | None, diff: str | None) -> bool:
+    """A passing receipt bound to this slice's diff: digest intact, verdict "passed" (as
+    work_ports.evidence writes it), exit_code 0 and diff_sha equal to the slice's judged diff."""
     try:
-        return raw is not None and EvidenceReceipt.from_json(raw).verify()
+        receipt = EvidenceReceipt.from_json(raw) if raw is not None and diff else None
+        return (receipt is not None and receipt.verify() and receipt.verdict == "passed"
+                and receipt.exit_code == 0 and receipt.diff_sha == diff)
     except (ValueError, TypeError, RecursionError):
         return False
 
@@ -86,7 +93,7 @@ def _slice(sid: str, owner: str, now: float, lease: Lease | None, facts: Facts) 
     missing = [name for name, ok in (
         ("worktree", sid in facts.worktrees),
         ("commit", _SHA.fullmatch(sha) is not None),
-        ("receipt", _receipt_ok(facts.receipts.get(sid))),
+        ("receipt", _receipt_ok(facts.receipts.get(sid), facts.diffs.get(sid))),
     ) if not ok]
     if missing:
         return Item("slice", sid, Action.HAND_BACK, "missing or invalid " + ",".join(missing))
@@ -99,8 +106,8 @@ def scan(lease_path: Path | str, pause_path: Path | str, owner: str, now: float,
     state = n6_lease._read(Path(lease_path))  # pyright: ignore[reportPrivateUsage]
     held_all = state is n6_lease.HELD_ALL
     lease = n6_lease._lease(state) if isinstance(state, dict) else None  # pyright: ignore[reportPrivateUsage]
-    sids = facts.worktrees | set(facts.commits) | set(facts.receipts)
-    if lease is not None and lease.slice_id in facts.known:
+    sids = facts.worktrees | set(facts.commits) | set(facts.receipts) | set(facts.diffs)
+    if lease is not None:  # a leftover lease is always classified, never dropped
         sids |= {lease.slice_id}
     items: list[Item] = []
     for sid in sorted(sids):
@@ -111,7 +118,7 @@ def scan(lease_path: Path | str, pause_path: Path | str, owner: str, now: float,
         items.append(Item("outbox", f"{run_id}#{seq}", Action.RESUME if ok else Action.ATTENTION,
                           "deliver" if ok else "outbox row without its event"))
     hold = "paused" if read_pause(Path(pause_path)) else "held_all" if held_all else ""
-    return Report(owner, hold, lease, tuple(items))
+    return Report(owner, hold, lease, tuple(items), Path(lease_path), now)
 
 
 def act(report: Report, lease_path: Path | str, now: float,
@@ -138,8 +145,11 @@ def apply_once(lease_path: Path | str, lease: Lease, sha: str, now: float,
 
     The intent key (slice id + epoch + sha) is written to the lease before the apply, so a
     crash after the commit replays as a receipt-only step (git shows ``sha`` applied) and a
-    crash before it becomes attention. Neither path ever applies twice. Fenced propagates."""
+    crash before it becomes attention. Neither path ever applies twice. Fenced propagates.
+    The receipt-only path writes only under a live lease of this slice and epoch."""
     if sha in applied:
+        if not n6_lease.check(lease_path, lease, now):
+            return "attention"  # stale, expired, re-epoched or HELD_ALL: no recovery write
         _ = receipt()
         return "receipt"
     if not n6_lease.apply_event(lease_path, lease, f"apply:{lease.slice_id}:{lease.epoch}:{sha}", now):

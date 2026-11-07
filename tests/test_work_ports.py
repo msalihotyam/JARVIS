@@ -14,7 +14,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from jarvis import stage_git, work_driver, work_ports
+from jarvis import n6_boot, stage_git, work_driver, work_ports
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.work_checks import CheckResult
 from jarvis.work_ledger import EventKind, RunState, StepState, WorkRun, WorkStep, step_key
@@ -26,6 +26,13 @@ from jarvis.workers.base import WorkerResult
 RUN = "run1"
 T0 = datetime(2026, 10, 1, tzinfo=timezone.utc)
 ACCEPTED = types.SimpleNamespace(outcome="accepted", logged=(), blocking=(), reason="")
+
+
+def booted(ports):
+    """N6-12FIX: the driver fails closed without boot ports; give it an empty, unheld boot."""
+    ports.boot_scan = lambda: n6_boot.Report("w", "", None, (), Path("n6.lease"), 0.0)
+    ports.boot_record = ports.boot_resume = lambda item: None
+    return ports
 
 
 def _check(stdout, *, exit_code=0, timed_out=False, truncated=False):
@@ -757,7 +764,7 @@ class ResumeTests(ApplyBase):
         ports.budget_exhausted = lambda: True
         ports.apply = mock.Mock(side_effect=AssertionError("a resume never applies"))
         step = WorkStep(RUN, self.step.key, 1, "one", StepState.ACCEPTING, self.clock())
-        _, steps = work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), (step,), ports)
+        _, steps = work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), (step,), booted(ports))
         return steps[0]
 
     def gates(self, name):
@@ -990,7 +997,7 @@ class SliceChainTests(Base):
 
     def chain(self, count, after_first=None):
         head, ports, steps, tips, stages = self.rig(count, after_first)
-        _, done = work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), steps, ports)
+        _, done = work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), steps, booted(ports))
         self.assertEqual([step.state for step in done], [StepState.ACCEPTED] * count)
         self.assertEqual(len(stages), count)
         return head, ports, done, tips, stages
@@ -1040,7 +1047,7 @@ class SliceChainTests(Base):
             return real(step)
         ports.stage_create = stage_create
         with self.assertRaisesRegex(StageError, "does not match the ledger"):
-            work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), steps, ports)
+            work_driver.drive(WorkRun(RUN, RunState.BUILDING, T0, T0), steps, booted(ports))
         self.assertEqual(len(stages), 1)  # slice 2's worker never started
         self.assertEqual(self.git(self.repo, "for-each-ref"), seen["refs"])
         self.assertEqual(sorted(p.name for p in stages[0].path.parent.iterdir()), seen["stages"])

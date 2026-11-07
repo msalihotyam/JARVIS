@@ -17,7 +17,14 @@ from jarvis.work_evidence import EvidenceReceipt
 NOW = 1000.0
 AT = datetime(2026, 1, 1, tzinfo=timezone.utc)
 SHA = "c0" * 20
-RECEIPT = EvidenceReceipt("p", "d", ("x",), 0, "o", {}, "pass").to_json()
+DIFF = "d1" * 32  # sha256 of s1's judged diff
+
+
+def receipt(diff=DIFF, exit_code=0, verdict="passed"):
+    return EvidenceReceipt("p", diff, ("x",), exit_code, "o", {}, verdict).to_json()
+
+
+RECEIPT = receipt()
 
 
 class N6BootTest(unittest.TestCase):
@@ -50,7 +57,7 @@ class N6BootTest(unittest.TestCase):
 
     def facts(self, **kw):
         base = {"known": frozenset({"s1"}), "worktrees": frozenset({"s1"}),
-                "commits": {"s1": SHA}, "receipts": {"s1": RECEIPT}}
+                "commits": {"s1": SHA}, "receipts": {"s1": RECEIPT}, "diffs": {"s1": DIFF}}
         return Facts(**{**base, **kw})
 
     def run_boot(self, facts, owner="me", now=NOW):
@@ -156,6 +163,63 @@ class N6BootTest(unittest.TestCase):
         self.assertEqual(apply_once(*args), "applied")
         self.assertEqual(apply_once(*args), "attention")  # replay without git proof never re-applies
         self.assertEqual(applies, [1])
+
+    def test_neg_failing_or_unbound_receipt_is_handed_back_not_resumed(self):
+        # N6-12FIX F2: only a passing receipt bound to this slice's diff resumes.
+        variants = {"failed verdict": {"receipts": {"s1": receipt(verdict="failed")}},
+                    "nonzero exit": {"receipts": {"s1": receipt(exit_code=1)}},
+                    "other slice's diff": {"receipts": {"s1": receipt(diff="e2" * 32)}},
+                    "no expected diff": {"diffs": {}},
+                    "empty expected diff": {"diffs": {"s1": ""}}}
+        for name, kw in variants.items():
+            with self.subTest(name):
+                self.lease_path.unlink(missing_ok=True)
+                self.own()
+                report, acted, log = self.run_boot(self.facts(**kw))
+                self.assertTrue(acted)
+                self.assertEqual([(i.ref, i.action, i.reason) for i in report.items],
+                                 [("s1", Action.HAND_BACK, "missing or invalid receipt")])
+                self.assertNotIn("resume", [e[0] for e in log])
+
+    def test_neg_recovery_receipt_needs_a_live_lease_of_this_slice_and_epoch(self):
+        # N6-12FIX F3: the already-applied path never writes under a stale lease.
+        def expired():
+            return self.own(ttl=10.0, now=0.0)
+
+        def re_epoched():
+            old = self.own(ttl=10.0, now=0.0)
+            new = n6_lease.acquire(self.lease_path, "other", "s1", 60.0, NOW)
+            assert new is not None and new.epoch != old.epoch
+            return old
+
+        def other_owner():
+            self.own(owner="other")
+            return n6_lease.Lease("me", "s1", 1, NOW + 60.0)
+
+        def held_all():
+            lease = self.own()
+            self.lease_path.write_bytes(b"{not json")
+            return lease
+        for case in (expired, re_epoched, other_owner, held_all):
+            with self.subTest(case.__name__):
+                self.lease_path.unlink(missing_ok=True)
+                lease = case()
+                before, receipts = self.lease_path.read_bytes(), []
+                out = apply_once(self.lease_path, lease, SHA, NOW, frozenset({SHA}),
+                                 lambda: self.fail("apply"), lambda: receipts.append(1))
+                self.assertEqual((out, receipts), ("attention", []))
+                self.assertEqual(self.lease_path.read_bytes(), before)
+
+    def test_neg_leftover_lease_with_no_other_fact_is_attention_never_dropped(self):
+        # N6-12FIX F4: a lease whose slice is unknown and has no other fact is still reported.
+        n6_lease.acquire(self.lease_path, "me", "orphan", 60.0, NOW)
+        before = self.lease_path.read_bytes()
+        report, acted, log = self.run_boot(Facts())
+        self.assertTrue(acted)
+        self.assertEqual([(i.ref, i.action, i.reason) for i in report.items],
+                         [("orphan", Action.ATTENTION, "unknown leftover")])
+        self.assertEqual([e[0] for e in log], ["record"])
+        self.assertEqual(self.lease_path.read_bytes(), before)  # untouched
 
     def test_neg_outbox_row_without_its_event_is_attention(self):
         report = scan(self.lease_path, self.pause, "me", NOW,

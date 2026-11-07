@@ -6,7 +6,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from jarvis import n6_lease
+from jarvis import n6_boot, n6_lease
 from jarvis.n6_lease import Fenced
 from jarvis.work_checks import CheckResult
 from jarvis.work_driver import drive
@@ -89,6 +89,15 @@ class FakePorts:
     def clock(self):
         self.now += timedelta(seconds=1)
         return self.now
+
+    def boot_scan(self):  # N6-12FIX: an empty, unheld report; boot ports never log
+        return n6_boot.Report("w", "", None, (), Path("n6.lease"), 0.0)
+
+    def boot_record(self, item):
+        return None
+
+    def boot_resume(self, item):
+        return None
 
     def append_event(self, kind, key, payload, idempotency_key=None):
         if idempotency_key is not None:
@@ -519,22 +528,54 @@ class LeaseFencingTest(unittest.TestCase):
 
 
 class BootScanTest(unittest.TestCase):
-    """N6-12: ``boot_scan`` runs once before the driver acts; a held report acts on nothing."""
+    """N6-12: the boot scan runs once and ``n6_boot.act`` carries it out before the driver
+    acts; a missing boot port, a non-Report or a held report acts on nothing (fail-closed)."""
+
+    def assert_untouched(self, ports, run, steps):
+        self.assertIs(run.state, RunState.BUILDING)
+        self.assertEqual(ports.log, [])
+        self.assertTrue(all(s.state is StepState.PENDING for s in steps.values()))
 
     def test_boot_scan_once_and_hold_acts_on_nothing(self):
         for hold in ("", "paused", "held_all"):
             with self.subTest(hold=hold):
                 ports = FakePorts({"a": [result()], "b": [result()]})
                 calls = []
-                ports.boot_scan = lambda: calls.append(1) or type("R", (), {"hold": hold})()
+                report = n6_boot.Report("w", hold, None, (), Path("n6.lease"), 0.0)
+                ports.boot_scan = lambda r=report: calls.append(1) or r
                 run, steps = run_drive(ports)
                 self.assertEqual(calls, [1])
                 if hold:
-                    self.assertIs(run.state, RunState.BUILDING)
-                    self.assertEqual(ports.log, [])
-                    self.assertTrue(all(s.state is StepState.PENDING for s in steps.values()))
+                    self.assert_untouched(ports, run, steps)
                 else:
                     self.assertIs(run.state, RunState.ACCEPTING)
+
+    def test_neg_missing_boot_port_fails_closed(self):
+        for name in ("boot_scan", "boot_record", "boot_resume"):
+            with self.subTest(missing=name):
+                ports = FakePorts({"a": [result()]})
+                setattr(ports, name, None)
+                run, steps = run_drive(ports)
+                self.assert_untouched(ports, run, steps)
+
+    def test_neg_scan_that_is_not_a_report_fails_closed(self):
+        for bogus in (None, type("R", (), {"hold": ""})(), {"hold": ""}):
+            with self.subTest(bogus=bogus):
+                ports = FakePorts({"a": [result()]})
+                ports.boot_scan = lambda b=bogus: b
+                run, steps = run_drive(ports)
+                self.assert_untouched(ports, run, steps)
+
+    def test_act_runs_on_the_scan_before_the_driver(self):
+        ports = FakePorts({"a": [result()]})
+        items = (n6_boot.Item("slice", "s1", n6_boot.Action.RESUME, "consistent", TREE),
+                 n6_boot.Item("slice", "ghost", n6_boot.Action.ATTENTION, "unknown leftover"))
+        ports.boot_scan = lambda: n6_boot.Report("w", "", None, items, Path("n6.lease"), 0.0)
+        ports.boot_resume = lambda item: ports.log.append(("boot_resume", item.ref))
+        ports.boot_record = lambda item: ports.log.append(("boot_record", item.ref))
+        run, _ = run_drive(ports)
+        self.assertEqual(ports.log[:2], [("boot_resume", "s1"), ("boot_record", "ghost")])
+        self.assertIs(run.state, RunState.ACCEPTING)
 
 
 if __name__ == "__main__":

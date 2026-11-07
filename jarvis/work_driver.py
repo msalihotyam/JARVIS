@@ -29,8 +29,10 @@ The driver owns no process, database or network. ``ports`` supplies:
 - ``applied(stage, key)`` -> bool: the apply for ``key`` took effect.
 - ``undo(stage, key)``: roll ``key``'s effect back to the checkpoint before
   it; a no-op when nothing of ``key`` is applied, so it is safe to repeat.
-- ``boot_scan()`` (optional) -> ``n6_boot.Report``: called once before the
-  driver acts; a report whose ``hold`` is set stops the driver untouched.
+- ``boot_scan()`` -> ``n6_boot.Report``, ``boot_record(item)`` and
+  ``boot_resume(item)``: the scan runs once and ``n6_boot.act`` carries it out
+  before the driver acts. A missing port, a non-Report, or a held report
+  (paused, HELD_ALL) stops the driver untouched (fail-closed).
 
 Worker claims are data: only the Core gates accept a slice. Any gate
 error fails closed as a finding, so apply never follows a failed gate.
@@ -47,6 +49,7 @@ import re
 from collections.abc import Callable, Iterable, Mapping
 from typing import TYPE_CHECKING, Protocol, cast
 
+from jarvis import n6_boot
 from jarvis.n6_lease import Fenced, Lease
 from jarvis.work_ledger import (
     MAX_REVISIONS,
@@ -115,11 +118,26 @@ class Ports(Protocol):
     def apply_intent(self, step: WorkStep, /) -> tuple[str, object] | None: ...
     def applied(self, stage: Stage, key: str, /) -> object: ...
     def undo(self, stage: Stage, key: str, /) -> object: ...
+    def boot_scan(self) -> object: ...
+    def boot_record(self, item: n6_boot.Item, /) -> object: ...
+    def boot_resume(self, item: n6_boot.Item, /) -> object: ...
 
 # PM34: MINOR is logged; BLOCKER, MAJOR and any unknown severity block.
 _NON_BLOCKING = frozenset({"MINOR"})
 _REVISABLE = frozenset({StepState.ACCEPTING, StepState.BLOCKED_BY_GATE, StepState.TIMEOUT})
 _TREE_HASH = re.compile(r"[0-9a-f]{40,64}")
+
+
+def _booted(ports: object) -> bool:
+    """N6-12: scan once and act on the report before the driver acts. Fail-closed: a missing
+    boot port, a scan that is not a ``Report`` or a held report (act returns False) acts on nothing."""
+    scan, record, resume = (getattr(ports, n, None) for n in ("boot_scan", "boot_record", "boot_resume"))
+    if not (callable(scan) and callable(record) and callable(resume)):
+        return False
+    report = cast("object", scan())
+    return isinstance(report, n6_boot.Report) and n6_boot.act(
+        report, report.lease_path, report.now, cast("Callable[[n6_boot.Item], object]", record),
+        cast("Callable[[n6_boot.Item], object]", resume))
 
 
 def drive(run: WorkRun, steps: Iterable[WorkStep], ports: Ports) -> tuple[WorkRun, tuple[WorkStep, ...]]:
@@ -128,9 +146,7 @@ def drive(run: WorkRun, steps: Iterable[WorkStep], ports: Ports) -> tuple[WorkRu
     Returns ``(run, steps)`` with the final ledger values.
     """
     by_key = {step.key: step for step in steps}
-    # N6-12: the boot scan runs once before the driver acts; a held report (paused, HELD_ALL) acts on nothing.
-    boot: object = getattr(ports, "boot_scan", None)
-    if callable(boot) and getattr(boot(), "hold", True):
+    if not _booted(ports):
         return run, tuple(sorted(by_key.values(), key=lambda s: s.ordinal))
     while run.state == RunState.BUILDING:
         # Checked first: a resumed run may already hold three failed slices.
