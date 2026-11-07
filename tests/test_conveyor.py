@@ -8137,7 +8137,7 @@ class TestTempWatch(Base):
     def test_main_wires_the_prune_and_the_watch(self):
         with open(conveyor.__file__, encoding="utf-8") as f:
             self.assertIn('Conveyor(prune=start_detached, temp_watch=os.environ.get("TEMP"),\n'
-                          '                      fetch=ntfy_poll)', f.read())
+                          '                      fetch=ntfy_poll, spawn=restart_detached)', f.read())
 
 
 class TestChain(AutopilotBase):
@@ -9442,6 +9442,104 @@ class PhoneCmd(Base):
             self.tick()
         self.assertTrue(str(self.c.root).startswith(str(self.root)))
         self.assertTrue((self.root / "build" / "orch" / "INBOX.jsonl").exists())
+
+    # PHONECMDFIX F1: durum routes with the pager's one predicate; nothing is dropped.
+    def sections(self, items):
+        text = self.c.durum_text({}, items)
+        senden = text.split("Senden beklenen:")[1].split("Orkestratörden beklenen:")[0]
+        orch = text.split("Orkestratörden beklenen:")[1].split("N6:")[0]
+        return ({i for i in "ABC" if f"{i}: " in senden}, {i for i in "ABC" if f"{i}: " in orch})
+
+    def test_durum_sections_route_like_the_pager_awake_and_asleep(self):
+        items = [("A", "needs salih: x", 0), ("B", "lane blocked, needs orchestrator: blocked since 1", 0),
+                 ("C", "PASS needs orchestrator", 0)]
+        self.c.salih, self.c.quiet = {"A"}, {"C"}
+        hb = self.root / "build" / "orch" / "heartbeat"
+        hb.parent.mkdir(parents=True, exist_ok=True)
+        hb.write_text(str(int(self.t) + 3600), encoding="utf-8")
+        wake = self.c.orch_wake()
+        self.assertEqual(self.sections(items), ({"A"}, {"B", "C"}))
+        self.assertEqual({i for i, _, _ in items if self.c.for_salih(i, wake)}, {"A"})
+        hb.unlink()
+        self.assertEqual(self.sections(items), ({"A", "B"}, {"C"}))
+        self.assertEqual({i for i, _, _ in items if self.c.for_salih(i, None)}, {"A", "B"})
+
+    # PHONECMDFIX restart: fake spawn, clock and send.
+    def restart_once(self, spawned, mid="r1", body="Yeniden başlat"):
+        self.c.spawn = lambda argv: spawned.append(list(argv))
+        self.msgs((mid, body))
+        self.tick()
+        self.c.restart_go()
+
+    def phone(self):
+        return json.loads((self.base / "phone.json").read_text(encoding="utf-8"))
+
+    def test_neg_restart_handled_once_across_the_restart_and_pause_stays(self):
+        (self.base / "PAUSE").write_text("phone\n", encoding="utf-8")
+        spawned = []
+        with mock.patch("sqlite3.connect", side_effect=AssertionError("db")):
+            self.restart_once(spawned)
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual(self.pushes, ["Yeniden başlatılıyor…"])
+        self.assertEqual(self.phone()["restart"]["pid"], self.c.pid)
+        c2 = Conveyor(self.root, self.fake, now=lambda: self.t,  # the new instance: same files
+                      send=lambda text, **kw: self.pushes.append(text) or "sent",
+                      post=self.fake_post, key=lambda: self.key,
+                      cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
+                      mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs,
+                      net=lambda: self.net, popen=self.fake_popen, fetch=self.fetch,
+                      spawn=lambda argv: spawned.append(list(argv)))
+        c2.pid = self.c.pid + 1
+        c2.phone_tick({}, [])
+        c2.restart_go()
+        c2.heartbeat()
+        self.assertEqual((len(spawned), len(self.pushes)), (1, 1))  # seen id; no push before beat 2
+        c2.heartbeat()
+        self.assertEqual(self.pushes[-1], f"Konveyör yeniden başlatıldı ve çalışıyor · PID {c2.pid}")
+        self.assertNotIn("restart", self.phone())
+        c2.heartbeat()
+        self.assertEqual(len(self.pushes), 2)
+        self.assertTrue((self.base / "PAUSE").exists())
+        self.assertTrue(str(c2.root).startswith(str(self.root)))
+
+    def test_neg_second_restart_within_10_min_refused(self):
+        spawned = []
+        self.restart_once(spawned)
+        self.t += 100
+        self.restart_once(spawned, "r2", "YENİDEN")
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual(self.pushes[-1], "Son 10 dakikada zaten yeniden başlatıldı")
+        self.t += 501
+        self.restart_once(spawned, "r3", "yeniden")
+        self.assertEqual(len(spawned), 2)
+
+    def test_neg_spawn_failure_pushes_error_and_keeps_running(self):
+        def boom(argv):
+            raise OSError("breakaway refused")
+        self.c.spawn = boom
+        self.msgs(("f1", "yeniden"))
+        self.tick()
+        self.c.restart_go()
+        self.assertEqual(self.pushes[-1], "Yeniden başlatma başarısız (OSError); konveyör çalışmaya devam ediyor.")
+        st = self.phone()
+        self.assertNotIn("restart", st)
+        self.assertNotIn("restart_ts", st)
+        self.assertEqual([r["error"] for r in self.events("phone_restart_failed")], ["OSError"])
+        spawned = []
+        self.restart_once(spawned, "f2", "yeniden")  # not counted against the 10 min window
+        self.assertEqual(len(spawned), 1)
+
+    def test_neg_helper_argv_has_no_topic(self):
+        spawned = []
+        self.restart_once(spawned)
+        line = " ".join(spawned[0])
+        self.assertEqual(spawned[0], conveyor.RESTART_ARGV)
+        self.assertNotIn(self.TOPIC, line)
+        self.assertNotIn("ntfy", line.lower())
+        self.assertIn("Stop-ScheduledTask -TaskName 'JARVIS Konveyor'", line)
+        self.assertIn("Start-ScheduledTask -TaskName 'JARVIS Konveyor'", line)
+        self.assertLess(line.index("Stop-"), line.index("Start-Sleep -Seconds 5"))
+        self.assertNotIn(self.TOPIC, (self.base / "phone.json").read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":

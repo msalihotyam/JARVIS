@@ -681,6 +681,21 @@ def start_detached(args):
                             stderr=subprocess.DEVNULL, creationflags=flags)
 
 
+# Salih's manual restart, verbatim. No topic and no secret on this command line.
+RESTART_ARGV = ["powershell", "-NoProfile", "-NonInteractive", "-Command",
+                "Stop-ScheduledTask -TaskName 'JARVIS Konveyor' -TaskPath '\\'; Start-Sleep -Seconds 5; "
+                "Start-ScheduledTask -TaskName 'JARVIS Konveyor' -TaskPath '\\'"]
+
+
+def restart_detached(argv):
+    """Start the restart helper outside the task's job object; a refused breakaway raises OSError."""
+    flags = (getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+             | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000))
+    return subprocess.Popen([shutil.which(argv[0]) or argv[0], *argv[1:]], cwd=ROOT,
+                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL, creationflags=flags)
+
+
 def real_cmd(args, timeout=120):
     """Run git or gh (args[0]) in the canonical checkout; return (returncode, output)."""
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
@@ -1103,9 +1118,12 @@ class Conveyor:
                  post=anthropic_post, key=reader_key, cmd=real_cmd, disk=shutil.disk_usage,
                  projects=None, mem=real_mem, idle=real_idle, procs=None, net=real_net,
                  popen=subprocess.Popen, codex=None, jules=None, prune=None, temp_watch=None,
-                 instance_lock=real_instance_lock, fetch=None):
+                 instance_lock=real_instance_lock, fetch=None, spawn=None):
         self.root = Path(root)
         self.fetch = fetch  # PHONECMD: ntfy_poll on the real loop only; None -> phone commands off
+        self.spawn = spawn  # PHONECMDFIX: restart_detached on the real loop only; None -> restart refused
+        self.restart_pending = False  # set by "yeniden"; restart_go spawns after the tick's writes
+        self.beats = 0  # heartbeats of this pid; the 2nd confirms a phone restart
         self.started = now()
         self.prune = prune  # prune and temp_watch are wired only on the real loop: no test reaches them
         self.temp_watch = temp_watch
@@ -1231,6 +1249,12 @@ class Conveyor:
     def heartbeat(self):
         self.beat_ts = self.now()
         self.write_info(self.now())
+        self.beats += 1
+        if self.beats == 2:
+            try:
+                self.restart_confirm()
+            except Exception as e:  # a bad phone.json never stops the heartbeat
+                self.event("phone_restart_confirm_failed", error=type(e).__name__)
 
     def write_info(self, beat):
         """tmp + os.replace, so readers never see a torn file; os.replace is denied on Windows
@@ -1541,6 +1565,7 @@ class Conveyor:
         ids = [i for i in raw.get("ids", []) if isinstance(i, str)] if isinstance(raw.get("ids"), list) else []
         st = {"since": since, "ids": ids, "fail": raw.get("fail") if isinstance(raw.get("fail"), str) else None,
               "fail_n": n, "next_ts": next_ts}
+        st.update({k: raw[k] for k in ("restart", "restart_ts") if k in raw})  # PHONECMDFIX marker and cap
         kind, msgs = (None if TOPIC_RE.fullmatch(topic) else "bad_topic"), []
         if not kind:
             try:
@@ -1576,17 +1601,19 @@ class Conveyor:
                 self.event("phone_error", error=type(e).__name__)
 
     def phone_cmd(self, m, lanes, items):
-        """durum / not / durdur only. The text is untrusted: never run, never sent to a shell, model,
+        """durum / not / durdur / yeniden only. The text is untrusted: never run, never sent to a shell, model,
         git or prompt; a note is only appended to build/orch/INBOX.jsonl. Anything else: one event."""
         text = m.get("message") if isinstance(m.get("message"), str) else ""
         parts = text.split(None, 1)
         word = parts[0].replace("İ", "i").replace("I", "i").replace("ı", "i").lower() if parts else ""
-        if word not in ("durum", "not", "durdur"):
+        if word not in ("durum", "not", "durdur", "yeniden"):
             self.event("phone_unknown")
             return
         self.event("phone_cmd", cmd=word)
         if word == "durum":
             self.send(self.durum_text(lanes, items), title="Durum")
+        elif word == "yeniden":
+            self.phone_restart()
         elif word == "durdur":
             (self.base / "PAUSE").write_text("")
             self.send("Konveyör durduruldu. Devam için panelden PAUSE kaldır.", title="Durdur")
@@ -1599,6 +1626,55 @@ class Conveyor:
             with open(orch / "INBOX.jsonl", "a", encoding="utf-8") as fh:  # one write: one whole line
                 fh.write(json.dumps({"id": m["id"], "ts": iso(self.now()), "text": note}, ensure_ascii=False) + "\n")
             self.send(f"Not alındı ({self.inbox_unread()} okunmamış)", title="Not")
+
+    def phone_restart(self):
+        """"yeniden": at most one restart per 10 min. The marker goes to phone.json first; the spawn
+        waits for restart_go, after the tick, so no push or integration write is cut."""
+        f = self.base / "phone.json"
+        st = self.load_json(f, {})
+        st = st if isinstance(st, dict) else {}
+        last = st.get("restart_ts")
+        if self.restart_pending or (isinstance(last, (int, float)) and abs(self.now() - last) < 600):
+            self.send("Son 10 dakikada zaten yeniden başlatıldı", title="Yeniden başlat")
+            return
+        st.update(restart={"ts": self.now(), "pid": self.pid}, restart_ts=self.now())
+        if not self.write_atomic(f, json.dumps(st)):
+            self.send("Yeniden başlatma kaydedilemedi; konveyör çalışmaya devam ediyor.", title="Yeniden başlat")
+            return
+        self.send("Yeniden başlatılıyor…", title="Yeniden başlat")
+        self.restart_pending = True
+
+    def restart_go(self):
+        """Spawn the one detached restart helper; on any failure clear the marker and say so."""
+        if not self.restart_pending:
+            return
+        self.restart_pending = False
+        try:
+            if self.spawn is None:
+                raise RuntimeError("no spawn")
+            self.spawn(RESTART_ARGV)
+            self.event("phone_restart_spawned")
+        except Exception as e:  # a refused breakaway is OSError: nothing stopped, keep running
+            f = self.base / "phone.json"
+            st = self.load_json(f, {})
+            st = st if isinstance(st, dict) else {}
+            st.pop("restart", None)
+            st.pop("restart_ts", None)
+            self.write_atomic(f, json.dumps(st))
+            self.event("phone_restart_failed", error=type(e).__name__)
+            self.send(f"Yeniden başlatma başarısız ({type(e).__name__}); konveyör çalışmaya devam ediyor.",
+                      title="Yeniden başlat")
+
+    def restart_confirm(self):
+        """On this pid's 2nd heartbeat: a marker from another pid means the phone restart worked."""
+        f = self.base / "phone.json"
+        st = self.load_json(f, {})
+        mark = st.get("restart") if isinstance(st, dict) else None
+        if not isinstance(mark, dict) or mark.get("pid") == self.pid:
+            return
+        self.send(f"Konveyör yeniden başlatıldı ve çalışıyor · PID {self.pid}", title="Yeniden başlat")
+        st.pop("restart")
+        self.write_atomic(f, json.dumps(st))
 
     def inbox_unread(self):
         """Notes after the id in build/orch/INBOX.read (the orchestrator writes it); absent: all."""
@@ -1624,9 +1700,9 @@ class Conveyor:
         """The phone's Durum report, from local state only; unknowns read "bilinmiyor"; <= 3500 chars."""
         now, unk = self.now(), "bilinmiyor"
         run = self.running(lanes)
-        salih = [f"{i}: {r}"[:150] for i, r, _ in items if i not in self.quiet]
-        orch = [f"{i}: {r}"[:150] for i, r, _ in items if i in self.quiet and i in lanes and (
-            lanes[i].get("status") in GOOD or lanes[i].get("chain_refused"))]
+        awake = self.orch_wake()
+        salih = [f"{i}: {r}"[:150] for i, r, _ in items if self.for_salih(i, awake)]
+        orch = [f"{i}: {r}"[:150] for i, r, _ in items if not self.for_salih(i, awake)]
         try:
             lines = (self.base / "events.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
             push = next((r for r in map(self.push_record, reversed(lines[-2000:])) if r), None)
@@ -1663,7 +1739,7 @@ class Conveyor:
         return "\n".join(L)[:3500]
 
     def finish(self, name, ln, report, status, **why):
-        quiet =ln.get("finished") and "started_ts" not in ln  # a v0 lane already freed: no page
+        quiet = ln.get("finished") and "started_ts" not in ln  # a v0 lane already freed: no page
         ln["finished"] = True
         ln["status"] = status
         ln["report"] = str(self.collect(name, report))
@@ -3673,6 +3749,10 @@ class Conveyor:
                                           f"{int(self.now() - failed) // 60} min", failed))
         return [i for i in items if not self.acked(i[0], i[2])]
 
+    def for_salih(self, i, wake):
+        """The one Salih-routing predicate: the pager's backstop and durum's "Senden beklenen"."""
+        return i == BREAKER_ID or i in URGENT_PAGE_IDS or i in self.salih or (not wake and i not in self.quiet)
+
     def backstop(self, items):
         """Page Salih once per urgent or needs_salih item left unacked ATTENTION_PAGE_S (the breaker at
         once). The orchestrator's own routine items never page while a heartbeat exists: a late
@@ -3688,7 +3768,7 @@ class Conveyor:
                 continue
             if i == BREAKER_ID:
                 due, text = True, f"Devre kesici açık: {why}"
-            elif i in URGENT_PAGE_IDS or i in self.salih or not wake and i not in self.quiet:
+            elif self.for_salih(i, wake):
                 due, text = now - since >= ATTENTION_PAGE_S, \
                     f"Orkestratör {ATTENTION_PAGE_S // 60} dk tepki vermedi: {i}: {why}"
             else:
@@ -5444,6 +5524,7 @@ class Conveyor:
                         self.event("flush_error", error=repr(e), file=fn and str(fn), at=at)
                     except Exception:
                         pass  # the event log itself is unwritable: nowhere left to record it
+            self.restart_go()  # after the tick: never mid push or integration write
             if once:  # a zero heartbeat tells readers no conveyor runs; loop() drops the OS lock
                 self.write_info(0)
                 return 0
@@ -5475,4 +5556,4 @@ if __name__ == "__main__":
     if "--archive-sessions" in sys.argv:
         sys.exit(archive_cli(Conveyor(), "--dry-run" in sys.argv))
     sys.exit(Conveyor(prune=start_detached, temp_watch=os.environ.get("TEMP"),
-                      fetch=ntfy_poll).loop(once="--once" in sys.argv))
+                      fetch=ntfy_poll, spawn=restart_detached).loop(once="--once" in sys.argv))
