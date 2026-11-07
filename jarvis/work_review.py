@@ -272,3 +272,119 @@ def review_slice(
     revisions += 1
     outcome = "slice_failed_after_cap" if revisions > REVISION_CAP else "revise"
     return GateDecision(outcome, revisions, sessions_used, blocking, logged, reason="blocking_findings")
+
+
+# --- N6-11 review routing by tier (G3) ------------------------------------------------------------
+#: Providers whose review can count toward G3.
+REVIEW_PROVIDERS = frozenset({"claude", "codex"})
+
+
+@dataclass(frozen=True)
+class ReviewRecord:
+    """One finished review: who reviewed, in which session, and its RAW output (parsed strictly here)."""
+
+    provider: str
+    session_id: str
+    output: str
+
+
+@dataclass(frozen=True)
+class G3Exception:
+    """The recorded same-provider exception: who granted it, why, for which slice."""
+
+    who: str
+    why: str
+    slice_id: str
+
+
+@dataclass(frozen=True)
+class RouteDecision:
+    #: accepted | blocked
+    outcome: str
+    #: two_providers | cross_provider | g3_exception
+    kind: str
+    reason: str = ""
+    blocking: tuple[Finding, ...] = ()
+    logged: tuple[Finding, ...] = ()
+
+
+def _text(value: object) -> bool:
+    return type(value) is str and bool(value.strip())
+
+
+def route_reviews(
+    *,
+    slice_id: str,
+    tier: object,
+    state_machine: object,
+    writer: str,
+    writer_session: str,
+    reviews: Sequence[ReviewRecord],
+    exception: object = None,
+) -> RouteDecision:
+    """Decide whether the finished reviews are enough for this slice (G3).
+
+    - T2, an unknown tier (fail closed) and any state-machine slice need a PASS from
+      BOTH providers (Claude in a session separate from the writer's, and Codex);
+    - T0/T1 non-state-machine slices need a PASS from the cross provider
+      (``REVIEWER_FOR``), or, ONLY on T1 with a ``G3Exception`` record for this
+      slice, a same-provider review from a separate session;
+    - every review is parsed strictly: an unknown severity or verdict blocks;
+    - there is no skip: no reviews means blocked at every tier.
+
+    Misuse (unknown writer/provider, own-session review, an exception that is not
+    a record or is on a T2/state-machine slice) raises ``ReviewRefused``.
+    """
+    if not _text(slice_id) or not _text(writer_session):
+        raise ReviewRefused("input_invalid")
+    if writer not in REVIEWER_FOR:
+        raise ReviewRefused("writer_unknown")
+    tier = tier if type(tier) is str and tier in ("T0", "T1") else "T2"
+    two_providers = tier == "T2" or state_machine is not False
+    if exception is not None:
+        if (
+            type(exception) is not G3Exception
+            or not all(_text(v) for v in (exception.who, exception.why, exception.slice_id))
+            or exception.slice_id != slice_id
+        ):
+            raise ReviewRefused("exception_unrecorded")
+        if two_providers or tier != "T1":
+            raise ReviewRefused("exception_not_allowed")
+    if type(reviews) not in (list, tuple) or any(type(r) is not ReviewRecord for r in reviews):
+        raise ReviewRefused("input_invalid")
+    sessions = [r.session_id for r in reviews]
+    for r in reviews:
+        if r.provider not in REVIEW_PROVIDERS:
+            raise ReviewRefused("reviewer_unknown")
+        if not _text(r.session_id) or r.session_id == writer_session:
+            raise ReviewRefused("own_session")
+    if len(set(sessions)) != len(sessions):
+        raise ReviewRefused("session_reused")
+
+    if two_providers:
+        kind, needed = "two_providers", REVIEW_PROVIDERS
+    elif exception is not None:
+        kind, needed = "g3_exception", frozenset({writer, REVIEWER_FOR[writer]})
+    else:
+        kind, needed = "cross_provider", frozenset({REVIEWER_FOR[writer]})
+    if not reviews:
+        return RouteDecision("blocked", kind, "no_review")
+
+    findings: list[Finding] = []
+    passed: set[str] = set()
+    for r in reviews:
+        try:
+            review = parse_review(r.output)
+        except (ValueError, RecursionError):
+            return RouteDecision("blocked", kind, "unparsable")
+        findings.extend(review.findings)
+        if review.verdict == "PASS":
+            passed.add(r.provider)
+    blocking = tuple(f for f in findings if f.severity in BLOCKING)
+    logged = tuple(f for f in findings if f.severity not in BLOCKING)
+    if blocking:
+        return RouteDecision("blocked", kind, "blocking_findings", blocking, logged)
+    # Two providers: both must pass. One provider: the allowed one(s) must have passed.
+    if (kind == "two_providers" and not needed <= passed) or not (needed & passed):
+        return RouteDecision("blocked", kind, "provider_missing", logged=logged)
+    return RouteDecision("accepted", kind, logged=logged)

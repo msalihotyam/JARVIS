@@ -896,6 +896,7 @@
   "tests.test_n6_preflight.N6PreflightTests": 0.3,
   "tests.test_n6_quota.QuotaWindowTests": 0.1,
   "tests.test_n6_receipt.N6ReceiptTests": 0.1,
+  "tests.test_n6_review_route.N6ReviewRouteTests": 0.1,
   "tests.test_n6_root.N6RootTests": 15.517,
   "tests.test_n6_shadow.N6ShadowTests": 0.3,
   "tests.test_n6_usage.UsageReaderTests": 0.1,
