@@ -1,0 +1,1 @@
+{"version":1,"limits":{"false_pass":0,"security_incidents":0,"rollback_drill_required":true},"measures":{"pass_rate":"higher","post_accept_defects":"lower","salih_interventions":"lower","quota_tokens_per_accepted":"lower","finish_seconds":"lower"},"slice_ids":[]}
