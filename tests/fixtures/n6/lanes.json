@@ -1,0 +1,7 @@
+{
+  "N6-01": {"state": "stopped", "finished": true, "status": "PASS", "base": "5ce9176f0744666870d2b48da51b3cbbb24fff63", "started_ts": 1793983817.77, "finished_ts": 1793984493.31},
+  "CDX-N6-01": {"state": "done", "finished": true, "status": "BLOCKED", "base": "main", "started_ts": 1793984973.01, "finished_ts": 1793985298.97},
+  "N6-01FIX": {"state": "stopped", "finished": true, "status": "PASS", "base": "main", "started_ts": 1793986348.61, "finished_ts": 1793988203.59},
+  "N6-02": {"state": "done", "finished": true, "status": "PASS", "base": "a8244f2a58292049a8a3d6d982eeb91cf7895ec0", "started_ts": 1794000098.51, "finished_ts": 1794000291.03},
+  "INT100B": {"state": "stopped", "finished": true, "status": "DROPPED", "base": "main", "started_ts": 1793720443.32, "finished_ts": 1793792368.05}
+}

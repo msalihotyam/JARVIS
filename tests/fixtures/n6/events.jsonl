@@ -1,0 +1,10 @@
+{"ts": "2026-11-05T06:19:28", "event": "finish", "lane": "INT100B", "status": "DROPPED"}
+{"ts": "2026-11-06T19:41:33", "event": "finish", "lane": "N6-01", "status": "PASS"}
+{"ts": "2026-11-06T20:01:37", "event": "chain", "src": "N6-01", "step": "CLREV", "id": "CLREV-N6-01", "sha": "83f131420162740a1b123b258d0c0ce50a32f02a"}
+{"ts": "2026-11-06T20:09:31", "event": "chain", "src": "N6-01", "step": "CDX", "id": "CDX-N6-01", "sha": "83f131420162740a1b123b258d0c0ce50a32f02a"}
+{"ts": "2026-11-06T20:14:58", "event": "finish", "lane": "CDX-N6-01", "status": "BLOCKED"}
+{"ts": "2026-11-06T21:03:23", "event": "finish", "lane": "N6-01FIX", "status": "PASS"}
+{"ts": "2026-11-07T00:24:51", "event": "collect", "lane": "N6-02", "src": "reports/N6-02.md"}
+{"ts": "2026-11-07T00:24:51", "event": "finish", "lane": "N6-02", "status": "PASS"}
+{"ts": "2026-11-07T00:25:10", "event": "chain", "src": "N6-02", "step": "CLREV", "id": "CLREV-N6-02", "sha": "ff2a698a09b572c8c55574e6fb6293b744f8f2e0"}
+{"ts": "2026-11-07T00:31:02", "event": "chain", "src": "N6-02", "step": "INT", "id": "INT-N6-02", "sha": "ff2a698a09b572c8c55574e6fb6293b744f8f2e0"}
