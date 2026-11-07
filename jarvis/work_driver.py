@@ -7,7 +7,10 @@ The driver owns no process, database or network. ``ports`` supplies:
 - ``append_event(kind, step_key, payload, idempotency_key=None)``: one
   durable ledger event; a reused idempotency key raises.
 - ``notify(point, dedupe_key, step_key)``: one §2.1 notification point.
-- ``lease_claim(step)`` / ``lease_release(step)``: the slice lease.
+- ``lease_claim(step)`` / ``lease_release(step)``: the slice lease. A claim that
+  returns an N6 ``Lease`` (N6-08) fences the slice: each write first calls the
+  optional ``lease_check(lease)`` port, a stale epoch raises ``Fenced``, and every
+  event payload carries the epoch.
 - ``stage_create(step)`` -> stage; ``route(step)`` -> worker name;
   ``worker(name)`` -> ``jarvis.workers.base.Worker``.
 - ``task(step, stage, findings)`` -> worker task; findings travel as data.
@@ -39,8 +42,9 @@ from __future__ import annotations
 import contextlib
 import re
 from collections.abc import Callable, Iterable, Mapping
-from typing import TYPE_CHECKING, Protocol
+from typing import TYPE_CHECKING, Protocol, cast
 
+from jarvis.n6_lease import Fenced, Lease
 from jarvis.work_ledger import (
     MAX_REVISIONS,
     EventKind,
@@ -148,10 +152,48 @@ def drive(run: WorkRun, steps: Iterable[WorkStep], ports: Ports) -> tuple[WorkRu
     return run, tuple(sorted(by_key.values(), key=lambda s: s.ordinal))
 
 
+# N6-08 (M8): with an N6 lease, these writes re-check the epoch first and are refused once stale.
+_FENCED_WRITES = frozenset({"append_event", "notify", "stage_create", "evidence", "apply", "undo"})
+
+
+class _FencedPorts:
+    """Ports behind an N6 lease: each write needs ``ports.lease_check(lease)``; events carry the epoch."""
+
+    def __init__(self, ports: Ports, lease: Lease) -> None:
+        self._ports = ports
+        self._lease = lease
+        self.fenced = False
+
+    def __getattr__(self, name: str) -> object:
+        attr: object = getattr(self._ports, name)
+        if name not in _FENCED_WRITES or not callable(attr):
+            return attr
+        target = cast("Callable[..., object]", attr)
+
+        def write(*args: object, **kw: object) -> object:
+            self._guard()
+            if name == "append_event" and len(args) >= 3:
+                payload = cast("Mapping[str, object]", args[2])
+                args = (*args[:2], {**payload, "epoch": self._lease.epoch}, *args[3:])
+            return target(*args, **kw)
+
+        return write
+
+    def _guard(self) -> None:
+        check: object = getattr(self._ports, "lease_check", None)
+        # Fail closed: no check port, a falsy check or an earlier refusal fences every later write.
+        if self.fenced or not callable(check) or not check(self._lease):
+            self.fenced = True
+            raise Fenced(f"stale epoch {self._lease.epoch} for {self._lease.slice_id}")
+
+
 def _drive_slice(step: WorkStep, ports: Ports) -> tuple[WorkStep, str]:
     track = [step]
     done = False
-    ports.lease_claim(step)
+    claimed = ports.lease_claim(step)
+    fenced = _FencedPorts(ports, claimed) if isinstance(claimed, Lease) else None
+    if fenced is not None:
+        ports = cast("Ports", fenced)
     try:
         outcome = _slice_body(track, ports)
         done = True
@@ -161,7 +203,9 @@ def _drive_slice(step: WorkStep, ports: Ports) -> tuple[WorkStep, str]:
         if not done and track[0].state == StepState.RUNNING:
             with contextlib.suppress(Exception):
                 _step_to(track[0], StepState.INTERRUPTED, ports)
-        ports.lease_release(step)
+        # A fenced manager writes nothing more, its release included: the lease is not its own.
+        if fenced is None or not fenced.fenced:
+            ports.lease_release(step)
 
 
 def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:

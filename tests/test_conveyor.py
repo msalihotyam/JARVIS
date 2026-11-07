@@ -5557,6 +5557,55 @@ class TestDiskGuard(Base):
         self.assertTrue(self.status()["disk_hold"])
 
 
+class TestN6Lease(Base):
+    """N6-08: the conveyor only READS build/n6/lease.json (a temp root here)."""
+
+    def lease(self, raw):
+        p = self.root / "build" / "n6" / "lease.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(raw if isinstance(raw, str) else json.dumps(raw), encoding="utf-8")
+        return p
+
+    def test_live_lease_skips_that_slice_once(self):
+        p = self.lease({"epoch": 3, "owner": "n6", "slice_id": "A", "expires": self.t + 600,
+                        "applied": []})
+        before = p.read_bytes()
+        self.drop("a.md", HDR.format("A") + "x")
+        self.drop("b.md", HDR.format("B") + "y")
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["B"])
+        skips = [e for e in self.events() if e["event"] == "n6_lease_skip"]
+        self.assertEqual([e["slice"] for e in skips], ["A"])
+        self.assertEqual(p.read_bytes(), before)  # read only, never written
+        self.t += 601  # the lease expires: A goes out unchanged
+        self.c.pass_once()
+        self.assertEqual(sorted(self.fake.bg_names()), ["A", "B"])
+
+    def test_neg_no_lease_file_dispatch_unchanged(self):
+        self.drop("a.md", HDR.format("A") + "x")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        self.assertEqual([e["event"] for e in self.events()], ["dispatch"])
+        self.assertFalse((self.root / "build" / "n6").exists())
+        self.assertEqual(self.attn(), [])
+
+    def test_neg_malformed_lease_holds_all_and_pages_once(self):
+        p = self.lease("{not json")
+        self.drop("a.md", HDR.format("A") + "x")
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])
+        self.assertEqual(self.attn(), [conveyor.N6_LEASE_ID])
+        self.assertIn(conveyor.N6_LEASE_ID, conveyor.URGENT_PAGE_IDS)
+        self.assertEqual(len([e for e in self.events() if e["event"] == "n6_lease_held"]), 1)
+        self.assertEqual(p.read_text(encoding="utf-8"), "{not json")
+        p.unlink()  # repaired: dispatch resumes, the item clears
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        self.assertEqual(self.attn(), [])
+
+
 SHA_A, SHA_B = "a1" + "0" * 38, "b2" + "0" * 38  # two integration commits stacked on ORIGIN
 
 

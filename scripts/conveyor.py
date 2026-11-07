@@ -17,6 +17,7 @@ See JARVIS_RUNBOOK.md "Konveyor".
 import calendar
 import fnmatch
 import json
+import math
 import os
 import posixpath
 import re
@@ -52,6 +53,32 @@ def real_instance_lock(fd, unlock=False):
     else:
         import fcntl
         fcntl.flock(fd, fcntl.LOCK_UN if unlock else fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+N6_HELD_ALL = "held_all"
+
+
+def n6_live_slices(path, now):
+    """N6-08 lease CHECK ONLY (jarvis/n6_lease.live_slices without importing jarvis): the
+    slice ids under a live N6 lease; N6_HELD_ALL when the file is malformed or unreadable
+    (fail closed); an empty set when there is no file. Never writes or creates anything."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return frozenset()
+    except (OSError, UnicodeError, ValueError):
+        return N6_HELD_ALL
+    if not isinstance(data, dict):
+        return N6_HELD_ALL
+    epoch, exp, applied = data.get("epoch"), data.get("expires"), data.get("applied")
+    if type(epoch) is not int or epoch < 0 or not isinstance(data.get("owner"), str) \
+            or not isinstance(data.get("slice_id"), str) or isinstance(exp, bool) \
+            or not isinstance(exp, (int, float)) or not math.isfinite(exp) \
+            or not isinstance(applied, list) or not all(
+                isinstance(p, list) and len(p) == 2 and type(p[0]) is int and isinstance(p[1], str)
+                for p in applied):
+        return N6_HELD_ALL
+    return frozenset({data["slice_id"]}) if exp > now else frozenset()
 # CONVSAFE: a pushed range touching these needs Salih's manual key 1 (never auto-approved):
 # CI, its build-time skip/allow lists, the conveyor itself and the Claude config
 PROTECTED_DIRS = (".github/workflows/", ".claude/")
@@ -183,7 +210,8 @@ BELOW_NORMAL, NORMAL = 0x4000, 0x20  # Windows priority classes of the conveyor'
 PRIORITY = {"present": BELOW_NORMAL, "away": NORMAL}
 POWER_PLANS = {"present": "JarvisWatch", "away": "JarvisFocus"}  # "{plan}" in power_switch_cmd
 POWER_SWITCH_ID = "power-switch"  # attention id (and ack file) of a failed power switch
-URGENT_PAGE_IDS = {"outage", "status_stale", POWER_SWITCH_ID}  # page Salih (+ breaker, needs_salih)
+N6_LEASE_ID = "n6-lease"  # attention id (and ack file) of an unreadable N6 lease file
+URGENT_PAGE_IDS = {"outage", "status_stale", POWER_SWITCH_ID, N6_LEASE_ID}  # page Salih (+ breaker, needs_salih)
 POWER_QUERY_TIMEOUT_S = 15  # power_switch_query_cmd; a timeout means "unreadable": no switch
 # Active plans the switch may override, by GUID (powercfg names are localized/codepage-mangled):
 # LaptopControl JarvisWatch / JarvisFocus (PowerProfileApplyService.cs ProfileSchemeGuids) and the
@@ -3006,6 +3034,16 @@ class Conveyor:
                 self.event("disk_hold", free_gb=self.free_gb and round(self.free_gb, 1))
         elif self.pager_flag("disk_low"):
             self.pager_flag("disk_low", False)
+        live = n6_live_slices(self.root / "build" / "n6" / "lease.json", self.now())
+        if live == N6_HELD_ALL:  # N6-08: fail closed, no new dispatch until the file is repaired
+            if not self.pager_flag("n6_lease_held"):
+                self.pager_flag("n6_lease_held", self.now())
+                self.event("n6_lease_held")
+            return
+        if self.pager_flag("n6_lease_held"):
+            self.pager_flag("n6_lease_held", False)
+        self.n6_live = live
+        self.n6_skipped = getattr(self, "n6_skipped", set()) & live
         if self.hold():
             return
         busy = self.busy_names(lanes, agents)
@@ -3024,6 +3062,10 @@ class Conveyor:
                 self.reject(f, why)
                 continue
             name = hdr["lane"]
+            if name in live:  # N6-08: an N6 manager owns this slice; the backlog goes on
+                held.add(f)
+                self.n6_skip(name)
+                continue
             if self.breaker and not INT_RE.match(name):
                 held.add(f)  # breaker open: no new product lane; integration/fix lanes go on
                 continue
@@ -3054,6 +3096,13 @@ class Conveyor:
             self.pager_flag("dry", False)
         elif self.pager_flag("dry") in (None, False, True):  # True: a v1 flag without a time
             self.pager_flag("dry", self.now())  # the dry episode's attention since
+
+    def n6_skip(self, sid):
+        """One n6_lease_skip event per slice per live-lease episode."""
+        skipped = self.n6_skipped = getattr(self, "n6_skipped", set())
+        if sid not in skipped:
+            skipped.add(sid)
+            self.event("n6_lease_skip", slice=sid)
 
     def started_path(self, name):
         ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.now()))
@@ -3190,6 +3239,10 @@ class Conveyor:
                 view[sid] = "breaker_open"
             elif why := self.slice_lint(s):
                 view[sid] = "held: " + why  # the lint would drop its header
+            elif sid in getattr(self, "n6_live", ()):
+                view[sid] = "n6_lease"  # N6-08: an N6 manager owns it; never dispatched meanwhile
+                if sid not in skip:
+                    self.n6_skip(sid)
             else:
                 view[sid] = "ready"
                 if sid not in skip:
@@ -3392,6 +3445,9 @@ class Conveyor:
         if low:
             items.append((DISK_ID, f"disk {self.free_gb and round(self.free_gb, 1)} GB boş "
                                    f"(< {MIN_FREE_GB}): lane başlatılmıyor", low))
+        n6 = self.pager_flag("n6_lease_held")
+        if n6:
+            items.append((N6_LEASE_ID, "build/n6/lease.json okunamıyor: yeni dispatch durdu", n6))
         for name, st in self.load_json(self.push_file, {}).items():
             items.append((name, f"push blocked: {st['reason']}", st["since"]))
         # ponytail: acked rejects stay in pager.json (a few bytes each); prune if it ever grows

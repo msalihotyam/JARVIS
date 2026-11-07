@@ -1513,6 +1513,7 @@
   "tests.test_work_controls.ControlTests": 0.0,
   "tests.test_work_controls.RevisionAndWatchdogTests": 0.0,
   "tests.test_work_driver.DriverMatrixTest": 0.028,
+  "tests.test_n6_lease.N6LeaseTest": 0.05,
   "tests.test_work_evidence.EvidenceReceiptTests": 0.001,
   "tests.test_work_lease.WorkLeaseTest": 5.913,
   "tests.test_work_ledger.DependencyTests": 0.0,

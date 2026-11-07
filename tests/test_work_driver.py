@@ -1,8 +1,13 @@
 """PM24 fake-worker matrix: no process, database, network or wall clock."""
 
+import json
+import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 
+from jarvis import n6_lease
+from jarvis.n6_lease import Fenced
 from jarvis.work_checks import CheckResult
 from jarvis.work_driver import drive
 from jarvis.work_ledger import (
@@ -437,6 +442,68 @@ class DriverMatrixTest(unittest.TestCase):
         self.assertIs(run.state, RunState.NEEDS_INPUT)
         self.assertEqual(ports.points(), ["slice_started", "needs_input", "slice_started", "slice_accepted"])
 
+
+class LeasedPorts(FakePorts):
+    """FakePorts whose claim is a real N6 lease file in a temp dir (explicit clock)."""
+
+    def __init__(self, workers, path, owner="mgr-a", **script):
+        super().__init__(workers, **script)
+        self.path, self.owner, self.now_s, self.takeover, self.cut = path, owner, 1000.0, False, None
+
+    def lease_claim(self, step):
+        lease = n6_lease.acquire(self.path, self.owner, step.slug, 60, self.now_s)
+        if lease is None:
+            raise Fenced(f"{step.slug} is leased by another manager")
+        self.log.append(("claim", step.slug))
+        return lease
+
+    def lease_check(self, lease):
+        return n6_lease.check(self.path, lease, self.now_s)
+
+    def lease_release(self, step):
+        self.log.append(("release", step.slug))
+
+    def stage_create(self, step):
+        if self.takeover:  # the lease expires mid-slice and a second manager takes it
+            self.now_s += 61
+            self.cut = len(self.log)
+            self.other = n6_lease.acquire(self.path, "mgr-b", step.slug, 60, self.now_s)
+        return "stage"
+
+
+class LeaseFencingTest(unittest.TestCase):
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.path = Path(tmp.name) / "n6" / "lease.json"
+
+    def test_neg_two_managers_exactly_one_wins(self):
+        n6_lease.acquire(self.path, "mgr-b", "a", 60, 1000.0)
+        ports = LeasedPorts({"a": [result()]}, self.path)
+        with self.assertRaises(Fenced):
+            run_drive(ports)
+        self.assertEqual([e for e in ports.log if e[0] in ("event", "notify", "start", "release")], [])
+        self.assertEqual(json.loads(self.path.read_text())["owner"], "mgr-b")
+
+    def test_neg_stale_epoch_write_refused(self):
+        ports = LeasedPorts({"a": [result()]}, self.path)
+        ports.takeover = True
+        with self.assertRaises(Fenced):
+            run_drive(ports)
+        self.assertEqual(ports.other.epoch, 2)
+        after = ports.log[ports.cut:]
+        self.assertEqual([e for e in after if e[0] in ("event", "notify", "release")], [])
+        self.assertEqual(json.loads(self.path.read_text())["owner"], "mgr-b")
+
+    def test_every_write_carries_the_epoch_and_the_lease_is_released(self):
+        ports = LeasedPorts({"a": [result()]}, self.path)
+        run, steps = run_drive(ports)
+        self.assertIs(steps["a"].state, StepState.ACCEPTED)
+        events = [e for e in ports.log if e[0] == "event" and e[2] is not None]  # slice-scoped
+        self.assertTrue(events)
+        self.assertTrue(all(e[3]["epoch"] == 1 for e in events))
+        rel = ports.log.index(("release", "a"))
+        self.assertEqual([e for e in ports.log[rel:] if e[0] == "event" and e[2] is not None], [])
 
 if __name__ == "__main__":
     unittest.main()
