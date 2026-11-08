@@ -1404,6 +1404,7 @@
   "tests.test_trusted_exec.SpawnShapeTests": 0.039,
   "tests.test_trusted_exec.WorkspaceShadowTests": 0.01,
   "tests.test_tuicrash.BridgeReleaseTests": 0.397,
+  "tests.test_type_gate.TypeGateTests": 0.2,
   "tests.test_ui.AttachmentUiTests": 2.171,
   "tests.test_ui.AuthorityTests": 8.265,
   "tests.test_ui.BootstrapTests": 4.187,
