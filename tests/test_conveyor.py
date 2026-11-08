@@ -6958,6 +6958,23 @@ class TestConvHeal(AutopilotBase):
         for n in names:
             self.assertIn(n, self.attn())
 
+    def blocked_three(self, names):
+        (self.base / "pace.json").write_text(json.dumps({**conveyor.PACE_DEFAULTS, "max_lanes": 6}), encoding="utf-8")
+        for i, n in enumerate(names):
+            self.lane(n, age=i)
+        self.c.pass_once()
+        for n in names:
+            self.report(n, "BLOCKED", where=n, mtime=self.t)
+        self.t += 60
+        self.c.pass_once()
+        return self.status()["breaker"]
+
+    def test_clrev_blocked_three_times_is_a_finding_not_a_breaker_count(self):
+        self.assertEqual(self.blocked_three(["CLREV-X", "CLREV-Y", "CLREV1"]), "closed")
+
+    def test_code_lane_blocked_three_times_still_opens_the_breaker(self):
+        self.assertNotEqual(self.blocked_three(["A1", "B2", "C3"]), "closed")
+
     def test_stuck_inbox_prompt_does_not_block_the_rest(self):
         start = self.c.start
         self.c.start = lambda name, *a, **kw: None if name == "X" else start(name, *a, **kw)
@@ -8763,6 +8780,65 @@ class TestChain(AutopilotBase):
         (approvals / f"push-{SHA_B}-int-src").write_text("orchestrator\n", encoding="utf-8")
         self.c.pass_once()
         self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{SHA_B}:refs/heads/main"]])
+
+    def stale_green(self):  # CONVCHAIN3: main moved under a GREEN chain INT
+        self.cand()
+        self.start(**self.T2_CHAIN)
+        for name in ("SRC", "CLREV-SRC", "CDX-SRC"):
+            self.finish(name, "PASS", extra={"SRC": self.PICK, "CLREV-SRC": self.REVPICK, "CDX-SRC": self.CDXPICK}[name])
+        self.finish("INT-SRC", "CI_PENDING", f"CANDIDATE SHA: {SHA_B}\nCI: pushed ci/int-src, run in progress\n")
+        self.git.ci(SHA_B)
+        self.git.origin = self.git.main = SHA_C
+        self.c.pass_once()
+
+    def reruns(self):
+        return [e for e in self.events() if e["event"] == "chain" and e.get("step") == "INT-RERUN"]
+
+    def test_stale_green_chain_int_dispatches_one_rerun_with_its_picks_on_the_new_main(self):
+        self.stale_green()
+        self.assertIn("INT-SRC-R1", self.ids())
+        old = self.prompt("INT-SRC").read_text(encoding="utf-8")
+        new = self.prompt("INT-SRC-R1").read_text(encoding="utf-8")
+        self.assertIn("lane=INT-SRC-R1", new.split("\n", 1)[0])
+        self.assertIn(f"base={SHA_C}", new.split("\n", 1)[0])
+        self.assertIn(self.SHA, new)
+        self.assertEqual(new.split("\n", 1)[1], old.split("\n", 1)[1].replace("INT-SRC", "INT-SRC-R1")
+                         .replace("int-src", "int-src-r1").replace(old.split("base=")[1][:40], SHA_C))
+        (r1,) = [s for s in self.state()["chain_slices"] if s["id"] == "INT-SRC-R1"]
+        (src,) = [s for s in self.state()["chain_slices"] if s["id"] == "INT-SRC"]
+        self.assertEqual(r1["files"], src["files"])
+        self.assertEqual(self.lanes()["INT-SRC"]["rerun"], "INT-SRC-R1")
+        self.assertEqual(len(self.reruns()), 1)
+        self.assertEqual((self.git.pushes(), self.approvals()), ([], []))
+        self.c.pass_once()
+        self.assertEqual(len(self.reruns()), 1)
+        self.assertNotIn("INT-SRC-R2", self.ids())
+        why, approval, url = self.c.approval_for("INT-SRC-R1", {}, {}, self.state())
+        self.assertIn(conveyor.CHAIN_KEY1, why)
+        self.assertEqual((approval, url), (None, None))
+
+    def test_fast_forward_green_chain_int_gets_no_rerun(self):
+        self.to_green()
+        self.assertNotIn("INT-SRC-R1", self.ids())
+        self.assertEqual(self.reruns(), [])
+
+    def test_third_rerun_is_refused_and_becomes_attention(self):
+        self.stale_green()
+        ap = self.state()
+        ap["chain_slices"].append({**ap["chain_slices"][-1], "id": "INT-SRC-R2"})
+        ln = {"ci": {"sha": SHA_B, "cand": True}}
+        self.assertTrue(self.c.chain_int_rerun("INT-SRC-R2", ln, ap))
+        self.assertIn("already had 2 reruns", ln["auto_refused"])
+        self.assertNotIn("INT-SRC-R3", [s["id"] for s in ap["chain_slices"]])
+        self.assertFalse(self.prompt("INT-SRC-R3").exists())
+        self.assertEqual(self.git.pushes(), [])
+
+    def test_approval_name_refusal_names_the_expected_file(self):
+        self.cand()
+        self.git.main = SHA_B
+        lanes = {"INT125-R": {"status": "GREEN", "ci": {"sha": SHA_B, "branch": "ci/int125-2", "cand": True}}}
+        why = self.c.push_checks(f"push-{SHA_B}-int125", lanes)[0]
+        self.assertIn(f"push-{SHA_B}-int125-2", why)
 
     def test_approval_for_refuses_every_chain_int_form_and_malformed_state(self):
         rec = {"steps": ["CLREV-SRC", "INT-SRC"], "at": 1}
