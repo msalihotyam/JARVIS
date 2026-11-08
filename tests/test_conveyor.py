@@ -9046,6 +9046,103 @@ class TestChain(AutopilotBase):
         self.assertIn("JARVIS_NTFY_TOPIC= codex exec", cdx)
         self.assertNotIn("powershell -", cdx)
 
+    # ---- CONVCHAIN2: a stacked FIX slice chains its re-reviews and one INT of every stacked pick ----
+    S1, S2, RB = "d" * 40, "e" * 40, "f" * 40
+    STACK = {"stack": [S1, S2], "review_base": RB, "files": ["scripts/a.py", "scripts/b.py", "tests/t.py"]}
+
+    def stacked(self, sha_parent=None):
+        """RB -> S1 -> S2 -> SHA, one file each, and the two stack lanes' reports naming S1 and S2."""
+        keys = {}
+        for c, p, f in ((self.S1, self.RB, "scripts/b.py"), (self.S2, self.S1, "tests/t.py"),
+                        (self.SHA, sha_parent or self.S2, "scripts/a.py")):
+            keys[self.PIN + ("rev-parse", "--verify", "--quiet", f"{c}^{{commit}}")] = (0, c + "\n")
+            keys[("git", "merge-base", "--is-ancestor", c, ORIGIN)] = (1, "")
+            keys[self.PIN + ("rev-list", "--parents", "-n", "1", c)] = (0, f"{c} {p}\n")
+            keys[self.PIN + ("diff", "--name-only", "--ignore-submodules=none", "--no-renames", "-z", f"{c}^", c)] = (0, f + "\0")
+        self.git.fail = {**keys, **self.git.fail}  # first match wins: these before the generic keys
+        lanes = {}
+        for n, c in (("FIXA", self.S1), ("FIXB", self.S2)):
+            self.report(n, "PASS", extra=f"COMMIT: {c}\n")
+            lanes[n] = {"finished": True, "status": "PASS",
+                        "report": str(self.root / ".claude/worktrees/wt/build/reports" / f"{n}.md")}
+        return lanes
+
+    def test_stacked_fix_pass_dispatches_clrev_over_review_base_to_the_fix(self):
+        why, ap = self.direct(self.stacked(), **self.STACK)
+        self.assertIsNone(why)
+        self.assertEqual(self.ids() or [x["id"] for x in ap["chain_slices"]], ["CLREV-SRC"])
+        text = self.prompt("CLREV-SRC").read_text(encoding="utf-8")
+        self.assertIn(f"Review ONLY the diff {self.RB}..{self.SHA}", text)
+        self.assertNotIn(f"{self.SHA}^..", text)
+        self.assertIn(f"{self.S1} build/reports/FIXA.md; {self.S2} build/reports/FIXB.md", text)
+        self.no_authority()
+
+    def test_stacked_neg_a_stack_commit_without_its_report_is_refused(self):
+        lanes = self.stacked()
+        del lanes["FIXB"]
+        why, ap = self.direct(lanes, **self.STACK)
+        self.assertEqual(why, f"no single report names stack commit {self.S2[:7]}")
+        self.assertNotIn("chain_slices", ap)
+        self.assertFalse(self.prompt("CLREV-SRC").exists())
+
+    def test_stacked_neg_a_broken_parent_chain_is_refused(self):
+        why, ap = self.direct(self.stacked(sha_parent=self.S1), **self.STACK)
+        self.assertEqual(why, f"{self.SHA[:7]} is not the next stacked commit on {self.S2[:7]}")
+        self.assertNotIn("chain_slices", ap)
+
+    def test_stacked_neg_validation_fails_closed(self):
+        base = {"id": "SRC", "title": "t", "model": "opus", "effort": "high",
+                "prompt": "build/conveyor/prompts/SRC.md", **self.T2_CHAIN, **self.STACK}
+        self.assertIsNone(conveyor.validate_slice(base))
+        self.assertIsNone(conveyor.validate_slice({**base, "tier": "T1", "chain": ["CLREV", "INT"]}))
+        for stack in ([self.S1[:7], self.S2], [], self.S2, [self.S1, self.S1], [self.S1, None], ["g" * 40]):
+            with self.subTest(stack=stack):
+                self.assertEqual(conveyor.validate_slice({**base, "stack": stack}), "bad stack")
+        for rb in (self.RB[:7], "main", self.S1, None, 1):
+            with self.subTest(rb=rb):
+                self.assertEqual(conveyor.validate_slice({**base, "review_base": rb}), "bad review_base")
+        no_rb = dict(base)
+        del no_rb["review_base"]
+        self.assertEqual(conveyor.validate_slice(no_rb), "bad review_base")
+        self.assertIn("CDX", conveyor.validate_slice({**base, "chain": ["CLREV", "INT"]}) or "")  # T2 needs CDX
+        self.assertIn("stacked", conveyor.validate_slice({**base, "tier": "T1", "chain": ["CLREV"]}) or "")
+
+    def test_stacked_neg_lint_needs_base_main_and_base_at_the_last_stack_sha(self):
+        s = {"id": "SRC", **self.T2_CHAIN, **self.STACK}
+        body = "TASK SRC\n" + "".join(f"{f} (new)\n" for f in s["files"])
+        for base, at, want in (("main", self.S2, None), (self.git.main, self.S2, "base=main"),
+                               ("main", self.S1, "BASE AT"), ("main", None, "BASE AT")):
+            with self.subTest(base=base, at=at):
+                text = f"@jarvis lane=SRC model=sonnet effort=medium base={base}\n{body}" + (f"BASE AT {at}\n" if at else "")
+                why = conveyor.lint_slice(s, text, lambda p: True, set()) or ""
+                if want:
+                    self.assertIn(want, why)
+                else:
+                    self.assertNotIn("stacked", why)
+
+    def test_stacked_neg_a_review_finding_or_non_pass_refuses(self):
+        for name, ln_kw, want in (("CLREV-SRC", {"extra": self.REVPICK + "F1 MAJOR: broken\n"}, "report has a finding line"),
+                                  ("CLREV-SRC", {"status": "BLOCKED"}, "did not PASS naming"),
+                                  ("CLREV-SRC", {"extra": f"COMMIT: {self.S2}\nFINDINGS: none\n"}, "did not PASS naming")):
+            with self.subTest(ln_kw=ln_kw):
+                lanes = {**self.stacked(), name: self.step_ln(name, **ln_kw)}
+                why, ap = self.direct(lanes, done=(name,), **self.STACK)
+                self.assertIn(want, why or "")
+                self.assertNotIn("chain_slices", ap)
+
+    def test_stacked_int_picks_the_stack_then_the_fix_onto_the_current_main_with_the_union(self):
+        lanes = {**self.stacked(), "CLREV-SRC": self.step_ln("CLREV-SRC"), "CDX-SRC": self.step_ln("CDX-SRC")}
+        why, ap = self.direct(lanes, done=("CLREV-SRC", "CDX-SRC"), **self.STACK)
+        self.assertIsNone(why)
+        self.assertEqual(ap["chain_slices"][-1]["id"], "INT-SRC")
+        text = self.prompt("INT-SRC").read_text(encoding="utf-8")
+        self.assertIn(f"cand/int-src {ORIGIN}; git cherry-pick {self.S1} {self.S2} {self.SHA} "
+                      "(these commits in this order, each its own commit, never merge).", text)
+        self.assertNotIn("one commit, never merge", text)
+        self.assertIn("scripts/a.py, scripts/b.py, tests/t.py", text)
+        self.assertIn(conveyor.CHAIN_MARK, text)  # key 1 stays the orchestrator's
+        self.no_authority()
+
     # ---- CONVCHAIN1FIXD: the review gate reads an allowlist of exact machine lines ----
     NEED_NONE = 'report needs exactly one "FINDINGS: none" line'
 
