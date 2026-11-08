@@ -354,6 +354,82 @@ class N6RefcheckTests(unittest.TestCase):
         for word in ("sqlite3", "jarvis.db", "subprocess", "open("):
             self.assertNotIn(word, src)
 
+    # --- N6-15FIX3 ---------------------------------------------------------------------
+    def test_neg_cdxn615r2_crlf_blank_line_cannot_hide_a_pick(self):
+        # F1 (CDXN615R2), verbatim shape: a CRLF blank line used to end the block early.
+        for eol in ("\r\n", "\r", "\r\r\n", " \t\r\n"):
+            report = f"RUN_ID: r1\r\nPICKS:\r\n  {SRC1} -> {NEW1} N6-12\r\n{eol}  {SRC2} N6-13 garbage\r\n"
+            with self.subTest(eol=eol), self.assertRaisesRegex(RefCheckError, "malformed pick line"):
+                parse_picks(report)
+            with self.subTest(eol=eol, via="read_evidence"), self.assertRaisesRegex(RefCheckError, "malformed pick line"):
+                _read(FakeGit([HEAD, HEAD]), report=report, run_id="r1")
+
+    def test_neg_crlf_pick_after_blank_line_still_patch_id_checked(self):
+        report = GOOD.replace(f"\n  {SRC2}", f"\n\n  {SRC2}").replace("\n", "\r\n")
+        git = FakeGit([HEAD, HEAD], {SRC1: PID1, NEW1: PID1, SRC2: PID2, NEW2: PID1})
+        with self.assertRaisesRegex(RefCheckError, f"N6-13 {SRC2}->{NEW2}: patch-id differs"):
+            _read(git, report=report)
+
+    def test_neg_other_line_separators_refused(self):
+        # str.splitlines() breaks on these but PICKS_RE does not: at a line start one would
+        # end the block and hide an indented-looking pick, so the boundary refuses them all.
+        for sep in ("\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", " ", " "):
+            report = GOOD.replace(f"\n  {SRC2}", f"{sep}  {SRC2}")
+            with self.subTest(sep=sep), self.assertRaisesRegex(RefCheckError, "line separator other than CR/LF"):
+                _read(FakeGit([HEAD, HEAD]), report=report)
+            with self.subTest(sep=sep, via="parse_picks"), self.assertRaisesRegex(RefCheckError, "other than CR/LF"):
+                parse_picks(report)
+
+    def test_neg_cr_split_second_run_id_line_counted(self):
+        report = GOOD.replace("RUN_ID: run-2026-11-08.1\n", "RUN_ID: run-2026-11-08.1\rRUN_ID: run-other\n")
+        with self.assertRaisesRegex(RefCheckError, "exactly one RUN_ID"):
+            _read(FakeGit([HEAD, HEAD]), report=report)
+
+
+def _eol(text: object, ends: tuple[str, ...]) -> object:
+    """``text`` with its LF line ends replaced by ``ends`` in turn; non-str (and str
+    subclasses) unchanged so the type checks see exactly what the base test passes."""
+    if type(text) is not str:
+        return text
+    parts = text.split("\n")
+    return parts[0] + "".join(ends[i % len(ends)] + p for i, p in enumerate(parts[1:]))
+
+
+class _EolVariant(N6RefcheckTests):
+    """Every test above, rerun with each report's line ends rewritten: same verdicts."""
+
+    ENDS: tuple[str, ...] = ()
+
+    def setUp(self) -> None:
+        super().setUp()
+        real_parse, real_read = parse_picks, read_evidence
+
+        def parse(report: object) -> object:
+            return real_parse(_eol(report, self.ENDS))  # pyright: ignore[reportArgumentType]
+
+        def read(git: object, ref: object, read_report, run_id: object) -> object:
+            return real_read(git, ref, lambda: _eol(read_report(), self.ENDS), run_id)  # pyright: ignore[reportArgumentType]
+
+        for name, fake in (("parse_picks", parse), ("read_evidence", read)):
+            patcher = mock.patch(f"{__name__}.{name}", fake)
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
+
+class N6RefcheckCrlfTests(_EolVariant):
+    ENDS = ("\r\n",)
+
+
+class N6RefcheckCrTests(_EolVariant):
+    ENDS = ("\r",)
+
+
+class N6RefcheckMixedEolTests(_EolVariant):
+    ENDS = ("\r\n", "\r", "\n")
+
+
+del _EolVariant  # the base runs only through its subclasses
+
 
 if __name__ == "__main__":
     unittest.main()

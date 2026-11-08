@@ -22,6 +22,7 @@ from typing import Protocol
 
 # Copied verbatim from scripts/orchbot.py (PICKS_RE / PICK_TOK_RE): refcheck must see at
 # least every line orchbot treats as a pick, blank lines inside the block included.
+# Both are LF-only, so every report is _lf()-normalized once before any parsing.
 PICKS_RE = re.compile(r"(?m)^PICKS\b([^\n]*)(?:\n|$)((?:(?:[ \t]*\n)*[ \t]+\S.*(?:\n|$))*)")
 PICK_TOK_RE = re.compile(r"\b[A-Z][A-Z0-9_-]{1,63}\b")
 
@@ -35,6 +36,7 @@ _WORD_SPLIT_RE = re.compile(r"[ \t()]+")  # lane labels are whole words: bare or
 _SEAL = object()  # held only by read_evidence: a caller-built Evidence cannot carry it
 _RUN_LINE_RE = re.compile(r"(?m)^[ \t]*RUN_ID\b.*$")  # an indented second RUN_ID counts too
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
+_OTHER_EOL_RE = re.compile("[\x0b\x0c\x1c-\x1e\x85  ]")
 _REF_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}")
 
 
@@ -75,11 +77,21 @@ def _full_sha(value: object, what: str) -> str:
     return value
 
 
+def _lf(report: str) -> str:
+    """The input boundary: CRLF and lone CR become LF (as universal-newline reads do), so a
+    CRLF blank line cannot end the PICKS block early and hide the picks after it. Any other
+    separator str.splitlines() honours (\\v \\f \\x1c-\\x1e \\x85 U+2028 U+2029) is refused: at a
+    line start it would end the block and hide an indented-looking pick."""
+    if _OTHER_EOL_RE.search(report):
+        raise RefCheckError("report holds a line separator other than CR/LF")
+    return report.replace("\r\n", "\n").replace("\r", "\n")
+
+
 def _check_run_id(report: str, run_id: str) -> None:
     lines = _RUN_LINE_RE.findall(report)
     if len(lines) != 1:
         raise RefCheckError(f"report needs exactly one RUN_ID line, found {len(lines)}")
-    m = re.fullmatch(r"RUN_ID:[ \t]*(\S+)[ \t]*\r?", lines[0])
+    m = re.fullmatch(r"RUN_ID:[ \t]*(\S+)[ \t]*", lines[0])
     if m is None or not _RUN_ID_RE.fullmatch(m.group(1)):
         raise RefCheckError(f"malformed RUN_ID line: {lines[0][:80]!r}")
     if m.group(1) != run_id:
@@ -118,6 +130,7 @@ def parse_picks(report: str) -> tuple[Pick, ...]:
     report_ok: object = report
     if type(report_ok) is not str:
         raise RefCheckError("report is not text")
+    report = _lf(report)  # idempotent: read_evidence already normalized it
     blocks = PICKS_RE.findall(report)
     if len(blocks) != 1:
         raise RefCheckError(f"report needs exactly one PICKS block, found {len(blocks)}")
@@ -125,7 +138,6 @@ def parse_picks(report: str) -> tuple[Pick, ...]:
     lines = [header.partition(":")[2], *body.split("\n")]
     picks: list[Pick] = []
     for line in lines:
-        line = line.rstrip("\r")
         if not line.strip():
             continue
         picks.append(_parse_pick_line(line))
@@ -178,6 +190,7 @@ def read_evidence(git: GitPort, ref: str, read_report: Callable[[], object], run
         raise RefCheckError(f"torn read: {ref} moved {before} -> {after} during the evidence read")
     if type(report) is not str or not report:
         raise RefCheckError("torn or empty report read")
+    report = _lf(report)
     _check_run_id(report, run_id)
     picks = parse_picks(report)
     verify_picks(git, picks)
