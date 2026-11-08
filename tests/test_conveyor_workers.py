@@ -1,4 +1,5 @@
 """WORKERADAPT: the codex worker adapter with a FAKE codex exe; no model, network or auth call."""
+import hashlib
 import importlib.util
 import json
 import os
@@ -158,6 +159,13 @@ class CodexWorkerTest(unittest.TestCase):
         self.root = Path(tmp.name) / "repo"
         self.wt = self.root / ".claude" / "worktrees" / "CDXA"
         self.wt.mkdir(parents=True)
+        # CODEXTOOLS2: a fake ruff.exe pinned by its own sha256; never the real binary
+        self.tools = self.root.resolve() / "build" / "conveyor" / "tools"
+        self.tools.mkdir(parents=True)
+        (self.tools / "ruff.exe").write_bytes(b"fake ruff")
+        pin = mock.patch.object(workers, "RUFF_SHA256", hashlib.sha256(b"fake ruff").hexdigest())
+        pin.start()
+        self.addCleanup(pin.stop)
         self.t = T0
         self.procs = []
         self.state = self.fresh()
@@ -231,9 +239,7 @@ class CodexWorkerTest(unittest.TestCase):
                              "CODEX_PROVIDER": "p", "Openai_Api_Key": "sk-y"})
         self.w.start("CDXA", self.wt, "@jarvis lane=CDXA\nDo it.\n")
         env = self.procs[0].kw["env"]
-        path = sanitized_path(self.environ)
-        self.assertEqual(env, {"CODEX_HOME": "C:/codex-home", **({"PATH": path} if path else {}),
-                               **self.sandbox()})
+        self.assertEqual(env, {"CODEX_HOME": "C:/codex-home", "PATH": self.path(), **self.sandbox()})
         for v in self.sandbox().values():
             self.assertTrue(Path(v).is_dir())
             self.assertTrue(Path(v).is_relative_to(self.wt.resolve()))
@@ -311,9 +317,7 @@ class CodexWorkerTest(unittest.TestCase):
                                   "--sandbox", "workspace-write", "-"])
         # no key, base URL, org or provider override reaches the child; the login home stays
         # allowlist (jarvis/codex.py route): PATH keeps only real, trusted directories
-        path = sanitized_path(self.environ)
-        self.assertEqual(p.kw["env"], {"CODEX_HOME": "C:/codex-home", **({"PATH": path} if path else {}),
-                                       **self.sandbox()})
+        self.assertEqual(p.kw["env"], {"CODEX_HOME": "C:/codex-home", "PATH": self.path(), **self.sandbox()})
         self.assertEqual(p.kw["cwd"], str(self.wt))
         self.assertEqual(p.stdin_text, "@jarvis lane=CDXA\nDo it.\n")
         log = self.root / "build" / "conveyor" / "codex" / "CDXA.jsonl"
@@ -444,6 +448,112 @@ class CodexWorkerTest(unittest.TestCase):
             with self.assertRaises(FileNotFoundError):
                 w.start("CDXA", self.wt, "x")
         self.assertEqual(self.procs, [])
+
+    def path(self, environ=None):
+        path = sanitized_path(self.environ if environ is None else environ)
+        return f"{path}{os.pathsep}{self.tools}" if path else str(self.tools)
+
+    def assert_tools_refused(self, started=0):
+        # CODEXTOOLS2: fail closed with one clear error, before anything is written or started
+        with self.assertRaisesRegex(OSError, "^codex tools: "):
+            self.w.start("CDXA", self.wt, "@jarvis lane=CDXA\nDo it.\n")
+        self.assertEqual(len(self.procs), started)
+        if started:
+            return
+        self.assertFalse((self.wt / ".codex-tmp").exists())
+        self.assertFalse((self.root / "build" / "conveyor" / "codex" / "CDXA.prompt.md").exists())
+
+    def test_tools_dir_is_appended_last_never_prepended(self):
+        for environ in ({**self.environ, "Path": "C:/bin"}, {"path": "C:/bin;C:/other"}, {}):
+            with self.subTest(environ=environ):
+                self.w.environ = environ
+                self.w.start("CDXA", self.wt, "x")
+                env = self.procs[-1].kw["env"]
+                self.assertEqual([k for k in env if k.upper() == "PATH"], ["PATH"])
+                parts = env["PATH"].split(os.pathsep)
+                self.assertEqual(parts[-1], str(self.tools))
+                self.assertNotIn(str(self.tools), parts[:-1])  # never first, never twice
+                self.assertTrue(Path(parts[-1]).is_absolute())
+                self.assertEqual(env["PATH"], self.path(environ))
+
+    def test_ruff_hash_mismatch_refuses_start(self):
+        (self.tools / "ruff.exe").write_bytes(b"evil ruff")
+        self.assert_tools_refused()
+
+    def test_ruff_hash_is_rechecked_at_every_start(self):
+        self.w.start("CDXA", self.wt, "x")
+        (self.tools / "ruff.exe").write_bytes(b"swapped after the first start")
+        self.assert_tools_refused(started=1)
+
+    def test_real_pin_refuses_a_fake_binary(self):
+        with mock.patch.object(workers, "RUFF_SHA256",
+                               "bd38bcef24863ae54a2abb5a0cc33446ef1ed6f1385b60bf6329fcbbce0a105a"):
+            self.assert_tools_refused()
+
+    def test_missing_ruff_or_tools_dir_refuses_start(self):
+        (self.tools / "ruff.exe").unlink()
+        self.assert_tools_refused()
+        shutil.rmtree(self.root / "build")
+        self.assert_tools_refused()
+
+    def test_ruff_outside_build_conveyor_tools_refuses_start(self):
+        # a correct binary anywhere else (root, worktree, its .codex-tmp) is never used
+        good = (self.tools / "ruff.exe").read_bytes()
+        shutil.rmtree(self.tools)
+        for d in (self.root / "tools", self.root / "build" / "tools", self.wt / "bin"):
+            d.mkdir(parents=True)
+            (d / "ruff.exe").write_bytes(good)
+        self.assert_tools_refused()
+
+    def test_ruff_that_is_not_a_plain_single_link_file_refuses_start(self):
+        ruff = self.tools / "ruff.exe"
+        os.link(ruff, self.root / "other.exe")  # a hard link: nlink 2
+        self.assert_tools_refused()
+        ruff.unlink()
+        ruff.mkdir()  # a directory named ruff.exe
+        self.assert_tools_refused()
+        ruff.rmdir()
+        self.symlink(ruff, self.root / "other.exe")  # last: no symlink right skips only it
+        self.assert_tools_refused()
+
+    def plant_dirs(self, link, target):
+        plants = []
+        if sys.platform == "win32":
+            import _winapi
+            plants.append(lambda: _winapi.CreateJunction(str(target), str(link)))
+        plants.append(lambda: self.symlink(link, target, target_is_directory=True))
+        return plants  # the symlink last: no symlink right skips only it
+
+    def test_tools_dir_link_or_junction_refuses_start(self):
+        outside = self.root.parent / "outside-tools"
+        shutil.copytree(self.tools, outside)  # a valid pinned ruff.exe, just elsewhere
+        shutil.rmtree(self.tools)
+        for plant in self.plant_dirs(self.tools, outside):
+            plant()
+            self.assert_tools_refused()
+            os.rmdir(self.tools)  # removes the link only
+        self.assertTrue((outside / "ruff.exe").is_file())
+
+    def test_linked_parent_of_tools_refuses_start(self):
+        conveyor_dir = self.root / "build" / "conveyor"
+        outside = self.root.parent / "outside-conveyor"
+        shutil.copytree(conveyor_dir, outside)
+        shutil.rmtree(conveyor_dir)
+        for plant in self.plant_dirs(conveyor_dir, outside):
+            plant()
+            self.assert_tools_refused()
+            os.rmdir(conveyor_dir)
+
+    def test_argv_is_unchanged_by_the_tools_path(self):
+        self.w.start("CDXA", self.wt, "x")
+        argv = self.procs[0].argv
+        self.assertEqual(argv, ["fake-codex.exe", "exec", "--json", *FLAGS, "-C", str(self.wt),
+                                "--sandbox", "workspace-write", "-"])
+        self.assertNotIn("--add-dir", argv)
+        self.assertEqual(argv.count("-c"), 2)
+        self.assertNotIn(str(self.tools), " ".join(argv))
+        with self.assertRaises(ValueError):
+            check_argv([*argv[:-1], "--add-dir", str(self.tools), "-"], worktree=self.wt)
 
 
 class WorkerFieldTest(unittest.TestCase):

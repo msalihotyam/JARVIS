@@ -25,8 +25,7 @@ Running checks as a Codex lane (the sandbox writes only your worktree; the conve
 TMP, TMPDIR and the uv/ruff/pip caches at `<worktree>/.codex-tmp`, which is never committed):
 
 - Tests: `python -m unittest <modules>`. NOT `scripts/test_parallel.py` (it locks in the main checkout).
-- Lint: `python -m ruff check --select E4,E7,E9,F <files>` if ruff is installed, else
-  `uvx ruff@0.16.0 check --select E4,E7,E9,F <files>`.
+- Lint with the pinned ruff on your PATH: `ruff check --select E4,E7,E9,F <touched files>`; on WinError 10013 / PermissionError in tests report `socket-blocked`, never retry or weaken the test.
 - Never write outside your worktree. Test data files go under `tests/fixtures/` (`tests/data/` is
   git-ignored by the `data/` rule).
 

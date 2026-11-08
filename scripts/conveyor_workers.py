@@ -15,6 +15,7 @@ a REST session on the GitHub repo in Google's Linux VM that ends in a PR. Only s
 flagged `linux_ok` (no UI/Windows tests) go there; collect() fetches the PR head and
 checks base and files itself, Jules' own claims are never read.
 """
+import hashlib
 import json
 import os
 import re
@@ -160,6 +161,48 @@ def sandbox_env(env, worktree):
         raise
     out = {k: v for k, v in env.items() if k.upper() not in SANDBOX_DIRS}
     out.update({k: str(base / sub) for k, sub in SANDBOX_DIRS.items()})
+    return out
+
+
+# CODEXTOOLS2: ruff 0.16.0 x86_64-pc-windows-msvc (build/conveyor/tools/PROVENANCE.txt),
+# read and executed by the mxc sandbox from the main checkout (step 0 probe); never written.
+TOOLS_DIR = "build/conveyor/tools"
+RUFF_SHA256 = "bd38bcef24863ae54a2abb5a0cc33446ef1ed6f1385b60bf6329fcbbce0a105a"
+
+
+def tools_dir(root):
+    """The absolute <root>/build/conveyor/tools when it is a real directory (no link or
+    junction anywhere in build/conveyor/tools) holding a plain, single-link ruff.exe whose
+    sha256 is RUFF_SHA256; otherwise raise OSError (fail closed: the lane does not start)."""
+    base = Path(root).resolve(strict=True)
+    tools = base / TOOLS_DIR
+    try:
+        real = tools.resolve(strict=True)
+        st = os.lstat(tools / "ruff.exe")
+    except OSError as e:
+        raise OSError(f"codex tools: {tools} or its ruff.exe is missing") from e
+    if real != tools or not stat.S_ISDIR(os.lstat(tools).st_mode) \
+            or getattr(os.lstat(tools), "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        raise OSError(f"codex tools: {tools} is a link or junction or not a directory")
+    if not stat.S_ISREG(st.st_mode) or st.st_nlink > 1 \
+            or getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+        raise OSError("codex tools: ruff.exe is a link or not a plain file")
+    h = hashlib.sha256()
+    with open(tools / "ruff.exe", "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    if h.hexdigest() != RUFF_SHA256:
+        raise OSError(f"codex tools: ruff.exe sha256 {h.hexdigest()} is not the pinned {RUFF_SHA256}")
+    return tools
+
+
+def append_path(env, directory):
+    """env with `directory` APPENDED to PATH (last, so it never shadows python or git);
+    a PATH key of any case is folded into one "PATH"."""
+    keys = [k for k in env if k.upper() == "PATH"]
+    old = env[keys[0]] if keys else ""
+    out = {k: v for k, v in env.items() if k.upper() != "PATH"}
+    out["PATH"] = f"{old}{os.pathsep}{directory}" if old else str(directory)
     return out
 
 
@@ -322,8 +365,11 @@ class CodexWorker:
     def start(self, name, worktree, text):
         """Start `codex exec` in `worktree` with the prompt on stdin and a scrubbed
         environment; the --json events go to build/conveyor/codex/<name>.jsonl.
-        Returns "codex-<pid>"; raises on failure."""
+        Returns "codex-<pid>"; raises on failure, before anything is written when the
+        pinned ruff in build/conveyor/tools does not check out (CODEXTOOLS2)."""
         argv = self.argv(worktree)
+        tools = tools_dir(self.root)  # re-checked at every start
+        env = append_path(sandbox_env(scrubbed_env(self.environ), worktree), tools)
         self.log_dir.mkdir(parents=True, exist_ok=True)
         prompt = self.log_dir / f"{name}.prompt.md"
         prompt.write_bytes(text.encode("utf-8"))  # byte-exact: no CRLF translation on Windows
@@ -331,7 +377,7 @@ class CodexWorker:
                 open(self.log_dir / f"{name}.stderr.log", "ab") as ferr:
             self.offsets[name] = fout.tell()  # an earlier run's events are not this run's
             p = self.popen(argv, cwd=str(worktree), stdin=fin, stdout=fout, stderr=ferr,
-                           env=sandbox_env(scrubbed_env(self.environ), worktree),
+                           env=env,
                            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         sid = f"codex-{p.pid}"
         self.procs[sid] = p
