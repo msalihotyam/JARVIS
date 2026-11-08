@@ -691,32 +691,16 @@ def start_detached(args):
                             stderr=subprocess.DEVNULL, creationflags=flags, env=child_env())
 
 
-# Salih's manual restart, then PHONECMDFIX2 F4: the task must reach Running (3 tries, ~60 s);
-# otherwise the script itself posts one failure push. The topic is read inside the script from
-# the USER environment registry, never from argv or the inherited environment (child_env drops it).
-_TASK = "-TaskName 'JARVIS Konveyor' -TaskPath '\\'"
-RESTART_SCRIPT = "; ".join([
-    f"Stop-ScheduledTask {_TASK} -ErrorAction SilentlyContinue",
-    "Start-Sleep -Seconds 5",
-    "$ok = $false",
-    "for ($i = 1; $i -le 3 -and -not $ok; $i++) { "
-    f"try {{ Start-ScheduledTask {_TASK} -ErrorAction Stop }} catch {{ }}; Start-Sleep -Seconds 20; "
-    f"$ok = ((Get-ScheduledTask {_TASK} -ErrorAction SilentlyContinue).State -eq 'Running') }}",
-    "if (-not $ok) { $t = [Environment]::GetEnvironmentVariable('JARVIS_NTFY_TOPIC','User'); "
-    "if ($t -cmatch '^[A-Za-z0-9_-]{1,64}$') { try { Invoke-RestMethod -Method Post "
-    "-Uri ('https://ntfy.sh/' + $t) -Body 'Konveyor telefondan yeniden baslatilamadi; panelden baslat' "
-    "-Headers @{Title = 'Yeniden baslat'} -TimeoutSec 15 | Out-Null } catch { } } }",
-])
-RESTART_ARGV = ["powershell", "-NoProfile", "-NonInteractive", "-Command", RESTART_SCRIPT]
+# PHONECMDFIX4: the conveyor's Task Scheduler job refuses breakaway, so the phone restart runs
+# scripts/konveyor_restart.ps1 as its own on-demand scheduled task (registered once by Salih);
+# Task Scheduler starts it outside this job. The script reads the topic itself from the USER env.
+RESTART_ARGV = ["schtasks", "/Run", "/TN", "\\Konveyor Yeniden Baslat"]
 
 
-def restart_detached(argv):
-    """Start the restart helper outside the task's job object; a refused breakaway raises OSError."""
-    flags = (getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-             | getattr(subprocess, "CREATE_BREAKAWAY_FROM_JOB", 0x01000000))
-    return subprocess.Popen([shutil.which(argv[0]) or argv[0], *argv[1:]], cwd=ROOT,
-                            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                            stderr=subprocess.DEVNULL, creationflags=flags, env=child_env())
+def restart_task(argv):
+    """Ask Task Scheduler to start the restart task; return schtasks' returncode (non-zero: missing)."""
+    return subprocess.run(argv, cwd=ROOT, capture_output=True, stdin=subprocess.DEVNULL, timeout=30,
+                          env=child_env(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode
 
 
 def real_cmd(args, timeout=120):
@@ -1171,7 +1155,7 @@ class Conveyor:
                  instance_lock=real_instance_lock, fetch=None, spawn=None):
         self.root = Path(root)
         self.fetch = fetch  # PHONECMD: ntfy_poll on the real loop only; None -> phone commands off
-        self.spawn = spawn  # PHONECMDFIX: restart_detached on the real loop only; None -> restart refused
+        self.spawn = spawn  # PHONECMDFIX4: restart_task on the real loop only; None -> restart refused
         self.restart_pending = False  # set by "yeniden"; restart_go spawns after the tick's writes
         self.restart_done = False  # PHONECMDFIX2: restart_confirm retried per heartbeat until True
         self.beats = 0  # heartbeats of this pid; the 2nd confirms a phone restart
@@ -1708,25 +1692,29 @@ class Conveyor:
         self.restart_pending = True
 
     def restart_go(self):
-        """Spawn the one detached restart helper; on any failure clear the marker and say so."""
+        """Run the restart task once; on any failure clear the marker, say so and keep running."""
         if not self.restart_pending:
             return
         self.restart_pending = False
         try:
             if self.spawn is None:
                 raise RuntimeError("no spawn")
-            self.spawn(RESTART_ARGV)
-            self.event("phone_restart_spawned")
-        except Exception as e:  # a refused breakaway is OSError: nothing stopped, keep running
-            f = self.base / "phone.json"
-            st = self.load_json(f, {})
-            st = st if isinstance(st, dict) else {}
-            st.pop("restart", None)
-            st.pop("restart_ts", None)
-            self.write_atomic(f, json.dumps(st))
-            self.event("phone_restart_failed", error=type(e).__name__)
-            self.send(f"Yeniden başlatma başarısız ({type(e).__name__}); konveyör çalışmaya devam ediyor.",
-                      title="Yeniden baslat")
+            rc = self.spawn(RESTART_ARGV)
+            if rc == 0:
+                self.event("phone_restart_spawned")
+                return
+            error, text = f"rc={rc}", "Telefondan yeniden baslatma kurulmamis: bir kez kurulum gerekli"
+        except Exception as e:  # schtasks missing or hung: nothing stopped, keep running
+            error = type(e).__name__
+            text = f"Yeniden başlatma başarısız ({error}); konveyör çalışmaya devam ediyor."
+        f = self.base / "phone.json"
+        st = self.load_json(f, {})
+        st = st if isinstance(st, dict) else {}
+        st.pop("restart", None)
+        st.pop("restart_ts", None)
+        self.write_atomic(f, json.dumps(st))
+        self.event("phone_restart_failed", error=error)
+        self.send(text, title="Yeniden baslat")
 
     def restart_confirm(self):
         """From this pid's 2nd heartbeat on: a marker from another pid means the phone restart worked.
@@ -5653,4 +5641,4 @@ if __name__ == "__main__":
     if "--archive-sessions" in sys.argv:
         sys.exit(archive_cli(Conveyor(), "--dry-run" in sys.argv))
     sys.exit(Conveyor(prune=start_detached, temp_watch=os.environ.get("TEMP"),
-                      fetch=ntfy_poll, spawn=restart_detached).loop(once="--once" in sys.argv))
+                      fetch=ntfy_poll, spawn=restart_task).loop(once="--once" in sys.argv))
