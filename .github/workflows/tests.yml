@@ -171,11 +171,15 @@ jobs:
         shell: pwsh
         run: python -m pip install "basedpyright==1.40.2"
 
-      # Errors fail the job, warnings do not.
+      # Errors fail the job, warnings do not. INT125-AFX: when basedpyright
+      # sees GITHUB_ACTIONS it counts warnings past --level error and exits 1
+      # on them (0 errors, 125 warnings -> exit 1); without it the same files
+      # exit 0 and a real type error still exits 1.
       - name: Type-check the files in scripts/type_gate.txt
         shell: pwsh
         run: |
           $files = @(Get-Content scripts/type_gate.txt | Where-Object { $_.Trim() })
           if ($files.Count -eq 0) { Write-Error "scripts/type_gate.txt is empty"; exit 1 }
+          $env:GITHUB_ACTIONS = $null
           basedpyright --level error @files
           exit $LASTEXITCODE
