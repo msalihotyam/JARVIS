@@ -24,7 +24,9 @@ PICKS_RE = re.compile(r"(?m)^PICKS\b([^\n]*)(?:\n|$)((?:(?:[ \t]*\n)*[ \t]+\S.*(
 PICK_TOK_RE = re.compile(r"\b[A-Z][A-Z0-9_-]{1,63}\b")
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
-_PICK_LINE_RE = re.compile(r"[ \t]*([0-9a-f]{7,40})[ \t]+->[ \t]+([0-9a-f]{7,40})[ \t]+([A-Z][A-Z0-9_-]{1,63})[ \t]*")
+# Every hex-looking run of 4+ chars (git's shortest abbreviation) not glued to a word; a
+# pick line must hold exactly two and both must be full lowercase 40-hex shas.
+_HEX_RUN_RE = re.compile(r"(?<![0-9A-Za-z_-])[0-9A-Fa-f]{4,}(?![0-9A-Za-z_-])")
 _RUN_LINE_RE = re.compile(r"(?m)^[ \t]*RUN_ID\b.*$")  # an indented second RUN_ID counts too
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _REF_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}")
@@ -72,8 +74,30 @@ def _check_run_id(report: str, run_id: str) -> None:
         raise RefCheckError(f"run_id mismatch: report {m.group(1)[:80]!r} != run {run_id!r}")
 
 
+def _parse_pick_line(line: str) -> Pick:
+    """The real INT shapes: two full shas (source, then candidate) with one ``->`` between
+    them and exactly one lane label anywhere (bare or in parens); lowercase words allowed."""
+
+    def bad(why: str) -> RefCheckError:
+        return RefCheckError(f"malformed pick line ({why}): {line[:80]!r}")
+
+    runs = list(_HEX_RUN_RE.finditer(line))
+    glued = len(re.findall(r"[0-9A-Fa-f]{40,}", line))  # a third sha glued to a word still counts
+    if glued != 2 or len(runs) != 2 or not all(_SHA_RE.fullmatch(m.group()) for m in runs):
+        raise bad("needs exactly two full 40-hex shas, no abbreviation")
+    src, new = runs
+    arrow = line.find("->")
+    if line.count("->") != 1 or "<-" in line or not src.end() <= arrow < new.start():
+        raise bad("needs one -> from source to candidate")
+    rest = f"{line[: src.start()]} {line[src.end() : new.start()]} {line[new.end() :]}"
+    lanes: list[str] = PICK_TOK_RE.findall(rest)
+    if len(lanes) != 1:
+        raise bad(f"needs exactly one lane label, found {len(lanes)}")
+    return Pick(src.group(), new.group(), lanes[0])
+
+
 def parse_picks(report: str) -> tuple[Pick, ...]:
-    """The single PICKS block, strict: every non-blank line is ``<src> -> <new> <LANE>``."""
+    """The single PICKS block, strict: every non-blank line is one ``_parse_pick_line`` pick."""
     report_ok: object = report
     if type(report_ok) is not str:
         raise RefCheckError("report is not text")
@@ -87,10 +111,7 @@ def parse_picks(report: str) -> tuple[Pick, ...]:
         line = line.rstrip("\r")
         if not line.strip():
             continue
-        m = _PICK_LINE_RE.fullmatch(line)
-        if m is None:
-            raise RefCheckError(f"malformed pick line: {line[:80]!r}")
-        picks.append(Pick(m.group(1), m.group(2), m.group(3)))
+        picks.append(_parse_pick_line(line))
     if not picks:
         raise RefCheckError("empty PICKS block")
     for field in ("source", "new", "lane"):

@@ -15,15 +15,50 @@ HEAD = "a" * 40
 MOVED = "b" * 40
 SRC1, NEW1 = "1111111" + "0" * 33, "2222222" + "0" * 33
 SRC2, NEW2 = "3333333" + "0" * 33, "4444444" + "0" * 33
+S5, S6 = "5555555" + "0" * 33, "6666666" + "0" * 33
 PID1, PID2 = "c" * 40, "d" * 40
 
 GOOD = (
     "STATUS: CI_PENDING\n"
     "RUN_ID: run-2026-11-08.1\n"
     "PICKS old -> new (all clean, no conflicts):\n"
-    "  1111111 -> 2222222 N6-14\n"
-    "  3333333 -> 4444444 N6-13\n"
+    f"  {SRC1} -> {NEW1} N6-14\n"
+    f"  {SRC2} -> {NEW2} N6-13\n"
     "NEW MAIN SHA: " + HEAD + "\n"
+)
+
+# Verbatim PICKS lines from real INT reports in build/reports (read-only copies).
+REAL_OK = {
+    "INT118": (
+        "  5646e8f3cb9807a2fcfb996ef4d5b5d0d8a12a40 -> 0a40aa463aac2627fd6017ce2bf9587dffc4808b (N6-10)",
+        ("5646e8f3cb9807a2fcfb996ef4d5b5d0d8a12a40", "0a40aa463aac2627fd6017ce2bf9587dffc4808b", "N6-10"),
+    ),
+    "INT118 fix lane": (
+        "  da006444e175b282e05b44db816f603eee50f4bd -> 10a475728879c6dcafd670b099a748bb068f8432 (N6-10FIX)",
+        ("da006444e175b282e05b44db816f603eee50f4bd", "10a475728879c6dcafd670b099a748bb068f8432", "N6-10FIX"),
+    ),
+    "INT-N6-11 lane between": (
+        "  a2fd7079378ec55c0d17423b30991efb91959d3a (N6-11) -> e2b281ff3f8a3dc4900b054b38429c458162d946",
+        ("a2fd7079378ec55c0d17423b30991efb91959d3a", "e2b281ff3f8a3dc4900b054b38429c458162d946", "N6-11"),
+    ),
+    "INT-N6-09 lane first, notes after": (
+        "  N6-09 fbae69e6f06bb6717ee6e9927bb91fc5b67ddb5a -> b7e8429e034e146c61d071f643550b84c82d50a6 (clean, no conflict)",
+        ("fbae69e6f06bb6717ee6e9927bb91fc5b67ddb5a", "b7e8429e034e146c61d071f643550b84c82d50a6", "N6-09"),
+    ),
+    "INT-N6-HARD1 lane between, word after": (
+        "  3b050c8f8b265811366756ccdd3231c1d1fa5689 (N6-HARD1) -> 2eb193c82adc81357c573dd0ef780714130895f6 clean",
+        ("3b050c8f8b265811366756ccdd3231c1d1fa5689", "2eb193c82adc81357c573dd0ef780714130895f6", "N6-HARD1"),
+    ),
+    "INT47 lane first, notes after": (
+        f"  INT47-AFX {SRC1} -> {NEW1} (tests only, 2 files)",
+        (SRC1, NEW1, "INT47-AFX"),
+    ),
+}
+# INT117 wrote abbreviated candidates: refused, a full sha is required on both sides.
+REAL_ABBREVIATED = (
+    "  1f573977dc8f9fbbeb228a67a8b4f89d1dae8c62 N6-08 -> 37378abd",
+    "  542984da329e01c5b2ab69d7af423fce1594a510 N6-08FIX -> 1a1ca721",
+    "  fbae69e6f06bb6717ee6e9927bb91fc5b67ddb5a N6-09 -> 77ec711f",
 )
 
 
@@ -32,7 +67,7 @@ class FakeGit:
 
     def __init__(self, ref_reads: list[object], patch: dict[str, object] | None = None) -> None:
         self.ref_reads = list(ref_reads)
-        self.shas = {s[:7]: s for s in (SRC1, NEW1, SRC2, NEW2)}
+        self.shas: dict[str, object] = {s: s for s in (SRC1, NEW1, SRC2, NEW2)}
         self.patch: dict[str, object] = patch if patch is not None else {SRC1: PID1, NEW1: PID1, SRC2: PID2, NEW2: PID2}
 
     def rev_parse(self, rev: str) -> object:
@@ -121,31 +156,83 @@ class N6RefcheckTests(unittest.TestCase):
 
     def test_neg_two_or_empty_picks_blocks_refused(self):
         with self.assertRaisesRegex(RefCheckError, "exactly one PICKS block, found 2"):
-            parse_picks(GOOD + "PICKS:\n  5555555 -> 6666666 N6-12\n")
+            parse_picks(GOOD + f"PICKS:\n  {S5} -> {S6} N6-12\n")
         with self.assertRaisesRegex(RefCheckError, "empty PICKS block"):
             parse_picks("PICKS:\nNEW MAIN SHA: x\n")
 
+    def test_ok_real_int_report_pick_lines_parse(self):
+        for name, (line, want) in REAL_OK.items():
+            with self.subTest(name):
+                (p,) = parse_picks(f"STATUS: CI_PENDING\nPICKS:\n{line}\nFILES: x\n")
+                self.assertEqual((p.source, p.new, p.lane), want)
+
+    def test_ok_verbatim_int118_block_parses_and_ends_at_unindented_line(self):
+        block = "PICKS:\n" + "\n".join(REAL_OK[k][0] for k in ("INT118", "INT118 fix lane")) + "\n"
+        block += "  a2fd7079378ec55c0d17423b30991efb91959d3a -> b9058e7d4b3da2a40242f10e80ecb11d97c27064 (N6-11)\n"
+        block += "RESOLVED HUNKS: scripts/test_durations.json (N6-11 pick): both entries kept\n"
+        self.assertEqual([p.lane for p in parse_picks(block)], ["N6-10", "N6-10FIX", "N6-11"])
+
+    def test_neg_real_int117_abbreviated_candidate_refused(self):
+        for line in REAL_ABBREVIATED:
+            with self.subTest(line), self.assertRaisesRegex(RefCheckError, "exactly two full 40-hex shas"):
+                parse_picks(f"PICKS:\n{line}\n")
+
+    def test_neg_pick_line_without_exactly_two_full_shas_refused(self):
+        bad = {
+            "one sha": f"  {SRC1} -> N6-14",
+            "one sha, lane only": f"  {SRC1} N6-14",
+            "three shas": f"  {SRC1} -> {NEW1} N6-14 (was {S5})",
+            "three shas, third glued": f"  {SRC1} -> {NEW1} N6-14 {S5}-x",
+            "abbreviated source": f"  {SRC1[:7]} -> {NEW1} N6-14",
+            "abbreviated note": f"  {SRC1} -> {NEW1} N6-14 (was 37378abd)",
+            "39 hex": f"  {SRC1[:39]} -> {NEW1} N6-14",
+            "41 hex": f"  {SRC1}0 -> {NEW1} N6-14",
+            "uppercase sha": f"  {'AB' * 20} -> {NEW1} N6-14",
+            "no sha": "  N6-14",
+            "semicolon joined": f"  {SRC1} -> {NEW1} N6-14; {SRC2} -> {NEW2} N6-13",
+        }
+        for name, line in bad.items():
+            with self.subTest(name), self.assertRaisesRegex(RefCheckError, "exactly two full 40-hex shas"):
+                parse_picks(f"PICKS:\n{line}\n")
+
+    def test_neg_pick_line_arrow_or_lane_wrong_refused(self):
+        arrow = {
+            "no arrow": f"  {SRC1} {NEW1} N6-14",
+            "reversed arrow": f"  {SRC1} <- {NEW1} N6-14",
+            "two arrows": f"  {SRC1} -> {NEW1} -> N6-14",
+            "arrow before both": f"  -> {SRC1} {NEW1} N6-14",
+        }
+        for name, line in arrow.items():
+            with self.subTest(name), self.assertRaisesRegex(RefCheckError, "one -> from source"):
+                parse_picks(f"PICKS:\n{line}\n")
+        lane = {
+            "no lane (real shape)": f"  {SRC1} -> {NEW1}",
+            "lowercase lane": f"  {SRC1} -> {NEW1} (n6-14)",
+            "two lanes": f"  {SRC1} -> {NEW1} N6-14 N6-13",
+            "second uppercase word": f"  {SRC1} -> {NEW1} (N6-14) OK",
+        }
+        for name, line in lane.items():
+            with self.subTest(name), self.assertRaisesRegex(RefCheckError, "exactly one lane label"):
+                parse_picks(f"PICKS:\n{line}\n")
+
     def test_neg_pick_lines_orchbot_would_count_are_strict(self):
         bad = {
-            "blank line hides a pick": "PICKS:\n  1111111 -> 2222222 N6-14\n\n  3333333 N6-13\n",
+            "blank line hides a pick": f"PICKS:\n  {SRC1} -> {NEW1} N6-14\n\n  {SRC2} N6-13\n",
             "lane only": "PICKS:\n  N6-14\n",
-            "semicolon joined": "PICKS:\n  1111111 -> 2222222 N6-14; 3333333 -> 4444444 N6-13\n",
-            "header colon content": "PICKS: N6-14\n  1111111 -> 2222222 N6-14\n",
-            "short sha": "PICKS:\n  111111 -> 2222222 N6-14\n",
-            "uppercase sha": "PICKS:\n  ABCDEF1 -> 2222222 N6-14\n",
+            "header colon content": f"PICKS: N6-14\n  {SRC1} -> {NEW1} N6-14\n",
         }
         for name, report in bad.items():
             with self.subTest(name), self.assertRaisesRegex(RefCheckError, "malformed pick line"):
                 parse_picks(report)
 
     def test_neg_duplicate_pick_refused(self):
-        for line in ("  1111111 -> 5555555 N6-12", "  5555555 -> 2222222 N6-12", "  5555555 -> 6666666 N6-14"):
+        for line in (f"  {SRC1} -> {S5} N6-12", f"  {S5} -> {NEW1} N6-12", f"  {S5} -> {S6} N6-14"):
             with self.subTest(line), self.assertRaisesRegex(RefCheckError, "duplicate pick"):
-                parse_picks("PICKS:\n  1111111 -> 2222222 N6-14\n" + line + "\n")
+                parse_picks(f"PICKS:\n  {SRC1} -> {NEW1} N6-14\n" + line + "\n")
 
     def test_neg_pick_patch_id_differs_refused(self):
         git = FakeGit([HEAD, HEAD], {SRC1: PID1, NEW1: PID2, SRC2: PID2, NEW2: PID2})
-        with self.assertRaisesRegex(RefCheckError, "N6-14 1111111->2222222: patch-id differs"):
+        with self.assertRaisesRegex(RefCheckError, f"N6-14 {SRC1}->{NEW1}: patch-id differs"):
             _read(git)
 
     def test_neg_missing_or_malformed_patch_id_raises(self):
@@ -156,21 +243,17 @@ class N6RefcheckTests(unittest.TestCase):
 
     def test_neg_abbreviation_resolving_elsewhere_raises(self):
         git = FakeGit([HEAD, HEAD])
-        git.shas["2222222"] = "9" * 40
+        git.shas[NEW1] = "9" * 40
         with self.assertRaisesRegex(RefCheckError, "resolved to a different commit"):
             _read(git)
 
     def test_neg_pick_reusing_a_commit_refused(self):
-        self_pick = GOOD.replace("1111111 -> 2222222", "1111111 -> 11111110")  # the source itself: patch-ids trivially equal
-        git = FakeGit([HEAD, HEAD])
-        git.shas["11111110"] = SRC1
+        self_pick = GOOD.replace(f"{SRC1} -> {NEW1}", f"{SRC1} -> {SRC1}")  # the source itself: patch-ids trivially equal
         with self.assertRaisesRegex(RefCheckError, "commit reused"):
-            _read(git, report=self_pick)
-        git = FakeGit([HEAD, HEAD])
-        report = GOOD.replace("3333333 -> 4444444", "1111111000 -> 4444444")  # same source, longer abbrev
-        git.shas["1111111000"] = SRC1
+            _read(FakeGit([HEAD, HEAD]), report=self_pick)
+        reused = GOOD.replace(f"{SRC2} -> {NEW2}", f"{NEW1} -> {NEW2}")  # a candidate reused as a source
         with self.assertRaisesRegex(RefCheckError, "commit reused"):
-            _read(git, report=report)
+            _read(FakeGit([HEAD, HEAD]), report=reused)
 
     def test_neg_non_str_ref_or_run_id_raises_refcheck_error(self):
         for ref, run_id in ((None, "run-2026-11-08.1"), (REF, None), (b"refs/x", "r"), (REF, 7)):
@@ -190,7 +273,7 @@ class N6RefcheckTests(unittest.TestCase):
         ev = _read(git)
         self.assertEqual((ev.run_id, ev.ref, ev.sha), ("run-2026-11-08.1", REF, HEAD))
         self.assertEqual(
-            [(p.source, p.new, p.lane) for p in ev.picks], [("1111111", "2222222", "N6-14"), ("3333333", "4444444", "N6-13")]
+            [(p.source, p.new, p.lane) for p in ev.picks], [(SRC1, NEW1, "N6-14"), (SRC2, NEW2, "N6-13")]
         )
         self.assertEqual(accept(git, ev), HEAD)
         self.assertEqual(git.ref_reads, [])
