@@ -237,6 +237,7 @@
   "tests.test_conveyor.TestSharedWrite": 0.646,
   "tests.test_conveyor.TestUsageGuard": 0.288,
   "tests.test_conveyor.TestVersionPin": 0.662,
+  "tests.test_conveyor_api.ApiBrokerTest": 0.5,
   "tests.test_conveyor_replay.TestR1StallBatchCollect": 0.129,
   "tests.test_conveyor_replay.TestR2BreakerStorm": 0.304,
   "tests.test_conveyor_replay.TestR3AutoFixChainFail": 0.24,
