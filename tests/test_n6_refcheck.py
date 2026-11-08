@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
+import dataclasses
 import sqlite3
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from jarvis import n6_refcheck
-from jarvis.n6_refcheck import RefCheckError, accept, parse_picks, read_evidence
+from jarvis.n6_refcheck import Evidence, Pick, RefCheckError, accept, parse_picks, read_evidence
+
+RUN = "run-2026-11-08.1"
 
 REF = "refs/heads/ci/INTN6"
 HEAD = "a" * 40
@@ -140,13 +143,13 @@ class N6RefcheckTests(unittest.TestCase):
         git = FakeGit([HEAD, HEAD, MOVED])
         ev = _read(git)
         with self.assertRaisesRegex(RefCheckError, "between read and accept"):
-            accept(git, ev)
+            accept(git, ev, RUN)
 
     def test_neg_torn_read_at_accept_raises(self):
         git = FakeGit([HEAD, HEAD, HEAD[:12]])
         ev = _read(git)
         with self.assertRaisesRegex(RefCheckError, "torn or malformed"):
-            accept(git, ev)
+            accept(git, ev, RUN)
 
     # --- PICKS cleanup evidence --------------------------------------------------------
     def test_neg_missing_picks_block_refused(self):
@@ -275,12 +278,76 @@ class N6RefcheckTests(unittest.TestCase):
         self.assertEqual(
             [(p.source, p.new, p.lane) for p in ev.picks], [(SRC1, NEW1, "N6-14"), (SRC2, NEW2, "N6-13")]
         )
-        self.assertEqual(accept(git, ev), HEAD)
+        self.assertEqual(accept(git, ev, RUN), HEAD)
         self.assertEqual(git.ref_reads, [])
 
     def test_ok_crlf_report_accepted(self):
         git = FakeGit([HEAD, HEAD, HEAD])
-        self.assertEqual(accept(git, _read(git, report=GOOD.replace("\n", "\r\n"))), HEAD)
+        self.assertEqual(accept(git, _read(git, report=GOOD.replace("\n", "\r\n")), RUN), HEAD)
+
+    # --- N6-15FIX2 ---------------------------------------------------------------------
+    def test_neg_glued_partial_or_suffixed_lane_label_refused(self):
+        # F1: one case per variant in the defect class; never trimmed back to a valid lane.
+        bad = {
+            "glued suffix": "N6-14fix",
+            "glued suffix, real lane": "N6-10FIXx",
+            "glued prefix": "xN6-14",
+            "partial": "N6-",
+            "underscore suffix": "N6-14_",
+            "single letter": "N",
+            "trailing comma": "N6-14,",
+            "trailing dot": "(N6-14.)",
+            "colon joined": "N6-14:N6-13",
+            "slash joined": "N6-14/x",
+            "mixed case": "n6-14FIX",
+            "non-ascii suffix": "N6-14é",
+            "zero-width suffix": "N6-14​",
+            "nbsp joined": "N6-14 fix",
+            "fullwidth": "Ｎ6-14",
+            "cyrillic homoglyph": "Н6-14",
+            "titlecase digraph": "ǅ6-14",
+            "lane plus glued word": "N6-14 Clean",
+        }
+        for name, label in bad.items():
+            for line in (f"  {SRC1} -> {NEW1} {label}", f"  {label} {SRC1} -> {NEW1}", f"  {SRC1} ({label}) -> {NEW1}"):
+                with self.subTest(name, line=line), self.assertRaisesRegex(RefCheckError, "malformed pick line.*lane label"):
+                    parse_picks(f"PICKS:\n{line}\n")
+
+    def test_neg_sha_glued_to_non_ascii_refused(self):
+        # F2: a letter/digit/mark of any script, or a zero-width / NBSP, glued to a sha.
+        for glue in ("é", "١", "д", "́", "‍", " ", "０", "²"):
+            for line in (f"  {SRC1}{glue} -> {NEW1} N6-14", f"  {SRC1} -> {glue}{NEW1} N6-14", f"  N6-14 {glue}{SRC1} -> {NEW1}"):
+                with self.subTest(glue=hex(ord(glue)), line=line), self.assertRaisesRegex(RefCheckError, "exactly two full 40-hex shas"):
+                    parse_picks(f"PICKS:\n{line}\n")
+
+    def test_neg_caller_built_or_altered_evidence_refused_at_accept(self):
+        # F3: only sealed read_evidence output; the git port is never consulted for a forgery.
+        git = FakeGit([HEAD, HEAD])
+        ev = _read(git)
+        pick = Pick(SRC1, NEW1, "N6-14")
+        forged = {
+            "caller built": Evidence(RUN, REF, HEAD, (pick,)),
+            "caller built, real picks": Evidence(RUN, REF, HEAD, ev.picks),
+            "replace sha": dataclasses.replace(ev, sha=MOVED),
+            "replace picks": dataclasses.replace(ev, picks=()),
+            "replace nothing": dataclasses.replace(ev),
+            "subclass": type("E", (Evidence,), {})(RUN, REF, HEAD, ev.picks),
+            "not evidence": (RUN, REF, HEAD, ev.picks),
+        }
+        for name, fake in forged.items():
+            with self.subTest(name), self.assertRaisesRegex(RefCheckError, "not produced by read_evidence"):
+                accept(FakeGit([]), fake, RUN)  # pyright: ignore[reportArgumentType]
+        stolen = Evidence(RUN, REF, MOVED, ev.picks)
+        object.__setattr__(stolen, "seal", ev.seal)
+        with self.assertRaisesRegex(RefCheckError, "not produced by read_evidence"):
+            accept(FakeGit([]), stolen, RUN)
+
+    def test_neg_accept_with_other_run_id_refused(self):
+        ev = _read(FakeGit([HEAD, HEAD]))
+        sub = type("S", (str,), {"__eq__": lambda s, o: True, "__ne__": lambda s, o: False, "__hash__": str.__hash__})
+        for other in ("run-2026-11-08.2", "RUN-2026-11-08.1", "", None, sub("x")):
+            with self.subTest(other=other), self.assertRaisesRegex(RefCheckError, "run_id mismatch"):
+                accept(FakeGit([]), ev, other)  # pyright: ignore[reportArgumentType]
 
     def test_neg_module_runs_no_process_and_opens_no_db(self):
         src = Path(n6_refcheck.__file__).read_text(encoding="utf-8")

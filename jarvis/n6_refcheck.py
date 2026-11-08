@@ -5,7 +5,8 @@
 change or a torn (partial / non-hex) sha raises. The report's single ``RUN_ID:`` line
 must equal the run that produced it, and its single PICKS block is the cleanup
 evidence: every pick's new commit must carry the source commit's patch-id.
-``accept`` re-reads the ref right before acceptance and refuses if it moved.
+``accept`` takes only sealed ``read_evidence`` output for the same run_id, then re-reads
+the ref right before acceptance and refuses if it moved.
 
 Git is an injected port (``GitPort``); this module runs no process and opens no file.
 Port results are typed ``object`` because they are untrusted: anything malformed raises.
@@ -13,6 +14,7 @@ Port results are typed ``object`` because they are untrusted: anything malformed
 
 from __future__ import annotations
 
+import dataclasses
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -25,8 +27,12 @@ PICK_TOK_RE = re.compile(r"\b[A-Z][A-Z0-9_-]{1,63}\b")
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 # Every hex-looking run of 4+ chars (git's shortest abbreviation) not glued to a word; a
-# pick line must hold exactly two and both must be full lowercase 40-hex shas.
-_HEX_RUN_RE = re.compile(r"(?<![0-9A-Za-z_-])[0-9A-Fa-f]{4,}(?![0-9A-Za-z_-])")
+# pick line must hold exactly two and both must be full lowercase 40-hex shas. Any
+# non-ASCII neighbour (letter, digit, mark, zero-width, NBSP of any script) is glue too.
+_GLUE = r"0-9A-Za-z_\-\u0080-\U0010ffff"
+_HEX_RUN_RE = re.compile(rf"(?<![{_GLUE}])[0-9A-Fa-f]{{4,}}(?![{_GLUE}])")
+_WORD_SPLIT_RE = re.compile(r"[ \t()]+")  # lane labels are whole words: bare or in parens
+_SEAL = object()  # held only by read_evidence: a caller-built Evidence cannot carry it
 _RUN_LINE_RE = re.compile(r"(?m)^[ \t]*RUN_ID\b.*$")  # an indented second RUN_ID counts too
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _REF_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}")
@@ -55,6 +61,12 @@ class Evidence:
     ref: str
     sha: str
     picks: tuple[Pick, ...]
+    # Set only by read_evidence, bound to the exact field objects; replace() resets it.
+    seal: tuple[object, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
+
+
+def _seal_of(ev: Evidence) -> tuple[object, ...]:
+    return (_SEAL, ev.run_id, ev.ref, ev.sha, ev.picks)
 
 
 def _full_sha(value: object, what: str) -> str:
@@ -90,7 +102,12 @@ def _parse_pick_line(line: str) -> Pick:
     if line.count("->") != 1 or "<-" in line or not src.end() <= arrow < new.start():
         raise bad("needs one -> from source to candidate")
     rest = f"{line[: src.start()]} {line[src.end() : new.start()]} {line[new.end() :]}"
-    lanes: list[str] = PICK_TOK_RE.findall(rest)
+    words = [w for w in _WORD_SPLIT_RE.split(rest) if w]
+    lanes = [w for w in words if PICK_TOK_RE.fullmatch(w) and w[-1].isalnum()]  # N6-14_ is suffixed
+    # Any other word with an upper/titlecase char (any script) is a glued, partial or
+    # suffixed label (N6-14fix, xN6-14, N6-, N6-14,): refused, never trimmed to a lane.
+    if any(c.isupper() or c.istitle() for w in words if w not in lanes for c in w):
+        raise bad("lane label not a whole token")
     if len(lanes) != 1:
         raise bad(f"needs exactly one lane label, found {len(lanes)}")
     return Pick(src.group(), new.group(), lanes[0])
@@ -164,11 +181,23 @@ def read_evidence(git: GitPort, ref: str, read_report: Callable[[], object], run
     _check_run_id(report, run_id)
     picks = parse_picks(report)
     verify_picks(git, picks)
-    return Evidence(run_id, ref, before, picks)
+    ev = Evidence(run_id, ref, before, picks)
+    object.__setattr__(ev, "seal", _seal_of(ev))
+    return ev
 
 
-def accept(git: GitPort, evidence: Evidence) -> str:
-    """Compare-before-accept: the ref still names the sha the evidence was read at."""
+def accept(git: GitPort, evidence: Evidence, run_id: str) -> str:
+    """Compare-before-accept: only sealed read_evidence output for this run_id, and the
+    ref still names the sha the evidence was read at."""
+    ev_ok: object = evidence
+    run_ok: object = run_id  # exact str: a subclass could fake __eq__/__ne__
+    if type(ev_ok) is not Evidence:
+        raise RefCheckError("evidence not produced by read_evidence")
+    seal, want = evidence.seal, _seal_of(evidence)
+    if len(seal) != len(want) or not all(a is b for a, b in zip(seal, want)):
+        raise RefCheckError("evidence not produced by read_evidence")
+    if type(run_ok) is not str or evidence.run_id != run_id:
+        raise RefCheckError(f"run_id mismatch: evidence {evidence.run_id!r} != run {str(run_ok)[:80]!r}")
     now = _full_sha(git.rev_parse(evidence.ref), evidence.ref)
     if now != evidence.sha:
         raise RefCheckError(f"{evidence.ref} moved {evidence.sha} -> {now} between read and accept")
