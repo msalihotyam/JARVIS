@@ -1522,6 +1522,7 @@
   "tests.test_work_controls.RevisionAndWatchdogTests": 0.0,
   "tests.test_work_driver.DriverMatrixTest": 0.028,
   "tests.test_n6_lease.N6LeaseTest": 0.05,
+  "tests.test_n6_breaker.N6BreakerTest": 0.1,
   "tests.test_n6_boot.N6BootTest": 0.1,
   "tests.test_work_evidence.EvidenceReceiptTests": 0.001,
   "tests.test_work_lease.WorkLeaseTest": 5.913,
