@@ -16,15 +16,19 @@ from __future__ import annotations
 
 import dataclasses
 import re
+import unicodedata
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
-# Copied verbatim from scripts/orchbot.py (PICKS_RE / PICK_TOK_RE): refcheck must see at
-# least every line orchbot treats as a pick, blank lines inside the block included.
-# Both are LF-only, so every report is _lf()-normalized once before any parsing.
-PICKS_RE = re.compile(r"(?m)^PICKS\b([^\n]*)(?:\n|$)((?:(?:[ \t]*\n)*[ \t]+\S.*(?:\n|$))*)")
+# Copied verbatim from scripts/orchbot.py (PICK_TOK_RE). The PICKS block itself is a closed
+# line grammar (parse_picks), a superset of orchbot's PICKS_RE: every line up to the next
+# top-level KEY: header is Unicode-blank or a pick, so no blank-looking line can end it.
+# Every report is _lf()-normalized once before any parsing.
 PICK_TOK_RE = re.compile(r"\b[A-Z][A-Z0-9_-]{1,63}\b")
+_HEADER_RE = re.compile(r"[A-Z][A-Z _-]*:")  # .match on the raw line: column 0, ASCII only
+_PICKS_HEAD_RE = re.compile(r"PICKS\b")
+_RUN_HEAD_RE = re.compile(r"RUN_ID\b")
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 # Every hex-looking run of 4+ chars (git's shortest abbreviation) not glued to a word; a
@@ -34,7 +38,6 @@ _GLUE = r"0-9A-Za-z_\-\u0080-\U0010ffff"
 _HEX_RUN_RE = re.compile(rf"(?<![{_GLUE}])[0-9A-Fa-f]{{4,}}(?![{_GLUE}])")
 _WORD_SPLIT_RE = re.compile(r"[ \t()]+")  # lane labels are whole words: bare or in parens
 _SEAL = object()  # held only by read_evidence: a caller-built Evidence cannot carry it
-_RUN_LINE_RE = re.compile(r"(?m)^[ \t]*RUN_ID\b.*$")  # an indented second RUN_ID counts too
 _RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:-]{0,127}")
 _OTHER_EOL_RE = re.compile("[\x0b\x0c\x1c-\x1e\x85  ]")
 _REF_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9._/-]{0,254}")
@@ -87,8 +90,19 @@ def _lf(report: str) -> str:
     return report.replace("\r\n", "\n").replace("\r", "\n")
 
 
+def _blank(c: str) -> bool:
+    """Unicode whitespace or an invisible format char (NBSP, U+3000, BOM, ZWSP, ZWNJ, ...)."""
+    return c.isspace() or unicodedata.category(c) in ("Zs", "Zl", "Zp", "Cf")
+
+
+def _unblank(line: str) -> str:
+    """``line`` without its leading Unicode-blank chars; "" for a blank line."""
+    return next((line[i:] for i, c in enumerate(line) if not _blank(c)), "")
+
+
 def _check_run_id(report: str, run_id: str) -> None:
-    lines = _RUN_LINE_RE.findall(report)
+    # A second RUN_ID behind any indent, NBSP, BOM or zero-width prefix still counts.
+    lines = [ln for ln in report.split("\n") if _RUN_HEAD_RE.match(_unblank(ln))]
     if len(lines) != 1:
         raise RefCheckError(f"report needs exactly one RUN_ID line, found {len(lines)}")
     m = re.fullmatch(r"RUN_ID:[ \t]*(\S+)[ \t]*", lines[0])
@@ -126,21 +140,25 @@ def _parse_pick_line(line: str) -> Pick:
 
 
 def parse_picks(report: str) -> tuple[Pick, ...]:
-    """The single PICKS block, strict: every non-blank line is one ``_parse_pick_line`` pick."""
+    """The single PICKS block as a closed grammar: the header's rest and every line up to the
+    next top-level ``KEY:`` header (or the end) is Unicode-blank or one valid pick; anything
+    else raises "malformed pick line". A PICKS header behind any Unicode prefix counts."""
     report_ok: object = report
     if type(report_ok) is not str:
         raise RefCheckError("report is not text")
-    report = _lf(report)  # idempotent: read_evidence already normalized it
-    blocks = PICKS_RE.findall(report)
-    if len(blocks) != 1:
-        raise RefCheckError(f"report needs exactly one PICKS block, found {len(blocks)}")
-    header, body = blocks[0]
-    lines = [header.partition(":")[2], *body.split("\n")]
-    picks: list[Pick] = []
-    for line in lines:
-        if not line.strip():
-            continue
-        picks.append(_parse_pick_line(line))
+    lines = _lf(report).split("\n")  # idempotent: read_evidence already normalized it
+    heads = [i for i, ln in enumerate(lines) if _PICKS_HEAD_RE.match(_unblank(ln))]
+    if len(heads) != 1:
+        raise RefCheckError(f"report needs exactly one PICKS block, found {len(heads)}")
+    head = heads[0]
+    if not _PICKS_HEAD_RE.match(lines[head]):
+        raise RefCheckError(f"PICKS header not at line start: {lines[head][:80]!r}")
+    block = [lines[head].partition(":")[2]]
+    for line in lines[head + 1 :]:
+        if _HEADER_RE.match(line):
+            break
+        block.append(line)
+    picks = [_parse_pick_line(line) for line in block if _unblank(line)]
     if not picks:
         raise RefCheckError("empty PICKS block")
     for field in ("source", "new", "lane"):

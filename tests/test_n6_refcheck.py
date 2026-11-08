@@ -385,6 +385,73 @@ class N6RefcheckTests(unittest.TestCase):
         with self.assertRaisesRegex(RefCheckError, "exactly one RUN_ID"):
             _read(FakeGit([HEAD, HEAD]), report=report)
 
+    # --- N6-15FIX4: the PICKS block is a closed grammar under Unicode blank rules ------
+    BLANKS = {
+        "NBSP": " ", "BOM": "﻿", "ZWSP": "​", "ZWNJ": "‌", "WJ": "⁠",
+        "U+3000": "　", "U+202F": " ", "tab-only": "\t", "CR-only": "\r",
+        "mixed": "  ﻿​\t　 ",
+    }
+    PREFIXES = ("", "  ", "\t", " ", "﻿", "​", "‌", "　")
+
+    def test_neg_cdxn615r3_blank_line_of_any_class_cannot_hide_a_pick(self):
+        # F1 (CDXN615R3), verbatim shape: an NBSP/BOM/ZWSP-only line used to end the block.
+        for name, blank in self.BLANKS.items():
+            report = f"RUN_ID: r1\nPICKS:\n  {SRC1} -> {NEW1} N6-12\n{blank}\n  {SRC2} N6-13 garbage\n"
+            with self.subTest(blank=name), self.assertRaisesRegex(RefCheckError, "malformed pick line"):
+                parse_picks(report)
+            with self.subTest(blank=name, via="read_evidence"), self.assertRaisesRegex(RefCheckError, "malformed pick line"):
+                _read(FakeGit([HEAD, HEAD]), report=report, run_id="r1")
+
+    def test_ok_pick_after_blank_line_of_any_class_is_parsed_and_patch_id_checked(self):
+        for name, blank in self.BLANKS.items():
+            report = GOOD.replace(f"\n  {SRC2}", f"\n{blank}\n  {SRC2}")
+            with self.subTest(blank=name):
+                self.assertEqual(parse_picks(report), (Pick(SRC1, NEW1, "N6-14"), Pick(SRC2, NEW2, "N6-13")))
+            git = FakeGit([HEAD, HEAD], {SRC1: PID1, NEW1: PID1, SRC2: PID2, NEW2: PID1})
+            with self.subTest(blank=name, via="read_evidence"), self.assertRaisesRegex(RefCheckError, "N6-13 .*patch-id differs"):
+                _read(git, report=report)
+
+    def test_neg_anything_but_blank_or_pick_inside_the_block_refused(self):
+        for name, blank in self.BLANKS.items():
+            for junk in ("garbage", "  garbage", "done.", "Note: x", "⠀", "ㅤ", "́", f"​NOTE: {SRC2}"):
+                report = GOOD.replace(f"\n  {SRC2}", f"\n{blank}\n{junk}\n  {SRC2}")
+                with self.subTest(blank=name, junk=junk), self.assertRaisesRegex(RefCheckError, "malformed pick line"):
+                    parse_picks(report)
+
+    def test_neg_line_or_paragraph_separator_line_between_picks_refused(self):
+        for sep in (" ", " ", "  "):
+            report = GOOD.replace(f"\n  {SRC2}", f"\n{sep}\n  {SRC2}")
+            with self.subTest(sep=sep), self.assertRaisesRegex(RefCheckError, "other than CR/LF"):
+                parse_picks(report)
+
+    def test_neg_hidden_second_picks_block_refused(self):
+        for prefix in self.PREFIXES:
+            after = GOOD + f"{prefix}PICKS:\n  {S5} -> {S6} N6-15\n"
+            inside = GOOD.replace(f"\n  {SRC2}", f"\n\n{prefix}PICKS more:\n  {SRC2}")
+            for where, report in (("after", after), ("inside", inside)):
+                with self.subTest(prefix=prefix, where=where), self.assertRaisesRegex(RefCheckError, "exactly one PICKS block, found 2"):
+                    parse_picks(report)
+
+    def test_neg_sole_picks_header_behind_a_prefix_refused(self):
+        for prefix in self.PREFIXES[1:]:
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(RefCheckError, "PICKS header not at line start"):
+                parse_picks(GOOD.replace("PICKS old", f"{prefix}PICKS old"))
+
+    def test_neg_hidden_second_run_id_line_counted(self):
+        for prefix in self.PREFIXES:
+            report = GOOD + f"{prefix}RUN_ID: run-other\n"
+            with self.subTest(prefix=prefix), self.assertRaisesRegex(RefCheckError, "exactly one RUN_ID"):
+                _read(FakeGit([HEAD, HEAD]), report=report)
+
+    def test_ok_real_int_block_lf_and_crlf_still_parses(self):
+        lines = [line for line, _ in REAL_OK.values()]
+        want = tuple(Pick(*exp) for _, exp in REAL_OK.values())
+        report = "STATUS: CI_PENDING\nPICKS old -> new (all clean, no conflicts):\n" + "\n".join(lines)
+        report += "\n\nRESOLVED HUNKS: none\nCI: pending\n"
+        for eol in ("\n", "\r\n"):
+            with self.subTest(eol=eol):
+                self.assertEqual(parse_picks(report.replace("\n", eol)), want)
+
 
 def _eol(text: object, ends: tuple[str, ...]) -> object:
     """``text`` with its LF line ends replaced by ``ends`` in turn; non-str (and str
