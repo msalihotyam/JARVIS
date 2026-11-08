@@ -9,8 +9,10 @@ caller classifies network/API errors as ``outage``. Each maps to exactly one act
 - ``timeout`` -> NUDGE at most MAX_NUDGES times, NUDGE_GAP_S apart (the conveyor's
   MAX_NUDGES 2 / NUDGE_GAP_S 900; a nudge is counted when decided, even if it fails),
   WAIT inside the gap, then DROP to attention after the cap (and its gap) or
-  DROP_AFTER_S of stall. DROP is the only action that counts as a failure.
-- ``continue`` -> CONTINUE: progress; a hold clears and the run may resume.
+  DROP_AFTER_S of stall. DROP is the only action that counts as a failure. A dropped
+  run is never nudged again: every later timeout is DROP (attention and failure only
+  the first time), an outage HOLD keeps it dropped; only ``continue`` clears it.
+- ``continue`` -> CONTINUE: progress; a hold or a drop clears and the run may resume.
 - anything else, a malformed state file or a clock earlier than the state -> HOLD
   plus attention (fail closed); the state is left untouched.
 
@@ -62,39 +64,42 @@ def _number(value: object, top: float, *, whole: bool = False) -> float | None:
     """The one gate for every number from the state file or the caller: ``value`` as a
     finite float in [0, top], else None (malformed). bool, non-numbers, NaN/inf,
     negatives, ints too large for a float and any error while converting -> None.
-    ``whole`` also requires a plain int. Never raises."""
-    if isinstance(value, bool) or not isinstance(value, int if whole else (int, float)):
-        return None
+    ``whole`` also requires an int. Never raises: every check is inside the try."""
     try:
-        f = float(value)
+        if isinstance(value, bool) or not isinstance(value, int if whole else (int, float)):
+            return None
+        # the base method: a subclass's own (possibly lying) __float__ never runs
+        f = int.__float__(value) if isinstance(value, int) else float.__float__(value)
         return f if math.isfinite(f) and 0.0 <= f <= top else None
-    except Exception:  # OverflowError, or a subclass whose __float__ misbehaves
+    except Exception:  # OverflowError, a raising __class__/__float__/__instancecheck__
         return None
 
 
-def _time(value: object) -> bool:
-    return _number(value, MAX_EPOCH_S) is not None
-
-
-def _valid(state: object) -> bool:
-    if not isinstance(state, State):
-        return False
-    stamps = (state.last_nudge_at, state.stall_since, state.outage_since)
-    return (_number(state.nudges, MAX_NUDGES, whole=True) is not None
-            and type(state.dropped) is bool
-            and all(t is None or _time(t) for t in stamps)
-            and (state.nudges == 0) == (state.last_nudge_at is None))
+def _clean(state: object) -> State | None:
+    """``state`` rebuilt from plain int/float/bool/None, or None if malformed. Only an
+    exact State is accepted, so no subclass's own compare/arithmetic ever runs later."""
+    if type(state) is not State:
+        return None
+    nudges = _number(state.nudges, MAX_NUDGES, whole=True)
+    raw = (state.last_nudge_at, state.stall_since, state.outage_since)
+    stamps = [None if t is None else _number(t, MAX_EPOCH_S) for t in raw]
+    if (nudges is None or type(state.dropped) is not bool
+            or any(t is not None and c is None for t, c in zip(raw, stamps))
+            or (nudges == 0) != (stamps[0] is None)):
+        return None
+    return State(int(nudges), stamps[0], stamps[1], stamps[2], state.dropped)
 
 
 def decide(state: State | None, verdict: object, now: float) -> tuple[Decision, State | None]:
     """Pure: the action for ``verdict`` at ``now`` and the state to store next."""
     t = _number(now, MAX_EPOCH_S)
-    if state is None or not _valid(state) or t is None or type(verdict) is not str:
+    clean = _clean(state)
+    if clean is None or t is None or type(verdict) is not str:
         return _FAIL_CLOSED, state
-    now = t  # a plain float from here on: a subclass's own math never runs
+    given, state, now = state, clean, t  # plain values from here: no subclass math runs
     stamps = (state.last_nudge_at, state.stall_since, state.outage_since)
     if any(t is not None and now < t for t in stamps):
-        return _FAIL_CLOSED, state  # clock went backwards: no guess
+        return _FAIL_CLOSED, given  # clock went backwards: no guess
     if verdict == "continue":
         return Decision(CONTINUE), replace(state, stall_since=None, outage_since=None,
                                            dropped=False)
@@ -102,14 +107,15 @@ def decide(state: State | None, verdict: object, now: float) -> tuple[Decision, 
         since = state.outage_since if state.outage_since is not None else now
         return Decision(HOLD), replace(state, outage_since=since, stall_since=None)
     if verdict != "timeout":
-        return _FAIL_CLOSED, state
+        return _FAIL_CLOSED, given
     stalled = replace(state, outage_since=None,
                       stall_since=state.stall_since if state.stall_since is not None else now)
+    if state.dropped:  # already paged and counted: never nudged again until "continue"
+        return Decision(DROP), stalled
     since = cast(float, stalled.stall_since)
     gap_ok = state.last_nudge_at is None or now - state.last_nudge_at >= NUDGE_GAP_S
     if now - since >= DROP_AFTER_S or (state.nudges >= MAX_NUDGES and gap_ok):
-        first = not state.dropped  # page and count a drop once, not on every later tick
-        return Decision(DROP, attention=first, counts_failure=first), replace(stalled, dropped=True)
+        return Decision(DROP, attention=True, counts_failure=True), replace(stalled, dropped=True)
     if state.nudges < MAX_NUDGES and gap_ok:
         return Decision(NUDGE), replace(stalled, nudges=state.nudges + 1, last_nudge_at=now)
     return Decision(WAIT), stalled
@@ -133,19 +139,20 @@ def load(path: Path | str) -> State | None:
     version = _number(fields.pop("version", None), VERSION, whole=True)
     if version != VERSION or set(fields) != set(State.__dataclass_fields__):
         return None
-    state = State(**fields)  # pyright: ignore[reportArgumentType]  # checked by _valid
-    return state if _valid(state) else None
+    return _clean(State(**fields))  # pyright: ignore[reportArgumentType]  # checked by _clean
 
 
 def save(path: Path | str, state: State) -> None:
-    if not _valid(state):
+    clean = _clean(state)
+    if clean is None:
         raise ValueError("invalid outage state")
     target = Path(path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=target.name + ".", suffix=".tmp")
+    os.close(fd)  # reopened by name inside the try, so a failed open never leaks a handle
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump({"version": VERSION, **asdict(state)}, f, sort_keys=True)
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump({"version": VERSION, **asdict(clean)}, f, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp, target)
@@ -162,6 +169,6 @@ def step(path: Path | str, verdict: object, now: float) -> Decision:
     if state is not None and new is not None and new != state:
         try:
             save(path, new)
-        except OSError:
-            return _FAIL_CLOSED  # not stored, so not acted on (e.g. an unrecorded nudge)
+        except Exception:  # any failed write: not stored, so not acted on (fail closed)
+            return _FAIL_CLOSED
     return decision
