@@ -72,6 +72,33 @@ class Refusals(_Stage):
                 sign(bad)
             self.assertEqual(cm.exception.code, "not_argv")
 
+    def test_neg_record_refuses_a_result_that_ran_another_tool(self) -> None:
+        # N6-HARD2 H3: result.argv[0] must be the template's tool, not just any executable.
+        tail = ("-m", "unittest", "tests.test_x")
+
+        def sign(argv0: object) -> str:
+            result = work_checks.CheckResult(
+                argv=(argv0, *tail), runner="unittest", exit_code=0,  # type: ignore[arg-type]
+                duration_s=0.0, stdout="", stderr="", truncated=False, timed_out=False)
+            return work_checks.invocation_record("tests", ("python", *tail), result,
+                                                 "a" * 40, key=b"k")
+        for bad in ("C:/x/evil.exe", "", "C:/x/", "C:/x/\uff50\uff59\uff54\uff48\uff4f\uff4e.exe",
+                    "C:/x/python.exe.evil", "C:/x/pythonw.exe", "C:/x/python.ps1",
+                    "C:/x/python.exe\n", "C:/x/py.exe", 7, None):
+            with self.subTest(argv0=bad), self.assertRaises(CheckRefused) as cm:
+                sign(bad)
+            self.assertEqual(cm.exception.code, "record_argv")
+        for ok in ("C:/Python/python.exe", "C:\\Py\\PYTHON.EXE", "/usr/bin/python3.12",
+                   "C:/Py/python3.exe", "python"):
+            with self.subTest(argv0=ok):
+                self.assertTrue(sign(ok))
+        lint = work_checks.CheckResult(
+            argv=("C:/x/ru\ufb00.exe", "check", "a.py"), runner="ruff", exit_code=0,
+            duration_s=0.0, stdout="", stderr="", truncated=False, timed_out=False)
+        with self.assertRaises(CheckRefused):
+            work_checks.invocation_record("lint", ("ruff", "check", "a.py"), lint, "a" * 40,
+                                          key=b"k")
+
     def test_placeholder_must_be_a_validated_target(self) -> None:
         for argv in (["python", "-m", "pytest", "../x"], ["python", "-m", "pytest", "-p"],
                      ["python", "-m", "pytest", "-pplugin"], ["ruff", "check", "missing.py"],

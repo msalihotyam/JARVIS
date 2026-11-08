@@ -29,6 +29,7 @@ Every refusal raises ``CheckRefused`` with a stable code; nothing is started.
 from __future__ import annotations
 
 import ctypes
+import re
 import shutil
 import subprocess
 import tempfile
@@ -36,7 +37,7 @@ import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from jarvis import owned_process
@@ -289,6 +290,17 @@ def run_check(
     )
 
 
+def _ran_tool(argv0: object, tool: str) -> bool:
+    """The resolved executable's file name is the template's tool (any case, an optional
+    version suffix and .exe/.cmd/.bat). ASCII only, never normalized: a fullwidth or
+    ligature look-alike is another file, so it is refused (N6-HARD2 H3)."""
+    if type(argv0) is not str or not argv0 or not argv0.isascii():
+        return False
+    name = PureWindowsPath(argv0).name.lower()
+    return re.fullmatch(rf"{re.escape(tool.lower())}(\d+(\.\d+)*)?(\.exe|\.cmd|\.bat)?",
+                        name) is not None
+
+
 def invocation_record(check_id: str, requested_argv: Sequence[str], result: CheckResult,
                       commit_sha: str, *, key: bytes) -> str:
     """Sign the runner's record of one ``run_check`` result (N6-10, B2+).
@@ -305,6 +317,8 @@ def invocation_record(check_id: str, requested_argv: Sequence[str], result: Chec
     requested = tuple(requested_argv)
     if tuple(result.argv[1:]) != requested[1:]:
         raise CheckRefused("record_argv", "the result is for another command")
+    if not _ran_tool(result.argv[0] if result.argv else "", requested[0]):
+        raise CheckRefused("record_argv", "the result ran another tool")  # N6-HARD2 H3
     exit_code = None if result.timed_out else result.exit_code
     try:
         return InvocationRecord(check_id, requested, commit_sha, exit_code).sign(key)

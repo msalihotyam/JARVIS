@@ -217,6 +217,15 @@ class ReceiptVerdict:
 _RANK = {PASS: 0, NOT_RUN: 1, FAIL: 2, PARTIAL: 3, INVALID: 4}
 
 
+def _claimed_check(raw: object) -> object:
+    """The check id an unverified record claims, or None; never raises."""
+    try:
+        record = json.loads(raw)["record"]["check_id"] if type(raw) is str else None
+    except Exception:  # anything unparseable claims no check
+        return None
+    return record if type(record) is str else None
+
+
 def receipt_verdict(required: object, records: object, final_sha: object, *,
                     key: bytes, changed_files: Iterable[str],
                     commit_files: Iterable[str]) -> ReceiptVerdict:
@@ -238,12 +247,18 @@ def receipt_verdict(required: object, records: object, final_sha: object, *,
     checks = dict.fromkeys(required, NOT_RUN)
     reasons: list[str] = []
     seen: set[str] = set()
+    malformed = False
     for raw in records if isinstance(records, (list, tuple)) else [records]:
         try:
             record = InvocationRecord.from_signed(raw, key)
         except (ValueError, TypeError) as exc:
+            # N6-HARD2 H3: only the check the bad record names turns INVALID; the others
+            # keep their own state (a missing one stays NOT_RUN); the verdict is INVALID.
             reasons.append(f"malformed record: {exc}"[:120])
-            checks = {cid: INVALID for cid in checks}
+            malformed = True
+            cid = _claimed_check(raw)
+            if cid in checks:
+                checks[cid] = INVALID
             continue
         cid = record.check_id
         if cid not in checks:
@@ -266,7 +281,7 @@ def receipt_verdict(required: object, records: object, final_sha: object, *,
         if why:
             reasons.append(f"{cid}: {why}")
     reasons += [f"{cid}: no record" for cid, s in checks.items() if s == NOT_RUN]
-    verdict = max(checks.values(), key=_RANK.__getitem__)
+    verdict = INVALID if malformed else max(checks.values(), key=_RANK.__getitem__)
     try:
         if isinstance(changed_files, str) or isinstance(commit_files, str):
             raise TypeError

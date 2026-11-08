@@ -50,6 +50,24 @@ class N6LeaseTest(unittest.TestCase):
         self.assertTrue(n6_lease.check(self.path, new, NOW + 12))
         self.assertEqual(json.loads(self.path.read_text())["owner"], "mgr-b")
 
+    def test_neg_renew_never_shortens_the_expiry(self):
+        # N6-HARD2 H2: a shorter, zero or negative ttl keeps the longer expiry already on file.
+        lease = acquire(self.path, "mgr-a", "S1", 600, NOW)
+        for ttl in (10, 0, -50):
+            with self.subTest(ttl=ttl):
+                got = renew(self.path, lease, ttl, NOW + 1)
+                self.assertEqual(got.expires, NOW + 600)
+                self.assertEqual(json.loads(self.path.read_text())["expires"], NOW + 600)
+        self.assertEqual(renew(self.path, lease, 900, NOW + 1).expires, NOW + 901)
+
+    def test_neg_renew_non_finite_ttl_refused_and_file_stays_readable(self):
+        lease = acquire(self.path, "mgr-a", "S1", 60, NOW)
+        for ttl in (float("inf"), float("nan"), float("-inf"), 10 ** 400):
+            with self.subTest(ttl=ttl):
+                self.assertIsNone(renew(self.path, lease, ttl, NOW + 1))
+                self.assertEqual(live_slices(self.path, NOW + 1), frozenset({"S1"}))
+                self.assertEqual(json.loads(self.path.read_text())["expires"], NOW + 60)
+
     def test_neg_event_replayed_twice_applies_once(self):
         lease = acquire(self.path, "mgr-a", "S1", 60, NOW)
         self.assertTrue(apply_event(self.path, lease, "ev-1", NOW + 1))

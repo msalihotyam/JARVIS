@@ -134,6 +134,25 @@ class N6ReceiptTests(unittest.TestCase):
                 self.assertEqual(result.verdict, INVALID)
                 self.assertTrue(result.reasons)
 
+    def test_neg_malformed_record_marks_only_its_own_check(self):
+        # N6-HARD2 H3: a bad record makes only the check it names INVALID; a missing
+        # check stays NOT_RUN; a valid one keeps PASS; the verdict is never PASS.
+        bad_lint = resign(signed("lint", LINT, exit_code=1), exit_code=0)
+        for records in ([bad_lint, signed("tests")], [signed("tests"), bad_lint]):
+            with self.subTest(order=records.index(bad_lint)):
+                result = judge(records)
+                self.assertEqual(result.verdict, INVALID)
+                self.assertEqual(result.checks, {"tests": PASS, "lint": INVALID})
+        for junk in ("{", None, 0, json.dumps({"record": {"check_id": ["lint"]}}),
+                     json.dumps({"record": {"check_id": "extra"}, "hmac": "0"})):
+            with self.subTest(junk=junk):
+                result = judge([junk, signed("tests")])
+                self.assertEqual(result.verdict, INVALID)
+                self.assertEqual(result.checks, {"tests": PASS, "lint": NOT_RUN})
+        # A forged record cannot be cleared by an honest record for the same check after it.
+        result = judge([bad_lint, signed("lint", LINT), signed("tests")])
+        self.assertEqual((result.verdict, result.checks["lint"]), (INVALID, INVALID))
+
     def test_neg_forged_record_fails_authentication_alone(self):
         # Each forgery is judged with no second record for its check id, so
         # only the HMAC check can stop it (CDX-N6-10 F1).

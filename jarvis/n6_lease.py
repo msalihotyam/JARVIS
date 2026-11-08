@@ -170,13 +170,21 @@ def acquire(path: Path | str, owner: str, slice_id: str, ttl_s: float, now: floa
 
 
 def renew(path: Path | str, lease: Lease, ttl_s: float, now: float) -> Lease | None:
-    """The lease extended to now + ttl_s; None for a stale epoch or an expired lease."""
+    """The lease extended to max(current expiry, now + ttl_s); None for a stale epoch, an
+    expired lease or a non-finite expiry. A renew never shortens the lease (N6-HARD2 H2)."""
     path = Path(path)
     with _locked(path) as got:
         state = _read(path)
         if not got or not isinstance(state, dict) or not _current(state, lease, now):
             return None
-        renewed = replace(_lease(state), expires=now + ttl_s)  # N6-08FIX F2: the file's state
+        held = _lease(state)  # N6-08FIX F2: the file's state, never the caller's copy
+        try:
+            new = float(now + ttl_s)
+        except (OverflowError, TypeError):
+            return None
+        if not math.isfinite(new):
+            return None
+        renewed = replace(held, expires=max(held.expires, new))
         try:
             _write(path, renewed, _applied(state, renewed.epoch))
         except (OSError, ValueError):
