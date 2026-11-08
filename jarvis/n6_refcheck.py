@@ -27,8 +27,7 @@ from typing import Protocol
 # Every report is _lf()-normalized once before any parsing.
 PICK_TOK_RE = re.compile(r"\b[A-Z][A-Z0-9_-]{1,63}\b")
 _HEADER_RE = re.compile(r"[A-Z][A-Z _-]*:")  # .match on the raw line: column 0, ASCII only
-_PICKS_HEAD_RE = re.compile(r"PICKS\b")
-_RUN_HEAD_RE = re.compile(r"RUN_ID\b")
+_PICKS_LINE_RE = re.compile(r"PICKS:[ \t]*")  # fullmatch: the only header shape accepted
 
 _SHA_RE = re.compile(r"[0-9a-f]{40}")
 # Every hex-looking run of 4+ chars (git's shortest abbreviation) not glued to a word; a
@@ -100,9 +99,15 @@ def _unblank(line: str) -> str:
     return next((line[i:] for i, c in enumerate(line) if not _blank(c)), "")
 
 
+def _head(line: str, key: str) -> bool:
+    """Does ``line`` start with ``key`` in any case behind any Unicode-blank prefix? Matching
+    too much (ligatures, dotless i) only adds refusals."""
+    return _unblank(line).upper().startswith(key)
+
+
 def _check_run_id(report: str, run_id: str) -> None:
-    # A second RUN_ID behind any indent, NBSP, BOM or zero-width prefix still counts.
-    lines = [ln for ln in report.split("\n") if _RUN_HEAD_RE.match(_unblank(ln))]
+    # A second RUN_ID (any case, any suffix) behind any indent, NBSP, BOM or zero-width prefix counts.
+    lines = [ln for ln in report.split("\n") if _head(ln, "RUN_ID")]
     if len(lines) != 1:
         raise RefCheckError(f"report needs exactly one RUN_ID line, found {len(lines)}")
     m = re.fullmatch(r"RUN_ID:[ \t]*(\S+)[ \t]*", lines[0])
@@ -140,20 +145,23 @@ def _parse_pick_line(line: str) -> Pick:
 
 
 def parse_picks(report: str) -> tuple[Pick, ...]:
-    """The single PICKS block as a closed grammar: the header's rest and every line up to the
-    next top-level ``KEY:`` header (or the end) is Unicode-blank or one valid pick; anything
-    else raises "malformed pick line". A PICKS header behind any Unicode prefix counts."""
+    """A whitelist: exactly one line starts with PICKS (any case, after any Unicode-blank
+    prefix) and it is the bare header ``PICKS:`` plus spaces/tabs; every line up to the next
+    top-level ``KEY:`` header (or the end) is Unicode-blank or one valid pick. Any other
+    shape raises: refusal falls back to the orchestrator."""
     report_ok: object = report
     if type(report_ok) is not str:
         raise RefCheckError("report is not text")
     lines = _lf(report).split("\n")  # idempotent: read_evidence already normalized it
-    heads = [i for i, ln in enumerate(lines) if _PICKS_HEAD_RE.match(_unblank(ln))]
+    heads = [i for i, ln in enumerate(lines) if _head(ln, "PICKS")]
     if len(heads) != 1:
         raise RefCheckError(f"report needs exactly one PICKS block, found {len(heads)}")
     head = heads[0]
-    if not _PICKS_HEAD_RE.match(lines[head]):
+    if _unblank(lines[head]) != lines[head]:
         raise RefCheckError(f"PICKS header not at line start: {lines[head][:80]!r}")
-    block = [lines[head].partition(":")[2]]
+    if not _PICKS_LINE_RE.fullmatch(lines[head]):  # whitelist: the header holds nothing else
+        raise RefCheckError(f"malformed PICKS header: {lines[head][:80]!r}")
+    block: list[str] = []
     for line in lines[head + 1 :]:
         if _HEADER_RE.match(line):
             break

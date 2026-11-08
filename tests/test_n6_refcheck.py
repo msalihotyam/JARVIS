@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import re
 import sqlite3
 import unittest
 from pathlib import Path
@@ -24,7 +25,7 @@ PID1, PID2 = "c" * 40, "d" * 40
 GOOD = (
     "STATUS: CI_PENDING\n"
     "RUN_ID: run-2026-11-08.1\n"
-    "PICKS old -> new (all clean, no conflicts):\n"
+    "PICKS:\n"
     f"  {SRC1} -> {NEW1} N6-14\n"
     f"  {SRC2} -> {NEW2} N6-13\n"
     "NEW MAIN SHA: " + HEAD + "\n"
@@ -222,11 +223,48 @@ class N6RefcheckTests(unittest.TestCase):
         bad = {
             "blank line hides a pick": f"PICKS:\n  {SRC1} -> {NEW1} N6-14\n\n  {SRC2} N6-13\n",
             "lane only": "PICKS:\n  N6-14\n",
-            "header colon content": f"PICKS: N6-14\n  {SRC1} -> {NEW1} N6-14\n",
         }
         for name, report in bad.items():
             with self.subTest(name), self.assertRaisesRegex(RefCheckError, "malformed pick line"):
                 parse_picks(report)
+
+    def test_neg_cdxn615r4_header_content_refused(self):
+        # CDXN615R4 F1: content on (or a colon missing from) the header line was silently discarded.
+        body = f"\n  {SRC2} -> {NEW2} N6-14\n"
+        for head in (
+            f"PICKS {SRC1} -> {NEW1} N6-13",
+            f"PICKS {SRC1} N6-13 garbage",
+            f"PICKS garbage {SRC1} N6-13: ",
+            f"PICKS-X {SRC1} -> {NEW1} zz: ",
+            f"PICKS: {SRC1} -> {NEW1} N6-13",
+            "PICKS: N6-14",
+        ):
+            with self.subTest(head), self.assertRaisesRegex(RefCheckError, "malformed PICKS header"):
+                parse_picks(head + body)
+
+    def test_neg_header_whitelist_refuses_every_other_shape(self):
+        body = f"\n  {SRC1} -> {NEW1} N6-14\n"
+        for head in (
+            "PICKS :", "PICKS", "PICKS;", "PICKS::", "picks:", "Picks:", "pIcKs:", "PICKS :",
+            "PICKS: ", "PICKS:​", "PICKS:　", "PICKS:﻿", "PICKS​:", "PICKSX:",
+            "PICKS (original -> new):", "PICKS (clean, no conflicts):",
+            "PICKS old -> new (all clean, no conflicts):",
+        ):
+            with self.subTest(head), self.assertRaisesRegex(RefCheckError, "malformed PICKS header"):
+                parse_picks(head + body)
+        for head in ("PICK:", "PIKS:", "P I C K S:"):  # not a PICKS head at all
+            with self.subTest(head), self.assertRaisesRegex(RefCheckError, "found 0"):
+                parse_picks(head + body)
+
+    def test_neg_second_picks_head_any_case_or_suffix_refused(self):
+        for extra in ("picks:", "Picks more:", "PICKS-X: y", "PICKS", "pIcKs (old):", "​picks:"):
+            with self.subTest(extra), self.assertRaisesRegex(RefCheckError, "found 2"):
+                parse_picks(GOOD.replace("NEW MAIN SHA", f"{extra}\nNEW MAIN SHA"))
+
+    def test_neg_second_run_id_head_any_case_or_suffix_refused(self):
+        for extra in ("run_id: other", "Run_Id: " + RUN, "RUN_IDX: x", "RUN_ID", " run_id:"):
+            with self.subTest(extra), self.assertRaisesRegex(RefCheckError, "exactly one RUN_ID"):
+                _read(FakeGit([HEAD, HEAD]), report=GOOD + extra + "\n")
 
     def test_neg_duplicate_pick_refused(self):
         for line in (f"  {SRC1} -> {S5} N6-12", f"  {S5} -> {NEW1} N6-12", f"  {S5} -> {S6} N6-14"):
@@ -435,7 +473,7 @@ class N6RefcheckTests(unittest.TestCase):
     def test_neg_sole_picks_header_behind_a_prefix_refused(self):
         for prefix in self.PREFIXES[1:]:
             with self.subTest(prefix=prefix), self.assertRaisesRegex(RefCheckError, "PICKS header not at line start"):
-                parse_picks(GOOD.replace("PICKS old", f"{prefix}PICKS old"))
+                parse_picks(GOOD.replace("\nPICKS:", f"\n{prefix}PICKS:"))
 
     def test_neg_hidden_second_run_id_line_counted(self):
         for prefix in self.PREFIXES:
@@ -446,7 +484,7 @@ class N6RefcheckTests(unittest.TestCase):
     def test_ok_real_int_block_lf_and_crlf_still_parses(self):
         lines = [line for line, _ in REAL_OK.values()]
         want = tuple(Pick(*exp) for _, exp in REAL_OK.values())
-        report = "STATUS: CI_PENDING\nPICKS old -> new (all clean, no conflicts):\n" + "\n".join(lines)
+        report = "STATUS: CI_PENDING\nPICKS:\n" + "\n".join(lines)
         report += "\n\nRESOLVED HUNKS: none\nCI: pending\n"
         for eol in ("\n", "\r\n"):
             with self.subTest(eol=eol):
@@ -496,6 +534,88 @@ class N6RefcheckMixedEolTests(_EolVariant):
 
 
 del _EolVariant  # the base runs only through its subclasses
+
+# Mutation alphabet: separators, Unicode space/format chars, homoglyphs, letters and digits.
+FUZZ_CHARS = (":", " ", "\t", " ", "​", "﻿", "　", " ", "-", "−", ">",
+              "(", ")", ",", "：", "a", "A", "0", "P", "s", "N")
+_SHA_TOK_RE = re.compile(r"[0-9a-f]{40}")
+_LANE_TOK_RE = re.compile(r"[A-Z][A-Z0-9]*(?:-[A-Z0-9]+)+")
+
+
+def _mutations(line: str, header: bool):
+    """Every one-char insert/delete/replace/swapcase of ``line`` (plus colon moves on the header).
+    Skipped on a pick line, because they can yield a different but well-formed pick that no
+    parser can tell from the original (not a parser bug): alnum/'-' edits touching a sha, and any
+    edit inside a lane label or next to it (N6-10 -> N6-10A, AN6-10, 'N6-1 0')."""
+    shas = [] if header else [m.span() for m in _SHA_TOK_RE.finditer(line)]
+    lanes = [] if header else [m.span() for m in _LANE_TOK_RE.finditer(line)]
+
+    def guarded(p: int, ch: str, insert: bool) -> bool:
+        if any(a - 1 <= p <= b for a, b in lanes):
+            return True
+        if not (ch.isalnum() or ch == "-"):
+            return False
+        return any(a <= p <= b if insert else a <= p < b for a, b in shas)
+
+    for p in range(len(line) + 1):
+        for ch in FUZZ_CHARS:
+            if not guarded(p, ch, True):
+                yield line[:p] + ch + line[p:]
+    for p, old in enumerate(line):
+        if not guarded(p, "a", False):
+            yield line[:p] + line[p + 1 :]
+        for ch in FUZZ_CHARS:
+            if ch != old and not guarded(p, ch, False):
+                yield line[:p] + ch + line[p + 1 :]
+        if old.swapcase() != old and not guarded(p, "a", False):
+            yield line[:p] + old.swapcase() + line[p + 1 :]
+    if header:
+        bare = line.replace(":", "")
+        for p in range(len(bare) + 1):
+            yield bare[:p] + ":" + bare[p:]
+
+
+class PicksMutationFuzzTests(unittest.TestCase):
+    """Property: no single-char mutation of the header or a pick line of a real report is ever
+    accepted with a pick set different from the original; refusing is always fine."""
+
+    LINES = [f"  {SRC2} -> {NEW2} N6-13", *(line for line, _ in REAL_OK.values())]
+    WANT = (Pick(SRC2, NEW2, "N6-13"), *(Pick(*exp) for _, exp in REAL_OK.values()))
+
+    def _report(self, header: str, lines: list[str]) -> str:
+        return f"STATUS: CI_PENDING\nRUN_ID: {RUN}\n{header}\n" + "\n".join(lines) + "\n\nCI: pending\n"
+
+    def test_no_mutation_is_accepted_with_other_picks(self):
+        with mock.patch.object(sqlite3, "connect", side_effect=AssertionError("no db")):
+            stats, failures = self._fuzz()
+        self.assertEqual(failures, [])
+        self.assertGreater(stats["accepted"], 0)  # non-vacuous: harmless mutations still parse
+        self.assertGreater(stats["refused"], 0)
+
+    def _fuzz(self) -> tuple[dict[str, int], list[str]]:
+        stats = {"total": 0, "accepted": 0, "refused": 0}
+        failures: list[str] = []
+        for eol in ("\n", "\r\n"):
+            self.assertEqual(parse_picks(self._report("PICKS:", self.LINES).replace("\n", eol)), self.WANT)
+            for idx in range(-1, len(self.LINES)):
+                target = "PICKS:" if idx < 0 else self.LINES[idx]
+                for mutant in _mutations(target, idx < 0):
+                    header, lines = ("PICKS:", list(self.LINES)) if idx >= 0 else (mutant, list(self.LINES))
+                    if idx >= 0:
+                        lines[idx] = mutant
+                    stats["total"] += 1
+                    try:
+                        got = parse_picks(self._report(header, lines).replace("\n", eol))
+                    except RefCheckError:
+                        stats["refused"] += 1
+                        continue
+                    except Exception as exc:  # any other exception is a parser bug
+                        failures.append(f"{type(exc).__name__} on {mutant!r}")
+                        continue
+                    stats["accepted"] += 1
+                    if got != self.WANT:
+                        failures.append(f"accepted other picks: {mutant!r}")
+        return stats, failures[:20]
 
 
 if __name__ == "__main__":
