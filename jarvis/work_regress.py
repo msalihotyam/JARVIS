@@ -184,8 +184,8 @@ def retriable(exc: BaseException) -> bool:
     return isinstance(exc, _RETRIABLE)
 
 
-def _norm(text: str) -> str:
-    return " ".join(text.lower().split())
+def _words(text: str) -> list[str]:
+    return re.findall(r"[^\W_]+", text.lower())  # underscores split words too: gate_error == gate error
 
 
 def root_cause_ok(record: object, failure_id: str, error_text: str) -> bool:
@@ -193,8 +193,8 @@ def root_cause_ok(record: object, failure_id: str, error_text: str) -> bool:
     if not isinstance(record, str) or not failure_id:
         return False
     match = re.match(r"ROOT CAUSE " + re.escape(failure_id) + r": (.+)", record.strip(), re.S)
-    body = _norm(match[1]) if match else ""
-    err = _norm(error_text)
-    # Neither a part of the error text nor the error text with only punctuation added.
-    rest = body.replace(err, " ") if err else body
-    return bool(re.search(r"\w", rest)) and body not in err and body != _norm(failure_id)
+    body = _words(match[1]) if match else []
+    known = set(_words(error_text)) | set(_words(failure_id))
+    # N6-13FIX: case, spacing and punctuation are ignored; the why needs a word the error and id lack,
+    # and must not be a fragment of the error text.
+    return bool(set(body) - known) and " ".join(body) not in " ".join(_words(error_text))
