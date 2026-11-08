@@ -27,6 +27,7 @@ import socket
 import stat
 import subprocess
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -1690,14 +1691,31 @@ class Conveyor:
         if not self.write_atomic(f, json.dumps(st)):
             self.send("Yeniden başlatma kaydedilemedi; konveyör çalışmaya devam ediyor.", title="Yeniden baslat")
             return
-        self.send("Yeniden başlatılıyor…", title="Yeniden baslat")
-        self.restart_pending = True
+        self.restart_pending = True  # restart_go sends "Yeniden başlatılıyor…" itself, just before the spawn
+
+    def send_before_restart(self):
+        """PHONECMDFIX5: the starting message is delivered (result awaited, <= 10 s) before the task
+        spawns; a failed or hung send is logged once and the restart goes on."""
+        box = []
+
+        def run():
+            try:
+                box.append(self.send("Yeniden başlatılıyor…", title="Yeniden baslat"))
+            except Exception as e:
+                box.append("error " + type(e).__name__)
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        t.join(10)
+        res = box[0] if box else "timeout"
+        if isinstance(res, str) and (res.startswith("error") or res == "timeout"):
+            self.event("phone_restart_send_failed", error=res)
 
     def restart_go(self):
         """Run the restart task once; on any failure clear the marker, say so and keep running."""
         if not self.restart_pending:
             return
         self.restart_pending = False
+        self.send_before_restart()
         try:
             if self.spawn is None:
                 raise RuntimeError("no spawn")
