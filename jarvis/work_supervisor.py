@@ -18,6 +18,9 @@ from dataclasses import dataclass, replace
 from math import isfinite
 from typing import Mapping, NamedTuple
 
+from pathlib import Path
+
+from jarvis import n6_breaker
 from jarvis.work_controls import read_pause
 
 
@@ -407,7 +410,8 @@ def _decide(s: Situation) -> Decision:
     return _final(found["quota"], constraint)   # non_claude_only and no work
 
 
-def supervise(situation: Situation, pause_file: object = None) -> Decision:
+def supervise(situation: Situation, pause_file: object = None, *,
+              n6_dir: object = None, slice_id: str | None = None) -> Decision:
     """One decision by PRECEDENCE, with its worker constraint.
 
     A non-Situation (build one with Situation.from_dict) or unknown keys ->
@@ -424,8 +428,33 @@ def supervise(situation: Situation, pause_file: object = None) -> Decision:
     if pause_file is not None and read_pause(pause_file):
         situation = replace(situation, operator_pause=True)
     try:
-        return _decide(situation)
+        decision = _decide(situation)
     except ValueError:
         raise
     except Exception as exc:
         raise ValueError(f"malformed situation: {type(exc).__name__}") from None
+    if n6_dir is None or decision.action not in _ANY_WORKER:
+        return decision
+    # N6-WIRE1 (shadow): a worker action waits while the slice's root is open in the
+    # n6_breaker state. No slice id, a missing/unreadable state or any error holds.
+    try:
+        held = (not isinstance(slice_id, str) or not slice_id.strip()
+                or n6_breaker.holds(n6_breaker.load(Path(n6_dir) / "breaker.json"), slice_id))
+    except Exception:
+        held = True
+    if held:
+        return decision._replace(action="wait", rule_id="n6.breaker",
+                                 reason=f"breaker holds {slice_id!r}")
+    return decision
+
+
+def n6_record_finish(n6_dir: object, name: str, status: str, fin: float, now: float, *,
+                     outage: bool = False) -> bool:
+    """N6-WIRE1: record one lane finish in the breaker. An outage never counts: nothing
+    is written. False when nothing was written (the caller retries)."""
+    if outage:
+        return False
+    try:
+        return n6_breaker.record_finish(Path(str(n6_dir)) / "breaker.json", name, status, fin, now) is True
+    except Exception:
+        return False

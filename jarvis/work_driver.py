@@ -59,13 +59,16 @@ accepted, otherwise undone and counted as a failed attempt.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import math
 import re
 from collections.abc import Callable, Iterable, Mapping
+from dataclasses import dataclass
 from datetime import datetime
+from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
-from jarvis import n6_boot
+from jarvis import n6_boot, n6_notify, n6_outage, n6_preflight, n6_refcheck
 from jarvis.n6_lease import Fenced, Lease
 from jarvis.work_ledger import (
     MAX_REVISIONS,
@@ -137,6 +140,52 @@ class Ports(Protocol):
     def boot_record(self, item: n6_boot.Item, /) -> object: ...
     def boot_resume(self, item: n6_boot.Item, /) -> object: ...
 
+@dataclass(frozen=True)
+class N6:
+    """N6-WIRE1: the optional ``ports.n6`` port (shadow; the app never sets it, N6-01).
+
+    dir: the one N6 state dir (never build/conveyor/, never a database). now: epoch seconds.
+    slice(step) -> (slice_, main_sha, owned_by_running_lanes, done_ids) for n6_preflight.
+    watchdog(step, result) -> an n6_outage verdict ("continue" | "outage" | "timeout").
+    int_check(step) -> None (not an INT) or (git, ref, read_report, run_id) for n6_refcheck."""
+
+    dir: Path
+    now: Callable[[], float]
+    slice: Callable[[WorkStep], tuple[object, object, object, object]]
+    watchdog: Callable[[WorkStep, WorkerResult | None], object] | None = None
+    int_check: Callable[[WorkStep], tuple[n6_refcheck.GitPort, str, Callable[[], object], str] | None] | None = None
+
+
+def _n6_dir(n6: N6) -> Path:
+    """The state dir, checked; raises (the caller holds) on anything doubtful."""
+    d = Path(n6.dir).resolve()
+    parts = [p.lower() for p in d.parts]
+    if any(a == "build" and b == "conveyor" for a, b in zip(parts, parts[1:])) or any(
+        "jarvis.db" in p for p in parts
+    ):
+        raise ValueError("N6 state dir must not be build/conveyor/ or a database")
+    if not d.is_dir():
+        raise ValueError("N6 state dir is missing")
+    return d
+
+
+def _n6_file(n6: N6, prefix: str, key: str) -> Path:
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", key)[:40]
+    return _n6_dir(n6) / f"{prefix}-{safe}-{hashlib.sha1(key.encode()).hexdigest()[:8]}.json"
+
+
+def _notify(ports: Ports, point: str, dedupe: str, step_key: str | None) -> object:
+    """In N6 mode every notification goes through n6_notify's importance filter only
+    (ORCHESTRATOR items are never stored or paged); a failed submit is not paged."""
+    n6 = getattr(ports, "n6", None)
+    if n6 is None:
+        return ports.notify(point, dedupe, step_key)
+    try:
+        return n6_notify.submit(_n6_dir(n6) / "notify.json", n6_notify.Event(point, dedupe, step_key or ""))
+    except Exception:
+        return False
+
+
 # PM34: MINOR is logged; BLOCKER, MAJOR and any unknown severity block.
 _NON_BLOCKING = frozenset({"MINOR"})
 _REVISABLE = frozenset({StepState.ACCEPTING, StepState.BLOCKED_BY_GATE, StepState.TIMEOUT})
@@ -191,7 +240,7 @@ def drive(run: WorkRun, steps: Iterable[WorkStep], ports: Ports) -> tuple[WorkRu
         by_key[step.key] = step
         if outcome == "budget":
             run = _run_to(run, RunState.BLOCKED_BUDGET, ports)
-            ports.notify("blocked:budget", f"budget:{step.key}:{step.attempt}", step.key)
+            _notify(ports, "blocked:budget", f"budget:{step.key}:{step.attempt}", step.key)
         elif outcome == "held":
             break  # N6-13: an attention item; the run pauses below
     if run.state == RunState.BUILDING:
@@ -276,7 +325,7 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
 
     def accepted() -> tuple[WorkStep, str]:
         step = move(StepState.ACCEPTED)
-        ports.notify("slice_accepted", f"{step.key}:accepted", step.key)
+        _notify(ports, "slice_accepted", f"{step.key}:accepted", step.key)
         return step, "accepted"
 
     def capped() -> tuple[WorkStep, str] | None:
@@ -284,20 +333,20 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
         if step.revisions < MAX_REVISIONS:
             return None
         step = move(StepState.FAILED_AFTER_CAP)
-        ports.notify("slice_failed_after_cap", f"{step.key}:failed_after_cap", step.key)
+        _notify(ports, "slice_failed_after_cap", f"{step.key}:failed_after_cap", step.key)
         return step, "failed"
 
     def ended(found: _Findings) -> tuple[WorkStep, str]:
         # N6-13: a non-retriable gate error ends the slice; CANCELLED is terminal.
         step = move(StepState.CANCELLED)
         _gate_event(step, "non_retriable", found, ports)
-        ports.notify("slice_failed_after_cap", f"{step.key}:non_retriable", step.key)
+        _notify(ports, "slice_failed_after_cap", f"{step.key}:non_retriable", step.key)
         return step, "held"
 
     def hold(gate: str, detail: str) -> tuple[WorkStep, str]:
         step = track[0]
         _gate_event(step, gate, (_finding(gate, detail),), ports)
-        ports.notify("slice_failed_after_cap", f"{step.key}:{gate}:{step.attempt}", step.key)
+        _notify(ports, "slice_failed_after_cap", f"{step.key}:{gate}:{step.attempt}", step.key)
         return step, "held"
 
     def unrooted(found: _Findings | None) -> tuple[WorkStep, str] | None:
@@ -320,9 +369,20 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
         return hold("root_cause", ("missing_or_invalid:" if found else "findings_unreadable:") + failure)
 
     step = track[0]
+    started = step.state != StepState.PENDING
+    n6: N6 | None = getattr(ports, "n6", None)
+    if n6 is not None and not started:
+        # N6-WIRE1: preflight before anything is created; a block (or any doubt) holds the slice.
+        try:
+            _n6_dir(n6)
+            verdict = n6_preflight.preflight(*n6.slice(step))
+            why = None if verdict.ok is True else str(verdict.reason)
+        except Exception as exc:
+            why = f"error:{type(exc).__name__}"
+        if why is not None:
+            return hold("preflight", why)
     stage = ports.stage_create(step)
     worker = ports.worker(ports.route(step))
-    started = step.state != StepState.PENDING
     # A resumed revision's findings are read back from the ledger; unreadable stays None (held).
     findings: _Findings | None = _ledger_findings(step, ports) if started else ()
     if step.state == StepState.ACCEPTING:
@@ -350,7 +410,7 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
         step = move(StepState.RUNNING)
         if not started:
             started = True
-            ports.notify("slice_started", f"{step.key}:started:{step.attempt}", step.key)
+            _notify(ports, "slice_started", f"{step.key}:started:{step.attempt}", step.key)
         run_id: str | None = None
         result: WorkerResult | None = None
         try:
@@ -367,11 +427,31 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
             result = None
             findings = (_gate_error("worker", exc),)
         timed_out = result is not None and result.status == "timeout"
+        if n6 is not None and n6.watchdog is not None:
+            # N6-WIRE1: the watchdog verdict goes through n6_outage. HOLD/NUDGE/WAIT are an
+            # outage: INTERRUPTED, never counted (attempt and revisions unchanged). DROP counts
+            # as a timeout. Any error holds the same uncounted way (fail closed).
+            try:
+                decision = n6_outage.step(_n6_file(n6, "outage", step.key), n6.watchdog(step, result), n6.now())
+                action, counts = decision.action, decision.counts_failure is True
+            except Exception as exc:
+                action, counts = f"error:{type(exc).__name__}", False
+            if action != "continue" and not counts:
+                if result is None and run_id is not None:
+                    with contextlib.suppress(Exception):
+                        worker.stop(run_id)
+                step = move(StepState.INTERRUPTED)
+                return hold("outage", str(action))
+            if action != "continue":
+                timed_out = True
+                if result is not None and result.status == "completed":
+                    result = None
+                    findings = (_finding("outage", "drop"),)
         if result is not None:
             # Claims like "completed" never skip a gate; others only narrow.
             if ports.needs_input(result):
                 step = move(StepState.NEEDS_INPUT)
-                ports.notify("needs_input", f"{step.key}:needs_input:{step.attempt}", step.key)
+                _notify(ports, "needs_input", f"{step.key}:needs_input:{step.attempt}", step.key)
                 return step, "needs_input"
             if result.status != "completed":
                 findings = (_finding("worker", "status:" + result.status),)
@@ -447,7 +527,25 @@ def _accept(step: WorkStep, stage: Stage, ports: Ports) -> tuple[_Findings, bool
             ports.append_event(EventKind.PROGRESS, step.key, {"gate": "review_minor", "findings": minor})
         return blocking
 
-    for name, gate in (("checks", checks), ("regression", regression), ("review", review)):
+    def refcheck() -> list[str]:
+        # N6-WIRE1: an INT result is accepted only through n6_refcheck (read_evidence then
+        # accept). Any refusal or error is a finding, never a raise (fail closed, retriable).
+        n6 = getattr(ports, "n6", None)
+        try:
+            spec = n6.int_check(step) if n6 is not None and n6.int_check is not None else None
+            if spec is None:
+                return []
+            git, ref, read_report, run_id = spec
+            n6_refcheck.accept(git, n6_refcheck.read_evidence(git, ref, read_report, run_id), run_id)
+            return []
+        except Exception as exc:
+            return [f"refcheck:{type(exc).__name__}:{exc}"[:300]]
+
+    gates: tuple[tuple[str, Callable[[], list[str]]], ...] = (
+        ("checks", checks), ("regression", regression), ("review", review))
+    if getattr(ports, "n6", None) is not None:  # shadow only: no gate event without N6
+        gates += (("refcheck", refcheck),)
+    for name, gate in gates:
         findings = _gate(step, name, ports, gate)
         if findings:
             return findings, False
