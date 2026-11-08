@@ -464,6 +464,14 @@ class CodexWorkerTest(unittest.TestCase):
         self.assertFalse((self.root / "build" / "conveyor" / "codex" / "CDXA.prompt.md").exists())
 
     def test_tools_dir_is_appended_last_never_prepended(self):
+        # CODEXTOOLS2FIX: real directories survive sanitized_path, so a prepend is caught
+        dirs = [self.root.parent / "bin-a", self.root.parent / "bin-b"]
+        for d in dirs:
+            d.mkdir()
+        kept = [str(d.resolve()) for d in dirs]
+        self.w.environ = {**self.environ, "PATH": os.pathsep.join(map(str, dirs))}
+        self.w.start("CDXA", self.wt, "x")
+        self.assertEqual(self.procs[-1].kw["env"]["PATH"].split(os.pathsep), [*kept, str(self.tools)])
         for environ in ({**self.environ, "Path": "C:/bin"}, {"path": "C:/bin;C:/other"}, {}):
             with self.subTest(environ=environ):
                 self.w.environ = environ
@@ -524,6 +532,11 @@ class CodexWorkerTest(unittest.TestCase):
         plants.append(lambda: self.symlink(link, target, target_is_directory=True))
         return plants  # the symlink last: no symlink right skips only it
 
+    @staticmethod
+    def unplant(link):
+        # removes the link only: unlink a symlink (rmdir raises on a POSIX one), rmdir a junction
+        os.unlink(link) if os.path.islink(link) else os.rmdir(link)
+
     def test_tools_dir_link_or_junction_refuses_start(self):
         outside = self.root.parent / "outside-tools"
         shutil.copytree(self.tools, outside)  # a valid pinned ruff.exe, just elsewhere
@@ -531,7 +544,7 @@ class CodexWorkerTest(unittest.TestCase):
         for plant in self.plant_dirs(self.tools, outside):
             plant()
             self.assert_tools_refused()
-            os.rmdir(self.tools)  # removes the link only
+            self.unplant(self.tools)
         self.assertTrue((outside / "ruff.exe").is_file())
 
     def test_linked_parent_of_tools_refuses_start(self):
@@ -542,7 +555,7 @@ class CodexWorkerTest(unittest.TestCase):
         for plant in self.plant_dirs(conveyor_dir, outside):
             plant()
             self.assert_tools_refused()
-            os.rmdir(conveyor_dir)
+            self.unplant(conveyor_dir)
 
     def test_argv_is_unchanged_by_the_tools_path(self):
         self.w.start("CDXA", self.wt, "x")
