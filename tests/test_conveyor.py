@@ -9503,20 +9503,99 @@ class PhoneCmd(Base):
         self.assertEqual(len(self.pushes), 20)
         self.assertEqual([r["n"] for r in self.events("phone_dropped")], [5])
 
+    # PHONECMD3: plan targets under the temp root; a fixed clock (2026-11-08 12:00 Istanbul).
+    NOW = conveyor.datetime(2026, 11, 8, 12, tzinfo=conveyor.IST).timestamp()
+    RX = r"^(feat|fix)\(x\): P-(\d\d)\b"
+
+    def targets(self, doc):
+        f = self.root / "build" / "orch" / "plan_targets.json"
+        f.parent.mkdir(parents=True, exist_ok=True)
+        f.write_text(doc if isinstance(doc, str) else json.dumps(doc), encoding="utf-8")
+
+    def item(self, label="P plan", total=12, start="2026-11-06", due="2026-11-11", regex=None):
+        return {"id": label, "label": label, "regex": regex or self.RX, "total": total, "start": start, "due": due}
+
+    def done(self, n):  # n distinct ids, one duplicated, plus noise
+        subj = [f"feat(x): P-{k:02d} s" for k in range(1, n + 1)] + ["fix(x): P-01 again", "feat(y): P-99 no"]
+        self.git.fail[("git", "log")] = (0, "\n".join(subj) + "\n")
+
     def test_durum_sections_unknowns_and_cap(self):
+        self.targets({"items": [self.item("N6 kod (15 dilim)", 15, regex=r"^(feat|fix)\(n6\): N6-(\d\d)\b")]})
         self.git.fail[("git", "log")] = (0, "feat(n6): N6-01 a\nfix(n6): N6-01 b\nfeat(n6): N6-07 c\n")
         self.msgs(("d1", "DURUM"))
         self.tick()
         text = self.pushes[0]
-        for s in ("main: 1234567", "son push: bilinmiyor", "Senden beklenen: yok",
-                  "Orkestratörden beklenen: yok", "N6: 2/15", "Haftalık kota: bilinmiyor",
-                  "Konveyör: pid", "Son alarm: yok", "Okunmamış not: 0", "Orkestratör uyanışı: bilinmiyor"):
+        for s in ("0 hat · senden 0 · ork 0 · kota ? · N6 2/15", "main 1234567", "push ?",
+                  "Kota: bilinmiyor", "N6 kod (15 dilim): 2/15", "not 0"):
             self.assertIn(s, text)
         print("\nSAMPLE DURUM:\n" + text)
-        items = [(f"L{k}", "x" * 400, 0) for k in range(40)]
-        self.assertLessEqual(len(self.c.durum_text({}, items)), 3500)
         self.git.fail[("git", "log")] = (128, "fatal")
-        self.assertIn("N6: bilinmiyor", self.c.durum_text({}, []))
+        self.assertIn("N6 kod (15 dilim): bilinmiyor", self.c.durum_text({}, []))
+        self.assertEqual(sum(a[:2] == ["git", "log"] for a in self.git.calls), 2)  # one per report, two reports
+
+    def test_quota_fast_on_slow_unknown(self):
+        for use, line, want, short in ((62, 58, "hızlı harcıyoruz", "kota hızlı (62/58)"),
+                                       (60, 58, "plandayız", "kota planda (60/58)"),
+                                       (56, 58, "plandayız", "kota planda (56/58)"),
+                                       (55, 58, "yavaş harcıyoruz", "kota yavaş (55/58)")):
+            self.c.pace = {"usage_pct": use, "pace_line": line}
+            text = self.c.durum_text({}, [])
+            self.assertIn(f"Kota: %{use} / plan çizgisi %{line} -> {want}", text)
+            self.assertIn(short, text.splitlines()[0])
+        self.c.pace = {"usage_pct": None, "pace_line": 58}
+        self.assertIn("Kota: bilinmiyor", self.c.durum_text({}, []))
+        self.c.pace = {"usage_pct": 40, "pace_line": None}  # full_burn: no line to compare
+        self.assertIn("Kota: %40 (plan çizgisi yok)", self.c.durum_text({}, []))
+
+    def test_plan_ahead_on_behind_late(self):
+        self.t = self.NOW  # 2.5 of 6 days elapsed: 12 * 0.4167 = ~5 expected
+        self.targets({"items": [self.item()]})
+        for n, word in ((7, "öndeyiz"), (6, "plandayız"), (4, "plandayız"), (3, "gerideyiz")):
+            self.done(n)
+            self.assertIn(f"P plan: {n}/12 (beklenen ~5) -> {word}", self.c.durum_text({}, []))
+        self.targets({"items": [self.item(due="2026-11-07"), self.item("Q son", 2, due="2026-11-08")]})
+        self.done(2)
+        text = self.c.durum_text({}, [])
+        self.assertIn("P plan: 2/12 (beklenen ~12) -> gecikti", text)
+        self.assertIn("Q son: 2/2 (beklenen ~2) -> plandayız", text)  # the due day still counts
+        self.assertIn("P 2/12 gecikti", text.splitlines()[0])
+
+    def test_neg_targets_missing_or_malformed_one_line(self):
+        for doc in (None, "{not json", "[]", '{"items": 5}', '{"x": 1}'):
+            if doc is not None:
+                self.targets(doc)
+            text = self.c.durum_text({}, [])
+            self.assertEqual([x for x in text.splitlines() if x.startswith("Plan")], ["Plan: hedef dosyası okunamadı"])
+            self.assertIn("plan ?", text.splitlines()[0])
+
+    def test_neg_bad_regex_item_says_hatali_others_shown(self):
+        self.t = self.NOW
+        self.done(5)
+        self.targets({"items": [self.item("Bozuk", regex="("), 5, self.item("Tarih", start="dün"),
+                                self.item("Tek grup", regex=r"P-\d\d"), self.item("P plan")]})
+        rows = [d for d, _ in self.c.plan_status(self.git.fail[("git", "log")][1].splitlines())]
+        self.assertEqual(rows, ["Bozuk: hedef hatalı", "?: hedef hatalı", "Tarih: hedef hatalı",
+                                "Tek grup: hedef hatalı", "P plan: 5/12 (beklenen ~5) -> plandayız"])
+        self.assertIn("Bozuk: hedef hatalı", self.c.durum_text({}, []))  # and the report did not crash
+
+    def test_durum_fits_the_notification_with_long_inputs(self):
+        self.t = self.NOW
+        self.done(9)
+        self.targets({"items": [self.item("Uzun hedef " + "x" * 80, 15) for _ in range(20)]})
+        self.c.pace = {"usage_pct": 99.6, "pace_line": 12.4}
+        run = [f"LANE{k:02d}" * 5 for k in range(30)]
+        items = [(f"ITEM{k:02d}" * 6, "y" * 400, 0) for k in range(40)]
+        with mock.patch.object(self.c, "running", return_value=run), \
+                mock.patch.object(self.c, "started_ts", return_value=self.t - 600):
+            text = self.c.durum_text({n: {} for n in run}, items)
+        lines = text.splitlines()
+        print("\nLONG DURUM:\n" + text)
+        self.assertLessEqual(len(text), 450)
+        self.assertLessEqual(len(lines[0]), 90)
+        self.assertLessEqual(len(lines), 7)
+        self.assertTrue(all(len(x) <= 60 for x in lines[1:]), lines)
+        self.assertTrue(lines[0].startswith("30 hat · senden "))
+        self.assertIn("+27", lines[1])
 
     def test_not_appends_one_line_and_acks_unread(self):
         self.msgs(("n1", "Not  ilk\x07 not"), ("n2", "not"), ("n3", "NOT ikinci"))
@@ -9544,10 +9623,10 @@ class PhoneCmd(Base):
 
     # PHONECMDFIX F1: durum routes with the pager's one predicate; nothing is dropped.
     def sections(self, items):
-        text = self.c.durum_text({}, items)
-        senden = text.split("Senden beklenen:")[1].split("Orkestratörden beklenen:")[0]
-        orch = text.split("Orkestratörden beklenen:")[1].split("N6:")[0]
-        return ({i for i in "ABC" if f"{i}: " in senden}, {i for i in "ABC" if f"{i}: " in orch})
+        lines = self.c.durum_text({}, items).splitlines()
+        senden = next((x for x in lines if x.startswith("Senden: ")), "")[8:].split(", ")
+        orch = next((x for x in lines if x.startswith("Ork: ")), "")[5:].split(", ")
+        return ({i for i in "ABC" if i in senden}, {i for i in "ABC" if i in orch})
 
     def test_durum_sections_route_like_the_pager_awake_and_asleep(self):
         items = [("A", "needs salih: x", 0), ("B", "lane blocked, needs orchestrator: blocked since 1", 0),
