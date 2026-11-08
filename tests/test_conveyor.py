@@ -8139,7 +8139,7 @@ class TestTempWatch(Base):
     def test_main_wires_the_prune_and_the_watch(self):
         with open(conveyor.__file__, encoding="utf-8") as f:
             self.assertIn('Conveyor(prune=start_detached, temp_watch=os.environ.get("TEMP"),\n'
-                          '                      fetch=ntfy_poll, spawn=restart_detached)', f.read())
+                          '                      fetch=ntfy_poll, spawn=restart_task)', f.read())
 
 
 class TestChain(AutopilotBase):
@@ -9644,7 +9644,7 @@ class PhoneCmd(Base):
 
     # PHONECMDFIX restart: fake spawn, clock and send.
     def restart_once(self, spawned, mid="r1", body="Yeniden başlat"):
-        self.c.spawn = lambda argv: spawned.append(list(argv))
+        self.c.spawn = lambda argv: spawned.append(list(argv)) or 0
         self.msgs((mid, body))
         self.tick()
         self.c.restart_go()
@@ -9666,7 +9666,7 @@ class PhoneCmd(Base):
                       cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
                       mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs,
                       net=lambda: self.net, popen=self.fake_popen, fetch=self.fetch,
-                      spawn=lambda argv: spawned.append(list(argv)))
+                      spawn=lambda argv: spawned.append(list(argv)) or 0)
         c2.pid = self.c.pid + 1
         c2.phone_tick({}, [])
         c2.restart_go()
@@ -9710,14 +9710,45 @@ class PhoneCmd(Base):
     def test_neg_helper_argv_has_no_topic(self):
         spawned = []
         self.restart_once(spawned)
-        line = " ".join(spawned[0])
+        self.assertEqual(spawned, [["schtasks", "/Run", "/TN", "\\Konveyor Yeniden Baslat"]])
         self.assertEqual(spawned[0], conveyor.RESTART_ARGV)
-        self.assertNotIn(self.TOPIC, line)
-        self.assertIn("GetEnvironmentVariable('JARVIS_NTFY_TOPIC','User')", line)
-        self.assertIn("Stop-ScheduledTask -TaskName 'JARVIS Konveyor'", line)
-        self.assertIn("Start-ScheduledTask -TaskName 'JARVIS Konveyor'", line)
-        self.assertLess(line.index("Stop-"), line.index("Start-Sleep -Seconds 5"))
+        self.assertNotIn(self.TOPIC, " ".join(spawned[0]))
         self.assertNotIn(self.TOPIC, (self.base / "phone.json").read_text(encoding="utf-8"))
+        self.assertEqual(len(self.events("phone_restart_spawned")), 1)
+
+    # PHONECMDFIX4: the task missing (schtasks rc=1) or any rc != 0 -> one setup push, keep running.
+    def test_neg_restart_task_missing_pushes_setup_and_keeps_running(self):
+        for rc in (1, 2147942402, -1):
+            with self.subTest(rc=rc):
+                calls = []
+                self.c.spawn = lambda argv: calls.append(list(argv)) or rc
+                self.msgs((f"m{rc}", "yeniden başlat"))
+                with mock.patch("sqlite3.connect", side_effect=AssertionError("db")):
+                    self.tick()
+                    self.c.restart_go()
+                self.assertEqual(calls, [conveyor.RESTART_ARGV])
+                self.assertEqual(self.pushes[-1], "Telefondan yeniden baslatma kurulmamis: bir kez kurulum gerekli")
+                st = self.phone()
+                self.assertNotIn("restart", st)
+                self.assertNotIn("restart_ts", st)
+                self.assertEqual(self.events("phone_restart_failed")[-1]["error"], f"rc={rc}")
+                self.assertFalse(self.c.restart_pending)
+                self.c.heartbeat()  # still alive: no success push, no marker resurrected
+                self.assertNotIn("çalışıyor", self.pushes[-1])
+                self.assertNotIn("restart", self.phone())
+
+    def test_neg_no_breakaway_anywhere(self):
+        src = (Path(conveyor.__file__)).read_text(encoding="utf-8")
+        for bad in ("BREAKAWAY", "0x01000000", "restart_detached", "RESTART_SCRIPT"):
+            self.assertNotIn(bad, src)
+        done = subprocess.CompletedProcess([], 1, b"", b"ERROR: missing")
+        with mock.patch("subprocess.run", return_value=done) as run, mock.patch("subprocess.Popen") as po:
+            self.assertEqual(conveyor.restart_task(conveyor.RESTART_ARGV), 1)
+        self.assertEqual(po.call_count, 0)
+        (args,), kw = run.call_args
+        self.assertEqual(args, ["schtasks", "/Run", "/TN", "\\Konveyor Yeniden Baslat"])
+        self.assertEqual(kw["creationflags"] & 0x01000000, 0)
+        self.assertIn("timeout", kw)
 
     # PHONECMDFIX2
     def test_neg_children_never_inherit_topics(self):
@@ -9728,7 +9759,7 @@ class PhoneCmd(Base):
             conveyor.real_runner(["x"])
             conveyor.real_runner(["x"], env={"A": "1"})
             conveyor.start_detached(["x"])
-            conveyor.restart_detached(["x"])
+            conveyor.restart_task(["x"])
         calls = run.call_args_list + po.call_args_list
         self.assertGreaterEqual(len(calls), 5)
         for c in calls:
@@ -9775,13 +9806,20 @@ class PhoneCmd(Base):
         self.assertNotIn("restart", self.phone())
 
     def test_restart_script_verifies_and_reports(self):
-        s = conveyor.RESTART_SCRIPT
-        for want in ("Get-ScheduledTask", "State -eq 'Running'", "$i -le 3",
+        p = Path(conveyor.__file__).with_name("konveyor_restart.ps1")
+        s = p.read_text(encoding="utf-8")
+        for want in ("Stop-ScheduledTask -TaskName $Name -TaskPath $Path", "AddSeconds(30)",
+                     "Start-ScheduledTask -TaskName $Name -TaskPath $Path", "$t.State",
+                     "-eq 'Running'", "$i -le 3", "$Name = 'JARVIS Konveyor'",
                      "[Environment]::GetEnvironmentVariable('JARVIS_NTFY_TOPIC','User')",
-                     "Konveyor telefondan yeniden baslatilamadi; panelden baslat"):
+                     "Konveyor telefondan yeniden baslatilamadi; panelden baslat", "# Exit codes:"):
             self.assertIn(want, s)
+        self.assertLess(s.index("Stop-ScheduledTask -TaskName"), s.index("Start-ScheduledTask -TaskName"))
+        self.assertEqual(s.count("Invoke-RestMethod"), 1)  # one failure push, no other network
         self.assertNotIn(self.TOPIC, s)
-        self.assertTrue(s.isascii())
+        self.assertTrue(p.read_bytes().isascii())
+        self.assertIsNone(re.search(r"ntfy\.sh/[A-Za-z0-9_-]", s))  # never a literal topic
+        self.assertIsNone(re.search(r"\$env:|GetEnvironmentVariable\('[^']+'\)|token|secret|password", s, re.I))
 
     def test_partial_last_line_dropped_cursor_advances(self):
         self.msgs(("p1", "not bir"), ("p2", "not iki"))
