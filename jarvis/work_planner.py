@@ -180,6 +180,20 @@ def plan_project(
     return PlanFailed(tuple(refusals), MAX_REASKS + 1)
 
 
+def n6_next(n6_dir: Path | str, verify: n6_deps.Verify) -> n6_deps.Pick:
+    """N6-WIRE1: the slices that may start now, from the n6_deps backlog in n6_dir. A
+    dependent of an INT starts only after that INT's push is verified; each start is
+    marked (mark_started re-checks); any error starts nothing (held_all, fail closed)."""
+    try:
+        path = Path(n6_dir) / "deps.json"
+        got = n6_deps.pick(path, verify)
+        started = tuple(s for s in got.start if n6_deps.mark_started(path, s[0], verify) is True)
+        lost = tuple((s[0], "mark_started refused") for s in got.start if s not in started)
+        return n6_deps.Pick(started, got.held + lost, got.attention, got.held_all)
+    except Exception as exc:
+        return n6_deps.Pick((), (), (f"N6-WIRE1 deps held: {type(exc).__name__}",), held_all=True)
+
+
 def seed_backlog(path, planned: Planned) -> None:
     """N6-14: put a checked plan's slices on the cross-run backlog, in plan order.
 
