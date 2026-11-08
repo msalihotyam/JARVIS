@@ -491,7 +491,7 @@ MEM_OK_S = 5 * 60
 MEM_GAP_S = 10 * 60  # after a memory hold at most one start per MEM_GAP_S for MEM_RELEASE_S
 MEM_RELEASE_S = 60 * 60
 FINDINGS_RE = re.compile(r"(?m)^[\s>#*`-]*FINDINGS:\s*(.*)$")
-CDX_DRY_RE = re.compile(r"(CDX|DRY)")  # audit lanes: BLOCKED is a finding, not a breaker failure
+CDX_DRY_RE = re.compile(r"(CDX|DRY|CLREV)")  # audit/review lanes: BLOCKED is a finding, not a breaker failure
 CHAIN_SUFFIX_RE = re.compile(r"(?i)(-\d+)?-AFX$|-R$|-S$")  # auto-fix chain lanes: same root (BREAKERV2)
 CHAIN_KEY1 = "chain INT: orchestrator key 1"
 CHAIN_MARK = "written by the pre-approved chain"  # line 2 of chain_templates/INT.md
@@ -4022,7 +4022,7 @@ class Conveyor:
             if st == "GREEN":
                 if self.push_deferred(ap.get("breaker")):
                     ln.pop("ap", None)  # a later pass retries
-                else:
+                elif not self.chain_int_rerun(name, ln, ap):
                     self.auto_approve(name, ln, lanes, ap)
             elif st == "BLOCKED" and role is None and not name.endswith("-R"):
                 self.auto_fix(name, ln, chains, ap)
@@ -4031,6 +4031,7 @@ class Conveyor:
             self.open_breaker(ap, f"{len(ap['bad'])} lanes finished BLOCKED/STOP/FAIL within 2 h: "
                                   + ", ".join(x[0] for x in ap["bad"]))
         self.breaker = ap.get("breaker")
+        reruns = self.chain_pending  # CONVCHAIN3: chain_walk starts its own list; the INT-RERUN events survive it
         try:
             self.chain_walk(lanes, ap)
         except Exception as e:  # CONVCHAIN1FIXA: nothing the chain raises may stop the pass or lose ap
@@ -4038,6 +4039,7 @@ class Conveyor:
                 self.error(f"chain: {type(e).__name__}: {e}"[:300])
             except OSError:  # events.jsonl locked too: the pass goes on
                 pass
+        self.chain_pending = reruns + self.chain_pending
         self.chain_dead = {s for c in chains.values()
                            if any(lanes.get(x, {}).get("finished") and lanes[x].get("status")
                                   not in GOOD | {CI_PENDING} for x in chain_ids(c))
@@ -4257,6 +4259,59 @@ class Conveyor:
         ap.setdefault("chain", {})[key] = record
         self.chain_pending.append(event)
         return None
+
+    def chain_int_rerun(self, name, ln, ap):
+        """CONVCHAIN3: a GREEN chain INT whose candidate is no longer a fast-forward of origin/main
+        gets ONE rerun <INT>-R<n> (n <= 2): the same prompt (picks, expected files, review evidence)
+        on the current main. Its candidate is never pushed. True when this took the lane."""
+        c = ln.get("ci")
+        sha = c.get("sha") if isinstance(c, dict) and c.get("cand") else None
+        if not (isinstance(sha, str) and SHA_RE.fullmatch(sha) and name.upper() in chain_int_ids(ap)):
+            return False
+        try:
+            if self.cmd(["git", "fetch", "origin", "main"])[0] != 0 or self.is_ancestor("refs/remotes/origin/main", sha):
+                return False  # unknown, or still a fast-forward: the push gate decides
+        except RuntimeError:
+            return False
+        base = re.sub(r"-R\d+$", "", name)
+        slices = ap.get("chain_slices", [])
+        n = 1 + sum(bool(re.fullmatch(re.escape(base) + r"-R\d+", s.get("id", ""), re.I)) for s in slices)
+        nid = f"{base}-R{n}"
+        main = self.main_head() or ""
+        old = next((s for s in slices if str(s.get("id", "")).upper() == name.upper()), None)
+        try:
+            text = (self.root / old["prompt"]).read_text(encoding="utf-8") if old else None
+        except OSError:
+            text = None
+        hdr = re.search(r"\bbase=([0-9a-f]{40})\b", text.split("\n", 1)[0]) if text else None
+        why = None
+        if n > 2:
+            why = f"{base} already had 2 reruns"
+        elif not (old and hdr and SHA_RE.fullmatch(main)):
+            why = "its slice, prompt or local main is unreadable"
+        else:
+            for x in (name, name.lower()):
+                text = re.sub(rf"(?<![\w-]){re.escape(x)}(?![\w-])", nid if x == name else nid.lower(), text)
+            text = text.replace(hdr.group(1), main)
+            new = {**old, "id": nid, "title": f"{old.get('title', base)} (rerun {n})",
+                   "prompt": f"build/conveyor/prompts/{nid}.md"}
+            dest = self.root / new["prompt"]
+            h, why = check_header(text, main)
+            why = why or validate_slice(new) or (None if h and h["lane"] == nid else "rerun header rendered wrong")
+            if not why and dest.exists():
+                why = f"{new['prompt']} already exists"
+            if not why:
+                dest.parent.mkdir(parents=True, exist_ok=True)
+                if not self.write_atomic(dest, text):
+                    raise OSError(f"{new['prompt']} not written")
+                ap["chain_slices"] = slices + [new]
+                ln["rerun"] = nid
+                self.chain_pending.append(dict(src=base, step="INT-RERUN", id=nid, sha=sha, main=main))
+                return True
+        ln["auto_refused"] = (f"candidate {sha[:7]} is not a fast-forward of origin/main and no rerun: {why}; "
+                              "needs the orchestrator")
+        self.event("auto_approve_refused", lane=name, reason=ln["auto_refused"])
+        return True
 
     def open_breaker(self, ap, reason):
         if not ap.get("breaker"):
@@ -4916,6 +4971,12 @@ class Conveyor:
         # the CI branch: ci/<ci> from the approval name, else the one origin/ci/* containing sha
         if ci:
             branch = f"ci/{ci}"
+            pushed = sorted({c["branch"] for c in cis if c.get("sha") == sha and isinstance(c.get("branch"), str)
+                             and c["branch"].startswith("ci/")})
+            if pushed and branch not in pushed:  # CONVCHAIN3: name the file the orchestrator has to write
+                real = pushed[0]
+                return (f"approval names {branch} but the lane pushed {real}: "
+                        f"expected approval file push-{sha}-{real[3:]}"), sha, None
         else:
             rc, out = self.cmd(["git", "branch", "-r", "--contains", sha])
             cands = [b.strip()[len("origin/"):] for b in out.splitlines()
