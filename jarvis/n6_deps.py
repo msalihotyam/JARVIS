@@ -80,6 +80,14 @@ def _entry(raw: object) -> dict[str, object] | None:
     return e
 
 
+def _no_duplicate_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    # json keeps the last duplicate: "deps":["INT1"],"deps":[] would drop a dependency
+    out = dict(pairs)
+    if len(out) != len(pairs):
+        raise Unreadable("state file has a duplicate key")
+    return out
+
+
 def _read(path: Path) -> list[dict[str, object]]:
     """The backlog; [] when there is no file. Raises Unreadable when it cannot be trusted."""
     try:
@@ -89,7 +97,9 @@ def _read(path: Path) -> list[dict[str, object]]:
     except (OSError, UnicodeError) as exc:
         raise Unreadable(f"state file unreadable ({type(exc).__name__})") from exc
     try:
-        data = cast(object, json.loads(raw))
+        data = cast(object, json.loads(raw, object_pairs_hook=_no_duplicate_keys))
+    except Unreadable:
+        raise
     except (ValueError, RecursionError) as exc:  # RecursionError: absurdly deep nesting
         raise Unreadable("state file is not JSON") from exc
     if not isinstance(data, dict):
@@ -183,12 +193,18 @@ def record_push(path: Path | str, slice_id: str) -> None:
     _write(path, entries)
 
 
-def mark_started(path: Path | str, slice_id: str) -> bool:
-    """pending -> started; False when it is not pending, so two passes start it once."""
+def mark_started(path: Path | str, slice_id: str, verify: Verify) -> bool:
+    """pending -> started only when pick() would start it now (N6-14FIX: the
+    caller is not trusted). False and no write when it is not pending or is held
+    (unpushed, unverified, unreadable remote, ...), so two passes start it once
+    and pick() keeps reporting the hold reason."""
     path = Path(path)
     entries = _read(path)
     e = _find(entries, slice_id)
     if e["state"] != "pending":
+        return False
+    by_id = {cast(str, o["id"]): o for o in entries}
+    if _hold_reason(e, by_id, verify, {}, [])[0] is not None:
         return False
     e["state"] = "started"
     _write(path, entries)
@@ -225,29 +241,32 @@ def pick(path: Path | str, verify: Verify) -> Pick:
     for e in entries:
         if e["state"] != "pending":
             continue
-        reason: str | None = None
-        bases: set[str] = set()
-        for dep in cast("list[str]", e["deps"]):
-            d = by_id.get(dep)
-            if d is None or d["state"] != "done":
-                reason = f"dependency {dep} is {'unknown' if d is None else d['state']}"
-                break
-            if not d["int"]:
-                continue
-            if not d["pushed"]:
-                reason = f"INT {dep} is not pushed"
-                break
-            if dep not in seen:
-                seen[dep] = _verified(verify, dep, cast(str, d["sha"]), attention)
-            base = seen[dep]
-            if base is None:
-                reason = f"INT {dep} is not verified on the remote main"
-                break
-            bases.add(base)
-        if reason is None and len(bases) > 1:
-            reason = "INT dependencies verified at different main SHAs"
+        reason, base = _hold_reason(e, by_id, verify, seen, attention)
         if reason is None:
-            start.append((cast(str, e["id"]), min(bases) if bases else None))
+            start.append((cast(str, e["id"]), base))
         else:
             held.append((cast(str, e["id"]), reason))
     return Pick(tuple(start), tuple(held), tuple(attention))
+
+
+def _hold_reason(e: dict[str, object], by_id: dict[str, dict[str, object]], verify: Verify,
+                 seen: dict[str, str | None], attention: list[str]) -> tuple[str | None, str | None]:
+    """(hold reason, None) or (None, base SHA or None): the one readiness check."""
+    bases: set[str] = set()
+    for dep in cast("list[str]", e["deps"]):
+        d = by_id.get(dep)
+        if d is None or d["state"] != "done":
+            return f"dependency {dep} is {'unknown' if d is None else d['state']}", None
+        if not d["int"]:
+            continue
+        if not d["pushed"]:
+            return f"INT {dep} is not pushed", None
+        if dep not in seen:
+            seen[dep] = _verified(verify, dep, cast(str, d["sha"]), attention)
+        base = seen[dep]
+        if base is None:
+            return f"INT {dep} is not verified on the remote main", None
+        bases.add(base)
+    if len(bases) > 1:
+        return "INT dependencies verified at different main SHAs", None
+    return None, min(bases) if bases else None

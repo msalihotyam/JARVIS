@@ -27,7 +27,7 @@ class N6DepsTests(unittest.TestCase):
 
     def _int_with_dependent(self, pushed=True):
         n6_deps.enqueue(self.path, [Item("INT1", is_int=True), Item("D1", ("INT1",))])
-        self.assertTrue(n6_deps.mark_started(self.path, "INT1"))
+        self.assertTrue(n6_deps.mark_started(self.path, "INT1", self._verify(None)))
         n6_deps.record(self.path, "INT1", "done", CAND)
         if pushed:
             n6_deps.record_push(self.path, "INT1")
@@ -75,7 +75,7 @@ class N6DepsTests(unittest.TestCase):
         n6_deps.enqueue(self.path, [Item("A"), Item("B"), Item("X", ("A",)),
                                     Item("Y", ("B",)), Item("Z", ("GHOST",))])
         n6_deps.record(self.path, "A", "blocked")
-        n6_deps.mark_started(self.path, "B")
+        self.assertTrue(n6_deps.mark_started(self.path, "B", self._verify(None)))
         pick = n6_deps.pick(self.path, self._verify(MAIN))
         self.assertEqual(pick.start, ())
         self.assertEqual(dict(pick.held), {"X": "dependency A is blocked",
@@ -111,7 +111,16 @@ class N6DepsTests(unittest.TestCase):
             "duplicate": good.replace('"D1"', '"INT1"').encode(),
             "not utf-8": b"\xff\xfe\x00{",
             "deep": b"[" * 100000 + b"]" * 100000,
+            # N6-14FIX F2: json keeps the last duplicate key, which would drop a dependency
+            "duplicate deps key": good.replace(
+                '"deps": ["INT1"]', '"deps": ["INT1"], "deps": []').encode(),
+            "duplicate backlog key": good.replace(
+                '{"version": 1, ', '{"version": 1, "backlog": [], ').encode(),
+            "duplicate version key": good.replace(
+                '"version": 1', '"version": 1, "version": 1').encode(),
         }
+        for name, raw in variants.items():  # every variant really differs from the good file
+            self.assertNotEqual(raw, good.encode(), name)
         for name, raw in variants.items():
             with self.subTest(variant=name):
                 self.path.write_bytes(raw)
@@ -122,8 +131,65 @@ class N6DepsTests(unittest.TestCase):
                 with self.assertRaises(n6_deps.Unreadable):
                     n6_deps.enqueue(self.path, [Item("NEW")])
                 with self.assertRaises(n6_deps.Unreadable):
-                    n6_deps.mark_started(self.path, "D1")
+                    n6_deps.mark_started(self.path, "D1", self._verify(MAIN))
                 self.assertEqual(self.path.read_bytes(), raw)  # never overwritten
+
+    def _assert_start_refused(self, verify, reason):
+        before = self.path.read_bytes()
+        self.assertFalse(n6_deps.mark_started(self.path, "D1", verify))
+        self.assertEqual(self.path.read_bytes(), before)  # no state change
+        pick = n6_deps.pick(self.path, verify)
+        self.assertEqual(pick.start, ())
+        self.assertEqual(len(pick.held), 1)
+        self.assertEqual(pick.held[0][0], "D1")
+        self.assertIn(reason, pick.held[0][1])  # the hold reason is kept
+
+    def test_neg_mark_started_refuses_unpushed_int_dependent(self):
+        self._int_with_dependent(pushed=False)
+        verify = self._verify(MAIN)
+        self._assert_start_refused(verify, "is not pushed")
+        verify.assert_not_called()
+
+    def test_neg_mark_started_refuses_unverified_int_dependent(self):
+        self._int_with_dependent()
+        for answer in (None, True, CAND[:7], MAIN.upper(), MAIN + "\n"):
+            with self.subTest(answer=answer):
+                self._assert_start_refused(self._verify(answer), "not verified")
+
+    def test_neg_mark_started_refuses_when_remote_unreadable(self):
+        self._int_with_dependent()
+        for exc in (OSError("net"), RuntimeError("x"), TimeoutError()):
+            with self.subTest(exc=type(exc).__name__):
+                self._assert_start_refused(mock.Mock(side_effect=exc), "not verified")
+
+    def test_neg_mark_started_refuses_other_holds(self):
+        n6_deps.enqueue(self.path, [Item("A"), Item("BL"), Item("I1", is_int=True),
+                                    Item("I2", is_int=True)])
+        n6_deps.record(self.path, "BL", "blocked")
+        for i, (dep, sha) in enumerate((("I1", CAND), ("I2", "c" * 40))):
+            self.assertTrue(n6_deps.mark_started(self.path, dep, self._verify(None)), i)
+            n6_deps.record(self.path, dep, "done", sha)
+            n6_deps.record_push(self.path, dep)
+        cases = {("A",): "is pending", ("BL",): "is blocked", ("GHOST",): "is unknown",
+                 ("I1", "I2"): "different main SHAs"}
+        for deps, reason in cases.items():
+            with self.subTest(deps=deps):
+                sid = "D-" + "-".join(deps)
+                n6_deps.enqueue(self.path, [Item(sid, deps)])
+                before = self.path.read_bytes()
+                verify = mock.Mock(side_effect=lambda sha: MAIN if sha == CAND else "d" * 40)
+                self.assertFalse(n6_deps.mark_started(self.path, sid, verify))
+                self.assertEqual(self.path.read_bytes(), before)
+                held = dict(n6_deps.pick(self.path, verify).held)
+                self.assertIn(reason, held[sid])
+
+    def test_ok_mark_started_verified_dependent_starts_once(self):
+        self._int_with_dependent()
+        verify = self._verify(MAIN)
+        self.assertTrue(n6_deps.mark_started(self.path, "D1", verify))
+        verify.assert_called_once_with(CAND)
+        self.assertFalse(n6_deps.mark_started(self.path, "D1", verify))
+        self.assertNotIn("D1", dict(n6_deps.pick(self.path, verify).held))
 
     def test_neg_malformed_input_raises_and_writes_nothing(self):
         n6_deps.enqueue(self.path, [Item("A")])
@@ -165,8 +231,8 @@ class N6DepsTests(unittest.TestCase):
 
     def test_two_passes_start_a_slice_once(self):
         self._int_with_dependent()
-        self.assertTrue(n6_deps.mark_started(self.path, "D1"))
-        self.assertFalse(n6_deps.mark_started(self.path, "D1"))
+        self.assertTrue(n6_deps.mark_started(self.path, "D1", self._verify(MAIN)))
+        self.assertFalse(n6_deps.mark_started(self.path, "D1", self._verify(MAIN)))
         self.assertEqual(n6_deps.pick(self.path, self._verify(MAIN)).start, ())
 
     def test_g13_dependency_pushed_late(self):
