@@ -97,10 +97,75 @@ class N6OutageTests(unittest.TestCase):
                                  raw[:80])
             self.assertEqual(self.path.read_bytes(), raw)
 
+    def assert_holds_and_kept(self, raw: bytes, msg: object) -> None:
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_bytes(raw)
+        self.assertIsNone(o.load(self.path), msg)
+        for v in ("continue", "outage", "timeout"):
+            self.assertEqual(o.step(self.path, v, T0 + 10), o.Decision(o.HOLD, attention=True), msg)
+        self.assertEqual(self.path.read_bytes(), raw, msg)
+
+    def test_neg_every_numeric_field_every_bad_shape_holds(self) -> None:
+        good = {"version": 1, "nudges": 1, "last_nudge_at": T0, "stall_since": T0,
+                "outage_since": None, "dropped": False}
+        self.path.parent.mkdir(parents=True)
+        self.path.write_text(json.dumps(good), encoding="utf-8")
+        self.assertEqual(o.load(self.path), o.State(nudges=1, last_nudge_at=T0, stall_since=T0))
+        bad = ["true", "false", '"5"', '"1e3"', "[]", "{}", "[1]", "NaN", "Infinity", "-Infinity",
+               "1e400", "-1", "-1e-9", "1" + "0" * 400, "-1" + "0" * 400, "1" + "0" * 5000,
+               "1e12", "1e300", "1.7976931348623157e308"]
+        extra = {"version": ["null", "1.0", "0", "2"], "nudges": ["null", "1.0", "3", "0.5"]}
+        for field in ("version", "nudges", "last_nudge_at", "stall_since", "outage_since"):
+            for token in bad + extra.get(field, []):
+                raw = json.dumps({**good, field: "@BAD@"}).replace('"@BAD@"', token).encode()
+                with self.subTest(field=field, token=token[:20]):
+                    self.assert_holds_and_kept(raw, (field, token[:20]))
+
+    def test_neg_deeply_nested_state_holds(self) -> None:
+        self.assert_holds_and_kept(b"[" * 100_000, "nested")
+
+    def test_neg_bad_now_shapes_hold(self) -> None:
+        class BadFloat(int):
+            def __float__(self) -> float:
+                raise RuntimeError("no")
+
+        class BadMath(float):  # converts fine, but its own compare/subtract raise
+            def _no(self, *_: object) -> bool:
+                raise RuntimeError("no")
+            __lt__ = __le__ = __gt__ = __ge__ = __sub__ = __rsub__ = _no  # type: ignore[assignment]
+
+        o.step(self.path, "timeout", T0)
+        self.assertEqual(o.step(self.path, "timeout", BadMath(T0 + GAP)).action, o.NUDGE)
+        before = self.path.read_bytes()
+        for now in (True, False, "5", None, [T0], float("-inf"), -0.5, 10 ** 400, -(10 ** 400),
+                    1e12, 1e300, BadFloat(int(T0) + 5), BadMath(T0 - 1)):
+            with self.subTest(now=repr(now)[:20]):
+                for v in ("continue", "outage", "timeout"):
+                    self.assertEqual(o.step(self.path, v, now),  # type: ignore[arg-type]
+                                     o.Decision(o.HOLD, attention=True))
+                self.assertEqual(self.path.read_bytes(), before)
+
+    def test_neg_save_refuses_absurd_numbers(self) -> None:
+        for s in (o.State(stall_since=10 ** 400), o.State(outage_since=1e300),  # type: ignore[arg-type]
+                  o.State(nudges=True, last_nudge_at=T0), o.State(nudges=10 ** 400)):  # type: ignore[arg-type]
+            with self.subTest(state=repr(s)[:60]), self.assertRaises(ValueError):
+                o.save(self.path, s)
+        self.assertFalse(self.path.exists())
+
     def test_neg_unreadable_state_fails_closed(self) -> None:
         self.path.mkdir(parents=True)  # a directory at the path
         self.assertIsNone(o.load(self.path))
         self.assertEqual(o.step(self.path, "continue", T0), o.Decision(o.HOLD, attention=True))
+
+    def test_neg_bad_path_or_unwritable_holds(self) -> None:
+        for p in ("a\0b", 5):
+            self.assertIsNone(o.load(p))  # type: ignore[arg-type]
+            self.assertEqual(o.step(p, "timeout", T0), o.Decision(o.HOLD, attention=True))  # type: ignore[arg-type]
+        blocker = Path(self._tmp.name) / "file"
+        blocker.write_bytes(b"x")  # a file where the state's parent directory should be
+        self.assertEqual(o.step(blocker / "outage.json", "timeout", T0),
+                         o.Decision(o.HOLD, attention=True))
+        self.assertEqual(blocker.read_bytes(), b"x")
 
     def test_neg_clock_backwards_or_invalid_holds(self) -> None:
         o.step(self.path, "timeout", T0)
@@ -159,6 +224,8 @@ class N6OutageTests(unittest.TestCase):
         self.assertEqual((d.action, s.nudges), (o.NUDGE, 0))
         self.assertEqual(new, o.State(nudges=1, last_nudge_at=T0, stall_since=T0))
         self.assertEqual(o.decide(None, "continue", T0), (o.Decision(o.HOLD, attention=True), None))
+        for now in (0, int(T0), -0.0, o.MAX_EPOCH_S):  # the gate keeps every sane time
+            self.assertEqual(o.decide(s, "timeout", now)[0].action, o.NUDGE, now)
 
 
 if __name__ == "__main__":

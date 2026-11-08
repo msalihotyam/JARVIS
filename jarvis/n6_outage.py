@@ -34,6 +34,7 @@ MAX_NUDGES = 2
 NUDGE_GAP_S = 900.0
 DROP_AFTER_S = 1800.0
 VERSION = 1
+MAX_EPOCH_S = 253_402_300_800.0  # year 10000: a later timestamp is malformed, not a time
 
 CONTINUE, HOLD, NUDGE, WAIT, DROP = "continue", "hold", "nudge", "wait", "drop"
 
@@ -57,25 +58,40 @@ class Decision:
 _FAIL_CLOSED = Decision(HOLD, attention=True)
 
 
+def _number(value: object, top: float, *, whole: bool = False) -> float | None:
+    """The one gate for every number from the state file or the caller: ``value`` as a
+    finite float in [0, top], else None (malformed). bool, non-numbers, NaN/inf,
+    negatives, ints too large for a float and any error while converting -> None.
+    ``whole`` also requires a plain int. Never raises."""
+    if isinstance(value, bool) or not isinstance(value, int if whole else (int, float)):
+        return None
+    try:
+        f = float(value)
+        return f if math.isfinite(f) and 0.0 <= f <= top else None
+    except Exception:  # OverflowError, or a subclass whose __float__ misbehaves
+        return None
+
+
 def _time(value: object) -> bool:
-    return (isinstance(value, (int, float)) and not isinstance(value, bool)
-            and math.isfinite(value) and value >= 0)
+    return _number(value, MAX_EPOCH_S) is not None
 
 
 def _valid(state: object) -> bool:
     if not isinstance(state, State):
         return False
-    n = state.nudges
     stamps = (state.last_nudge_at, state.stall_since, state.outage_since)
-    return (type(n) is int and 0 <= n <= MAX_NUDGES and type(state.dropped) is bool
+    return (_number(state.nudges, MAX_NUDGES, whole=True) is not None
+            and type(state.dropped) is bool
             and all(t is None or _time(t) for t in stamps)
-            and (n == 0) == (state.last_nudge_at is None))
+            and (state.nudges == 0) == (state.last_nudge_at is None))
 
 
 def decide(state: State | None, verdict: object, now: float) -> tuple[Decision, State | None]:
     """Pure: the action for ``verdict`` at ``now`` and the state to store next."""
-    if state is None or not _valid(state) or not _time(now):
+    t = _number(now, MAX_EPOCH_S)
+    if state is None or not _valid(state) or t is None or type(verdict) is not str:
         return _FAIL_CLOSED, state
+    now = t  # a plain float from here on: a subclass's own math never runs
     stamps = (state.last_nudge_at, state.stall_since, state.outage_since)
     if any(t is not None and now < t for t in stamps):
         return _FAIL_CLOSED, state  # clock went backwards: no guess
@@ -105,16 +121,17 @@ def load(path: Path | str) -> State | None:
         raw = Path(path).read_text(encoding="utf-8")
     except FileNotFoundError:
         return None if os.path.lexists(path) else State()
-    except (OSError, UnicodeDecodeError):
+    except (OSError, ValueError, TypeError):  # unreadable, bad UTF-8, a NUL or non-path
         return None
     try:
         data = cast(object, json.loads(raw))
-    except ValueError:
+    except (ValueError, RecursionError):  # bad JSON, an int over the digit limit, deep nesting
         return None
     if not isinstance(data, dict):
         return None
     fields = cast(dict[str, object], data)
-    if fields.pop("version", None) != VERSION or set(fields) != set(State.__dataclass_fields__):
+    version = _number(fields.pop("version", None), VERSION, whole=True)
+    if version != VERSION or set(fields) != set(State.__dataclass_fields__):
         return None
     state = State(**fields)  # pyright: ignore[reportArgumentType]  # checked by _valid
     return state if _valid(state) else None
@@ -143,5 +160,8 @@ def step(path: Path | str, verdict: object, now: float) -> Decision:
     state = load(path)
     decision, new = decide(state, verdict, now)
     if state is not None and new is not None and new != state:
-        save(path, new)
+        try:
+            save(path, new)
+        except OSError:
+            return _FAIL_CLOSED  # not stored, so not acted on (e.g. an unrecorded nudge)
     return decision
