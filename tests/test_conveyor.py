@@ -9728,6 +9728,28 @@ class PhoneCmd(Base):
     def phone(self):
         return json.loads((self.base / "phone.json").read_text(encoding="utf-8"))
 
+    def test_restart_starting_message_is_delivered_before_the_spawn(self):  # PHONECMDFIX5
+        order = []
+        self.c.send = lambda text, **kw: order.append(("send", text)) or "sent"
+        self.c.spawn = lambda argv: order.append(("spawn", list(argv))) or 0
+        self.msgs(("r1", "Yeniden başlat"))
+        self.tick()
+        self.assertEqual(order, [])  # the poll only marks the restart; nothing sent, nothing spawned yet
+        self.c.restart_go()
+        self.assertEqual([k for k, _ in order], ["send", "spawn"])
+        self.assertEqual(order[0][1], "Yeniden başlatılıyor…")
+
+    def test_neg_restart_failing_send_does_not_block_the_spawn_and_is_logged_once(self):  # PHONECMDFIX5
+        spawned = []
+        self.c.send = lambda text, **kw: "error URLError"
+        self.c.spawn = lambda argv: spawned.append(list(argv)) or 0
+        self.msgs(("r1", "Yeniden başlat"))
+        self.tick()
+        self.c.restart_go()
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual([r["error"] for r in self.events("phone_restart_send_failed")], ["error URLError"])
+        self.assertEqual(len(self.events("phone_restart_spawned")), 1)
+
     def test_neg_restart_handled_once_across_the_restart_and_pause_stays(self):
         (self.base / "PAUSE").write_text("phone\n", encoding="utf-8")
         spawned = []
