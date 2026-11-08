@@ -56,16 +56,98 @@ class N6BreakerTest(unittest.TestCase):
         # zero-padded slice numbers are never iterations: distinct slices never merge
         st = run([("N6-05-AFX", "FAIL", T0), ("N6-02-AFX", "FAIL", T0 + 1), ("N6-03-AFX", "FAIL", T0 + 2)])
         self.assertFalse(nb.is_open(st))
-        # AFX lanes of different unpadded slices never pool into a phantom root (review D1)
-        for v, other in ((["N6-11-AFX", "N6-12-AFX", "N6-13-AFX"], "N6-14-AFX"),
-                         (["A1-2-AFX", "A1-3-AFX", "A1-4-AFX"], "A1-5-AFX")):
-            with self.subTest(v=v):
-                st = run([(n, "FAIL", T0 + i) for i, n in enumerate(v)])
-                self.assertFalse(nb.is_open(st))
-                self.assertFalse(nb.holds(st, other))
-        # the real chain still opens: the root itself failed too
         self.assertEqual(roots(run([(n, "FAIL", T0 + i) for i, n in enumerate(
             ["N6", "N6-1-AFX", "N6-2-AFX"])])), ["N6"])
+
+    # ---- CLREV-N6-17FIX F1 NEG: split iterations count toward the root without its own BAD ----
+    SHAPES = ("INT45", "N6-05", "A1", "G16-2", "INT-7", "N6-17FIX", "x9")
+    ITERS = (("-1-AFX", "-2-AFX", "-3-AFX"), ("-AFX", "-S", "-R"), ("-S", "-1-AFX", "-R-AFX"),
+             ("-2-AFX", "-S-R", "-3-afx"))
+
+    def splits(self, x: str, sfx: tuple[str, ...], t: float) -> list[tuple[str, str, float]]:
+        return [(x + s, "FAIL", t + i * 0.5 * H) for i, s in enumerate(sfx)]
+
+    def test_neg_splits_open_root_when_its_bad_is_out_of_window(self) -> None:
+        # the CLREV probe: INT45 FAIL t0, INT45-1/2/3-AFX FAIL t0+3h..t0+4h -> open, INT45 held
+        st = run([("INT45", "FAIL", T0), *self.splits("INT45", self.ITERS[0], T0 + 3 * H)])
+        self.assertEqual(len(st.bad), 3)
+        self.assertTrue(nb.is_open(st))
+        self.assertIn("INT45", roots(st))
+        self.assertTrue(nb.holds(st, "INT45"))
+        for x in self.SHAPES:
+            for sfx in self.ITERS:
+                with self.subTest(x=x, sfx=sfx):
+                    for head in ([(x, "FAIL", T0)], []):  # X's own BAD aged out, or never there
+                        st = run([*head, *self.splits(x, sfx, T0 + 3 * H)])
+                        self.assertIn(x.upper(), roots(st))
+                        self.assertTrue(nb.holds(st, x))
+                        self.assertTrue(nb.holds(st, x + "-4-AFX"))
+                    two = run(self.splits(x, sfx[:2], T0 + 3 * H))  # two are not enough
+                    self.assertFalse(nb.holds(two, x))
+
+    def test_neg_splits_after_reset_reopen(self) -> None:
+        for x in self.SHAPES:
+            for sfx in self.ITERS:
+                with self.subTest(x=x, sfx=sfx), tempfile.TemporaryDirectory() as d:
+                    p = Path(d) / "breaker.json"
+                    for n, s, f in [(x, "FAIL", T0), (x, "FAIL", T0 + 1), (x, "FAIL", T0 + 2)]:
+                        self.assertTrue(nb.record_finish(p, n, s, f, f))
+                    self.assertTrue(nb.holds(nb.load(p), x))
+                    self.assertTrue(nb.reset(p, T0 + 2))
+                    self.assertFalse(nb.holds(nb.load(p), x))
+                    for n, s, f in self.splits(x, sfx, T0 + H):
+                        self.assertTrue(nb.record_finish(p, n, s, f, f))
+                    self.assertTrue(nb.holds(nb.load(p), x))
+
+    def test_neg_splits_after_good_close_reopen(self) -> None:
+        for x in self.SHAPES:
+            for sfx in self.ITERS:
+                with self.subTest(x=x, sfx=sfx):
+                    st = run([(x, "FAIL", T0), (x, "FAIL", T0 + 1), (x, "FAIL", T0 + 2), (x, "PASS", T0 + 3)])
+                    self.assertFalse(nb.holds(st, x))
+                    self.assertTrue(nb.holds(run(self.splits(x, sfx, T0 + 4), state=st), x))
+                    self.assertFalse(nb.holds(run(self.splits(x, sfx[:2], T0 + 4), state=st), x))
+
+    def test_phantom_root_fails_closed_narrowly(self) -> None:
+        # AFX lanes of different unpadded slices pool into N6 / A1: held, but only N6 / N6-<i>-AFX
+        for v, root, held, free in ((["N6-11-AFX", "N6-12-AFX", "N6-13-AFX"], "N6", "N6-14-AFX", "N6-14"),
+                                    (["A1-2-AFX", "A1-3-AFX", "A1-4-AFX"], "A1", "A1-5-AFX", "A1-5")):
+            with self.subTest(v=v):
+                st = run([(n, "FAIL", T0 + i) for i, n in enumerate(v)])
+                self.assertEqual(roots(st), [root])
+                self.assertTrue(nb.holds(st, root))
+                self.assertTrue(nb.holds(st, held))
+                for f in (free, "N6-05", "N6-05-AFX", "B1"):
+                    self.assertFalse(nb.holds(st, f), f)
+
+    def test_neg_future_dated_good_does_not_mute_later_bads(self) -> None:
+        # review H1: a GOOD dated 1h ahead closes X but its clear is capped at now
+        st = run([("X", "FAIL", T0), ("X-AFX", "FAIL", T0 + 1), ("X-R", "FAIL", T0 + 2)])
+        st = nb.apply_finish(st, "X", "PASS", T0 + 3 + H, now=T0 + 3)
+        self.assertFalse(nb.is_open(st))
+        st = run([("X-1-AFX", "FAIL", T0 + 10), ("X-2-AFX", "FAIL", T0 + 11), ("X-3-AFX", "FAIL", T0 + 12)], state=st)
+        self.assertEqual(roots(st), ["X"])
+
+    def test_neg_hand_edited_chain_key_still_holds_root(self) -> None:
+        # review H2: an open key "x-afx" normalizes to X
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "breaker.json"
+            p.write_text(json.dumps({"bad": [], "open": [["x-afx", T0, "hand"]], "cleared": [["x-r", T0]]}),
+                         encoding="utf-8")
+            st = nb.load(p)
+            assert isinstance(st, nb.State)
+            self.assertEqual(roots(st), ["X"])
+            self.assertEqual(st.cleared, (("X", T0),))
+            self.assertTrue(nb.holds(st, "X"))
+            self.assertTrue(nb.holds(st, "X-2-AFX"))
+
+    def test_neg_deep_chain_name_opens_without_recursion_error(self) -> None:
+        # review H3: root_ids is iterative
+        deep = "X" + "-R" * 3000
+        st = run([(deep, "FAIL", T0 + i) for i in range(3)])
+        self.assertEqual(roots(st), ["X"])
+        self.assertTrue(nb.holds(st, deep + "-AFX"))
+        self.assertFalse(nb.holds(st, "Y" + "-R" * 3000))
 
     def test_neg_same_root_spread_over_two_hours_does_not_open(self) -> None:
         st = run([("N6-05", "FAIL", T0), ("N6-05-AFX", "FAIL", T0 + H + 1), ("N6-05-R", "FAIL", T0 + 2 * H + 1)])

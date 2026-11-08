@@ -38,8 +38,8 @@ CDX_DRY_RE = re.compile(r"(CDX|DRY)")  # used with .match: a CDX/DRY prefix
 # conveyor's r"(?i)(-\d+)?-AFX$|-R$|-S$", split in two: the -<i> iteration before -AFX is an
 # unpadded positive int (conveyor emits f"{name}-{i}-AFX", i from 1), so a zero-padded slice
 # number (N6-05-AFX) never strips to N6. Where the shape is ambiguous (A1-2-AFX) the name
-# belongs to both candidate roots (A1-2 and A1): it counts toward and is held by either, but
-# a candidate opens only when its literal root failed too (A1-2/3/4-AFX alone never open A1).
+# belongs to both candidate roots (A1-2 and A1): it counts toward and is held by either
+# (A1-2/3/4-AFX alone open A1: the conveyor's split lanes of A1 are named exactly so).
 CHAIN_SUFFIX_RE = re.compile(r"(?i)-(AFX|R|S)$")
 _ITER_RE = re.compile(r"-[1-9]\d*$")
 BREAKER_BAD = 3
@@ -70,15 +70,24 @@ def root_id(name: str) -> str:
 
 def root_ids(name: str) -> frozenset[str]:
     """Every root ``name`` may be an iteration of: X-AFX, X-<i>-AFX, X-R, X-S and chains -> X."""
-    n = name.strip().upper()
-    m = CHAIN_SUFFIX_RE.search(n)
-    if not m or m.start() == 0:
-        return frozenset({n})
-    base = n[:m.start()]
-    out = root_ids(base)
-    if m.group(1) == "AFX" and (it := _ITER_RE.search(base)) and it.start() > 0:
-        out |= root_ids(base[:it.start()])
-    return out
+    # iterative with a seen set: every candidate is a prefix of name, so a deep chain neither
+    # recurses nor blows up (review H3)
+    out: set[str] = set()
+    todo, seen = [name.strip().upper()], set[str]()
+    while todo:
+        n = todo.pop()
+        if n in seen:
+            continue
+        seen.add(n)
+        m = CHAIN_SUFFIX_RE.search(n)
+        if not m or m.start() == 0:
+            out.add(n)
+            continue
+        base = n[:m.start()]
+        todo.append(base)
+        if m.group(1) == "AFX" and (it := _ITER_RE.search(base)) and it.start() > 0:
+            todo.append(base[:it.start()])
+    return frozenset(out)
 
 
 def _num(v: object) -> float | None:
@@ -113,9 +122,9 @@ def _parse(data: object) -> State | None:
     bad, opened, cleared = _rows(d.get("bad"), 2), _rows(d.get("open"), 3), _rows(d.get("cleared"), 2)
     if bad is None or opened is None or cleared is None:
         return None
-    # root keys are normalized as root_ids does, so a hand-edited "x" still holds X
-    return State(tuple((n, f) for n, f, _ in bad), tuple((r.strip().upper(), t, w) for r, t, w in opened),
-                 tuple((r.strip().upper(), t) for r, t, _ in cleared))
+    # root keys are normalized by root_id, so a hand-edited "x" or "x-afx" still holds X (review H2)
+    return State(tuple((n, f) for n, f, _ in bad), tuple((root_id(r), t, w) for r, t, w in opened),
+                 tuple((root_id(r), t) for r, t, _ in cleared))
 
 
 def _marker(path: Path) -> Path:
@@ -167,16 +176,18 @@ def apply_finish(state: State, name: str, status: str, fin: float, now: float) -
         r = root_id(name)
         if r in opened and fin > opened[r][0]:
             del opened[r]
-            cleared[r] = max(cleared.get(r, fin), float(fin))
+            # capped at now: a future-dated GOOD must not mute that root's later BADs (review H1)
+            cleared[r] = max(cleared.get(r, -math.inf), min(float(fin), float(now)))
     bad = [b for b in bad if now - b[1] < BREAKER_WINDOW_S]
     cleared = {r: t for r, t in cleared.items() if now - t < BREAKER_WINDOW_S}
     if counted:
         for r in sorted(root_ids(name) - opened.keys()):
-            rows = [b for b, f in bad if r in root_ids(b) and f > cleared.get(r, -math.inf)]
-            n = len(rows)
-            # an iteration-stripped candidate (N6 from N6-11-AFX) opens only when that root
-            # itself failed too: AFX lanes of different numbered slices never pool into it
-            if n >= BREAKER_BAD and any(root_id(b) == r for b in rows):
+            # every BAD counts toward every root it may belong to, so split lanes X-<i>-AFX
+            # open X even when X's own BAD aged out or was reset (CLREV-N6-17FIX F1). A phantom
+            # root pooled from AFX lanes of different slices (N6 from N6-11/12/13-AFX) fails
+            # closed: it holds only N6 and N6-<i>-AFX names.
+            n = sum(1 for b, f in bad if r in root_ids(b) and f > cleared.get(r, -math.inf))
+            if n >= BREAKER_BAD:
                 opened[r] = (float(now), f"{n} bad finishes of {r} within {BREAKER_WINDOW_S}s")
     return State(tuple(bad), tuple((r, s, w) for r, (s, w) in sorted(opened.items())),
                  tuple(sorted(cleared.items())))
