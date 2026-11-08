@@ -2,16 +2,19 @@
 """N6-17 (G16/R16): a cross-run breaker that trips to hold and resets only by an explicit action.
 
 The conveyor's autopilot breaker without the conveyor: pure functions over a ``State``
-plus one small JSON file whose path the caller passes in. Bad finishes count one per
-root id (auto-fix chain suffixes share the root); ``BREAKER_BAD`` distinct roots within
-``BREAKER_WINDOW_S`` open it. While open, every new non-INT slice is held. It closes
-only on ``reset`` (an operator action at or after the opening) or a GOOD finish, after
-the opening, of a root that is not one of the breaker's bad roots and not a CDX/DRY
-review lane. BLOCKED from a CDX/DRY lane never counts.
+plus one small JSON file whose path the caller passes in. The breaker is per root:
+every BAD finish is kept, and ``BREAKER_BAD`` BAD finishes of the same root (its
+-AFX/-R/-S/-<i>-AFX iterations included, see ``root_ids``) within ``BREAKER_WINDOW_S``
+open that root. While a root is open, new dispatches of that root (INT roots included)
+are held; unrelated roots are never held. An open root closes only by ``reset`` (an
+operator record at or after its opening) or a GOOD finish of that same root after the
+opening that is not a CDX/DRY review lane. BLOCKED from a CDX/DRY lane never counts.
 
-A malformed or unreadable state file is UNREADABLE, which counts as open; finishes do
-not rewrite it. Writes go through a temp file + ``os.replace`` under an OS byte lock on
-``<path>.lock`` (the n6_lease pattern). Time is always an argument; no clock is read.
+A malformed or unreadable state file is UNREADABLE, which counts as open for every root;
+finishes do not rewrite it. A missing state file while the ``<path>.open`` marker exists
+(written whenever any root is open) is UNREADABLE too. Writes go through a temp file +
+``os.replace`` under an OS byte lock on ``<path>.lock`` (the n6_lease pattern). Time is
+always an argument; no clock is read.
 """
 
 from __future__ import annotations
@@ -31,13 +34,14 @@ from typing import cast
 # Mirrors scripts/conveyor.py (autopilot breaker); copied, not imported: jarvis/ never imports scripts/.
 GOOD = frozenset({"PASS", "COMPLETE", "DONE", "GREEN", "OK"})
 BAD = frozenset({"BLOCKED", "STOP", "FAIL", "FAILED"})
-INT_RE = re.compile(r"(?i)^int(?![a-z])")
 CDX_DRY_RE = re.compile(r"(CDX|DRY)")  # used with .match: a CDX/DRY prefix
-# Deviation: conveyor's r"(?i)(-\d+)?-AFX$|-R$|-S$" strips a slice's own number (N6-05-AFX -> N6),
-# merging distinct slices (fail open). Here an -<i> iteration before -AFX is stripped only when
-# what remains still has a numbered root (N6-05-2-AFX) or is a numbered INT lane (INT5-2-AFX).
+# conveyor's r"(?i)(-\d+)?-AFX$|-R$|-S$", split in two: the -<i> iteration before -AFX is an
+# unpadded positive int (conveyor emits f"{name}-{i}-AFX", i from 1), so a zero-padded slice
+# number (N6-05-AFX) never strips to N6. Where the shape is ambiguous (A1-2-AFX) the name
+# belongs to both candidate roots (A1-2 and A1): it counts toward and is held by either, but
+# a candidate opens only when its literal root failed too (A1-2/3/4-AFX alone never open A1).
 CHAIN_SUFFIX_RE = re.compile(r"(?i)-(AFX|R|S)$")
-_ITER_RE = re.compile(r"-\d+$")
+_ITER_RE = re.compile(r"-[1-9]\d*$")
 BREAKER_BAD = 3
 BREAKER_WINDOW_S = 7200
 
@@ -51,21 +55,30 @@ UNREADABLE = _Unreadable.OPEN  # load() of a state that cannot be trusted: count
 
 @dataclass(frozen=True)
 class State:
-    bad: tuple[tuple[str, float], ...] = ()  # (lane name, finished ts), one per root
-    since: float | None = None  # opening time; None while closed
-    roots: tuple[str, ...] = ()  # root ids that opened it or failed while open
-    reason: str = ""
+    bad: tuple[tuple[str, float], ...] = ()  # every BAD finish in the window: (lane name, fin)
+    opened: tuple[tuple[str, float, str], ...] = ()  # open roots: (root, since, reason)
+    cleared: tuple[tuple[str, float], ...] = ()  # (root, ts): its BAD finishes up to ts no longer count
 
 
 def root_id(name: str) -> str:
-    """The chain root: X-AFX, X-2-AFX, X-R, X-S (and chains of them) all map to X."""
+    """The literal root: chain suffixes (-AFX/-R/-S) stripped, no iteration stripped."""
+    name = name.strip()
     while (m := CHAIN_SUFFIX_RE.search(name)) and m.start() > 0:
         name = name[:m.start()]
-        if m.group(1).upper() == "AFX" and (it := _ITER_RE.search(name)) and it.start() > 0:
-            base = root_id(name[:it.start()])
-            if _ITER_RE.search(base) or (INT_RE.match(base) and any(c.isdigit() for c in base)):
-                name = name[:it.start()]
     return name.upper()
+
+
+def root_ids(name: str) -> frozenset[str]:
+    """Every root ``name`` may be an iteration of: X-AFX, X-<i>-AFX, X-R, X-S and chains -> X."""
+    n = name.strip().upper()
+    m = CHAIN_SUFFIX_RE.search(n)
+    if not m or m.start() == 0:
+        return frozenset({n})
+    base = n[:m.start()]
+    out = root_ids(base)
+    if m.group(1) == "AFX" and (it := _ITER_RE.search(base)) and it.start() > 0:
+        out |= root_ids(base[:it.start()])
+    return out
 
 
 def _num(v: object) -> float | None:
@@ -78,42 +91,45 @@ def _num(v: object) -> float | None:
     return f if math.isfinite(f) else None
 
 
+def _rows(v: object, width: int) -> list[tuple[str, float, str]] | None:
+    if not isinstance(v, list):
+        return None
+    out: list[tuple[str, float, str]] = []
+    for item in cast("list[object]", v):
+        row = cast("list[object]", item) if isinstance(item, list) else []
+        if len(row) != width:
+            return None
+        key, ts, why = row[0], _num(row[1]), row[2] if width == 3 else ""
+        if not isinstance(key, str) or not key.strip() or ts is None or not isinstance(why, str):
+            return None
+        out.append((key, ts, why))
+    return out
+
+
 def _parse(data: object) -> State | None:
     if not isinstance(data, dict):
         return None
     d = cast("dict[str, object]", data)
-    raw_bad, brk = d.get("bad"), d.get("breaker")
-    if not isinstance(raw_bad, list) or "breaker" not in d:
+    bad, opened, cleared = _rows(d.get("bad"), 2), _rows(d.get("open"), 3), _rows(d.get("cleared"), 2)
+    if bad is None or opened is None or cleared is None:
         return None
-    bad: list[tuple[str, float]] = []
-    for item in cast("list[object]", raw_bad):
-        if not isinstance(item, list):
-            return None
-        pair = cast("list[object]", item)
-        fin = _num(pair[1]) if len(pair) == 2 else None
-        if fin is None or not isinstance(pair[0], str) or not pair[0].strip():
-            return None
-        bad.append((pair[0], fin))
-    if brk is None:
-        return State(tuple(bad))
-    if not isinstance(brk, dict):
-        return None
-    b = cast("dict[str, object]", brk)
-    since, roots, reason = _num(b.get("since")), b.get("roots"), b.get("reason")
-    if since is None or not isinstance(reason, str) or not isinstance(roots, list):
-        return None
-    rl = cast("list[object]", roots)
-    if not all(isinstance(r, str) for r in rl):
-        return None
-    return State(tuple(bad), since, tuple(cast("list[str]", rl)), reason)
+    # root keys are normalized as root_ids does, so a hand-edited "x" still holds X
+    return State(tuple((n, f) for n, f, _ in bad), tuple((r.strip().upper(), t, w) for r, t, w in opened),
+                 tuple((r.strip().upper(), t) for r, t, _ in cleared))
+
+
+def _marker(path: Path) -> Path:
+    return Path(f"{path}.open")
 
 
 def load(path: Path | str) -> State | _Unreadable:
-    """The breaker state; a fresh closed State when there is no file; UNREADABLE otherwise."""
+    """The breaker state; a fresh closed State when there is no file and no open marker;
+    UNREADABLE otherwise (a lost file while a root was open stays open)."""
+    path = Path(path)
     try:
-        raw = Path(path).read_text(encoding="utf-8")
+        raw = path.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return State()
+        return UNREADABLE if _marker(path).exists() else State()
     except (OSError, UnicodeError):
         return UNREADABLE
     try:
@@ -125,33 +141,45 @@ def load(path: Path | str) -> State | _Unreadable:
 
 
 def is_open(state: State | _Unreadable) -> bool:
-    return not isinstance(state, State) or state.since is not None
+    """True when any root is open (or the state is unreadable)."""
+    return not isinstance(state, State) or bool(state.opened)
 
 
 def holds(state: State | _Unreadable, slice_id: str) -> bool:
-    """True when a new dispatch of ``slice_id`` must wait: the breaker is open and it is not INT."""
-    return is_open(state) and not INT_RE.match(slice_id.strip())
+    """True when a new dispatch of ``slice_id`` must wait: one of its roots is open."""
+    if not isinstance(state, State):
+        return True
+    return bool(root_ids(slice_id) & {r for r, _, _ in state.opened})
 
 
 def apply_finish(state: State, name: str, status: str, fin: float, now: float) -> State:
     """The state after one lane finish (pure). Non-terminal statuses only age the window."""
     if not name.strip() or _num(fin) is None or _num(now) is None:
         raise ValueError(f"bad finish: name={name!r} fin={fin!r} now={now!r}")
-    st, root = status.strip().upper(), root_id(name)
-    bad, since, roots, reason = list(state.bad), state.since, state.roots, state.reason
-    if st in BAD and not (st == "BLOCKED" and CDX_DRY_RE.match(name)):
-        bad = [b for b in bad if root_id(b[0]) != root] + [(name, float(fin))]
-        if since is not None and root not in roots:
-            roots = (*roots, root)
-    elif st in GOOD and since is not None and fin > since and root not in roots \
-            and not CDX_DRY_RE.match(root):
-        since, roots, reason = None, (), ""
-        bad = [b for b in bad if b[1] > fin]
+    st = status.strip().upper()
+    bad = list(state.bad)
+    opened = {r: (since, why) for r, since, why in state.opened}
+    cleared = dict(state.cleared)
+    counted = st in BAD and not (st == "BLOCKED" and CDX_DRY_RE.match(name))
+    if counted:
+        bad.append((name, float(fin)))
+    elif st in GOOD and not CDX_DRY_RE.match(name):
+        r = root_id(name)
+        if r in opened and fin > opened[r][0]:
+            del opened[r]
+            cleared[r] = max(cleared.get(r, fin), float(fin))
     bad = [b for b in bad if now - b[1] < BREAKER_WINDOW_S]
-    if since is None and len(bad) >= BREAKER_BAD:
-        since, roots = float(now), tuple(sorted({root_id(b[0]) for b in bad}))
-        reason = f"{len(bad)} bad roots within {BREAKER_WINDOW_S}s"
-    return State(tuple(bad), since, roots, reason)
+    cleared = {r: t for r, t in cleared.items() if now - t < BREAKER_WINDOW_S}
+    if counted:
+        for r in sorted(root_ids(name) - opened.keys()):
+            rows = [b for b, f in bad if r in root_ids(b) and f > cleared.get(r, -math.inf)]
+            n = len(rows)
+            # an iteration-stripped candidate (N6 from N6-11-AFX) opens only when that root
+            # itself failed too: AFX lanes of different numbered slices never pool into it
+            if n >= BREAKER_BAD and any(root_id(b) == r for b in rows):
+                opened[r] = (float(now), f"{n} bad finishes of {r} within {BREAKER_WINDOW_S}s")
+    return State(tuple(bad), tuple((r, s, w) for r, (s, w) in sorted(opened.items())),
+                 tuple(sorted(cleared.items())))
 
 
 def _os_lock(fd: int, unlock: bool = False) -> None:
@@ -186,9 +214,12 @@ def _locked(path: Path) -> Generator[bool]:
 
 
 def _write(path: Path, state: State) -> None:
-    brk = None if state.since is None else \
-        {"reason": state.reason, "since": state.since, "roots": list(state.roots)}
-    data = {"bad": [list(b) for b in state.bad], "breaker": brk}
+    """Atomic write. The open marker is created before an open state lands and removed only
+    after a fully closed state has landed, so a lost state file never reads as closed."""
+    data = {"bad": [list(b) for b in state.bad], "open": [list(o) for o in state.opened],
+            "cleared": [list(c) for c in state.cleared]}
+    if state.opened:
+        _marker(path).touch()
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -198,6 +229,8 @@ def _write(path: Path, state: State) -> None:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+    if not state.opened:
+        _marker(path).unlink(missing_ok=True)
 
 
 def record_finish(path: Path | str, name: str, status: str, fin: float, now: float) -> bool:
@@ -217,9 +250,10 @@ def record_finish(path: Path | str, name: str, status: str, fin: float, now: flo
 
 
 def reset(path: Path | str, ts: float) -> bool:
-    """Operator reset record: closes the breaker when ``ts`` is at or after its opening and
-    clears the bad list. A reset older than the opening is ignored (False). On an unreadable
-    file the reset is the repair: it writes a fresh closed state."""
+    """Operator reset record: closes every root opened at or before ``ts`` and drops the BAD
+    finishes up to ``ts``. False when it closes nothing (a reset older than every opening is
+    ignored). On an unreadable state (or a lost file with the open marker) the reset is the
+    repair: it writes a fresh closed state and removes the marker."""
     if _num(ts) is None:
         raise ValueError(f"bad reset ts: {ts!r}")
     path = Path(path)
@@ -227,10 +261,14 @@ def reset(path: Path | str, ts: float) -> bool:
         if not got:
             return False
         state = load(path)
-        if isinstance(state, State) and (state.since is None or ts < state.since):
-            return False
+        new = State()
+        if isinstance(state, State):
+            keep = tuple(o for o in state.opened if o[1] > ts)
+            if len(keep) == len(state.opened):
+                return False
+            new = State(tuple(b for b in state.bad if b[1] > ts), keep, state.cleared)
         try:
-            _write(path, State())
+            _write(path, new)
         except (OSError, ValueError):
             return False
         return True
