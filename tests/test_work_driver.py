@@ -551,7 +551,7 @@ class BootScanTest(unittest.TestCase):
                     self.assertIs(run.state, RunState.ACCEPTING)
 
     def test_neg_missing_boot_port_fails_closed(self):
-        for name in ("boot_scan", "boot_record", "boot_resume"):
+        for name in ("boot_scan", "boot_record", "boot_resume", "clock"):
             with self.subTest(missing=name):
                 ports = FakePorts({"a": [result()]})
                 setattr(ports, name, None)
@@ -566,16 +566,59 @@ class BootScanTest(unittest.TestCase):
                 run, steps = run_drive(ports)
                 self.assert_untouched(ports, run, steps)
 
+    def boot(self, acquired_at, scanned_at, use_lease=True):
+        """Drive once on a scan with a slice RESUME over a real lease file (60 s ttl)."""
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "n6.lease"
+            lease = n6_lease.acquire(path, "w", "s1", 60, acquired_at)
+            self.assertIsNotNone(lease)
+            items = (n6_boot.Item("slice", "s1", n6_boot.Action.RESUME, "consistent", TREE),
+                     n6_boot.Item("slice", "ghost", n6_boot.Action.ATTENTION, "unknown leftover"))
+            ports = FakePorts({"a": [result()]})
+            ports.boot_scan = lambda: n6_boot.Report(
+                "w", "", lease if use_lease else None, items, path, scanned_at)
+            ports.boot_resume = lambda item: ports.log.append(("boot_resume", item.ref, item.action))
+            ports.boot_record = lambda item: ports.log.append(("boot_record", item.ref, item.action))
+            run, _ = run_drive(ports)
+        return ports.log[:2], run
+
     def test_act_runs_on_the_scan_before_the_driver(self):
-        ports = FakePorts({"a": [result()]})
-        items = (n6_boot.Item("slice", "s1", n6_boot.Action.RESUME, "consistent", TREE),
-                 n6_boot.Item("slice", "ghost", n6_boot.Action.ATTENTION, "unknown leftover"))
-        ports.boot_scan = lambda: n6_boot.Report("w", "", None, items, Path("n6.lease"), 0.0)
-        ports.boot_resume = lambda item: ports.log.append(("boot_resume", item.ref))
-        ports.boot_record = lambda item: ports.log.append(("boot_record", item.ref))
-        run, _ = run_drive(ports)
-        self.assertEqual(ports.log[:2], [("boot_resume", "s1"), ("boot_record", "ghost")])
+        log, run = self.boot(T0.timestamp(), T0.timestamp())
+        self.assertEqual(log, [("boot_resume", "s1", n6_boot.Action.RESUME),
+                               ("boot_record", "ghost", n6_boot.Action.ATTENTION)])
         self.assertIs(run.state, RunState.ACCEPTING)
+
+    def test_neg_scan_without_lease_records_attention_not_resume(self):
+        log, run = self.boot(T0.timestamp(), T0.timestamp(), use_lease=False)
+        self.assertEqual(log, [("boot_record", "s1", n6_boot.Action.ATTENTION),
+                               ("boot_record", "ghost", n6_boot.Action.ATTENTION)])
+        self.assertIs(run.state, RunState.ACCEPTING)
+
+    def test_neg_lease_expired_between_scan_and_act_is_not_resumed(self):
+        # Live at the scan (report.now), expired at the fresh clock act now reads.
+        start = T0.timestamp() - 100
+        log, _ = self.boot(start, start)
+        self.assertEqual(log[0], ("boot_record", "s1", n6_boot.Action.ATTENTION))
+
+    def test_neg_clock_behind_the_scan_is_floored_at_report_now(self):
+        from unittest import mock
+        seen = []
+        later = T0.timestamp() + 1000
+        with mock.patch.object(n6_boot, "act", lambda r, p, now, rec, res: seen.append(now) or True):
+            self.boot(later, later)
+        self.assertEqual(seen, [later])
+
+    def test_neg_clock_that_is_not_aware_fails_closed(self):
+        for bogus in (T0.replace(tzinfo=None), T0.timestamp(), None):
+            with self.subTest(bogus=bogus):
+                ports = FakePorts({"a": [result()]})
+                ports.clock = lambda b=bogus: b
+                ports.boot_record = lambda item: ports.log.append(("boot_record", item.ref))
+                ports.boot_scan = lambda: n6_boot.Report(
+                    "w", "", None, (n6_boot.Item("slice", "g", n6_boot.Action.ATTENTION, "x"),),
+                    Path("n6.lease"), 0.0)
+                run, steps = run_drive(ports)
+                self.assert_untouched(ports, run, steps)
 
 
 if __name__ == "__main__":

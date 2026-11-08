@@ -47,6 +47,7 @@ from __future__ import annotations
 import contextlib
 import re
 from collections.abc import Callable, Iterable, Mapping
+from datetime import datetime
 from typing import TYPE_CHECKING, Protocol, cast
 
 from jarvis import n6_boot
@@ -69,8 +70,6 @@ from jarvis.workers.base import WorkerResult
 
 if TYPE_CHECKING:
     # Types only: the driver stays pure and imports no process/stage code.
-    from datetime import datetime
-
     from jarvis.work_checks import CheckResult
     from jarvis.work_evidence import EvidenceReceipt
     from jarvis.work_regress import RegressionVerdict
@@ -130,13 +129,22 @@ _TREE_HASH = re.compile(r"[0-9a-f]{40,64}")
 
 def _booted(ports: object) -> bool:
     """N6-12: scan once and act on the report before the driver acts. Fail-closed: a missing
-    boot port, a scan that is not a ``Report`` or a held report (act returns False) acts on nothing."""
-    scan, record, resume = (getattr(ports, n, None) for n in ("boot_scan", "boot_record", "boot_resume"))
-    if not (callable(scan) and callable(record) and callable(resume)):
+    boot port, a scan that is not a ``Report`` or a held report (act returns False) acts on nothing.
+    N6-12FIX3: act judges liveness at a FRESH clock reading taken after the scan (not
+    ``report.now``), so a lease that expired between scan and act is not resumed; a clock
+    that is not an aware datetime acts on nothing."""
+    names = ("boot_scan", "boot_record", "boot_resume", "clock")
+    scan, record, resume, clock = (getattr(ports, n, None) for n in names)
+    if not (callable(scan) and callable(record) and callable(resume) and callable(clock)):
         return False
     report = cast("object", scan())
-    return isinstance(report, n6_boot.Report) and n6_boot.act(
-        report, report.lease_path, report.now, cast("Callable[[n6_boot.Item], object]", record),
+    if not isinstance(report, n6_boot.Report):
+        return False
+    now = cast("object", clock())
+    if not isinstance(now, datetime) or now.utcoffset() is None:
+        return False
+    return n6_boot.act(
+        report, report.lease_path, max(now.timestamp(), report.now), cast("Callable[[n6_boot.Item], object]", record),
         cast("Callable[[n6_boot.Item], object]", resume))
 
 
