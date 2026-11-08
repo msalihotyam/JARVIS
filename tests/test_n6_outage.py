@@ -2,6 +2,7 @@
 
 import builtins
 import io
+import itertools
 import json
 import os
 import tempfile
@@ -51,6 +52,72 @@ class N6OutageTests(unittest.TestCase):
         self.assertEqual(state.nudges, o.MAX_NUDGES)
         again = o.step(self.path, "timeout", T0 + 3 * GAP)
         self.assertEqual(again, o.Decision(o.DROP))  # attention and failure count once
+
+    def test_neg_dropped_run_is_never_nudged_after_an_outage(self) -> None:  # CDX F1
+        got = self.run_seq([("timeout", T0), ("timeout", T0 + o.DROP_AFTER_S),
+                            ("outage", T0 + o.DROP_AFTER_S + 1)])
+        self.assertEqual(got, [o.Decision(o.NUDGE),
+                               o.Decision(o.DROP, attention=True, counts_failure=True),
+                               o.Decision(o.HOLD)])
+        for t in (T0 + o.DROP_AFTER_S + 2, T0 + 3 * GAP, T0 + 9 * GAP):
+            self.assertEqual(o.step(self.path, "timeout", t), o.Decision(o.DROP))  # never NUDGE
+        state = o.load(self.path)
+        assert state is not None
+        self.assertEqual((state.nudges, state.dropped), (1, True))
+        self.assertEqual(o.step(self.path, "continue", T0 + 9 * GAP), o.Decision(o.CONTINUE))
+        state = o.load(self.path)
+        assert state is not None
+        self.assertFalse(state.dropped)  # only progress clears a drop
+
+    def test_state_machine_table_every_state_every_event(self) -> None:
+        n = T0 + 10_000.0
+        fail = o.Decision(o.HOLD, attention=True)
+        drop1 = o.Decision(o.DROP, attention=True, counts_failure=True)
+        S = o.State
+        # name: (state, timeout decision, state after timeout)
+        table = {
+            "fresh": (S(), o.Decision(o.NUDGE), S(1, n, n)),
+            "stalled": (S(stall_since=n - 10), o.Decision(o.NUDGE), S(1, n, n - 10)),
+            "nudged_in_gap": (S(1, n - 10, n - 10), o.Decision(o.WAIT), S(1, n - 10, n - 10)),
+            "nudged_gap_ok": (S(1, n - GAP, n - GAP), o.Decision(o.NUDGE), S(2, n, n - GAP)),
+            "capped_in_gap": (S(2, n - 10, n - GAP), o.Decision(o.WAIT), S(2, n - 10, n - GAP)),
+            "capped_gap_ok": (S(2, n - GAP, n - GAP), drop1, S(2, n - GAP, n - GAP, None, True)),
+            "stall_30_min": (S(1, n - 10, n - o.DROP_AFTER_S), drop1,
+                             S(1, n - 10, n - o.DROP_AFTER_S, None, True)),
+            "outage": (S(outage_since=n - 10), o.Decision(o.NUDGE), S(1, n, n)),
+            "dropped_fresh": (S(dropped=True), o.Decision(o.DROP), S(0, None, n, None, True)),
+            "dropped_in_gap": (S(1, n - 10, n - 10, None, True), o.Decision(o.DROP),
+                               S(1, n - 10, n - 10, None, True)),
+            "dropped_after_outage": (S(1, n - GAP, None, n - 1, True), o.Decision(o.DROP),
+                                     S(1, n - GAP, n, None, True)),
+            "dropped_capped": (S(2, n - GAP, n - GAP, None, True), o.Decision(o.DROP),
+                               S(2, n - GAP, n - GAP, None, True)),
+        }
+        for name, (s, tdec, tnext) in table.items():
+            outage_since = s.outage_since if s.outage_since is not None else n
+            expected = {
+                "timeout": (tdec, tnext),
+                "continue": (o.Decision(o.CONTINUE),
+                             S(s.nudges, s.last_nudge_at, None, None, False)),
+                "outage": (o.Decision(o.HOLD),
+                           S(s.nudges, s.last_nudge_at, None, outage_since, s.dropped)),
+                "bogus": (fail, s),
+            }
+            for event, want in expected.items():
+                with self.subTest(state=name, event=event):
+                    self.assertEqual(o.decide(s, event, n), want)
+
+    def test_neg_dropped_walk_never_nudges_waits_or_recounts(self) -> None:
+        for seq in itertools.product(("timeout", "outage", "bogus"), repeat=4):
+            state: o.State | None = o.State(1, T0, T0, None, True)
+            for i, event in enumerate(seq, 1):
+                d, state = o.decide(state, event, T0 + i * GAP)
+                with self.subTest(seq=seq, i=i):
+                    self.assertIn(d.action, (o.DROP, o.HOLD))
+                    self.assertFalse(d.counts_failure)
+                    self.assertEqual(d.attention, event == "bogus")
+                    assert state is not None
+                    self.assertTrue(state.dropped)
 
     def test_neg_cap_reached_after_reset_still_refuses_nudge(self) -> None:
         self.run_seq([("timeout", T0), ("timeout", T0 + GAP), ("continue", T0 + GAP + 1)])
@@ -145,6 +212,56 @@ class N6OutageTests(unittest.TestCase):
                                      o.Decision(o.HOLD, attention=True))
                 self.assertEqual(self.path.read_bytes(), before)
 
+    def test_neg_number_gate_never_raises_and_no_subclass_math_runs(self) -> None:  # CDX F2
+        class Shy:  # isinstance() falls back to __class__, which raises
+            @property
+            def __class__(self) -> type:  # type: ignore[override]
+                raise RuntimeError("no")
+
+        def _no(*_: object) -> bool:
+            raise RuntimeError("no")
+
+        evil_ops = {k: _no for k in ("__eq__", "__ne__", "__lt__", "__le__", "__gt__", "__ge__",
+                                     "__sub__", "__rsub__", "__add__", "__radd__")}
+        EvilInt = type("EvilInt", (int,), dict(evil_ops))
+        Evil = type("Evil", (float,), dict(evil_ops))
+
+        class SubState(o.State):
+            pass
+
+        fail = o.Decision(o.HOLD, attention=True)
+        shy = Shy()
+        self.assertIsNone(o._number(shy, o.MAX_EPOCH_S))  # pyright: ignore[reportPrivateUsage]
+        for v in ("continue", "outage", "timeout"):
+            self.assertEqual(o.decide(o.State(), v, shy), (fail, o.State()))  # type: ignore[arg-type]
+            d, kept = o.decide(shy, v, T0)  # type: ignore[arg-type]
+            self.assertEqual(d, fail)
+            self.assertIs(kept, shy)
+            sub = SubState()
+            d, kept = o.decide(sub, v, T0)
+            self.assertEqual(d, fail)
+            self.assertIs(kept, sub)
+        evil = o.State(EvilInt(1), Evil(T0), Evil(T0))
+        d, new = o.decide(evil, "timeout", T0 + GAP)
+        self.assertEqual(d, o.Decision(o.NUDGE))
+        self.assertIs(type(new), o.State)
+        assert new is not None
+        self.assertEqual([type(x) for x in (new.nudges, new.last_nudge_at, new.stall_since)],
+                         [int, float, float])
+        self.assertEqual(new, o.State(2, T0 + GAP, T0))
+        d, kept = o.decide(evil, "bogus", T0 + GAP)
+        self.assertEqual(d, fail)
+        self.assertIs(kept, evil)  # fail closed hands back the exact object given
+        o.save(self.path, evil)
+        self.assertEqual(o.load(self.path), o.State(1, T0, T0))
+        Liar = type("Liar", (int,), {"__float__": lambda _s: 1.0})  # at the cap, claims 1
+        Big = type("Big", (float,), {"__float__": lambda _s: 9e9})
+        self.assertEqual(o._number(Liar(2), o.MAX_NUDGES, whole=True), 2.0)  # pyright: ignore[reportPrivateUsage]
+        self.assertEqual(o._number(Big(5.0), o.MAX_EPOCH_S), 5.0)  # pyright: ignore[reportPrivateUsage]
+        d, new = o.decide(o.State(Liar(2), T0, T0), "timeout", T0 + GAP)
+        self.assertEqual(d, o.Decision(o.DROP, attention=True, counts_failure=True))  # no 3rd nudge
+        self.assertEqual(new, o.State(2, T0, T0, None, True))
+
     def test_neg_save_refuses_absurd_numbers(self) -> None:
         for s in (o.State(stall_since=10 ** 400), o.State(outage_since=1e300),  # type: ignore[arg-type]
                   o.State(nudges=True, last_nudge_at=T0), o.State(nudges=10 ** 400)):  # type: ignore[arg-type]
@@ -217,6 +334,33 @@ class N6OutageTests(unittest.TestCase):
         self.assertEqual(data, {"version": 1, "nudges": 1, "last_nudge_at": T0,
                                 "stall_since": T0, "outage_since": None, "dropped": False})
         self.assertEqual(sorted(p.name for p in self.path.parent.iterdir()), ["outage.json"])
+
+    def test_neg_failed_write_keeps_original_bytes_and_holds(self) -> None:  # CDX F3
+        def torn(_obj: object, f: io.TextIOBase, **_k: object) -> None:
+            f.write('{"vers')  # half a document reaches the temp file, then the disk fails
+            raise OSError("disk full")
+
+        o.step(self.path, "timeout", T0)
+        before = self.path.read_bytes()
+        faults = [("jarvis.n6_outage.open", OSError("emfile")),  # the temp file cannot be opened
+                  ("jarvis.n6_outage.json.dump", torn),
+                  ("jarvis.n6_outage.json.dump", RuntimeError("bug")),
+                  ("jarvis.n6_outage.os.fsync", OSError("io")),
+                  ("jarvis.n6_outage.os.replace", OSError("locked")),
+                  ("jarvis.n6_outage.os.replace", KeyboardInterrupt())]
+        for target, effect in faults:
+            with self.subTest(target=target, effect=repr(effect)):
+                try:
+                    with mock.patch(target, side_effect=effect, create=True):
+                        d = o.step(self.path, "timeout", T0 + GAP)
+                except KeyboardInterrupt:
+                    d = None  # not swallowed: the caller sees the interrupt
+                if not isinstance(effect, KeyboardInterrupt):
+                    self.assertEqual(d, o.Decision(o.HOLD, attention=True))
+                self.assertEqual(self.path.read_bytes(), before)
+                self.assertEqual(sorted(p.name for p in self.path.parent.iterdir()),
+                                 ["outage.json"])
+        self.assertEqual(o.step(self.path, "timeout", T0 + GAP), o.Decision(o.NUDGE))
 
     def test_decide_is_pure(self) -> None:
         s = o.State()
