@@ -101,10 +101,11 @@ class N6NotifyTests(unittest.TestCase):
         self.assertIn("acil: disk dolu", text)
         self.assertNotIn("dilim 0", text)
         summaries = []
-        summary = evening_summary(self.path, summaries.append)
-        self.assertEqual(summaries, [summary])
-        self.assertEqual(summary.count("basladi"), 6)
-        self.assertIsNone(evening_summary(self.path, summaries.append))
+        parts = evening_summary(self.path, summaries.append)
+        self.assertEqual(summaries, parts)
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0].count("basladi"), 6)
+        self.assertEqual(evening_summary(self.path, summaries.append), [])
         self.assertEqual(len(self.sent), 1)
 
     def test_neg_tests_never_open_the_database(self):
@@ -186,11 +187,80 @@ class N6NotifyTests(unittest.TestCase):
     def test_neg_daily_replay_and_non_str_fields(self):
         submit(self.path, Event("status", "s", "durum iyi"))
         submit(self.path, Event("status", "s", "durum iyi"))
-        self.assertEqual(evening_summary(self.path, lambda _t: None), "durum iyi")
+        self.assertEqual(evening_summary(self.path, lambda _t: None), ["durum iyi"])
         for bad in (Event("urgent", "k", 5), Event("ask", "k", "t", None), Event(1, "k", "t")):
             with self.assertRaises(ValueError):
                 submit(self.path, bad)
         self.assertIsNone(self.flush())
+
+    def daily_items(self, n):
+        items = [f"N6-{i:03d} dilimi kabul edildi, testler yeşil" for i in range(n)]
+        for i, text in enumerate(items):
+            submit(self.path, Event("slice_accepted" if i % 2 else "slice_started", f"s{i}", text))
+        return items
+
+    def state_daily(self):
+        return json.loads(self.path.read_text(encoding="utf-8"))["daily"]
+
+    def body_lines(self, parts, total=None):
+        """Item lines of delivered parts; checks each numbered header (total = parts in the run)."""
+        total = total or len(parts)
+        lines = []
+        for k, text in enumerate(parts, 1):
+            got = text.split("\n")
+            if total > 1:
+                self.assertEqual(got.pop(0), f"Akşam özeti {k}/{total}")
+            lines += got
+        return lines
+
+    def test_neg_daily_over_max_chars_is_never_dropped(self):
+        for n in (60, 600):
+            with self.subTest(n=n):
+                self.path.unlink(missing_ok=True)
+                items = self.daily_items(n)
+                delivered = []
+                parts = evening_summary(self.path, delivered.append)
+                self.assertEqual(delivered, parts)
+                self.assertGreater(len(parts), 1)
+                self.assertTrue(all(len(t) <= n6_notify.MAX_CHARS for t in parts))
+                self.assertEqual(self.body_lines(parts), items)  # each once, in order
+                self.assertEqual(self.state_daily(), [])
+                self.assertEqual(evening_summary(self.path, delivered.append), [])
+
+    def test_neg_failed_delivery_keeps_every_undelivered_item(self):
+        for n in (60, 600):
+            with self.subTest(n=n):
+                self.path.unlink(missing_ok=True)
+                items = self.daily_items(n)
+                delivered = []
+
+                def deliver(text, delivered=delivered):
+                    if len(delivered) == 1:
+                        raise OSError("mail down")
+                    delivered.append(text)
+
+                with self.assertRaises(OSError):
+                    evening_summary(self.path, deliver)
+                total = int(delivered[0].split("\n")[0].rsplit("/", 1)[1])
+                self.assertGreater(total, 1)
+                first = self.body_lines(delivered, total)
+                self.assertTrue(first)
+                self.assertEqual(first + self.state_daily(), items)  # delivered or kept, never both
+                rest = evening_summary(self.path, delivered.append)
+                self.assertEqual(first + self.body_lines(rest), items)
+                self.assertEqual(self.state_daily(), [])
+
+    def test_neg_daily_item_longer_than_a_message_is_clipped_not_dropped(self):
+        submit(self.path, Event("status", "a", "kısa önce"))
+        submit(self.path, Event("status", "b", "uzun " + "x" * 5000))
+        submit(self.path, Event("status", "c", "kısa sonra"))
+        parts = evening_summary(self.path, lambda _t: None)
+        self.assertTrue(all(len(t) <= n6_notify.MAX_CHARS for t in parts))
+        lines = self.body_lines(parts)
+        self.assertEqual(len(lines), 3)
+        self.assertEqual((lines[0], lines[2]), ("kısa önce", "kısa sonra"))
+        self.assertTrue(lines[1].startswith("uzun xxx") and lines[1].endswith("..."))
+        self.assertEqual(self.state_daily(), [])
 
     def test_neg_send_error_is_resent_once_without_duplicate(self):
         def boom(_text):

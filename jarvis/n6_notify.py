@@ -260,14 +260,42 @@ def flush(
     return text
 
 
-def evening_summary(state_path: Path | str, deliver: Callable[[str], None]) -> str | None:
-    """Hand the day's DAILY items to ``deliver`` as one text; clear them only after."""
+def _head(i: int, n: int) -> str:
+    return f"Akşam özeti {i}/{n}\n"
+
+
+def _parts(items: list[str]) -> list[list[str]]:
+    """Pack items in order into parts that fit MAX_CHARS with any header; one line per item."""
+    room = MAX_CHARS - len(_head(len(items), len(items)))  # widest header: parts <= items
+    parts: list[list[str]] = []
+    size = 0
+    for item in items:
+        line = _clip(item, room)  # an item longer than a part is clipped, never dropped
+        if parts and size + 1 + len(line) <= room:
+            parts[-1].append(line)
+            size += 1 + len(line)
+        else:
+            parts.append([line])
+            size = len(line)
+    return parts
+
+
+def evening_summary(state_path: Path | str, deliver: Callable[[str], None]) -> list[str]:
+    """Deliver the DAILY items as numbered parts of at most MAX_CHARS each; return them.
+
+    An item leaves state only after ``deliver`` returned for the part holding it, so
+    a failed delivery keeps every undelivered item for the next call (nothing dropped).
+    """
     path = Path(state_path)
     s = _load(path)
-    if not s.daily:
-        return None
-    text = _clip("\n".join(s.daily))
-    deliver(text)
-    s.daily = []
-    _save(path, s)
-    return text
+    parts = _parts(s.daily)
+    sent: list[str] = []
+    for i, part in enumerate(parts, 1):
+        text = "\n".join(part)
+        if len(parts) > 1:
+            text = _head(i, len(parts)) + text
+        deliver(text)
+        s.daily = s.daily[len(part):]
+        _save(path, s)
+        sent.append(text)
+    return sent
