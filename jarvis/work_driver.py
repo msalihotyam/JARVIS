@@ -33,9 +33,15 @@ The driver owns no process, database or network. ``ports`` supplies:
   ``boot_resume(item)``: the scan runs once and ``n6_boot.act`` carries it out
   before the driver acts. A missing port, a non-Report, or a held report
   (paused, HELD_ALL) stops the driver untouched (fail-closed).
+- ``root_cause(step)`` -> str | None (optional; N6-13 G17/R23): the written
+  "ROOT CAUSE <key>:<attempt>: <why>" record for the step's last failure.
+  From ``RETRY_CAP`` failed attempts on, a retry without a valid record is
+  held (step unchanged, attention notify, run paused); a missing port holds.
 
 Worker claims are data: only the Core gates accept a slice. Any gate
 error fails closed as a finding, so apply never follows a failed gate.
+A gate error that is not ``work_regress.retriable`` (StageError, any
+unknown class) cancels the slice: no retry, ever; the operator decides.
 Apply is exactly-once: a durable intent event carries the idempotency key
 before apply and a receipt event follows it. A resumed ACCEPTING step with
 an intent is verified, never applied again: receipted or applied ->
@@ -66,6 +72,7 @@ from jarvis.work_ledger import (
     run_waits_for_input,
     runnable_steps,
 )
+from jarvis.work_regress import RETRY_CAP, retriable, root_cause_ok
 from jarvis.workers.base import WorkerResult
 
 if TYPE_CHECKING:
@@ -170,6 +177,8 @@ def drive(run: WorkRun, steps: Iterable[WorkStep], ports: Ports) -> tuple[WorkRu
         if outcome == "budget":
             run = _run_to(run, RunState.BLOCKED_BUDGET, ports)
             ports.notify("blocked:budget", f"budget:{step.key}:{step.attempt}", step.key)
+        elif outcome == "held":
+            break  # N6-13: an attention item; the run pauses below
     if run.state == RunState.BUILDING:
         values = tuple(by_key.values())
         if run_waits_for_input(values):
@@ -262,6 +271,30 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
         ports.notify("slice_failed_after_cap", f"{step.key}:failed_after_cap", step.key)
         return step, "failed"
 
+    def ended(found: _Findings) -> tuple[WorkStep, str]:
+        # N6-13: a non-retriable gate error ends the slice; CANCELLED is terminal.
+        step = move(StepState.CANCELLED)
+        _gate_event(step, "non_retriable", found, ports)
+        ports.notify("slice_failed_after_cap", f"{step.key}:non_retriable", step.key)
+        return step, "held"
+
+    def unrooted(found: _Findings) -> tuple[WorkStep, str] | None:
+        # N6-13 (O61/PM26X): from RETRY_CAP failed attempts on, a retry needs a written root cause.
+        step = track[0]
+        if step.attempt < RETRY_CAP:
+            return None
+        port = getattr(ports, "root_cause", None)
+        try:
+            record = port(step) if callable(port) else None
+        except Exception:
+            record = None
+        failure = f"{step.key}:{step.attempt}"
+        if root_cause_ok(record, failure, " ".join(f["detail"] for f in found)):
+            return None
+        _gate_event(step, "root_cause", (_finding("root_cause", "missing_or_invalid:" + failure),), ports)
+        ports.notify("slice_failed_after_cap", f"{step.key}:root_cause:{step.attempt}", step.key)
+        return step, "held"
+
     step = track[0]
     stage = ports.stage_create(step)
     worker = ports.worker(ports.route(step))
@@ -284,6 +317,10 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
         # D3 fails closed: only an explicit False lets a worker session start.
         if ports.budget_exhausted() is not False:
             return step, "budget"
+        if step.state in _REVISABLE:
+            held = unrooted(findings)
+            if held is not None:
+                return held
         step = move(StepState.RUNNING)
         if not started:
             started = True
@@ -302,7 +339,7 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
                 with contextlib.suppress(Exception):
                     worker.stop(run_id)
             result = None
-            findings = (_finding("worker", "gate_error:" + type(exc).__name__),)
+            findings = (_gate_error("worker", exc),)
         timed_out = result is not None and result.status == "timeout"
         if result is not None:
             # Claims like "completed" never skip a gate; others only narrow.
@@ -314,6 +351,8 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
                 findings = (_finding("worker", "status:" + result.status),)
             else:
                 findings = _gate(step, "scope", ports, lambda: _scope(stage, ports))
+        if _fatal(findings):
+            return ended(findings)
         if findings:
             step = move(StepState.TIMEOUT if timed_out else StepState.BLOCKED_BY_GATE)
         else:
@@ -321,6 +360,8 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
             findings, ok = _accept(step, stage, ports)
             if ok:
                 return accepted()
+            if _fatal(findings):
+                return ended(findings)
         outcome = capped()
         if outcome is not None:
             return outcome
@@ -395,7 +436,7 @@ def _accept(step: WorkStep, stage: Stage, ports: Ports) -> tuple[_Findings, bool
             EventKind.PROGRESS, step.key, {"gate": "apply_intent", "idempotency_key": key}, idempotency_key=key,
         )
     except Exception as exc:
-        findings = (_finding(name, "gate_error:" + type(exc).__name__),)
+        findings = (_gate_error(name, exc),)
         _gate_event(step, name, findings, ports)
         return findings, False
     try:
@@ -406,7 +447,7 @@ def _accept(step: WorkStep, stage: Stage, ports: Ports) -> tuple[_Findings, bool
         # A partial effect rolls back before the attempt counts as failed; an
         # undo that raises escapes and leaves the intent for the resume.
         ports.undo(stage, key)
-        findings = (_finding("apply", "gate_error:" + type(exc).__name__),)
+        findings = (_gate_error("apply", exc),)
         _gate_event(step, "apply", findings, ports)
         return findings, False
     _receipt(step, key, str(ref), ports)
@@ -425,9 +466,20 @@ def _gate(step: WorkStep, name: str, ports: Ports, gate: Callable[[], Iterable[o
     try:
         findings = tuple(_finding(name, str(item)) for item in gate())
     except Exception as exc:
-        findings = (_finding(name, "gate_error:" + type(exc).__name__),)
+        findings = (_gate_error(name, exc),)
     _gate_event(step, name, findings, ports)
     return findings
+
+
+def _gate_error(gate: str, exc: Exception) -> _Finding:
+    found = _finding(gate, "gate_error:" + type(exc).__name__)
+    if not retriable(exc):
+        found["retriable"] = "no"  # the detail format stays; only the driver reads this flag
+    return found
+
+
+def _fatal(findings: _Findings) -> bool:
+    return any(f.get("retriable") == "no" for f in findings)
 
 
 def _gate_event(step: WorkStep, name: str, findings: _Findings, ports: Ports) -> None:

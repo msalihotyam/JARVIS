@@ -127,6 +127,9 @@ class FakePorts:
     def needs_input(self, worker_result):
         return worker_result.summary == "question?"
 
+    def root_cause(self, step):  # N6-13: a valid written record for every revision
+        return f"ROOT CAUSE {step.key}:{step.attempt}: fake worker regressed, fixed input"
+
     def count(self, name):
         return sum(1 for entry in self.log if entry == (name,))
 
@@ -218,12 +221,12 @@ class DriverMatrixTest(unittest.TestCase):
         self.assertEqual((step.state, ports.count("undo"), ports.count("start")), (StepState.FAILED_AFTER_CAP, 1, 0))
 
     def test_apply_error_undoes_then_counts_a_failed_attempt(self):
-        ports = FakePorts({"a": [result()]}, apply=[RuntimeError("disk"), "ckpt"])
+        ports = FakePorts({"a": [result()]}, apply=[TimeoutError("disk"), "ckpt"])
         run, steps = run_drive(ports)
         self.assertEqual((steps["a"].state, steps["a"].attempt), (StepState.ACCEPTED, 2))
         self.assertEqual(ports.count("undo"), 1)
         self.assertLess(ports.log.index(("undo",)), ports.log.index(("start",), ports.log.index(("undo",))))
-        self.assertEqual(ports.workers["a"].tasks[1]["findings"], ({"gate": "apply", "detail": "gate_error:RuntimeError"},))
+        self.assertEqual(ports.workers["a"].tasks[1]["findings"], ({"gate": "apply", "detail": "gate_error:TimeoutError"},))
         ports = FakePorts({"a": [result()]}, apply=[RuntimeError("disk")], undo=[OSError("undo")])
         with self.assertRaises(OSError):
             run_drive(ports)
@@ -236,23 +239,25 @@ class DriverMatrixTest(unittest.TestCase):
             with self.subTest(tree=tree):
                 ports = FakePorts({"a": [result()]}, tree_hash=[tree])
                 run, steps = run_drive(ports)
-                self.assertIs(steps["a"].state, StepState.FAILED_AFTER_CAP)
+                # N6-13: ValueError/RuntimeError are non-retriable, so the slice ends.
+                self.assertIs(steps["a"].state, StepState.CANCELLED)
                 self.assertEqual((ports.count("apply"), ports.keys), (0, []))
-                self.assertEqual(ports.workers["a"].tasks[1]["findings"][0]["gate"], "apply")
+                self.assertEqual(len(ports.workers["a"].tasks), 1)
+                self.assertIn("apply", gates(ports))
 
     def test_collect_without_worker_result_is_a_gate_error(self):
         for bad in (None, "completed", {"status": "completed"}):
             with self.subTest(bad=bad):
                 ports = FakePorts({"a": [bad]})
                 run, steps = run_drive(ports)
-                self.assertIs(steps["a"].state, StepState.FAILED_AFTER_CAP)
+                self.assertIs(steps["a"].state, StepState.CANCELLED)
                 self.assertEqual(ports.count("link_rescan") + ports.count("apply"), 0)
-                self.assertEqual(ports.workers["a"].tasks[1]["findings"],
-                                 ({"gate": "worker", "detail": "gate_error:TypeError"},))
+                self.assertEqual(len(ports.workers["a"].tasks), 1)
+                self.assertIn("non_retriable", gates(ports))
                 self.assertIn(("stop", "w1"), ports.log)
 
     def test_verify_cwd_failure_never_starts_the_worker(self):
-        ports = FakePorts({"a": [result()]}, verify_cwd=[RuntimeError("cwd")])
+        ports = FakePorts({"a": [result()]}, verify_cwd=[TimeoutError("cwd")])
         run, steps = run_drive(ports)
         self.assertIs(steps["a"].state, StepState.FAILED_AFTER_CAP)
         self.assertEqual((ports.workers["a"].tasks, ports.count("verify_cwd")), ([], 6))
@@ -273,10 +278,11 @@ class DriverMatrixTest(unittest.TestCase):
         self.assertEqual(ports.count("start"), 0)
 
     def test_apply_without_ref_is_undone_and_failed(self):
+        # N6-13: a missing ref is a contract error (not transient), so it is undone and ends the slice.
         ports = FakePorts({"a": [result(), result()]}, apply=[None, "ckpt"])
         run, steps = run_drive(ports)
-        self.assertEqual((steps["a"].state, steps["a"].attempt), (StepState.ACCEPTED, 2))
-        self.assertEqual((ports.count("apply"), ports.count("undo")), (2, 1))
+        self.assertEqual((steps["a"].state, steps["a"].attempt), (StepState.CANCELLED, 1))
+        self.assertEqual((ports.count("apply"), ports.count("undo")), (1, 1))
 
     def test_resumed_run_with_three_failed_slices_pauses_at_once(self):
         keys = {s: step_key(RUN, n, s) for n, s in enumerate("abcd", 1)}
@@ -410,25 +416,25 @@ class DriverMatrixTest(unittest.TestCase):
     def test_apply_never_runs_after_failed_gate(self):
         for port in ("link_rescan", "scope_check", "run_checks", "regress", "review", "evidence"):
             with self.subTest(port=port):
-                ports = FakePorts({"a": [result()]}, **{port: [RuntimeError("boom")]})
+                ports = FakePorts({"a": [result()]}, **{port: [TimeoutError("boom")]})
                 run, steps = run_drive(ports)
                 self.assertIs(steps["a"].state, StepState.FAILED_AFTER_CAP)
                 self.assertEqual(ports.count("apply"), 0)
                 self.assertEqual(ports.log[-2], ("release", "a"))
-        for script in ([result("failed")], [result("partial")], [RuntimeError("crash")]):
+        for script in ([result("failed")], [result("partial")], [TimeoutError("crash")]):
             with self.subTest(script=script):
                 ports = FakePorts({"a": script})
                 run, steps = run_drive(ports)
                 self.assertIs(steps["a"].state, StepState.FAILED_AFTER_CAP)
                 self.assertEqual(ports.count("link_rescan") + ports.count("apply"), 0)
-        ports = FakePorts({"a": [RuntimeError("crash")]})
+        ports = FakePorts({"a": [TimeoutError("crash")]})
         run_drive(ports)
         self.assertIn(("stop", "w1"), ports.log)
         ports = FakePorts({"a": [result()]}, run_checks=[[]])
         run, steps = run_drive(ports)
         self.assertEqual((steps["a"].state, ports.count("regress")), (StepState.FAILED_AFTER_CAP, 0))
         self.assertIs(drive(WorkRun(RUN, RunState.BUILDING, T0, T0), (), ports)[0].state, RunState.PAUSED)
-        ports = FakePorts({"a": [result()]}, apply=[RuntimeError("disk")])
+        ports = FakePorts({"a": [result()]}, apply=[TimeoutError("disk")])
         run, steps = run_drive(ports)
         self.assertIs(steps["a"].state, StepState.FAILED_AFTER_CAP)
         self.assertNotIn("slice_accepted", ports.points())

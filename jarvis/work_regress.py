@@ -172,3 +172,29 @@ def compare_results(base: TestResult, stage: TestResult, *,
     if locked_fixture_hash != stage_fixture_hash:
         reasons.append("locked_fixtures_changed")
     return RegressionVerdict(not reasons, new, tuple(reasons))
+
+
+# N6-13 (G17, R23). O61 and O64 both name 2; fail closed to the lower number if they ever differ.
+RETRY_CAP = 2
+# Only transient classes may retry; StageError and any unknown class end the slice (fail closed).
+_RETRIABLE = (TimeoutError, ConnectionError)
+
+
+def retriable(exc: BaseException) -> bool:
+    return isinstance(exc, _RETRIABLE)
+
+
+def _norm(text: str) -> str:
+    return " ".join(text.lower().split())
+
+
+def root_cause_ok(record: object, failure_id: str, error_text: str) -> bool:
+    """A written "ROOT CAUSE <failure_id>: <why>" record whose why is not just the error text."""
+    if not isinstance(record, str) or not failure_id:
+        return False
+    match = re.match(r"ROOT CAUSE " + re.escape(failure_id) + r": (.+)", record.strip(), re.S)
+    body = _norm(match[1]) if match else ""
+    err = _norm(error_text)
+    # Neither a part of the error text nor the error text with only punctuation added.
+    rest = body.replace(err, " ") if err else body
+    return bool(re.search(r"\w", rest)) and body not in err and body != _norm(failure_id)
