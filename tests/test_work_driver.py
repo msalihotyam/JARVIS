@@ -484,6 +484,7 @@ class LeasedPorts(FakePorts):
     def __init__(self, workers, path, owner="mgr-a", **script):
         super().__init__(workers, **script)
         self.path, self.owner, self.now_s, self.takeover, self.cut = path, owner, 1000.0, False, None
+        self.other = None
 
     def lease_claim(self, step):
         lease = n6_lease.acquire(self.path, self.owner, step.slug, 60, self.now_s)
@@ -495,14 +496,23 @@ class LeasedPorts(FakePorts):
     def lease_check(self, lease):
         return n6_lease.check(self.path, lease, self.now_s)
 
+    def lease_fenced(self, lease, write):
+        if self.takeover and self.other is None and self.wrote:
+            # The lease expires between writes and a second manager takes it (outside the lock).
+            self.now_s += 61
+            self.cut = len(self.log)
+            self.other = n6_lease.acquire(self.path, "mgr-b", lease.slice_id, 60, self.now_s)
+        return n6_lease.fenced(self.path, lease, self.now_s, write)
+
+    @property
+    def wrote(self):
+        return any(e[0] == "event" for e in self.log)
+
     def lease_release(self, step):
         self.log.append(("release", step.slug))
 
     def stage_create(self, step):
-        if self.takeover:  # the lease expires mid-slice and a second manager takes it
-            self.now_s += 61
-            self.cut = len(self.log)
-            self.other = n6_lease.acquire(self.path, "mgr-b", step.slug, 60, self.now_s)
+        self.log.append(("stage_create", step.slug))
         return "stage"
 
 
@@ -529,6 +539,27 @@ class LeaseFencingTest(unittest.TestCase):
         after = ports.log[ports.cut:]
         self.assertEqual([e for e in after if e[0] in ("event", "notify", "release")], [])
         self.assertEqual(json.loads(self.path.read_text())["owner"], "mgr-b")
+
+    def test_neg_takeover_between_check_and_write_never_writes(self):
+        # N6-HARD2 H1: a check that still says "live" cannot let a write through after a takeover;
+        # the epoch is re-checked under the lock, in the same step as the write.
+        ports = LeasedPorts({"a": [result()]}, self.path)
+        ports.takeover = True
+        ports.lease_check = lambda lease: True  # a check-then-act driver would write now
+        with self.assertRaises(Fenced):
+            run_drive(ports)
+        self.assertEqual(ports.other.epoch, 2)
+        names = [e[0] for e in ports.log[ports.cut:]]
+        for written in ("event", "notify", "stage_create", "start", "release"):
+            self.assertNotIn(written, names)
+        self.assertEqual(json.loads(self.path.read_text())["owner"], "mgr-b")
+
+    def test_neg_no_fence_port_refuses_every_write(self):
+        ports = LeasedPorts({"a": [result()]}, self.path)
+        ports.lease_fenced = None
+        with self.assertRaises(Fenced):
+            run_drive(ports)
+        self.assertEqual([e for e in ports.log if e[0] in ("event", "notify", "stage_create", "start")], [])
 
     def test_every_write_carries_the_epoch_and_the_lease_is_released(self):
         ports = LeasedPorts({"a": [result()]}, self.path)
