@@ -130,6 +130,16 @@ class FakePorts:
     def root_cause(self, step):  # N6-13: a valid written record for every revision
         return f"ROOT CAUSE {step.key}:{step.attempt}: fake worker regressed, fixed input"
 
+    def gate_findings(self, step):  # N6-13FIX: the step's gate payloads for its current attempt
+        cur, out = None, []
+        for e in self.log:
+            if e[0] == "event" and e[2] == step.key:
+                if e[1] is EventKind.STEP_STATE:
+                    cur = e[3].get("attempt", cur)
+                elif "gate" in e[3] and cur == step.attempt:
+                    out.append(e[3])
+        return out
+
     def count(self, name):
         return sum(1 for entry in self.log if entry == (name,))
 
@@ -162,6 +172,16 @@ def resume(ports, attempt=1):
 
 def gates(ports):
     return [e[3]["gate"] for e in ports.log if e[0] == "event" and "gate" in e[3]]
+
+
+def assert_held(tc, ports, step, attempt=2, applies=0):
+    """N6-13FIX: the attempt after RETRY_CAP (2) is held as an attention item, never run."""
+    tc.assertIn(step.state, (StepState.BLOCKED_BY_GATE, StepState.TIMEOUT, StepState.ACCEPTING))
+    tc.assertEqual(step.attempt, attempt)
+    tc.assertEqual([e[1:] for e in ports.log if e[0] == "notify"][-1],
+                   ("slice_failed_after_cap", f"{step.key}:retry_cap:{attempt}"))
+    tc.assertLessEqual(len(ports.workers[step.slug].tasks), attempt)
+    tc.assertEqual(ports.count("apply"), applies)  # a failed apply is undone, never accepted
 
 
 class DriverMatrixTest(unittest.TestCase):
@@ -259,8 +279,8 @@ class DriverMatrixTest(unittest.TestCase):
     def test_verify_cwd_failure_never_starts_the_worker(self):
         ports = FakePorts({"a": [result()]}, verify_cwd=[TimeoutError("cwd")])
         run, steps = run_drive(ports)
-        self.assertIs(steps["a"].state, StepState.FAILED_AFTER_CAP)
-        self.assertEqual((ports.workers["a"].tasks, ports.count("verify_cwd")), ([], 6))
+        assert_held(self, ports, steps["a"])
+        self.assertEqual((ports.workers["a"].tasks, ports.count("verify_cwd")), ([], 2))
 
     def test_resumed_step_at_cap_fails_without_a_worker(self):
         for state in (StepState.BLOCKED_BY_GATE, StepState.TIMEOUT, StepState.ACCEPTING):
@@ -308,7 +328,7 @@ class DriverMatrixTest(unittest.TestCase):
         ports = FakePorts({"a": [result()]}, regress=[FAIL])
         run_drive(ports)
         self.assertEqual([e[1:] for e in ports.log if e[0] == "notify"],
-                         [("slice_started", f"{KEY_A}:started:1"), ("slice_failed_after_cap", f"{KEY_A}:failed_after_cap")])
+                         [("slice_started", f"{KEY_A}:started:1"), ("slice_failed_after_cap", f"{KEY_A}:retry_cap:2")])
         ports = FakePorts({"a": [result(summary="question?")]})
         run_drive(ports)
         self.assertEqual([e for e in ports.log if e[0] == "notify"][-1][1:], ("needs_input", f"{KEY_A}:needs_input:1"))
@@ -328,36 +348,35 @@ class DriverMatrixTest(unittest.TestCase):
         self.assertEqual(ports.count("apply"), 1)
         self.assertEqual(ports.points(), ["slice_started", "slice_accepted"])
 
-    def test_cap_hit_fails_slice_and_others_continue(self):
+    def test_cap_hit_holds_slice_and_pauses_the_run(self):
+        # N6-13FIX: a held slice is an attention item; the run pauses before any other slice starts.
         ports = FakePorts({"a": [result()], "b": [result()]}, regress=[FAIL] * 6 + [PASS])
         run, steps = run_drive(ports)
-        self.assertIs(steps["a"].state, StepState.FAILED_AFTER_CAP)
-        self.assertEqual(steps["a"].attempt, 6)
-        self.assertEqual(len(ports.workers["a"].tasks), 6)
-        self.assertIs(steps["b"].state, StepState.ACCEPTED)
-        self.assertEqual(ports.count("apply"), 1)
-        self.assertIn("slice_failed_after_cap", ports.points())
+        assert_held(self, ports, steps["a"])
+        self.assertEqual(len(ports.workers["a"].tasks), 2)
+        self.assertIs(steps["b"].state, StepState.PENDING)
+        self.assertNotIn(("claim", "b"), ports.log)
         self.assertIs(run.state, RunState.PAUSED)
 
     def test_three_failed_slices_pause_the_run(self):
         ports = FakePorts({s: [result()] for s in "abcd"}, regress=[FAIL])
         run, steps = run_drive(ports)
         self.assertIs(run.state, RunState.PAUSED)
-        self.assertEqual([steps[s].state for s in "abc"], [StepState.FAILED_AFTER_CAP] * 3)
-        self.assertIs(steps["d"].state, StepState.PENDING)
-        self.assertNotIn(("claim", "d"), ports.log)
-        self.assertEqual(ports.count("apply"), 0)
+        assert_held(self, ports, steps["a"])
+        self.assertEqual([steps[s].state for s in "bcd"], [StepState.PENDING] * 3)
+        self.assertEqual([e[1] for e in ports.log if e[0] == "claim"], ["a"])
 
     def test_scope_gate_block_link_rescan_first(self):
-        ports = FakePorts({"a": [result()]}, link_rescan=[["link:x"], [], []],
-                          scope_check=[["out_of_scope:y"], []])
+        ports = FakePorts({"a": [result()]}, link_rescan=[["link:x"], []],
+                          scope_check=[["out_of_scope:y"]])
         run, steps = run_drive(ports)
         self.assertEqual(ports.states("a").count("blocked_by_gate"), 2)
-        self.assertEqual(steps["a"].attempt, 3)
-        self.assertEqual(ports.count("scope_check"), 2)
-        self.assertEqual(ports.count("run_checks"), 1)
-        self.assertEqual(ports.workers["a"].tasks[2]["findings"],
-                         ({"gate": "scope", "detail": "out_of_scope:y"},))
+        assert_held(self, ports, steps["a"])
+        self.assertEqual(ports.count("scope_check"), 1)
+        self.assertEqual(ports.count("run_checks"), 0)
+        self.assertEqual([f["detail"] for f in ports.workers["a"].tasks[1]["findings"]], ["link:x"])
+        self.assertIn({"gate": "scope", "passed": False, "findings": ["out_of_scope:y"]},
+                      [e[3] for e in ports.log if e[0] == "event"])
 
     def test_check_timeout_is_a_revision(self):
         ports = FakePorts({"a": [result()]}, run_checks=[[HUNG], [CHECK]])
@@ -367,15 +386,17 @@ class DriverMatrixTest(unittest.TestCase):
         self.assertEqual(ports.count("regress"), 1)
 
     def test_review_major_and_unknown_block_minor_logged(self):
-        ports = FakePorts({"a": [result()]}, review=[
-            [{"severity": "MAJOR", "detail": "x"}], [{"severity": "weird"}],
-            [{"severity": "MINOR", "detail": "nit"}]])
-        run, steps = run_drive(ports)
-        self.assertIs(steps["a"].state, StepState.ACCEPTED)
-        self.assertEqual(steps["a"].attempt, 3)
-        self.assertEqual(ports.workers["a"].tasks[1]["findings"], ({"gate": "review", "detail": "MAJOR:x"},))
-        minor = [e[3] for e in ports.log if e[0] == "event" and e[3].get("gate") == "review_minor"]
-        self.assertEqual(minor, [{"gate": "review_minor", "findings": ["MINOR:nit"]}])
+        for first in ({"severity": "MAJOR", "detail": "x"}, {"severity": "weird"}):
+            with self.subTest(first=first):
+                ports = FakePorts({"a": [result()]}, review=[[first], [{"severity": "MINOR", "detail": "nit"}]])
+                run, steps = run_drive(ports)
+                self.assertEqual((steps["a"].state, steps["a"].attempt), (StepState.ACCEPTED, 2))
+                found = ports.workers["a"].tasks[1]["findings"]
+                self.assertEqual([f["gate"] for f in found], ["review"])
+                if "detail" in first:
+                    self.assertEqual(found, ({"gate": "review", "detail": "MAJOR:x"},))
+                minor = [e[3] for e in ports.log if e[0] == "event" and e[3].get("gate") == "review_minor"]
+                self.assertEqual(minor, [{"gate": "review_minor", "findings": ["MINOR:nit"]}])
 
     def test_worker_timeout_then_pass(self):
         ports = FakePorts({"a": [result("timeout"), result()]})
@@ -398,7 +419,7 @@ class DriverMatrixTest(unittest.TestCase):
         self.assertIs(run.state, RunState.ACCEPTING)
         self.assertEqual((step.state, step.attempt), (StepState.ACCEPTED, 2))
         self.assertEqual(ports.workers["a"].tasks[1]["findings"],
-                         ({"gate": "resume", "detail": "see_ledger_gate_events"},))
+                         ({"gate": "regression", "detail": "tests.t.T.test_x"},))
         self.assertEqual(ports.points().count("slice_started"), 1)
         fresh = FakePorts({"a": [result()]}, budget_exhausted=[True])
         run, steps = run_drive(fresh)
@@ -409,8 +430,7 @@ class DriverMatrixTest(unittest.TestCase):
     def test_lying_worker_is_not_accepted(self):
         ports = FakePorts({"a": [result(summary="done, all tests pass")]}, run_checks=[[HUNG]])
         run, steps = run_drive(ports)
-        self.assertIs(steps["a"].state, StepState.FAILED_AFTER_CAP)
-        self.assertEqual(ports.count("apply"), 0)
+        assert_held(self, ports, steps["a"])
         self.assertNotIn("slice_accepted", ports.points())
 
     def test_apply_never_runs_after_failed_gate(self):
@@ -418,25 +438,25 @@ class DriverMatrixTest(unittest.TestCase):
             with self.subTest(port=port):
                 ports = FakePorts({"a": [result()]}, **{port: [TimeoutError("boom")]})
                 run, steps = run_drive(ports)
-                self.assertIs(steps["a"].state, StepState.FAILED_AFTER_CAP)
-                self.assertEqual(ports.count("apply"), 0)
-                self.assertEqual(ports.log[-2], ("release", "a"))
+                assert_held(self, ports, steps["a"])
+                self.assertIn(("release", "a"), ports.log[-3:])
         for script in ([result("failed")], [result("partial")], [TimeoutError("crash")]):
             with self.subTest(script=script):
                 ports = FakePorts({"a": script})
                 run, steps = run_drive(ports)
-                self.assertIs(steps["a"].state, StepState.FAILED_AFTER_CAP)
+                assert_held(self, ports, steps["a"])
                 self.assertEqual(ports.count("link_rescan") + ports.count("apply"), 0)
         ports = FakePorts({"a": [TimeoutError("crash")]})
         run_drive(ports)
         self.assertIn(("stop", "w1"), ports.log)
         ports = FakePorts({"a": [result()]}, run_checks=[[]])
         run, steps = run_drive(ports)
-        self.assertEqual((steps["a"].state, ports.count("regress")), (StepState.FAILED_AFTER_CAP, 0))
+        assert_held(self, ports, steps["a"])
+        self.assertEqual(ports.count("regress"), 0)
         self.assertIs(drive(WorkRun(RUN, RunState.BUILDING, T0, T0), (), ports)[0].state, RunState.PAUSED)
         ports = FakePorts({"a": [result()]}, apply=[TimeoutError("disk")])
         run, steps = run_drive(ports)
-        self.assertIs(steps["a"].state, StepState.FAILED_AFTER_CAP)
+        assert_held(self, ports, steps["a"], applies=2)
         self.assertNotIn("slice_accepted", ports.points())
 
     def test_lease_released_on_exception(self):

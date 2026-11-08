@@ -35,8 +35,15 @@ The driver owns no process, database or network. ``ports`` supplies:
   (paused, HELD_ALL) stops the driver untouched (fail-closed).
 - ``root_cause(step)`` -> str | None (optional; N6-13 G17/R23): the written
   "ROOT CAUSE <key>:<attempt>: <why>" record for the step's last failure.
-  From ``RETRY_CAP`` failed attempts on, a retry without a valid record is
-  held (step unchanged, attention notify, run paused); a missing port holds.
+  EVERY retry needs a valid record, checked against the failed attempt's
+  real findings; otherwise the step is held (step unchanged, attention
+  notify, run paused); a missing port holds. The cap counts attempts: once
+  ``step.attempt >= RETRY_CAP`` the next attempt is always held, whatever
+  the record says.
+- ``gate_findings(step)`` -> iterable of gate payloads (optional; N6-13FIX):
+  the ledger's PROGRESS gate payloads for the step's current attempt, in
+  order. A resumed retry takes its failure text from the last failing one;
+  a missing port, an error or no failing payload holds the step.
 
 Worker claims are data: only the Core gates accept a slice. Any gate
 error fails closed as a finding, so apply never follows a failed gate.
@@ -278,29 +285,35 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
         ports.notify("slice_failed_after_cap", f"{step.key}:non_retriable", step.key)
         return step, "held"
 
-    def unrooted(found: _Findings) -> tuple[WorkStep, str] | None:
-        # N6-13 (O61/PM26X): from RETRY_CAP failed attempts on, a retry needs a written root cause.
+    def hold(gate: str, detail: str) -> tuple[WorkStep, str]:
         step = track[0]
-        if step.attempt < RETRY_CAP:
-            return None
+        _gate_event(step, gate, (_finding(gate, detail),), ports)
+        ports.notify("slice_failed_after_cap", f"{step.key}:{gate}:{step.attempt}", step.key)
+        return step, "held"
+
+    def unrooted(found: _Findings | None) -> tuple[WorkStep, str] | None:
+        # N6-13FIX (O61/O64): the cap counts attempts and fails closed to the lower
+        # number, so the attempt after RETRY_CAP is held even with a valid record.
+        step = track[0]
+        failure = f"{step.key}:{step.attempt}"
+        if step.attempt >= RETRY_CAP:
+            return hold("retry_cap", "attempt_after_cap:" + failure)
+        # Every retry needs a written root cause that says more than the real failure text.
         port = getattr(ports, "root_cause", None)
         try:
             record = port(step) if callable(port) else None
         except Exception:
             record = None
-        failure = f"{step.key}:{step.attempt}"
-        if root_cause_ok(record, failure, " ".join(f["detail"] for f in found)):
+        if found and root_cause_ok(record, failure, " ".join(f["detail"] for f in found)):
             return None
-        _gate_event(step, "root_cause", (_finding("root_cause", "missing_or_invalid:" + failure),), ports)
-        ports.notify("slice_failed_after_cap", f"{step.key}:root_cause:{step.attempt}", step.key)
-        return step, "held"
+        return hold("root_cause", ("missing_or_invalid:" if found else "findings_unreadable:") + failure)
 
     step = track[0]
     stage = ports.stage_create(step)
     worker = ports.worker(ports.route(step))
     started = step.state != StepState.PENDING
-    # A resumed revision's findings live in the ledger's gate events.
-    findings: _Findings = (_finding("resume", "see_ledger_gate_events"),) if started else ()
+    # A resumed revision's findings are read back from the ledger; unreadable stays None (held).
+    findings: _Findings | None = _ledger_findings(step, ports) if started else ()
     if step.state == StepState.ACCEPTING:
         resumed = _resume_apply(step, stage, ports)
         if resumed is not None:
@@ -329,7 +342,7 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
         result: WorkerResult | None = None
         try:
             ports.verify_cwd(stage)
-            run_id = worker.start(ports.task(step, stage, findings))
+            run_id = worker.start(ports.task(step, stage, findings or ()))
             collected = worker.collect(run_id)
             if not isinstance(collected, WorkerResult):
                 raise TypeError("collect returned no WorkerResult")
@@ -351,6 +364,9 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
                 findings = (_finding("worker", "status:" + result.status),)
             else:
                 findings = _gate(step, "scope", ports, lambda: _scope(stage, ports))
+        if result is None or result.status != "completed":
+            # N6-13FIX: worker failures go to the ledger too, so a resume can read them back.
+            _gate_event(step, "worker", findings, ports)
         if _fatal(findings):
             return ended(findings)
         if findings:
@@ -488,6 +504,23 @@ def _gate_event(step: WorkStep, name: str, findings: _Findings, ports: Ports) ->
         "passed": not findings,
         "findings": [f["detail"] for f in findings],
     })
+
+
+def _ledger_findings(step: WorkStep, ports: Ports) -> _Findings | None:
+    # N6-13FIX: the last failing gate of the step's current attempt; None (unreadable) holds the step.
+    port = getattr(ports, "gate_findings", None)
+    try:
+        payloads = list(port(step)) if callable(port) else []
+        failing = [p for p in payloads if isinstance(p, Mapping) and p.get("passed") is False
+                   and p.get("gate") not in ("root_cause", "retry_cap")]
+        if not failing:
+            return None
+        gate, details = str(failing[-1]["gate"]), failing[-1].get("findings")
+        if not isinstance(details, list) or not details or not all(isinstance(d, str) and d for d in details):
+            return None
+        return tuple(_finding(gate, d) for d in details)
+    except Exception:
+        return None
 
 
 def _finding(gate: str, detail: str) -> _Finding:
