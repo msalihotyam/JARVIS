@@ -59,6 +59,7 @@ accepted, otherwise undone and counted as a failed attempt.
 from __future__ import annotations
 
 import contextlib
+import math
 import re
 from collections.abc import Callable, Iterable, Mapping
 from datetime import datetime
@@ -158,8 +159,14 @@ def _booted(ports: object) -> bool:
     now = cast("object", clock())
     if not isinstance(now, datetime) or now.utcoffset() is None:
         return False
+
+    def fresh() -> float:  # N6-HARD2C H4: act re-reads the clock per item, floored at the scan
+        t = cast("object", clock())
+        if not isinstance(t, datetime) or t.utcoffset() is None:
+            return math.inf  # a bad reading mid-act: every lease reads expired, nothing resumes
+        return max(t.timestamp(), report.now)
     return n6_boot.act(
-        report, report.lease_path, max(now.timestamp(), report.now), cast("Callable[[n6_boot.Item], object]", record),
+        report, report.lease_path, fresh, cast("Callable[[n6_boot.Item], object]", record),
         cast("Callable[[n6_boot.Item], object]", resume))
 
 
@@ -306,7 +313,9 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
             record = port(step) if callable(port) else None
         except Exception:
             record = None
-        if found and root_cause_ok(record, failure, " ".join(f["detail"] for f in found)):
+        # N6-HARD2C H5: the failed attempt's exception message counts as error text too.
+        error = " ".join([f["detail"] for f in found or ()] + [f.get("message", "") for f in found or ()])
+        if found and root_cause_ok(record, failure, error):
             return None
         return hold("root_cause", ("missing_or_invalid:" if found else "findings_unreadable:") + failure)
 
@@ -323,6 +332,8 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
             if ok:
                 return accepted()
             # Not applied and undone: a failed attempt, never a second apply.
+    if findings and _fatal(findings):  # N6-HARD2C H5: a persisted non-retriable failure stays fatal
+        return ended(findings)
     if step.state in _REVISABLE:
         # A resumed step already at the cap fails instead of wedging on RUNNING.
         outcome = capped()
@@ -491,6 +502,7 @@ def _gate(step: WorkStep, name: str, ports: Ports, gate: Callable[[], Iterable[o
 
 def _gate_error(gate: str, exc: Exception) -> _Finding:
     found = _finding(gate, "gate_error:" + type(exc).__name__)
+    found["message"] = str(exc)[:500]  # N6-HARD2C H5: a root cause must say more than this
     if not retriable(exc):
         found["retriable"] = "no"  # the detail format stays; only the driver reads this flag
     return found
@@ -505,6 +517,9 @@ def _gate_event(step: WorkStep, name: str, findings: _Findings, ports: Ports) ->
         "gate": name,
         "passed": not findings,
         "findings": [f["detail"] for f in findings],
+        # N6-HARD2C H5: persisted so a resume restores them (parallel to "findings").
+        "retriable": ["no" if f.get("retriable") == "no" else "yes" for f in findings],
+        "messages": [f.get("message", "") for f in findings],
     })
 
 
@@ -517,10 +532,29 @@ def _ledger_findings(step: WorkStep, ports: Ports) -> _Findings | None:
                    and p.get("gate") not in ("root_cause", "retry_cap")]
         if not failing:
             return None
-        gate, details = str(failing[-1]["gate"]), failing[-1].get("findings")
+        last = failing[-1]
+        gate, details = str(last["gate"]), last.get("findings")
         if not isinstance(details, list) or not details or not all(isinstance(d, str) and d for d in details):
             return None
-        return tuple(_finding(gate, d) for d in details)
+        # N6-HARD2C H5: rows before H5 lack both keys (legacy, read as retriable, no message);
+        # a row with either key must carry both, parallel to "findings", or it is unreadable.
+        flags, messages = last.get("retriable"), last.get("messages")
+        if flags is None and messages is None:
+            flags, messages = ["yes"] * len(details), [""] * len(details)
+        if (not isinstance(flags, list) or not isinstance(messages, list)
+                or len(flags) != len(details) or len(messages) != len(details)
+                or not all(f in ("yes", "no") for f in flags)
+                or not all(isinstance(m, str) for m in messages)):
+            return None
+        out: list[_Finding] = []
+        for d, f, m in zip(details, flags, messages):
+            found = _finding(gate, d)
+            if m:
+                found["message"] = m
+            if f == "no":
+                found["retriable"] = "no"
+            out.append(found)
+        return tuple(out)
     except Exception:
         return None
 

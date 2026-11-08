@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import hashlib
 import json
 import re
+import unicodedata
 from collections.abc import Mapping
 
 
@@ -184,8 +185,18 @@ def retriable(exc: BaseException) -> bool:
     return isinstance(exc, _RETRIABLE)
 
 
+# N6-HARD2C H5: common Cyrillic/Greek look-alikes of Latin letters fold to Latin before comparing.
+# ponytail: partial confusables map, use the full Unicode confusables table if a copy slips through.
+_HOMOGLYPHS = str.maketrans("аеорсухіјѕԁһӏοαειкνρτυχ", "aeopcyxijsdhloaeiknptux")
+
+
 def _words(text: str) -> list[str]:
-    return re.findall(r"[^\W_]+", text.lower())  # underscores split words too: gate_error == gate error
+    # N6-HARD2C H5: NFKC (fullwidth, ligatures, math letters) and casefold (ß == ss), then NFKD
+    # with format chars (Cf: zero-width, bidi, soft hyphen) and combining marks (Mn: accents,
+    # variation selectors) dropped, so a disguised copy of the error compares equal.
+    text = unicodedata.normalize("NFKD", unicodedata.normalize("NFKC", str(text)).casefold())
+    text = "".join(c for c in text if unicodedata.category(c) not in ("Cf", "Mn"))
+    return re.findall(r"[^\W_]+", text.translate(_HOMOGLYPHS))  # underscores split words: gate_error == gate error
 
 
 def root_cause_ok(record: object, failure_id: str, error_text: str) -> bool:

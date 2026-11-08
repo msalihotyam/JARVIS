@@ -139,6 +139,106 @@ class RootCauseTest(unittest.TestCase):
             self.assertFalse(retriable(exc))
         self.assertEqual(RETRY_CAP, 2)
 
+    # N6-HARD2C H5 -------------------------------------------------------------------------
+
+    def blocked(self, ports):
+        ports.root_cause = lambda s: None
+        run, steps = run_drive(ports)
+        self.assertEqual((steps["a"].state, steps["a"].attempt), (StepState.BLOCKED_BY_GATE, 1))
+        return steps["a"]
+
+    def resume(self, step, ports):
+        return drive(WorkRun(RUN, RunState.BUILDING, T0, T0), (step,), ports)
+
+    def test_neg_disguised_copy_of_the_error_is_refused(self):
+        fid, err = f"{KEY_A}:2", "gate_error:TimeoutError"
+        for name, why in (
+            ("fullwidth", "ｇａｔｅ＿ｅｒｒｏｒ：ＴｉｍｅｏｕｔＥｒｒｏｒ"),
+            ("zero_width_soft_hyphen", "gate\u200b_error:Time\u00adout\u2060Error"),
+            ("bidi", "\u202egate_error\u202c:\u2066TimeoutError\u2069"),
+            ("bom_variation_selector", "\ufeffgate_error:Timeout\ufe0fError"),
+            ("cyrillic", "gаtе_еrrоr:TimеоutErrоr"),
+            ("greek_upper", "gate_errοr:ΤimeοutErrοr"),
+            ("math_bold", "𝐠𝐚𝐭𝐞_𝐞𝐫𝐫𝐨𝐫:𝐓𝐢𝐦𝐞𝐨𝐮𝐭𝐄𝐫𝐫𝐨𝐫"),
+            ("combining_marks", "ga\u0301te_e\u0308rror:Ti\u0300meoutError"),
+            ("precomposed_accents", "gáte_error:TïmeoutÉrror"),
+            ("case_and_ordering", "TIMEOUTERROR, GATE ERROR"),
+            ("fragment", "timeouterror"),
+        ):
+            with self.subTest(name=name):
+                self.assertFalse(root_cause_ok(f"ROOT CAUSE {fid}: {why}", fid, err))
+        # casefold: German sharp s folds to "ss" in both directions.
+        for why, error in (("straße closed", "STRASSE CLOSED"), ("STRAẞE CLOSED", "strasse closed")):
+            with self.subTest(why=why):
+                self.assertFalse(root_cause_ok(f"ROOT CAUSE {fid}: {why}", fid, error))
+        # OK: a genuine explanation, in any script, still passes.
+        for why in ("proxy dropped idle sockets", "vekil sunucu boştaki soketleri düşürdü",
+                    "keepalive is shorter than the proxy\u200b idle timeout"):
+            with self.subTest(ok=why):
+                self.assertTrue(root_cause_ok(f"ROOT CAUSE {fid}: {why}", fid, err))
+
+    def test_neg_record_copying_the_exception_message_is_refused(self):
+        msg = "proxy dropped idle sockets"
+        ports = FakePorts({"a": [TimeoutError(msg), result()]})
+        ports.root_cause = lambda s: f"ROOT CAUSE {s.key}:1: Proxy\u200b dropped ＩＤＬＥ sockets."
+        run, steps = run_drive(ports)
+        step = steps["a"]
+        self.assertEqual((step.state, step.attempt, len(ports.workers["a"].tasks)), (StepState.BLOCKED_BY_GATE, 1, 1))
+        self.assertIn([f"missing_or_invalid:{KEY_A}:1"], self.hold_detail(ports, "root_cause"))
+        # The message round-trips through the ledger: a resume still compares it.
+        run, (step,) = self.resume(step, ports)
+        self.assertEqual((step.state, step.attempt, len(ports.workers["a"].tasks)), (StepState.BLOCKED_BY_GATE, 1, 1))
+        # OK: a record that explains the failure lets the retry run.
+        ports.root_cause = lambda s: f"ROOT CAUSE {s.key}:1: keepalive is shorter than the proxy idle timeout"
+        run, (step,) = self.resume(step, ports)
+        self.assertEqual((step.state, step.attempt, len(ports.workers["a"].tasks)), (StepState.ACCEPTED, 2, 2))
+
+    def test_neg_resumed_non_retriable_failure_ends_the_slice(self):
+        ports = FakePorts({"a": [TimeoutError("slow"), result()]})
+        step = self.blocked(ports)
+        ports.root_cause = lambda s: f"ROOT CAUSE {s.key}:1: proxy dropped idle sockets"
+        ports.gate_findings = mock.Mock(return_value=[{
+            "gate": "worker", "passed": False, "findings": ["gate_error:StageError"],
+            "retriable": ["no"], "messages": ["stage gone"]}])
+        run, (step,) = self.resume(step, ports)
+        self.assertIs(step.state, StepState.CANCELLED)
+        self.assertEqual(len(ports.workers["a"].tasks), 1)
+        self.assertTrue(self.notified(ports, f"{KEY_A}:non_retriable"))
+
+    def test_neg_non_retriable_flag_round_trips_through_the_ledger(self):
+        ports = FakePorts({"a": [StageError("stage gone")]})
+        run_drive(ports)
+        rows = [e[3] for e in ports.log if e[0] == "event" and e[3].get("gate") == "non_retriable"]
+        self.assertEqual([r["retriable"] for r in rows], [["no"]])
+        self.assertEqual([r["messages"] for r in rows], [["stage gone"]])
+
+    def test_neg_malformed_retriable_or_messages_hold_as_unreadable(self):
+        ports = FakePorts({"a": [TimeoutError("slow"), result()]})
+        step = self.blocked(ports)
+        ports.root_cause = lambda s: f"ROOT CAUSE {s.key}:1: proxy dropped idle sockets"
+        base = {"gate": "worker", "passed": False, "findings": ["gate_error:TimeoutError"]}
+        for extra in ({"retriable": ["yes"]}, {"messages": [""]}, {"retriable": ["no"]},
+                      {"retriable": ["yes", "no"], "messages": [""]}, {"retriable": [], "messages": []},
+                      {"retriable": ["maybe"], "messages": [""]}, {"retriable": ["No"], "messages": [""]},
+                      {"retriable": [None], "messages": [""]}, {"retriable": ["yes"], "messages": [3]},
+                      {"retriable": "yes", "messages": [""]}, {"retriable": ["yes"], "messages": None},
+                      {"retriable": ["yes"], "messages": "x"}):
+            with self.subTest(extra=extra):
+                ports.gate_findings = mock.Mock(return_value=[{**base, **extra}])
+                run, (step,) = self.resume(step, ports)
+                self.assertEqual((run.state, step.state, step.attempt, len(ports.workers["a"].tasks)),
+                                 (RunState.PAUSED, StepState.BLOCKED_BY_GATE, 1, 1))
+        self.assertIn([f"findings_unreadable:{KEY_A}:1"], self.hold_detail(ports, "root_cause"))
+
+    def test_ok_legacy_row_without_the_new_keys_still_retries(self):
+        ports = FakePorts({"a": [TimeoutError("slow"), result()]})
+        step = self.blocked(ports)
+        ports.root_cause = lambda s: f"ROOT CAUSE {s.key}:1: proxy dropped idle sockets"
+        ports.gate_findings = mock.Mock(return_value=[
+            {"gate": "worker", "passed": False, "findings": ["gate_error:TimeoutError"]}])
+        run, (step,) = self.resume(step, ports)
+        self.assertEqual((step.state, step.attempt, len(ports.workers["a"].tasks)), (StepState.ACCEPTED, 2, 2))
+
 
 if __name__ == "__main__":
     unittest.main()

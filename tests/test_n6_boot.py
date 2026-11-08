@@ -9,7 +9,7 @@ from unittest import mock
 
 from jarvis import n6_lease
 from jarvis.memory import SQLiteMemoryStore
-from jarvis.n6_boot import Action, Facts, act, apply_once, recorder, scan
+from jarvis.n6_boot import Action, Facts, Item, Report, act, apply_once, recorder, scan
 from jarvis.notify import NotificationCore
 from jarvis.work_controls import write_pause
 from jarvis.work_evidence import EvidenceReceipt
@@ -273,6 +273,86 @@ class N6BootTest(unittest.TestCase):
         report = scan(self.lease_path, self.pause, "me", NOW,
                       Facts(outbox=(("r", 1), ("r", 2)), events=frozenset({("r", 1)})))
         self.assertEqual([i.action for i in report.items], [Action.RESUME, Action.ATTENTION])
+
+    def test_neg_outbox_resume_after_the_lease_changed_is_attention(self):
+        # N6-HARD2C H4: an outbox RESUME is lease-gated too (changed, appeared, unreadable).
+        facts = Facts(outbox=(("r", 1),), events=frozenset({("r", 1)}))
+
+        def re_epoched():
+            lease = self.own(ttl=10.0, now=0.0)
+            report = scan(self.lease_path, self.pause, "me", 5.0, facts)
+            self.assertTrue(n6_lease.release(self.lease_path, lease, 5.0))
+            n6_lease.acquire(self.lease_path, "other", "s1", 60.0, NOW)
+            return report
+
+        def appeared():
+            report = scan(self.lease_path, self.pause, "me", NOW, facts)
+            self.own(owner="other")
+            return report
+
+        def held_all():
+            report = scan(self.lease_path, self.pause, "me", NOW, facts)
+            self.lease_path.write_bytes(b"{not json")
+            return report
+        for case in (re_epoched, appeared, held_all):
+            with self.subTest(case.__name__):
+                self.lease_path.unlink(missing_ok=True)
+                report, log = case(), []
+                self.assertIn(Action.RESUME, [i.action for i in report.items])
+                self.assertTrue(act(report, self.lease_path, NOW, lambda i: log.append(("record", i)),
+                                    lambda i: log.append(("resume", i))))
+                self.assertNotIn("resume", [e[0] for e in log])
+                self.assertIn(("record", Action.ATTENTION, "lease changed since scan"),
+                              [(e[0], e[1].action, e[1].reason) for e in log])
+
+    def test_outbox_resume_under_an_unchanged_lease_or_none_is_resumed(self):
+        facts = Facts(outbox=(("r", 1),), events=frozenset({("r", 1)}))
+        for owned in (False, True):
+            with self.subTest(owned=owned):
+                self.lease_path.unlink(missing_ok=True)
+                if owned:
+                    self.own()
+                _, _, log = self.run_boot(facts if not owned else self.facts(
+                    outbox=facts.outbox, events=facts.events))
+                self.assertEqual([e[0] for e in log], ["resume"] * (2 if owned else 1))
+
+    def test_neg_lease_expiring_between_items_is_judged_at_each_items_clock(self):
+        # N6-HARD2C H4: act reads the clock per item, not once for the whole report.
+        lease = self.own(ttl=60.0)
+        items = (Item("slice", "ghost", Action.ATTENTION, "unknown leftover"),
+                 Item("slice", "s1", Action.RESUME, "consistent", SHA))
+        report = Report("me", "", lease, items, self.lease_path, NOW)
+        ticks, log = iter((NOW, NOW + 61.0)), []
+        self.assertTrue(act(report, self.lease_path, lambda: next(ticks),
+                            lambda i: log.append(("record", i)), lambda i: log.append(("resume", i))))
+        self.assertEqual([(e[0], e[1].ref, e[1].action) for e in log],
+                         [("record", "ghost", Action.ATTENTION), ("record", "s1", Action.ATTENTION)])
+
+    def test_neg_hand_back_release_uses_the_items_own_clock(self):
+        lease = self.own(ttl=60.0)
+        items = (Item("slice", "ghost", Action.ATTENTION, "unknown leftover"),
+                 Item("slice", "s1", Action.HAND_BACK, "missing or invalid worktree"))
+        ticks = iter((NOW, NOW + 61.0))
+        before = self.lease_path.read_bytes()
+        self.assertTrue(act(Report("me", "", lease, items, self.lease_path, NOW), self.lease_path,
+                            lambda: next(ticks), lambda i: None, lambda i: self.fail("resume")))
+        self.assertEqual(self.lease_path.read_bytes(), before)  # expired at its own tick: no release
+
+    def test_neg_fresh_receipt_is_not_written_once_the_lease_went_stale(self):
+        # N6-HARD2C H4: the receipt after a fresh apply is fenced like the recovery receipt.
+        lease, applies, receipts = self.own(), [], []
+
+        def apply():
+            applies.append(1)
+            self.assertTrue(n6_lease.release(self.lease_path, lease, NOW))
+            n6_lease.acquire(self.lease_path, "other", "s1", 60.0, NOW)
+        out = apply_once(self.lease_path, lease, SHA, NOW, frozenset(), apply, lambda: receipts.append(1))
+        self.assertEqual((out, applies, receipts), ("attention", [1], []))
+
+    def test_fresh_receipt_is_written_under_a_live_lease(self):
+        lease, receipts = self.own(), []
+        out = apply_once(self.lease_path, lease, SHA, NOW, frozenset(), lambda: None, lambda: receipts.append(1))
+        self.assertEqual((out, receipts), ("applied", [1]))
 
     def test_neg_tests_never_open_live_db(self):
         self.store()

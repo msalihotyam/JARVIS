@@ -246,7 +246,8 @@ class DriverMatrixTest(unittest.TestCase):
         self.assertEqual((steps["a"].state, steps["a"].attempt), (StepState.ACCEPTED, 2))
         self.assertEqual(ports.count("undo"), 1)
         self.assertLess(ports.log.index(("undo",)), ports.log.index(("start",), ports.log.index(("undo",))))
-        self.assertEqual(ports.workers["a"].tasks[1]["findings"], ({"gate": "apply", "detail": "gate_error:TimeoutError"},))
+        self.assertEqual(ports.workers["a"].tasks[1]["findings"],
+                         ({"gate": "apply", "detail": "gate_error:TimeoutError", "message": "disk"},))
         ports = FakePorts({"a": [result()]}, apply=[RuntimeError("disk")], undo=[OSError("undo")])
         with self.assertRaises(OSError):
             run_drive(ports)
@@ -375,7 +376,8 @@ class DriverMatrixTest(unittest.TestCase):
         self.assertEqual(ports.count("scope_check"), 1)
         self.assertEqual(ports.count("run_checks"), 0)
         self.assertEqual([f["detail"] for f in ports.workers["a"].tasks[1]["findings"]], ["link:x"])
-        self.assertIn({"gate": "scope", "passed": False, "findings": ["out_of_scope:y"]},
+        self.assertIn({"gate": "scope", "passed": False, "findings": ["out_of_scope:y"],
+                       "retriable": ["yes"], "messages": [""]},
                       [e[3] for e in ports.log if e[0] == "event"])
 
     def test_check_timeout_is_a_revision(self):
@@ -661,9 +663,19 @@ class BootScanTest(unittest.TestCase):
         from unittest import mock
         seen = []
         later = T0.timestamp() + 1000
-        with mock.patch.object(n6_boot, "act", lambda r, p, now, rec, res: seen.append(now) or True):
+        with mock.patch.object(n6_boot, "act", lambda r, p, clock, rec, res: seen.append(clock()) or True):
             self.boot(later, later)
         self.assertEqual(seen, [later])
+
+    def test_neg_clock_that_turns_bogus_mid_act_resumes_nothing(self):
+        # N6-HARD2C H4: the per-item clock is re-validated; a bad later reading reads as expired.
+        from unittest import mock
+        for bogus in (T0.replace(tzinfo=None), T0.timestamp(), None):
+            with self.subTest(bogus=bogus):
+                readings = iter((T0, bogus))
+                with mock.patch.object(FakePorts, "clock", lambda self: next(readings, T0), create=True):
+                    log, _ = self.boot(T0.timestamp(), T0.timestamp())
+                self.assertEqual(log[0], ("boot_record", "s1", n6_boot.Action.ATTENTION))
 
     def test_neg_clock_that_is_not_aware_fails_closed(self):
         for bogus in (T0.replace(tzinfo=None), T0.timestamp(), None):

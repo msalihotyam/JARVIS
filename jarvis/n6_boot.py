@@ -7,7 +7,7 @@ live git. Each leftover gets exactly one action:
 
 - RESUME: only when every needed fact is present and consistent under this owner's live lease,
   and the receipt is bound to this slice's own plan, check and commit (N6-12FIX2). ``act``
-  re-reads the lease before each slice RESUME; the recovery receipt is written under the lock.
+  re-reads the clock and the lease before each RESUME; every receipt is written under the lock.
 - HAND_BACK: the slice goes back to the conveyor. Boot records why, then releases the lease
   if it is ours and live. Recording comes first, so a crash between the two keeps the lease held.
 - ATTENTION: the leftover is unknown or not ours. It is left untouched and only recorded.
@@ -140,23 +140,34 @@ def scan(lease_path: Path | str, pause_path: Path | str, owner: str, now: float,
     return Report(owner, hold, lease, tuple(items), Path(lease_path), now)
 
 
-def act(report: Report, lease_path: Path | str, now: float,
+def act(report: Report, lease_path: Path | str, clock: Callable[[], float] | float,
         record: Callable[[Item], object], resume: Callable[[Item], object]) -> bool:
     """Carry out each item once. A held report does nothing and returns False.
 
-    A slice RESUME re-reads the lease file at ``now`` first: if the scanned lease is no longer
-    the file's live lease of that slice (released, expired, re-epoched, HELD_ALL), the item
-    becomes ATTENTION and is only recorded, never resumed from the scan snapshot."""
+    ``clock`` is read again for every item (N6-HARD2C H4), so a lease that expires while
+    earlier items run is judged at the time of the item that needs it; a plain float is a
+    fixed clock. Every RESUME re-reads the lease file first: a slice RESUME needs the scanned
+    lease to still be the file's live lease of that slice; an outbox RESUME needs the file's
+    lease to still equal the scanned one (or both absent). Otherwise (released, expired,
+    re-epoched, HELD_ALL) the item becomes ATTENTION and is only recorded, never resumed from
+    the scan snapshot."""
     if report.hold:
         return False
     lease = report.lease
     for item in report.items:
+        now = clock() if callable(clock) else clock
         if item.action is Action.RESUME:
             state = n6_lease._read(Path(lease_path))  # pyright: ignore[reportPrivateUsage]
-            same = (lease is not None and isinstance(state, dict)  # exact: a release/renew since scan
-                    and n6_lease._lease(state) == lease)  # pyright: ignore[reportPrivateUsage]
-            if item.kind != "slice" or (lease is not None and lease.slice_id == item.ref and same
-                                        and n6_lease.check(lease_path, lease, now)):
+            if isinstance(state, dict):  # exact: a release/renew since scan
+                same = n6_lease._lease(state) == lease  # pyright: ignore[reportPrivateUsage]
+            else:
+                same = state is None and lease is None  # HELD_ALL never matches
+            if item.kind == "slice":
+                ok = (same and lease is not None and lease.slice_id == item.ref
+                      and n6_lease.check(lease_path, lease, now))
+            else:
+                ok = item.kind == "outbox" and same
+            if ok:
                 _ = resume(item)
             else:
                 _ = record(Item(item.kind, item.ref, Action.ATTENTION, "lease changed since scan"))
@@ -177,7 +188,8 @@ def apply_once(lease_path: Path | str, lease: Lease, sha: str, now: float,
     crash after the commit replays as a receipt-only step (git shows ``sha`` applied) and a
     crash before it becomes attention. Neither path ever applies twice. Fenced propagates.
     The receipt-only path writes only under a live lease of this slice and epoch, checked and
-    held under the lease lock for the whole write (n6_lease.fenced)."""
+    held under the lease lock for the whole write (n6_lease.fenced); so does the fresh
+    receipt after an apply (N6-HARD2C H4), "attention" when the lease went stale meanwhile."""
     if sha in applied:
         if not n6_lease.fenced(lease_path, lease, now, receipt):
             return "attention"  # stale, expired, re-epoched, HELD_ALL or locked: no recovery write
@@ -185,7 +197,8 @@ def apply_once(lease_path: Path | str, lease: Lease, sha: str, now: float,
     if not n6_lease.apply_event(lease_path, lease, f"apply:{lease.slice_id}:{lease.epoch}:{sha}", now):
         return "attention"  # intent recorded earlier but git shows no apply: never guess
     _ = apply()
-    _ = receipt()
+    if not n6_lease.fenced(lease_path, lease, now, receipt):  # N6-HARD2C H4: fresh receipt fenced too
+        return "attention"  # applied, but the lease went stale: no receipt under someone else's epoch
     return "applied"
 
 
