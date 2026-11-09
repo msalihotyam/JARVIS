@@ -9956,6 +9956,122 @@ class PhoneCmd(Base):
         self.assertEqual([p for p in self.pushes if "çalışıyor" in p], [f"Konveyör yeniden başlatıldı ve çalışıyor · PID {self.c.pid}"])
         self.assertNotIn("restart", self.phone())
 
+    # PHONECMDFIX6: every phone reply logs {cmd, result}; the confirm logs confirmed / skipped {reason}.
+    def sends(self):
+        return [(r["cmd"], r["result"]) for r in self.events("phone_send")]
+
+    def test_live_restart_sequence_delivers_both_messages_in_order_and_logs_them(self):
+        self.c.spawn = lambda argv: 0
+        self.msgs(("r1", "yeniden başlat"))
+        self.tick()
+        self.c.restart_go()  # old pid: the starting message, then the spawn
+        self.t += 4  # the new pid takes the lock ~4 s later
+        c2 = Conveyor(self.root, self.fake, now=lambda: self.t,
+                      send=lambda text, **kw: self.pushes.append(text) or "sent",
+                      post=self.fake_post, key=lambda: self.key,
+                      cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
+                      mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs,
+                      net=lambda: self.net, popen=self.fake_popen, fetch=self.fetch, spawn=lambda argv: 0)
+        c2.pid = self.c.pid + 1
+        c2.heartbeat()  # beat 1: acquire_lock
+        c2.heartbeat()  # beat 2: the first _loop beat confirms
+        self.assertEqual(self.pushes, ["Yeniden başlatılıyor…", f"Konveyör yeniden başlatıldı ve çalışıyor · PID {c2.pid}"])
+        self.assertEqual(self.sends(), [("yeniden", "sent"), ("restart_confirm", "sent")])
+        self.assertEqual([r["result"] for r in self.events("phone_restart_confirmed")], ["sent"])
+        self.assertNotIn("restart", self.phone())
+
+    def test_neg_no_topic_is_logged_for_every_phone_reply(self):
+        self.c.send = lambda text, **kw: "no-topic"
+        self.c.spawn = lambda argv: 0
+        self.msgs(("d1", "durum"), ("n1", "not süt al"), ("r1", "yeniden başlat"), ("s1", "durdur"))
+        self.tick()
+        self.c.restart_go()
+        self.assertEqual(self.sends(), [("durum", "no-topic"), ("not", "no-topic"),
+                                        ("durdur", "no-topic"), ("yeniden", "no-topic")])
+
+    def test_neg_failed_confirm_send_keeps_marker_and_logs_each_result(self):
+        def boom(text, **kw):
+            raise ConnectionResetError()
+        self.marker(self.c.pid + 1, self.t)
+        self.c.beats = 1
+        for send in (lambda text, **kw: "no-topic", lambda text, **kw: "error HTTPError", boom):
+            self.c.send = send
+            self.c.heartbeat()
+        self.assertFalse(self.c.restart_done)
+        self.assertIn("restart", self.phone())
+        self.assertEqual(self.sends(), [("restart_confirm", "no-topic"), ("restart_confirm", "error HTTPError"),
+                                        ("restart_confirm", "error ConnectionResetError")])
+        self.assertEqual(self.events("phone_restart_confirmed") + self.events("phone_restart_confirm_skipped"), [])
+
+    def test_neg_hung_starting_send_logs_timeout_and_still_spawns(self):
+        import threading
+        gate, spawned = threading.Event(), []
+        self.c.send = lambda text, **kw: gate.wait(5) and "sent"
+        self.c.spawn = lambda argv: spawned.append(1) or 0
+        self.c.send_wait = 0.05
+        self.msgs(("r1", "yeniden başlat"))
+        self.tick()
+        try:
+            self.c.restart_go()
+        finally:
+            gate.set()
+        self.assertEqual(spawned, [1])
+        self.assertEqual(self.sends(), [("yeniden", "timeout")])
+        self.assertEqual([r["error"] for r in self.events("phone_restart_send_failed")], ["timeout"])
+
+    def test_confirm_skip_reasons_are_logged(self):
+        self.c.beats = 1
+        self.c.heartbeat()  # no phone.json
+        self.marker(self.c.pid, self.t)
+        self.c.restart_done = False
+        self.c.heartbeat()  # the old pid's own marker
+        self.assertIn("restart", self.phone())
+        self.marker(self.c.pid + 1, self.t - 601)
+        self.c.restart_done = False
+        self.c.heartbeat()  # stale: dropped, nothing sent
+        self.assertNotIn("restart", self.phone())
+        self.assertEqual([r["reason"] for r in self.events("phone_restart_confirm_skipped")],
+                         ["no-marker", "own-pid", "stale"])
+        self.assertEqual(self.sends(), [])
+
+    def test_neg_unreadable_phone_json_retries_then_gives_up_once(self):
+        t0 = self.t
+        for body in ("{bad", "[]", ""):
+            with self.subTest(body=body):
+                (self.base / "phone.json").write_text(body, encoding="utf-8")
+                self.t, self.c.beats, self.c.restart_done = t0, 1, False
+                n0 = len(self.events("phone_restart_confirm_skipped"))
+                self.c.heartbeat()
+                self.c.heartbeat()
+                self.assertFalse(self.c.restart_done)  # still in the window: retry, no event yet
+                self.assertEqual(len(self.events("phone_restart_confirm_skipped")), n0)
+                self.t = self.c.started + 601
+                self.c.heartbeat()
+                self.assertTrue(self.c.restart_done)
+                self.assertEqual([r["reason"] for r in self.events("phone_restart_confirm_skipped")[n0:]], ["unreadable"])
+
+    def test_neg_unsaved_capped_and_failed_spawn_replies_are_logged(self):
+        def boom(text, **kw):
+            raise ConnectionResetError()
+        orig = self.c.write_atomic
+        self.c.write_atomic = lambda f, d: False if '"restart": {' in d else orig(f, d)
+        self.msgs(("w1", "yeniden başlat"))
+        self.tick()
+        self.assertIn("kaydedilemedi", self.pushes[-1])
+        self.c.write_atomic = orig
+        spawned = []
+        self.restart_once(spawned, "r1", "yeniden başlat")
+        self.restart_once(spawned, "r2", "yeniden başlat")
+        self.assertEqual(self.pushes[-1], "Son 10 dakikada zaten yeniden başlatıldı")
+        self.assertEqual(self.sends(), [("yeniden", "sent")] * 3)
+        self.t += 700
+        self.c.send, self.c.spawn = boom, (lambda argv: 3)
+        self.msgs(("r3", "yeniden başlat"))
+        self.tick()
+        self.c.restart_go()  # a raising send on the failure path no longer escapes
+        self.assertEqual(self.sends()[3:], [("yeniden", "error ConnectionResetError")] * 2)
+        self.assertEqual(self.events("phone_restart_failed")[-1]["error"], "rc=3")
+
     def test_restart_script_verifies_and_reports(self):
         p = Path(conveyor.__file__).with_name("konveyor_restart.ps1")
         s = p.read_text(encoding="utf-8")

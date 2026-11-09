@@ -1660,12 +1660,12 @@ class Conveyor:
             return
         self.event("phone_cmd", cmd=word)
         if word == "durum":
-            self.send(self.durum_text(lanes, items), title="Durum")
+            self.phone_send(word, self.durum_text(lanes, items), "Durum")
         elif word == "yeniden":
             self.phone_restart()
         elif word == "durdur":
             (self.base / "PAUSE").write_text("")
-            self.send("Konveyör durduruldu. Devam için panelden PAUSE kaldır.", title="Durdur")
+            self.phone_send(word, "Konveyör durduruldu. Devam için panelden PAUSE kaldır.", "Durdur")
         else:
             note = re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", parts[1] if len(parts) > 1 else "")
             note = redacted(note, "", n=4000)  # PHONECMDFIX2 F2: a topic or key never lands in the file
@@ -1675,7 +1675,16 @@ class Conveyor:
             orch.mkdir(parents=True, exist_ok=True)
             with open(orch / "INBOX.jsonl", "a", encoding="utf-8") as fh:  # one write: one whole line
                 fh.write(json.dumps({"id": m["id"], "ts": iso(self.now()), "text": note}, ensure_ascii=False) + "\n")
-            self.send(f"Not alındı ({self.inbox_unread()} okunmamış)", title="Not")
+            self.phone_send(word, f"Not alındı ({self.inbox_unread()} okunmamış)", "Not")
+
+    def phone_send(self, cmd, text, title):
+        """PHONECMDFIX6: every phone reply logs phone_send {cmd, result}; a raising send never escapes."""
+        try:
+            res = self.send(text, title=title)
+        except Exception as e:
+            res = "error " + type(e).__name__
+        self.event("phone_send", cmd=cmd, result=res)
+        return res
 
     def phone_restart(self):
         """"yeniden": at most one restart per 10 min. The marker goes to phone.json first; the spawn
@@ -1685,17 +1694,20 @@ class Conveyor:
         st = st if isinstance(st, dict) else {}
         last = st.get("restart_ts")
         if self.restart_pending or (isinstance(last, (int, float)) and abs(self.now() - last) < 600):
-            self.send("Son 10 dakikada zaten yeniden başlatıldı", title="Yeniden baslat")
+            self.phone_send("yeniden", "Son 10 dakikada zaten yeniden başlatıldı", "Yeniden baslat")
             return
         st.update(restart={"ts": self.now(), "pid": self.pid}, restart_ts=self.now())
         if not self.write_atomic(f, json.dumps(st)):
-            self.send("Yeniden başlatma kaydedilemedi; konveyör çalışmaya devam ediyor.", title="Yeniden baslat")
+            self.phone_send("yeniden", "Yeniden başlatma kaydedilemedi; konveyör çalışmaya devam ediyor.", "Yeniden baslat")
             return
         self.restart_pending = True  # restart_go sends "Yeniden başlatılıyor…" itself, just before the spawn
 
+    send_wait = 10  # s the starting message may take before the spawn goes on without it
+
     def send_before_restart(self):
-        """PHONECMDFIX5: the starting message is delivered (result awaited, <= 10 s) before the task
-        spawns; a failed or hung send is logged once and the restart goes on."""
+        """PHONECMDFIX5: the starting message is delivered (result awaited, <= send_wait s) before the
+        task spawns; PHONECMDFIX6: its result is logged as phone_send, a failed or hung send also once
+        as phone_restart_send_failed, and the restart goes on."""
         box = []
 
         def run():
@@ -1705,8 +1717,9 @@ class Conveyor:
                 box.append("error " + type(e).__name__)
         t = threading.Thread(target=run, daemon=True)
         t.start()
-        t.join(10)
+        t.join(self.send_wait)
         res = box[0] if box else "timeout"
+        self.event("phone_send", cmd="yeniden", result=res)
         if isinstance(res, str) and (res.startswith("error") or res == "timeout"):
             self.event("phone_restart_send_failed", error=res)
 
@@ -1734,23 +1747,38 @@ class Conveyor:
         st.pop("restart_ts", None)
         self.write_atomic(f, json.dumps(st))
         self.event("phone_restart_failed", error=error)
-        self.send(text, title="Yeniden baslat")
+        self.phone_send("yeniden", text, "Yeniden baslat")
 
     def restart_confirm(self):
         """From this pid's 2nd heartbeat on: a marker from another pid means the phone restart worked.
         Returns True when done (no marker, own marker, stale marker dropped, or push sent); a failed
-        push keeps the marker for the next heartbeat until it is 600 s old (PHONECMDFIX2 F3, CLREV129)."""
+        push keeps the marker for the next heartbeat until it is 600 s old (PHONECMDFIX2 F3, CLREV129).
+        PHONECMDFIX6: an unreadable phone.json is retried for 600 s after start, and every outcome is
+        logged: phone_send + phone_restart_confirmed {result}, or phone_restart_confirm_skipped {reason}."""
         f = self.base / "phone.json"
-        st = self.load_json(f, {})
-        mark = st.get("restart") if isinstance(st, dict) else None
-        if not isinstance(mark, dict) or mark.get("pid") == self.pid:
-            return True  # the old pid never pushes success
-        ts = mark.get("ts")
-        if isinstance(ts, (int, float)) and not isinstance(ts, bool) and 0 <= self.now() - ts <= 600:
-            if self.send(f"Konveyör yeniden başlatıldı ve çalışıyor · PID {self.pid}", title="Yeniden baslat") != "sent":
+        st = self.load_json(f, None)
+        if f.exists() and not isinstance(st, dict):
+            if self.now() - self.started < 600:
                 return False
+            self.event("phone_restart_confirm_skipped", reason="unreadable")
+            return True
+        mark = st.get("restart") if isinstance(st, dict) else None
+        if not isinstance(mark, dict) or mark.get("pid") == self.pid:  # the old pid never pushes success
+            self.event("phone_restart_confirm_skipped", reason="no-marker" if not isinstance(mark, dict) else "own-pid")
+            return True
+        ts = mark.get("ts")
+        if not (isinstance(ts, (int, float)) and not isinstance(ts, bool) and 0 <= self.now() - ts <= 600):
+            st.pop("restart")
+            self.write_atomic(f, json.dumps(st))
+            self.event("phone_restart_confirm_skipped", reason="stale")
+            return True
+        res = self.phone_send("restart_confirm", f"Konveyör yeniden başlatıldı ve çalışıyor · PID {self.pid}",
+                              "Yeniden baslat")
+        if res != "sent":
+            return False
         st.pop("restart")
         self.write_atomic(f, json.dumps(st))
+        self.event("phone_restart_confirmed", result=res)
         return True
 
     def inbox_unread(self):
