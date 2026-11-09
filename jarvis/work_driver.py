@@ -471,6 +471,8 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
             findings, ok = _accept(step, stage, ports)
             if ok:
                 return accepted()
+            if findings and findings[0].get("n6_hold") == "yes":
+                return hold("refcheck", findings[0]["detail"], n6_gate=True)
             if _fatal(findings):
                 return ended(findings)
         outcome = capped()
@@ -529,28 +531,29 @@ def _accept(step: WorkStep, stage: Stage, ports: Ports) -> tuple[_Findings, bool
             ports.append_event(EventKind.PROGRESS, step.key, {"gate": "review_minor", "findings": minor})
         return blocking
 
-    def refcheck() -> list[str]:
-        # N6-WIRE1: an INT result is accepted only through n6_refcheck (read_evidence then
-        # accept). Any refusal or error is a finding, never a raise (fail closed, retriable).
-        n6 = getattr(ports, "n6", None)
-        try:
-            spec = n6.int_check(step) if n6 is not None and n6.int_check is not None else None
-            if spec is None:
-                return []
-            git, ref, read_report, run_id = spec
-            n6_refcheck.accept(git, n6_refcheck.read_evidence(git, ref, read_report, run_id), run_id)
-            return []
-        except Exception as exc:
-            return [f"refcheck:{type(exc).__name__}:{exc}"[:300]]
-
     gates: tuple[tuple[str, Callable[[], list[str]]], ...] = (
         ("checks", checks), ("regression", regression), ("review", review))
-    if getattr(ports, "n6", None) is not None:  # shadow only: no gate event without N6
-        gates += (("refcheck", refcheck),)
     for name, gate in gates:
         findings = _gate(step, name, ports, gate)
         if findings:
             return findings, False
+    n6 = getattr(ports, "n6", None)
+    if n6 is not None:  # shadow only: no gate event without N6
+        # N6-WIRE1: an INT result is accepted only through n6_refcheck (read_evidence then
+        # accept). N6-WIRE1FIX2: any refusal or error is an N6 hold the driver turns into
+        # wait/n6.refcheck/none; a worker cannot fix an unverified INT push (no revision).
+        try:
+            spec = n6.int_check(step) if n6.int_check is not None else None
+            if spec is not None:
+                git, ref, read_report, run_id = spec
+                n6_refcheck.accept(git, n6_refcheck.read_evidence(git, ref, read_report, run_id), run_id)
+        except Exception as exc:
+            try:
+                msg = str(exc)
+            except Exception:  # an unprintable error still holds
+                msg = "?"
+            return ({"gate": "refcheck", "detail": f"{type(exc).__name__}:{msg}"[:300], "n6_hold": "yes"},), False
+        _gate_event(step, "refcheck", (), ports)
     verdict = verdicts.pop()
     name = "evidence"
     try:

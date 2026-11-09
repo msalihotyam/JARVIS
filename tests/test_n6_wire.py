@@ -134,6 +134,55 @@ class ShadowRunTest(unittest.TestCase):
         self.assertEqual(self.gate_decision(ports, "outage"),
                          {"action": "wait", "rule_id": "n6.outage", "constraint": "none"})
 
+    # N6-WIRE1FIX2 NEG (F1): every refcheck refusal or raise is an N6 hold, never a revision.
+    def test_neg_refcheck_refusal_or_error_holds_without_revision(self):
+        def boom(*a):
+            raise RuntimeError("boom")
+
+        class MovingGit(FakeGit):  # the ref moves between read_evidence and accept
+            n = 0
+
+            def rev_parse(self, rev):
+                self.n += 1
+                return ("d" if self.n <= 2 else "f") * 40
+
+        class Unprintable(Exception):
+            def __str__(self):
+                raise RuntimeError("str")
+
+        def unprintable(*a):
+            raise Unprintable()
+
+        good = "RUN_ID: r1\nPICKS:\n  N6-77 " + "a" * 40 + " -> " + "b" * 40 + "\n"
+        cases = {
+            "unprintable_error": unprintable,
+            "refused_bad_picks": lambda s: (FakeGit(), "ci/int-1", lambda: "RUN_ID: r1\nPICKS: N6-77 abc\n", "r1"),
+            "int_check_raises": boom,
+            "int_check_raises_permission": lambda s: (_ for _ in ()).throw(PermissionError("denied")),
+            "read_report_raises": lambda s: (FakeGit(), "ci/int-1", boom, "r1"),
+            "read_evidence_bad_ref": lambda s: (FakeGit(), 7, lambda: good, "r1"),
+            "git_raises": lambda s: (type("G", (), {"rev_parse": boom, "patch_id": boom})(), "ci/int-1",
+                                     lambda: good, "r1"),
+            "accept_ref_moved": lambda s: (MovingGit(), "ci/int-1", lambda: good, "r1"),
+            "malformed_spec": lambda s: ("not", "a", "spec"),
+            "not_a_tuple": lambda s: 42,
+        }
+        for name, check in cases.items():
+            with self.subTest(name):
+                ports, step = self.drive(self.n6(int_check=check), [result(), result(), result()])
+                self.assertEqual(ports.count("start"), 1)  # no worker revision
+                self.assertEqual((step.revisions, step.attempt), (0, 1))
+                self.assertIs(step.state, StepState.ACCEPTING)
+                self.assertEqual(ports.count("apply"), 0)
+                self.assertEqual(self.gate_decision(ports, "refcheck"),
+                                 {"action": "wait", "rule_id": "n6.refcheck", "constraint": "none"})
+
+    def test_no_int_check_still_accepts(self):
+        for check in (lambda s: None, None):
+            ports, step = self.drive(self.n6(int_check=check))
+            self.assertIs(step.state, StepState.ACCEPTED)
+            self.assertIn("refcheck", gates(ports))
+
     def test_neg_deps_error_holds_everything(self):
         (self.dir / "deps.json").write_text("{not json", "utf-8")
         got = n6_next(self.dir, lambda sha: None)
