@@ -1993,6 +1993,59 @@ class TestPaceGovernor(TestUsageGuard):
         self.assertEqual(self.lanes_for_8(80), 8)  # clamped to MAX_LANES_CAP; no max_lanes set
         self.assertIsNone(self.status()["pace"]["error"])
 
+    def test_min_lanes_zero_waits_for_the_line_without_a_hold(self):  # PACE0
+        for pct in (52.1, 70, 96.9):
+            self.fresh()
+            self.paced_min_max(0, 3)
+            self.assertEqual(self.lanes_for_8(pct), 0, pct)
+            st = self.status()
+            self.assertIsNone(st["pace"]["error"])
+            self.assertEqual((st["pace"]["max_lanes"], st["pace"]["band"]),
+                             (0, "paced: ahead of line -> 0 (waiting for the line)"))
+            self.assertFalse(st["usage_hold"])  # unlike PAUSE / the 97 % hold
+        for pct in (0, 50, 52):  # on/under the line: max lanes as before
+            self.fresh()
+            self.paced_min_max(0, 3)
+            self.assertEqual(self.lanes_for_8(pct), 3, pct)
+            self.assertEqual(self.status()["pace"]["band"], "paced: on/under line -> max 3")
+
+    def test_min_lanes_zero_unknown_usage_and_hold_unchanged(self):  # PACE0
+        self.paced_min_max(0, 6)  # no reading: today's behaviour (at most 3)
+        for n in "ABCDEFGH":
+            self.drop(f"{n}.md", HDR.format(n))
+        self.c.pass_once()
+        self.assertEqual(len(self.fake.bg_calls()), 3)
+        self.fresh()
+        self.paced_min_max(0, 3)
+        self.assertEqual(self.lanes_for_8(97), 0)
+        self.assertEqual(self.status()["pace"]["band"], "paced: hold at 97 %")
+
+    def test_min_lanes_zero_still_pushes_an_approved_green(self):  # PACE0
+        self.paced_min_max(0, 3)
+        self.ledger(70)  # ahead of the 50 % line
+        d = self.root / "build" / "approvals"
+        d.mkdir(parents=True, exist_ok=True)
+        (d / f"push-{MAIN}-p2b").write_text("integration report read, ok\n", encoding="utf-8")
+        self.drop("a.md", HDR.format("A"))
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])
+        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{MAIN}:refs/heads/main"]])
+
+    def test_max_lanes_zero_is_still_clamped_to_one(self):  # PACE0
+        self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400), max_lanes=0, min_lanes=0)
+        self.assertEqual(self.lanes_for_8(50), 1)
+        self.assertIsNone(self.status()["pace"]["error"])
+        for key in ("lanes_present", "lanes_away"):
+            self.fresh()
+            self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400), **{key: 0})
+            self.c.pass_once()
+            self.assertIsNone(self.status()["pace"]["error"], key)
+            self.assertEqual(self.c.load_pace()[0][key], 1, key)
+
+    def test_negative_min_lanes_still_clamps_to_one(self):  # PACE0
+        self.pace(mode="paced", window_start=conveyor.iso(self.t - 3.5 * 86400), min_lanes=-3)
+        self.assertEqual(self.c.load_pace()[0]["min_lanes"], 1)
+
     def test_reset_keeps_min_and_max_lanes(self):
         self.pace(min_lanes=2, max_lanes=3)
         self.ledger(96)

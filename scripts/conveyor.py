@@ -3121,8 +3121,8 @@ class Conveyor:
                 if isinstance(p[k], bool) or not isinstance(p[k], (int, float)) or \
                         (p[k] <= 0 and k not in lane_keys):
                     raise ValueError(f"{k} {p[k]!r}")
-            for k in lane_keys:
-                p[k] = min(MAX_LANES_CAP, max(1, int(p[k])))
+            for k in lane_keys:  # min_lanes 0 (exactly) = wait for the pace line; the others stay >= 1
+                p[k] = min(MAX_LANES_CAP, max(0 if k == "min_lanes" and p[k] == 0 else 1, int(p[k])))
             for k in ("codex_max", "jules_max"):  # CONVCAP: rejected, not clamped; 0 stops that worker
                 if isinstance(p[k], bool) or not isinstance(p[k], int) or not 0 <= p[k] <= MAX_LANES_CAP:
                     raise ValueError(f"{k} {p[k]!r}")
@@ -3217,7 +3217,9 @@ class Conveyor:
                 n = max(top, floor)
                 band = f"paced: on/under line -> max {n}"
             else:
-                n, band = floor, f"paced: ahead of line -> min {floor}"
+                # floor 0: nothing new starts; usage_hold stays off, so pushes and approvals go on
+                n, band = floor, (f"paced: ahead of line -> min {floor}" if floor
+                                  else "paced: ahead of line -> 0 (waiting for the line)")
         self.usage_hold = u is not None and u >= limit
         tag = " (Salih payi)" if held else ""
         if self.usage_hold and p["mode"] == "paced":
