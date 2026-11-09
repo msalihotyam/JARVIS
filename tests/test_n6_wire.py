@@ -5,14 +5,15 @@ in a TemporaryDirectory (never build/conveyor/, never data/jarvis.db)."""
 import json
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 from jarvis import n6_breaker, n6_deps, n6_notify
-from jarvis.work_driver import N6
-from jarvis.work_ledger import StepState
+from jarvis.work_driver import N6, drive
+from jarvis.work_ledger import MAX_REVISIONS, EventKind, RunState, StepState, WorkRun
 from jarvis.work_planner import n6_next
 from jarvis.work_supervisor import n6_record_finish, supervise
-from tests.test_work_driver import FakePorts, gates, result, run_drive
+from tests.test_work_driver import RUN, T0, FakePorts, gates, result, run_drive
 from tests.test_work_supervisor import _sit
 
 MAIN = "c" * 40
@@ -176,6 +177,47 @@ class ShadowRunTest(unittest.TestCase):
                 self.assertEqual(ports.count("apply"), 0)
                 self.assertEqual(self.gate_decision(ports, "refcheck"),
                                  {"action": "wait", "rule_id": "n6.refcheck", "constraint": "none"})
+
+    # N6-WIRE1FIX3 NEG (F1): a resumed refcheck hold re-holds (valid root cause present) at
+    # revisions 0 and MAX_REVISIONS: no worker revision, no FAILED_AFTER_CAP until accepted.
+    def test_neg_resumed_refcheck_hold_never_revises_or_caps(self):
+        refuse = lambda s: (FakeGit(), "ci/int-1", lambda: "RUN_ID: r1\nPICKS: N6-77 abc\n", "r1")  # noqa: E731
+        good = "RUN_ID: r1\nPICKS:\n  N6-77 " + "a" * 40 + " -> " + "b" * 40 + "\n"
+
+        class PassGit(FakeGit):  # full shas resolve to themselves, the INT ref to d*40: refcheck passes
+            def rev_parse(self, rev):
+                return rev if len(rev) == 40 else "d" * 40
+
+        for revisions in (0, MAX_REVISIONS):
+            with self.subTest(revisions=revisions):
+                ports, step = self.drive(self.n6(int_check=refuse), [result(), result(), result()])
+                step = replace(step, attempt=revisions + 1)  # the hold landed on this attempt
+                for e in ports.log:
+                    if e[0] == "event" and e[1] is EventKind.STEP_STATE and e[2] == step.key:
+                        e[3]["attempt"] = step.attempt
+                seen, held = len(ports.states("a")), gates(ports).count("refcheck")
+                for n6 in (ports.n6, ports.n6, None):  # None: no N6 cannot accept, still holds
+                    ports.n6 = n6
+                    step = self.redrive(ports, step)
+                    held += 1
+                    self.assertIs(step.state, StepState.ACCEPTING)
+                    self.assertEqual(step.revisions, revisions)
+                    self.assertEqual(gates(ports)[-1], "refcheck")
+                    self.assertEqual(gates(ports).count("refcheck"), held)
+                    self.assertEqual(self.gate_decision(ports, "refcheck"),
+                                     {"action": "wait", "rule_id": "n6.refcheck", "constraint": "none"})
+                self.assertEqual(ports.states("a")[seen:], [])  # no RUNNING, no FAILED_AFTER_CAP
+                self.assertEqual((ports.count("start"), ports.count("apply")), (1, 0))
+                ports.n6 = self.n6(int_check=lambda s: (PassGit(), "ci/int-1", lambda: good, "r1"))
+                step = self.redrive(ports, step)  # the evidence is accepted: the step proceeds
+                self.assertIs(step.state, StepState.ACCEPTED)
+                self.assertEqual(step.revisions, revisions)
+                self.assertEqual((ports.count("start"), ports.count("apply")), (1, 1))
+                self.assertEqual(ports.states("a")[seen:], [StepState.ACCEPTED.value])
+
+    def redrive(self, ports, step):
+        _, (step,) = drive(WorkRun(RUN, RunState.BUILDING, T0, T0), (step,), ports)
+        return step
 
     def test_no_int_check_still_accepts(self):
         for check in (lambda s: None, None):
