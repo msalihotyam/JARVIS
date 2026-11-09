@@ -70,6 +70,7 @@ from typing import TYPE_CHECKING, Protocol, cast
 
 from jarvis import n6_boot, n6_notify, n6_outage, n6_preflight, n6_refcheck
 from jarvis.n6_lease import Fenced, Lease
+from jarvis.work_supervisor import n6_hold
 from jarvis.work_ledger import (
     MAX_REVISIONS,
     EventKind,
@@ -343,9 +344,10 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
         _notify(ports, "slice_failed_after_cap", f"{step.key}:non_retriable", step.key)
         return step, "held"
 
-    def hold(gate: str, detail: str) -> tuple[WorkStep, str]:
+    def hold(gate: str, detail: str, n6_gate: bool = False) -> tuple[WorkStep, str]:
         step = track[0]
-        _gate_event(step, gate, (_finding(gate, detail),), ports)
+        # N6-WIRE1FIX: an N6 wiring hold carries the supervisor's own non-worker decision.
+        _gate_event(step, gate, (_finding(gate, detail),), ports, n6_hold(gate, detail) if n6_gate else None)
         _notify(ports, "slice_failed_after_cap", f"{step.key}:{gate}:{step.attempt}", step.key)
         return step, "held"
 
@@ -380,7 +382,7 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
         except Exception as exc:
             why = f"error:{type(exc).__name__}"
         if why is not None:
-            return hold("preflight", why)
+            return hold("preflight", why, n6_gate=True)
     stage = ports.stage_create(step)
     worker = ports.worker(ports.route(step))
     # A resumed revision's findings are read back from the ledger; unreadable stays None (held).
@@ -441,7 +443,7 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
                     with contextlib.suppress(Exception):
                         worker.stop(run_id)
                 step = move(StepState.INTERRUPTED)
-                return hold("outage", str(action))
+                return hold("outage", str(action), n6_gate=True)
             if action != "continue":
                 timed_out = True
                 if result is not None and result.status == "completed":
@@ -610,15 +612,19 @@ def _fatal(findings: _Findings) -> bool:
     return any(f.get("retriable") == "no" for f in findings)
 
 
-def _gate_event(step: WorkStep, name: str, findings: _Findings, ports: Ports) -> None:
-    ports.append_event(EventKind.PROGRESS, step.key, {
+def _gate_event(step: WorkStep, name: str, findings: _Findings, ports: Ports,
+                held: object = None) -> None:
+    payload: dict[str, object] = {
         "gate": name,
         "passed": not findings,
         "findings": [f["detail"] for f in findings],
         # N6-HARD2C H5: persisted so a resume restores them (parallel to "findings").
         "retriable": ["no" if f.get("retriable") == "no" else "yes" for f in findings],
         "messages": [f.get("message", "") for f in findings],
-    })
+    }
+    if held is not None:
+        payload["decision"] = {k: getattr(held, k) for k in ("action", "rule_id", "constraint")}
+    ports.append_event(EventKind.PROGRESS, step.key, payload)
 
 
 def _ledger_findings(step: WorkStep, ports: Ports) -> _Findings | None:
