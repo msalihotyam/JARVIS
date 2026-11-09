@@ -17,6 +17,7 @@ from typing import Any, Callable
 
 from jarvis import n6_deps
 from jarvis.work_controls import budget_for
+from jarvis.work_supervisor import n6_hold
 from jarvis.work_plan import Plan, Refusal, classify, validate
 
 #: The JARVIS checkout; a project root at or under it is the JARVIS repo (I12).
@@ -188,10 +189,12 @@ def n6_next(n6_dir: Path | str, verify: n6_deps.Verify) -> n6_deps.Pick:
         path = Path(n6_dir) / "deps.json"
         got = n6_deps.pick(path, verify)
         started = tuple(s for s in got.start if n6_deps.mark_started(path, s[0], verify) is True)
-        lost = tuple((s[0], "mark_started refused") for s in got.start if s not in started)
+        lost = tuple((s[0], n6_hold("deps", "mark_started refused").reason) for s in got.start if s not in started)
         return n6_deps.Pick(started, got.held + lost, got.attention, got.held_all)
     except Exception as exc:
-        return n6_deps.Pick((), (), (f"N6-WIRE1 deps held: {type(exc).__name__}",), held_all=True)
+        # N6-WIRE1FIX: the hold text comes from the one wiring-hold builder.
+        held = n6_hold("deps", f"N6-WIRE1 deps held: {type(exc).__name__}")
+        return n6_deps.Pick((), (), (f"{held.rule_id}: {held.reason}",), held_all=True)
 
 
 def seed_backlog(path, planned: Planned) -> None:

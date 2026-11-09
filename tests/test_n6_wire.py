@@ -98,6 +98,50 @@ class ShadowRunTest(unittest.TestCase):
         (self.dir / "breaker.json").write_text("{not json", "utf-8")
         self.assertEqual(supervise(_sit(), n6_dir=self.dir, slice_id="N6-78").rule_id, "n6.breaker")
 
+    # N6-WIRE1FIX NEG: every wiring hold is a non-worker decision with constraint "none" (H6).
+    def assertHeld(self, d, gate):
+        self.assertEqual((d.action, d.rule_id, d.constraint), ("wait", f"n6.{gate}", "none"))
+        self.assertEqual((d.groups, d.options), ((), ()))
+
+    def gate_decision(self, ports, gate):
+        got = [e[3]["decision"] for e in ports.log
+               if e[0] == "event" and isinstance(e[3], dict) and e[3].get("gate") == gate]
+        self.assertTrue(got, gate)
+        return got[-1]
+
+    def test_neg_breaker_open_corrupt_or_no_slice_is_constraint_none(self):
+        self.assertEqual(supervise(_sit()).constraint, "any")  # the decision being held lets a worker start
+        for i in range(n6_breaker.BREAKER_BAD):
+            n6_record_finish(self.dir, "N6-77", "BLOCKED", NOW + i, NOW + i)
+        self.assertHeld(supervise(_sit(), n6_dir=self.dir, slice_id="N6-77"), "breaker")
+        class BadRepr(str):
+            def __repr__(self):
+                raise RuntimeError("repr")
+        for sid in (None, "", "   ", 77, BadRepr("N6-77")):
+            self.assertHeld(supervise(_sit(), n6_dir=self.dir, slice_id=sid), "breaker")
+        (self.dir / "breaker.json").write_text("{not json", "utf-8")
+        self.assertHeld(supervise(_sit(), n6_dir=self.dir, slice_id="N6-78"), "breaker")
+        (self.dir / "breaker.json").write_bytes(b"\xff\xfe\x00")
+        self.assertHeld(supervise(_sit(), n6_dir=self.dir, slice_id="N6-78"), "breaker")
+
+    def test_neg_preflight_and_outage_hold_are_constraint_none(self):
+        self.owned = {"N6-99": ["a.py"]}
+        ports, _ = self.drive(self.n6())
+        self.assertEqual(self.gate_decision(ports, "preflight"),
+                         {"action": "wait", "rule_id": "n6.preflight", "constraint": "none"})
+        self.owned = {}
+        ports, _ = self.drive(self.n6(watchdog=lambda s, r: "outage"))
+        self.assertEqual(self.gate_decision(ports, "outage"),
+                         {"action": "wait", "rule_id": "n6.outage", "constraint": "none"})
+
+    def test_neg_deps_error_holds_everything(self):
+        (self.dir / "deps.json").write_text("{not json", "utf-8")
+        got = n6_next(self.dir, lambda sha: None)
+        self.assertEqual((got.start, got.held_all), ((), True))
+        got = n6_next(None, lambda sha: None)  # the wiring's own error path
+        self.assertEqual((got.start, got.held_all), ((), True))
+        self.assertTrue(got.attention[0].startswith("n6.deps: "))
+
     def test_dependent_waits_for_verified_push(self):
         deps = self.dir / "deps.json"
         n6_deps.enqueue(deps, [n6_deps.Item("INT-1", is_int=True), n6_deps.Item("N6-80", ("INT-1",))])

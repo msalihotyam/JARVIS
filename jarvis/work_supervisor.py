@@ -433,19 +433,25 @@ def supervise(situation: Situation, pause_file: object = None, *,
         raise
     except Exception as exc:
         raise ValueError(f"malformed situation: {type(exc).__name__}") from None
-    if n6_dir is None or decision.action not in _ANY_WORKER:
+    if n6_dir is None or decision.constraint == "none":
         return decision
-    # N6-WIRE1 (shadow): a worker action waits while the slice's root is open in the
-    # n6_breaker state. No slice id, a missing/unreadable state or any error holds.
+    # N6-WIRE1 (shadow): any decision that lets a worker start waits while the slice's
+    # root is open in the n6_breaker state. No slice id, an unreadable state or any error
+    # holds (a missing state file is the breaker's fresh, closed state).
     try:
         held = (not isinstance(slice_id, str) or not slice_id.strip()
                 or n6_breaker.holds(n6_breaker.load(Path(n6_dir) / "breaker.json"), slice_id))
+        why = f"breaker holds {str.__repr__(slice_id) if isinstance(slice_id, str) else type(slice_id).__name__}"
     except Exception:
-        held = True
-    if held:
-        return decision._replace(action="wait", rule_id="n6.breaker",
-                                 reason=f"breaker holds {slice_id!r}")
-    return decision
+        held, why = True, "breaker holds: error"
+    return n6_hold("breaker", why) if held else decision
+
+
+def n6_hold(gate: str, reason: object) -> Decision:
+    """N6-WIRE1FIX: the one builder of every N6 wiring hold (breaker, preflight, outage,
+    deps). A fresh non-worker decision through _final, so its constraint is "none"
+    (H6) and nothing of a worker decision (groups, options) leaks through."""
+    return _final(Decision("wait", f"n6.{gate}", str(reason)[:_REASON_MAX]), "none")
 
 
 def n6_record_finish(n6_dir: object, name: str, status: str, fin: float, now: float, *,
