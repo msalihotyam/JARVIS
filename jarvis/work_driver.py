@@ -387,13 +387,22 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
     worker = ports.worker(ports.route(step))
     # A resumed revision's findings are read back from the ledger; unreadable stays None (held).
     findings: _Findings | None = _ledger_findings(step, ports) if started else ()
-    if step.state == StepState.ACCEPTING:
-        resumed = _resume_apply(step, stage, ports)
-        if resumed is not None:
-            findings, ok = resumed
+    resumed = _resume_apply(step, stage, ports) if step.state == StepState.ACCEPTING else None
+    if resumed is not None:
+        findings, ok = resumed
+        if ok:
+            return accepted()
+        # Not applied and undone: a failed attempt, never a second apply.
+    elif findings and findings[0].get("n6_hold") == "yes":
+        # N6-WIRE1FIX3: a persisted refcheck hold re-holds until the evidence is accepted:
+        # no worker revision, no FAILED_AFTER_CAP. Only ACCEPTING under N6 re-checks; without
+        # N6 _accept would skip refcheck and apply, so it holds (fail closed).
+        if step.state == StepState.ACCEPTING and n6 is not None:
+            findings, ok = _accept(step, stage, ports)
             if ok:
                 return accepted()
-            # Not applied and undone: a failed attempt, never a second apply.
+        if findings[0].get("n6_hold") == "yes":
+            return hold("refcheck", findings[0]["detail"], n6_gate=True)
     if findings and _fatal(findings):  # N6-HARD2C H5: a persisted non-retriable failure stays fatal
         return ended(findings)
     if step.state in _REVISABLE:
@@ -660,6 +669,8 @@ def _ledger_findings(step: WorkStep, ports: Ports) -> _Findings | None:
                 found["message"] = m
             if f == "no":
                 found["retriable"] = "no"
+            if gate == "refcheck":  # N6-WIRE1FIX3: only hold() writes a failing refcheck row
+                found["n6_hold"] = "yes"
             out.append(found)
         return tuple(out)
     except Exception:
