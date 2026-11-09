@@ -737,6 +737,9 @@ def ntfy_request(topic, text, title):
                                   headers={"Title": title})
 
 
+NTFY_TIMEOUT_S = 15  # urlopen timeout of one push; send_before_restart waits longer than this
+
+
 def ntfy_send(text, title="JARVIS Konveyor"):
     """Push text to ntfy. Returns a short result; the topic never leaves this function."""
     topic = os.environ.get("JARVIS_NTFY_TOPIC", "")
@@ -744,7 +747,7 @@ def ntfy_send(text, title="JARVIS Konveyor"):
         return "no-topic"
     try:
         req = ntfy_request(topic, text, title)
-        with urllib.request.urlopen(req, timeout=15):  # nosec B310 - fixed https URL, topic validated
+        with urllib.request.urlopen(req, timeout=NTFY_TIMEOUT_S):  # nosec B310 - fixed https URL, topic validated
             return "sent"
     except Exception as e:  # never str(e): keep any URL out of the log
         return "error " + type(e).__name__
@@ -1580,6 +1583,8 @@ class Conveyor:
         except (KeyError, ValueError):
             return 0.0
 
+    phone_unreadable = False  # phone_state_unreadable is logged once per unreadable streak
+
     def phone_tick(self, lanes, items, cap=20):
         """PHONECMD: at most one poll of the private command topic (JARVIS_NTFY_CMD_TOPIC) per pass;
         fetch is wired on the real loop only. New ids are persisted in phone.json BEFORE acting, so
@@ -1590,8 +1595,15 @@ class Conveyor:
         if not topic or self.fetch is None:
             return
         f = self.base / "phone.json"
-        raw = self.load_json(f, {})
-        raw = raw if isinstance(raw, dict) else {}
+        raw = self.load_json(f, None)
+        if not isinstance(raw, dict):
+            if f.exists():  # PHONECMDFIX7 F2: unreadable -> never rewritten, so the restart marker is kept
+                if not self.phone_unreadable:
+                    self.event("phone_state_unreadable")
+                self.phone_unreadable = True
+                return
+            raw = {}
+        self.phone_unreadable = False
         try:
             n, next_ts = int(raw.get("fail_n", 0)), float(raw.get("next_ts", 0))
         except (TypeError, ValueError):
@@ -1702,12 +1714,12 @@ class Conveyor:
             return
         self.restart_pending = True  # restart_go sends "Yeniden başlatılıyor…" itself, just before the spawn
 
-    send_wait = 10  # s the starting message may take before the spawn goes on without it
+    send_wait = NTFY_TIMEOUT_S + 5  # PHONECMDFIX7 F1: longer than the send's own timeout, so the spawn never cuts it
 
     def send_before_restart(self):
         """PHONECMDFIX5: the starting message is delivered (result awaited, <= send_wait s) before the
         task spawns; PHONECMDFIX6: its result is logged as phone_send, a failed or hung send also once
-        as phone_restart_send_failed, and the restart goes on."""
+        as phone_restart_send_failed, and the restart goes on. PHONECMDFIX7: send_wait > NTFY_TIMEOUT_S."""
         box = []
 
         def run():

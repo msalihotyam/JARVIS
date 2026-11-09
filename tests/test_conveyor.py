@@ -9980,6 +9980,61 @@ class PhoneCmd(Base):
         self.assertEqual([r["result"] for r in self.events("phone_restart_confirmed")], ["sent"])
         self.assertNotIn("restart", self.phone())
 
+    def test_slow_starting_send_is_awaited_before_spawn_through_full_loop_passes(self):
+        # PHONECMDFIX7 F1/F3: a send that needs its full 15 s ntfy timeout (urlopen timeout=15) used to be
+        # cut by the 10 s join; the spawned restart task then killed it in flight. Fails on 1275d5a and f581bb5.
+        order = []
+
+        class SlowSend:  # deterministic: the send completes only if the join waits >= the ntfy timeout
+            def __init__(self, target, daemon=True):
+                self.target = target
+            def start(self):
+                pass
+            def join(self, timeout=None):
+                if timeout is None or timeout >= 15:
+                    self.target()
+        self.c.send = lambda text, **kw: order.append(("send", text)) or self.pushes.append(text) or "sent"
+        self.c.spawn = lambda argv: order.append(("spawn",)) or 0
+        self.msgs(("r1", "yeniden başlat"))
+        with mock.patch.object(conveyor, "threading", types.SimpleNamespace(Thread=SlowSend)):
+            self.assertEqual(self.c.loop(once=True), 0)  # old pid: phone_tick, then restart_go
+        self.assertEqual(order, [("send", "Yeniden başlatılıyor…"), ("spawn",)])
+        self.body = ""
+        self.t += 4
+        c2 = Conveyor(self.root, self.fake, now=lambda: self.t,
+                      send=lambda text, **kw: self.pushes.append(text) or "sent",
+                      post=self.fake_post, key=lambda: self.key,
+                      cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
+                      mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs,
+                      net=lambda: self.net, popen=self.fake_popen, fetch=self.fetch, spawn=lambda argv: 0)
+        c2.pid = self.c.pid + 1
+        self.assertEqual(c2.loop(once=True), 0)  # new pid: acquire_lock beat 1, _loop beat 2 confirms
+        self.assertEqual(self.pushes, ["Yeniden başlatılıyor…", f"Konveyör yeniden başlatıldı ve çalışıyor · PID {c2.pid}"])
+        self.assertNotIn("restart", self.phone())
+
+    def test_neg_unreadable_phone_json_for_one_pass_keeps_marker_and_confirms(self):
+        # PHONECMDFIX7 F2: a failed read must not make phone_tick rewrite phone.json without the marker
+        self.marker(self.c.pid + 1, self.t)
+        before = (self.base / "phone.json").read_text(encoding="utf-8")
+        self.c.heartbeat()  # beat 1
+        real, hits = self.c.load_json, []
+
+        def flaky(path, default):
+            if path.name == "phone.json" and not hits:
+                hits.append(1)
+                return default  # what load_json returns on OSError/ValueError
+            return real(path, default)
+        with mock.patch.object(self.c, "load_json", flaky):
+            self.tick()
+        self.assertEqual(hits, [1])
+        self.assertEqual((self.base / "phone.json").read_text(encoding="utf-8"), before)
+        self.assertEqual(len(self.events("phone_state_unreadable")), 1)
+        self.c.heartbeat()  # beat 2: the marker survived, so the confirm goes out
+        self.assertEqual(self.pushes, [f"Konveyör yeniden başlatıldı ve çalışıyor · PID {self.c.pid}"])
+        self.assertNotIn("restart", self.phone())
+        self.tick()  # readable again: the tick runs and rewrites as before
+        self.assertFalse(self.c.phone_unreadable)
+
     def test_neg_no_topic_is_logged_for_every_phone_reply(self):
         self.c.send = lambda text, **kw: "no-topic"
         self.c.spawn = lambda argv: 0
@@ -10004,17 +10059,23 @@ class PhoneCmd(Base):
         self.assertEqual(self.events("phone_restart_confirmed") + self.events("phone_restart_confirm_skipped"), [])
 
     def test_neg_hung_starting_send_logs_timeout_and_still_spawns(self):
-        import threading
-        gate, spawned = threading.Event(), []
-        self.c.send = lambda text, **kw: gate.wait(5) and "sent"
+        # PHONECMDFIX7 F4: injected thread, no real wait, no worker left behind
+        joins, spawned = [], []
+
+        class Hung:  # the send never finishes within the wait
+            def __init__(self, target, daemon=True):
+                self.target = target
+            def start(self):
+                pass
+            def join(self, timeout=None):
+                joins.append(timeout)
         self.c.spawn = lambda argv: spawned.append(1) or 0
-        self.c.send_wait = 0.05
         self.msgs(("r1", "yeniden başlat"))
         self.tick()
-        try:
+        with mock.patch.object(conveyor, "threading", types.SimpleNamespace(Thread=Hung)):
             self.c.restart_go()
-        finally:
-            gate.set()
+        self.assertEqual(joins, [Conveyor.send_wait])
+        self.assertGreater(Conveyor.send_wait, conveyor.NTFY_TIMEOUT_S)
         self.assertEqual(spawned, [1])
         self.assertEqual(self.sends(), [("yeniden", "timeout")])
         self.assertEqual([r["error"] for r in self.events("phone_restart_send_failed")], ["timeout"])
