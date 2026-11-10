@@ -3,17 +3,19 @@
 Fakes only: git, CI (checks) and the phone sink; a frozen clock; every state file lives
 in a TemporaryDirectory (never build/conveyor/, never data/jarvis.db)."""
 import json
+import random
 import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
 from jarvis import n6_breaker, n6_deps, n6_notify
 from jarvis.work_driver import N6, drive
 from jarvis.work_ledger import MAX_REVISIONS, EventKind, RunState, StepState, WorkRun
 from jarvis.work_planner import n6_next
 from jarvis.work_supervisor import n6_record_finish, supervise
-from tests.test_work_driver import RUN, T0, FakePorts, gates, result, run_drive
+from tests.test_work_driver import FAIL, RUN, T0, FakePorts, gates, result, run_drive
 from tests.test_work_supervisor import _sit
 
 MAIN = "c" * 40
@@ -246,6 +248,130 @@ class ShadowRunTest(unittest.TestCase):
         pushed["f" * 40] = MAIN
         self.assertEqual([s for s, _ in n6_next(self.dir, verify).start], ["N6-80"])
         self.assertTrue(n6_next(self.dir / "nope", verify).held_all or not n6_next(self.dir / "nope", verify).start)
+
+    # N6-WIRE1FIX4: a persisted refcheck hold and the non-accept outcomes a resume can meet.
+    KINDS = ("review_major", "review_raises", "checks_raise", "regress_fails", "int_check_none",
+             "int_check_returns_none", "int_check_raises", "no_n6", "findings_unreadable", "refused",
+             "hold_row_gate_corrupt")
+    WAIT = {"action": "wait", "rule_id": "n6.refcheck", "constraint": "none"}
+
+    def accepting(self):
+        class PassGit(FakeGit):  # full shas resolve to themselves, the INT ref to d*40: refcheck passes
+            def rev_parse(self, rev):
+                return rev if len(rev) == 40 else "d" * 40
+
+        good = "RUN_ID: r1\nPICKS:\n  N6-77 " + "a" * 40 + " -> " + "b" * 40 + "\n"
+        return self.n6(int_check=lambda s: (PassGit(), "ci/int-1", lambda: good, "r1"))
+
+    def held(self, revisions):
+        self.setUp()  # a fresh state directory per held step
+        refuse = self.n6(int_check=lambda s: (FakeGit(), "ci/int-1", lambda: "RUN_ID: r1\nPICKS: N6-77 abc\n", "r1"))
+        ports, step = self.drive(refuse, [result(), result(), result()])
+        step = replace(step, attempt=revisions + 1)  # the hold landed on this attempt
+        for e in ports.log:
+            if e[0] == "event" and e[1] is EventKind.STEP_STATE and e[2] == step.key:
+                e[3]["attempt"] = step.attempt
+        return ports, step, len(ports.states("a")), len(ports.log)
+
+    def spoil(self, ports, kind):
+        """Make the next resume meet one non-accept outcome; returns the undo."""
+        def boom(*a):
+            raise OSError(kind)
+
+        scripts = {"review_major": ("review", [[{"severity": "major", "detail": "flaky"}]]),
+                   "review_raises": ("review", [RuntimeError("review down")]),
+                   "checks_raise": ("run_checks", [OSError("checks down")]),
+                   "regress_fails": ("regress", [FAIL])}
+        swaps = {"int_check_none": lambda: self.n6(int_check=None),
+                 "int_check_returns_none": lambda: self.n6(int_check=lambda s: None),
+                 "int_check_raises": lambda: self.n6(int_check=boom),
+                 "no_n6": lambda: None}
+        if kind in scripts:
+            port, items = scripts[kind]
+            old, ports.script[port] = ports.script[port], items
+            return lambda: ports.script.__setitem__(port, old)
+        if kind in swaps:
+            old, ports.n6 = ports.n6, swaps[kind]()
+            return lambda: setattr(ports, "n6", old)
+        if kind == "findings_unreadable":
+            ports.gate_findings = boom
+            return lambda: delattr(ports, "gate_findings")
+        if kind == "hold_row_gate_corrupt":  # the hold row is still known by its decision
+            rows = [e[3] for e in ports.log if e[0] == "event" and e[3].get("gate") == "refcheck"]
+            for r in rows:
+                r["gate"] = "Refcheck"
+            return lambda: [r.__setitem__("gate", "refcheck") for r in rows]
+        return lambda: None  # "refused": refcheck just refuses again
+
+    def assert_still_held(self, ports, step, revisions, seen, mark):
+        self.assertIs(step.state, StepState.ACCEPTING)
+        self.assertEqual(step.revisions, revisions)
+        self.assertEqual(ports.states("a")[seen:], [])  # no RUNNING, no FAILED_AFTER_CAP
+        self.assertEqual((ports.count("start"), ports.count("apply")), (1, 0))
+        rows = [e[3] for e in ports.log[mark:] if e[0] == "event" and "gate" in e[3]]
+        self.assertEqual((rows[-1]["gate"], rows[-1].get("decision")), ("refcheck", self.WAIT))
+        # no revisable gate row replaces the hold: every failing row is a wait
+        self.assertEqual([r["gate"] for r in rows if r.get("passed") is False and r.get("decision") != self.WAIT], [])
+
+    def assert_accepted_once(self, ports, step, revisions, seen):
+        ports.n6 = self.accepting()
+        step = self.redrive(ports, step)  # the evidence is accepted: the step proceeds, once
+        self.assertIs(step.state, StepState.ACCEPTED)
+        self.assertEqual((step.revisions, ports.count("start"), ports.count("apply")), (revisions, 1, 1))
+        self.assertEqual(ports.states("a")[seen:], [StepState.ACCEPTED.value])
+
+    # N6-WIRE1FIX4 NEG (F1-F3): every non-accept outcome on a resumed hold re-holds, the NEXT
+    # resume still holds, and only accepted evidence lets the step proceed.
+    def test_neg_resumed_hold_survives_every_non_accept_outcome(self):
+        for revisions in (0, MAX_REVISIONS):
+            for kind in self.KINDS:
+                with self.subTest(revisions=revisions, kind=kind):
+                    ports, step, seen, mark = self.held(revisions)
+                    undo = self.spoil(ports, kind)
+                    step = self.redrive(ports, step)
+                    self.assert_still_held(ports, step, revisions, seen, mark)
+                    undo()
+                    step = self.redrive(ports, step)  # the NEXT resume: the hold is still the finding
+                    self.assert_still_held(ports, step, revisions, seen, mark)
+                    self.assert_accepted_once(ports, step, revisions, seen)
+
+    # N6-WIRE1FIX4 property: N resumes with randomised gate / refcheck outcomes (fixed seed, no
+    # clock) keep the invariant on every step.
+    def test_property_random_resumes_keep_the_hold(self):
+        rng = random.Random(64)
+        for revisions in (0, MAX_REVISIONS):
+            ports, step, seen, mark = self.held(revisions)
+            for n in range(25):
+                kinds = [rng.choice(self.KINDS[4:])] + ([rng.choice(self.KINDS[:4])] if rng.random() < 0.5 else [])
+                with self.subTest(revisions=revisions, n=n, kinds=kinds):
+                    undos = [self.spoil(ports, k) for k in kinds]
+                    step = self.redrive(ports, step)
+                    self.assert_still_held(ports, step, revisions, seen, mark)
+                    for undo in reversed(undos):
+                        undo()
+            self.assert_accepted_once(ports, step, revisions, seen)
+
+    # N6-WIRE1FIX4 NEG (F4): a mark_started error after an earlier mark keeps that start.
+    def test_neg_partial_mark_error_keeps_the_marked_start(self):
+        deps, verify, real, calls = self.dir / "deps.json", (lambda sha: None), n6_deps.mark_started, []
+        n6_deps.enqueue(deps, [n6_deps.Item("N6-81"), n6_deps.Item("N6-82"), n6_deps.Item("N6-83")])
+
+        def flaky(path, sid, check):
+            calls.append(sid)
+            if len(calls) == 2:
+                raise OSError("disk")
+            return real(path, sid, check)
+
+        with mock.patch.object(n6_deps, "mark_started", side_effect=OSError("disk")):
+            got = n6_next(self.dir, verify)  # nothing marked yet: the fail-closed shape
+        self.assertEqual((got.start, got.held_all), ((), True))
+        with mock.patch.object(n6_deps, "mark_started", side_effect=flaky):
+            got = n6_next(self.dir, verify)
+        self.assertEqual(([s for s, _ in got.start], got.held_all), (["N6-81"], False))
+        self.assertEqual([s for s, _ in got.held], ["N6-82", "N6-83"])
+        self.assertTrue(got.attention[-1].startswith("n6.deps: "))
+        self.assertIn("started before it: N6-81", got.attention[-1])
+        self.assertEqual([s for s, _ in n6_next(self.dir, verify).start], ["N6-82", "N6-83"])  # none lost
 
 
 if __name__ == "__main__":
