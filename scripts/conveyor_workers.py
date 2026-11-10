@@ -537,7 +537,8 @@ def _activity(a, scrub=str):
 
 def _git(argv):
     """(returncode, stdout); stderr is dropped so -z output stays clean."""
-    p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False)
+    p = subprocess.run(argv, capture_output=True, text=True, encoding="utf-8", errors="replace", check=False,
+                       creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
     return p.returncode, p.stdout or ""
 
 

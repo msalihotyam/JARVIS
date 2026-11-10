@@ -1582,5 +1582,38 @@ class ConveyorJulesTest(Base):
         self.assertEqual(lanes["JX"]["jules_state"], "IN_PROGRESS")
 
 
+class NoWindowTest(unittest.TestCase):
+    """JULESNOWIN: a windowless conveyor must not flash a console per child process."""
+
+    def test_every_subprocess_call_site_passes_creationflags(self):
+        import ast
+        scripts = Path(__file__).resolve().parents[1] / "scripts"
+        missing, seen = [], 0
+        for name in ("conveyor.py", "conveyor_workers.py", "usage_ledger.py"):
+            tree = ast.parse((scripts / name).read_text(encoding="utf-8"))
+            for n in ast.walk(tree):
+                f = getattr(n, "func", None)
+                if (isinstance(n, ast.Call) and isinstance(f, ast.Attribute) and isinstance(f.value, ast.Name)
+                        and f.value.id == "subprocess"
+                        and f.attr in ("run", "Popen", "check_output", "call", "check_call")):
+                    seen += 1
+                    if not any(k.arg == "creationflags" for k in n.keywords):
+                        missing.append(f"{name}:{n.lineno}")
+        self.assertGreater(seen, 0)
+        self.assertEqual(missing, [])
+
+    def test_git_passes_create_no_window(self):
+        calls = []
+
+        def fake_run(argv, **kw):
+            calls.append(kw)
+            return mock.Mock(returncode=0, stdout="ok")
+
+        with mock.patch.object(workers.subprocess, "CREATE_NO_WINDOW", 0x08000000, create=True), \
+                mock.patch.object(workers.subprocess, "run", fake_run):
+            self.assertEqual(workers._git(["git", "status"]), (0, "ok"))
+        self.assertEqual(calls[0]["creationflags"], 0x08000000)
+
+
 if __name__ == "__main__":
     sys.exit(unittest.main())
