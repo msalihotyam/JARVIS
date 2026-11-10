@@ -315,9 +315,13 @@ READER_SYSTEM = (
     '{"kind": "...", "summary": "...", "next": "..."}. '
     "kind is one of: pass (finished, tests green, nothing to do but integrate); "
     "blocked (the lane stopped on a blocker it reported); stalled (no or incomplete report, "
-    "no progress); needs_orchestrator (the orchestrator should act: re-dispatch, small fix, "
-    "unclear report); needs_salih (only a human decision or action can unblock it: approval, "
-    "credentials, scope or risk decision). summary: one short sentence, at most 100 characters. "
+    "no progress); needs_orchestrator (the orchestrator should act or decide: re-dispatch, "
+    "small fix, unclear report, key 1 / push or integration approval, keep-or-fix of review "
+    "findings, a flaky test, spec or prompt wording, design follow-ups); needs_salih (ONLY when "
+    "a human must act or decide: new credentials, secrets or env vars he must set, spending "
+    "money or quota policy, loosening a security rule, product scope, deleting his data, a "
+    "physical action on his computer; anything else is needs_orchestrator). "
+    "summary: one short sentence, at most 100 characters. "
     "next: the single next step, at most 100 characters. Both non-empty. Write BOTH summary AND "
     "next in Turkish, in the Latin script only: never Korean, Chinese, Japanese, Russian or Arabic.")
 # Hangul, CJK (ideographs, kana, bopomofo, symbols, full/halfwidth forms), Cyrillic, Arabic:

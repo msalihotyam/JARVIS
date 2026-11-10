@@ -2603,6 +2603,24 @@ class TestReader(Base):
     def all_files_text(self):
         return {p: p.read_bytes().decode("utf-8", "replace") for p in self.root.rglob("*") if p.is_file()}
 
+    def test_reader_system_pages_salih_only_for_human_only_decisions(self):
+        s = conveyor.READER_SYSTEM
+        salih = s[s.index("needs_salih ("):s.index("summary:")]
+        orch = s[s.index("needs_orchestrator ("):s.index("needs_salih (")]
+        for case in ("credentials", "secrets", "env vars", "money", "quota policy",
+                     "loosening a security rule", "product scope", "deleting his data",
+                     "physical action on his computer"):
+            self.assertIn(case, salih)
+        self.assertIn("ONLY when a human must act or decide", salih)
+        self.assertIn("anything else is needs_orchestrator", salih)
+        for case in ("key 1", "keep-or-fix of review findings", "re-dispatch", "flaky test",
+                     "spec or prompt wording", "design follow-ups"):
+            self.assertIn(case, orch)
+            self.assertNotIn(case, salih)
+        self.assertIn('{"kind": "...", "summary": "...", "next": "..."}', s)
+        self.assertIn("at most 100 characters", s)
+        self.assertIn("in Turkish, in the Latin script only", s)
+
     def test_valid_reading_recorded(self):
         rep = self.finish_a()
         (body,) = self.posts
