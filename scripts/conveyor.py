@@ -492,6 +492,15 @@ OUTAGE_IDLE_S = 5 * 60
 OUTAGE_GAP_S = 10 * 60
 OUTAGE_NUDGE_S = 30 * 60
 OUTAGE_NUDGE = "The API outage seems over; continue your task where you left off."
+# AUTHWATCH: the Claude login is gone (2026-11-10: 9 h of nudged/respawned lanes, no page).
+# Checked before API_ERR_RE, which also matches "invalid api key" / "authentication".
+AUTH_ERR_RE = re.compile(r"(?i)login required|run /login|failed to authenticate|reached its time limit"
+                         r"|claude auth login|oauth token has expired|invalid api key")
+AUTH_FAST_S = 120  # 2+ lanes blocked this soon after their start, no activity: suspected
+AUTH_PROBE_S = 5 * 60  # one `claude auth status` (no model call) per this while held
+AUTH_PAGE_EVERY_S = 2 * 3600  # the "login lost" page repeats at most this often
+AUTH_NUDGE = "The Claude login is back; continue your task where you left off."
+AUTH_PAGE = "Claude Code girisi dustu. Terminalde: claude auth login"
 MEM_MARGIN_GB = 1.5  # memory hold hysteresis: release at min_free_mem_gb + this, held MEM_OK_S
 MEM_OK_S = 5 * 60
 MEM_GAP_S = 10 * 60  # after a memory hold at most one start per MEM_GAP_S for MEM_RELEASE_S
@@ -1523,6 +1532,8 @@ class Conveyor:
             self.error(f"agents: {e}")
             agents = None
         self.usage = self.usage_pct()
+        if self.pager_flag("auth"):  # AUTHWATCH: the reading froze with the login; pace must not trust it
+            self.usage = None
         self.memory = self.mem()
         if self.memory is None and not self.mem_unknown_logged:
             self.mem_unknown_logged = True
@@ -1904,6 +1915,8 @@ class Conveyor:
         except Exception:
             subjects = None
         quota, qs = self.quota_pace()
+        if self.pager_flag("auth"):
+            quota, qs = f"{quota} (kota okumasi eski)", f"{qs} (kota okumasi eski)"
         plan = self.plan_status(subjects)
         sha = self.main_head()
         head = " · ".join([f"{len(run)} hat", f"senden {len(salih)}", f"ork {len(orch)}", qs]
@@ -2136,7 +2149,8 @@ class Conveyor:
 
     def track(self, lanes, agents):
         by_id = {a.get("id"): a for a in agents}
-        held = bool(self.pager_flag("outage"))
+        auth = bool(self.pager_flag("auth"))
+        held = bool(self.pager_flag("outage")) or auth
         for name, ln in lanes.items():
             if ln.get("worker") in ("codex", "jules"):
                 continue  # codex_track / jules_track
@@ -2171,6 +2185,14 @@ class Conveyor:
                 continue
             if ln.get("finished"):
                 continue
+            auth_txt = self.auth_text(a)
+            if auth_txt and auth_txt != ln.get("auth_err"):  # the same stale text never re-parks
+                ln.update(auth_parked=True, auth_err=auth_txt)
+            elif auth and ln.get("state") == "blocked":  # blocked while the login is gone: same cause
+                ln["auth_parked"] = True
+            if ln.get("auth_parked"):
+                ln["state"] = "AUTH_HOLD"
+                continue  # auth hold: no nudge/respawn/redispatch, counters untouched; auth_watch() resumes
             err = a is not None and next((v for k, v in a.items() if API_KEY_RE.search(k)
                                           and isinstance(v, str) and API_ERR_RE.search(v)), None)
             if err and err != ln.get("api_err"):  # the same stale text never re-pauses a cleared lane
@@ -2225,6 +2247,7 @@ class Conveyor:
             if alive and self.budget(name, ln, a):
                 continue
             self.unblock(name, ln, a)
+        self.auth_watch(lanes, by_id)
         self.outage(lanes, by_id)
 
     def heal(self, name, ln, lanes):
@@ -2265,6 +2288,80 @@ class Conveyor:
         self.redispatch(name, ln)
         return True
 
+    def auth_text(self, a):
+        """AUTHWATCH: the login-loss text in the session's error/state/status fields, or in its
+        last transcript entry when that is the CLI's own API error (blocked sessions only); None."""
+        if a is None:
+            return None
+        texts = [v for k, v in a.items() if API_KEY_RE.search(k) and isinstance(v, str)]
+        if a.get("state") == "blocked":
+            d = self.last_assistant(a)
+            if d and d.get("isApiErrorMessage") is True:
+                texts.append(json.dumps(d.get("message")))
+        m = next((m for m in map(AUTH_ERR_RE.search, texts) if m), None)
+        return m and m.group(0)
+
+    def auth_probe(self):
+        """One read-only `claude auth status` (no model call); True only on a clean logged-in answer."""
+        try:
+            rc, out = self.run(["auth", "status"], timeout=30)
+        except Exception as e:  # noqa: BLE001 - a failed probe is just "still lost"
+            rc, out = 1, str(e)
+        out = str(out or "")
+        return rc == 0 and not AUTH_ERR_RE.search(out) and not re.search(r'(?i)"loggedIn"\s*:\s*false', out)
+
+    def auth_watch(self, lanes, by_id):
+        """AUTHWATCH: lanes track() parked on login-loss text, or 2+ live lanes blocked within
+        AUTH_FAST_S of their start with no activity (suspected) -> auth hold: no dispatch (hold()),
+        no nudge/respawn/redispatch, one urgent page (again every AUTH_PAGE_EVERY_S). While held,
+        one `claude auth status` probe per AUTH_PROBE_S; on success the hold clears, one page, and
+        the parked lanes resume in place (uncounted nudge) or through the normal paths."""
+        now, h = self.now(), self.pager_flag("auth")
+        live = {n: ln for n, ln in lanes.items() if not ln.get("finished")}
+        fast = [n for n, ln in live.items() if not ln.get("auth_parked") and ln.get("state") == "blocked"
+                and ln.get("blocked_since") is not None and self.started_ts(ln) is not None
+                and ln["blocked_since"] - self.started_ts(ln) <= AUTH_FAST_S
+                and not self.active_since(n, self.started_ts(ln), (by_id.get(ln["id"]) or {}).get("cwd"))]
+        if len(fast) >= 2:
+            for n in fast:
+                live[n].update(auth_parked=True, state="AUTH_HOLD")
+        parked = sorted(n for n, ln in live.items() if ln.get("auth_parked"))
+        if not h:
+            if not parked:
+                return
+            matched = next((live[n]["auth_err"] for n in parked if live[n].get("auth_err")), None)
+            h = {"since": now, "paged": now, "probed": now, "lanes": parked,
+                 "matched": matched or "suspected", "suspected": not matched}
+            self.pager_flag("auth", h)
+            self.event("auth_lost", lanes=parked, matched=h["matched"])
+            self.page(self.auth_page(h))
+            return
+        h["lanes"] = parked
+        if now - h.get("probed", h["since"]) >= AUTH_PROBE_S:
+            h["probed"] = now
+            ok = self.auth_probe()
+            self.event("auth_probe", result="ok" if ok else "fail")
+            if ok:
+                self.pager_flag("auth", {})
+                self.event("auth_restored", held_s=int(now - h["since"]), lanes=parked)
+                self.page("Claude Code girisi geri geldi, isler devam ediyor")
+                for n in parked:
+                    ln = live[n]
+                    for k in ("auth_parked", "blocked_since", "blocked_attention", "idle_since", "respawned_ts"):
+                        ln.pop(k, None)
+                    a = by_id.get(ln["id"])
+                    if a and "pid" in a:
+                        self.nudge(n, ln, a, AUTH_NUDGE, "auth_resume")  # uncounted (kind != "nudge")
+                return
+        if now - h.get("paged", h["since"]) >= AUTH_PAGE_EVERY_S:
+            h["paged"] = now
+            self.page(self.auth_page(h))
+        self.pager_flag("auth", h)
+
+    def auth_page(self, h):
+        tag = " (supheli)" if h.get("suspected") else ""
+        return f"{AUTH_PAGE}{tag} - {len(h['lanes'])} lane bekliyor: {', '.join(h['lanes'])}"
+
     def outage(self, lanes, by_id):
         """Outage hold: live lanes whose session shows an API error (billing, credit, auth,
         overloaded, 5xx, network), or 2+ lanes idle with no progress within OUTAGE_GAP_S of each
@@ -2272,7 +2369,7 @@ class Conveyor:
         Every OUTAGE_NUDGE_S ONE paused lane is nudged; on progress the hold clears and the rest
         are nudged in place. No live calls of its own."""
         now, o = self.now(), self.pager_flag("outage")
-        live = {n: ln for n, ln in lanes.items() if not ln.get("finished")}
+        live = {n: ln for n, ln in lanes.items() if not ln.get("finished") and not ln.get("auth_parked")}
         paused = {n: ln for n, ln in live.items() if ln.get("paused")}
 
         def cwd(n):
@@ -2330,9 +2427,15 @@ class Conveyor:
         """CTXRESUME: the session's last assistant transcript entry is the CLI's own context-full
         error (isApiErrorMessage: autocompact thrashing, or prompt too long), read from the last
         CTX_TAIL_BYTES. Text that only mentions it never counts; any read error is False."""
+        d = self.last_assistant(a)
+        return bool(d and d.get("isApiErrorMessage") is True and (
+            d.get("apiError") == "autocompact_thrashing" or "Prompt is too long" in json.dumps(d.get("message"))))
+
+    def last_assistant(self, a):
+        """The last assistant entry in the session's transcript tail (CTX_TAIL_BYTES), or None."""
         sid = str(a.get("sessionId") or "")
         if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid):
-            return False
+            return None
         for tx in self.projects.glob(f"*/{sid}.jsonl"):
             try:
                 with open(tx, "rb") as f:
@@ -2346,11 +2449,8 @@ class Conveyor:
                 except ValueError:
                     continue
                 if isinstance(d, dict) and d.get("type") == "assistant":
-                    if d.get("isApiErrorMessage") is True and (d.get("apiError") == "autocompact_thrashing"
-                                                               or "Prompt is too long" in json.dumps(d.get("message"))):
-                        return True
-                    break
-        return False
+                    return d
+        return None
 
     def messages(self, sid):
         """Distinct assistant messages in the session's transcript; a removed file counts 0."""
@@ -3129,7 +3229,8 @@ class Conveyor:
         throttled = self.mem_released is not None and self.now() - self.mem_released < MEM_RELEASE_S \
             and self.now() - self.last_start < MEM_GAP_S
         return (self.base / "PAUSE").exists() or self.disk_hold() or self.usage_hold \
-            or self.mem_hold or throttled or bool(self.pager_flag("outage")) or self.cc_hold() \
+            or self.mem_hold or throttled or bool(self.pager_flag("outage")) or bool(self.pager_flag("auth")) \
+            or self.cc_hold() \
             or bool(self.pager_flag("uv_prune_run"))  # uv prune: nothing starts while it runs
 
     def cc_version(self):
@@ -3960,6 +4061,7 @@ class Conveyor:
                 self.pager_flag("backstop", done)
 
     def write_status(self, lanes, items):
+        auth = self.pager_flag("auth")
         status = {
             "updated_at": iso(self.now()),
             "pid": self.pid,
@@ -3972,6 +4074,9 @@ class Conveyor:
             "disk_free_gb": self.free_gb and round(self.free_gb, 1),
             "memory_hold": self.mem_hold,
             "outage_hold": bool(self.pager_flag("outage")),
+            "auth_hold": bool(auth),
+            "usage_stale": bool(auth),
+            "usage_stale_s": int(self.now() - auth["since"]) if auth else None,
             "uv_prune_hold": bool(self.pager_flag("uv_prune_run")),
             "memory": self.memory and {"free_gb": round(self.memory[0], 1),
                                        "commit_pct": round(self.memory[1], 1)},

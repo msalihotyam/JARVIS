@@ -526,7 +526,8 @@ class TestInbox(Base):
                                   "usage_hold", "pace", "disk_hold", "disk_free_gb",
                                   "memory_hold", "memory", "presence", "lanes",
                                   "preserved", "backlog", "breaker", "band", "attention",
-                                  "outage_hold", "uv_prune_hold"})
+                                  "outage_hold", "uv_prune_hold",
+                                  "auth_hold", "usage_stale", "usage_stale_s"})
         self.assertFalse(s["paused"])
         self.assertIsNone(s["last_error"])
         (lane,) = s["lanes"]
@@ -10390,6 +10391,132 @@ class TestReviewAutoFix(TestChain):  # CONVAUTOFIX3: was TestAutoFix, which shad
         self.assertTrue(all(len(x) <= 406 for x in lines if x.startswith("    > ")))
         self.assertIn("fix(conveyor): SRCFIX close 'it' now", txt)
         self.assertIsNone(conveyor.lint_slice(self.entry()[0], txt, lambda p: (self.root / p).exists(), {"SRC"}))
+
+
+class TestAuthWatch(Base):
+    """AUTHWATCH: 2026-11-10 the Claude login hit its time limit; 9 h of nudged/respawned lanes, no page."""
+
+    LOST = "Failed to authenticate. API Error: 401 OAuth token has expired. Please run /login"
+
+    def setUp(self):
+        super().setUp()
+        (self.base / "pace.json").write_text(json.dumps({**conveyor.PACE_DEFAULTS, "max_lanes": 6}),
+                                             encoding="utf-8")
+        self.probe = (1, "Not logged in. Run claude auth login")
+        self.wrap()
+
+    def wrap(self):
+        run = self.fake
+        self.c.run = lambda args, **kw: self.probe if args[:2] == ["auth", "status"] else run(args, **kw)
+
+    def lane(self, name, age=0):
+        self.drop(f"{name}.md", HDR.format(name) + "TASK\n", age=age)
+
+    def ev(self, kind):
+        return [e for e in self.events() if e["event"] == kind]
+
+    def step(self, dt=60):
+        self.t += dt
+        self.c.pass_once()
+
+    def restart(self):
+        self.c.release_lock()
+        self.c = Conveyor(self.root, self.fake, now=lambda: self.t,
+                          send=lambda text, **kw: self.pushes.append(text) or "sent",
+                          post=self.fake_post, key=lambda: self.key,
+                          cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
+                          mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs,
+                          net=lambda: self.net, popen=self.fake_popen)
+        self.wrap()
+
+    def lost(self):
+        self.lane("A")
+        self.c.pass_once()
+        self.fake.agent("A").update(state="blocked", status="idle", error=self.LOST)
+        self.step()
+
+    def auth_pages(self):
+        return [p for p in self.pushes if "claude auth login" in p]
+
+    def test_login_text_holds_pages_once_and_spends_nothing(self):
+        self.net = True
+        self.lost()
+        self.assertEqual(self.lanes()["A"]["state"], "AUTH_HOLD")
+        s = self.status()
+        self.assertTrue(s["auth_hold"] and s["usage_stale"])
+        self.assertFalse(s["outage_hold"])
+        self.assertIsNone(s["usage_pct"])
+        (ev,) = self.ev("auth_lost")
+        self.assertEqual((ev["lanes"], ev["matched"]), (["A"], "Failed to authenticate"))
+        self.assertEqual(len(self.auth_pages()), 1)
+        self.assertIn("1 lane bekliyor: A", self.auth_pages()[0])
+        self.assertNotIn("supheli", self.auth_pages()[0])
+        self.lane("B", age=100)
+        for _ in range(30):  # 30 min blocked with the network up: CONV9 would nudge, respawn, redispatch
+            self.step()
+        self.assertNotIn("B", self.fake.bg_names())
+        self.assertEqual(self.fake.bg_names().count("A"), 1)
+        self.assertFalse([c for c in self.fake.calls
+                          if c[0] in ("stop", "respawn") or c[:2] == ["--bg", "--resume"]])
+        ln = self.lanes()["A"]
+        self.assertEqual((ln.get("redispatches", 0), ln.get("nudges", 0), ln["state"]), (0, 0, "AUTH_HOLD"))
+        self.assertEqual(len(self.auth_pages()), 1)
+        self.assertGreaterEqual(self.status()["usage_stale_s"], 30 * 60)
+        probes = self.ev("auth_probe")
+        self.assertTrue(probes and all(e["result"] == "fail" for e in probes))
+
+    def test_repeat_page_is_capped_at_two_hours(self):
+        self.lost()
+        for _ in range(int(conveyor.AUTH_PAGE_EVERY_S // 600) * 2 - 1):  # just under 4 h
+            self.step(600)
+        self.assertEqual(len(self.auth_pages()), 2)
+
+    def test_two_fast_blocked_lanes_are_suspected(self):
+        self.lane("A")
+        self.lane("B", age=1)
+        self.c.pass_once()
+        for n in "AB":
+            self.fake.agent(n).update(state="blocked", status="idle")
+        self.step()
+        self.assertEqual({self.lanes()[n]["state"] for n in "AB"}, {"AUTH_HOLD"})
+        (ev,) = self.ev("auth_lost")
+        self.assertEqual((sorted(ev["lanes"]), ev["matched"]), (["A", "B"], "suspected"))
+        (page,) = self.auth_pages()
+        self.assertIn("(supheli)", page)
+
+    def test_probe_success_survives_a_restart_clears_and_resumes(self):
+        self.lost()
+        self.lane("B", age=100)
+        self.restart()
+        self.step()
+        self.assertTrue(self.status()["auth_hold"])
+        self.assertNotIn("B", self.fake.bg_names())
+        self.probe = (0, '{"loggedIn": true, "authMethod": "claude.ai"}')
+        self.step(conveyor.AUTH_PROBE_S)
+        (ev,) = self.ev("auth_restored")
+        self.assertGreaterEqual(ev["held_s"], conveyor.AUTH_PROBE_S)
+        s = self.status()
+        self.assertEqual((s["auth_hold"], s["usage_stale"], s["usage_stale_s"]), (False, False, None))
+        self.step(600)
+        self.assertEqual(sum("geri geldi" in p for p in self.pushes), 1)
+        resumes = [c for c in self.fake.calls if c[:2] == ["--bg", "--resume"]]
+        self.assertEqual(len(resumes), 1)
+        self.assertIn(conveyor.AUTH_NUDGE, resumes[0][-1])
+        self.assertNotEqual(self.lanes()["A"]["state"], "AUTH_HOLD")
+        self.assertEqual(self.lanes()["A"].get("nudges", 0), 0)
+        self.assertIn("B", self.fake.bg_names())
+        self.assertEqual(len(self.auth_pages()), 1)
+
+    def test_ordinary_blocked_lane_is_not_auth_loss(self):
+        self.lane("A")
+        self.c.pass_once()
+        self.fake.agent("A").update(state="blocked", status="idle")  # one fast blocked lane: CONV9
+        self.step()
+        self.fake.agent("A")["error"] = "API Error: 529 overloaded"
+        self.step()
+        s = self.status()
+        self.assertEqual((s["auth_hold"], s["usage_stale"], s["outage_hold"]), (False, False, True))
+        self.assertFalse(self.ev("auth_lost") or self.auth_pages())
 
 
 if __name__ == "__main__":
