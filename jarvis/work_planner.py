@@ -184,17 +184,32 @@ def plan_project(
 def n6_next(n6_dir: Path | str, verify: n6_deps.Verify) -> n6_deps.Pick:
     """N6-WIRE1: the slices that may start now, from the n6_deps backlog in n6_dir. A
     dependent of an INT starts only after that INT's push is verified; each start is
-    marked (mark_started re-checks); any error starts nothing (held_all, fail closed)."""
+    marked (mark_started re-checks); an error before any mark starts nothing (held_all, fail
+    closed). N6-WIRE1FIX4: an error after a mark returns the already-marked starts (a slice is
+    never left "started" and undispatched), holds the rest and names both in attention."""
+    started: list[tuple[str, str | None]] = []
+    lost: list[tuple[str, str]] = []
+    got = None
     try:
         path = Path(n6_dir) / "deps.json"
         got = n6_deps.pick(path, verify)
-        started = tuple(s for s in got.start if n6_deps.mark_started(path, s[0], verify) is True)
-        lost = tuple((s[0], n6_hold("deps", "mark_started refused").reason) for s in got.start if s not in started)
-        return n6_deps.Pick(started, got.held + lost, got.attention, got.held_all)
+        for s in got.start:
+            if n6_deps.mark_started(path, s[0], verify) is True:
+                started.append(s)
+            else:
+                lost.append((s[0], n6_hold("deps", "mark_started refused").reason))
+        return n6_deps.Pick(tuple(started), got.held + tuple(lost), got.attention, got.held_all)
     except Exception as exc:
         # N6-WIRE1FIX: the hold text comes from the one wiring-hold builder.
         held = n6_hold("deps", f"N6-WIRE1 deps held: {type(exc).__name__}")
-        return n6_deps.Pick((), (), (f"{held.rule_id}: {held.reason}",), held_all=True)
+        note = f"{held.rule_id}: {held.reason}"
+        if not started or got is None:
+            return n6_deps.Pick((), (), (note,), held_all=True)
+        done = {s[0] for s in started} | {s for s, _ in lost}
+        rest = tuple((s[0], held.reason) for s in got.start if s[0] not in done)
+        note += "; started before it: " + ", ".join(s[0] for s in started)
+        return n6_deps.Pick(tuple(started), tuple(got.held) + tuple(lost) + rest, tuple(got.attention) + (note,),
+                            got.held_all)
 
 
 def seed_backlog(path, planned: Planned) -> None:

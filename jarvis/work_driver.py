@@ -398,11 +398,16 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
         # no worker revision, no FAILED_AFTER_CAP. Only ACCEPTING under N6 re-checks; without
         # N6 _accept would skip refcheck and apply, so it holds (fail closed).
         if step.state == StepState.ACCEPTING and n6 is not None:
-            findings, ok = _accept(step, stage, ports)
+            # N6-WIRE1FIX4: the re-check is held: any non-accept outcome before refcheck accepts
+            # comes back as the hold itself and writes no revisable gate row.
+            findings, ok = _accept(step, stage, ports, held=True)
             if ok:
                 return accepted()
         if findings[0].get("n6_hold") == "yes":
             return hold("refcheck", findings[0]["detail"], n6_gate=True)
+    elif findings is None and n6 is not None and step.state == StepState.ACCEPTING:
+        # N6-WIRE1FIX4 F3: unreadable findings may hide a refcheck hold: hold before capped().
+        return hold("refcheck", f"findings_unreadable:{step.key}:{step.attempt}", n6_gate=True)
     if findings and _fatal(findings):  # N6-HARD2C H5: a persisted non-retriable failure stays fatal
         return ended(findings)
     if step.state in _REVISABLE:
@@ -512,8 +517,10 @@ def _scope(stage: Stage, ports: Ports) -> list[object]:
     return refusals or list(ports.scope_check(stage))
 
 
-def _accept(step: WorkStep, stage: Stage, ports: Ports) -> tuple[_Findings, bool]:
-    """Checks -> regression -> review -> evidence -> apply, all fail-closed."""
+def _accept(step: WorkStep, stage: Stage, ports: Ports, held: bool = False) -> tuple[_Findings, bool]:
+    """Checks -> regression -> review -> evidence -> apply, all fail-closed. ``held``
+    (N6-WIRE1FIX4) re-checks a step carrying a persisted refcheck hold: until refcheck
+    accepts, every non-accept outcome is returned as that hold and writes no gate row."""
     results: list[CheckResult] = []
     verdicts: list[RegressionVerdict] = []
 
@@ -543,16 +550,20 @@ def _accept(step: WorkStep, stage: Stage, ports: Ports) -> tuple[_Findings, bool
     gates: tuple[tuple[str, Callable[[], list[str]]], ...] = (
         ("checks", checks), ("regression", regression), ("review", review))
     for name, gate in gates:
-        findings = _gate(step, name, ports, gate)
+        findings = _gate(step, name, ports, gate, quiet=held)
         if findings:
+            if held:  # the hold stays the step's failure: nothing a worker may revise
+                return (_n6_held(f"resume:{name}:{findings[0]['detail']}"),), False
             return findings, False
     n6 = getattr(ports, "n6", None)
-    if n6 is not None:  # shadow only: no gate event without N6
+    if n6 is not None or held:  # shadow only: no gate event without N6
         # N6-WIRE1: an INT result is accepted only through n6_refcheck (read_evidence then
         # accept). N6-WIRE1FIX2: any refusal or error is an N6 hold the driver turns into
         # wait/n6.refcheck/none; a worker cannot fix an unverified INT push (no revision).
         try:
             spec = n6.int_check(step) if n6.int_check is not None else None
+            if spec is None and held:  # N6-WIRE1FIX4 F2: a held step is never applied unchecked
+                raise LookupError("no_int_check_on_resume")
             if spec is not None:
                 git, ref, read_report, run_id = spec
                 n6_refcheck.accept(git, n6_refcheck.read_evidence(git, ref, read_report, run_id), run_id)
@@ -561,7 +572,7 @@ def _accept(step: WorkStep, stage: Stage, ports: Ports) -> tuple[_Findings, bool
                 msg = str(exc)
             except Exception:  # an unprintable error still holds
                 msg = "?"
-            return ({"gate": "refcheck", "detail": f"{type(exc).__name__}:{msg}"[:300], "n6_hold": "yes"},), False
+            return (_n6_held(f"{type(exc).__name__}:{msg}"),), False
         _gate_event(step, "refcheck", (), ports)
     verdict = verdicts.pop()
     name = "evidence"
@@ -603,13 +614,20 @@ def _receipt(step: WorkStep, key: str, ref: str, ports: Ports) -> None:
     )
 
 
-def _gate(step: WorkStep, name: str, ports: Ports, gate: Callable[[], Iterable[object]]) -> _Findings:
+def _gate(step: WorkStep, name: str, ports: Ports, gate: Callable[[], Iterable[object]],
+          quiet: bool = False) -> _Findings:
     try:
         findings = tuple(_finding(name, str(item)) for item in gate())
     except Exception as exc:
         findings = (_gate_error(name, exc),)
-    _gate_event(step, name, findings, ports)
+    if not (quiet and findings):  # N6-WIRE1FIX4: a held re-check writes no failing row
+        _gate_event(step, name, findings, ports)
     return findings
+
+
+def _n6_held(detail: str) -> _Finding:
+    # N6-WIRE1FIX4: the one refcheck-hold finding; the driver turns it into wait/n6.refcheck/none.
+    return {"gate": "refcheck", "detail": detail[:300], "n6_hold": "yes"}
 
 
 def _gate_error(gate: str, exc: Exception) -> _Finding:
@@ -641,17 +659,25 @@ def _gate_event(step: WorkStep, name: str, findings: _Findings, ports: Ports,
 
 def _ledger_findings(step: WorkStep, ports: Ports) -> _Findings | None:
     # N6-13FIX: the last failing gate of the step's current attempt; None (unreadable) holds the step.
+    # N6-WIRE1FIX4: a refcheck hold is sticky: while the attempt's last refcheck row is not a
+    # pass, that row is the finding, whatever failed after it; an unreadable hold row still holds.
     port = getattr(ports, "gate_findings", None)
+    bad: _Findings | None = None
     try:
         payloads = list(port(step)) if callable(port) else []
         failing = [p for p in payloads if isinstance(p, Mapping) and p.get("passed") is False
                    and p.get("gate") not in ("root_cause", "retry_cap")]
+        # a hold row is also known by its decision, so a damaged gate name cannot unhold it
+        ref = [p for p in payloads if isinstance(p, Mapping) and (p.get("gate") == "refcheck" or (
+            isinstance(p.get("decision"), Mapping) and p["decision"].get("rule_id") == "n6.refcheck"))]
+        if ref and ref[-1].get("passed") is not True:
+            bad, failing = (_n6_held("hold_row_unreadable"),), ref[-1:]
         if not failing:
             return None
         last = failing[-1]
-        gate, details = str(last["gate"]), last.get("findings")
+        gate, details = "refcheck" if bad else str(last["gate"]), last.get("findings")
         if not isinstance(details, list) or not details or not all(isinstance(d, str) and d for d in details):
-            return None
+            return bad
         # N6-HARD2C H5: rows before H5 lack both keys (legacy, read as retriable, no message);
         # a row with either key must carry both, parallel to "findings", or it is unreadable.
         flags, messages = last.get("retriable"), last.get("messages")
@@ -661,7 +687,7 @@ def _ledger_findings(step: WorkStep, ports: Ports) -> _Findings | None:
                 or len(flags) != len(details) or len(messages) != len(details)
                 or not all(f in ("yes", "no") for f in flags)
                 or not all(isinstance(m, str) for m in messages)):
-            return None
+            return bad
         out: list[_Finding] = []
         for d, f, m in zip(details, flags, messages):
             found = _finding(gate, d)
@@ -674,7 +700,7 @@ def _ledger_findings(step: WorkStep, ports: Ports) -> _Findings | None:
             out.append(found)
         return tuple(out)
     except Exception:
-        return None
+        return bad
 
 
 def _finding(gate: str, detail: str) -> _Finding:
