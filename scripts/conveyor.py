@@ -1579,7 +1579,7 @@ class Conveyor:
         STUCK on API errors within API_PAGE_WINDOW_S -> at once and every API_PAGE_EVERY_S
         while it lasts. PAGEFIX: the orchestrator-stale alarm is hb_watch.py's alone (sleep-aware)."""
         now = self.now()
-        ts = sorted(ln["api_err_ts"] for ln in lanes.values() if ln.get("api_err_ts") and (
+        ts = sorted(ln["api_err_ts"] for ln in lanes.values() if ln.get("api_err_ts") and not ln.get("auth_parked") and (
             (ln.get("paused") and not ln.get("finished"))
             or (ln.get("status") == "STUCK" and now - ln.get("finished_ts", 0) < API_PAGE_EVERY_S)))
         f = self.pager_flag("api_outage")
@@ -2190,10 +2190,13 @@ class Conveyor:
                 old = ln.pop("auth_err")
                 if s := [t for t in texts if old in t]:
                     ln["auth_seen"] = s
-            seen = ln.get("auth_seen") or []  # error texts consumed by the last auth restore
-            if seen and not set(seen) & set(texts):  # gone from the session: its next occurrence is new
-                ln.pop("auth_seen")
-                seen = []
+            # error texts consumed by the last auth restore; each expires on its own once it left the
+            # session, so the next byte-identical occurrence of it is new (AUTHWATCHFIX2)
+            seen = [t for t in ln.get("auth_seen") or [] if t in texts]
+            if seen:
+                ln["auth_seen"] = seen
+            else:
+                ln.pop("auth_seen", None)
             auth_txt = self.auth_text([t for t in texts if t not in seen])
             if auth_txt:
                 ln.update(auth_parked=True, auth_err=auth_txt)
@@ -2361,16 +2364,20 @@ class Conveyor:
                 self.pager_flag("auth", {})
                 self.event("auth_restored", held_s=int(now - h["since"]), lanes=parked)
                 self.page("Claude Code girisi geri geldi, isler devam ediyor")
+                held = bool(self.pager_flag("outage"))
                 for n in parked:
                     ln = live[n]
                     for k in ("auth_parked", "auth_err", "blocked_since", "blocked_attention", "idle_since",
                               "respawned_ts"):
                         ln.pop(k, None)
+                    if not held:  # AUTHWATCHFIX2: its pre-auth outage pause goes with the login loss; only
+                        for k in ("paused", "api_err", "api_err_ts", "outage_nudged"):  # new API text re-pauses.
+                            ln.pop(k, None)  # A live hold keeps its paused lanes (outage() counts them; clear nudges)
                     a = by_id.get(ln["id"])
                     seen = [t for t in self.err_texts(a) if AUTH_ERR_RE.search(t) or API_ERR_RE.search(t)]
                     if seen:  # consumed: neither track() path re-acts on it, only new text does
                         ln["auth_seen"] = seen
-                    if a and "pid" in a:
+                    if a and "pid" in a and not ln.get("paused"):  # a held lane waits for the outage_clear nudge
                         self.nudge(n, ln, a, AUTH_NUDGE, "auth_resume")  # uncounted (kind != "nudge")
                 return
         if now - h.get("paged", h["since"]) >= AUTH_PAGE_EVERY_S:

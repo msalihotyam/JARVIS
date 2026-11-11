@@ -10593,6 +10593,99 @@ class TestAuthWatch(Base):
         self.assertEqual((s["auth_hold"], s["usage_stale"], s["outage_hold"]), (False, False, True))
         self.assertFalse(self.ev("auth_lost") or self.auth_pages())
 
+    def kesinti(self):
+        return (len(self.ev("outage_hold")), sum("Kesinti" in p for p in self.pushes))
+
+    def login_back(self):
+        self.probe = (0, '{"loggedIn": true}')
+        self.step(conveyor.AUTH_PROBE_S)
+        for _ in range(3):
+            self.step(600)
+
+    def test_auth_parked_lane_sheds_its_earlier_outage_pause(self):
+        # AUTHWATCHFIX2 F1: paused by a 529, auth-parked, B clears the hold, login back -> no 2nd hold/page
+        self.lane("A")
+        self.lane("B")
+        self.c.pass_once()
+        for n in "AB":
+            self.fake.agent(n)["error"] = "API Error: 529 overloaded"
+        self.step()
+        self.assertEqual([self.lanes()[n]["state"] for n in "AB"], ["PAUSED", "PAUSED"])
+        self.fake.agent("A")["error"] = self.LOST
+        self.step()
+        self.assertEqual(self.lanes()["A"]["state"], "AUTH_HOLD")
+        self.fake.agents.remove(self.fake.agent("B"))
+        self.step()
+        self.assertTrue(self.ev("outage_clear"))
+        self.assertFalse(self.status()["outage_hold"])
+        self.assertEqual(self.kesinti(), (1, 1))
+        self.login_back()
+        ln = self.lanes()["A"]
+        self.assertNotIn(ln.get("state"), ("PAUSED", "AUTH_HOLD"))
+        self.assertFalse({"paused", "api_err", "auth_parked"} & set(ln))
+        self.assertFalse(self.status()["outage_hold"])
+        self.assertEqual(self.kesinti(), (1, 1))
+        self.fake.agent("A")["error"] = "API Error: 529 overloaded"  # genuinely new, byte-identical: CONV9
+        self.step()
+        self.assertEqual(self.lanes()["A"]["state"], "PAUSED")
+        self.assertTrue(self.status()["outage_hold"])
+        self.step(conveyor.PAGE_GAP_S)  # the queued page goes out with the next push
+        self.assertEqual(self.kesinti(), (2, 2))
+
+    def test_lane_named_by_a_live_hold_stays_in_it_after_restore(self):
+        self.lane("A")
+        self.c.pass_once()
+        self.fake.agent("A")["error"] = "API Error: 529 overloaded"
+        self.step()
+        self.fake.agent("A")["error"] = self.LOST
+        self.step()
+        self.assertEqual(self.lanes()["A"]["state"], "AUTH_HOLD")
+        self.assertTrue(self.status()["outage_hold"])
+        self.login_back()
+        self.assertEqual(self.lanes()["A"]["state"], "PAUSED")
+        self.assertTrue(self.status()["outage_hold"])
+        self.assertEqual(self.kesinti(), (1, 1))
+        self.assertFalse(self.ev("outage_clear"))
+        self.assertEqual(self.auth_resumes(), 0)  # no resume into a live outage; outage_clear nudges it
+
+    def auth_resumes(self):
+        return sum(c[:2] == ["--bg", "--resume"] and conveyor.AUTH_NUDGE in c[-1] for c in self.fake.calls)
+
+    def test_lane_paused_into_a_live_hold_it_is_not_named_in_stays_in_it(self):
+        self.lane("A")
+        self.lane("B")
+        self.c.pass_once()
+        self.fake.agent("B")["error"] = "API Error: 529 overloaded"
+        self.step()
+        self.assertTrue(self.status()["outage_hold"])
+        self.fake.agent("A")["error"] = "API Error: 500 internal server error"
+        self.step()
+        self.assertEqual(self.lanes()["A"]["state"], "PAUSED")
+        self.fake.agent("A")["error"] = self.LOST
+        self.step()
+        self.assertEqual(self.lanes()["A"]["state"], "AUTH_HOLD")
+        self.login_back()
+        self.assertEqual([self.lanes()[n]["state"] for n in "AB"], ["PAUSED", "PAUSED"])
+        self.assertTrue(self.status()["outage_hold"])
+        self.assertEqual(self.kesinti(), (1, 1))
+        self.assertEqual(self.auth_resumes(), 0)
+
+    def test_each_consumed_text_expires_on_its_own(self):
+        # AUTHWATCHFIX2 F2: the sibling field keeps its text, the cleared one re-parks on the same text
+        self.LOST = "OAuth token has expired"
+        self.lost()
+        self.fake.agent("A")["errorType"] = "authentication_error"
+        self.step()
+        self.login_back()
+        self.assertIn(self.LOST, self.lanes()["A"]["auth_seen"])
+        self.fake.agent("A").pop("error")
+        self.step()
+        self.assertEqual(self.lanes()["A"]["auth_seen"], ["authentication_error"])
+        self.fake.agent("A")["error"] = self.LOST
+        self.step()
+        self.assertEqual(self.lanes()["A"]["state"], "AUTH_HOLD")
+        self.assertEqual(len(self.ev("auth_lost")), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
