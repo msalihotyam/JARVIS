@@ -2185,8 +2185,17 @@ class Conveyor:
                 continue
             if ln.get("finished"):
                 continue
-            auth_txt = self.auth_text(a)
-            if auth_txt and auth_txt != ln.get("auth_err"):  # the same stale text never re-parks
+            texts = self.err_texts(a)
+            if "auth_err" in ln and not ln.get("auth_parked"):  # restored before AUTHWATCHFIX1: consume it now
+                old = ln.pop("auth_err")
+                if s := [t for t in texts if old in t]:
+                    ln["auth_seen"] = s
+            seen = ln.get("auth_seen") or []  # error texts consumed by the last auth restore
+            if seen and not set(seen) & set(texts):  # gone from the session: its next occurrence is new
+                ln.pop("auth_seen")
+                seen = []
+            auth_txt = self.auth_text([t for t in texts if t not in seen])
+            if auth_txt:
                 ln.update(auth_parked=True, auth_err=auth_txt)
             elif auth and ln.get("state") == "blocked":  # blocked while the login is gone: same cause
                 ln["auth_parked"] = True
@@ -2194,7 +2203,9 @@ class Conveyor:
                 ln["state"] = "AUTH_HOLD"
                 continue  # auth hold: no nudge/respawn/redispatch, counters untouched; auth_watch() resumes
             err = a is not None and next((v for k, v in a.items() if API_KEY_RE.search(k)
-                                          and isinstance(v, str) and API_ERR_RE.search(v)), None)
+                                          and isinstance(v, str) and API_ERR_RE.search(v)
+                                          and not AUTH_ERR_RE.search(v) and v not in seen),
+                                         None)  # auth owns its texts; a restore consumed the stale ones
             if err and err != ln.get("api_err"):  # the same stale text never re-pauses a cleared lane
                 ln.update(paused=True, api_err=err, api_err_ts=self.now())  # outage(): the hold, its page and its nudges
             if ln.get("paused") and a is None:  # its session is gone: the DEAD path, not a held lane
@@ -2288,16 +2299,21 @@ class Conveyor:
         self.redispatch(name, ln)
         return True
 
-    def auth_text(self, a):
-        """AUTHWATCH: the login-loss text in the session's error/state/status fields, or in its
-        last transcript entry when that is the CLI's own API error (blocked sessions only); None."""
+    def err_texts(self, a):
+        """The session's error/state/status fields, plus its last transcript entry when that is
+        the CLI's own API error (blocked sessions only); [] without a session."""
         if a is None:
-            return None
+            return []
         texts = [v for k, v in a.items() if API_KEY_RE.search(k) and isinstance(v, str)]
         if a.get("state") == "blocked":
             d = self.last_assistant(a)
             if d and d.get("isApiErrorMessage") is True:
                 texts.append(json.dumps(d.get("message")))
+        return texts
+
+    @staticmethod
+    def auth_text(texts):
+        """AUTHWATCH: the login-loss phrase in the first text that has one; None."""
         m = next((m for m in map(AUTH_ERR_RE.search, texts) if m), None)
         return m and m.group(0)
 
@@ -2347,9 +2363,13 @@ class Conveyor:
                 self.page("Claude Code girisi geri geldi, isler devam ediyor")
                 for n in parked:
                     ln = live[n]
-                    for k in ("auth_parked", "blocked_since", "blocked_attention", "idle_since", "respawned_ts"):
+                    for k in ("auth_parked", "auth_err", "blocked_since", "blocked_attention", "idle_since",
+                              "respawned_ts"):
                         ln.pop(k, None)
                     a = by_id.get(ln["id"])
+                    seen = [t for t in self.err_texts(a) if AUTH_ERR_RE.search(t) or API_ERR_RE.search(t)]
+                    if seen:  # consumed: neither track() path re-acts on it, only new text does
+                        ln["auth_seen"] = seen
                     if a and "pid" in a:
                         self.nudge(n, ln, a, AUTH_NUDGE, "auth_resume")  # uncounted (kind != "nudge")
                 return
@@ -2668,6 +2688,7 @@ class Conveyor:
         lane again from its saved prompt with a 'continue' preface."""
         ln["redispatches"] = ln.get("redispatches", 0) + 1
         ln.pop("respawned_ts", None)
+        ln.pop("auth_seen", None)  # a new session: its errors are new
         try:
             text = (self.base / ln["prompt"]).read_text(encoding="utf-8")
         except (OSError, KeyError) as e:

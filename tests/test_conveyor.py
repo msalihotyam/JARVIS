@@ -10507,6 +10507,81 @@ class TestAuthWatch(Base):
         self.assertIn("B", self.fake.bg_names())
         self.assertEqual(len(self.auth_pages()), 1)
 
+    def restored(self, text):
+        """Park A on `text` (auth AND API class), restore the login, run 3 more passes."""
+        self.LOST = text
+        self.lost()
+        self.assertEqual(self.lanes()["A"]["state"], "AUTH_HOLD")
+        self.probe = (0, '{"loggedIn": true}')
+        self.step(conveyor.AUTH_PROBE_S)
+        self.assertEqual(len(self.ev("auth_restored")), 1)
+        for _ in range(3):
+            self.step(600)
+
+    def assert_consumed(self):
+        ln, s = self.lanes()["A"], self.status()
+        self.assertNotIn(ln["state"], ("PAUSED", "AUTH_HOLD"))
+        self.assertFalse(ln.get("paused") or ln.get("auth_parked"))
+        self.assertEqual((s["outage_hold"], s["auth_hold"]), (False, False))
+        self.assertFalse(self.ev("outage_hold") or [p for p in self.pushes if "Kesinti" in p])
+        # the auth_resume nudge (stop + resume) only, no outage_clear one
+        self.assertEqual(len([c for c in self.fake.calls if c[:2] == ["--bg", "--resume"]]), 1)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "stop"]), 1)
+        self.assertEqual(len(self.ev("auth_lost")), 1)
+
+    def test_restore_consumes_stale_text_in_both_classes(self):
+        self.restored("API Error: invalid api key. Please run /login")
+        self.assert_consumed()
+
+    def test_restore_consumes_stale_401_authentication_error_body(self):
+        self.restored('API Error: 401 {"type":"error","error":{"type":"authentication_error",'
+                      '"message":"Invalid API key"}} Please run /login')
+        self.assert_consumed()
+
+    def test_restore_consumes_api_text_in_a_sibling_field(self):
+        self.LOST = "OAuth token has expired"
+        self.lost()
+        self.fake.agent("A")["errorType"] = "authentication_error"
+        self.step()
+        self.assertEqual(self.lanes()["A"]["state"], "AUTH_HOLD")
+        self.probe = (0, '{"loggedIn": true}')
+        self.step(conveyor.AUTH_PROBE_S)
+        for _ in range(3):
+            self.step(600)
+        self.assert_consumed()
+
+    def test_consumed_text_survives_a_restart(self):
+        self.restored("API Error: invalid api key. Please run /login")
+        self.restart()
+        self.step()
+        self.assert_consumed()
+
+    def test_new_api_error_after_restore_takes_the_outage_path(self):
+        self.restored("API Error: invalid api key. Please run /login")
+        self.fake.agent("A")["error"] = "API Error: 529 overloaded"
+        self.step()
+        self.assertEqual(self.lanes()["A"]["state"], "PAUSED")
+        self.assertTrue(self.status()["outage_hold"])
+        self.assertEqual(len(self.ev("auth_lost")), 1)
+
+    def test_new_auth_text_after_restore_reparks(self):
+        self.restored("API Error: invalid api key. Please run /login")
+        self.fake.agent("A")["error"] = "OAuth token has expired"
+        self.step()
+        self.assertEqual(self.lanes()["A"]["state"], "AUTH_HOLD")
+        self.assertEqual(len(self.ev("auth_lost")), 2)
+        self.assertFalse(self.status()["outage_hold"])
+
+    def test_same_auth_text_reparks_once_it_left_the_session(self):
+        self.restored("API Error: invalid api key. Please run /login")
+        self.fake.agent("A").pop("error")
+        self.step()
+        self.assertNotIn("auth_seen", self.lanes()["A"])
+        self.fake.agent("A")["error"] = self.LOST
+        self.step()
+        self.assertEqual(self.lanes()["A"]["state"], "AUTH_HOLD")
+        self.assertEqual(len(self.ev("auth_lost")), 2)
+
     def test_ordinary_blocked_lane_is_not_auth_loss(self):
         self.lane("A")
         self.c.pass_once()
