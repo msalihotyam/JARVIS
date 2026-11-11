@@ -10201,7 +10201,7 @@ class PhoneCmd(Base):
         self.assertNotIn("restart", self.phone())
 
 
-class TestAutoFix(TestChain):
+class TestReviewAutoFix(TestChain):  # CONVAUTOFIX3: was TestAutoFix, which shadowed the CONVAUTO one
     """CONVAUTOFIX: a BLOCKED chain review queues its own stacked FIX slice from a template."""
     FIX = "F1 MAJOR the gate is open\nFIX SLICE: SRCFIX - close the gate\n"
 
@@ -10270,19 +10270,86 @@ class TestAutoFix(TestChain):
                          (["d" * 40, self.SHA], "e" * 40, "ROOT", "sonnet"))
         self.assertIn("stack ddddddd -> ccccccc; review base eeeeeee", self.prompt("SRCFIX").read_text(encoding="utf-8"))
 
-    def test_second_blocked_review_of_a_series_is_fable(self):
+    def fable(self, on):
+        f = self.base / "pace.json"
+        p = json.loads(f.read_text(encoding="utf-8")) if f.exists() else dict(conveyor.PACE_DEFAULTS)
+        f.write_text(json.dumps({**p, "autofix_fable": on}), encoding="utf-8")
+        self.assertIsNone(self.c.load_pace()[1])
+
+    def second_blocked_review(self):
+        """CONVAUTOFIX3 F3: CLREV-SRC BLOCKED with only MINOR findings (skipped), then the
+        recorded CDX-SRC step BLOCKED with a FIX SLICE: the second BLOCKED review of the series."""
         self.ready()
-        self.patch_src(auto_fix=1)
+        ap = self.blocked("F1 MINOR x\n")
+        self.assertIn("no BLOCKER/MAJOR", self.ev("autofix_skipped")[-1]["reason"])
+        [rec] = ap["chain"].values()
+        rec["steps"].append("CDX-SRC")
+        self.blocked(self.FIX, ap, name="CDX-SRC")
+        [new] = self.entry()
+        self.assertEqual(new["auto_fix"], 1)  # the cap counts generated fixes, the switch counts reviews
+        return new["model"], self.prompt("SRCFIX").read_text(encoding="utf-8")
+
+    def test_second_blocked_review_of_a_series_is_fable_when_switched_on(self):
+        self.fable(True)
+        model, txt = self.second_blocked_review()
+        self.assertEqual(model, "fable")
+        self.assertTrue(txt.startswith("@jarvis lane=SRCFIX model=fable "), txt[:60])
+
+    def test_fable_switch_is_off_by_default(self):
+        self.assertEqual(self.second_blocked_review()[0], "sonnet")
+
+    def test_fable_switch_false_keeps_the_source_model(self):
+        self.fable(False)
+        self.assertEqual(self.second_blocked_review()[0], "sonnet")
+
+    def test_first_blocked_review_stays_on_the_source_model_with_the_switch_on(self):
+        self.fable(True)
+        self.ready()
+        self.patch_src(auto_fix=1)  # a generated fix's own first BLOCKED review: 1 review, not 2
         self.blocked(self.FIX)
         [new] = self.entry()
-        self.assertEqual((new["model"], new["auto_fix"]), ("fable", 2))
-        self.assertTrue(self.prompt("SRCFIX").read_text(encoding="utf-8").startswith("@jarvis lane=SRCFIX model=fable "))
+        self.assertEqual((new["model"], new["auto_fix"]), ("sonnet", 2))
+
+    def test_autofix_fable_must_be_a_bool(self):
+        f = self.base / "pace.json"
+        f.write_text(json.dumps({**conveyor.PACE_DEFAULTS, "autofix_fable": "yes"}), encoding="utf-8")
+        p, err = self.c.load_pace()
+        self.assertIn("autofix_fable", err)
+        self.assertNotIn("autofix_fable", p)  # invalid: fail-closed, the switch stays off
+
+    def test_review_not_in_the_chain_record_is_skipped(self):
+        self.ready()
+        ap = self.blocked(self.FIX, name="CDX-SRC")  # hand-dispatched: SRC's chain is CLREV, INT
+        self.assertEqual(self.ev("autofix_skipped")[-1]["reason"], "review is not a recorded chain step")
+        self.assertEqual([r.get("series") for r in ap["autofix"].values()], [None])  # not an O74 count
+        self.assertEqual((self.ev("autofix_queued"), self.entry()), ([], []))
+        self.assertFalse((self.base / "ack" / conveyor.ack_name("CDX-SRC")).exists())
+
+    def test_bad_sha_in_the_chain_record_is_skipped(self):
+        self.ready()
+        ap = self.state()
+        ap["chain"] = {"SRC@--output=x": {"steps": ["CLREV-SRC"], "at": self.t}}
+        self.blocked(self.FIX, ap)
+        self.assertEqual(self.ev("autofix_skipped")[-1]["reason"], "bad chain record sha")
+        self.assertEqual(self.entry(), [])
+
+    def test_stacked_sha_comes_from_the_record_that_holds_the_review(self):
+        self.ready()
+        ap = self.state()
+        ap["chain"]["SRC@" + "f" * 40] = {"steps": ["CLREV-OTHER"], "at": self.t}  # later, not ours
+        self.blocked(self.FIX, ap)
+        [new] = self.entry()
+        self.assertEqual(new["stack"], [self.SHA])
+        self.assertIn(f"BASE AT {self.SHA}", self.prompt("SRCFIX").read_text(encoding="utf-8"))
 
     def test_negatives_create_nothing(self):
         self.ready()
         cases = [("F1 MINOR x\nF2 NIT y\nFIX SLICE: SRCFIX - y\n", "no BLOCKER/MAJOR"),
                  ("F1 MAJOR x\n", "no FIX SLICE line"),
                  ("F1 BLOCKER x\nFIX SLICE: AFIX1 - y\nFIX SLICE: AFIX2 - y\n", "2 FIX SLICE lines"),
+                 ("F1 MAJOR x\nFIX SLICE: SRCFIX - y\n> FIX SLICE: SRCFIX2\n", "2 FIX SLICE lines"),
+                 ("F1 MAJOR x\n- FIX SLICE:SRCFIX2 y\nFIX SLICE: SRCFIX - y\n", "2 FIX SLICE lines"),
+                 ("F1 MAJOR x\nFIX SLICE: SRCFIX\n", "malformed FIX SLICE line"),
                  ("F1 MAJOR x\nFIX SLICE: bad_id - y\n", "bad id"),
                  ("F1 MAJOR x\nFIX SLICE: INT-SRC - y\n", "bad id"),
                  ("F1 MAJOR x\nFIX SLICE: CLREV-X - y\n", "bad id"),

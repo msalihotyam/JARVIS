@@ -3206,6 +3206,8 @@ class Conveyor:
                 raise ValueError(f"power_switch_query_cmd {q!r}")
             if not isinstance(skip, list) or not all(isinstance(s, str) and s for s in skip):
                 raise ValueError(f"power_switch_skip_plans {skip!r}")
+            if not isinstance(p.get("autofix_fable", False), bool):  # CONVAUTOFIX3: O74 switch, off by default
+                raise ValueError(f"autofix_fable {p['autofix_fable']!r}")
             if p["mode"] == "paced":
                 datetime.fromisoformat(p["window_start"]).timestamp()  # TypeError when null
             return p, None
@@ -3237,7 +3239,7 @@ class Conveyor:
                 p.pop("salih_keep_pct", None)  # CONVRESERVE: the keep expires with the window
                 p.pop("salih_keep_window", None)
                 keep =[*PACE_DEFAULTS, *(k for k in ("max_lanes", "min_lanes", "test_pool_tokens",
-                                                      "claude_version") if k in p)]
+                                                      "claude_version", "autofix_fable") if k in p)]
                 (self.base / "pace.json").write_text(
                     json.dumps({k: p[k] for k in keep}, indent=2), encoding="utf-8")
                 self.event("quota_reset", before=prev, after=u, window_start=p["window_start"])
@@ -4355,10 +4357,11 @@ class Conveyor:
         file build/conveyor/autofix_off turns it off. PAUSE and pace still gate the dispatch."""
         done = ap.setdefault("autofix", {})
         root = self.base.parent.parent
+        tag = {}  # the series once known: a skipped BLOCKED review still counts for the fable switch
 
         def skip(reason, key=None):
             if key:
-                done[key] = {"skip": reason, "at": self.now()}
+                done[key] = {"skip": reason, "at": self.now(), **tag}
             self.event("autofix_skipped", src=name, reason=reason)
 
         if (self.base / "autofix_off").exists():
@@ -4374,22 +4377,36 @@ class Conveyor:
         if text is None:
             return skip("no report", key)
         src = name.split("-", 1)[1]
-        keys = [k for k in ap.get("chain", {}) if k.startswith(src + "@")]
+        chain = ap.get("chain")
+        # CONVAUTOFIX3 F2: only a review the chain itself recorded as a step; its sha is that record's
+        keys = [k for k, r in (chain.items() if isinstance(chain, dict) else ())
+                if k.startswith(src + "@") and isinstance(r, dict) and isinstance(r.get("steps"), list)
+                and name in r["steps"]]
         slices = self.load_backlog()[0]
         s = next((x for x in slices if x.get("id") == src), None)
-        if not keys or s is None:
+        if s is None:
             return skip("no chain source", key)
+        series = s.get("series") or src
+        if not keys:  # not a chain step, so not counted for O74 (no series tag)
+            return skip("review is not a recorded chain step", key)
+        tag["series"] = series
         sha = keys[-1].split("@", 1)[1]
+        if not SHA_RE.fullmatch(sha):
+            return skip("bad chain record sha", key)
         if not {"BLOCKER", "MAJOR"} & set(AUTOFIX_F_RE.findall(text)):
             return skip("no BLOCKER/MAJOR finding", key)
-        fixes = AUTOFIX_FIX_RE.findall(text)
-        if len(fixes) != 1:
-            return skip(f"{len(fixes)} FIX SLICE lines" if fixes else "no FIX SLICE line", key)
+        # CONVAUTOFIX3 F1: every FIX SLICE: line counts, and the only one must be well-formed
+        lines = re.findall(r"(?m)^[ \t>*`-]*FIX SLICE:.*$", text)
+        if len(lines) != 1:
+            return skip(f"{len(lines)} FIX SLICE lines" if lines else "no FIX SLICE line", key)
+        fix = AUTOFIX_FIX_RE.fullmatch(lines[0])
+        if not fix:
+            return skip("malformed FIX SLICE line", key)
 
         def clean(x):
             return re.sub(r"[\x00-\x1f\x7f\x85\u2028\u2029]", "", x).strip()[:400]
 
-        nid, ftext = fixes[0][0], clean(fixes[0][1]).replace('"', "'")[:120]
+        nid, ftext = fix.group(1), clean(fix.group(2)).replace('"', "'")[:120]
         if (not AUTOFIX_ID_RE.fullmatch(nid) or INT_RE.match(nid) or re.search("CLREV|CDX", nid)
                 or CHAIN_SUFFIX_RE.search(nid)):
             return skip(f"bad id {clean(nid)[:60]!r}", key)
@@ -4397,8 +4414,8 @@ class Conveyor:
         prompt = f"build/conveyor/prompts/{nid}.md"
         if nid in ids or nid in lanes or (root / prompt).exists() or self.find_report(nid):
             return skip(f"id {nid} exists", key)
-        series = s.get("series") or src
-        n = max(s.get("auto_fix") or 0, sum(1 for r in done.values() if r.get("series") == series)) + 1
+        mine = [r for r in done.values() if isinstance(r, dict) and r.get("series") == series]
+        n = max(s.get("auto_fix") or 0, sum(1 for r in mine if "id" in r)) + 1
         if n > AUTOFIX_MAX:
             return skip(f"series cap: {series} has {n - 1} auto FIX slices", key)
         rb = s.get("review_base")
@@ -4425,7 +4442,10 @@ class Conveyor:
         stack = list(s.get("stack") or []) + [sha]
         rep = f"build/reports/{nid}.md"
         files = [f for f in s.get("files", []) if f != f"build/reports/{src}.md"] + [rep]
-        model = "fable" if n >= 2 else s["model"]
+        # CONVAUTOFIX3 F3: O74 counts BLOCKED reviews of the series (skipped ones too, this one
+        # included); suspended by Salih 2026-11-10, so off unless pace.json autofix_fable is true
+        fable = self.load_pace()[0].get("autofix_fable") is True
+        model = "fable" if fable and len(mine) + 1 >= 2 else s["model"]
         vals = {"ID": nid, "MODEL": model, "EFFORT": s["effort"], "TIER": s["tier"], "SHA": sha, "SRC": src,
                 "STACK": " -> ".join(x[:7] for x in stack), "RB": rb[:7], "BRANCH": nid.lower(),
                 "REVIEW": f"build/reports/{name}.md", "SRCREP": f"build/reports/{src}.md",
