@@ -117,13 +117,87 @@ class LimitedRun(unittest.TestCase):
             (self.n6 / "LIMITED_ON").unlink()
             return _sit()
 
+        snap = self.states()
         notes = lr.tick(self.root, self.ports(situation=situation))
         self.assertIn("A-1: handed back (switch off)", notes)
         self.assertEqual(self.ran, [])
         self.assertEqual(self.live(), frozenset())  # the conveyor may dispatch it now
+        self.assertEqual(self.states(), snap)  # F3: still pending, never marked started
+        conv = self.root / "build" / "conveyor"
+        conv.mkdir(parents=True)
+        (conv / "lanes.json").write_text('{"A-1": {}}', encoding="utf-8")  # the conveyor took it
         self.on()
         lr.tick(self.root, self.ports())
-        self.assertEqual(self.ran, [])  # N6 never re-picks it: no double run
+        self.assertEqual(self.ran, [])  # N6 never runs what the conveyor has: no double run
+
+    def test_int_flag_or_int_name_with_t1_tier_is_not_taken(self):
+        # N6-WIRE2FIX F2: an INT entry stays with the conveyor even if its tier says T1.
+        self.on()
+        self.backlog(n6_deps.Item("A-1", is_int=True), n6_deps.Item("int-5"))
+        snap = self.states()
+        lr.tick(self.root, self.ports(tier=lambda s: "T1"))
+        self.assertEqual(self.ran, [])
+        self.assertEqual(self.states(), snap)
+        self.assertFalse((self.n6 / "lease.json").exists())
+
+    def test_lease_lock_held_marks_nothing(self):
+        # F4/F5: the conveyor holding the lease lock (mid-dispatch) means no acquire, no mark.
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        snap = self.states()
+        with n6_lease._locked(self.n6 / "lease.json") as got:
+            self.assertTrue(got)
+            notes = lr.tick(self.root, self.ports())
+        self.assertIn("lease held: nothing started", notes)
+        self.assertEqual(self.ran, [])
+        self.assertEqual(self.states(), snap)
+
+    def test_conveyor_record_or_unreadable_record_is_not_taken(self):
+        # F5: lanes.json key, an inbox/started file, or an unreadable lanes.json.
+        conv = self.root / "build" / "conveyor"
+        started = conv / "inbox" / "started"
+        started.mkdir(parents=True)
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        snap = self.states()
+        for setup in (lambda: (conv / "lanes.json").write_text('{"A-1": {}}', encoding="utf-8"),
+                      lambda: (started / "20261112-120000-A-1.md").write_text("", encoding="utf-8"),
+                      lambda: (conv / "lanes.json").write_text("{", encoding="utf-8")):
+            for p in [conv / "lanes.json", *started.iterdir()]:
+                p.unlink(missing_ok=True)
+            setup()
+            lr.tick(self.root, self.ports())
+            self.assertEqual(self.ran, [])
+            self.assertEqual(self.states(), snap)
+
+    def test_lease_lost_before_mark_hands_back(self):
+        # F6: the lease is re-checked with a fresh clock right before the mark.
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        snap = self.states()
+        calls = iter([1000.0, 1000.0, 2000.0, 2000.0])
+        notes = lr.tick(self.root, self.ports(now=lambda: next(calls)))
+        self.assertIn("A-1: handed back (lease lost)", notes)
+        self.assertEqual(self.ran, [])
+        self.assertEqual(self.states(), snap)
+
+    def test_overflowing_ttl_or_inf_clock_starts_nothing(self):
+        # F7: now + ttl_s must be finite before any acquire.
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        for kw in (dict(ttl_s=10 ** 400), dict(ttl_s=float("inf")),
+                   dict(now=lambda: float("inf")), dict(ttl_s=-5.0)):
+            lr.tick(self.root, self.ports(**kw))
+        self.assertEqual(self.ran, [])
+        self.assertFalse((self.n6 / "lease.json").exists())
+
+    def test_acquire_refuses_non_finite_expiry(self):
+        p = self.n6 / "lease.json"
+        nan, inf = float("nan"), float("inf")
+        for ttl, now in ((nan, 1.0), (inf, 1.0), (10 ** 400, 1.0), (0.0, 1.0), (-1.0, 1.0),
+                         (600.0, nan), (600.0, inf), (1e308, 1e308)):
+            self.assertIsNone(n6_lease.acquire(p, "o", "A-1", ttl, now), (ttl, now))
+        self.assertFalse(p.exists())
 
     def test_runner_exception_releases_and_never_reruns(self):
         self.on()
@@ -199,10 +273,10 @@ class LimitedRun(unittest.TestCase):
     def test_clock_failing_after_run_still_releases(self):
         self.on()
         self.backlog(n6_deps.Item("A-1"))
-        calls = iter([self.clock])
+        calls = iter([self.clock] * 3)  # t0, the fresh acquire clock, the pre-mark re-check
 
         def now():
-            return next(calls)  # StopIteration after the first call
+            return next(calls)  # StopIteration once the slice has run
 
         notes = lr.tick(self.root, self.ports(now=now))
         self.assertEqual(self.ran, ["A-1"])

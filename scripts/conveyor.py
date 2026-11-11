@@ -16,6 +16,7 @@ See JARVIS_RUNBOOK.md "Konveyor".
 """
 import base64
 import calendar
+import contextlib
 import fnmatch
 import hashlib
 import json
@@ -3635,18 +3636,19 @@ class Conveyor:
                 continue
             if name in busy or self.int_blocked(name, lanes):
                 continue  # same-name lane still working, or another integration lane; wait
-            if self.n6_fresh(name):  # N6-08FIX F4: a lease taken earlier in this pass
-                held.add(f)
-                continue
-            sid = self.start(name, hdr["model"], hdr["effort"], text)
-            if not sid:  # CONVHEAL: a stuck prompt never blocks the backlog; attention item
-                held.add(f)
-                stuck = self.pager_flag("inbox_stuck") or {}
-                if f.name not in stuck:
-                    self.pager_flag("inbox_stuck", {**stuck, f.name: self.now()})
-                continue
-            dest = self.started_path(name)
-            os.replace(f, dest)
+            with self.n6_claim() as ok:  # N6-WIRE2FIX F5: N6 cannot acquire until the started file exists
+                if not ok or self.n6_fresh(name):  # N6-08FIX F4: a lease taken earlier in this pass
+                    held.add(f)
+                    continue
+                sid = self.start(name, hdr["model"], hdr["effort"], text)
+                if not sid:  # CONVHEAL: a stuck prompt never blocks the backlog; attention item
+                    held.add(f)
+                    stuck = self.pager_flag("inbox_stuck") or {}
+                    if f.name not in stuck:
+                        self.pager_flag("inbox_stuck", {**stuck, f.name: self.now()})
+                    continue
+                dest = self.started_path(name)
+                os.replace(f, dest)
             self.record(lanes, name, sid, hdr["model"], hdr["effort"], hdr["base"], dest)
             busy.add(name)
             started = True
@@ -3674,6 +3676,34 @@ class Conveyor:
             self.n6_skip(name)
             return True
         return False
+
+    @contextlib.contextmanager
+    def n6_claim(self):
+        """N6-WIRE2FIX F5: hold the N6 lease's OS lock from the fresh check until the started
+        file exists, so an N6 tick can neither acquire nor mark in between. False = N6 holds
+        the lock now: do not start. No build/n6 dir: True and nothing is created."""
+        n6 = self.root / "build" / "n6"
+        if not n6.is_dir():
+            yield True
+            return
+        try:
+            fd = os.open(n6 / "lease.json.lock", os.O_RDWR | os.O_CREAT, 0o600)
+        except OSError:
+            yield False
+            return
+        try:
+            try:
+                real_instance_lock(fd)
+            except OSError:
+                yield False
+                return
+            try:
+                yield True
+            finally:
+                with contextlib.suppress(OSError):
+                    real_instance_lock(fd, unlock=True)
+        finally:
+            os.close(fd)
 
     def n6_skip(self, sid):
         """One n6_lease_skip event per slice per live-lease episode."""
@@ -3888,25 +3918,26 @@ class Conveyor:
             if self.cap_full(lanes, worker):  # CONVCAP: its worker's cap; the next ready slice may go
                 capped.add(name)
                 continue
-            if self.n6_fresh(name):  # N6-08FIX F4: a lease taken earlier in this pass
-                slices = [x for x in slices if x is not s]
-                continue
-            if s.get("worker") == "auto":
-                self.event("route", lane=name, worker=worker, reason=why)
-            codex = worker == "codex"
-            # what this launch really applies: an auto slice routed away from Claude gets neither
-            trial = {} if worker in ("codex", "jules") else \
-                {k: s[k] for k in ("advisor", "subagent_model") if k in s}
-            if worker == "jules":
-                sid = self.start_jules(name, base, text, s.get("files", []))
-            else:
-                sid = self.start_codex(name, base, text) if codex else \
-                    self.start(name, s["model"], s["effort"], text, **trial)
-            if not sid:
-                slices = [x for x in slices if x is not s]  # retry next pass
-                continue
-            dest = self.started_path(name)
-            dest.write_text(text, encoding="utf-8")
+            with self.n6_claim() as ok:  # N6-WIRE2FIX F5: N6 cannot acquire until the started file exists
+                if not ok or self.n6_fresh(name):  # N6-08FIX F4: a lease taken earlier in this pass
+                    slices = [x for x in slices if x is not s]
+                    continue
+                if s.get("worker") == "auto":
+                    self.event("route", lane=name, worker=worker, reason=why)
+                codex = worker == "codex"
+                # what this launch really applies: an auto slice routed away from Claude gets neither
+                trial = {} if worker in ("codex", "jules") else \
+                    {k: s[k] for k in ("advisor", "subagent_model") if k in s}
+                if worker == "jules":
+                    sid = self.start_jules(name, base, text, s.get("files", []))
+                else:
+                    sid = self.start_codex(name, base, text) if codex else \
+                        self.start(name, s["model"], s["effort"], text, **trial)
+                if not sid:
+                    slices = [x for x in slices if x is not s]  # retry next pass
+                    continue
+                dest = self.started_path(name)
+                dest.write_text(text, encoding="utf-8")
             self.record(lanes, name, sid, s["model"], s["effort"], base, dest,
                         files=s.get("files", []), slice_=True,
                         worker=worker if worker in ("codex", "jules") else None, **trial)
