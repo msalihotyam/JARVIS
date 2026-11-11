@@ -11,7 +11,7 @@ from pathlib import Path
 from unittest import mock
 
 from jarvis import n6_breaker, n6_deps, n6_notify
-from jarvis.work_driver import N6, drive
+from jarvis.work_driver import N6, _n6_mark, drive
 from jarvis.work_ledger import MAX_REVISIONS, EventKind, RunState, StepState, WorkRun
 from jarvis.work_planner import n6_next
 from jarvis.work_supervisor import n6_record_finish, supervise
@@ -350,6 +350,63 @@ class ShadowRunTest(unittest.TestCase):
                     for undo in reversed(undos):
                         undo()
             self.assert_accepted_once(ports, step, revisions, seen)
+
+    @staticmethod
+    def unreadable(*a):
+        raise OSError("findings_unreadable")
+
+    # N6-WIRE1FIX5 NEG: the N6 hold marker re-holds with unreadable gate rows in every revisable
+    # state at revisions 0 and MAX_REVISIONS; accepted evidence clears it and proceeds once.
+    def test_neg_marker_holds_with_unreadable_findings_in_every_revisable_state(self):
+        for revisions in (0, MAX_REVISIONS):
+            for state in (StepState.ACCEPTING, StepState.BLOCKED_BY_GATE, StepState.TIMEOUT):
+                with self.subTest(revisions=revisions, state=state):
+                    ports, step, seen, mark = self.held(revisions)
+                    marker = _n6_mark(ports.n6, step)
+                    self.assertTrue(marker.exists())
+                    step = replace(step, state=state)
+                    ports.gate_findings = self.unreadable
+                    for _ in range(2):  # and the NEXT resume too
+                        step = self.redrive(ports, step)
+                        self.assertIs(step.state, state)
+                        self.assertEqual(step.revisions, revisions)
+                        self.assertEqual(ports.states("a")[seen:], [])  # no RUNNING, no FAILED_AFTER_CAP
+                        self.assertEqual((ports.count("start"), ports.count("apply")), (1, 0))
+                        rows = [e[3] for e in ports.log[mark:] if e[0] == "event" and "gate" in e[3]]
+                        self.assertEqual((rows[-1]["gate"], rows[-1].get("decision")), ("refcheck", self.WAIT))
+                        self.assertTrue(marker.exists())
+                    if state is StepState.ACCEPTING:
+                        del ports.gate_findings
+                        self.assert_accepted_once(ports, step, revisions, seen)
+                        self.assertFalse(marker.exists())
+
+    # N6-WIRE1FIX5 NEG: an old record (no marker) or no N6 keeps today's behaviour: at the cap
+    # with unreadable gate rows a revisable step fails after the cap.
+    def test_neg_without_marker_or_n6_keeps_todays_cap(self):
+        for case in ("old_record", "no_n6"):
+            with self.subTest(case=case):
+                ports, step, seen, _ = self.held(MAX_REVISIONS)
+                if case == "old_record":
+                    _n6_mark(ports.n6, step).unlink()
+                else:  # the marker is on disk but never read without N6
+                    ports.n6 = None
+                ports.gate_findings = self.unreadable
+                step = self.redrive(ports, replace(step, state=StepState.BLOCKED_BY_GATE))
+                self.assertIs(step.state, StepState.FAILED_AFTER_CAP)
+                self.assertEqual(ports.states("a")[seen:], [StepState.FAILED_AFTER_CAP.value])
+
+    # N6-WIRE1FIX5 NEG (F2 B1/B3): accepted evidence clears the marker; a later evidence or apply
+    # failure is not re-held as a refcheck wait and does not rewrite the marker.
+    def test_neg_accepted_evidence_then_later_failure_is_not_a_refcheck_hold(self):
+        for port, err in (("apply", RuntimeError("disk full")), ("evidence", ValueError("bad"))):
+            with self.subTest(port=port):
+                ports, step, _, mark = self.held(MAX_REVISIONS)
+                ports.n6 = self.accepting()
+                ports.script[port] = [err]
+                step = self.redrive(ports, step)
+                self.assertFalse(_n6_mark(ports.n6, step).exists())
+                rows = [e[3] for e in ports.log[mark:] if e[0] == "event" and "gate" in e[3]]
+                self.assertNotEqual((rows[-1]["gate"], rows[-1].get("decision")), ("refcheck", self.WAIT))
 
     # N6-WIRE1FIX4 NEG (F4): a mark_started error after an earlier mark keeps that start.
     def test_neg_partial_mark_error_keeps_the_marked_start(self):
