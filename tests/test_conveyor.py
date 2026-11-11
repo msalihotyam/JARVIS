@@ -3660,6 +3660,81 @@ class TestLedgerSubprocess(Base):
         self.assertEqual([e["message"] for e in self.errors()], ["usage ledger: exit 1 (build/ledger/usage.log)"])
 
 
+class TestN6ShadowHook(Base):
+    """N6-SHADOW1: the one N6 call site, a subprocess never waited on, failures are events only."""
+
+    def on(self):
+        (self.root / "build" / "n6").mkdir(parents=True, exist_ok=True)
+        (self.root / "build" / "n6" / "SHADOW_ON").write_text("")
+
+    def n6_events(self):
+        return [e for e in self.events() if e["event"] == "n6_shadow"]
+
+    def test_switch_off_starts_nothing(self):
+        self.c.n6_due = True
+        self.c.n6_shadow()
+        self.assertEqual((self.ledger_procs, self.c.n6_due, self.n6_events()), ([], False, []))
+
+    def test_on_starts_once_per_finish_without_a_window(self):
+        self.on()
+        self.c.n6_shadow()
+        self.assertEqual(self.ledger_procs, [])  # no lane finished yet
+        self.c.n6_due = True
+        self.c.n6_shadow()
+        self.c.n6_due = True  # a second finish while it runs waits for the next start
+        self.c.n6_shadow()
+        self.assertEqual(len(self.ledger_procs), 1)
+        proc = self.ledger_procs[0]
+        self.assertTrue(proc.argv[-1].endswith("n6_shadow_run.py"))
+        self.assertEqual(proc.kw["creationflags"], getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        proc.rc = 0
+        self.c.n6_shadow()  # reaps
+        self.c.n6_shadow()  # starts the one owed to the second finish
+        self.assertEqual((len(self.ledger_procs), self.n6_events()), (2, []))
+
+    def test_timeout_kills_with_one_event_and_no_error(self):
+        self.on()
+        last = self.c.last_error
+        self.c.n6_due = True
+        self.c.n6_shadow()
+        self.t += conveyor.N6_TIMEOUT_S
+        self.c.n6_shadow()
+        self.c.n6_shadow()
+        self.assertTrue(self.ledger_procs[0].killed)
+        self.assertEqual([e["error"] for e in self.n6_events()], [f"killed after {conveyor.N6_TIMEOUT_S}s"])
+        self.assertEqual(self.c.last_error, last)
+        self.assertFalse(any(e["event"] == "error" for e in self.events()))
+
+    def test_runner_exception_is_an_event_only(self):
+        self.on()
+        last = self.c.last_error
+        self.fake_popen_error = OSError("no python")
+        self.c.n6_due = True
+        self.c.n6_shadow()
+        self.assertIn("no python", self.n6_events()[0]["error"])
+        self.assertEqual(self.c.last_error, last)
+        self.assertFalse(any(e["event"] == "error" for e in self.events()))
+
+    def test_finish_marks_due(self):
+        TestLedgerSubprocess.finished(self)
+        self.assertTrue(self.c.n6_due)
+
+    def test_loop_continues_when_the_hook_raises(self):
+        beats, sleeps = [], []
+
+        def sleep(s):
+            sleeps.append(s)
+            self.t += 100
+
+        with mock.patch.object(self.c, "n6_shadow", side_effect=RuntimeError("boom")), \
+                mock.patch.object(self.c, "heartbeat", side_effect=lambda: beats.append(self.t)), \
+                mock.patch.object(self.c, "own_lock", side_effect=lambda: len(sleeps) < 3), \
+                mock.patch.object(conveyor.time, "sleep", side_effect=sleep):
+            self.assertEqual(self.c.loop(), 0)
+        self.assertGreaterEqual(len(beats), 3)
+        self.assertFalse(any("boom" in str(e) for e in self.events()))
+
+
 class TestSharedWrite(Base):
     """CONVSTATUS: a reader holding a shared file (PermissionError on os.replace) is retried, then
     one error event; the pass never aborts. The heartbeat stays fresh across the CLI loops."""

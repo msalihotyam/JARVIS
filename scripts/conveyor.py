@@ -133,6 +133,7 @@ BUDGET_NUDGE = "commit the coherent part, list the rest in OPEN ISSUES, write th
 PASS_S = 60
 USAGE_S = 1800  # usage ledger cadence (scripts/usage_ledger.py, else the build/conveyor copy)
 LEDGER_TIMEOUT_S = 300  # a ledger subprocess still running after this is killed
+N6_TIMEOUT_S = 120  # an N6 shadow runner (scripts/n6_shadow_run.py) still running after this is killed
 CLEANUP_S = 3600  # a finished lane's session is removed this long after its report was collected
 CLEANUP_PER_PASS = 5  # stop/rm calls are slow; keep one pass well under the stale-lock time
 # CONVIDLE: `claude agents` lists a finished idle background session as state "working"; early
@@ -1271,6 +1272,8 @@ class Conveyor:
         self.beat_ts = 0
         self.popen = popen
         self.ledger_proc = None  # (Popen, start ts) of the usage ledger subprocess still running
+        self.n6_proc = None  # (Popen, start ts) of the N6 shadow runner still running
+        self.n6_due = False  # a lane finished since the last N6 shadow start
         self.ledger_ts = float("-inf")  # last ledger start
 
     # ---- lock -------------------------------------------------------
@@ -1940,6 +1943,7 @@ class Conveyor:
         ln["status"] = status
         ln["report"] = str(self.collect(name, report))
         self.event("finish", lane=name, id=ln["id"], status=status, report=ln["report"], **why)
+        self.n6_due = True
         if quiet:
             return
         ln["finished_ts"] = self.now()  # since of its attention item (bad STATUS, non-pass reading)
@@ -4194,6 +4198,35 @@ class Conveyor:
                 self.ledger_proc = (proc, self.ledger_ts)
                 return
 
+    def n6_shadow(self):
+        """N6-SHADOW1: the shadow runner (scripts/n6_shadow_run.py) as a subprocess, never waited
+        on, started after a lane finished when build/n6/SHADOW_ON exists. A failure, a nonzero
+        exit or a kill after N6_TIMEOUT_S is one n6_shadow event, never an error: shadow only, so
+        it neither pages nor touches last_error or the loop."""
+        try:
+            if self.n6_proc:
+                proc, started = self.n6_proc
+                rc = proc.poll()
+                if rc is None and self.now() - started < N6_TIMEOUT_S:
+                    return
+                if rc is None:
+                    proc.kill()
+                self.n6_proc = None
+                if rc != 0:
+                    self.event("n6_shadow", error=f"killed after {N6_TIMEOUT_S}s" if rc is None else f"exit {rc}")
+                return
+            if not self.n6_due:
+                return
+            self.n6_due = False
+            if not (self.root / "build" / "n6" / "SHADOW_ON").is_file():
+                return
+            proc = self.popen([sys.executable, str(self.root / "scripts" / "n6_shadow_run.py")], cwd=self.root,
+                              env=child_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self.n6_proc = (proc, self.now())
+        except Exception as e:
+            self.event("n6_shadow", error=repr(e))
+
     # ---- autopilot (CONV7): the three routine orchestrator decisions -----
     def autopilot(self, lanes):
         """Every pass, for each lane that reached a terminal status since the autopilot began:
@@ -4941,6 +4974,7 @@ class Conveyor:
         if why:
             ln["ci_why"] = why
         self.event("finish", lane=name, id=ln["id"], status=status, reason=why)
+        self.n6_due = True
         try:
             text = Path(ln["report"]).read_text(encoding="utf-8-sig", errors="replace")
         except OSError:
@@ -6071,6 +6105,10 @@ class Conveyor:
                         self.error(f"usage ledger: {e!r}")
                     except Exception:
                         pass
+                try:
+                    self.n6_shadow()  # the one N6 call site: guarded inside, never waits, never errors
+                except Exception:
+                    pass
             try:
                 self.note_pass(ok)
                 self.flush_pages()
