@@ -477,7 +477,8 @@ class CodexWorker:
     def _kill(self, pid):
         if os.name == "nt":  # by full path: a taskkill.exe in the cwd is never run
             taskkill = Path(os.environ.get("SystemRoot", r"C:\Windows")) / "System32" / "taskkill.exe"
-            self.run([str(taskkill), "/PID", str(pid), "/T", "/F"], capture_output=True, check=False)
+            self.run([str(taskkill), "/PID", str(pid), "/T", "/F"], capture_output=True, check=False,
+                     creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
         else:
             try:
                 os.kill(pid, signal.SIGTERM)

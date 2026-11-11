@@ -172,11 +172,11 @@ class CodexWorkerTest(unittest.TestCase):
         self.environ = {"PATH": "C:/bin", "CODEX_HOME": "C:/codex-home", "OPENAI_API_KEY": "sk-x",
                         "openai_base_url": "http://proxy", "CODEX_API_KEY": "k", "OPENAI_ORG_ID": "o",
                         "AZURE_OPENAI_ENDPOINT": "e", "ANTHROPIC_BASE_URL": "u", "X_API_KEY": "k"}
-        self.runs = []  # never the real taskkill: the fake pid could be a real process
+        self.runs, self.run_kw = [], []  # never the real taskkill: the fake pid could be a real process
         self.pstart = {4242: 111}  # pid -> creation time; never the real process table
         self.w = CodexWorker(self.root, exe="fake-codex.exe", popen=self.popen, now=lambda: self.t,
                              reader=lambda: self.state, environ=self.environ,
-                             run=lambda argv, **kw: self.runs.append(argv),
+                             run=lambda argv, **kw: (self.runs.append(argv), self.run_kw.append(kw)),
                              proc_start=lambda pid: self.pstart.get(pid))
 
     def popen(self, argv, **kw):
@@ -330,6 +330,7 @@ class CodexWorkerTest(unittest.TestCase):
         if os.name == "nt":  # the whole tree, so no codex child outlives the stop
             self.assertEqual([a[0].lower().endswith("\\system32\\taskkill.exe") for a in self.runs], [True])
             self.assertEqual(self.runs[0][1:], ["/PID", "4242", "/T", "/F"])
+            self.assertEqual(self.run_kw[0]["creationflags"], workers.subprocess.CREATE_NO_WINDOW)  # JULESNOWIN2: no flash
         self.assertEqual(self.w.status(sid), "exited:1")
         self.assertFalse(self.w.stop(sid))
         self.assertFalse(self.w.stop("codex-1"))
@@ -1588,7 +1589,7 @@ class NoWindowTest(unittest.TestCase):
     def test_every_subprocess_call_site_passes_creationflags(self):
         import ast
         scripts = Path(__file__).resolve().parents[1] / "scripts"
-        missing, seen = [], 0
+        missing, seen, injected = [], 0, 0
         for name in ("conveyor.py", "conveyor_workers.py", "usage_ledger.py"):
             tree = ast.parse((scripts / name).read_text(encoding="utf-8"))
             for n in ast.walk(tree):
@@ -1599,7 +1600,29 @@ class NoWindowTest(unittest.TestCase):
                     seen += 1
                     if not any(k.arg == "creationflags" for k in n.keywords):
                         missing.append(f"{name}:{n.lineno}")
+                # JULESNOWIN2: a class whose ctor defaults a param to subprocess.<fn> and keeps it as
+                # self.<attr> runs a real child through self.<attr>(...), which needs the flag too
+                if isinstance(n, ast.ClassDef):
+                    init = next((d for d in n.body if isinstance(d, ast.FunctionDef) and d.name == "__init__"), None)
+                    if init is None:
+                        continue
+                    a = init.args
+                    params = {p.arg for p, d in [*zip(a.args[::-1], a.defaults[::-1]), *zip(a.kwonlyargs, a.kw_defaults)]
+                              if isinstance(d, ast.Attribute) and isinstance(d.value, ast.Name)
+                              and d.value.id == "subprocess"
+                              and d.attr in ("run", "Popen", "check_output", "call", "check_call")}
+                    attrs = {t.attr for s in ast.walk(init) if isinstance(s, ast.Assign)
+                             and isinstance(s.value, ast.Name) and s.value.id in params
+                             for t in s.targets if isinstance(t, ast.Attribute)}
+                    for c in ast.walk(n):
+                        g = getattr(c, "func", None)
+                        if (isinstance(c, ast.Call) and isinstance(g, ast.Attribute) and isinstance(g.value, ast.Name)
+                                and g.value.id == "self" and g.attr in attrs):
+                            injected += 1
+                            if not any(k.arg == "creationflags" for k in c.keywords):
+                                missing.append(f"{name}:{c.lineno}")
         self.assertGreater(seen, 0)
+        self.assertGreaterEqual(injected, 3)  # CodexWorker popen + taskkill run, Conveyor popen
         self.assertEqual(missing, [])
 
     def test_git_passes_create_no_window(self):
