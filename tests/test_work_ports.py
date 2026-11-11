@@ -411,7 +411,7 @@ class ExportTests(Base):
 class WiringTests(Base):
     def test_driver_runs_scope_before_any_other_judgement(self):
         body = inspect.getsource(work_driver._slice_body)
-        self.assertLess(body.index("_scope(stage, ports)"), body.index("_accept("))
+        self.assertLess(body.index("_scope(stage, ports)"), body.index("_accept(step, stage, ports)"))
         scope = inspect.getsource(work_driver._scope)
         self.assertIn("ports.scope_check", scope)
         accept = inspect.getsource(work_driver._accept)
