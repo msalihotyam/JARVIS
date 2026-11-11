@@ -37,7 +37,9 @@ from jarvis.work_controls import ISTANBUL
 ASKS_PER_DAY = 4
 MAX_CHARS = 1000
 
-_SALIH_POINTS = {"ask": "needs_input", "job_finished": "done", "urgent": "interrupted"}
+# N6-WIRE2: the work_driver kinds that must reach Salih in N6 mode map onto their own points.
+_SALIH_POINTS = {"ask": "needs_input", "job_finished": "done", "urgent": "interrupted",
+                 "needs_input": "needs_input", "slice_failed_after_cap": "slice_failed_after_cap"}
 _DAILY = frozenset({"status", "progress", "slice_started", "slice_accepted"})
 _LINK = re.compile(
     r"\S*://\S*|\bwww\.\S+|\b\d{1,3}(?:\.\d{1,3}){3}\b\S*|(?:[\w-]+\.)+[^\W\d_]{2,}\b(?:/\S*)?",
