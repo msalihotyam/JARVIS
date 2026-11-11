@@ -8493,9 +8493,11 @@ class TestChain(AutopilotBase):
         self.assertEqual((self.ev("chain")[0]["src"], self.ev("chain")[0]["sha"]), ("SRC", self.SHA))
         clrev = self.state()["chain_slices"][0]
         self.assertEqual((clrev["model"], clrev["effort"], clrev["files"], clrev["depends_on"]),
-                         ("opus", "high", ["build/reports/CLREV-SRC.md"], ["SRC"]))
+                         ("sonnet", "high", ["build/reports/CLREV-SRC.md"], ["SRC"]))  # MODELROUTE1: T1 review
         self.assertIn(self.SHA, self.prompt("CLREV-SRC").read_text(encoding="utf-8"))
         self.assertIn("CLREV-SRC", self.fake.bg_names())
+        self.assertEqual([(e["model"], e["route"]) for e in self.ev("dispatch") if e.get("lane") == "CLREV-SRC"],
+                         [("sonnet", "tier T1 review")])  # MODELROUTE1: the dispatch event names the reason
         self.finish("CLREV-SRC", "PASS", extra=self.REVPICK)
         self.assertEqual(self.ids(), ["CLREV-SRC", "INT-SRC"])
         new = self.state()["chain_slices"][1]
@@ -8988,12 +8990,46 @@ class TestChain(AutopilotBase):
         self.assertIn("CLREV-SRC already exists", why)
         self.assertNotIn("chain_slices", ap)
 
+    def routed(self, step, tier, done=()):
+        """MODELROUTE1: the generated step's (model, effort, route) and its prompt's header line."""
+        why, ap = self.direct({x: self.step_ln(x) for x in done}, done=done, tier=tier)
+        self.assertIsNone(why)
+        (new,) = ap["chain_slices"]
+        self.assertEqual(new["id"], f"{step}-SRC")
+        head = self.prompt(new["id"]).read_text(encoding="utf-8").split("\n", 1)[0]
+        self.assertIsNone(conveyor.check_header(head)[1])
+        return new["model"], new["effort"], new["route"], head
+
+    def test_modelroute1_t1_reviews_and_the_codex_wrapper_run_on_sonnet(self):
+        m, e, r, head = self.routed("CLREV", "T1")
+        self.assertEqual((m, e, r), ("sonnet", "high", "tier T1 review"))
+        self.assertTrue(head.startswith("@jarvis lane=CLREV-SRC model=sonnet effort=high "), head)
+        m, e, r, head = self.routed("CDX", "T1", done=("CLREV-SRC",))
+        self.assertEqual((m, e, r), ("sonnet", "high", "Codex wrapper"))
+        self.assertTrue(head.startswith("@jarvis lane=CDX-SRC model=sonnet effort=high "), head)
+
+    def test_modelroute1_t2_clrev_stays_opus_and_its_codex_wrapper_is_sonnet(self):
+        m, e, r, head = self.routed("CLREV", "T2")
+        self.assertEqual((m, e, r), ("opus", "high", "tier T2 review"))
+        self.assertTrue(head.startswith("@jarvis lane=CLREV-SRC model=opus effort=high "), head)
+        m, e, r, head = self.routed("CDX", "T2", done=("CLREV-SRC",))
+        self.assertEqual((m, e, r), ("sonnet", "high", "Codex wrapper"))
+        self.assertTrue(head.startswith("@jarvis lane=CDX-SRC model=sonnet effort=high "), head)
+
+    def test_modelroute1_table_is_tier_driven_and_int_is_unchanged(self):
+        t = conveyor.CHAIN_MODELS
+        self.assertEqual(set(t), {(s, x) for s in ("CLREV", "CDX", "INT") for x in ("T0", "T1", "T2")})
+        self.assertEqual([t[("CLREV", x)][:2] for x in ("T0", "T1", "T2")],
+                         [("sonnet", "high"), ("sonnet", "high"), ("opus", "high")])
+        self.assertEqual({t[("CDX", x)][:2] for x in ("T0", "T1", "T2")}, {("sonnet", "high")})
+        self.assertEqual({t[("INT", x)][:2] for x in ("T0", "T1", "T2")}, {("sonnet", "medium")})
+
     def test_cdx_step_is_written_from_its_template_and_a_t2_int_records_no_exception(self):
         why, ap = self.direct({"CLREV-SRC": self.step_ln("CLREV-SRC")}, done=("CLREV-SRC",))
         self.assertIsNone(why)
         (new,) = ap["chain_slices"]
         self.assertEqual((new["id"], new["model"], new["effort"], new["files"]),
-                         ("CDX-SRC", "opus", "medium", ["build/reports/CDX-SRC.md"]))
+                         ("CDX-SRC", "sonnet", "high", ["build/reports/CDX-SRC.md"]))  # MODELROUTE1
         self.assertIn(f"COMMIT: {self.SHA}", self.prompt("CDX-SRC").read_text(encoding="utf-8"))
         cdx = self.prompt("CDX-SRC").read_text(encoding="utf-8")
         for want in ("JARVIS_NTFY_TOPIC= codex exec", "--ignore-user-config", "CODEX RUN: rc=0 calls=<1-2>"):
@@ -10238,14 +10274,14 @@ class TestReviewAutoFix(TestChain):  # CONVAUTOFIX3: was TestAutoFix, which shad
         self.ready()
         self.finish("CLREV-SRC", "BLOCKED", extra=self.PICK + self.FIX)
         q = self.ev("autofix_queued")
-        self.assertEqual([(e["src"], e["id"], e["stack"], e["model"], e["auto_fix"]) for e in q],
-                         [("SRC", "SRCFIX", [self.SHA], "sonnet", 1)])
+        self.assertEqual([(e["src"], e["id"], e["stack"], e["model"], e["route"], e["auto_fix"]) for e in q],
+                         [("SRC", "SRCFIX", [self.SHA], "opus", "escalated after BLOCKED", 1)])  # MODELROUTE1
         [new] = self.entry()
         self.assertEqual((new["stack"], new["review_base"], new["approved"], new["series"], new["auto_fix"]),
                          ([self.SHA], self.git.main, True, "SRC", 1))
         self.assertEqual(new["files"], ["scripts/a.py", "build/reports/SRCFIX.md"])
         txt = self.prompt("SRCFIX").read_text(encoding="utf-8")
-        self.assertTrue(txt.startswith("@jarvis lane=SRCFIX model=sonnet effort=medium base=main\n"), txt[:80])
+        self.assertTrue(txt.startswith("@jarvis lane=SRCFIX model=opus effort=medium base=main\n"), txt[:80])
         for frag in (f"BASE AT {self.SHA}", "Run: python scripts/test_parallel.py tests.x",
                      'ONE commit "fix(conveyor): SRCFIX close the gate"', "PARENT: ccccccc",
                      "build/reports/CLREV-SRC.md", "    > F1 MAJOR the gate is open"):
@@ -10268,7 +10304,7 @@ class TestReviewAutoFix(TestChain):  # CONVAUTOFIX3: was TestAutoFix, which shad
         self.blocked(self.FIX)
         [new] = self.entry()
         self.assertEqual((new["stack"], new["review_base"], new["series"], new["model"]),
-                         (["d" * 40, self.SHA], "e" * 40, "ROOT", "sonnet"))
+                         (["d" * 40, self.SHA], "e" * 40, "ROOT", "opus"))  # MODELROUTE1: sonnet source escalates
         self.assertIn("stack ddddddd -> ccccccc; review base eeeeeee", self.prompt("SRCFIX").read_text(encoding="utf-8"))
 
     def fable(self, on):
@@ -10297,11 +10333,11 @@ class TestReviewAutoFix(TestChain):  # CONVAUTOFIX3: was TestAutoFix, which shad
         self.assertTrue(txt.startswith("@jarvis lane=SRCFIX model=fable "), txt[:60])
 
     def test_fable_switch_is_off_by_default(self):
-        self.assertEqual(self.second_blocked_review()[0], "sonnet")
+        self.assertEqual(self.second_blocked_review()[0], "opus")  # MODELROUTE1: was the sonnet source model
 
     def test_fable_switch_false_keeps_the_source_model(self):
         self.fable(False)
-        self.assertEqual(self.second_blocked_review()[0], "sonnet")
+        self.assertEqual(self.second_blocked_review()[0], "opus")  # MODELROUTE1: was the sonnet source model
 
     def test_first_blocked_review_stays_on_the_source_model_with_the_switch_on(self):
         self.fable(True)
@@ -10309,7 +10345,27 @@ class TestReviewAutoFix(TestChain):  # CONVAUTOFIX3: was TestAutoFix, which shad
         self.patch_src(auto_fix=1)  # a generated fix's own first BLOCKED review: 1 review, not 2
         self.blocked(self.FIX)
         [new] = self.entry()
-        self.assertEqual((new["model"], new["auto_fix"]), ("sonnet", 2))
+        self.assertEqual((new["model"], new["auto_fix"]), ("opus", 2))  # MODELROUTE1: not fable
+
+    def test_modelroute1_sonnet_t1_blocked_fix_escalates_to_opus(self):
+        self.ready()
+        self.patch_src(tier="T1")
+        self.blocked(self.FIX)
+        [new] = self.entry()
+        self.assertEqual((new["model"], new["tier"], new["route"]), ("opus", "T1", "escalated after BLOCKED"))
+        self.assertTrue(self.prompt("SRCFIX").read_text(encoding="utf-8").startswith("@jarvis lane=SRCFIX model=opus "))
+
+    def test_modelroute1_opus_t2_blocked_fix_keeps_opus(self):
+        self.ready()
+        self.patch_src(model="opus", **TestChain.T2_CHAIN)
+        self.blocked(self.FIX)
+        [new] = self.entry()
+        self.assertEqual((new["model"], new["tier"], new["route"]), ("opus", "T2", "source model"))
+
+    def test_modelroute1_fable_switch_outranks_the_opus_escalation(self):
+        self.fable(True)
+        model, txt = self.second_blocked_review()
+        self.assertEqual((model, self.entry()[0]["route"]), ("fable", "O74 fable after a second BLOCKED review"))
 
     def test_autofix_fable_must_be_a_bool(self):
         f = self.base / "pace.json"
@@ -10382,7 +10438,7 @@ class TestReviewAutoFix(TestChain):  # CONVAUTOFIX3: was TestAutoFix, which shad
         txt = self.prompt("SRCFIX").read_text(encoding="utf-8")
         lines = txt.splitlines()
         self.assertEqual([x for x in lines if x.startswith("@jarvis")], [lines[0]])
-        self.assertEqual(lines[0], "@jarvis lane=SRCFIX model=sonnet effort=medium base=main")
+        self.assertEqual(lines[0], "@jarvis lane=SRCFIX model=opus effort=medium base=main")  # MODELROUTE1
         self.assertEqual([x for x in lines if x.startswith("Owned files:")],
                          ["Owned files: scripts/a.py (new), build/reports/SRCFIX.md (new). Anything else -> STOP (C2)."])
         self.assertNotIn("EVIL2", txt)

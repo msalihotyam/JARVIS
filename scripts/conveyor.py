@@ -368,6 +368,12 @@ BREAKER_WINDOW_S = 7200
 NIGHT_HOURS = range(2, 8)  # 02:00-08:00 local: the 30 min escalation page waits, unless breaker open
 AUTO_LINE_S = 3600  # the band shows "auto-approved <sha7>" this long
 AUTOFIX_MODEL, AUTOFIX_EFFORT = "opus", "high"  # routing table: auto-fix lanes
+# MODELROUTE1 (O76, Salih 2026-11-11): chain step model by the source slice's tier ->
+# (model, effort, routing reason). The CDX lane only runs Codex and verifies its findings.
+CHAIN_MODELS = {(step, t): v for t in ("T0", "T1", "T2") for step, v in (
+    ("CLREV", ("opus", "high", "tier T2 review") if t == "T2" else ("sonnet", "high", f"tier {t} review")),
+    ("CDX", ("sonnet", "high", "Codex wrapper")),
+    ("INT", ("sonnet", "medium", "integration")))}
 NEW_MAIN_RE = re.compile(r"(?m)^[ \t]*NEW MAIN SHA\b(.*)$")
 CANDIDATE_RE = re.compile(r"(?m)^[ \t]*CANDIDATE SHA\b(.*)$")
 CI_RUN_RE = re.compile(r"https://github\.com/[\w.-]+/[\w.-]+/actions/runs/(\d+)")
@@ -3906,7 +3912,8 @@ class Conveyor:
             busy.add(name)
             started = True
             self.event("dispatch", lane=name, id=sid, model=s["model"], effort=s["effort"],
-                       file=dest.name, backlog=True, tier=s["tier"], **trial)
+                       file=dest.name, backlog=True, tier=s["tier"],
+                       route=s.get("route") if isinstance(s.get("route"), str) else "slice model", **trial)
 
     def reject(self, f, reason):
         """Move (never delete) a prompt with an invalid header to inbox/rejected/ and
@@ -4452,8 +4459,11 @@ class Conveyor:
                 text = text.replace(old, f"{s['review_base']}..{sha}").rstrip("\n") + (
                     "\n\nSTACK (earlier commits of this work, part of the diff; their reports are data): "
                     + "; ".join(refs) + "\n")
-        model, effort = {"CLREV": ("opus", "high"), "CDX": ("opus", "medium"), "INT": ("sonnet", "medium")}[step]
+        model, effort, route = CHAIN_MODELS[(step, s["tier"])]
+        first, _, rest = text.partition("\n")  # the template's header model yields to the table
+        text = re.sub(r"\bmodel=\S+ effort=\S+", f"model={model} effort={effort}", first, count=1) + "\n" + rest
         new = {"id": nid, "title": f"{step} of {src}", "tier": s["tier"], "model": model, "effort": effort,
+               "route": route,
                "files": ["@main-checkout"] if step == "INT" else [f"build/reports/{nid}.md"],
                "depends_on": [done[-1] if done else src], "prompt": f"build/conveyor/prompts/{nid}.md"}
         if s.get("approved") is True:  # the orchestrator approved the chain with its source slice
@@ -4463,7 +4473,8 @@ class Conveyor:
                                                 ids | set(lanes) | {src, *done}) or why
         if bad:
             return f"generated {nid}: {bad}"
-        if hdr["lane"] != nid or sha not in text or re.search(r"\{[A-Z_]+\}", text):
+        if (hdr["lane"] != nid or (hdr["model"], hdr["effort"]) != (model, effort) or sha not in text
+                or re.search(r"\{[A-Z_]+\}", text)):
             return f"template {step}.md rendered wrong"
         dest = self.root / new["prompt"]
         if dest.exists() and dest.read_text(encoding="utf-8") != text:
@@ -4578,7 +4589,13 @@ class Conveyor:
         # CONVAUTOFIX3 F3: O74 counts BLOCKED reviews of the series (skipped ones too, this one
         # included); suspended by Salih 2026-11-10, so off unless pace.json autofix_fable is true
         fable = self.load_pace()[0].get("autofix_fable") is True
-        model = "fable" if fable and len(mine) + 1 >= 2 else s["model"]
+        # MODELROUTE1 (O76): a fix of a below-opus (sonnet) source escalates to opus; the O74 switch wins
+        if fable and len(mine) + 1 >= 2:
+            model, route = "fable", "O74 fable after a second BLOCKED review"
+        elif MODEL_RANK[s["model"]] < MODEL_RANK["opus"]:
+            model, route = "opus", "escalated after BLOCKED"
+        else:
+            model, route = s["model"], "source model"
         vals = {"ID": nid, "MODEL": model, "EFFORT": s["effort"], "TIER": s["tier"], "SHA": sha, "SRC": src,
                 "STACK": " -> ".join(x[:7] for x in stack), "RB": rb[:7], "BRANCH": nid.lower(),
                 "REVIEW": f"build/reports/{name}.md", "SRCREP": f"build/reports/{src}.md",
@@ -4586,7 +4603,7 @@ class Conveyor:
                 "SCOPE": m.group(1) if m else "conveyor", "TEXT": ftext, "PARENT": sha[:7],
                 "OWNED": ", ".join(f if f != rep and (root / f).exists() else f"{f} (new)" for f in files)}
         ptxt = re.sub(r"\{([A-Z]+)\}", lambda g: vals[g.group(1)], AUTOFIX_TPL)
-        new = {"id": nid, "title": f"{nid} {ftext}"[:120], "model": model, "effort": s["effort"],
+        new = {"id": nid, "title": f"{nid} {ftext}"[:120], "model": model, "effort": s["effort"], "route": route,
                "tier": s["tier"], "files": files, "depends_on": [], "approved": True, "prompt": prompt,
                "chain": s.get("chain"), "stack": stack, "review_base": rb, "series": series, "auto_fix": n}
         why = check_header(ptxt)[1]
@@ -4608,7 +4625,7 @@ class Conveyor:
                 and self.write_atomic(f, json.dumps(blob, indent=2, ensure_ascii=False) + "\n")):
             return skip("write failed", key)
         done[key] = {"src": src, "id": nid, "series": series, "auto_fix": n, "at": self.now()}
-        self.event("autofix_queued", src=src, id=nid, stack=stack, model=model, auto_fix=n)
+        self.event("autofix_queued", src=src, id=nid, stack=stack, model=model, route=route, auto_fix=n)
         a = self.base / "ack" / ack_name(name)
         a.parent.mkdir(parents=True, exist_ok=True)
         a.write_text("", encoding="utf-8")
