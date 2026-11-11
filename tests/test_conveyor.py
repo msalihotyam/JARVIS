@@ -5741,6 +5741,20 @@ class TestN6Lease(Base):
         self.assertFalse((self.root / "build" / "n6").exists())
         self.assertEqual(self.attn(), [])
 
+    def test_neg_n6_holding_the_lease_lock_defers_dispatch(self):
+        # N6-WIRE2FIX F5: N6 mid-acquire holds lease.json.lock; the conveyor must not start
+        # in that window, and dispatches normally once the lock is free.
+        from jarvis import n6_lease
+        (self.root / "build" / "n6").mkdir(parents=True)
+        self.drop("a.md", HDR.format("A") + "x")
+        with n6_lease._locked(self.root / "build" / "n6" / "lease.json") as got:
+            self.assertTrue(got)
+            self.c.pass_once()
+            self.assertEqual(self.fake.bg_calls(), [])
+            self.assertTrue((self.c.inbox / "a.md").exists())
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+
     def test_neg_malformed_lease_holds_all_and_pages_once(self):
         p = self.lease("{not json")
         self.drop("a.md", HDR.format("A") + "x")

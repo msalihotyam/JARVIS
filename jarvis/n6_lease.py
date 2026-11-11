@@ -154,6 +154,12 @@ def _applied(state: dict[str, object], epoch: int) -> list[list[object]]:
 def acquire(path: Path | str, owner: str, slice_id: str, ttl_s: float, now: float) -> Lease | None:
     """A new lease at epoch + 1, or None while a live lease, the lock or an unreadable file stands."""
     path = Path(path)
+    try:  # N6-WIRE2FIX F7: a NaN/inf/overflowing expiry never reaches the file
+        expires = float(now + ttl_s)
+        if not (math.isfinite(float(now)) and math.isfinite(expires) and expires > now):
+            return None
+    except (OverflowError, TypeError, ValueError):
+        return None
     with _locked(path) as got:
         if not got:
             return None
@@ -161,7 +167,7 @@ def acquire(path: Path | str, owner: str, slice_id: str, ttl_s: float, now: floa
         if isinstance(state, _Held) or (state is not None and _lease(state).expires > now):
             return None  # held, or unreadable: fail closed until an operator repairs the file
         epoch = 0 if state is None else _lease(state).epoch
-        lease = Lease(owner, slice_id, epoch + 1, now + ttl_s)
+        lease = Lease(owner, slice_id, epoch + 1, expires)
         try:
             _write(path, lease, [])
         except (OSError, ValueError):  # ValueError: an epoch past the int digit limit
