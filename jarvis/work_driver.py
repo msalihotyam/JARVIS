@@ -175,6 +175,18 @@ def _n6_file(n6: N6, prefix: str, key: str) -> Path:
     return _n6_dir(n6) / f"{prefix}-{safe}-{hashlib.sha1(key.encode()).hexdigest()[:8]}.json"
 
 
+def _n6_mark(n6: N6, step: WorkStep) -> Path:
+    """N6-WIRE1FIX5: the refcheck hold marker, outside the gate rows, per run and step."""
+    return _n6_file(n6, "hold", f"{step.run_id}:{step.key}")
+
+
+def _n6_marked(n6: N6, step: WorkStep) -> bool:
+    try:
+        return _n6_mark(n6, step).exists()
+    except Exception:  # an unreadable marker fails closed: held
+        return True
+
+
 def _notify(ports: Ports, point: str, dedupe: str, step_key: str | None) -> object:
     """In N6 mode every notification goes through n6_notify's importance filter only
     (ORCHESTRATOR items are never stored or paged); a failed submit is not paged."""
@@ -346,6 +358,12 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
 
     def hold(gate: str, detail: str, n6_gate: bool = False) -> tuple[WorkStep, str]:
         step = track[0]
+        port = getattr(ports, "n6", None)
+        if n6_gate and gate == "refcheck" and port is not None:
+            # N6-WIRE1FIX5: the marker is written before the gate row and survives a damaged
+            # ledger; a failed write still holds (the hold is the outcome either way).
+            with contextlib.suppress(Exception):
+                _n6_mark(port, step).write_text("true", encoding="utf-8")
         # N6-WIRE1FIX: an N6 wiring hold carries the supervisor's own non-worker decision.
         _gate_event(step, gate, (_finding(gate, detail),), ports, n6_hold(gate, detail) if n6_gate else None)
         _notify(ports, "slice_failed_after_cap", f"{step.key}:{gate}:{step.attempt}", step.key)
@@ -388,12 +406,15 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
     # A resumed revision's findings are read back from the ledger; unreadable stays None (held).
     findings: _Findings | None = _ledger_findings(step, ports) if started else ()
     resumed = _resume_apply(step, stage, ports) if step.state == StepState.ACCEPTING else None
+    # N6-WIRE1FIX5: the N6 hold marker re-holds in every revisable state even when the gate
+    # rows are unreadable or damaged; without N6 the marker is never read.
+    marked = n6 is not None and step.state in _REVISABLE and _n6_marked(n6, step)
     if resumed is not None:
         findings, ok = resumed
         if ok:
             return accepted()
         # Not applied and undone: a failed attempt, never a second apply.
-    elif findings and findings[0].get("n6_hold") == "yes":
+    elif marked or (findings and findings[0].get("n6_hold") == "yes"):
         # N6-WIRE1FIX3: a persisted refcheck hold re-holds until the evidence is accepted:
         # no worker revision, no FAILED_AFTER_CAP. Only ACCEPTING under N6 re-checks; without
         # N6 _accept would skip refcheck and apply, so it holds (fail closed).
@@ -403,8 +424,12 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
             findings, ok = _accept(step, stage, ports, held=True)
             if ok:
                 return accepted()
-        if findings[0].get("n6_hold") == "yes":
+        if findings and findings[0].get("n6_hold") == "yes":
             return hold("refcheck", findings[0]["detail"], n6_gate=True)
+        # a refcheck pass in _accept cleared the marker: a later evidence/apply failure is not
+        # a refcheck hold (F2 B1/B3), it takes today's path below
+        if marked and (step.state != StepState.ACCEPTING or _n6_marked(n6, step)):
+            return hold("refcheck", f"marker:{step.key}:{step.attempt}", n6_gate=True)
     elif findings is None and n6 is not None and step.state == StepState.ACCEPTING:
         # N6-WIRE1FIX4 F3: unreadable findings may hide a refcheck hold: hold before capped().
         return hold("refcheck", f"findings_unreadable:{step.key}:{step.attempt}", n6_gate=True)
@@ -574,6 +599,8 @@ def _accept(step: WorkStep, stage: Stage, ports: Ports, held: bool = False) -> t
                 msg = "?"
             return (_n6_held(f"{type(exc).__name__}:{msg}"),), False
         _gate_event(step, "refcheck", (), ports)
+        with contextlib.suppress(Exception):  # N6-WIRE1FIX5: accepted evidence clears the marker
+            _n6_mark(n6, step).unlink(missing_ok=True)
     verdict = verdicts.pop()
     name = "evidence"
     try:
