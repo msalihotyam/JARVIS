@@ -78,11 +78,16 @@ class ShadowRunTest(unittest.TestCase):
         self.assertFalse(n6_record_finish(self.dir, "N6-77", "BLOCKED", NOW, NOW, outage=True))
         self.assertFalse((self.dir / "breaker.json").exists())
 
-    def test_orchestrator_only_event_never_pages(self):
+    def test_failed_after_cap_is_queued_for_the_phone(self):
+        # N6-WIRE2: slice_failed_after_cap is a SALIH kind now (it used to never page)
         self.owned = {"N6-99": ["a.py"]}  # the hold notifies slice_failed_after_cap
         self.drive(self.n6())
-        self.assertIs(n6_notify.classify("slice_failed_after_cap"), n6_notify.Route.ORCHESTRATOR)
-        self.assertEqual(self.pending(), [])  # nothing queued for the phone sink
+        self.assertIs(n6_notify.classify("slice_failed_after_cap"), n6_notify.Route.SALIH)
+        self.assertIs(n6_notify.classify("needs_input"), n6_notify.Route.SALIH)
+        self.assertIn("slice_failed_after_cap", [p["kind"] for p in self.pending()])
+
+    def test_unknown_kind_still_never_pages(self):
+        self.assertIs(n6_notify.classify("blocked:budget"), n6_notify.Route.ORCHESTRATOR)
 
     def test_int_refused_on_bad_picks(self):
         report = "RUN_ID: r1\nPICKS: N6-77 abc\n"

@@ -181,19 +181,32 @@ def plan_project(
     return PlanFailed(tuple(refusals), MAX_REASKS + 1)
 
 
-def n6_next(n6_dir: Path | str, verify: n6_deps.Verify) -> n6_deps.Pick:
+def _allowed(allow: Callable[[str], object], sid: str) -> bool:
+    try:
+        return allow(sid) is True
+    except Exception:  # an unjudgeable slice is not N6's (fail closed)
+        return False
+
+
+def n6_next(n6_dir: Path | str, verify: n6_deps.Verify, *,
+            allow: Callable[[str], object] | None = None, limit: int | None = None) -> n6_deps.Pick:
     """N6-WIRE1: the slices that may start now, from the n6_deps backlog in n6_dir. A
     dependent of an INT starts only after that INT's push is verified; each start is
     marked (mark_started re-checks); an error before any mark starts nothing (held_all, fail
     closed). N6-WIRE1FIX4: an error after a mark returns the already-marked starts (a slice is
-    never left "started" and undispatched), holds the rest and names both in attention."""
+    never left "started" and undispatched), holds the rest and names both in attention.
+    N6-WIRE2: ``allow`` (True only) and ``limit`` filter the starts BEFORE any mark, so a
+    slice N6 may not or cannot run now stays pending and untouched (not held)."""
     started: list[tuple[str, str | None]] = []
     lost: list[tuple[str, str]] = []
+    starts: list[tuple[str, str | None]] = []
     got = None
     try:
         path = Path(n6_dir) / "deps.json"
         got = n6_deps.pick(path, verify)
-        for s in got.start:
+        starts = [s for s in got.start if allow is None or _allowed(allow, s[0])]
+        starts = starts if limit is None else starts[:max(limit, 0)]
+        for s in starts:
             if n6_deps.mark_started(path, s[0], verify) is True:
                 started.append(s)
             else:
@@ -206,7 +219,7 @@ def n6_next(n6_dir: Path | str, verify: n6_deps.Verify) -> n6_deps.Pick:
         if not started or got is None:
             return n6_deps.Pick((), (), (note,), held_all=True)
         done = {s[0] for s in started} | {s for s, _ in lost}
-        rest = tuple((s[0], held.reason) for s in got.start if s[0] not in done)
+        rest = tuple((s[0], held.reason) for s in starts if s[0] not in done)
         note += "; started before it: " + ", ".join(s[0] for s in started)
         return n6_deps.Pick(tuple(started), tuple(got.held) + tuple(lost) + rest, tuple(got.attention) + (note,),
                             got.held_all)
