@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import subprocess
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -84,6 +85,87 @@ class ShadowRunTest(unittest.TestCase):
         self.on()
         self.write("build/ledger/usage.json", json.dumps({"by_lane": {"A": {"total_tokens": 1000}}}))
         self.assertEqual(self.judge(head=lambda lane: None), 0)  # A unknown, B has no tokens
+        self.assertFalse(self.db.exists())
+
+    def git(self, *args: str) -> str:
+        return subprocess.run(
+            ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
+             "-c", "core.autocrlf=false", *args],
+            cwd=self.root, check=True, capture_output=True, text=True).stdout.strip()
+
+    def real_repo(self) -> str:
+        """self.root as a git repo whose worktree-A branch holds the commit A's report names."""
+        self.git("init", "-q")
+        self.git("add", "build/reports")
+        self.git("commit", "-q", "-m", "x")
+        sha = self.git("rev-parse", "HEAD")
+        self.git("branch", "worktree-A")
+        self.write("build/reports/A.md", f"STATUS: PASS\nCOMMIT: {sha}\n")
+        return sha
+
+    def test_default_head_on_a_plain_repo_writes_rows(self) -> None:
+        self.real_repo()
+        self.on()
+        self.assertEqual(run.judge(self.root, clock=lambda: T0), 4)
+        got = {(r.slice_id, r.source): r.passed for r in rows(self.db)}
+        self.assertEqual((got["A", "conveyor"], got["A", "n6"]), (True, True))
+
+    def test_default_head_with_a_multi_pack_index_and_packed_refs(self) -> None:
+        sha = self.real_repo()
+        self.git("repack", "-a", "-d", "-q")
+        self.git("multi-pack-index", "write")
+        self.git("pack-refs", "--all")
+        pack = self.root / ".git" / "objects" / "pack"
+        self.assertTrue(any(p.name.startswith("multi-pack-index") for p in pack.iterdir()))
+        self.assertFalse((self.root / ".git" / "refs" / "heads" / "worktree-A").exists())
+        self.on()
+        self.assertEqual(run.judge(self.root, clock=lambda: T0), 4)
+        self.assertIn("A agree",self.notes.read_text(encoding="utf-8"))
+        self.assertEqual(run.branch_tip(self.n6(), self.root, "A"), sha)
+
+    def n6(self):
+        return run.N6(run.SimpleNamespace(clock=lambda: T0), store=None, notes=self.notes, clock=lambda: T0)
+
+    def tip(self, lane: str = "A"):
+        return run.branch_tip(self.n6(), self.root, lane)
+
+    def test_branch_tip_variants(self) -> None:
+        loose, packed = ".git/refs/heads/worktree-A", ".git/packed-refs"
+        self.write(".git/HEAD", "ref: refs/heads/main\n")
+        self.assertIsNone(self.tip())  # neither loose nor packed: branch deleted
+        self.write(packed, f"# pack-refs with: peeled\n{'b' * 40} refs/heads/worktree-AB\n"
+                           f"{'c' * 40} refs/heads/worktree-A\n^{'d' * 40}\n")
+        self.assertEqual(self.tip(), "c" * 40)  # packed, exact name, peeled line skipped
+        self.assertEqual(self.tip("AB"), "b" * 40)
+        self.write(loose, "e" * 64 + "\r\n")
+        self.assertEqual(self.tip(), "e" * 64)  # loose wins; sha-256 and CRLF accepted
+        (self.root / loose).unlink()
+        (self.root / loose / "x").mkdir(parents=True)
+        self.assertEqual(self.tip(), "c" * 40)  # a directory there is not this ref
+        for bad in ("../A", "A/B", "A\\B", "", ".A", "A..B", "A.lock", "C:A", "A\nB", "A B", "Ａ"):
+            self.assertIsNone(self.tip(bad), bad)  # never a path outside refs/heads
+
+    def test_branch_tip_fails_loudly_on_a_broken_store(self) -> None:
+        loose = ".git/refs/heads/worktree-A"
+        for content in ("", "abc", "A" * 40, "g" * 40, "ref: refs/heads/main", "a" * 41):
+            self.write(loose, content)
+            with self.assertRaises(RuntimeError, msg=content):
+                self.tip()
+        (self.root / loose).unlink()
+        self.write(".git/packed-refs", "zz refs/heads/worktree-A\n")
+        with self.assertRaises(RuntimeError):
+            self.tip()
+        (self.root / ".git" / "reftable").mkdir()
+        with self.assertRaises(RuntimeError):
+            self.tip()
+
+    def test_no_git_dir_fails_the_run_instead_of_writing_nothing(self) -> None:
+        self.on()
+        with self.assertRaises(RuntimeError):
+            run.judge(self.root, clock=lambda: T0)
+        self.write(".git", "gitdir: elsewhere\n")
+        with self.assertRaises(RuntimeError):
+            run.judge(self.root, clock=lambda: T0)
         self.assertFalse(self.db.exists())
 
     def test_streak_rule(self) -> None:

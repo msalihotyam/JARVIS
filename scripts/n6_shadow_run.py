@@ -63,6 +63,47 @@ def _defects(snap: Snapshot, lane: str) -> int:
                if fix.fullmatch(other) or (integ.fullmatch(other) and state.get("status") in BLOCK))
 
 
+_LANE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*(\.[A-Za-z0-9_-]+)*")
+_TIP = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
+
+
+def branch_tip(n6: N6, root: Path, lane: str) -> str | None:
+    """The sha of ``refs/heads/worktree-<lane>``, read from the ref files through ``n6.read``.
+
+    No git process: stage_git refuses the live repo (it has a multi-pack-index) and walks all
+    of .git per call. None only when neither a loose nor a packed ref exists (branch deleted)
+    or the lane name cannot be a plain ref file; any other oddity raises, so the run fails.
+    """
+    if not _LANE.fullmatch(lane) or lane.endswith(".lock"):
+        return None  # no such branch can be read as one plain file under refs/heads
+    git_dir = root / ".git"
+    if not git_dir.is_dir():
+        raise RuntimeError(f"N6 head: {git_dir} is not a git directory")
+    if (git_dir / "reftable").exists():
+        raise RuntimeError("N6 head: reftable ref storage is not read")
+    name = f"refs/heads/worktree-{lane}"
+    loose = git_dir / name
+    if not loose.is_dir():  # a directory there holds worktree-<lane>/... refs, not this one
+        try:
+            text: str | None = n6.read(loose)
+        except FileNotFoundError:
+            text = None
+        if text is not None:
+            sha = text.strip()
+            if not _TIP.fullmatch(sha):
+                raise RuntimeError(f"N6 head: {name} does not hold a sha: {sha[:80]!r}")
+            return sha
+    for line in _read(n6, git_dir / "packed-refs").splitlines():
+        if line.startswith(("#", "^")) or not line.strip():
+            continue
+        sha, _, ref = line.strip().partition(" ")
+        if ref == name:
+            if not _TIP.fullmatch(sha):
+                raise RuntimeError(f"N6 head: packed {name} is not a sha: {sha[:80]!r}")
+            return sha
+    return None
+
+
 def judge(root: Path, *, clock: Callable[[], datetime],
           timer: Callable[[], float] = time.perf_counter,
           head: Callable[[str], str | None] | None = None) -> int:
@@ -75,13 +116,10 @@ def judge(root: Path, *, clock: Callable[[], datetime],
 
     def git_head(lane: str) -> str | None:
         try:
-            return n6.git(root, "rev-parse", "--verify",
-                          f"refs/heads/worktree-{lane}").decode().strip()
+            return branch_tip(n6, root, lane)
         except PermissionError as error:
             n6.note(f"{lane} refused: {error}")
-        except Exception:  # no branch (deleted after integration): no independent sha
-            pass
-        return None
+            return None
 
     started = timer()
     result = compare(root, clock=clock, read=n6.read, head=head or git_head)
