@@ -211,6 +211,19 @@ def mark_started(path: Path | str, slice_id: str, verify: Verify) -> bool:
     return True
 
 
+def hand_back(path: Path | str, slice_id: str) -> bool:
+    """started -> pending (N6-WIRE2FIX2): a claim the conveyor did not start, or a
+    run that raised. False and no write when it is not started."""
+    path = Path(path)
+    entries = _read(path)
+    e = _find(entries, slice_id)
+    if e["state"] != "started":
+        return False
+    e["state"] = "pending"
+    _write(path, entries)
+    return True
+
+
 def _verified(verify: Verify, dep: str, sha: str, attention: list[str]) -> str | None:
     try:
         got = verify(sha)
