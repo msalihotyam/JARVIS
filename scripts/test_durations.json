@@ -903,6 +903,7 @@
   "tests.test_n6_wire.ShadowRunTest": 0.5,
   "tests.test_n6_limited_run.LimitedRun": 0.5,
   "tests.test_n6_limited_run.ClaimFlow": 0.5,
+  "tests.test_n6_replay.ReplayTest": 0.5,
   "tests.test_n6_review_route.N6ReviewRouteTests": 0.1,
   "tests.test_n6_root.N6RootTests": 15.517,
   "tests.test_n6_rootcause.RootCauseTest": 0.1,
