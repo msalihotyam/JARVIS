@@ -102,18 +102,22 @@ class ReplayTest(unittest.TestCase):
         s, recs = result["summary"], result["records"]
         by = {r["lane"]: r for r in recs if r["lane"] != "W"}
         w = {r["finish"]: r for r in recs if r["lane"] == "W"}
-        self.assertEqual(s["totals"], {"agree": 5, "different": 1, "not_comparable": 11})
-        self.assertEqual(s["verdicts"], {"agree": 5, "disagree": 0, "false_pass": 1, "excluded": 1,
+        self.assertEqual(s["totals"], {"agree": 6, "different": 0, "not_comparable": 11})
+        self.assertEqual(s["verdicts"], {"agree": 6, "disagree": 0, "false_pass": 0, "excluded": 1,
                                          "unprovable": 9, "unknown": 1})
         self.assertEqual((s["lanes"], s["decisions"], s["reports_found"], s["false_pass"]),
-                         (15, 17, 8, 1))
+                         (15, 17, 8, 0))
         self.assertEqual(s["behaviours"]["R06"], {"agree": 3, "different": 0, "not_comparable": 10,
                                                   "agreement": 1.0})
         self.assertEqual(s["behaviours"]["R05"]["agree"], 2)
         self.assertEqual(s["behaviours"]["R17"]["not_comparable"], 1)
-        self.assertEqual(s["behaviours"]["unmapped"]["different"], 1)
-        # H was decided before its INT chain event was recorded: N6 passed, the conveyor blocked.
-        self.assertEqual((by["H"]["verdict"], by["H"]["conveyor"]["verdict"]), ("false_pass", "block"))
+        self.assertEqual(s["behaviours"]["unmapped"]["agree"], 1)
+        self.assertEqual(sorted(s["behaviours"]), ["R05", "R06", "R17", "unmapped"])
+        # INT-H finished before its chain event was recorded: the chain that moves H's decision
+        # point stays visible (at >= its index), so both verdicts see INT-H BLOCKED.
+        self.assertEqual((by["H"]["verdict"], by["H"]["conveyor"], by["H"]["n6"]["verdict"]),
+                         ("agree", {"verdict": "block", "reason": "chained check INT-H BLOCKED"},
+                          "block"))
         # R is judged when its child first finished (PASS), not on the child's later BLOCKED rerun.
         self.assertEqual((by["R"]["verdict"], by["R"]["conveyor"]["verdict"]), ("agree", "pass"))
         # W finished twice: each finish is its own decision on its own state, both unprovable.
@@ -126,7 +130,7 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual(by["C"]["n6"]["reason"], "chained check CLREV-C BLOCKED")
         self.assertEqual(by["D"]["verdict"], "unprovable")
         self.assertNotIn("Z", by)
-        self.assertEqual(rp.replay(self.root)["summary"]["would_pass_with_head"], 5)  # A E H R W
+        self.assertEqual(rp.replay(self.root)["summary"]["would_pass_with_head"], 4)  # A E R W
         self.assertIn("| R06 | 3 | 0 | 10 | 100.0% |", rp.report(result))
         self.assertIn("## limits", rp.report(result))
 
@@ -143,11 +147,22 @@ class ReplayTest(unittest.TestCase):
         (self.root / "build" / "conveyor" / "events.jsonl").write_text("".join(lines), encoding="utf-8")
         (self.root / "build" / "reports" / "G.md").write_text(REPORTS["A"], encoding="utf-8")
         by = {r["lane"]: r for r in rp.replay(self.root, head={"A": SHA["a"], "G": SHA["a"]}.get)["records"]}
-        # C1 blocked, then was redispatched before its sibling C2 finished: still a real block.
-        self.assertEqual(by["A"]["conveyor"], {"verdict": "block", "reason": "chained check C1 BLOCKED"})
-        self.assertEqual(by["A"]["verdict"], "agree")
+        # C1 blocked, then was redispatched before its sibling C2 finished (the decision point):
+        # at that point C1 is unfinished, so the conveyor itself waits on it - not comparable.
+        self.assertEqual(by["A"]["conveyor"], {"verdict": "excluded", "reason": "chained check C1 pending"})
+        self.assertEqual((by["A"]["verdict"], by["A"]["outcome"]), ("excluded", "not_comparable"))
         self.assertEqual((by["G"]["verdict"], by["G"]["class"].endswith("lane redispatched after this finish")),
                          ("unprovable", True))
+
+    def test_false_pass_is_counted_when_n6_passes_a_block(self) -> None:
+        with mock.patch.object(rp, "n6_verdict", return_value=("pass", "forced")):
+            result = rp.replay(self.root, head=HEADS.get)
+        by = {r["lane"]: r for r in result["records"] if r["lane"] != "W"}
+        self.assertEqual((by["C"]["outcome"], by["C"]["verdict"], by["C"]["conveyor"]["verdict"]),
+                         ("different", "false_pass", "block"))
+        self.assertEqual(result["summary"]["false_pass"], result["summary"]["verdicts"]["false_pass"])
+        self.assertEqual(sorted(r["lane"] for r in result["records"] if r["verdict"] == "false_pass"),
+                         ["B", "C", "H", "P"])  # exactly the comparable blocks
 
     def test_refuses_a_linked_replay_directory(self) -> None:
         result = rp.replay(self.root)

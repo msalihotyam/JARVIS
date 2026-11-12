@@ -4,8 +4,8 @@ Every finish event in ``build/conveyor/events.jsonl`` is one decision, rebuilt f
 (dispatch -> unfinished, finish -> finished + status, chain -> chained check) as it stood at the
 decision's own point (see ``replay``) and judged by the live shadow's own code,
 ``jarvis.n6_shadow`` (nothing here re-decides):
-  truth: ``conveyor_verdict`` on the lane state at the decision point plus the decision's chains;
-  N6:    ``n6_verdict`` on the same state, seeing only the chain events recorded by then.
+  truth: ``conveyor_verdict`` on the ledger state at the decision point (lanes and chains);
+  N6:    ``n6_verdict`` on the same snapshot, plus the injected git head.
 Each pair is agree, different (N6-different) or not_comparable, tagged with the
 N6_HANDOVER_MATRIX behaviour that owns the deciding reason. Inputs are only read; output goes
 to build/n6/replay/<run>/{decisions.jsonl,report.md,summary.json} and nowhere else (never
@@ -123,11 +123,8 @@ def _judge(root: Path, events: list[dict[str, Any]], d: dict[str, Any],
     lane, at = d["lane"], d["at"]
     # ponytail: each snapshot holds only the lane, its chain children and its chain events
     # (all n6_shadow looks at), so the replay stays O(events); widen it if N6 ever reads more.
-    mine = [events[c] for c in d["chains"]]
-    kids = [e["id"] for e in mine]
-    lanes = {n: dict(state[n]) for n in [lane, *kids] if n in state}
-    for kid, idx in d["kid_at"].items():  # each child as of its own first finish in the window
-        lanes[kid] = {"finished": True, "status": events[idx].get("status")}
+    mine = tuple(events[c] for c in d["chains"] if c <= at)  # nothing recorded after at
+    lanes = {n: dict(state[n]) for n in [lane, *(e["id"] for e in mine)] if n in state}
     if lane not in texts:
         try:
             texts[lane] = (root / "build" / "reports" / f"{lane}.md").read_text(
@@ -135,9 +132,8 @@ def _judge(root: Path, events: list[dict[str, Any]], d: dict[str, Any],
         except OSError:  # missing, a directory or unreadable: no report
             texts[lane] = None
     text = texts[lane]
-    truth = conveyor_verdict(Snapshot(lanes, tuple(mine), {lane: text}), lane)
-    n6 = n6_verdict(Snapshot(lanes, tuple(events[c] for c in d["chains"] if c <= at),
-                             {lane: text}), lane, head)
+    snap = Snapshot(lanes, mine, {lane: text})
+    truth, n6 = conveyor_verdict(snap, lane), n6_verdict(snap, lane, head)
     times = len(finishes[lane])
     if truth[0] == "excluded":
         outcome, verdict, why = "not_comparable", "excluded", truth[1]
@@ -167,8 +163,8 @@ def replay(root: Path, *, head: Callable[[str], str | None] = _no_head) -> dict[
     A decision opens at a lane's finish and owns the chain events (src == lane) recorded until
     the lane's next dispatch or finish; a chain recorded while the lane is not finished waits for
     its next finish. Its point ``at`` is the finish, or the later first finish of an owned child
-    inside that window. Both verdicts see the lane state as of ``at`` (events <= at, nothing
-    later); N6 sees only the owned chains recorded by ``at``, the truth all owned chains."""
+    inside that window. Both verdicts see the same snapshot: every lane (children included) as
+    of ``at`` and the owned chains recorded by ``at`` - events <= at, nothing later."""
     events, bad, lines = load_history(root)
     finishes: dict[str, list[int]] = {}
     decisions: list[dict[str, Any]] = []
@@ -191,13 +187,12 @@ def replay(root: Path, *, head: Callable[[str], str | None] = _no_head) -> dict[
             open_ = current.get(event["src"])
             (open_["chains"] if open_ else pending.setdefault(event["src"], [])).append(i)
     for d in decisions:
-        d["at"], d["kid_at"] = d["f"], {}
+        d["at"] = d["f"]
         for c in d["chains"]:
             kid = finishes.get(events[c]["id"], [])
             j = bisect_left(kid, d["f"])
             if j < len(kid) and kid[j] < d["close"]:
-                d["kid_at"][events[c]["id"]] = kid[j]
-                d["at"] = max(d["at"], kid[j])
+                d["at"] = max(d["at"], kid[j], c)  # the chain that moves at stays visible
     order = sorted(decisions, key=lambda d: (d["at"], d["f"], d["lane"]))
     texts: dict[str, str | None] = {}
     state: dict[str, dict[str, Any]] = {}
@@ -241,13 +236,14 @@ LIMITS = (
     "is not comparable (`would_pass_with_head`); false PASS (R33/E8) is NOT measured on real "
     "history, only in the tests that inject a head.",
     "- Each finish is one decision, judged on the ledger state at its point (the finish, or the "
-    "later first finish of a chained child recorded before the lane's next dispatch/finish); the "
-    "truth also counts that decision's chain links recorded after the point (strict <= point "
-    "for both would make false PASS 0 by construction).",
+    "later first finish of a chained child recorded before the lane's next dispatch/finish); "
+    "both verdicts see only events up to that point (chain links and child states included), "
+    "so a chain link recorded later is invisible to both; one shared snapshot makes false PASS "
+    "0 by construction today (it counts only if the verdict logic diverges).",
     "- Reports are today's text of build/reports/<lane>.md, so a decision with no report, of "
     "a lane that finished more than once, or followed by a redispatch of the lane, is not "
     "comparable (unprovable): the report cannot be tied to that one decision. Each chained "
-    "child is seen as of its own first finish inside the decision's window.",
+    "child is seen in its state at the point (a child redispatched by then is pending).",
     "- Lane state is rebuilt from dispatch/finish events only; status edits made outside a "
     "finish event (lanes.json differs) are invisible, and old finishes without a status are "
     "excluded as not judged.",
