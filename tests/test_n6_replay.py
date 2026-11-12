@@ -1,4 +1,4 @@
-"""N6-REPLAY1: the offline replay of N6's shadow decisions over a recorded conveyor history."""
+"""N6-REPLAY1(FIX): the offline replay of N6's shadow decisions over a recorded conveyor history."""
 
 from __future__ import annotations
 
@@ -7,9 +7,11 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 _spec = importlib.util.spec_from_file_location("n6_replay", ROOT / "scripts" / "n6_replay.py")
@@ -17,11 +19,13 @@ assert _spec and _spec.loader
 rp = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(rp)
 
-SHA = {k: k * 40 for k in "acdef"}
-HEADS = {"A": SHA["a"], "C": SHA["c"], "E": SHA["f"], "H": SHA["d"]}  # E: a different head
+SHA = {k: k * 40 for k in "acdef123"}
+HEADS = {"A": SHA["a"], "C": SHA["c"], "E": SHA["f"], "H": SHA["d"],  # E: a different head
+         "R": SHA["1"], "W": SHA["2"], "P": SHA["3"]}
 REPORTS = {"A": f"STATUS: PASS\nCOMMIT: {SHA['a']}\n", "B": "STATUS: BLOCKED\n",
            "C": f"STATUS: PASS\nCOMMIT: {SHA['c']}\n", "E": f"STATUS: PASS\nCOMMIT: {SHA['e']}\n",
-           "H": f"STATUS: PASS\nCOMMIT: {SHA['d']}\n"}
+           "H": f"STATUS: PASS\nCOMMIT: {SHA['d']}\n", "R": f"STATUS: PASS\nCOMMIT: {SHA['1']}\n",
+           "W": f"STATUS: PASS\nCOMMIT: {SHA['2']}\n", "P": f"STATUS: PASS\nCOMMIT: {SHA['3']}\n"}
 
 
 def _events() -> list[str]:
@@ -32,7 +36,16 @@ def _events() -> list[str]:
               ("finish", "E", "PASS"),
               ("finish", "F", "GREEN"),
               ("finish", "H", "PASS"), ("finish", "INT-H", "BLOCKED"), ("chain", "H", "INT-H"),
-              ("dispatch", "Z", None)]  # never finishes: no record
+              ("dispatch", "Z", None),  # never finishes: no record
+              # R: its child passed, then was redispatched and blocked after R's decision
+              ("finish", "R", "PASS"), ("chain", "R", "CLREV-R"), ("finish", "CLREV-R", "PASS"),
+              ("dispatch", "CLREV-R", None), ("finish", "CLREV-R", "BLOCKED"),
+              # W finished twice (indices 18 and 22): today's report proves neither decision
+              ("finish", "W", "BLOCKED"), ("chain", "W", "CLREV-W"), ("finish", "CLREV-W", "BLOCKED"),
+              ("dispatch", "W", None), ("finish", "W", "PASS"),
+              # P: the chain is recorded while P runs and its child blocks before P finishes
+              ("dispatch", "P", None), ("chain", "P", "CLREV-P"), ("finish", "CLREV-P", "BLOCKED"),
+              ("finish", "P", "PASS")]
     out = []
     for i, (kind, lane, extra) in enumerate(script):
         ev: dict[str, object] = {"ts": f"2026-11-01T00:00:{i:02d}", "event": kind}
@@ -46,6 +59,7 @@ def _events() -> list[str]:
     return out + ["not json", "[1]", json.dumps({"event": "finish", "lane": "X"}),
                   json.dumps({"ts": "2026-11-01T00:01:00", "event": "finish", "lane": "../evil"}),
                   json.dumps({"ts": "2026-11-01T00:01:01", "event": "finish", "lane": "A", "status": []}),
+                  json.dumps({"ts": "2026-11-01T00:01:02", "event": "chain", "src": "A"}),  # no id
                   ""]
 
 
@@ -85,29 +99,75 @@ class ReplayTest(unittest.TestCase):
 
     def test_known_counts(self) -> None:
         result = rp.replay(self.root, head=HEADS.get)
-        s, by = result["summary"], {r["lane"]: r for r in result["records"]}
-        self.assertEqual(s["totals"], {"agree": 5, "different": 2, "not_comparable": 2})
-        self.assertEqual(s["verdicts"], {"agree": 5, "disagree": 1, "false_pass": 1,
-                                         "excluded": 1, "unknown": 1})
-        self.assertEqual((s["lanes"], s["reports_found"], s["false_pass"]), (9, 5, 1))
-        self.assertEqual(s["behaviours"]["R06"], {"agree": 4, "different": 1, "not_comparable": 1,
-                                                  "agreement": 0.8})
-        self.assertEqual(s["behaviours"]["R05"]["agree"], 1)
+        s, recs = result["summary"], result["records"]
+        by = {r["lane"]: r for r in recs if r["lane"] != "W"}
+        w = {r["finish"]: r for r in recs if r["lane"] == "W"}
+        self.assertEqual(s["totals"], {"agree": 5, "different": 1, "not_comparable": 11})
+        self.assertEqual(s["verdicts"], {"agree": 5, "disagree": 0, "false_pass": 1, "excluded": 1,
+                                         "unprovable": 9, "unknown": 1})
+        self.assertEqual((s["lanes"], s["decisions"], s["reports_found"], s["false_pass"]),
+                         (15, 17, 8, 1))
+        self.assertEqual(s["behaviours"]["R06"], {"agree": 3, "different": 0, "not_comparable": 10,
+                                                  "agreement": 1.0})
+        self.assertEqual(s["behaviours"]["R05"]["agree"], 2)
         self.assertEqual(s["behaviours"]["R17"]["not_comparable"], 1)
         self.assertEqual(s["behaviours"]["unmapped"]["different"], 1)
         # H was decided before its INT chain event was recorded: N6 passed, the conveyor blocked.
         self.assertEqual((by["H"]["verdict"], by["H"]["conveyor"]["verdict"]), ("false_pass", "block"))
+        # R is judged when its child first finished (PASS), not on the child's later BLOCKED rerun.
+        self.assertEqual((by["R"]["verdict"], by["R"]["conveyor"]["verdict"]), ("agree", "pass"))
+        # W finished twice: each finish is its own decision on its own state, both unprovable.
+        self.assertEqual(sorted(w), [18, 22])
+        self.assertEqual((w[18]["conveyor"]["reason"], w[18]["verdict"]),
+                         ("lane finished BLOCKED", "unprovable"))
+        self.assertEqual((w[22]["conveyor"]["verdict"], w[22]["verdict"]), ("pass", "unprovable"))
+        self.assertEqual(by["P"]["verdict"], "agree")
+        self.assertEqual(by["P"]["n6"]["reason"], "chained check CLREV-P BLOCKED")
         self.assertEqual(by["C"]["n6"]["reason"], "chained check CLREV-C BLOCKED")
+        self.assertEqual(by["D"]["verdict"], "unprovable")
         self.assertNotIn("Z", by)
-        self.assertEqual(rp.replay(self.root)["summary"]["would_pass_with_head"], 3)  # A, E, H
-        self.assertIn("| R06 | 4 | 1 | 1 | 80.0% |", rp.report(result))
+        self.assertEqual(rp.replay(self.root)["summary"]["would_pass_with_head"], 5)  # A E H R W
+        self.assertIn("| R06 | 3 | 0 | 10 | 100.0% |", rp.report(result))
         self.assertIn("## limits", rp.report(result))
+
+    def test_sibling_redispatch_and_redispatch_without_refinish(self) -> None:
+        script = [("finish", "A", "PASS"), ("chain", "A", "C1"), ("chain", "A", "C2"),
+                  ("finish", "C1", "BLOCKED"), ("dispatch", "C1", None), ("finish", "C2", "PASS"),
+                  ("finish", "G", "PASS"), ("dispatch", "G", None)]
+        lines = []
+        for i, (kind, lane, extra) in enumerate(script):
+            ev: dict[str, object] = {"ts": f"2026-11-02T00:00:{i:02d}", "event": kind}
+            ev.update({"src": lane, "id": extra} if kind == "chain" else
+                      {"lane": lane, **({"status": extra} if extra else {})})
+            lines.append(json.dumps(ev) + "\n")
+        (self.root / "build" / "conveyor" / "events.jsonl").write_text("".join(lines), encoding="utf-8")
+        (self.root / "build" / "reports" / "G.md").write_text(REPORTS["A"], encoding="utf-8")
+        by = {r["lane"]: r for r in rp.replay(self.root, head={"A": SHA["a"], "G": SHA["a"]}.get)["records"]}
+        # C1 blocked, then was redispatched before its sibling C2 finished: still a real block.
+        self.assertEqual(by["A"]["conveyor"], {"verdict": "block", "reason": "chained check C1 BLOCKED"})
+        self.assertEqual(by["A"]["verdict"], "agree")
+        self.assertEqual((by["G"]["verdict"], by["G"]["class"].endswith("lane redispatched after this finish")),
+                         ("unprovable", True))
+
+    def test_refuses_a_linked_replay_directory(self) -> None:
+        result = rp.replay(self.root)
+        outside = Path(self._tmp.name) / "outside"
+        outside.mkdir()
+        (self.root / "build" / "n6").mkdir()
+        try:
+            import _winapi  # a junction needs no symlink privilege on Windows
+            _winapi.CreateJunction(str(outside), str(self.root / "build" / "n6" / "replay"))
+        except ImportError:
+            os.symlink(outside, self.root / "build" / "n6" / "replay", target_is_directory=True)
+        with self.assertRaises(SystemExit):
+            rp.write(self.root, "r1", result)
+        self.assertEqual(list(outside.iterdir()), [])
 
     def test_malformed_lines_counted_and_skipped(self) -> None:
         s = rp.replay(self.root)["summary"]
-        self.assertEqual(s["malformed"], {"bad_lane": 1, "bad_status": 1, "bad_ts": 1,
+        self.assertEqual(s["malformed"], {"bad_lane": 2, "bad_status": 1, "bad_ts": 1,
                                           "not_json": 1, "not_object": 1})
-        self.assertEqual((s["malformed_total"], s["lines"]), (5, 18))
+        self.assertEqual((s["malformed_total"], s["lines"]), (6, 33))
 
     def test_summary_is_byte_identical(self) -> None:
         _main("--root", str(self.root), "--run", "r1")
@@ -137,6 +197,35 @@ class ReplayTest(unittest.TestCase):
                 rp.write(self.root, run, result)
         self.assertFalse(outside.exists())
         self.assertFalse((self.root / "build" / "n6" / "x").exists())
+
+    def test_refuses_a_symlinked_output_file(self) -> None:
+        result = rp.replay(self.root)
+        out = self.root / "build" / "n6" / "replay" / "s"
+        out.mkdir(parents=True)
+        outside = self.root / "outside.txt"
+        outside.write_bytes(b"keep")
+        try:
+            os.symlink(outside, out / "summary.json")
+            patch: contextlib.AbstractContextManager[object] = contextlib.nullcontext()
+        except OSError:  # no symlink privilege: fake the link the code must refuse
+            patch = mock.patch.object(rp.Path, "is_symlink", lambda p: p.name == "summary.json")
+        with patch, self.assertRaises(SystemExit):
+            rp.write(self.root, "s", result)
+        self.assertEqual(outside.read_bytes(), b"keep")
+        self.assertFalse((out / "report.md").exists())
+
+    def test_hardlinked_output_file_is_replaced_not_written_through(self) -> None:
+        result = rp.replay(self.root)
+        out = self.root / "build" / "n6" / "replay" / "h"
+        out.mkdir(parents=True)
+        outside = self.root / "outside.txt"
+        outside.write_bytes(b"keep")
+        os.link(outside, out / "report.md")
+        rp.write(self.root, "h", result)
+        self.assertEqual(outside.read_bytes(), b"keep")
+        self.assertEqual((out / "report.md").read_text(encoding="utf-8"), rp.report(result))
+        self.assertEqual(sorted(p.name for p in out.iterdir()),
+                         ["decisions.jsonl", "report.md", "summary.json"])
 
 
 if __name__ == "__main__":
