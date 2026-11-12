@@ -5778,6 +5778,52 @@ class TestN6Lease(Base):
                                   "reason": reason})
         self.assertEqual(self.fake.bg_calls(), [])
 
+    def n6_refused(self, lanes=None, more=(), **slice_):
+        # N6-WIRE2FIX3: one claim for slice A (shaped by slice_), the reason it is refused with
+        self.backlog({"id": "A", "tier": "T1", **slice_}, *more)
+        self.epoch = getattr(self, "epoch", 20) + 1  # a fresh claim each call
+        self.n6_claim("A", epoch=self.epoch)
+        self.assertFalse(self.c.n6_take(lanes or {}, set()))
+        res = self.n6_result()
+        self.assertEqual(res["state"], "refused")
+        self.assertEqual(self.fake.bg_calls(), [])
+        return res["reason"]
+
+    def test_neg_non_claude_route_is_refused(self):
+        # N6-WIRE2FIX3 F1: N6 launches claude lanes only; route() decides, auto included
+        for w in ("codex", "jules"):
+            with self.subTest(worker=w):
+                self.assertEqual(self.n6_refused(worker=w, linux_ok=True), "route not claude")
+        self.c.route = lambda s: ("codex", "claude headroom 10 < codex 50")  # auto -> codex
+        self.assertEqual(self.n6_refused(worker="auto"), "route not claude")
+        self.assertFalse((self.base / "lanes.json").exists())
+
+    def test_neg_claim_overlapping_a_running_lane_is_refused(self):
+        self.c.max_lanes = 5
+        lanes = {"X": {"files": ["jarvis/a.py"]}}  # running: not finished
+        self.assertEqual(self.n6_refused(lanes, files=["jarvis/a.py"]), "overlap")
+
+    def test_neg_claim_with_an_existing_report_is_refused(self):
+        self.c.reports.mkdir(parents=True, exist_ok=True)
+        (self.c.reports / "A.md").write_text("STATUS: PASS\n", encoding="utf-8")
+        self.assertEqual(self.n6_refused(), "PASS")
+
+    def test_neg_claim_failing_a_planner_gate_is_refused_with_its_view(self):
+        # N6-WIRE2FIX3 F2: the same slice_hold pick_slice uses (int_blocked and lint patched in:
+        # an INT claim is refused as "int" before it, and a lint failure needs a bad prompt)
+        self.c.chain_dead = {"A"}
+        self.assertEqual(self.n6_refused(), "dead")
+        self.c.chain_dead = set()
+        self.assertEqual(self.n6_refused(depends_on=["Z"], more=[{"id": "Z"}]), "waiting_deps")
+        self.assertEqual(self.n6_refused({"INT9": {"finished": True, "status": "PASS"}},
+                                         depends_on=["INT9"], more=[{"id": "INT9"}]),
+                         "waiting_deps")  # done but not pushed
+        self.c.int_blocked = lambda sid, lanes: True
+        self.assertEqual(self.n6_refused(), "int_busy")
+        del self.c.int_blocked
+        self.c.slice_lint = lambda s: "no header"
+        self.assertEqual(self.n6_refused(), "held: no header")
+
     def test_neg_raising_start_is_refused_never_started(self):
         self.backlog({"id": "A", "tier": "T1"})
         self.n6_claim("A")
