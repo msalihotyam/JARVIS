@@ -154,6 +154,21 @@ class ReplayTest(unittest.TestCase):
         self.assertEqual((by["G"]["verdict"], by["G"]["class"].endswith("lane redispatched after this finish")),
                          ("unprovable", True))
 
+    def test_a_chain_recorded_after_the_decision_point_stays_invisible(self) -> None:
+        script = [("finish", "Q", "PASS"), ("chain", "Q", "CLREV-Q"), ("dispatch", "CLREV-Q", None)]
+        lines = []
+        for i, (kind, lane, extra) in enumerate(script):
+            ev: dict[str, object] = {"ts": f"2026-11-03T00:00:{i:02d}", "event": kind}
+            ev.update({"src": lane, "id": extra} if kind == "chain" else
+                      {"lane": lane, **({"status": extra} if extra else {})})
+            lines.append(json.dumps(ev) + "\n")
+        (self.root / "build" / "conveyor" / "events.jsonl").write_text("".join(lines), encoding="utf-8")
+        (self.root / "build" / "reports" / "Q.md").write_text(
+            f"STATUS: PASS\nCOMMIT: {SHA['a']}\n", encoding="utf-8")
+        (rec,) = rp.replay(self.root, head={"Q": SHA["a"]}.get)["records"]
+        # the chain (index 1) is recorded after Q's finish (index 0, its decision point): unseen
+        self.assertEqual((rec["idx"], rec["conveyor"]["verdict"], rec["verdict"]), (0, "pass", "agree"))
+
     def test_false_pass_is_counted_when_n6_passes_a_block(self) -> None:
         with mock.patch.object(rp, "n6_verdict", return_value=("pass", "forced")):
             result = rp.replay(self.root, head=HEADS.get)
