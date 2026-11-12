@@ -336,7 +336,8 @@ class ClaimFlow(unittest.TestCase):
 
     def test_each_refusal_hands_back_to_pending(self):
         for reason in ("switch off", "int", "not started", "lease lost", "not T1",
-                       "already running", "start_error: RuntimeError", "start_failed"):
+                       "already running", "start_error: RuntimeError", "start_failed",
+                       "route not claude", "overlap", "held: no header"):
             with self.subTest(reason=reason):
                 self.setUp()
                 claim = self.claimed()
@@ -358,6 +359,20 @@ class ClaimFlow(unittest.TestCase):
         self.assertEqual(lr.tick(self.root, self.claim_ports()), ["A-1: PASS"])
         self.assertEqual(self.state(), "done")
         self.assertFalse((self.n6 / "claim.json").exists())
+
+    def test_started_claim_whose_lanes_entry_is_gone_does_not_wedge(self):
+        # N6-WIRE2FIX3 F3: finished, verdict unknown -> failure, claim dropped, one attention item
+        claim = self.claimed()
+        self.answer(claim, "started")
+        self.lanes({"OTHER": {"status": "running"}})
+        notes = lr.tick(self.root, self.claim_ports())
+        self.assertEqual([n for n in notes if n.startswith("attention:")],
+                         ["attention: A-1 finished unknown (lanes entry gone), recorded as failure"])
+        self.assertIn("A-1: BLOCKED", notes)
+        self.assertEqual(self.state(), "blocked")
+        self.assertFalse((self.n6 / "claim.json").exists())
+        self.assertFalse((self.n6 / "claim_result.json").exists())
+        self.assertNotIn("A-1: running", lr.tick(self.root, self.claim_ports()))
 
     def test_an_older_claims_answer_is_no_answer(self):
         claim = self.claimed()

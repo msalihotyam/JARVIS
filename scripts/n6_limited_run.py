@@ -276,11 +276,17 @@ def _settle(root: Path | str, n6: Path, ports: Ports) -> list[str]:
     n6_lease.release(lease_path, lease, ports.now())  # started: the lane is the conveyor's now
     lanes = json.loads((Path(root) / "build" / "conveyor" / "lanes.json").read_text(encoding="utf-8"))
     ln = lanes.get(sid) if isinstance(lanes, dict) else None
-    if not isinstance(ln, dict) or not ln.get("finished"):
+    if isinstance(ln, dict) and not ln.get("finished"):
         return [f"{sid}: running"]
-    status = ln.get("status")
-    verdict = status.strip().upper() if isinstance(status, str) else ""
     notes: list[str] = []
+    if not isinstance(ln, dict):
+        # N6-WIRE2FIX3: the started lane's entry is gone (pruned/removed): finished, verdict
+        # unknown. Count it a failure and drop the claim so N6 is never wedged on it.
+        verdict, status = "BLOCKED", None
+        notes.append(f"attention: {sid} finished unknown (lanes entry gone), recorded as failure")
+    else:
+        status = ln.get("status")
+        verdict = status.strip().upper() if isinstance(status, str) else ""
     if verdict in GOOD | BAD:
         now = ports.now()
         if not n6_record_finish(n6, sid, verdict, now, now):

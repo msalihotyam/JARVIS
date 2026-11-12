@@ -3777,16 +3777,18 @@ class Conveyor:
             elif sid in lanes or sid in busy or (started_dir.is_dir() and any(
                     p.name[16:] == f"{sid}.md" for p in started_dir.iterdir())):
                 reason = "already running"
-            if reason:
+            else:  # N6-WIRE2FIX3: every per-slice gate pick_slice uses, then claude lanes only
+                run_files = [lanes[n].get("files", []) for n in self.running(lanes)]
+                ids = {x["id"] for x in slices if isinstance(x, dict) and "id" in x}
+                reason = self.slice_hold(s, lanes, busy, ids, run_files)
+                if reason is None and self.route(s)[0] != "claude":
+                    reason = "route not claude"
+            if reason is not None:
                 self.n6_answer(epoch, sid, "refused", reason)
                 return False
-            worker, _why = self.route(s)
-            if s.get("worker") == "auto" and worker == "codex" and self.cap_full(lanes, "codex"):
-                worker = "claude"
-            if self.cap_full(lanes, worker):
+            if self.cap_full(lanes, "claude"):
                 return False
-            trial = {} if worker in ("codex", "jules") else {
-                k: s[k] for k in ("advisor", "subagent_model") if k in s}
+            trial = {k: s[k] for k in ("advisor", "subagent_model") if k in s}
             try:
                 text, base = self.slice_text(s)
                 lane_id = self.start(sid, s["model"], s["effort"], text, **trial)
@@ -3799,8 +3801,7 @@ class Conveyor:
             dest = self.started_path(sid)
             dest.write_text(text, encoding="utf-8")
         self.record(lanes, sid, lane_id, s["model"], s["effort"], base, dest,
-                    files=s.get("files", []), slice_=True,
-                    worker=worker if worker in ("codex", "jules") else None, **trial)
+                    files=s.get("files", []), slice_=True, **trial)
         busy.add(sid)
         self.event("dispatch", lane=sid, id=lane_id, model=s["model"], effort=s["effort"],
                    file=dest.name, backlog=True, tier=s["tier"], n6=True, **trial)
@@ -3909,6 +3910,43 @@ class Conveyor:
             return None
         return rec if isinstance(rec, dict) and rec.get("event") == "push" and rec.get("sha") else None
 
+    def slice_hold(self, s, lanes, busy, ids, run_files):
+        """N6-WIRE2FIX3: pick_slice's per-slice gates, in its order, shared with n6_take: the
+        view state that holds s back, or None (only pick_slice's n6_lease/ready remain)."""
+        sid = s["id"]
+        if sid in lanes:
+            ln = lanes[sid]
+            return "ci_pending" if ln.get("status") == CI_PENDING else \
+                ln.get("status") or ("finished" if ln.get("finished") else "running")
+        found = self.find_report(sid)
+        if found:
+            return found[1]
+        if sid in getattr(self, "lint_ids", ()) and (why := self.backlog_lint(s, ids, lanes)):
+            return "held: " + why  # CONVLINT: never dispatched, the others still are
+        if s["tier"] == "T2" and s.get("approved") is not True:
+            return "needs_t2_approval"
+        if sid.endswith("-R") and (x := lanes.get(sid[:-2] + "-AFX")) and x.get("finished") \
+                and x.get("status") not in GOOD | {CI_PENDING}:
+            return "dead"  # CONVHEAL: its -AFX ended non-GOOD; never waits forever
+        if sid in self.chain_dead:
+            return "dead"  # BREAKERV2: a lane of its auto-fix chain failed, the chain stops
+        if not all(self.slice_done(d, lanes, bool(INT_RE.match(sid))) for d in s.get("depends_on", [])):
+            return "waiting_deps"
+        if not INT_RE.match(sid) and not all(self.int_pushed(d, lanes) for d in s.get("depends_on", [])
+                                             if INT_RE.match(d)):
+            return "waiting_deps"  # CONVINTDEP: finished is not yet on origin
+        if any(files_overlap(s.get("files", []), rf) for rf in run_files):
+            return "overlap"
+        if sid in busy:
+            return "same_name_busy"
+        if self.int_blocked(sid, lanes):
+            return "int_busy"
+        if self.breaker and not INT_RE.match(sid):
+            return "breaker_open"
+        if why := self.slice_lint(s):
+            return "held: " + why  # the lint would drop its header
+        return None
+
     def pick_slice(self, slices, lanes, busy, skip=()):
         """First dispatchable slice (or None) and a {id: state} view of the backlog;
         a ready slice in skip (its worker's cap is full this pass) is not chosen."""
@@ -3917,38 +3955,8 @@ class Conveyor:
         ids = {x["id"] for x in slices}
         for s in slices:
             sid = s["id"]
-            if sid in lanes:
-                ln = lanes[sid]
-                view[sid] = "ci_pending" if ln.get("status") == CI_PENDING else \
-                    ln.get("status") or ("finished" if ln.get("finished") else "running")
-                continue
-            found = self.find_report(sid)
-            if found:
-                view[sid] = found[1]
-            elif sid in getattr(self, "lint_ids", ()) and (why := self.backlog_lint(s, ids, lanes)):
-                view[sid] = "held: " + why  # CONVLINT: never dispatched, the others still are
-            elif s["tier"] == "T2" and s.get("approved") is not True:
-                view[sid] = "needs_t2_approval"
-            elif sid.endswith("-R") and (x := lanes.get(sid[:-2] + "-AFX")) and x.get("finished") \
-                    and x.get("status") not in GOOD | {CI_PENDING}:
-                view[sid] = "dead"  # CONVHEAL: its -AFX ended non-GOOD; never waits forever
-            elif sid in self.chain_dead:
-                view[sid] = "dead"  # BREAKERV2: a lane of its auto-fix chain failed, the chain stops
-            elif not all(self.slice_done(d, lanes, bool(INT_RE.match(sid))) for d in s.get("depends_on", [])):
-                view[sid] = "waiting_deps"
-            elif not INT_RE.match(sid) and not all(self.int_pushed(d, lanes) for d in s.get("depends_on", [])
-                                                   if INT_RE.match(d)):
-                view[sid] = "waiting_deps"  # CONVINTDEP: finished is not yet on origin
-            elif any(files_overlap(s.get("files", []), rf) for rf in run_files):
-                view[sid] = "overlap"
-            elif sid in busy:
-                view[sid] = "same_name_busy"
-            elif self.int_blocked(sid, lanes):
-                view[sid] = "int_busy"
-            elif self.breaker and not INT_RE.match(sid):
-                view[sid] = "breaker_open"
-            elif why := self.slice_lint(s):
-                view[sid] = "held: " + why  # the lint would drop its header
+            if (hold := self.slice_hold(s, lanes, busy, ids, run_files)) is not None:
+                view[sid] = hold
             elif sid in getattr(self, "n6_live", ()):
                 view[sid] = "n6_lease"  # N6-08: an N6 manager owns it; never dispatched meanwhile
                 if sid not in skip:
