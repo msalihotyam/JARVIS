@@ -16,7 +16,8 @@ src == lane) finished blocked, as CDX-N6-01 overrode N6-01. N6 applies the same 
 B2+: N6 says PASS only when the report's first line is ``STATUS: PASS``, the lane state is
 finished PASS, the report has exactly one 40-hex COMMIT and that sha equals the injected git
 ``head`` (the ledger's sha is copied from the report, so it is not evidence); a missing or
-different head is "unknown", never agree. A lane with a chain child absent or unfinished is
+different head is "unknown", never agree. The one other PASS form is a single exact
+``COMMIT: none`` line on a lane whose ``files`` grant names nothing beyond build/reports/. A lane with a chain child absent or unfinished is
 excluded until the conveyor's final verdict exists. Report text alone never yields PASS.
 """
 
@@ -136,7 +137,18 @@ def n6_verdict(snap: Snapshot, lane: str,
     state = snap.lanes[lane]
     if state.get("finished") is not True or state.get("status") != "PASS":
         return "block", f"report PASS but lane state is {state.get('status')}"
-    commits = [line[len("COMMIT:"):].strip() for line in lines if line.startswith("COMMIT:")]
+    raw = [line for line in lines if line.startswith("COMMIT:")]
+    if raw == ["COMMIT: none"]:  # the legal no-commit form (C7), exact line, nothing else
+        files = state.get("files")
+        grant = cast(list[object], files) if isinstance(files, list) else []
+        code = [f for f in grant if not str(f).replace("\\", "/").startswith("build/reports/")]
+        if code:
+            return "block", f"COMMIT: none but the slice grants {code[0]}"
+        child = _blocked_child(snap, lane)
+        if child:
+            return "block", f"chained check {child}"
+        return "pass", "no-commit report, lane state and report-only grant agree"
+    commits = [line[len("COMMIT:"):].strip() for line in raw]
     if len(commits) != 1 or not _SHA.fullmatch(commits[0]):
         return "block", "report needs exactly one 40-hex COMMIT"
     child = _blocked_child(snap, lane)

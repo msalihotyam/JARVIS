@@ -148,6 +148,66 @@ class N6ShadowTests(unittest.TestCase):
         self.assertEqual(self.conveyor_digest(), before)
         self.assertFalse(hasattr(n6_shadow, "write"))
 
+    def no_commit_lane(self, report: str, files: list[str] | None) -> dict[str, object]:
+        """A finished PASS lane RO-1 with ``report``; ``files`` None leaves the grant absent."""
+        lanes = json.loads((self.conveyor / "lanes.json").read_text(encoding="utf-8"))
+        lanes["RO-1"] = {"finished": True, "status": "PASS"}
+        if files is not None:
+            lanes["RO-1"]["files"] = files
+        (self.conveyor / "lanes.json").write_text(json.dumps(lanes), encoding="utf-8")
+        (self.root / "build" / "reports" / "RO-1.md").write_text(report, encoding="utf-8")
+        return self.by_lane(head=lambda lane: None)["RO-1"]
+
+    def test_commit_none_on_a_report_only_lane_passes(self) -> None:
+        for files in (["build/reports/RO-1.md"], ["build\\reports\\RO-1.md"], [], None):
+            record = self.no_commit_lane("STATUS: PASS\nCOMMIT: none\nFILES: report\n", files)
+            self.assertEqual((record["verdict"], record["n6"]["verdict"]), ("agree", "pass"))
+
+    def test_neg_malformed_commit_still_blocks(self) -> None:
+        sha = FIX_SHA
+        for report, reason in (
+                (f"STATUS: PASS\nCOMMIT: {sha[:7]}\n", "report needs exactly one 40-hex COMMIT"),
+                (f"STATUS: PASS\nCOMMIT: {sha} (main)\n", "report needs exactly one 40-hex COMMIT"),
+                (f"STATUS: PASS\nBRANCH: x COMMIT: {sha}\n", "report needs exactly one 40-hex COMMIT"),
+                (f"```\nSTATUS: PASS\nCOMMIT: {sha}\n```\n", "report says ```"),
+                (f"STATUS: PASS\nCOMMIT: {sha}\nCOMMIT: {sha}\n", "report needs exactly one 40-hex COMMIT"),
+                (f"STATUS: PASS\nCOMMIT: none\nCOMMIT: {sha}\n", "report needs exactly one 40-hex COMMIT"),
+                ("STATUS: PASS\nCOMMIT: none\nCOMMIT: none\n", "report needs exactly one 40-hex COMMIT"),
+                ("STATUS: PASS\nCOMMIT: none (read-only)\n", "report needs exactly one 40-hex COMMIT"),
+                ("STATUS: PASS\nCOMMIT:none\n", "report needs exactly one 40-hex COMMIT"),
+                ("STATUS: PASS\nCOMMIT: None\n", "report needs exactly one 40-hex COMMIT"),
+                ("```\nSTATUS: PASS\nCOMMIT: none\n", "report says ```")):
+            with self.subTest(report=report):
+                record = self.no_commit_lane(report, ["build/reports/RO-1.md"])
+                self.assertEqual(record["n6"], {"verdict": "block", "reason": reason})
+
+    def test_neg_commit_none_on_a_code_lane_blocks(self) -> None:
+        record = self.no_commit_lane("STATUS: PASS\nCOMMIT: none\n",
+                                     ["build/reports/RO-1.md", "jarvis/n6_shadow.py"])
+        self.assertEqual(record["n6"], {"verdict": "block",
+                                        "reason": "COMMIT: none but the slice grants jarvis/n6_shadow.py"})
+        self.assertEqual(record["verdict"], "disagree")
+
+    def test_neg_commit_none_still_needs_state_and_chain(self) -> None:
+        lanes = json.loads((self.conveyor / "lanes.json").read_text(encoding="utf-8"))
+        lanes["CDX-N6-01"]["files"] = []
+        (self.conveyor / "lanes.json").write_text(json.dumps(lanes), encoding="utf-8")
+        for lane in ("CDX-N6-01", "INT100B", "N6-01"):
+            (self.root / "build" / "reports" / f"{lane}.md").write_text(
+                "STATUS: PASS\nCOMMIT: none\n", encoding="utf-8")
+        records = self.by_lane()
+        self.assertEqual(records["CDX-N6-01"]["n6"]["verdict"], "block")  # lane state BLOCKED
+        self.assertEqual(records["INT100B"]["n6"]["verdict"], "block")    # lane state DROPPED
+        self.assertEqual(records["N6-01"]["n6"]["verdict"], "block")      # CDX-N6-01 chained, BLOCKED
+        self.assertIn("chained check CDX-N6-01", records["N6-01"]["n6"]["reason"])
+
+    def test_default_verdicts_unchanged_without_commit_none(self) -> None:
+        got = {lane: (r["verdict"], r["n6"]["verdict"], r["n6"]["reason"])
+               for lane, r in self.by_lane().items()}
+        self.assertEqual(got["N6-01FIX"], ("unknown", "unknown", "no independent sha (git head)"))
+        self.assertEqual(got["CDX-N6-01"][:2], ("agree", "block"))
+        self.assertEqual(got["INT100B"][:2], ("agree", "block"))
+
     def test_neg_never_opens_the_live_db(self) -> None:
         paths: list[Path] = []
 
