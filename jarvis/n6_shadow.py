@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import json
 import os
+import posixpath
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -123,6 +124,14 @@ def conveyor_verdict(snap: Snapshot, lane: str) -> tuple[str, str]:
     return ("block", f"chained check {child}") if child else ("pass", "lane finished PASS")
 
 
+def _report_only(entry: object) -> bool:
+    """A grant entry that stays under build/reports/ after normalising separators and ``..``."""
+    if not isinstance(entry, str):
+        return False
+    norm = posixpath.normpath(entry.replace("\\", "/"))
+    return norm == "build/reports" or norm.startswith("build/reports/")
+
+
 def n6_verdict(snap: Snapshot, lane: str,
                head: Callable[[str], str | None]) -> tuple[str, str]:
     """(pass | block | unknown, reason): N6's own decision; PASS needs report, state and the
@@ -140,8 +149,9 @@ def n6_verdict(snap: Snapshot, lane: str,
     raw = [line for line in lines if line.startswith("COMMIT:")]
     if raw == ["COMMIT: none"]:  # the legal no-commit form (C7), exact line, nothing else
         files = state.get("files")
-        grant = cast(list[object], files) if isinstance(files, list) else []
-        code = [f for f in grant if not str(f).replace("\\", "/").startswith("build/reports/")]
+        if not isinstance(files, list):  # no grant is no evidence of a report-only slice
+            return "block", "COMMIT: none but the lane has no files grant"
+        code = [f for f in cast(list[object], files) if not _report_only(f)]
         if code:
             return "block", f"COMMIT: none but the slice grants {code[0]}"
         child = _blocked_child(snap, lane)

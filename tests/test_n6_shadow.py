@@ -16,6 +16,7 @@ from jarvis.n6_root import _guard  # pyright: ignore[reportPrivateUsage]
 
 FIXTURES = Path(__file__).parent / "fixtures" / "n6"
 FIX_SHA = "5d6f096ca07f06a046bc38bf9f3d3b55aeed1a6d"
+ABSENT = object()  # no_commit_lane: leave the "files" key out
 
 
 def guarded(path: Path) -> str:
@@ -148,20 +149,42 @@ class N6ShadowTests(unittest.TestCase):
         self.assertEqual(self.conveyor_digest(), before)
         self.assertFalse(hasattr(n6_shadow, "write"))
 
-    def no_commit_lane(self, report: str, files: list[str] | None) -> dict[str, object]:
-        """A finished PASS lane RO-1 with ``report``; ``files`` None leaves the grant absent."""
+    def no_commit_lane(self, report: str, files: object) -> dict[str, object]:
+        """A finished PASS lane RO-1 with ``report``; ``files`` ABSENT leaves the grant out."""
         lanes = json.loads((self.conveyor / "lanes.json").read_text(encoding="utf-8"))
         lanes["RO-1"] = {"finished": True, "status": "PASS"}
-        if files is not None:
+        if files is not ABSENT:
             lanes["RO-1"]["files"] = files
         (self.conveyor / "lanes.json").write_text(json.dumps(lanes), encoding="utf-8")
         (self.root / "build" / "reports" / "RO-1.md").write_text(report, encoding="utf-8")
         return self.by_lane(head=lambda lane: None)["RO-1"]
 
     def test_commit_none_on_a_report_only_lane_passes(self) -> None:
-        for files in (["build/reports/RO-1.md"], ["build\\reports\\RO-1.md"], [], None):
-            record = self.no_commit_lane("STATUS: PASS\nCOMMIT: none\nFILES: report\n", files)
-            self.assertEqual((record["verdict"], record["n6"]["verdict"]), ("agree", "pass"))
+        for files in (["build/reports/RO-1.md"], ["build\\reports\\RO-1.md"], [],
+                      ["./build/reports/RO-1.md"], ["build/reports/"], ["build/reports/*"],
+                      ["build/reports/sub/../RO-1.md"]):
+            with self.subTest(files=files):
+                record = self.no_commit_lane("STATUS: PASS\nCOMMIT: none\nFILES: report\n", files)
+                self.assertEqual((record["verdict"], record["n6"]["verdict"]), ("agree", "pass"))
+
+    def test_neg_commit_none_without_a_files_list_blocks(self) -> None:
+        for files in (ABSENT, None, "build/reports/RO-1.md", {"build/reports/RO-1.md": 1}, 0):
+            with self.subTest(files=files):
+                record = self.no_commit_lane("STATUS: PASS\nCOMMIT: none\n", files)
+                self.assertEqual(record["n6"], {"verdict": "block", "reason":
+                                                "COMMIT: none but the lane has no files grant"})
+                self.assertEqual(record["verdict"], "disagree")
+
+    def test_neg_commit_none_grant_escaping_build_reports_blocks(self) -> None:
+        for entry in ("build/reports/../jarvis/x.py", "build\\reports\\..\\jarvis\\x.py",
+                      "build/reports/./../../x.py", "build/reports/..", "/build/reports/RO-1.md",
+                      "C:/build/reports/RO-1.md", "Build/Reports/RO-1.md", "build/reportsx/a.md",
+                      "", None, 7):
+            with self.subTest(entry=entry):
+                record = self.no_commit_lane("STATUS: PASS\nCOMMIT: none\n",
+                                             ["build/reports/RO-1.md", entry])
+                self.assertEqual(record["n6"], {"verdict": "block", "reason":
+                                                f"COMMIT: none but the slice grants {entry}"})
 
     def test_neg_malformed_commit_still_blocks(self) -> None:
         sha = FIX_SHA
@@ -191,6 +214,7 @@ class N6ShadowTests(unittest.TestCase):
     def test_neg_commit_none_still_needs_state_and_chain(self) -> None:
         lanes = json.loads((self.conveyor / "lanes.json").read_text(encoding="utf-8"))
         lanes["CDX-N6-01"]["files"] = []
+        lanes["N6-01"]["files"] = []  # a grant, so the chain is what blocks
         (self.conveyor / "lanes.json").write_text(json.dumps(lanes), encoding="utf-8")
         for lane in ("CDX-N6-01", "INT100B", "N6-01"):
             (self.root / "build" / "reports" / f"{lane}.md").write_text(
