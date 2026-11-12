@@ -19,14 +19,28 @@ every path (finally); a crashed tick's lease expires after ``ttl_s``, which
 must be at least the runner's wall cap. T2, INT, push and cleanup stay with the
 conveyor: an INT flag or INT name excludes a slice, and an unknown or raising
 tier counts as not T1.
+
+N6-WIRE2FIX2 (O77 option B): the conveyor stays the only launcher. In production
+the runner is ``write_claim``: the pick is written to build/n6/claim.json and the
+lease is kept live; the conveyor's next pass starts it through its own start()
+or refuses it, writing build/n6/claim_result.json. The next tick settles the
+claim: a refused or expired claim goes back to pending, a started one waits for
+the conveyor's lanes.json verdict, then n6_record_finish + n6_deps.record.
+A runner that raises after the mark hands the slice back to pending.
 """
 
 from __future__ import annotations
 
+import contextlib
+import dataclasses
 import json
 import math
+import os
 import re
+import subprocess
 import sys
+import tempfile
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +55,7 @@ from jarvis.work_planner import n6_next  # noqa: E402
 from jarvis.work_supervisor import Situation, n6_record_finish, supervise  # noqa: E402
 
 OWNER = "n6-limited"
+CLAIMED = "claimed"  # a runner's answer: the conveyor will start it (keep the lease)
 
 
 @dataclass(frozen=True)
@@ -62,13 +77,14 @@ def switch_on(root: Path | str) -> bool:
 
 def tick(root: Path | str, ports: Ports) -> list[str]:
     """One LIMITED-phase step, then one page; the notes say what happened. Never raises."""
-    if not switch_on(root):
-        return []  # OFF: zero N6 actions
     n6 = Path(root) / "build" / "n6"
+    claim = (n6 / "claim.json").exists()  # an open claim settles even with the switch off
+    if not claim and not switch_on(root):
+        return []  # OFF: zero N6 actions
     try:
-        notes = _step(root, n6, ports)
+        notes = _settle(root, n6, ports) if claim else _step(root, n6, ports)
     except Exception as exc:
-        notes = [f"n6 held: {type(exc).__name__}"]
+        notes = [f"n6 {'claim ' if claim else ''}held: {type(exc).__name__}"]
     if ports.page is not None:
         try:
             ports.page(n6 / "notify.json")
@@ -155,7 +171,7 @@ def _step(root: Path | str, n6: Path, ports: Ports) -> list[str]:
     lease = n6_lease.acquire(lease_path, OWNER, sid, ports.ttl_s, t1)
     if lease is None:
         return [*notes, "lease held: nothing started"]
-    ran = False
+    ran = marked = kept = False
     try:
         decision = supervise(ports.situation(sid), n6_dir=n6, slice_id=sid)
         if decision.constraint == "none":
@@ -172,8 +188,12 @@ def _step(root: Path | str, n6: Path, ports: Ports) -> list[str]:
         notes += [a for a in got.attention if a not in notes]
         if sid not in {s for s, _ in got.start}:
             return [*notes, f"{sid}: handed back (not startable)"]
+        marked = True
         status = ports.run(sid, lease)
         ran = True
+        if status == CLAIMED:
+            kept = True  # the lease stays live until the conveyor starts or refuses it
+            return [*notes, f"{sid}: claimed for the conveyor"]
         verdict = status.strip().upper() if isinstance(status, str) else ""
         if verdict in GOOD | BAD:
             now = _now(ports, t0)
@@ -186,19 +206,134 @@ def _step(root: Path | str, n6: Path, ports: Ports) -> list[str]:
     except Exception as exc:
         what = "ran; bookkeeping failed" if ran else "handed back"
         notes.append(f"{sid}: {what} ({type(exc).__name__})")
+        if marked and not ran:  # N6-WIRE2FIX2: a raising runner never strands it started
+            try:
+                n6_deps.hand_back(deps, sid)
+            except Exception as exc2:
+                notes.append(f"{sid}: stays started ({type(exc2).__name__})")
     finally:
-        if not n6_lease.release(lease_path, lease, _now(ports, t0)):
+        if not kept and not n6_lease.release(lease_path, lease, _now(ports, t0)):
             notes.append(f"{sid}: lease lost mid-run")
     return notes
 
 
+def _put(path: Path, data: object) -> None:
+    fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp, path)
+    except BaseException:
+        with contextlib.suppress(OSError):
+            os.unlink(tmp)
+        raise
+
+
+def write_claim(n6: Path, lease: n6_lease.Lease) -> str:
+    """The production runner (O77 B): hand the pick to the conveyor as build/n6/claim.json."""
+    _put(n6 / "claim.json", dataclasses.asdict(lease))
+    return CLAIMED
+
+
+def _drop(*paths: Path) -> None:
+    for p in paths:
+        with contextlib.suppress(FileNotFoundError):
+            p.unlink()
+
+
+def _settle(root: Path | str, n6: Path, ports: Ports) -> list[str]:
+    """The open claim: wait for the conveyor's answer, hand a refused or expired one back
+    to pending, record a started one's verdict once the conveyor's lane has finished."""
+    claim_path, res_path = n6 / "claim.json", n6 / "claim_result.json"
+    lease_path, deps = n6 / "lease.json", n6 / "deps.json"
+    lease = n6_lease.Lease(**json.loads(claim_path.read_text(encoding="utf-8")))
+    sid = lease.slice_id
+
+    def result() -> dict[str, object] | None:
+        try:
+            r = json.loads(res_path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        ok = isinstance(r, dict) and r.get("epoch") == lease.epoch and r.get("slice_id") == sid
+        return r if ok else None  # an older claim's answer is no answer
+
+    res = result()
+    if res is None:
+        # The conveyor holds this lock from its checks to the inbox/started write, so an
+        # expired, unanswered claim it did not start is safe to hand back here.
+        with n6_lease._locked(lease_path) as got:  # pyright: ignore[reportPrivateUsage]
+            if not got or result() is not None or n6_lease.check(lease_path, lease, ports.now()) \
+                    or _conveyor_has(root, sid):
+                return [f"{sid}: claim pending"]
+            n6_deps.hand_back(deps, sid)
+            _drop(claim_path)
+        return [f"{sid}: handed back (claim expired)"]
+    if res.get("state") != "started":
+        n6_deps.hand_back(deps, sid)
+        n6_lease.release(lease_path, lease, ports.now())
+        _drop(claim_path, res_path)
+        return [f"{sid}: handed back ({str(res.get('reason'))[:60]})"]
+    n6_lease.release(lease_path, lease, ports.now())  # started: the lane is the conveyor's now
+    lanes = json.loads((Path(root) / "build" / "conveyor" / "lanes.json").read_text(encoding="utf-8"))
+    ln = lanes.get(sid) if isinstance(lanes, dict) else None
+    if not isinstance(ln, dict) or not ln.get("finished"):
+        return [f"{sid}: running"]
+    status = ln.get("status")
+    verdict = status.strip().upper() if isinstance(status, str) else ""
+    notes: list[str] = []
+    if verdict in GOOD | BAD:
+        now = ports.now()
+        if not n6_record_finish(n6, sid, verdict, now, now):
+            notes.append(f"{sid}: breaker not written")
+        try:
+            n6_deps.record(deps, sid, "done" if verdict in GOOD else "blocked")
+        except n6_deps.Unreadable:
+            raise
+        except ValueError:
+            pass  # already final: a second settle never rewrites it
+        notes.append(f"{sid}: {verdict}")
+    else:
+        notes.append(f"{sid}: no verdict ({str(status)[:40]})")
+    _drop(claim_path, res_path)
+    return notes
+
+
+def _git(*args: str) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", *args], cwd=ROOT, capture_output=True, text=True, timeout=60)
+
+
+def _verify(sha: str) -> str | None:
+    """The local origin/main SHA when it contains ``sha`` (local refs only, no fetch)."""
+    rc = _git("merge-base", "--is-ancestor", sha, "origin/main").returncode
+    if rc == 1:
+        return None
+    if rc != 0:
+        raise RuntimeError(f"git merge-base rc {rc}")
+    return _git("rev-parse", "origin/main").stdout.strip()
+
+
+def _tier(sid: str) -> object:
+    data = json.loads((ROOT / "build" / "conveyor" / "backlog.json").read_text(encoding="utf-8"))
+    slices = data.get("slices") if isinstance(data, dict) else data
+    return next(s.get("tier") for s in slices if isinstance(s, dict) and s.get("id") == sid)
+
+
+def _situation(sid: str) -> Situation:
+    # ponytail: nothing writes situation.json yet; absent -> _step hands the pick back.
+    return Situation(**json.loads((ROOT / "build" / "n6" / "situation.json").read_text(encoding="utf-8")))
+
+
 def main() -> int:
-    if not switch_on(ROOT):
+    n6 = ROOT / "build" / "n6"
+    if not switch_on(ROOT) and not (n6 / "claim.json").exists():
         print("N6 LIMITED is off (build/n6/LIMITED_ON absent): nothing done")
         return 0
-    # ponytail: no lane runner or phone send is wired yet; the LIMITED phase supplies them.
-    print("N6 LIMITED is on but no lane runner is wired (N6-WIRE2): nothing done")
-    return 2
+    # ponytail: no phone send wired (page=None); n6_notify.flush when the LIMITED phase wants it.
+    ports = Ports(now=time.time, verify=_verify, tier=_tier, situation=_situation,
+                  run=lambda sid, lease: write_claim(n6, lease), ttl_s=900.0)
+    for note in tick(ROOT, ports):
+        print(note)
+    return 0
 
 
 if __name__ == "__main__":

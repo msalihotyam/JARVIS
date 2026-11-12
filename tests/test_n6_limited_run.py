@@ -199,16 +199,19 @@ class LimitedRun(unittest.TestCase):
             self.assertIsNone(n6_lease.acquire(p, "o", "A-1", ttl, now), (ttl, now))
         self.assertFalse(p.exists())
 
-    def test_runner_exception_releases_and_never_reruns(self):
+    def test_runner_exception_releases_and_hands_back_to_pending(self):
+        # N6-WIRE2FIX2: a raising runner never strands the slice started; it runs again
         self.on()
         self.backlog(n6_deps.Item("A-1"))
         self.status = RuntimeError("lane crashed")
         notes = lr.tick(self.root, self.ports())
         self.assertIn("A-1: handed back (RuntimeError)", notes)
         self.assertEqual(self.live(), frozenset())
+        self.assertIn('"state": "pending"', self.states())
         self.status = "PASS"
         lr.tick(self.root, self.ports())
-        self.assertEqual(self.ran, ["A-1"])
+        self.assertEqual(self.ran, ["A-1", "A-1"])
+        self.assertIn('"state": "done"', self.states())
 
     def test_live_lease_or_unreadable_lease_starts_nothing(self):
         self.on()
@@ -290,6 +293,125 @@ class LimitedRun(unittest.TestCase):
             raise OSError("pager down")
 
         self.assertEqual(lr.tick(self.root, self.ports(page=page)), ["page failed: OSError"])
+
+
+class ClaimFlow(unittest.TestCase):
+    """N6-WIRE2FIX2 (O77 B): the production runner writes claim.json; the conveyor answers
+    in claim_result.json; tick settles it. Every refusal returns the slice to pending."""
+
+    setUp, on, backlog, ports, live, run_port = (
+        LimitedRun.setUp, LimitedRun.on, LimitedRun.backlog, LimitedRun.ports, LimitedRun.live,
+        LimitedRun.run_port)
+
+    def claim_ports(self, **kw):
+        return self.ports(run=lambda sid, lease: lr.write_claim(self.n6, lease), **kw)
+
+    def state(self, sid="A-1"):
+        data = json.loads((self.n6 / "deps.json").read_text(encoding="utf-8"))
+        return {e["id"]: e["state"] for e in data["backlog"]}[sid]
+
+    def claimed(self):
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        notes = lr.tick(self.root, self.claim_ports())
+        self.assertIn("A-1: claimed for the conveyor", notes)
+        return json.loads((self.n6 / "claim.json").read_text(encoding="utf-8"))
+
+    def answer(self, claim, state, reason="", sid="A-1"):
+        (self.n6 / "claim_result.json").write_text(json.dumps(
+            {"epoch": claim["epoch"], "slice_id": sid, "state": state, "reason": reason}),
+            encoding="utf-8")
+
+    def lanes(self, data):
+        conv = self.root / "build" / "conveyor"
+        conv.mkdir(parents=True, exist_ok=True)
+        (conv / "lanes.json").write_text(json.dumps(data), encoding="utf-8")
+
+    def test_claim_is_written_and_the_lease_kept(self):
+        claim = self.claimed()
+        self.assertEqual(claim["slice_id"], "A-1")
+        self.assertEqual(self.state(), "started")
+        self.assertEqual(self.live(), frozenset({"A-1"}))
+        self.assertEqual(lr.tick(self.root, self.claim_ports()), ["A-1: claim pending"])
+
+    def test_each_refusal_hands_back_to_pending(self):
+        for reason in ("switch off", "int", "not started", "lease lost", "not T1",
+                       "already running", "start_error: RuntimeError", "start_failed"):
+            with self.subTest(reason=reason):
+                self.setUp()
+                claim = self.claimed()
+                self.answer(claim, "refused", reason)
+                notes = lr.tick(self.root, self.claim_ports())
+                self.assertEqual(notes, [f"A-1: handed back ({reason})"])
+                self.assertEqual(self.state(), "pending")
+                self.assertEqual(self.live(), frozenset())
+                self.assertFalse((self.n6 / "claim.json").exists())
+                self.assertFalse((self.n6 / "claim_result.json").exists())
+
+    def test_started_claim_records_the_conveyor_verdict_once(self):
+        claim = self.claimed()
+        self.answer(claim, "started")
+        self.lanes({"A-1": {"status": "running"}})
+        self.assertEqual(lr.tick(self.root, self.claim_ports()), ["A-1: running"])
+        self.assertEqual(self.state(), "started")
+        self.lanes({"A-1": {"finished": True, "status": "PASS"}})
+        self.assertEqual(lr.tick(self.root, self.claim_ports()), ["A-1: PASS"])
+        self.assertEqual(self.state(), "done")
+        self.assertFalse((self.n6 / "claim.json").exists())
+
+    def test_an_older_claims_answer_is_no_answer(self):
+        claim = self.claimed()
+        self.answer({"epoch": claim["epoch"] - 1}, "refused", "x")
+        self.assertEqual(lr.tick(self.root, self.claim_ports()), ["A-1: claim pending"])
+        self.assertEqual(self.state(), "started")
+
+    def test_switch_off_still_settles_an_open_claim(self):
+        claim = self.claimed()
+        (self.n6 / "LIMITED_ON").unlink()
+        self.answer(claim, "refused", "switch off")
+        self.assertEqual(lr.tick(self.root, self.claim_ports()), ["A-1: handed back (switch off)"])
+        self.assertEqual(self.state(), "pending")
+
+    def test_expired_unanswered_claim_is_handed_back(self):
+        self.claimed()
+        self.clock += 601.0
+        self.assertEqual(lr.tick(self.root, self.claim_ports()),
+                         ["A-1: handed back (claim expired)"])
+        self.assertEqual(self.state(), "pending")
+        self.assertFalse((self.n6 / "claim.json").exists())
+
+    def test_expired_claim_the_conveyor_already_has_stays(self):
+        self.claimed()
+        self.lanes({"A-1": {"status": "running"}})
+        self.clock += 601.0
+        self.assertEqual(lr.tick(self.root, self.claim_ports()), ["A-1: claim pending"])
+        self.assertEqual(self.state(), "started")
+
+    def test_raising_claim_writer_never_strands_started(self):
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+
+        def boom(sid, lease):
+            raise OSError("disk full")
+
+        notes = lr.tick(self.root, self.ports(run=boom))
+        self.assertIn("A-1: handed back (OSError)", notes)
+        self.assertEqual(self.state(), "pending")
+        self.assertEqual(self.live(), frozenset())
+
+    def test_unreadable_claim_holds_and_changes_nothing(self):
+        claim = self.claimed()
+        (self.n6 / "claim.json").write_text("{not json", encoding="utf-8")
+        self.answer(claim, "refused", "x")
+        self.assertEqual(lr.tick(self.root, self.claim_ports()), ["n6 claim held: JSONDecodeError"])
+        self.assertEqual(self.state(), "started")
+
+    def test_main_is_a_no_op_when_off(self):
+        old = lr.ROOT
+        lr.ROOT = self.root
+        self.addCleanup(setattr, lr, "ROOT", old)
+        self.assertEqual(lr.main(), 0)
+        self.assertEqual(sorted(p.name for p in self.n6.iterdir()), [])
 
 
 if __name__ == "__main__":

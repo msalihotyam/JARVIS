@@ -5733,6 +5733,79 @@ class TestN6Lease(Base):
         self.c.pass_once()
         self.assertEqual(sorted(self.fake.bg_names()), ["A", "B"])
 
+    def n6_claim(self, sid, epoch=2, lease_sid=None, state="started", is_int=False, on=True):
+        # N6-WIRE2FIX2: N6's side of a claim, written by hand in the temp root
+        n6 = self.root / "build" / "n6"
+        self.lease({"epoch": epoch, "owner": "n6", "slice_id": lease_sid or sid,
+                    "expires": self.t + 600, "applied": []})
+        (n6 / "deps.json").write_text(json.dumps({"version": 1, "backlog": [
+            {"id": sid, "deps": [], "int": is_int, "state": state, "sha": None,
+             "pushed": False}]}), encoding="utf-8")
+        (n6 / "claim.json").write_text(json.dumps({"epoch": epoch, "slice_id": sid}),
+                                       encoding="utf-8")
+        if on:
+            (n6 / "LIMITED_ON").write_text("", encoding="utf-8")
+        elif (n6 / "LIMITED_ON").exists():
+            (n6 / "LIMITED_ON").unlink()
+
+    def n6_result(self):
+        return json.loads((self.root / "build" / "n6" / "claim_result.json").read_text(
+            encoding="utf-8"))
+
+    def test_n6_claim_runs_through_start_once(self):
+        self.backlog({"id": "A", "tier": "T1"})
+        self.n6_claim("A")
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])  # never a second start by the planner
+        self.assertEqual(self.n6_result()["state"], "started")
+        self.assertEqual(len([e for e in self.events() if e["event"] == "dispatch"]), 1)
+
+    def test_neg_each_unhonourable_claim_is_refused_with_its_reason(self):
+        self.backlog({"id": "A", "tier": "T1"}, {"id": "B", "tier": "T2"})
+        cases = [("switch off", dict(sid="A", on=False), {}),
+                 ("int", dict(sid="A", is_int=True), {}),
+                 ("not started", dict(sid="A", state="pending"), {}),
+                 ("lease lost", dict(sid="A", lease_sid="B"), {}),
+                 ("not T1", dict(sid="B"), {}),
+                 ("already running", dict(sid="A"), {"A": {}})]
+        for n, (reason, kw, lanes) in enumerate(cases):
+            with self.subTest(reason=reason):
+                self.n6_claim(epoch=10 + n, **kw)
+                self.assertFalse(self.c.n6_take(lanes, set()))
+                self.assertEqual(self.n6_result(),
+                                 {"epoch": 10 + n, "slice_id": kw["sid"], "state": "refused",
+                                  "reason": reason})
+        self.assertEqual(self.fake.bg_calls(), [])
+
+    def test_neg_raising_start_is_refused_never_started(self):
+        self.backlog({"id": "A", "tier": "T1"})
+        self.n6_claim("A")
+
+        def boom(*a, **k):
+            raise RuntimeError("spawn failed")
+
+        self.c.start = boom
+        self.assertFalse(self.c.n6_take({}, set()))
+        self.assertEqual(self.n6_result()["reason"], "start_error: RuntimeError")
+        self.assertFalse((self.base / "lanes.json").exists())  # no lane recorded
+        self.assertEqual(self.fake.bg_calls(), [])
+
+    def test_neg_unreadable_claim_holds_it_and_the_queue_goes_on(self):
+        n6 = self.root / "build" / "n6"
+        n6.mkdir(parents=True)
+        (n6 / "claim.json").write_text("{not json", encoding="utf-8")
+        self.drop("b.md", HDR.format("B") + "y")
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["B"])
+        self.assertEqual(self.attn(), [conveyor.N6_CLAIM_ID])
+        self.assertEqual(len([e for e in self.events() if e["event"] == "n6_claim_held"]), 1)
+        self.assertFalse((n6 / "claim_result.json").exists())
+        (n6 / "claim.json").unlink()
+        self.c.pass_once()
+        self.assertEqual(self.attn(), [])
+
     def test_neg_no_lease_file_dispatch_unchanged(self):
         self.drop("a.md", HDR.format("A") + "x")
         self.c.pass_once()

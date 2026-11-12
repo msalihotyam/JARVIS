@@ -220,6 +220,7 @@ PRIORITY = {"present": BELOW_NORMAL, "away": NORMAL}
 POWER_PLANS = {"present": "JarvisWatch", "away": "JarvisFocus"}  # "{plan}" in power_switch_cmd
 POWER_SWITCH_ID = "power-switch"  # attention id (and ack file) of a failed power switch
 N6_LEASE_ID = "n6-lease"  # attention id (and ack file) of an unreadable N6 lease file
+N6_CLAIM_ID = "n6-claim"  # attention id of an unreadable N6 claim/deps state (N6-WIRE2FIX2)
 URGENT_PAGE_IDS = {"outage", "status_stale", POWER_SWITCH_ID, N6_LEASE_ID}  # page Salih (+ breaker, needs_salih)
 POWER_QUERY_TIMEOUT_S = 15  # power_switch_query_cmd; a timeout means "unreadable": no switch
 # Active plans the switch may override, by GUID (powercfg names are localized/codepage-mangled):
@@ -3609,7 +3610,7 @@ class Conveyor:
         if self.hold():
             return
         busy = self.busy_names(lanes, agents)
-        started, held = False, set()
+        started, held = self.n6_take(lanes, busy), set()  # N6-WIRE2FIX2: N6's claim first
         files = sorted(self.inbox.glob("*.md"), key=mtime_or_0)
         for f in files:
             try:
@@ -3704,6 +3705,107 @@ class Conveyor:
                     real_instance_lock(fd, unlock=True)
         finally:
             os.close(fd)
+
+    def n6_answer(self, epoch, sid, state, reason=None):
+        """N6-WIRE2FIX2: the conveyor's one answer to N6's claim, for N6's ledger."""
+        n6 = self.root / "build" / "n6"
+        tmp = n6 / "claim_result.json.tmp"
+        tmp.write_text(json.dumps({"epoch": epoch, "slice_id": sid, "state": state,
+                                   "reason": reason}), encoding="utf-8")
+        os.replace(tmp, n6 / "claim_result.json")
+        self.event("n6_claim", lane=sid, state=state, reason=reason)
+
+    def n6_take(self, lanes, busy):
+        """N6-WIRE2FIX2 (O77 B): start N6's claim (build/n6/claim.json, a lease-held T1 pick)
+        through start(), the one launcher, and answer it once in claim_result.json. A claim
+        it cannot honour is refused with a reason (N6 hands the slice back to pending).
+        Unreadable claim/lease/deps: no launch, one attention item, the queue goes on."""
+        n6 = self.root / "build" / "n6"
+        claim_path = n6 / "claim.json"
+        if not claim_path.exists():
+            if self.pager_flag("n6_claim_held"):
+                self.pager_flag("n6_claim_held", False)
+            return False
+        if self.breaker or self.cap_full(lanes):
+            return False  # wait; an unanswered claim expires with its lease and N6 hands it back
+        with self.n6_claim() as ok:
+            if not ok:
+                return False
+            try:
+                claim = json.loads(claim_path.read_text(encoding="utf-8"))
+                sid, epoch = claim["slice_id"], claim["epoch"]
+                if type(sid) is not str or type(epoch) is not int:
+                    raise ValueError("claim shape")
+                try:
+                    res = json.loads((n6 / "claim_result.json").read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    res = None
+                if isinstance(res, dict) and res.get("epoch") == epoch and res.get("slice_id") == sid:
+                    return False  # already answered; N6 settles it
+                try:
+                    lease = json.loads((n6 / "lease.json").read_text(encoding="utf-8"))
+                except FileNotFoundError:
+                    lease = None
+                live = n6_live_slices(n6 / "lease.json", self.now())
+                if live == N6_HELD_ALL or (lease is not None and not isinstance(lease, dict)):
+                    raise ValueError("lease unreadable")
+                deps = json.loads((n6 / "deps.json").read_text(encoding="utf-8"))["backlog"]
+                entry = [e for e in deps if e["id"] == sid]
+                slices, _ = self.load_backlog()
+            except (OSError, ValueError, KeyError, TypeError, RecursionError) as exc:
+                if not self.pager_flag("n6_claim_held"):
+                    self.pager_flag("n6_claim_held", self.now())
+                    self.event("n6_claim_held", error=type(exc).__name__)
+                return False
+            if self.pager_flag("n6_claim_held"):
+                self.pager_flag("n6_claim_held", False)
+            e = entry[0] if entry else None
+            s = next((x for x in slices if isinstance(x, dict) and x.get("id") == sid), None)
+            started_dir = self.inbox / "started"
+            reason = None
+            if not (n6 / "LIMITED_ON").is_file():
+                reason = "switch off"
+            elif INT_RE.match(sid) or (isinstance(e, dict) and e.get("int") is not False):
+                reason = "int"
+            elif not isinstance(e, dict) or e.get("state") != "started":
+                reason = "not started"
+            elif lease is None or lease.get("epoch") != epoch or lease.get("slice_id") != sid \
+                    or sid not in live:
+                reason = "lease lost"
+            elif s is None or s.get("tier") != "T1":
+                reason = "not T1"
+            elif sid in lanes or sid in busy or (started_dir.is_dir() and any(
+                    p.name[16:] == f"{sid}.md" for p in started_dir.iterdir())):
+                reason = "already running"
+            if reason:
+                self.n6_answer(epoch, sid, "refused", reason)
+                return False
+            worker, _why = self.route(s)
+            if s.get("worker") == "auto" and worker == "codex" and self.cap_full(lanes, "codex"):
+                worker = "claude"
+            if self.cap_full(lanes, worker):
+                return False
+            trial = {} if worker in ("codex", "jules") else {
+                k: s[k] for k in ("advisor", "subagent_model") if k in s}
+            try:
+                text, base = self.slice_text(s)
+                lane_id = self.start(sid, s["model"], s["effort"], text, **trial)
+            except Exception as exc:  # a raising start never leaves the slice started
+                self.n6_answer(epoch, sid, "refused", f"start_error: {type(exc).__name__}")
+                return False
+            if not lane_id:
+                self.n6_answer(epoch, sid, "refused", "start_failed")
+                return False
+            dest = self.started_path(sid)
+            dest.write_text(text, encoding="utf-8")
+        self.record(lanes, sid, lane_id, s["model"], s["effort"], base, dest,
+                    files=s.get("files", []), slice_=True,
+                    worker=worker if worker in ("codex", "jules") else None, **trial)
+        busy.add(sid)
+        self.event("dispatch", lane=sid, id=lane_id, model=s["model"], effort=s["effort"],
+                   file=dest.name, backlog=True, tier=s["tier"], n6=True, **trial)
+        self.n6_answer(epoch, sid, "started")
+        return True
 
     def n6_skip(self, sid):
         """One n6_lease_skip event per slice per live-lease episode."""
@@ -4061,6 +4163,9 @@ class Conveyor:
         n6 = self.pager_flag("n6_lease_held")
         if n6:
             items.append((N6_LEASE_ID, "build/n6/lease.json okunamıyor: yeni dispatch durdu", n6))
+        n6c = self.pager_flag("n6_claim_held")
+        if n6c:
+            items.append((N6_CLAIM_ID, "build/n6 claim/deps okunamıyor: N6 claim başlatılmadı", n6c))
         for name, st in self.load_json(self.push_file, {}).items():
             items.append((name, f"push blocked: {st['reason']}", st["since"]))
         # ponytail: acked rejects stay in pager.json (a few bytes each); prune if it ever grows
