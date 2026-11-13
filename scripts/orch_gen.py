@@ -19,6 +19,10 @@ git show --name-only, their tests modules + tests importing a changed jarvis mod
 file is touched), CI BRANCH ci/<intnn>.
 Dry run is the default (prints what it would write). --write writes the prompt and the backlog entry,
 keeps a backup of the backlog in build/conveyor/hold/ and runs build/orch/check_backlog.py.
+"slice --spec S.json" / "fix --spec S.json" write a SKELETONS 1 feature slice / a stacked
+SKELETONS 2 FIX (stack = source stack + source COMMIT, review base = parent(stack[0]),
+stack-only grant = every stack file) from a short JSON spec; they also run
+build/orch/preflight.py and roll back the backlog and prompt on any error.
 Anything unclear refuses (exit 2) with the reason. Never edits conveyor.py, never pushes, never
 writes approvals (the entry carries no "approved" key).
 """
@@ -47,6 +51,7 @@ JULES_RE = re.compile(r"(?im)^[\s>#*`-]*worker:[\s`]*jules\b")
 SCOPE_RE = re.compile(r"(?m)^.*?\bScope:(.*)$")
 PAIR_RE = re.compile(r"(?<![\w./-])([A-Za-z0-9][A-Za-z0-9._-]*) `?([0-9a-f]{7,40})\b")
 PATH_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")
+SIZES = {"SMALL": 35, "MEDIUM": 50}  # tool-call budget per size (SKELETONS 1/2)
 REVIEW_NUM = re.compile(r"(?i)^(?:CDXINT|CLREV)(\d+)")
 INT_NUM = re.compile(r"(?i)^INT(\d+)")
 
@@ -417,6 +422,89 @@ class Gen:
                 found.append(f"tests.{stem}")
         return found
 
+    def spec(self, path, fix):
+        """A slice/fix spec (JSON object); refuses on any missing or bad field."""
+        try:
+            sp = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        except (OSError, ValueError) as e:
+            raise Refuse(f"spec unreadable: {e}") from None
+        if not isinstance(sp, dict):
+            raise Refuse("spec is not a JSON object")
+        need = ["id", "title", "tier", "model", "effort", "size", "goal", "tests", "run", "owned", "commit"]
+        need += ["review", "source"] if fix else []
+        for k in need:
+            if not sp.get(k):
+                raise Refuse(f"spec has no {k}")
+        for k in ("run", "owned"):
+            if not isinstance(sp[k], list) or not all(isinstance(x, str) and PATH_RE.fullmatch(x) for x in sp[k]):
+                raise Refuse(f"spec {k} must be a list of plain names")
+        if not conveyor.LANE_RE.fullmatch(sp["id"]) or not conveyor.LANE_RE.fullmatch(sp.get("source", "x")):
+            raise Refuse("spec id/source is not a lane id")
+        if sp["size"] not in SIZES and not isinstance(sp.get("calls"), int):
+            raise Refuse(f"spec size {sp['size']} needs calls (known: {', '.join(SIZES)})")
+        if any("\n" in str(sp.get(k, "")) for k in ("title", "goal", "decisions", "tests", "commit")):
+            raise Refuse("spec text fields are one line each")
+        return sp
+
+    def owned_line(self, paths):
+        """Owned paths, "(new)" on each one main does not have."""
+        return ", ".join(p if self.git_fn(self.root, "cat-file", "-e", f"main:{p}")[0] == 0 else f"{p} (new)"
+                         for p in paths)
+
+    def from_spec(self, path, fix):
+        """(backlog, entry, body) for a SKELETONS 1 feature slice or a SKELETONS 2 stacked FIX."""
+        sp, b = self.spec(path, fix), self.backlog()
+        sid, rep = sp["id"], f"build/reports/{sp['id']}.md"
+        owned = [p for p in sp["owned"] if p != rep]
+        calls = sp.get("calls") or SIZES[sp["size"]]
+        chain = fix or sp.get("chain") is True  # a stacked FIX is always chained (validate_slice)
+        entry = {"id": sid, "title": sp["title"], "model": sp["model"], "effort": sp["effort"],
+                 "tier": sp["tier"], "files": owned + [rep], "depends_on": list(sp.get("depends_on") or []),
+                 "prompt": f"build/conveyor/prompts/{sid}.md"}
+        base, mid, grant = "main", [], []
+        if fix:
+            src = next((s for s in b["slices"] if s.get("id") == sp["source"]), None)
+            if src is None:
+                raise Refuse(f"{sp['source']}: not in the backlog")
+            p = self.reports / f"{sp['review']}.md"
+            if not conveyor.LANE_RE.fullmatch(sp["review"]) or not p.is_file():
+                raise Refuse(f"{sp['review']}: no review report")
+            flines = [m.group(0).strip(" \t>*`-") for m in conveyor.AUTOFIX_F_RE.finditer(
+                p.read_text(encoding="utf-8", errors="replace"))]
+            fids = sorted({x.split()[0] for x in flines}, key=lambda x: int(x[1:]))
+            if not fids:
+                raise Refuse(f"{sp['review']}: report has no F<n> finding line")
+            stack = list(src.get("stack") or []) + [self.commit_of(sp["source"], self.report(sp["source"]))]
+            if len(set(stack)) != len(stack):
+                raise Refuse(f"{sp['source']}: its COMMIT is already on the stack")
+            rb = self.git("rev-parse", f"{stack[0]}^").strip()
+            for sha in stack:
+                grant += [f for f in self.changed(sha) if f not in owned and f not in grant]
+            entry["files"] = owned + grant + [rep]
+            entry.update(stack=stack, review_base=rb)
+            mid = [f"BASE AT {stack[-1]} (stack {' -> '.join(x[:7] for x in stack)}; review base {rb[:7]})",
+                   f"READ FIRST: build/reports/{sp['review']}.md ({', '.join(fids)})"]
+            mid += ["Findings (data):"] + [f"    > {x}" for x in flines]
+        elif chain:
+            base = self.git("rev-parse", "refs/heads/main").strip()
+            if not SHA40.fullmatch(base):
+                raise Refuse(f"main is {base!r}, not a 40-hex sha")
+        if chain:
+            entry["chain"] = ["CLREV", "CDX", "INT"]
+        head = f"{sid}: {sp['tier']}, {sp['size']} <= {calls}" + (
+            "." if fix else " tool calls" + (", SPLIT-OK." if sp.get("split_ok") else "."))
+        lines = [f"@jarvis lane={sid} model={sp['model']} effort={sp['effort']} base={base}",
+                 f"LANE RULES: build/conveyor/notes/LANE_RULES.md (CORE{' + FIX' if fix else ''})",
+                 head, *(["CHAIN: CLREV+CDX"] if chain else []),
+                 *([] if fix else [f"Goal: {sp['goal']}"]), *mid,
+                 *([f"Goal: {sp['goal']}"] if fix else []),
+                 *([f"Decisions: {sp['decisions']}"] if sp.get("decisions") else []),
+                 f"Tests: {sp['tests']}", f"Run: python scripts/test_parallel.py {' '.join(sp['run'])}",
+                 f"Owned: {self.owned_line(owned)}, {rep} (new)",
+                 *([f"Stack-only grant (do not edit): {', '.join(grant)}"] if grant else []),
+                 f'Commit: "{sp["commit"]}"']
+        return b, entry, "\n".join(lines) + "\n"
+
     def lint(self, b, entry, body):
         ids = {s.get("id") for s in b["slices"]}
         if entry["id"] in ids or (self.root / entry["prompt"]).exists():
@@ -429,7 +517,7 @@ class Gen:
         if why:
             raise Refuse(f"{entry['id']}: generated slice fails the conveyor lint: {why}")
 
-    def emit(self, b, entry, body, write):
+    def emit(self, b, entry, body, write, strict=False):
         self.lint(b, entry, body)
         if not write:
             self.out(f"dry-run: would write {entry['prompt']}:\n{body}\n"
@@ -451,12 +539,19 @@ class Gen:
         os.replace(tmp, self.backlog_path)
         self.out(f"wrote {entry['prompt']}, appended {entry['id']} (backup "
                  f"{backup.relative_to(self.root).as_posix()})")
-        r = subprocess.run([sys.executable, str(self.root / "build" / "orch" / "check_backlog.py")],
-                           cwd=self.root, capture_output=True, text=True, encoding="utf-8", errors="replace")
-        self.out((r.stdout + r.stderr).strip())
-        if r.returncode != 0:
-            self.out(f"check_backlog failed (exit {r.returncode}); backup at {backup}")
-            return 1
+        checks = ["check_backlog.py"] + (["preflight.py"] if strict else [])
+        for name in checks:
+            r = subprocess.run([sys.executable, str(self.root / "build" / "orch" / name), str(self.root)],
+                               cwd=self.root, capture_output=True, text=True, encoding="utf-8", errors="replace")
+            self.out((r.stdout + r.stderr).strip())
+            if r.returncode != 0:
+                if strict:  # slice/fix: refuse on any error, leave nothing behind but the backup
+                    self.backlog_path.write_bytes(raw)
+                    (self.root / entry["prompt"]).unlink()
+                    self.out(f"REFUSED: {name} failed (exit {r.returncode}); backlog restored, prompt removed")
+                else:
+                    self.out(f"{name} failed (exit {r.returncode}); backup at {backup}")
+                return 1
         return 0
 
 
@@ -465,9 +560,12 @@ def main(argv=None, git=real_git, out=print):
     ap.add_argument("--root", default=str(Path(__file__).resolve().parents[1]),
                     help="main checkout (holds build/)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("review", "int"):
+    for name in ("review", "int", "slice", "fix"):
         p = sub.add_parser(name)
-        p.add_argument("ids", nargs="+")
+        if name in ("slice", "fix"):
+            p.add_argument("--spec", required=True, metavar="JSON", help="the slice/fix spec file")
+        else:
+            p.add_argument("ids", nargs="+")
         if name == "review":
             p.add_argument("--with-partial", action="append", default=[], metavar="ID",
                            help="a BLOCKED predecessor a reviewed slice names as BASE")
@@ -485,6 +583,8 @@ def main(argv=None, git=real_git, out=print):
         out(f"warning: no --focus; the prompt carries the placeholder {FOCUS_PLACEHOLDER}")
         focus = None
     try:
+        if a.cmd in ("slice", "fix"):
+            return g.emit(*g.from_spec(a.spec, a.cmd == "fix"), a.write, strict=True)
         made = g.review(a.ids, a.with_partial, focus) if a.cmd == "review" else g.integration(a.ids)
         return g.emit(*made, a.write)
     except (Refuse, OSError) as e:

@@ -10515,6 +10515,15 @@ class TestReviewAutoFix(TestChain):  # CONVAUTOFIX3: was TestAutoFix, which shad
                          (["d" * 40, self.SHA], "e" * 40, "ROOT", "opus"))  # MODELROUTE1: sonnet source escalates
         self.assertIn("stack ddddddd -> ccccccc; review base eeeeeee", self.prompt("SRCFIX").read_text(encoding="utf-8"))
 
+    def test_chained_fix_prompt_carries_chain_and_run_lines(self):  # PV2-GEN
+        self.ready()
+        self.patch_src(chain=["CLREV", "CDX", "INT"])
+        self.blocked(self.FIX)
+        lines = self.prompt("SRCFIX").read_text(encoding="utf-8").splitlines()
+        self.assertTrue(any(x.startswith("CHAIN: CLREV+CDX") for x in lines), lines[:4])
+        self.assertTrue(any(x.startswith("Run:") for x in lines), lines)
+        self.assertFalse(any("Hard rules" in x for x in lines))
+
     def fable(self, on):
         f = self.base / "pace.json"
         p = json.loads(f.read_text(encoding="utf-8")) if f.exists() else dict(conveyor.PACE_DEFAULTS)

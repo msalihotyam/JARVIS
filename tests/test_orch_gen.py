@@ -36,6 +36,7 @@ class OrchGenTest(unittest.TestCase):
         self.sha_b = self.commit("fix: PMAFIX\n\nWorker: codex")
         self.put("build/conveyor/backlog.json", '{\n  "slices": []\n}')
         self.put("build/orch/check_backlog.py", "print('OK: stub')\n")
+        self.put("build/orch/preflight.py", "print('preflight: 0 pending, 0 errors, 0 warnings')\n")
         (r / "build/conveyor/prompts").mkdir()
         self.report("PMA", self.sha_a, "jarvis/foo.py; tests/test_foo_extra.py (new)")
         self.report("PMAFIX", self.sha_b, "`jarvis/foo.py`")
@@ -97,6 +98,72 @@ class OrchGenTest(unittest.TestCase):
             self.assertEqual(rc, 0, out)
             self.assertIn("@jarvis lane=CLREV1 ", out)
             self.assertIn("WRITTEN BY THE CODEX WORKER", out)
+
+    def spec(self, **over):
+        sp = {"id": "PV9", "title": "t", "tier": "T2", "model": "opus", "effort": "high", "size": "MEDIUM",
+              "goal": "g", "tests": "a test", "run": ["tests.test_foo"],
+              "owned": ["jarvis/foo.py", "jarvis/new_mod.py"], "commit": "feat: PV9 x"}
+        sp.update(over)
+        sp = {k: v for k, v in sp.items() if v is not None}
+        self.put("spec.json", json.dumps(sp))
+        return str(self.root / "spec.json")
+
+    def test_slice_spec_chained_lints_and_dry_run_writes_nothing(self):
+        before = (self.root / "build/conveyor/backlog.json").read_bytes()
+        rc, out = self.run_gen("slice", "--spec", self.spec(chain=True, split_ok=True))
+        self.assertEqual(rc, 0, out)
+        self.assertIn(f"@jarvis lane=PV9 model=opus effort=high base={self.base}\n", out)
+        self.assertIn("PV9: T2, MEDIUM <= 50 tool calls, SPLIT-OK.\nCHAIN: CLREV+CDX\n", out)
+        self.assertIn("Owned: jarvis/foo.py, jarvis/new_mod.py (new), build/reports/PV9.md (new)", out)
+        self.assertEqual((self.root / "build/conveyor/backlog.json").read_bytes(), before)
+        self.assertEqual(list((self.root / "build/conveyor/prompts").iterdir()), [])
+        rc, out = self.run_gen("slice", "--spec", self.spec(chain=True), "--write")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("preflight: 0 pending, 0 errors", out)
+        self.assert_lints("PV9")
+        self.assertEqual(self.backlog()["slices"][0]["chain"], ["CLREV", "CDX", "INT"])
+
+    def test_spec_without_tests_or_run_is_refused(self):
+        for k in ("tests", "run"):
+            rc, out = self.run_gen("slice", "--spec", self.spec(**{k: None}), "--write")
+            self.assertEqual(rc, 2, out)
+            self.assertIn(f"REFUSED: spec has no {k}", out)
+        self.assertEqual(self.backlog()["slices"], [])
+
+    def test_preflight_error_rolls_back(self):
+        before = (self.root / "build/conveyor/backlog.json").read_bytes()
+        self.put("build/orch/preflight.py", "import sys\nprint('preflight: 1 errors')\nsys.exit(1)\n")
+        rc, out = self.run_gen("slice", "--spec", self.spec(), "--write")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("REFUSED: preflight.py failed", out)
+        self.assertEqual((self.root / "build/conveyor/backlog.json").read_bytes(), before)
+        self.assertFalse((self.root / "build/conveyor/prompts/PV9.md").exists())
+
+    def test_fix_spec_over_three_commit_stack(self):
+        self.put("jarvis/bar.py", "y = 1\n")
+        sha_c = self.commit("fix: PMAFIX2")
+        self.put("build/conveyor/backlog.json", json.dumps({"slices": [
+            {"id": "PMAFIX2", "stack": [self.sha_a, self.sha_b], "review_base": self.base,
+             "chain": ["CLREV", "CDX", "INT"], "tier": "T2", "files": ["jarvis/foo.py"],
+             "prompt": "build/conveyor/prompts/PMAFIX2.md"}]}))
+        self.report("PMAFIX2", sha_c, "jarvis/bar.py (new)")
+        self.put("build/reports/CLREV7.md", "STATUS: BLOCKED\nF1 MAJOR foo breaks\nF2 NIT naming\n")
+        rc, out = self.run_gen("fix", "--spec", self.spec(id="PV9FIX", review="CLREV7", source="PMAFIX2",
+                                                         size="SMALL", commit="fix: PV9FIX y"), "--write")
+        self.assertEqual(rc, 0, out)
+        s = next(x for x in self.backlog()["slices"] if x["id"] == "PV9FIX")
+        self.assertEqual(s["stack"], [self.sha_a, self.sha_b, sha_c])
+        self.assertEqual(s["review_base"], self.base)
+        self.assertEqual(s["files"], ["jarvis/foo.py", "jarvis/new_mod.py", "tests/test_foo_extra.py",
+                                      "jarvis/bar.py", "build/reports/PV9FIX.md"])
+        text = self.prompt("PV9FIX")
+        self.assertTrue(text.startswith("@jarvis lane=PV9FIX model=opus effort=high base=main\n"
+                                        "LANE RULES: build/conveyor/notes/LANE_RULES.md (CORE + FIX)\n"
+                                        "PV9FIX: T2, SMALL <= 35.\nCHAIN: CLREV+CDX\n"), text)
+        self.assertIn(f"BASE AT {sha_c} (stack ", text)
+        self.assertIn("READ FIRST: build/reports/CLREV7.md (F1, F2)\nFindings (data):\n    > F1 MAJOR foo", text)
+        self.assertIn("Stack-only grant (do not edit): tests/test_foo_extra.py, jarvis/bar.py\n", text)
+        self.assert_lints("PV9FIX")
 
     def test_refusals(self):
         cases = {
