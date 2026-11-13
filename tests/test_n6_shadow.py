@@ -232,6 +232,48 @@ class N6ShadowTests(unittest.TestCase):
         self.assertEqual(got["CDX-N6-01"][:2], ("agree", "block"))
         self.assertEqual(got["INT100B"][:2], ("agree", "block"))
 
+    def first_sweep_lane(self, lane: str, report: str) -> dict[str, object]:
+        """A real first-sweep lane: finished PASS, report-only grant, no chain event, no git head."""
+        lanes = json.loads((self.conveyor / "lanes.json").read_text(encoding="utf-8"))
+        lanes[lane] = {"finished": True, "status": "PASS", "files": [f"build/reports/{lane}.md"]}
+        (self.conveyor / "lanes.json").write_text(json.dumps(lanes), encoding="utf-8")
+        (self.root / "build" / "reports" / f"{lane}.md").write_text(report, encoding="utf-8")
+        return self.by_lane(head=lambda lane: None)[lane]
+
+    def assert_first_sweep_pass(self, record: dict[str, object]) -> None:
+        # N6-REGR1: the 2026-11-12 06:42 sweep said "report needs exactly one 40-hex COMMIT" here.
+        self.assertEqual(record["verdict"], "agree")
+        self.assertEqual(record["conveyor"], {"verdict": "pass", "reason": "lane finished PASS"})
+        self.assertEqual(record["n6"], {"verdict": "pass", "reason":
+                                        "no-commit report, lane state and report-only grant agree"})
+
+    def test_botaudit_first_sweep_candidate_now_passes(self) -> None:
+        report = ("STATUS: PASS\nFINDINGS: 9\n  F1 the graduation % only measures key 1\n"
+                  "  F9 asks have no agreement measurement at all\n"
+                  "BRANCH: worktree-BOTAUDIT (base main 23316741, no commits)\n"
+                  "COMMIT: none\n"
+                  "FILES: build/reports/BOTAUDIT.md (gitignored)\n"
+                  "RUNS: analysis scripts only, read-only, no tests\n")
+        self.assert_first_sweep_pass(self.first_sweep_lane("BOTAUDIT", report))
+
+    def test_cdxint74b_first_sweep_candidate_now_passes(self) -> None:
+        report = ("STATUS: PASS\nLANE: CDXINT74B\n"
+                  "SCOPE: JULESWAITFIX c1471d33 (on JULESWAIT e98aaf29) + SPEEDWARM2D a410df32\n"
+                  "BRANCH: worktree-CDXINT74B (report-only; source read from main checkout)\n"
+                  "COMMIT: none\n"
+                  "FILES: build/reports/CDXINT74B.md (worktree-CDXINT74B)\n"
+                  "RUNS: Codex 1 call (rc=0); no tests run (read-only lane)\n")
+        self.assert_first_sweep_pass(self.first_sweep_lane("CDXINT74B", report))
+
+    def test_clrev82_first_sweep_candidate_now_passes(self) -> None:
+        report = ("STATUS: PASS\n"
+                  "BRANCH: worktree-CLREV82 (read-only review, no commits; base main 104e0fb2)\n"
+                  "COMMIT: none\n"
+                  "FILES: build/reports/CLREV82.md only\n"
+                  "RUNS: python -m unittest tests.test_work_controls ... Ran 26 tests OK\n"
+                  "CHANGED ASSERTS: none\nADJACENT FILES: none touched\n")
+        self.assert_first_sweep_pass(self.first_sweep_lane("CLREV82", report))
+
     def test_neg_never_opens_the_live_db(self) -> None:
         paths: list[Path] = []
 
