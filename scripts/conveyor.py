@@ -160,7 +160,7 @@ IDLE_NO_REPORT_S = 900
 IDLE_NUDGE = ("Write your report file now with the STATUS line; if you were waiting, say what you "
               "were waiting for.")
 # CONV12 / LANE_RULES C9: a feature lane BLOCKED only on 'NEEDS FILES: <path>[, <path>]' is resumed once.
-GRANT_NUDGE = ("You may now edit {paths} (orchestrator-approved by rule R3). Finish your goal and "
+GRANT_NUDGE = ("You may now edit {paths} (orchestrator-approved by rule C9). Finish your goal and "
                "rewrite your report.")
 # CTXRESUME: a nudge / resume in place starts with a fact note built by code (fact_note)
 FACT_CAP = 3072  # utf-8 bytes, the closing instruction included

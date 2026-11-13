@@ -6569,7 +6569,7 @@ class TestIdleWatchdog(Base):
 
 
 class TestResumeInPlace(Base):
-    """CONV12 / LANE_RULES R3: a feature lane BLOCKED only on NEEDS FILES is resumed once."""
+    """CONV12 / LANE_RULES C9: a feature lane BLOCKED only on NEEDS FILES is resumed once."""
 
     def setUp(self):
         super().setUp()
@@ -6594,7 +6594,7 @@ class TestResumeInPlace(Base):
         (call,) = self.resumes()
         note, grant = call[-1].rsplit("\n\n", 1)  # CTXRESUME: the fact note comes first
         self.assertEqual((call[2], grant), (sid, "You may now edit jarvis/b.py, tests/test_b.py "
-                         "(orchestrator-approved by rule R3). Finish your goal and rewrite your report."))
+                         "(orchestrator-approved by rule C9). Finish your goal and rewrite your report."))
         self.assertTrue(note.startswith(conveyor.FACT_HEAD + "\n") and note.endswith(conveyor.FACT_TAIL))
         (ev,) = [e for e in self.events() if e["event"] == "resume_in_place"]
         self.assertEqual(ev["paths"], ["jarvis/b.py", "tests/test_b.py"])
@@ -6709,7 +6709,7 @@ class TestInterimReport(AutopilotBase):
         self.c.pass_once()
         self.t += 60
         self.finish("F", "BLOCKED (interim)")
-        self.finish("F", "BLOCKED", extra="NEEDS FILES: jarvis/b.py\n")  # resumed in place (R3)
+        self.finish("F", "BLOCKED", extra="NEEDS FILES: jarvis/b.py\n")  # resumed in place (C9)
         self.assertNotIn("interim_since", self.lanes()["F"])
         self.t += conveyor.INTERIM_TIMEOUT_S
         t1 = self.t
@@ -8902,6 +8902,19 @@ class TestChain(AutopilotBase):
             with self.subTest(text=text):
                 self.assertEqual(conveyor.chain_findings(f"{text}\n"), want)
         self.assertTrue(conveyor.chain_findings(None))
+
+    def test_check_note_line_is_not_a_finding(self):
+        """PV2-GENFIX1: the templates tell reviewers to write verification notes as CHECK:."""
+        self.assertFalse(conveyor.chain_findings("STATUS: PASS\nCHECK: F1 verified, no defect\nFINDINGS: none\n"))
+        self.assertTrue(conveyor.chain_findings("STATUS: PASS\nF1 MINOR: x\nFINDINGS: none\n"))
+        for name in ("CLREV", "CDX"):
+            tpl = (Path(conveyor.__file__).parent / "chain_templates" / f"{name}.md").read_text(encoding="utf-8")
+            self.assertIn("Only findings start a line with F<n> <SEVERITY>:", tpl)
+            self.assertIn("CHECK:", tpl)
+
+    def test_grant_nudge_names_c9(self):
+        self.assertIn("C9", conveyor.GRANT_NUDGE)
+        self.assertNotIn("R3", conveyor.GRANT_NUDGE)
 
     # (e) both writes are atomic, the event comes only after they persist
     def test_autopilot_write_failure_no_event_then_same_prompt_once(self):

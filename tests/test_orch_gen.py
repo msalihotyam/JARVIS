@@ -123,6 +123,42 @@ class OrchGenTest(unittest.TestCase):
         self.assert_lints("PV9")
         self.assertEqual(self.backlog()["slices"][0]["chain"], ["CLREV", "CDX", "INT"])
 
+    def test_tests_list_renders_one_dash_line_per_test(self):
+        rc, out = self.run_gen("slice", "--spec", self.spec(tests=["one", "two", "three"]))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("\nTests:\n- one\n- two\n- three\nRun: python", out)
+        self.assertNotIn("['one'", out)
+
+    def test_max_calls_sets_the_size_line(self):
+        rc, out = self.run_gen("slice", "--spec", self.spec(max_calls=35))
+        self.assertEqual(rc, 0, out)
+        self.assertIn("PV9: T2, MEDIUM <= 35 tool calls.", out)
+
+    def test_fix_spec_series_is_the_source_series_or_source_id(self):
+        self.put("build/reports/CLREV7.md", "STATUS: BLOCKED\nF1 MAJOR foo breaks\n")
+        for fid, series, want in (("PV9FIX", None, "PMAFIX"), ("PV9FIXB", "PMASER", "PMASER")):
+            src = {"id": "PMAFIX", "tier": "T2", "files": ["jarvis/foo.py"],
+                   "prompt": "build/conveyor/prompts/PMAFIX.md"}
+            if series:
+                src["series"] = series
+            self.put("build/conveyor/backlog.json", json.dumps({"slices": [src]}))
+            rc, out = self.run_gen("fix", "--spec", self.spec(id=fid, review="CLREV7", source="PMAFIX",
+                                                             size="SMALL", commit=f"fix: {fid} y"), "--write")
+            self.assertEqual(rc, 0, out)
+            s = next(x for x in self.backlog()["slices"] if x["id"] == fid)
+            self.assertEqual(s["series"], want)
+
+    def test_int_accepts_a_stack_only_file_no_pick_changed(self):
+        # tests/test_foo_extra.py is in the tree at sha_b but only sha_a changed it
+        self.report("PMAFIX", self.sha_b, "jarvis/foo.py; tests/test_foo_extra.py")
+        self.assertEqual(self.run_gen("review", "PMA", "--write", "--focus", "x")[0], 0)
+        self.assertEqual(self.run_gen("review", "PMAFIX", "--write", "--focus", "x")[0], 0)
+        for rid in ("CDXINT1", "CLREV2"):
+            self.put(f"build/reports/{rid}.md", f"STATUS: PASS\nCOMMIT: reviewed {self.sha_a}\n")
+        rc, out = self.run_gen("int", "CLREV2", "CDXINT1")
+        self.assertEqual(rc, 0, out)
+        self.assertIn("Expected files only: jarvis/foo.py, tests/test_foo_extra.py.", out)
+
     def test_spec_without_tests_or_run_is_refused(self):
         for k in ("tests", "run"):
             rc, out = self.run_gen("slice", "--spec", self.spec(**{k: None}), "--write")

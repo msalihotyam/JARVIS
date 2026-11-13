@@ -168,7 +168,10 @@ class Gen:
         if not listed:
             raise Refuse(f"{sid}: report has no FILES")
         files = self.changed(sha)
-        unknown = [p for p in listed if not PATH_RE.fullmatch(p) or p not in files]
+        # a stack-only file (listed, in the tree at sha, no pick changes it) is no refusal: the INT's
+        # expected files come from the commits' real changes, so it never enters the INT
+        unknown = [p for p in listed if not PATH_RE.fullmatch(p) or (
+            p not in files and self.git_fn(self.root, "cat-file", "-e", f"{sha}:{p}")[0] != 0)]
         if unknown:
             raise Refuse(f"{sid}: FILES not changed by {sha[:12]}: {', '.join(unknown)}")
         return sha, files, codex
@@ -440,9 +443,14 @@ class Gen:
                 raise Refuse(f"spec {k} must be a list of plain names")
         if not conveyor.LANE_RE.fullmatch(sp["id"]) or not conveyor.LANE_RE.fullmatch(sp.get("source", "x")):
             raise Refuse("spec id/source is not a lane id")
-        if sp["size"] not in SIZES and not isinstance(sp.get("calls"), int):
-            raise Refuse(f"spec size {sp['size']} needs calls (known: {', '.join(SIZES)})")
-        if any("\n" in str(sp.get(k, "")) for k in ("title", "goal", "decisions", "tests", "commit")):
+        if sp["size"] not in SIZES and not any(isinstance(sp.get(k), int) for k in ("max_calls", "calls")):
+            raise Refuse(f"spec size {sp['size']} needs max_calls (known: {', '.join(SIZES)})")
+        tests = sp["tests"]
+        if isinstance(tests, list) and not all(isinstance(t, str) and t for t in tests):
+            raise Refuse("spec tests list holds non-empty strings")
+        flat = [sp.get(k, "") for k in ("title", "goal", "decisions", "commit")] + (
+            tests if isinstance(tests, list) else [tests])
+        if any("\n" in str(x) for x in flat):
             raise Refuse("spec text fields are one line each")
         return sp
 
@@ -456,7 +464,7 @@ class Gen:
         sp, b = self.spec(path, fix), self.backlog()
         sid, rep = sp["id"], f"build/reports/{sp['id']}.md"
         owned = [p for p in sp["owned"] if p != rep]
-        calls = sp.get("calls") or SIZES[sp["size"]]
+        calls = sp.get("max_calls") or sp.get("calls") or SIZES[sp["size"]]
         chain = fix or sp.get("chain") is True  # a stacked FIX is always chained (validate_slice)
         entry = {"id": sid, "title": sp["title"], "model": sp["model"], "effort": sp["effort"],
                  "tier": sp["tier"], "files": owned + [rep], "depends_on": list(sp.get("depends_on") or []),
@@ -481,7 +489,7 @@ class Gen:
             for sha in stack:
                 grant += [f for f in self.changed(sha) if f not in owned and f not in grant]
             entry["files"] = owned + grant + [rep]
-            entry.update(stack=stack, review_base=rb)
+            entry.update(stack=stack, review_base=rb, series=src.get("series") or sp["source"])
             mid = [f"BASE AT {stack[-1]} (stack {' -> '.join(x[:7] for x in stack)}; review base {rb[:7]})",
                    f"READ FIRST: build/reports/{sp['review']}.md ({', '.join(fids)})"]
             mid += ["Findings (data):"] + [f"    > {x}" for x in flines]
@@ -499,7 +507,8 @@ class Gen:
                  *([] if fix else [f"Goal: {sp['goal']}"]), *mid,
                  *([f"Goal: {sp['goal']}"] if fix else []),
                  *([f"Decisions: {sp['decisions']}"] if sp.get("decisions") else []),
-                 f"Tests: {sp['tests']}", f"Run: python scripts/test_parallel.py {' '.join(sp['run'])}",
+                 *(["Tests:", *(f"- {t}" for t in sp["tests"])] if isinstance(sp["tests"], list)
+                   else [f"Tests: {sp['tests']}"]), f"Run: python scripts/test_parallel.py {' '.join(sp['run'])}",
                  f"Owned: {self.owned_line(owned)}, {rep} (new)",
                  *([f"Stack-only grant (do not edit): {', '.join(grant)}"] if grant else []),
                  f'Commit: "{sp["commit"]}"']
