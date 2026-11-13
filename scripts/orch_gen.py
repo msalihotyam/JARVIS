@@ -443,6 +443,9 @@ class Gen:
                 raise Refuse(f"spec {k} must be a list of plain names")
         if not conveyor.LANE_RE.fullmatch(sp["id"]) or not conveyor.LANE_RE.fullmatch(sp.get("source", "x")):
             raise Refuse("spec id/source is not a lane id")
+        for k in ("max_calls", "calls"):
+            if k in sp and (type(sp[k]) is not int or sp[k] <= 0):
+                raise Refuse(f"spec {k} must be a positive integer")
         if sp["size"] not in SIZES and not any(isinstance(sp.get(k), int) for k in ("max_calls", "calls")):
             raise Refuse(f"spec size {sp['size']} needs max_calls (known: {', '.join(SIZES)})")
         tests = sp["tests"]

@@ -134,6 +134,18 @@ class OrchGenTest(unittest.TestCase):
         self.assertEqual(rc, 0, out)
         self.assertIn("PV9: T2, MEDIUM <= 35 tool calls.", out)
 
+    def test_max_calls_and_calls_must_be_a_positive_int(self):
+        for key in ("max_calls", "calls"):
+            for bad in (True, -1, 0, "30", 1.5):
+                rc, out = self.run_gen("slice", "--spec", self.spec(**{key: bad}), "--write")
+                self.assertEqual(rc, 2, f"{key}={bad!r}: {out}")
+                self.assertIn(f"REFUSED: spec {key} must be a positive integer", out)
+                self.assertEqual(self.backlog()["slices"], [])
+                self.assertEqual(list((self.root / "build/conveyor/prompts").iterdir()), [])
+            rc, out = self.run_gen("slice", "--spec", self.spec(**{key: 35}))
+            self.assertEqual(rc, 0, out)
+            self.assertIn("PV9: T2, MEDIUM <= 35 tool calls.", out)
+
     def test_fix_spec_series_is_the_source_series_or_source_id(self):
         self.put("build/reports/CLREV7.md", "STATUS: BLOCKED\nF1 MAJOR foo breaks\n")
         for fid, series, want in (("PV9FIX", None, "PMAFIX"), ("PV9FIXB", "PMASER", "PMASER")):
@@ -150,7 +162,8 @@ class OrchGenTest(unittest.TestCase):
 
     def test_int_accepts_a_stack_only_file_no_pick_changed(self):
         # tests/test_foo_extra.py is in the tree at sha_b but only sha_a changed it
-        self.report("PMAFIX", self.sha_b, "jarvis/foo.py; tests/test_foo_extra.py")
+        # tests/test_foo.py is in the tree but no pick changed it
+        self.report("PMAFIX", self.sha_b, "jarvis/foo.py; tests/test_foo_extra.py; tests/test_foo.py")
         self.assertEqual(self.run_gen("review", "PMA", "--write", "--focus", "x")[0], 0)
         self.assertEqual(self.run_gen("review", "PMAFIX", "--write", "--focus", "x")[0], 0)
         for rid in ("CDXINT1", "CLREV2"):
@@ -158,6 +171,7 @@ class OrchGenTest(unittest.TestCase):
         rc, out = self.run_gen("int", "CLREV2", "CDXINT1")
         self.assertEqual(rc, 0, out)
         self.assertIn("Expected files only: jarvis/foo.py, tests/test_foo_extra.py.", out)
+        self.assertNotIn("tests/test_foo.py", out.split("Expected files only:")[1].split("\n")[0])
 
     def test_spec_without_tests_or_run_is_refused(self):
         for k in ("tests", "run"):
