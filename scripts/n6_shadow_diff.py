@@ -38,7 +38,8 @@ RULE_V2 = datetime(2026, 10, 17, tzinfo=timezone(timedelta(hours=3))).timestamp(
 _NOTE = re.compile(r"(\S+) (disagree|false_pass|agree): conveyor (\w+) \((.*?)\); "
                    r"n6 (\w+) \((.*)\)", re.S)
 _STATUS = re.compile(r"STATUS:[\s*`]*((?i:CI_PENDING)(?!\w)|[A-Za-z]+)")  # conveyor.STATUS_RE
-_HEX = re.compile(r"(?i:COMMIT)\b[^\n]*?\b([0-9a-f]{7,40})\b")
+_COMMIT = re.compile(r"(?i:COMMIT):(.*)")  # a line that itself starts COMMIT: (never BASE_COMMIT:)
+_HEX = re.compile(r"\b[0-9a-f]{7,40}\b", re.I)
 _FORMAT = ("report says ", "report needs exactly one", "COMMIT: none")
 _LANE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
@@ -51,6 +52,12 @@ def report_status(text: str) -> str | None:
         if m:
             return "(INTERIM)" if "(interim)" in s.lower() else m.group(1).upper()
     return None
+
+
+def commit_values(text: str) -> list[str]:
+    """The value of every line that starts ``COMMIT:`` (conveyor left-strip), nothing else."""
+    found = (_COMMIT.fullmatch(x.lstrip(" \t>#*`﻿").rstrip()) for x in text.splitlines())
+    return [m.group(1).strip(" \t*`") for m in found if m]
 
 
 def read_notes(path: Path) -> tuple[dict[str, int], dict[str, dict[str, Any]], datetime | None]:
@@ -110,6 +117,12 @@ def read_kpi(db: Path) -> dict[str, dict[str, bool]]:
     """slice -> source -> passed, opened read-only; {} when the db or table is absent."""
     if not db.is_file():
         return {}
+    with db.open("rb") as fh:
+        head = fh.read(20)
+    wal = db.with_name(db.name + "-wal")
+    if (len(head) == 20 and 2 in head[18:20]) or (wal.is_file() and wal.stat().st_size):
+        # WAL: even mode=ro creates -wal/-shm beside the db
+        raise RuntimeError(f"{db} is in WAL mode; refusing to open it (a read must not write beside it)")
     found: dict[str, dict[str, bool]] = {}
     try:
         with closing(sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)) as con:
@@ -118,6 +131,8 @@ def read_kpi(db: Path) -> dict[str, dict[str, bool]]:
                 found.setdefault(str(slice_id), {})[str(source)] = bool(passed)
     except sqlite3.OperationalError:
         return {}
+    except sqlite3.DatabaseError as exc:
+        raise RuntimeError(f"{db} is not a readable sqlite db: {exc}") from exc
     return found
 
 
@@ -156,7 +171,9 @@ def _rule(lane: str, note: dict[str, Any], snap: Snapshot, finished: float | Non
         return "both_reasonable", "substance", f"N6 blocked on: {note['n6']['reason']}", today
     if finished < RULE_V2:
         return "n6_stricter_format", "pre_rule", "finished before lane rules v2 (2026-10-17)", today
-    if _HEX.search(report):
+    values = commit_values(report)
+    explicit_none = any(v.lower() == "none" for v in values)  # wins over any hex, on any key
+    if not explicit_none and any(_HEX.search(v) for v in values):
         return "n6_stricter_format", "format_only", "a commit sha is named, not in the exact form", today
     files = state.get("files")
     if not isinstance(files, list):
@@ -261,7 +278,12 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--date", type=date.fromisoformat, default=None)
     args = parser.parse_args(argv)
-    for path in write(args.root, args.date or date.today()):
+    try:
+        paths = write(args.root, args.date or date.today())
+    except RuntimeError as err:
+        print(err, file=sys.stderr)
+        return 2
+    for path in paths:
         print(path)
     return 0
 
