@@ -908,6 +908,7 @@
   "tests.test_n6_root.N6RootTests": 15.517,
   "tests.test_n6_rootcause.RootCauseTest": 0.1,
   "tests.test_n6_shadow.N6ShadowTests": 0.3,
+  "tests.test_n6_shadow_diff.ShadowDiffTest": 0.5,
   "tests.test_n6_shadow_run.ShadowRunTest": 1.4,
   "tests.test_n6_usage.UsageReaderTests": 0.1,
   "tests.test_notify.NotificationTests": 0.001,
