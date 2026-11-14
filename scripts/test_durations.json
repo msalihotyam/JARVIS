@@ -1600,7 +1600,10 @@
   "tests.test_workers_codex.StageTests": 0.106,
   "tests.test_workers_route.TestWorkersRoute": 0.006,
   "tests.test_write_scope.WriteScopeTests": 5.341,
-  "tests.test_write_stage.StageTests": 295.135
+  "tests.test_write_stage.StageTests": 295.135,
+  "tests.test_orch_digest.DigestTests": 0.118,
+  "tests.test_test_parallel.PlanTest": 0.017,
+  "tests.test_test_parallel.RollbackTest": 0.82
  },
  "tests": {
   "tests.test_app.AppCommandTests.test_approval_is_one_shot_by_default": 3.489,
