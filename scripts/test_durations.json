@@ -105,6 +105,7 @@
   "tests.test_cli_k3_approve.CliOrdinaryApproveTests": 1.337,
   "tests.test_cli_memory_extract_model.MemoryExtractModelCliTests": 0.27,
   "tests.test_clock_audit.ClockAuditTests": 0.225,
+  "tests.test_code_map.CodeMapTest": 1.5,
   "tests.test_codex_speed.CatalogCacheTests": 0.024,
   "tests.test_codex_speed.FinalResultTests": 0.124,
   "tests.test_codex_speed.FingerprintTests": 0.14,
