@@ -61,6 +61,11 @@ _GLUED = re.compile(r"(?<=[^\W\d_])\d{1,3}(?!\d)")  # O52, UIRED5: ids glued to 
 _MARK = ("Mn", "Mc", "Me", "Cf")
 # Cyrillic / Greek lookalikes (after casefold) -> Latin, for the letters skeleton only.
 _HOMO = str.maketrans("аеорсухіјѕԁкмнтвοαειкνρτυχβημ", "aeopcyxijsdkmhtboaeiknptuxbhm")
+# LESSONS1FIX4: leet digits ('d0ra') and Unicode small capitals ('ᴅora'), skeleton only.
+_LEET = str.maketrans(  # LATIN LETTER SMALL CAPITAL A..Z (Unicode has no X)
+    "013457ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍ"
+    "ɴᴏᴘꞯʀꜱᴛᴜᴠᴡʏᴢ",
+    "oieastabcdefghijklmnopqrstuvwyz")
 
 
 def _norm(text: str):
@@ -86,6 +91,9 @@ def _skeleton(n: str):
     as joined letters. Returns (skeleton, index in n per char, boundary-before per char);
     a boundary is a removed separator, a lower->Upper step or a letter<->digit step."""
     sk, so, sb, gap, prev = [], [], [], True, ""
+    # hex ids (commit shas) skip leet folding, else 'a7eb1f0c' reads as 'teb'
+    hexrun = {i for m in re.finditer(r"(?<![^\W_])[0-9a-fA-F]{7,}(?![^\W_])", n)
+              for i in range(*m.span())}
     for i, ch in enumerate(n):
         if unicodedata.category(ch) in _MARK:
             continue
@@ -95,7 +103,8 @@ def _skeleton(n: str):
         b = gap or (prev.islower() and ch.isupper()) or prev.isdigit() != ch.isdigit()
         for c in unicodedata.normalize("NFD", ch.casefold()):
             if c.isalnum():
-                sk.append(c.translate(_TR).translate(_HOMO))
+                c = c.translate(_TR).translate(_HOMO)
+                sk.append(c if i in hexrun else c.translate(_LEET))
                 so.append(i)
                 sb.append(b)
                 b = False

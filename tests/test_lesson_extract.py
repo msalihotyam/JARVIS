@@ -309,13 +309,33 @@ OTHER_SHAPES = {  # LESSONS1FIX2 review: id, IBAN, e-mail and word variants
     "teb_apostrophe": "TEB'in",
     "homoglyph_cyrillic_d": "ԁora",
     "homoglyph_cyrillic_o": "DоRA",
+    # LESSONS1FIX4: CLREV-LESSONS1FIX3 F1 (separator runs 1..4) and F3 (leet, small caps, spelled e-mail)
+    "F1_double_dash": "12345 -- 67890 1",
+    "F1_spaced_dash": "12345 - 678901",
+    "F1_newlines": "12345\n67890\n1",
+    "F1_crlf_underscore": "12345\r\n67890_1",
+    "F3_leet_dora": "d0ra",
+    "F3_leet_musteri": "mu5t3r1",
+    "F3_small_caps_dora": "ᴅora",
+    "F3_small_caps_all": "ᴅᴏʀᴀ",
+    "F3_spelled_email": "salih at example dot com",
+    "F3_paren_email": "salih (at) example (dot) com",
+    "F3_bracket_email": "salih [AT] example [DOT] com",
+    # FIX4 review hits: a nearby number must not hide the id; '@' + spelled dot; Turkish 'nokta'
+    "R_list_number": "1. 12345 678901",
+    "R_table_cell": "| 12345 678901 | 3 |",
+    "R_at_sign_dot": "salih@example dot com",
+    "R_nokta": "salih at gmail nokta com",
 }
 SHA_DATE_RULE = "O9 kural 3ac9e3786a660ebac394c44a993e4801b4396058 2026-11-14 notu"
 NOT_PHONES = ("O52 kurali 2026-11-14 12:30 tarihinde", "600000 ms, 80 cagri, 45 dk",
               "PR 5321 merged 2026", "O52 600000 3600 1234567", "plan 2.1, 4.2, 8 bolum",
               "sha e0bcc99a 4dee6b68", "O27 UIRED5 3 test", SHA_DATE_RULE,
               # LESSONS1FIX3: words need their skeleton boundary, so these stay clean
-              "kod orani", "ette bu", "tebrik", "en paralel", "test sayini", "endorphin", "isbn")
+              "kod orani", "ette bu", "tebrik", "en paralel", "test sayini", "endorphin", "isbn",
+              # LESSONS1FIX4 review: dates, hex shas under leet, at/dot inside words
+              "2026-11-14 (124 tests)", "2026-11-14 9:30 toplanti", "14.11.2026 9:30",
+              "commit a7eb1f0c merged", "update dotfiles", "Validate dotenv loading")
 # LESSONS1FIX2: comma is now a separator, so ten digits in a comma list read as a phone (fail closed)
 # LESSONS1FIX3: shapes also run on the unmasked text (CDX F6), so a rule id glued to an ISO date
 # reads as ten digits; any carve-out would reopen "Tel53 2026-11-14" (fail closed)

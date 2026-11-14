@@ -1,15 +1,16 @@
 {
-  "version": 6,
-  "about": "LESSONS1 Dora/company egress deny list (plan v2.4 4.2, 12.3). A chunk matching any pattern is dropped, never sent, never logged. Every source file is screened whole, and every chunk, source path, pointer and purpose on its own; a whole-file hit drops every chunk overlapping its lines +-1. 'shapes' (ignore case) run on raw text, on normalized text (whole-string NFKC, zero-width dropped, ASCII digits) and on the normalized text with separators around '@' removed; each view unmasked, with ISO dates blanked and with letter-glued ids hidden (LESSONS1FIX3). 'words' are letters/digits only and run on the letters skeleton (normalized, casefolded, accents/Turkish/lookalikes folded, every non-letter/digit removed); '^' / '$' require a word boundary there (removed separator, lower->Upper or letter<->digit step). Bump version on any change.",
+  "version": 7,
+  "about": "LESSONS1 Dora/company egress deny list (plan v2.4 4.2, 12.3). A chunk matching any pattern is dropped, never sent, never logged. Every source file is screened whole, and every chunk, source path, pointer and purpose on its own; a whole-file hit drops every chunk overlapping its lines +-1. 'shapes' (ignore case) run on raw text, on normalized text (whole-string NFKC, zero-width dropped, ASCII digits) and on the normalized text with separators around '@' removed; each view unmasked, with ISO dates blanked and with letter-glued ids hidden (LESSONS1FIX3). 'words' are letters/digits only and run on the letters skeleton (normalized, casefolded, accents/Turkish/lookalikes/small capitals/leet digits 0/1/3/4/5/7 folded (LESSONS1FIX4), every non-letter/digit removed); '^' / '$' require a word boundary there (removed separator, lower->Upper or letter<->digit step). Bump version on any change.",
   "shapes": [
     "(?<!\\d)\\d{11,}",
-    "(?<!\\d)(?<!\\d[ .\\-/])\\d(?:(?:[ .\\-/](?!(?:19|20)\\d\\d[-./]\\d\\d[-./]\\d\\d))?\\d){10}(?![ .\\-/]?\\d)",
+    "(?<!\\d)(?<!\\d[\\W_])(?!(?:(?:19|20)\\d\\d[-./]\\d\\d[-./]\\d\\d|\\d\\d[-./]\\d\\d[-./](?:19|20)\\d\\d)(?!\\d))\\d(?:(?:[\\W_]{1,4}(?!(?:(?:19|20)\\d\\d[-./]\\d\\d[-./]\\d\\d|\\d\\d[-./]\\d\\d[-./](?:19|20)\\d\\d)(?!\\d)))?\\d){10}(?![\\W_]?\\d)",
     "(?<!\\d)[1-9](?:\\d{2}[\\W_]{1,3}\\d{3}[\\W_]{1,3}\\d{3}[\\W_]{1,3}\\d{2}|\\d{4}[\\W_]{1,3}\\d{3}[\\W_]{1,3}\\d{3})(?!\\d)",
     "TR\\d{2}(?:\\s?[0-9A-Z]{4}){5}\\s?[0-9A-Z]{2}",
     "TR[\\W_]*+\\d\\d(?:[\\W_]*+\\d){22}",
     "(?<!\\d)(?:(?:\\+|00)?[\\W_]{0,3}90|0)?[\\W_]{0,3}(?!(?:19|20)\\d\\d[-./]\\d)[2-58](?:[\\W_]*+\\d){9}(?!\\d)",
     "(?<!\\d)444(?:[\\W_]*+\\d){4}(?!\\d)",
-    "[\\w.+-]{1,64}[\"']?(?:\\s{0,3}@\\s{0,3}|\\s{0,3}(?:\\[at\\]|\\(at\\))\\s{0,3})[\\w-]{1,63}\\s{0,3}[.。]\\s{0,3}[\\w.。-]{1,253}"
+    "[\\w.+-]{1,64}[\"']?(?:\\s{0,3}@\\s{0,3}|\\s{0,3}(?:\\[at\\]|\\(at\\))\\s{0,3})[\\w-]{1,63}\\s{0,3}[.。]\\s{0,3}[\\w.。-]{1,253}",
+    "(?<![\\w.+-])[\\w.+-]{1,64}[\\W_]{0,3}(?:(?<![^\\W\\d_])at(?![^\\W\\d_])|\\(at\\)|\\[at\\]|@)[\\W_]{0,3}[\\w-]{1,63}[\\W_]{0,3}(?:(?<![^\\W\\d_])(?:dot|nokta)(?![^\\W\\d_])|\\(dot\\)|\\[dot\\])[\\W_]{0,3}\\w{1,63}"
   ],
   "words": [
     "^dora",
