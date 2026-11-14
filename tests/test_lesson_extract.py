@@ -1,3 +1,5 @@
+import contextlib
+import io
 import json
 import sys
 import tempfile
@@ -105,7 +107,8 @@ class LessonExtractTests(unittest.TestCase):
     def test_denied_chunk_never_sent_never_written(self):
         self.write("ORCH_RULES.md", RULES + DENIED)
         api, rep, files = self.run_once()
-        self.assertEqual(rep["dropped_dora"], 3)
+        # LESSONS1FIX3: a hit drops every chunk within +-1 line, so O10 (line 12, next to O4) goes too
+        self.assertEqual(rep["dropped_dora"], 4)
         sent = "\n".join(api.payloads)
         for mark in ("MARKERX", "MARKERY", "MARKERZ", "12345678901", "OTHERMARK"):
             self.assertNotIn(mark, sent)
@@ -113,8 +116,29 @@ class LessonExtractTests(unittest.TestCase):
                 self.assertNotIn(mark.encode(), body)
         rows = [json.loads(x) for x in files["rules_classification.jsonl"].decode().splitlines()]
         cls = {r["rule"]: r["class"] for r in rows}
-        self.assertEqual([cls["O4"], cls["O5"], cls["O6"]], ["dropped_dora"] * 3)
-        self.assertEqual(rep["sent"], rep["chunks"] - 3)
+        self.assertEqual([cls["O4"], cls["O5"], cls["O6"], cls["O10"]], ["dropped_dora"] * 4)
+        self.assertEqual(cls["O3"], "topic")
+        self.assertEqual(rep["sent"], rep["chunks"] - 4)
+        self.assertIn("ORCH_RULES.md 4/8", files["run_report.md"].decode())
+        self.assertNotIn("warning", rep)
+
+    def test_drop_ratio_over_40_percent_warns(self):
+        self.write("ORCH_RULES.md", DENIED)
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            _, rep, files = self.run_once()
+        report = files["run_report.md"].decode()
+        self.assertEqual((rep["dropped_dora"], rep["sent"]), (3, 2))
+        self.assertIn("ORCH_RULES.md 3/3", report)
+        self.assertIn("dropped 3/5 chunks (> 40%)", report)
+        self.assertIn("WARNING: dropped 3/5", err.getvalue())
+
+    def test_word_split_over_chunk_boundary_is_never_sent(self):  # CDX-LESSONS1FIX2 F5
+        self.write("kayit/sohbet/S2.md", "\n".join(f"guvenli satir {i}" for i in range(39)) + "\nyapi\nkredi son\n")
+        self.assertGreater(len([c for c in L.chunks(self.root)[0] if c["source"].endswith("S2.md")]), 1)
+        api, rep, files = self.run_once()
+        self.assertEqual(rep["dropped_dora"], 2)
+        self.assert_never_sent(files, api, "yapi", "kredi")
+        self.assertIn("Orkestrator kuyrugu", "\n".join(api.payloads))
 
     def test_quote_not_verbatim_is_dropped(self):
         def answer(content):
@@ -169,11 +193,12 @@ class LessonExtractTests(unittest.TestCase):
                 self.assert_never_sent(files, api, "0532", "123 45 67")
                 self.assertIn("Orkestrator kuyrugu", "\n".join(api.payloads))
 
-    def test_source_name_is_screened(self):  # CDX F3
+    def test_source_name_is_screened(self):  # CDX F3, CDX-LESSONS1FIX2 F3
         self.write("kayit/sohbet/05321234567.md", "## Not\nTemiz bir ders metni burada.\n")
+        self.write("kayit/sohbet/dora_notes.md", "## Not\nBaska temiz bir metin.\n")
         api, rep, files = self.run_once()
-        self.assertEqual(rep["dropped_dora"], 1)
-        self.assert_never_sent(files, api, "05321234567", "Temiz bir ders")
+        self.assertEqual(rep["dropped_dora"], 2)
+        self.assert_never_sent(files, api, "05321234567", "Temiz bir ders", "dora_notes", "Baska temiz")
 
     def test_email_shape_is_bounded(self):  # CDX F4
         deny = L.load_deny()
@@ -264,13 +289,38 @@ OTHER_SHAPES = {  # LESSONS1FIX2 review: id, IBAN, e-mail and word variants
     "bank_double_space": "yapi  kredi",
     "bank_nbsp": "garanti bbva",
     "bank_newline": "is\nbankasi",
+    # LESSONS1FIX3: CDX-LESSONS1FIX2 F1-F6 and the letters-skeleton classes
+    "F1_email_space_before_at": "salih @example.com",
+    "F1_email_space_after_at": "salih@ example.com",
+    "F1_email_space_after_dot": "salih@example. com",
+    "F2_decomposed_marks": "müşteri",
+    "F2_upper_dotted": "MÜŞTERİ",
+    "F3_underscore_file": "dora_notes.md",
+    "F3_underscore_name": "dora_config",
+    "F4_hyphen_garanti": "Garanti-BBVA",
+    "F4_hyphen_yapi": "Yapi-Kredi",
+    "F4_glued_dotless_i": "YapıKredi",
+    "F6_glued_label_iso_date": "Tel53 2026-11-14",
+    "tckn_split": "1234567890 1",
+    "email_ideographic_dot": "ali@ornek。com",
+    "dora_dots": "D.O.R.A",
+    "dora_spaced": "d o r a",
+    "dora_suffix": "Doraya",
+    "teb_apostrophe": "TEB'in",
+    "homoglyph_cyrillic_d": "ԁora",
+    "homoglyph_cyrillic_o": "DоRA",
 }
+SHA_DATE_RULE = "O9 kural 3ac9e3786a660ebac394c44a993e4801b4396058 2026-11-14 notu"
 NOT_PHONES = ("O52 kurali 2026-11-14 12:30 tarihinde", "600000 ms, 80 cagri, 45 dk",
-              "PR 5321 merged 2026", "O52 600000 3600 1234567", "O29 (2026-10-18) kural",
-              "O2-7, 2026-11-07 notu", "plan 2.1, 4.2, 8 bolum",
-              "sha e0bcc99a 4dee6b68", "O27 UIRED5 3 test", "O52 2026-11-14 notu")
+              "PR 5321 merged 2026", "O52 600000 3600 1234567", "plan 2.1, 4.2, 8 bolum",
+              "sha e0bcc99a 4dee6b68", "O27 UIRED5 3 test", SHA_DATE_RULE,
+              # LESSONS1FIX3: words need their skeleton boundary, so these stay clean
+              "kod orani", "ette bu", "tebrik", "en paralel", "test sayini", "endorphin", "isbn")
 # LESSONS1FIX2: comma is now a separator, so ten digits in a comma list read as a phone (fail closed)
-ACCEPTED_FALSE_POSITIVES = ("plan 2.1, 4.2, 8, 11.4, 12 bolum",)
+# LESSONS1FIX3: shapes also run on the unmasked text (CDX F6), so a rule id glued to an ISO date
+# reads as ten digits; any carve-out would reopen "Tel53 2026-11-14" (fail closed)
+ACCEPTED_FALSE_POSITIVES = ("plan 2.1, 4.2, 8, 11.4, 12 bolum", "O52 2026-11-14 notu",
+                            "O29 (2026-10-18) kural", "O2-7, 2026-11-07 notu")
 
 
 class PhoneShapeTests(unittest.TestCase):

@@ -46,68 +46,132 @@ SYSTEM = (
 )
 
 
-def fold(s: str) -> str:
-    """Lower-case Turkish-folded text for deny word matching (MÜŞTERİ -> musteri)."""
-    return s.casefold().replace("̇", "").translate(_TR)
-
-
 def load_deny(path: Path = DENY_PATH):
+    """(version, shapes, words). A word is (letters, needs_start, needs_end): '^' / '$'
+    in the JSON ask for a word boundary in the letters skeleton (see _skeleton)."""
     d = json.loads(path.read_text(encoding="utf-8"))
-    return (int(d["version"]), [re.compile(p, re.I) for p in d["shapes"]],
-            [re.compile(p) for p in d["words"]])
+    words = [(w.strip("^$"), w.startswith("^"), w.endswith("$")) for w in d["words"]]
+    if not all(w and w.isalnum() for w, _, _ in words):
+        raise ValueError("deny words must be letters/digits with optional ^ $")
+    return int(d["version"]), [re.compile(p, re.I) for p in d["shapes"]], words
 
 
 _DATE = re.compile(r"(?<!\d)(?:19|20)\d\d-[01]\d-[0-3]\d(?!\d)")
 _GLUED = re.compile(r"(?<=[^\W\d_])\d{1,3}(?!\d)")  # O52, UIRED5: ids glued to letters
+_MARK = ("Mn", "Mc", "Me", "Cf")
+# Cyrillic / Greek lookalikes (after casefold) -> Latin, for the letters skeleton only.
+_HOMO = str.maketrans("аеорсухіјѕԁкмнтвοαειкνρτυχβημ", "aeopcyxijsdkmhtboaeiknptuxbhm")
 
 
 def _norm(text: str):
-    """NFKC per char (fullwidth digits), any script's digits -> ASCII, Cf (zero-width,
-    soft hyphen) dropped. Returns (normalized, origin index in text per char)."""
-    out, org = [], []
-    for i, ch in enumerate(text):
-        if unicodedata.category(ch) == "Cf":
-            continue
-        for c in unicodedata.normalize("NFKC", ch):
+    """Whole-string NFKC (each base char composed with its combining marks, so decomposed
+    mü / ş compose), Cf (zero-width, soft hyphen) dropped, any script's digits -> ASCII.
+    Returns (normalized, origin index in text per char)."""
+    out, org, i, n = [], [], 0, len(text)
+    while i < n:
+        j = i + 1
+        while j < n and unicodedata.category(text[j]) in _MARK:
+            j += 1
+        unit = "".join(c for c in text[i:j] if unicodedata.category(c) != "Cf")
+        for c in unicodedata.normalize("NFKC", unit):
             out.append(str(unicodedata.decimal(c)) if c.isdecimal() else c)
             org.append(i)
+        i = j
     return "".join(out), org
 
 
-def shape_hits(text: str, shapes) -> list:
-    """(start, end) offsets in text of every shape hit. Raw and normalized views, each
-    seen twice: (a) ISO dates blanked, (b) dates kept but letter-glued 1-3 digit ids
-    hidden, so a date can no longer hide the digits next to it (LESSONS1FIX2)."""
-    n, org = _norm(text)
+def _skeleton(n: str):
+    """Letters/digits only, casefolded, accents and Turkish letters folded, lookalikes
+    mapped: 'Garanti-BBVA', 'YapıKredi', 'dora_notes', 'D.O.R.A', 'yapi\\nkredi' all read
+    as joined letters. Returns (skeleton, index in n per char, boundary-before per char);
+    a boundary is a removed separator, a lower->Upper step or a letter<->digit step."""
+    sk, so, sb, gap, prev = [], [], [], True, ""
+    for i, ch in enumerate(n):
+        if unicodedata.category(ch) in _MARK:
+            continue
+        if not ch.isalnum():
+            gap = True
+            continue
+        b = gap or (prev.islower() and ch.isupper()) or prev.isdigit() != ch.isdigit()
+        for c in unicodedata.normalize("NFD", ch.casefold()):
+            if c.isalnum():
+                sk.append(c.translate(_TR).translate(_HOMO))
+                so.append(i)
+                sb.append(b)
+                b = False
+        gap, prev = False, ch
+    sb.append(True)
+    return "".join(sk), so, sb
+
+
+def _at_collapse(n: str):
+    """n with every non-letter/digit run on either side of each '@' removed
+    ('salih @example.com', 'salih@ example.com'). Returns (text, index in n per char)."""
+    drop = set()
+    for i, ch in enumerate(n):
+        if ch == "@":
+            for step in (-1, 1):
+                j = i + step
+                while 0 <= j < len(n) and j not in drop and n[j] != "@" and not n[j].isalnum():
+                    drop.add(j)
+                    j += step
+    keep = [i for i in range(len(n)) if i not in drop]
+    return "".join(n[i] for i in keep), keep
+
+
+def shape_hits(text: str, shapes, n=None, org=None) -> list:
+    """(start, end) offsets in text of every shape hit. Views: raw, normalized and the
+    '@'-collapsed normalized text; each seen unmasked, with ISO dates blanked and with
+    letter-glued 1-3 digit ids hidden (LESSONS1FIX3: the unmasked pass catches
+    'Tel53 2026-11-14')."""
+    if n is None:
+        n, org = _norm(text)
+    a, ao = _at_collapse(n)
+    views = [(n, org)] + [(text, None)] * (text != n) + [(a, [org[k] for k in ao])] * (a != n)
     out = []
-    for t, o in ((text, None), (n, org)):
-        for v in (_DATE.sub(lambda m: " " * len(m.group()), t),
+    for t, o in views:  # identical views skipped: same hits, a third of the time
+        for v in (t, _DATE.sub(lambda m: " " * len(m.group()), t),
                   _GLUED.sub(lambda m: "#" * len(m.group()), t)):
             for p in shapes:
                 for m in p.finditer(v):
                     s, e = m.span()
-                    out.append((s, e) if o is None else (o[s], o[e - 1] + 1))
+                    out.append((s, e) if o is None else (o[s], o[max(e - 1, s)] + 1))
+    return out
+
+
+def _screen(text: str, deny) -> list:
+    """(start, end) offsets in text of every shape and word hit."""
+    _, shapes, words = deny
+    n, org = _norm(text)
+    out = shape_hits(text, shapes, n, org)
+    sk, so, sb = _skeleton(n)
+    for w, st, en in words:
+        i = sk.find(w)
+        while i >= 0:
+            e = i + len(w)
+            if (not st or sb[i]) and (not en or sb[e]):
+                out.append((org[so[i]], org[so[e - 1]] + 1))
+            i = sk.find(w, i + 1)
     return out
 
 
 def denied(text: str, deny) -> bool:
-    """True = drop. Any doubt (error) also drops."""
+    """True = drop. Any doubt (error, non-text) also drops."""
     try:
-        _, shapes, words = deny
-        views = (fold(text), fold(_norm(text)[0]))  # do​ra, mü­şteri, fullwidth
-        return bool(shape_hits(text, shapes)) or any(p.search(v) for p in words for v in views)
+        return bool(_screen(text, deny))
     except Exception:  # fail closed
         return True
 
 
 def hit_lines(path: Path, deny):
-    """Whole-file screen: (first, last) line of every shape hit, so a phone split over a
-    chunk boundary still drops both chunks. None = screen failed -> drop the whole file."""
+    """Whole-file screen, shapes and words: (first - 1, last + 1) line of every hit, so a
+    phone or 'yapi\\nkredi' split over a chunk boundary drops every chunk it touches.
+    None = screen failed -> drop the whole file."""
     try:
         text = "\n".join(_read_lines(path))
         nl = [i for i, ch in enumerate(text) if ch == "\n"]
-        return [(bisect.bisect_left(nl, s) + 1, bisect.bisect_left(nl, e) + 1)
-                for s, e in shape_hits(text, deny[1])]
+        return [(max(1, bisect.bisect_left(nl, s)), bisect.bisect_left(nl, e) + 2)
+                for s, e in _screen(text, deny)]
     except Exception:  # fail closed
         return None
 
@@ -242,15 +306,20 @@ def run(root: Path, out: Path, ceiling: float, api, deny_path: Path = DENY_PATH)
         except api.ApiRefused as exc:
             rep.update(partial=True, stop=f"refused: {exc}")
     hits = {src: hit_lines(root / src, deny) for src in {c["source"] for c in all_chunks}}
+    seen = {}  # source -> [dropped, screened]
     for c in all_chunks if eid is not None else []:
-        if denied(c["text"], deny) or denied(c["source"], deny) or _hit(c, hits[c["source"]]):
+        ptr = pointer(c)
+        purpose = f"ders lesson {Path(c['source']).name}:{c['start']}"[:80]
+        st = seen.setdefault(c["source"], [0, 0])
+        st[1] += 1
+        if (_hit(c, hits[c["source"]]) or any(denied(t, deny) for t in
+                                              (c["text"], c["source"], ptr, purpose))):
             rep["dropped_dora"] += 1
+            st[0] += 1
             if c["rule"] is not None:
                 cls[c["rule"]] = "dropped_dora"
             continue
-        ptr = pointer(c)
         msg = [{"role": "user", "content": f"Kaynak: {ptr}\n<<<\n{c['text']}\n>>>"}]
-        purpose = f"ders lesson {Path(c['source']).name}:{c['start']}"[:80]
         try:
             ans = api.call(MODEL, SYSTEM, msg, MAX_TOKENS, purpose, envelope=eid)
         except api.ApiRefused as exc:
@@ -279,6 +348,12 @@ def run(root: Path, out: Path, ceiling: float, api, deny_path: Path = DENY_PATH)
                 rec.update(kaynak=ptr, dogrulama_durumu="aday",
                            rule=None if c["rule"] is None else f"O{c['rule']}")
                 cands.append(rec)
+    rep["drop_ratio"] = [f"{'<denied name>' if denied(s, deny) else s} {d}/{n}"
+                         for s, (d, n) in sorted(seen.items())]
+    dropped, screened = rep["dropped_dora"], sum(n for _, n in seen.values())
+    if screened and dropped / screened > 0.4:
+        rep["warning"] = f"dropped {dropped}/{screened} chunks (> 40%): deny screen may be too wide"
+        print(f"WARNING: {rep['warning']}", file=sys.stderr)
     rep["candidates"] = len(cands)
     rep["usd_spent"] = _spent(api, eid) if eid is not None else "0.0000"
     rule_chunks = [c for c in all_chunks if c["rule"] is not None]
