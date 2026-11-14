@@ -1,0 +1,39 @@
+{
+  "version": 1,
+  "about": "LESSONS1 Dora/company egress deny list (plan v2.4 4.2, 12.3). A chunk matching any pattern is dropped, never sent, never logged. 'shapes' run on raw text (ignore case); 'words' run on Turkish-folded lower-case text. Bump version on any change.",
+  "shapes": [
+    "(?<!\\d)\\d{11}(?!\\d)",
+    "TR\\d{2}(?:\\s?[0-9A-Z]{4}){5}\\s?[0-9A-Z]{2}",
+    "(?:\\+90|\\b0)\\s?5\\d{2}[\\s.-]?\\d{3}[\\s.-]?\\d{2}[\\s.-]?\\d{2}",
+    "[\\w.+-]+@[\\w-]+\\.[\\w.]+"
+  ],
+  "words": [
+    "\\bdora\\b",
+    "musteri",
+    "ekspertiz",
+    "\\bkvkk\\b",
+    "\\bcustomer",
+    "\\bsigortali",
+    "\\bsayin\\b",
+    "ziraat",
+    "halkbank",
+    "vakifbank",
+    "garanti bbva",
+    "garanti bankasi",
+    "is bankasi",
+    "\\bisbank",
+    "yapi kredi",
+    "akbank",
+    "denizbank",
+    "\\bqnb\\b",
+    "finansbank",
+    "\\bteb\\b",
+    "ing bank",
+    "kuveyt turk",
+    "albaraka",
+    "sekerbank",
+    "odeabank",
+    "fibabanka",
+    "enpara"
+  ]
+}
