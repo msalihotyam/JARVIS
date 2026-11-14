@@ -126,7 +126,7 @@ def render(data: dict) -> str:
            "format: path [lines] doc / imports: in-repo modules / class|def signature @line - doc (public, top level)"]
     entries = [(rel, "mod") for rel in data["modules"]] + [(u["path"], "bad") for u in data["unparsed"]]
     last_dir = None
-    for rel, kind in sorted(entries):
+    for rel, kind in sorted(entries, key=lambda e: (e[0].rpartition("/")[0], e[0])):  # by package, then name
         pdir = rel.rpartition("/")[0]
         if pdir != last_dir:
             out += ["", f"## {pdir}/"]

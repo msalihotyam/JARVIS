@@ -82,8 +82,23 @@ class CodeMapTest(unittest.TestCase):
         self.assertEqual(before, sorted(p.relative_to(self.src).as_posix() for p in self.src.rglob("*")))
         self.assertEqual(json.loads(outs[0]["map.json"])["version"], 1)
 
+    def test_subpackage_between_top_level_files_keeps_each_heading_once(self):
+        # "pkg/sub/c.py" sorts between "pkg/b.py" and "pkg/z_last.py" by full path
+        make(self.src, {"pkg/z_last.py": "", "pkg/sub/__init__.py": "", "pkg/sub/zz.py": "", "pkg/bad.py": "def x(:\n"})
+        text = code_map.render(code_map.build(self.src, ("pkg", "tools")))
+        heads = [ln for ln in text.splitlines() if ln.startswith("## ")]
+        self.assertEqual(heads, ["## pkg/", "## pkg/sub/", "## tools/"])
+        paths = [ln.split()[1] for ln in text.splitlines() if ln.startswith("- ")]
+        self.assertEqual(paths, [
+            "pkg/__init__.py", "pkg/a.py", "pkg/b.py", "pkg/bad.py", "pkg/z_last.py",
+            "pkg/sub/__init__.py", "pkg/sub/c.py", "pkg/sub/zz.py", "tools/t.py", "tools/tools_x.py"])
+        self.assertEqual(text, code_map.render(code_map.build(self.src, ("pkg", "tools"))))
+
     def test_real_tree_maps_and_map_is_compact(self):
         text, data = code_map.write(ROOT, self.tmp / "real")
+        heads = [ln for ln in text.splitlines() if ln.startswith("## ")]
+        self.assertEqual(len(heads), len(set(heads)))
+        self.assertEqual(text, code_map.render(code_map.build(ROOT)))
         self.assertEqual(data["unparsed"], [])
         self.assertIn("jarvis/core.py", data["modules"])
         self.assertIn("scripts/code_map.py", data["modules"])
