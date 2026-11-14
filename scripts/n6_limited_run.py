@@ -52,7 +52,7 @@ if str(ROOT) not in sys.path:
 from jarvis import n6_deps, n6_lease  # noqa: E402
 from jarvis.n6_breaker import BAD, GOOD  # noqa: E402
 from jarvis.work_planner import n6_next  # noqa: E402
-from jarvis.work_supervisor import Situation, n6_record_finish, supervise  # noqa: E402
+from jarvis.work_supervisor import DEFAULT_POLICY, Situation, n6_record_finish, supervise  # noqa: E402
 
 OWNER = "n6-limited"
 CLAIMED = "claimed"  # a runner's answer: the conveyor will start it (keep the lease)
@@ -148,9 +148,39 @@ def _takes(ports: Ports, sid: str, ints: set[str]) -> bool:
         return False
 
 
+def _backlog(root: Path | str) -> list[dict[str, object]]:
+    """The conveyor backlog's slices; [] when there is no backlog. Raises when unreadable."""
+    try:
+        data = json.loads((Path(root) / "build" / "conveyor" / "backlog.json").read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return []
+    slices = data.get("slices") if isinstance(data, dict) else data
+    if not isinstance(slices, list):
+        raise ValueError("backlog shape")
+    return [s for s in slices if isinstance(s, dict)]
+
+
+def sync_backlog(root: Path | str, deps: Path) -> list[str]:
+    """N6-LIMIT1: enqueue the backlog's n6-marked T1 non-INT slices deps.json lacks.
+
+    Only dependencies on other n6-marked slices are copied; the rest are the
+    conveyor's: its n6_take runs the full slice_hold (depends_on included)."""
+    marked = [s for s in _backlog(root) if s.get("n6") is True]
+    ids = {s.get("id") for s in marked}
+    have = {e["id"] for e in n6_deps._read(deps)}  # pyright: ignore[reportPrivateUsage]
+    new = [s for s in marked if isinstance(s.get("id"), str) and s["id"] not in have
+           and _is_t1(s.get("tier")) and not INT_RE.match(str(s["id"]))]
+    items = [n6_deps.Item(str(s["id"]), tuple(d for d in s.get("depends_on") or () if d in ids))
+             for s in new]
+    if items:
+        n6_deps.enqueue(deps, items)
+    return [f"{i.slice_id}: queued for N6" for i in items]
+
+
 def _step(root: Path | str, n6: Path, ports: Ports) -> list[str]:
     lease_path, deps = n6 / "lease.json", n6 / "deps.json"
     held = "n6 held: clock or ttl_s not finite and positive"  # a NaN lease poisons all
+    sync_backlog(root, deps)  # raises on an unreadable backlog/deps: tick notes it, no pick
     t0 = ports.now()
     if _expires(t0, ports.ttl_s) is None:
         return [held]
@@ -174,7 +204,7 @@ def _step(root: Path | str, n6: Path, ports: Ports) -> list[str]:
     ran = marked = kept = False
     try:
         decision = supervise(ports.situation(sid), n6_dir=n6, slice_id=sid)
-        if decision.constraint == "none":
+        if decision.constraint != "any":  # N6 lanes are Claude: non_claude_only holds too
             return [*notes, f"{sid}: handed back ({decision.rule_id})"]
         if not switch_on(root):
             return [*notes, f"{sid}: handed back (switch off)"]
@@ -324,9 +354,36 @@ def _tier(sid: str) -> object:
     return next(s.get("tier") for s in slices if isinstance(s, dict) and s.get("id") == sid)
 
 
-def _situation(sid: str) -> Situation:
-    # ponytail: nothing writes situation.json yet; absent -> _step hands the pick back.
-    return Situation(**json.loads((ROOT / "build" / "n6" / "situation.json").read_text(encoding="utf-8")))
+_HOLDS = ("paused", "usage_hold", "memory_hold", "outage_hold", "auth_hold", "disk_hold")
+
+
+def _num(v: object) -> bool:
+    return type(v) in (int, float) and math.isfinite(v)  # pyright: ignore[reportArgumentType]
+
+
+def _situation(sid: str, root: Path | str = ROOT) -> Situation:
+    """N6-LIMIT1: the supervisor's view built read-only from the conveyor's status.json
+    and PAUSE. Anything unreadable, missing or not exactly "no hold" pauses."""
+    pause = Situation(operator_pause=True)
+    conv = Path(root) / "build" / "conveyor"
+    try:
+        if (conv / "PAUSE").exists():
+            return pause
+        st = json.loads((conv / "status.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return pause
+    if not isinstance(st, dict) or any(st.get(k) is not False for k in _HOLDS) \
+            or st.get("breaker") != "closed":
+        return pause
+    pace, mem = st.get("pace"), st.get("memory")
+    used, line = st.get("usage_pct"), pace.get("pace_line") if isinstance(pace, dict) else None
+    free = mem.get("free_gb") if isinstance(mem, dict) else None
+    if not _num(used) or not _num(free):
+        return pause
+    return Situation(operator_pause=False, policy=DEFAULT_POLICY,
+                     quota={"used_pct": used, "line_pct": line if _num(line) else None,
+                            "hour": time.localtime().tm_hour},
+                     memory={"free_gb": free, "held": False})
 
 
 def main() -> int:

@@ -134,7 +134,8 @@ BUDGET_NUDGE = "commit the coherent part, list the rest in OPEN ISSUES, write th
 PASS_S = 60
 USAGE_S = 1800  # usage ledger cadence (scripts/usage_ledger.py, else the build/conveyor copy)
 LEDGER_TIMEOUT_S = 300  # a ledger subprocess still running after this is killed
-N6_TIMEOUT_S = 120  # an N6 shadow runner (scripts/n6_shadow_run.py) still running after this is killed
+N6_TIMEOUT_S = 120
+N6_LIMITED_S = 300  # N6-LIMIT1: the LIMITED tick runs at most this often  # an N6 shadow runner (scripts/n6_shadow_run.py) still running after this is killed
 CLEANUP_S = 3600  # a finished lane's session is removed this long after its report was collected
 CLEANUP_PER_PASS = 5  # stop/rm calls are slow; keep one pass well under the stale-lock time
 # CONVIDLE: `claude agents` lists a finished idle background session as state "working"; early
@@ -1275,6 +1276,7 @@ class Conveyor:
         self.ledger_proc = None  # (Popen, start ts) of the usage ledger subprocess still running
         self.n6_proc = None  # (Popen, start ts) of the N6 shadow runner still running
         self.n6_due = False  # a lane finished since the last N6 shadow start
+        self.n6_lim_proc, self.n6_lim_ts = None, None  # N6-LIMIT1 tick subprocess and its last start
         self.ledger_ts = float("-inf")  # last ledger start
 
     # ---- lock -------------------------------------------------------
@@ -3960,6 +3962,14 @@ class Conveyor:
                 view[sid] = "n6_lease"  # N6-08: an N6 manager owns it; never dispatched meanwhile
                 if sid not in skip:
                     self.n6_skip(sid)
+            elif s.get("n6") is True:  # N6-LIMIT1 (O77 B): only N6's claim starts it, via n6_take
+                if s.get("tier") == "T1" and not INT_RE.match(sid):
+                    view[sid] = "n6"
+                else:
+                    view[sid] = "n6_refused"  # T2/INT stay with the conveyor: never started, paged once
+                    if not self.pager_flag(f"n6_refused:{sid}"):
+                        self.pager_flag(f"n6_refused:{sid}", self.now())
+                        self.page(f"N6: {sid} is n6-marked but {s.get('tier')}/INT: refused, not started")
             else:
                 view[sid] = "ready"
                 if sid not in skip:
@@ -4369,6 +4379,34 @@ class Conveyor:
             self.n6_proc = (proc, self.now())
         except Exception as e:
             self.event("n6_shadow", error=repr(e))
+
+    def n6_limited(self):
+        """N6-LIMIT1: one n6_limited_run tick subprocess while build/n6/LIMITED_ON exists,
+        at most every N6_LIMITED_S, never under PAUSE; killed after N6_TIMEOUT_S.
+        Errors are events only: the loop runs on and the slice stays pending."""
+        try:
+            if self.n6_lim_proc:
+                proc, started = self.n6_lim_proc
+                rc = proc.poll()
+                if rc is None and self.now() - started < N6_TIMEOUT_S:
+                    return
+                if rc is None:
+                    proc.kill()
+                self.n6_lim_proc = None
+                if rc != 0:
+                    self.event("n6_limited", error=f"killed after {N6_TIMEOUT_S}s" if rc is None else f"exit {rc}")
+                return
+            if not (self.root / "build" / "n6" / "LIMITED_ON").is_file() or (self.base / "PAUSE").exists():
+                return
+            if self.n6_lim_ts is not None and self.now() - self.n6_lim_ts < N6_LIMITED_S:
+                return
+            self.n6_lim_ts = self.now()
+            proc = self.popen([sys.executable, str(self.root / "scripts" / "n6_limited_run.py")], cwd=self.root,
+                              env=child_env(), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                              stderr=subprocess.DEVNULL, creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+            self.n6_lim_proc = (proc, self.now())
+        except Exception as e:
+            self.event("n6_limited", error=repr(e))
 
     # ---- autopilot (CONV7): the three routine orchestrator decisions -----
     def autopilot(self, lanes):
@@ -6251,6 +6289,10 @@ class Conveyor:
                         pass
                 try:
                     self.n6_shadow()  # the one N6 call site: guarded inside, never waits, never errors
+                except Exception:
+                    pass
+                try:
+                    self.n6_limited()  # N6-LIMIT1: LIMITED_ON only, at most every N6_LIMITED_S
                 except Exception:
                     pass
             try:

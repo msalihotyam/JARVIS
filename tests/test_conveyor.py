@@ -3719,6 +3719,108 @@ class TestN6ShadowHook(Base):
         TestLedgerSubprocess.finished(self)
         self.assertTrue(self.c.n6_due)
 
+
+class TestN6LimitedHook(Base):
+    """N6-LIMIT1: LIMITED_ON ticks n6_limited_run at most every N6_LIMITED_S; n6-marked
+    slices start only through N6's claim; absent switch = unchanged conveyor."""
+
+    def on(self):
+        (self.root / "build" / "n6").mkdir(parents=True, exist_ok=True)
+        (self.root / "build" / "n6" / "LIMITED_ON").write_text("")
+
+    def lim_events(self):
+        return [e for e in self.events() if e["event"] == "n6_limited"]
+
+    def test_switch_off_no_tick_and_unmarked_t1_picked_as_before(self):
+        self.c.n6_limited()
+        self.assertEqual(self.ledger_procs, [])
+        self.backlog({"id": "A", "tier": "T1"})
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        self.assertEqual(self.ledger_procs, [])
+
+    def test_tick_at_most_every_window_and_never_under_pause(self):
+        self.on()
+        self.c.n6_limited()
+        self.assertEqual(len(self.ledger_procs), 1)
+        self.assertTrue(self.ledger_procs[0].argv[-1].endswith("n6_limited_run.py"))
+        self.ledger_procs[0].rc = 0
+        self.c.n6_limited()  # reaps
+        self.c.n6_limited()  # inside the window: no start
+        self.assertEqual(len(self.ledger_procs), 1)
+        self.t += conveyor.N6_LIMITED_S
+        (self.base / "PAUSE").write_text("")
+        self.c.n6_limited()
+        self.assertEqual(len(self.ledger_procs), 1)
+        (self.base / "PAUSE").unlink()
+        self.c.n6_limited()
+        self.assertEqual((len(self.ledger_procs), self.lim_events()), (2, []))
+
+    def test_timeout_kill_and_raise_are_events_only(self):
+        self.on()
+        self.c.n6_limited()
+        self.t += conveyor.N6_TIMEOUT_S
+        self.c.n6_limited()
+        self.assertTrue(self.ledger_procs[0].killed)
+        self.t += conveyor.N6_LIMITED_S
+        self.fake_popen_error = OSError("no python")
+        self.c.n6_limited()
+        self.assertEqual([e["error"][:9] for e in self.lim_events()], ["killed af", "OSError('"])
+        self.assertFalse(any(e["event"] == "error" for e in self.events()))
+
+    def test_loop_continues_when_the_tick_raises(self):
+        sleeps = []
+
+        def sleep(s):
+            sleeps.append(s)
+            self.t += 100
+
+        with mock.patch.object(self.c, "n6_limited", side_effect=RuntimeError("boom")), \
+                mock.patch.object(self.c, "heartbeat"), \
+                mock.patch.object(self.c, "own_lock", side_effect=lambda: len(sleeps) < 3), \
+                mock.patch.object(conveyor.time, "sleep", side_effect=sleep):
+            self.assertEqual(self.c.loop(), 0)
+        self.assertEqual(len(sleeps), 3)
+
+    def test_marked_t1_never_dispatched_by_the_planner(self):
+        for on in (False, True):
+            with self.subTest(on=on):
+                self.setUp()
+                if on:
+                    self.on()
+                self.backlog({"id": "A", "tier": "T1", "n6": True}, {"id": "B", "tier": "T1"})
+                self.c.pass_once()
+                self.c.pass_once()
+                self.assertEqual(self.fake.bg_names(), ["B"])
+
+    def test_marked_t2_or_int_refused_and_paged_once(self):
+        self.backlog({"id": "A", "tier": "T2", "n6": True}, {"id": "INT9", "tier": "T1", "n6": True})
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), [])
+        refused = [p for p in self.pushes if "refused, not started" in p]
+        # ponytail: T2 is held by an earlier planner branch before the n6 check, so only INT pages here
+        self.assertEqual([p.split()[1] for p in refused], ["INT9"], self.pushes)
+
+    def test_marked_t1_tick_claim_take_finish(self):
+        from tests.test_n6_limited_run import lr
+        from tests.test_work_supervisor import _sit
+        self.on()
+        self.backlog({"id": "A", "tier": "T1", "n6": True})
+        n6 = self.root / "build" / "n6"
+        ports = lr.Ports(now=lambda: self.t, verify=lambda sha: True, tier=lambda s: "T1",
+                         situation=lambda sid: _sit(),
+                         run=lambda sid, lease: lr.write_claim(n6, lease), ttl_s=900.0)
+        self.assertIn("A: claimed for the conveyor", lr.tick(self.root, ports))
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        self.assertEqual(json.loads((n6 / "claim_result.json").read_text())["state"], "started")
+        (self.base / "lanes.json").write_text(json.dumps({"A": {"finished": True, "status": "PASS"}}))
+        self.assertIn("A: PASS", lr.tick(self.root, ports))
+        deps = json.loads((n6 / "deps.json").read_text())["backlog"]
+        self.assertEqual([(e["id"], e["state"]) for e in deps], [("A", "done")])
+        self.assertTrue((n6 / "breaker.json").exists())
+
     def test_loop_continues_when_the_hook_raises(self):
         beats, sleeps = [], []
 

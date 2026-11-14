@@ -429,5 +429,47 @@ class ClaimFlow(unittest.TestCase):
         self.assertEqual(sorted(p.name for p in self.n6.iterdir()), [])
 
 
+class LimitedInputs(unittest.TestCase):
+    """N6-LIMIT1: the real situation and backlog ports, fail closed."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.root = Path(tmp.name)
+        self.conv = self.root / "build" / "conveyor"
+        self.conv.mkdir(parents=True)
+
+    def status(self, **kw):
+        data = {h: False for h in lr._HOLDS}
+        data.update(breaker="closed", usage_pct=40.0, pace={"pace_line": 50.0}, memory={"free_gb": 8.0})
+        data.update(kw)
+        (self.conv / "status.json").write_text(json.dumps(data))
+
+    def test_situation_clear_only_when_every_hold_is_false(self):
+        self.status()
+        self.assertFalse(lr._situation("A", self.root).operator_pause)
+        for kw in [*({h: True} for h in lr._HOLDS), {"breaker": "open"}, {"usage_pct": None}]:
+            with self.subTest(kw=kw):
+                self.status(**kw)
+                self.assertTrue(lr._situation("A", self.root).operator_pause)
+        (self.conv / "status.json").write_text("{bad")
+        self.assertTrue(lr._situation("A", self.root).operator_pause)
+        (self.conv / "status.json").unlink()
+        self.assertTrue(lr._situation("A", self.root).operator_pause)
+        self.status()
+        (self.conv / "PAUSE").write_text("")
+        self.assertTrue(lr._situation("A", self.root).operator_pause)
+
+    def test_sync_takes_only_marked_t1_once(self):
+        deps = self.root / "build" / "n6" / "deps.json"
+        deps.parent.mkdir(parents=True)
+        (self.conv / "backlog.json").write_text(json.dumps({"slices": [
+            {"id": "A", "tier": "T1", "n6": True}, {"id": "B", "tier": "T2", "n6": True},
+            {"id": "INT-x", "tier": "T1", "n6": True}, {"id": "C", "tier": "T1"}]}))
+        self.assertEqual(lr.sync_backlog(self.root, deps), ["A: queued for N6"])
+        self.assertEqual(lr.sync_backlog(self.root, deps), [])
+        self.assertEqual([e["id"] for e in json.loads(deps.read_text())["backlog"]], ["A"])
+
+
 if __name__ == "__main__":
     unittest.main()
