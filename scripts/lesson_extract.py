@@ -16,6 +16,7 @@ import json
 import math
 import re
 import sys
+import unicodedata
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -60,7 +61,11 @@ def denied(text: str, deny) -> bool:
     try:
         _, shapes, words = deny
         f = fold(text)
-        return any(p.search(text) for p in shapes) or any(p.search(f) for p in words)
+        text = re.sub(r"(?<!\d)(?:19|20)\d\d-[01]\d-[0-3]\d(?!\d)", " ", text)  # ISO dates are not phones
+        n = unicodedata.normalize("NFKC", text)  # NFKC: fullwidth digits
+        n = "".join(str(unicodedata.decimal(ch)) if ch.isdecimal() else ch  # any script's digits
+                    for ch in n if unicodedata.category(ch) != "Cf")  # drop zero-width / soft hyphen
+        return any(p.search(t) for p in shapes for t in (text, n)) or any(p.search(f) for p in words)
     except Exception:  # fail closed
         return True
 

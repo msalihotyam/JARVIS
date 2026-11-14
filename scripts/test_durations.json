@@ -602,6 +602,7 @@
   "tests.test_intent.TokenUsageFoundationTests": 2.212,
   "tests.test_intent.WebResearchTests": 4.099,
   "tests.test_lesson_extract.LessonExtractTests": 0.5,
+  "tests.test_lesson_extract.PhoneShapeTests": 0.05,
   "tests.test_live_stop.AtMostOnceTests": 6.749,
   "tests.test_live_stop.AuthorityBarrierTests": 30.257,
   "tests.test_live_stop.BaseConnectorStopTests": 2.688,

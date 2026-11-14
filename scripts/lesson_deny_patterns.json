@@ -1,10 +1,11 @@
 {
-  "version": 1,
+  "version": 2,
   "about": "LESSONS1 Dora/company egress deny list (plan v2.4 4.2, 12.3). A chunk matching any pattern is dropped, never sent, never logged. 'shapes' run on raw text (ignore case); 'words' run on Turkish-folded lower-case text. Bump version on any change.",
   "shapes": [
     "(?<!\\d)\\d{11}(?!\\d)",
     "TR\\d{2}(?:\\s?[0-9A-Z]{4}){5}\\s?[0-9A-Z]{2}",
-    "(?:\\+90|\\b0)\\s?5\\d{2}[\\s.-]?\\d{3}[\\s.-]?\\d{2}[\\s.-]?\\d{2}",
+    "(?<!\\d)(?:(?:\\+|00)?[\\s./()_:|*\\u00b7\\u2010-\\u2015\\u2212\\u200b-\\u200d\\u2060\\ufeff-]{0,3}90|0)?[\\s./()_:|*\\u00b7\\u2010-\\u2015\\u2212\\u200b-\\u200d\\u2060\\ufeff-]{0,3}(?!(?:19|20)\\d\\d[-./]\\d)[2-58](?:[\\s./()_:|*\\u00b7\\u2010-\\u2015\\u2212\\u200b-\\u200d\\u2060\\ufeff-]{0,3}\\d){9}(?!\\d)",
+    "(?<!\\d)444(?:[\\s./()_:|*\\u00b7\\u2010-\\u2015\\u2212\\u200b-\\u200d\\u2060\\ufeff-]{0,3}\\d){4}(?!\\d)",
     "[\\w.+-]+@[\\w-]+\\.[\\w.]+"
   ],
   "words": [

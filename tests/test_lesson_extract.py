@@ -151,5 +151,67 @@ class LessonExtractTests(unittest.TestCase):
         self.assertTrue(first["candidates.jsonl"])
 
 
+PHONES = {  # LESSONS1FIX: every Turkish phone shape is dropped before any call
+    "landline_0_area": "0212 123 45 67",
+    "mobile_unprefixed": "532 123 45 67",
+    "mobile_0": "0532 123 45 67",
+    "mobile_plus90": "+90 532 123 45 67",
+    "mobile_plus90_tight": "+905321234567",
+    "mobile_90_no_plus": "905321234567",
+    "mobile_0090": "0090 532 123 4567",
+    "landline_parens": "(0212) 123 45 67",
+    "landline_plus90_parens": "+90 (216) 123-45-67",
+    "landline_unprefixed_3_7": "312 1234567",
+    "contiguous_10": "5321234567",
+    "dots": "532.123.45.67",
+    "dashes": "0532-123-45-67",
+    "slash": "0212/123 45 67",
+    "double_space": "532  123  45  67",
+    "en_dash": "532–123–45–67",
+    "nbsp": "532 123 45 67",
+    "fullwidth_digits": "５３２ １２３ ４５ ６７",
+    "service_0850": "0850 123 45 67",
+    "call_center_444": "444 1 444",
+    "after_letters": "Tel05321234567",
+    "in_sentence": "ara: 232 123 45 67 lutfen",
+    "grouping_2_2_3": "05 32 12 34 567",
+    "grouping_3_2_2_3": "532 12 34 567",
+    "grouping_4_4_3": "0532 1234 567",
+    "split_last_digit": "+90 532 123 45 6 7",
+    "spaced_digits": "0 5 3 2 1 2 3 4 5 6 7",
+    "zero_width_sep": "0532​123​45​67",
+    "underscore_sep": "532_123_45_67",
+    "minus_sign_sep": "532−123−45−67",
+    "middle_dot_sep": "532·123·45·67",
+    "arabic_indic_digits": "٥٣٢ 123 45 67",
+    "line_break_inside": "532\n123 45 67",
+    "soft_hyphen_sep": "0532­123­45­67",
+    "word_joiner_sep": "0532⁠123⁠45⁠67",
+    "colon_sep": "0532:123:45:67",
+    "pipe_sep": "532|123|45|67",
+    "star_sep": "532*123*45*67",
+    "call_center_444_2_2": "444 12 34",
+    "devanagari_digits": "५३२ १२३ ४५ ६७",
+}
+NOT_PHONES = ("O52 kurali 2026-11-14 12:30 tarihinde", "600000 ms, 80 cagri, 45 dk",
+              "PR 5321 merged 2026", "O52 600000 3600 1234567", "O29 (2026-10-18) kural",
+              "O2-7, 2026-11-07 notu", "plan 2.1, 4.2, 8, 11.4, 12 bolum",
+              "sha e0bcc99a 4dee6b68", "O27 UIRED5 3 test")
+
+
+class PhoneShapeTests(unittest.TestCase):
+    def test_each_phone_shape_is_denied(self):
+        deny = L.load_deny()
+        for name, text in PHONES.items():
+            with self.subTest(name):
+                self.assertTrue(L.denied(f"O9 kural {text} son", deny))
+
+    def test_rule_text_without_phones_is_not_denied(self):
+        deny = L.load_deny()
+        for text in NOT_PHONES:
+            with self.subTest(text):
+                self.assertFalse(L.denied(text, deny))
+
+
 if __name__ == "__main__":
     unittest.main()
