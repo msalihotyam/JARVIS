@@ -7,6 +7,7 @@ import os
 import tempfile
 import traceback
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
@@ -49,7 +50,7 @@ class ApiBrokerTest(unittest.TestCase):
         return self.reply
 
     def call(self, model=HAIKU, messages=MSG, max_tokens=100, reader=lambda: KEY, now=T0, **kw):
-        return api.call(model, "sys", messages, max_tokens, kw.pop("purpose", "test"), root=self.root,
+        return api.call(model, "sys", messages, max_tokens, kw.pop("purpose", "orch test"), root=self.root,
                         clock=lambda: now, reader=reader, post=self.post, **kw)
 
     def rows(self):
@@ -60,8 +61,8 @@ class ApiBrokerTest(unittest.TestCase):
             for t, usd in rows:
                 f.write(json.dumps({"ts": t, "usd": usd}) + "\n")
 
-    def refused(self, fn, needle=""):
-        with self.assertRaises(api.ApiRefused) as cm:
+    def refused(self, fn, needle="", mod=None):  # mod: a restarted module has its own ApiRefused
+        with self.assertRaises((mod or api).ApiRefused) as cm:
             fn()
         self.assertIn(needle, str(cm.exception))
         self.assertEqual(self.sent, [], "a refusal must come before any request")
@@ -75,7 +76,7 @@ class ApiBrokerTest(unittest.TestCase):
 
     # --- NEG: the key never leaks -------------------------------------------------------------
     def test_neg_key_never_in_ledger_exception_or_repr(self):
-        self.assertEqual(self.call(purpose=f"why {KEY}"), "hello")
+        self.assertEqual(self.call(purpose=f"orch why {KEY}"), "hello")
         self.reply = (401, json.dumps({"error": {"type": f"auth {KEY}", "message": KEY}}).encode())
         with self.assertRaises(api.ApiError) as cm:
             self.call()
@@ -102,7 +103,7 @@ class ApiBrokerTest(unittest.TestCase):
     def test_neg_default_reader_is_the_credential_manager_only(self):
         fake = mock.Mock(return_value="")  # the real CredReadW path is never run in a test
         with mock.patch.object(api, "read_credential", fake):
-            self.refused(lambda: api.call(HAIKU, "", MSG, 10, "t", root=self.root, clock=lambda: T0,
+            self.refused(lambda: api.call(HAIKU, "", MSG, 10, "orch t", root=self.root, clock=lambda: T0,
                                           post=self.post), "credential")
         fake.assert_called_once_with()
         dll = mock.Mock()  # CredReadW fails: "" even with the key in the env (never a fallback)
@@ -194,7 +195,7 @@ class ApiBrokerTest(unittest.TestCase):
         with mock.patch.object(api, "check_budget"):  # this test is about the math, not the cap
             self.assertEqual(self.call(), "a")
             self.reply = (200, ok_body(1000, 2000, "b"))
-            self.assertEqual(self.call(model=SONNET, purpose="p" * 500), "b")
+            self.assertEqual(self.call(model=SONNET, purpose="orch " + "p" * 500), "b")
         (rh, h, rs, s) = self.rows()  # a reserve row before each request, then the settled row
         self.assertEqual((rh["status"], rs["status"], h["status"]), ("sent", "sent", 200))
         self.assertEqual((h["model"], h["in"], h["out"], h["usd"]), (HAIKU, 10**6, 10**6, 0.6))
@@ -244,6 +245,101 @@ class ApiBrokerTest(unittest.TestCase):
 
     def test_redirects_are_never_followed(self):
         self.assertIsNone(api._NoRedirect().redirect_request(None, None, 302, "", {}, "https://x"))
+
+    # --- APIBUDGET1: no overspend -------------------------------------------------------------
+    def caps_file(self, **o):
+        (self.root / api.CAPS_NAME).write_text(json.dumps(o), encoding="utf-8")
+
+    def fresh(self):  # a restarted process: a new module instance reading the same ledger directory
+        mod = importlib.util.module_from_spec(_SPEC)
+        _SPEC.loader.exec_module(mod)
+        return mod
+
+    def test_neg_threads_with_budget_for_one_call_send_exactly_once(self):
+        self.caps_file(monthly_usd=0.0001)  # on 11-17 the daily share is the whole monthly cap
+        self.reply = (200, ok_body(n_in=0, n_out=100))  # bills 0.00005; every estimate is > 0.00005
+        out = []
+
+        def one():
+            try:
+                out.append(self.call(now=ts(17)))
+            except api.ApiRefused:
+                out.append("refused")
+        with ThreadPoolExecutor(8) as ex:
+            for _ in range(8):
+                ex.submit(one)
+        self.assertEqual((len(self.sent), sorted(out)), (1, ["hello"] + ["refused"] * 7))
+        self.assertLessEqual(sum(r["usd"] - r.get("release", 0) for r in self.rows()), 0.0001)
+
+    def test_neg_crash_after_reserve_keeps_it_booked_after_restart(self):
+        self.reply = KeyboardInterrupt()  # killed after the reserve row, before any settlement
+        with self.assertRaises(KeyboardInterrupt):
+            self.call(purpose="okuyucu x", now=ts(17))
+        (row,) = self.rows()
+        self.assertEqual((row["status"], row["purpose"]), ("sent", "okuyucu x"))
+        self.sent, self.reply = [], (200, ok_body())
+        api2 = self.fresh()
+
+        def again():
+            api2.call(HAIKU, "sys", MSG, 100, "okuyucu y", root=self.root, clock=lambda: ts(17),
+                      reader=lambda: KEY, post=self.post)
+        for o, needle in (({"monthly_usd": 0.0001}, "monthly cap"),
+                          ({"callers": {"okuyucu": 0.0001}}, "caller cap okuyucu: spent 0.0001")):
+            self.caps_file(**o)  # one more call fits each cap only if the kept reserve is forgotten
+            self.refused(again, needle, api2)
+
+    def test_neg_envelope_ceiling_counts_reserves_and_survives_restart(self):
+        eid = api.open_envelope(5.0, "sinav batch", root=self.root, clock=lambda: T0)
+        self.reply = (200, ok_body(n_in=0, n_out=495_000))
+        self.call(model=SONNET, purpose="sinav q1", envelope=eid)  # settles at 4.95
+        self.reply = OSError("reset")
+        with self.assertRaises(api.ApiError):  # maybe billed: its ~0.041 reserve stays in the envelope
+            self.call(model=SONNET, max_tokens=4096, purpose="sinav q2", envelope=eid)
+        self.sent, self.reply = [], (200, ok_body())
+        # ~0.0104 more passes 5 USD only together with the reserve (0.05 left without it)
+        self.refused(lambda: self.call(model=SONNET, max_tokens=1024, purpose="sinav q3", envelope=eid),
+                     "envelope: remaining 0.0088")
+        api2 = self.fresh()
+        self.refused(lambda: api2.call(SONNET, "sys", MSG, 1024, "sinav q3", root=self.root, clock=lambda: T0,
+                                       reader=lambda: KEY, post=self.post, envelope=eid), "envelope: remaining 0.0088", api2)
+        self.assertLessEqual(sum(r["usd"] - r.get("release", 0) for r in self.rows()), 5.0)
+
+    def test_neg_envelopes_together_never_exceed_the_daily_share(self):
+        def env(usd, purpose="sinav a"):
+            return api.open_envelope(usd, purpose, root=self.root, clock=lambda: T0)
+        e1 = env(5.0)  # T0: share 9.0
+        self.refused(lambda: env(5.0), "daily share")
+        env(4.0, "ders b")
+        self.refused(lambda: self.call(), "daily share")  # 9.0 held: nothing left outside the envelopes
+        self.refused(lambda: self.call(purpose="orch x", envelope=e1), "another caller")
+        self.refused(lambda: self.call(purpose="sinav x", envelope=e1, now=ts(9)), "unknown or expired")
+        self.refused(lambda: self.call(purpose="sinav x", envelope="nope"), "unknown or expired")
+        self.assertEqual(self.call(purpose="sinav x", envelope=e1), "hello")  # its own hold is usable
+        self.sent = []
+        for bad in (0, -1, float("nan"), True, "5"):
+            self.refused(lambda: env(bad), "ceiling")
+
+    def test_neg_unknown_caller_and_per_caller_cap(self):
+        for p in ("nope x", "", "orchx", " orch", None):
+            self.refused(lambda: self.call(purpose=p), "unknown caller")
+        self.refused(lambda: api.open_envelope(1.0, "nope", root=self.root, clock=lambda: T0), "unknown caller")
+        with open(self.ledger, "a", encoding="utf-8") as f:
+            f.write(json.dumps({"ts": ts(2), "usd": 4.99999, "purpose": "okuyucu old"}) + "\n")
+        self.refused(lambda: self.call(purpose="okuyucu x"), "caller cap okuyucu")  # global: 85 USD left
+        self.assertEqual(self.call(purpose="orch x"), "hello")
+
+    def test_caller_caps_table_and_override_only_lowers(self):
+        self.assertEqual((api.CALLER_CAPS_VERSION, sum(api.CALLER_CAPS.values())), (1, 165.0))
+        dec = datetime(2026, 12, 2, tzinfo=timezone.utc).timestamp()
+        self.assertEqual((api.caller_cap(self.root, "sinav", T0), api.caller_cap(self.root, "sinav", dec)),
+                         (60.0, 0.0))
+        self.caps_file(callers={"orch": 1000})
+        self.assertEqual(api.caller_cap(self.root, "orch", T0), 45.0)
+        self.caps_file(callers={"orch": 1})
+        self.assertEqual(api.caller_cap(self.root, "orch", T0), 1)
+        for bad in ({"callers": {"nope": 1}}, {"callers": {"orch": -1}}, {"callers": [1]}):
+            self.caps_file(**bad)
+            self.refused(lambda: api.caller_cap(self.root, "orch", T0), api.CAPS_NAME)
 
 
 if __name__ == "__main__":
