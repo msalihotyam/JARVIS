@@ -51,8 +51,14 @@ The serial run stays the reference when a result is disputed.
   runs), so one big run cannot starve the others), gives a token back as each of its
   workers runs out of units (the last one at its end), and the tokens of a pid that is gone are reclaimed.
   No pool under CI.
+* TESTSPEED1: when memory or the pool cuts the process count, UI processes are
+  filled first (up to the UI default, one plain worker kept when there is room),
+  since a UI process also takes the plain units and only it may take UI units;
+  the UI set's tail then spreads over more processes instead of setting the
+  run's critical path. ``--ui-split share`` restores the old cut (UI share kept).
+  Not under CI.
 
-    python scripts/test_parallel.py [--workers N] [--ui-workers K] [--durations N] [--no-rerun]
+    python scripts/test_parallel.py [--workers N] [--ui-workers K] [--ui-split first|share] [--durations N] [--no-rerun]
                                     [--python PATH] [--shard I/N] [--report PATH] [--no-ui-lock]
                                     [--require-durations] [--write-durations PATH] [modules ...]
     python scripts/test_parallel.py --aggregate DIR --shards N [--durations N] [--write-durations PATH]
@@ -520,14 +526,26 @@ def free_mem_gb() -> float | None:
         return None
 
 
-def worker_counts(cpus: int, free_gb: float | None, workers: int = 0, ui_workers: int = 0) -> tuple[int, int]:
+def ui_first_split(total: int, ui: int) -> tuple[int, int]:
+    """TESTSPEED1: (UI processes, plain workers) for ``total`` processes: up to ``ui`` UI processes first,
+    one plain worker kept when there is room, at least one UI process."""
+    ui = max(1, min(ui, total - 1))
+    return ui, total - ui
+
+
+def worker_counts(cpus: int, free_gb: float | None, workers: int = 0, ui_workers: int = 0,
+                  ui_first: bool = False) -> tuple[int, int]:
     """(non-UI workers, UI processes), each >= 1: explicit counts win; else the CPU defaults cut to
-    free_gb // WORKER_MEM_GB processes in all (UI share kept); the CPU defaults when memory is unknown."""
+    free_gb // WORKER_MEM_GB processes in all (UI share kept, or UI processes first with ``ui_first``);
+    the CPU defaults when memory is unknown."""
     w, ui = min(cpus - 1, 6), min(4, cpus // 3)
     if free_gb is not None:
         slots = int(free_gb // WORKER_MEM_GB)
-        ui = min(ui, slots * ui // max(1, ui + w))
-        w = min(w, slots - ui)
+        if ui_first:
+            ui, w = ui_first_split(min(slots, ui + w), ui)
+        else:
+            ui = min(ui, slots * ui // max(1, ui + w))
+            w = min(w, slots - ui)
     return max(1, workers or w), max(1, ui_workers or ui)
 
 
@@ -648,7 +666,7 @@ class TestPool:
             _cas(self.path, lambda text: (None, json.dumps(self._held(text))))
 
 
-def pool_for(ui_workers: int, workers: int) -> tuple[TestPool | None, int, int]:
+def pool_for(ui_workers: int, workers: int, ui_first: bool = False) -> tuple[TestPool | None, int, int]:
     """Takes the run's tokens: (pool or None under CI, UI processes, non-UI workers) within what it got."""
     if os.environ.get("CI"):
         return None, ui_workers, workers
@@ -656,7 +674,9 @@ def pool_for(ui_workers: int, workers: int) -> tuple[TestPool | None, int, int]:
     pool = TestPool(folder, pool_budget(folder))
     want = ui_workers + workers
     got = pool.acquire(want)
-    if got < want:  # fewer processes: the UI share kept, at least one UI process (it also takes plain units)
+    if got < want and ui_first:  # TESTSPEED1: UI processes first
+        ui_workers, workers = ui_first_split(got, ui_workers)
+    elif got < want:  # fewer processes: the UI share kept, at least one UI process (it also takes plain units)
         ui_workers = max(1, got * ui_workers // want)
         workers = got - ui_workers
     return pool, ui_workers, workers
@@ -841,13 +861,42 @@ def run_unit(python: str, unit: Unit, env: dict[str, str], durations: int | None
     return result
 
 
+def _dispatch_order(u: Unit) -> tuple[float, str]:
+    """execute()'s queue order: the longest recorded first (unknown = CHUNK_SECONDS / 4), then by label."""
+    return -(u.seconds if u.seconds is not None else CHUNK_SECONDS / 4), u.label
+
+
+def plan_processes(units: list[Unit], ui_workers: int, workers: int) -> dict[str, list[Unit]]:
+    """TESTSPEED1: execute()'s dispatch replayed on recorded seconds (no clock): the units each process
+    ("ui1".., then "plainN") would take. An estimate; execute() keeps its live queue."""
+    queues = {"ui": sorted((u for u in units if u.ui), key=_dispatch_order),
+              "plain": sorted((u for u in units if not u.ui), key=_dispatch_order)}
+    clock = {f"ui{i}": 0.0 for i in range(1, ui_workers + 1)}
+    clock.update({f"plain{i}": 0.0 for i in range(ui_workers + 1, ui_workers + workers + 1)})
+    plan: dict[str, list[Unit]] = {name: [] for name in clock}
+    while clock:
+        name = min(clock, key=clock.__getitem__)
+        queue = queues["plain"] or (queues["ui"] if name.startswith("ui") else [])
+        if not queue:
+            del clock[name]
+            continue
+        plan[name].append(queue.pop(0))
+        clock[name] -= _dispatch_order(plan[name][-1])[0]
+    return plan
+
+
+def ui_wall(plan: dict[str, list[Unit]]) -> float:
+    """TESTSPEED1: the UI set's planned wall, the most recorded UI seconds one process carries."""
+    return max((-sum(_dispatch_order(u)[0] for u in run if u.ui) for run in plan.values()), default=0.0)
+
+
 def execute(args, units: list[Unit], ui_workers: int, workers: int,
             ui_lock: UiLock | None = None, pool: TestPool | None = None) -> tuple[list[Result], dict[str, float], float, list[Path]]:
     durations = 0 if args.write_durations or args.report else (args.durations or None)
     bases: list[Path] = []
     results: list[Result] = []
     lock, gate = threading.Lock(), threading.Lock()
-    order = lambda u: (-(u.seconds if u.seconds is not None else CHUNK_SECONDS / 4), u.label)  # noqa: E731
+    order = _dispatch_order
     queues = {"ui": sorted((u for u in units if u.ui), key=order), "plain": sorted((u for u in units if not u.ui), key=order)}
     ui_left = len(queues["ui"])
     worker_wall: dict[str, float] = {}
@@ -911,6 +960,9 @@ def main(argv: list[str] | None = None) -> int:
                         help="non-UI workers (default min(cpu_count - 1, 6), cut by free memory, >= 1)")
     parser.add_argument("--ui-workers", type=int, default=0,
                         help="UI processes at once (default min(4, cpu_count // 3), cut by free memory, >= 1)")
+    parser.add_argument("--ui-split", choices=("first", "share"), default="first",
+                        help="how a memory or pool cut splits the processes: UI processes first (default, "
+                             "TESTSPEED1) or the old UI share kept (rollback); CI always keeps the share")
     parser.add_argument("--durations", type=int, default=0, help="report the N slowest tests")
     parser.add_argument("--no-rerun", action="store_true", help="do not rerun load-sensitive failures alone")
     parser.add_argument("--python", default=sys.executable, help="interpreter for the workers")
@@ -950,7 +1002,8 @@ def main(argv: list[str] | None = None) -> int:
         global SHARDED
         SHARDED = True
 
-    workers, ui_workers = worker_counts(os.cpu_count() or 2, free_mem_gb(), args.workers, args.ui_workers)
+    ui_first = args.ui_split == "first" and not os.environ.get("CI")
+    workers, ui_workers = worker_counts(os.cpu_count() or 2, free_mem_gb(), args.workers, args.ui_workers, ui_first)
     began = time.monotonic()
     discovery = discover_tests(args.python, names, serial=not args.modules)
     if discovery["errors"]:
@@ -974,7 +1027,7 @@ def main(argv: list[str] | None = None) -> int:
         _print_set_difference("the dispatched ids", dispatched, expected)
         return 1
     ui_count = sum(1 for u in units if u.ui)
-    pool, ui_workers, workers = pool_for(ui_workers, workers)
+    pool, ui_workers, workers = pool_for(ui_workers, workers, ui_first)
     print(f"{len(names)} modules, {sum(expected.values())} tests discovered (serial set checked: "
           f"{'yes' if not args.modules else 'no, modules given'}) in {time.monotonic() - began:.0f}s"
           + (f"; shard {shard[0]}/{shard[1]}" if shard else ""), flush=True)
