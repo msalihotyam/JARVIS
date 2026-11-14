@@ -150,6 +150,38 @@ class LessonExtractTests(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertTrue(first["candidates.jsonl"])
 
+    def assert_never_sent(self, files, api, *marks):
+        sent = "\n".join(api.payloads)
+        for mark in marks:
+            self.assertNotIn(mark, sent)
+            for body in files.values():
+                self.assertNotIn(mark.encode(), body)
+
+    def test_phone_split_over_chunk_boundary_is_never_sent(self):  # CDX F2
+        cases = {"line_limit": "\n".join(f"guvenli satir {i}" for i in range(39)) + "\nara 0532\n123 45 67 son\n",
+                 "blank_padded": "\n".join("x" for _ in range(38)) + "\nara 0532\n\n\n123 45 67 son\n"}
+        for name, body in cases.items():
+            with self.subTest(name):
+                self.write("kayit/sohbet/S2.md", body)
+                self.assertGreater(len([c for c in L.chunks(self.root)[0] if c["source"].endswith("S2.md")]), 1)
+                api, rep, files = self.run_once(out=name)
+                self.assertEqual(rep["dropped_dora"], 2)
+                self.assert_never_sent(files, api, "0532", "123 45 67")
+                self.assertIn("Orkestrator kuyrugu", "\n".join(api.payloads))
+
+    def test_source_name_is_screened(self):  # CDX F3
+        self.write("kayit/sohbet/05321234567.md", "## Not\nTemiz bir ders metni burada.\n")
+        api, rep, files = self.run_once()
+        self.assertEqual(rep["dropped_dora"], 1)
+        self.assert_never_sent(files, api, "05321234567", "Temiz bir ders")
+
+    def test_email_shape_is_bounded(self):  # CDX F4
+        deny = L.load_deny()
+        self.assertTrue(L.denied("a" * 100 + "@x.com", deny))
+        self.assertTrue(L.denied("kisi.ad+etiket@ornek.com.tr", deny))
+        self.assertFalse(L.denied("a" * 40000, deny))
+        self.assertFalse(L.denied("." * 40000 + "@", deny))
+
 
 PHONES = {  # LESSONS1FIX: every Turkish phone shape is dropped before any call
     "landline_0_area": "0212 123 45 67",
@@ -192,11 +224,53 @@ PHONES = {  # LESSONS1FIX: every Turkish phone shape is dropped before any call
     "star_sep": "532*123*45*67",
     "call_center_444_2_2": "444 12 34",
     "devanagari_digits": "५३२ १२३ ४५ ६७",
+    # LESSONS1FIX2 (CDX F1): unbounded separator runs, comma, digits next to an ISO date
+    "wide_gap_4_spaces": "532    123 45 67",
+    "wide_gap_12_spaces": "0532            123 45 67",
+    "tab_gap": "532\t123\t45\t67",
+    "blank_lines_inside": "532\n\n\n123 45 67",
+    "separator_line_inside": "0532\n---\n123 45 67",
+    "comma_sep": "532,123,45,67",
+    "comma_space_sep": "532, 123, 45, 67",
+    "comma_plus90": "+90,532,123,45,67",
+    "digits_before_iso_date": "53 2026-11-14",
+    "digits_around_iso_date": "5 2026-11-14 3",
+    "call_center_444_wide": "444     1     444",
+    # LESSONS1FIX2 review: any non-word character separates digits
+    "hash_sep": "532#123#45#67",
+    "semicolon_sep": "532;123;45;67",
+    "plus_sep": "532+123+45+67",
+    "tilde_eq_amp_sep": "532~123=45&67",
+    "angle_backslash_sep": "532<123>45\\67",
+    "quoted_groups": "\"532\" '123' \"45\" '67'",
+    "brackets": "[532] {123} [45] {67}",
+    "backticks": "`0532` `123` `45` `67`",
+    "blockquote": "> 0532 123\n> 45 67",
+    "keycap_digits": "5️⃣3️⃣2️⃣ 123 45 67",
+    "combining_marks": "5̲3̲2̲ 1͏23 45 67",
+}
+OTHER_SHAPES = {  # LESSONS1FIX2 review: id, IBAN, e-mail and word variants
+    "id_3_3_3_2": "123 456 789 01",
+    "id_5_3_3": "12345-678-901",
+    "iban_dashes": "TR17-0006-1000-0000-1234-5678-90",
+    "iban_double_space": "TR17  0006  1000  0000  1234  5678  90",
+    "bban_24_digits": "000610000000123456789012",
+    "email_spaced_at": "salih @ example.com",
+    "email_quoted_local": "\"salih\"@example.com",
+    "email_bracket_at": "salih[at]example.com",
+    "word_zwsp": "do​ra",
+    "word_soft_hyphen": "mu­steri",
+    "word_fullwidth": "ｄｏｒａ",
+    "bank_double_space": "yapi  kredi",
+    "bank_nbsp": "garanti bbva",
+    "bank_newline": "is\nbankasi",
 }
 NOT_PHONES = ("O52 kurali 2026-11-14 12:30 tarihinde", "600000 ms, 80 cagri, 45 dk",
               "PR 5321 merged 2026", "O52 600000 3600 1234567", "O29 (2026-10-18) kural",
-              "O2-7, 2026-11-07 notu", "plan 2.1, 4.2, 8, 11.4, 12 bolum",
-              "sha e0bcc99a 4dee6b68", "O27 UIRED5 3 test")
+              "O2-7, 2026-11-07 notu", "plan 2.1, 4.2, 8 bolum",
+              "sha e0bcc99a 4dee6b68", "O27 UIRED5 3 test", "O52 2026-11-14 notu")
+# LESSONS1FIX2: comma is now a separator, so ten digits in a comma list read as a phone (fail closed)
+ACCEPTED_FALSE_POSITIVES = ("plan 2.1, 4.2, 8, 11.4, 12 bolum",)
 
 
 class PhoneShapeTests(unittest.TestCase):
@@ -206,11 +280,23 @@ class PhoneShapeTests(unittest.TestCase):
             with self.subTest(name):
                 self.assertTrue(L.denied(f"O9 kural {text} son", deny))
 
+    def test_each_other_shape_is_denied(self):
+        deny = L.load_deny()
+        for name, text in OTHER_SHAPES.items():
+            with self.subTest(name):
+                self.assertTrue(L.denied(f"O9 kural {text} son", deny))
+
     def test_rule_text_without_phones_is_not_denied(self):
         deny = L.load_deny()
         for text in NOT_PHONES:
             with self.subTest(text):
                 self.assertFalse(L.denied(text, deny))
+
+    def test_accepted_false_positives_are_denied(self):
+        deny = L.load_deny()
+        for text in ACCEPTED_FALSE_POSITIVES:
+            with self.subTest(text):
+                self.assertTrue(L.denied(text, deny))
 
 
 if __name__ == "__main__":

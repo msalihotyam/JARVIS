@@ -12,6 +12,7 @@ here becomes a rule.
 from __future__ import annotations
 
 import argparse
+import bisect
 import json
 import math
 import re
@@ -56,18 +57,63 @@ def load_deny(path: Path = DENY_PATH):
             [re.compile(p) for p in d["words"]])
 
 
+_DATE = re.compile(r"(?<!\d)(?:19|20)\d\d-[01]\d-[0-3]\d(?!\d)")
+_GLUED = re.compile(r"(?<=[^\W\d_])\d{1,3}(?!\d)")  # O52, UIRED5: ids glued to letters
+
+
+def _norm(text: str):
+    """NFKC per char (fullwidth digits), any script's digits -> ASCII, Cf (zero-width,
+    soft hyphen) dropped. Returns (normalized, origin index in text per char)."""
+    out, org = [], []
+    for i, ch in enumerate(text):
+        if unicodedata.category(ch) == "Cf":
+            continue
+        for c in unicodedata.normalize("NFKC", ch):
+            out.append(str(unicodedata.decimal(c)) if c.isdecimal() else c)
+            org.append(i)
+    return "".join(out), org
+
+
+def shape_hits(text: str, shapes) -> list:
+    """(start, end) offsets in text of every shape hit. Raw and normalized views, each
+    seen twice: (a) ISO dates blanked, (b) dates kept but letter-glued 1-3 digit ids
+    hidden, so a date can no longer hide the digits next to it (LESSONS1FIX2)."""
+    n, org = _norm(text)
+    out = []
+    for t, o in ((text, None), (n, org)):
+        for v in (_DATE.sub(lambda m: " " * len(m.group()), t),
+                  _GLUED.sub(lambda m: "#" * len(m.group()), t)):
+            for p in shapes:
+                for m in p.finditer(v):
+                    s, e = m.span()
+                    out.append((s, e) if o is None else (o[s], o[e - 1] + 1))
+    return out
+
+
 def denied(text: str, deny) -> bool:
     """True = drop. Any doubt (error) also drops."""
     try:
         _, shapes, words = deny
-        f = fold(text)
-        text = re.sub(r"(?<!\d)(?:19|20)\d\d-[01]\d-[0-3]\d(?!\d)", " ", text)  # ISO dates are not phones
-        n = unicodedata.normalize("NFKC", text)  # NFKC: fullwidth digits
-        n = "".join(str(unicodedata.decimal(ch)) if ch.isdecimal() else ch  # any script's digits
-                    for ch in n if unicodedata.category(ch) != "Cf")  # drop zero-width / soft hyphen
-        return any(p.search(t) for p in shapes for t in (text, n)) or any(p.search(f) for p in words)
+        views = (fold(text), fold(_norm(text)[0]))  # do​ra, mü­şteri, fullwidth
+        return bool(shape_hits(text, shapes)) or any(p.search(v) for p in words for v in views)
     except Exception:  # fail closed
         return True
+
+
+def hit_lines(path: Path, deny):
+    """Whole-file screen: (first, last) line of every shape hit, so a phone split over a
+    chunk boundary still drops both chunks. None = screen failed -> drop the whole file."""
+    try:
+        text = "\n".join(_read_lines(path))
+        nl = [i for i, ch in enumerate(text) if ch == "\n"]
+        return [(bisect.bisect_left(nl, s) + 1, bisect.bisect_left(nl, e) + 1)
+                for s, e in shape_hits(text, deny[1])]
+    except Exception:  # fail closed
+        return None
+
+
+def _hit(c: dict, lines) -> bool:
+    return lines is None or any(s <= he and hs <= e for s, e in c["spans"] for hs, he in lines)
 
 
 def _mk(rel: str, rule, spans, lines) -> dict:
@@ -195,8 +241,9 @@ def run(root: Path, out: Path, ceiling: float, api, deny_path: Path = DENY_PATH)
             rep["envelope"] = eid
         except api.ApiRefused as exc:
             rep.update(partial=True, stop=f"refused: {exc}")
+    hits = {src: hit_lines(root / src, deny) for src in {c["source"] for c in all_chunks}}
     for c in all_chunks if eid is not None else []:
-        if denied(c["text"], deny):
+        if denied(c["text"], deny) or denied(c["source"], deny) or _hit(c, hits[c["source"]]):
             rep["dropped_dora"] += 1
             if c["rule"] is not None:
                 cls[c["rule"]] = "dropped_dora"
