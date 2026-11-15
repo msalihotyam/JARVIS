@@ -23,6 +23,9 @@ import sys
 import tokenize
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from mutate import check_target  # noqa: E402
+
 MAX_MUTATIONS = 60
 OPS = ("cmp", "bool", "not", "num", "ret", "raise", "early")
 _CMP = {"==": "!=", "!=": "==", "<": "<=", "<=": "<", ">": ">=", ">=": ">"}
@@ -37,7 +40,8 @@ def _col(line, byte_col):
 def _token_sites(text, lines):
     for tok in tokenize.generate_tokens(io.StringIO(text).readline):
         (row, col), (erow, ecol) = tok.start, tok.end
-        if row != erow:
+        # no final newline: NEWLINE/DEDENT/ENDMARKER sit one row past the split lines
+        if row != erow or row > len(lines):
             continue
         line, s = lines[row - 1], tok.string
         if tok.type == tokenize.OP and s in _CMP:
@@ -46,7 +50,7 @@ def _token_sites(text, lines):
             yield row, col, "bool", line[:col] + _BOOL[s] + line[ecol:]
         elif tok.type == tokenize.NAME and s == "not":
             yield row, col, "not", line[:col] + line[ecol:].lstrip()
-        elif tok.type == tokenize.NUMBER and s.isdigit():
+        elif tok.type == tokenize.NUMBER and s.isdigit() and len(s) < 4000:  # int() digit limit
             yield row, col, "num", line[:col] + str(int(s) + 1) + line[ecol:]
 
 
@@ -72,8 +76,14 @@ def _ast_sites(tree, lines):
 
 
 def generate(text, rel_file, tests, cap=MAX_MUTATIONS):
-    """Return (specs, stats) for one file's text; deterministic for the same input."""
+    """Return (specs, stats) for one file's text; deterministic for the same input.
+
+    Raises SyntaxError/ValueError when the original itself does not compile.
+    """
     cap = max(0, min(cap, MAX_MUTATIONS))
+    compile(text, rel_file, "exec")  # full compile: catches "return" outside a function
+    if "\r" in text.replace("\r\n", ""):  # ast counts a lone CR as a line break, split does not
+        raise ValueError("lone CR line endings")
     lines = text.split("\n")
     sites = set(_token_sites(text, lines)) | set(_ast_sites(ast.parse(text), lines))
     stats = {"candidates": len(sites), "ambiguous": 0, "invalid": 0, "capped": 0,
@@ -113,6 +123,16 @@ def default_tests(repo, rel):
     return [f"tests.test_{stem}"] if (Path(repo) / "tests" / f"test_{stem}.py").is_file() else []
 
 
+def _protected(p, root):
+    """True for data/** or uv.lock under the git top-level above root (where mutate anchors)."""
+    top = next((d for d in (root, *root.parents) if (d / ".git").exists()), root)
+    try:
+        parts = p.relative_to(top).parts
+    except ValueError:
+        return False
+    return bool(parts) and (parts[0].lower() == "data" or parts[-1].lower() == "uv.lock")
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("file", help="repo-relative path of the target")
@@ -125,15 +145,31 @@ def main(argv=None):
         ap.error("file must be repo-relative")
     if not 0 < a.cap <= MAX_MUTATIONS:
         ap.error(f"--cap must be 1..{MAX_MUTATIONS}")
-    rel = Path(a.file).as_posix()
+    # resolve + containment (symlinks/junctions followed), protected paths, size: same gate as mutate
+    path, why = check_target(a.repo, a.file)
+    root = Path(a.repo).resolve()
+    if why or _protected(path, root):
+        ap.error(f"{a.file}: {why or 'file is protected (data/ or uv.lock)'}")
+    out = Path(a.out).resolve() if a.out else None
+    if out and (out == path or _protected(out, root)):
+        ap.error("--out must not be the target, data/ or uv.lock")
+    rel = path.relative_to(root).as_posix()
     tests = a.tests or default_tests(a.repo, rel)
     if not tests:
         ap.error("no tests/test_<stem>.py found; pass --tests")
-    text = (Path(a.repo) / rel).read_text(encoding="utf-8")
-    specs, stats = generate(text, rel, tests, a.cap)
+    try:
+        text = path.read_text(encoding="utf-8-sig")  # mutate applies UTF-8 bytes; BOM is fine
+        specs, stats = generate(text, rel, tests, a.cap)
+    except UnicodeDecodeError as e:
+        ap.error(f"{rel}: not UTF-8: {e}")
+    except (SyntaxError, ValueError, RecursionError, MemoryError) as e:
+        ap.error(f"{rel}: original does not compile: {type(e).__name__}: {e}")
     data = dump(specs)
-    if a.out:
-        Path(a.out).write_text(data, encoding="utf-8", newline="\n")
+    if out:
+        try:
+            out.write_text(data, encoding="utf-8", newline="\n")
+        except OSError as e:
+            ap.error(f"--out: {e}")
     else:
         sys.stdout.write(data)
     print(" ".join(f"{k}={v}" for k, v in stats.items()), file=sys.stderr)
