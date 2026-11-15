@@ -62,7 +62,11 @@ DFRESUME, DFPAUSE 20ae99a, DFPAUSEFIX/2, CDXDFPAUSEC), INT59.
   `test_dfreply.LongMarkdownTests.test_a_50000_character_markdown_reply_renders_whole`
   and
   `test_dfwin.WindowPowerV2Tests.test_the_power_up_ignites_the_core_then_unfolds_the_content`
-  (orchestrator 2026-10-13: render/animation timing under parallel lanes; pass alone).
+  (orchestrator 2026-10-13: render/animation timing under parallel lanes; pass alone)
+  and
+  `test_live_stop.RaceTests.test_11_a_simultaneous_signal_and_completion_finalize_once`
+  (orchestrator LOADSENS1 2026-11-15: CI took 49.7 s on a 10 s wait under load,
+  INT-TESTSTR1-AFX; code unrelated).
   `scripts/test_parallel.py` reruns every listed `module.Class.test` id itself; rule D
   for whole-module entries is applied by hand.
 - Push: `main` only via the conveyor two-key gate; `ci/*` standing-authorized
