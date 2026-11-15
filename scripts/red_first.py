@@ -10,8 +10,11 @@ parent) run one by one, in sorted order: RED = fails on the parent (it guards th
 change), GREEN = passes on the parent (proves nothing for this change). The test
 files are restored and checked (bytes equal, ``git status --porcelain`` empty);
 the worktree is removed WITHOUT ``--force`` in a finally (also on Ctrl-C).
+Only TestCase subclasses count (test* methods inherited from in-file bases included); an
+id unittest cannot load as a TestCase test on the commit itself is ERROR, never RED.
 Exit: 0 all RED or N/A (no source change), 1 any GREEN or a source change with
-no new/changed test, 3 setup, restore or cleanup failed ("SCRATCH LEFT: <path>").
+no new/changed test, 3 any ERROR id, setup, restore or cleanup failed ("SCRATCH LEFT:
+<path>") or any unexpected exception (one line "ERROR: <type>: <message>").
 No network, no commit or push, never data/ or uv.lock.
 """
 
@@ -46,14 +49,68 @@ def protected(path):
 
 
 def test_methods(source):
-    """{(class, method): ast dump} for test* methods of top-level classes."""
+    """{(class, method): ast dump} for test* methods (own + inherited from in-file bases) of
+    top-level classes that may be TestCase subclasses. A class whose bases all resolve in the
+    file to non-TestCase (a plain mixin) is left out; an external base it cannot see is kept
+    and the commit-tree probe (``unloadable``) decides."""
     if source is None:
         return {}
-    tree = ast.parse(source)
-    return {(c.name, f.name): ast.dump(f)
-            for c in tree.body if isinstance(c, ast.ClassDef)
-            for f in c.body
-            if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name.startswith("test")}
+    classes = {c.name: c for c in ast.parse(source).body if isinstance(c, ast.ClassDef)}
+
+    def kind(name, seen):  # True TestCase, None unknown (external base), False not one
+        res = set()
+        for b in classes[name].bases:
+            s = ast.unparse(b)
+            if s in classes and s not in seen:
+                res.add(kind(s, seen | {s}))
+            elif s.split(".")[-1].endswith("TestCase"):
+                res.add(True)
+            elif s not in ("object", name) and s not in seen:
+                res.add(None)
+        return True if True in res else None if None in res else False
+
+    def methods(name, seen):
+        out = {}
+        for b in reversed(classes[name].bases):
+            s = ast.unparse(b)
+            if s in classes and s not in seen:
+                out.update(methods(s, seen | {s}))
+        out.update({f.name: ast.dump(f) for f in classes[name].body
+                    if isinstance(f, (ast.FunctionDef, ast.AsyncFunctionDef)) and f.name.startswith("test")})
+        return out
+
+    return {(n, m): d for n in classes if kind(n, {n}) is not False
+            for m, d in methods(n, {n}).items()}
+
+
+_PROBE = (  # positive OK lines on sys.__stdout__: a hijacked or silent stdout reads as unloadable
+    "import importlib, sys, types, unittest\n"
+    "for tid in sys.argv[1:]:\n"
+    "    mod, cls, meth = tid.rsplit('.', 2)\n"
+    "    try:\n"
+    "        c = getattr(importlib.import_module(mod), cls)\n"
+    "        ok = issubclass(c, unittest.TestCase) and isinstance(getattr(c(meth), meth), types.MethodType)\n"
+    "    except BaseException:\n"
+    "        ok = False\n"
+    "    if ok:\n"
+    "        sys.__stdout__.write('OK ' + tid + '\\n')\n"
+    "sys.__stdout__.flush()\n"
+)
+
+
+def unloadable(python, tree, ids, timeout):
+    """Ids unittest cannot load as a TestCase test in tree (the commit), or None if the probe failed."""
+    env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", PYTHONIOENCODING="utf-8")
+    try:
+        p = subprocess.run([python, "-B", "-c", _PROBE, *ids], cwd=str(tree), env=env,
+                           capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return None
+    if p.returncode:
+        return None
+    ok = {ln[3:] for ln in p.stdout.splitlines() if ln.startswith("OK ")}
+    return [t for t in ids if t not in ok]
 
 
 def changed_ids(path, old, new):
@@ -98,10 +155,19 @@ def _body(repo, commit, scratch, python, timeout, out):
     if not ids:
         out("NO NEW TESTS: source changed but no test method was added or changed")
         return 1
-    add = _git(repo, "worktree", "add", "--detach", str(scratch), parent)
+    add = _git(repo, "worktree", "add", "--detach", str(scratch), sha)
     if add.returncode:
         out("WORKTREE ADD FAILED: " + add.stderr.strip()[:200])
         return 3
+    bad_ids = unloadable(python, scratch, ids, timeout)  # judged on the commit, never the parent
+    if bad_ids is None:
+        out("LOAD PROBE FAILED")
+        return 3
+    co = _git(scratch, "checkout", "-q", "--detach", parent)
+    if co.returncode:
+        out("CHECKOUT PARENT FAILED: " + co.stderr.strip()[:200])
+        return 3
+    ids = [t for t in ids if t not in bad_ids]
     originals = {p: (scratch / p).read_bytes() if (scratch / p).is_file() else None for p in overlay}
     results = {}
     try:
@@ -123,12 +189,14 @@ def _body(repo, commit, scratch, python, timeout, out):
         out(f"RESTORED: {ok}")
     if not ok:
         return 3
-    code = 0
+    code = 3 if bad_ids else 0
+    for tid in bad_ids:
+        out(f"{tid} ERROR not loadable as a TestCase test on the commit")
     for tid in ids:
         verdict, detail = classify(*results[tid])
         if verdict == "PASS":
             out(f"{tid} GREEN")
-            code = 1
+            code = max(code, 1)
         else:
             out(f"{tid} RED {detail}".rstrip())
     return code
@@ -157,14 +225,18 @@ def main(argv=None):
     ap.add_argument("--python")
     ap.add_argument("--timeout", type=int, default=600)
     a = ap.parse_args(argv)
-    top = _git(a.repo, "rev-parse", "--show-toplevel")
-    if top.returncode:
-        print("NOT A GIT REPO")
-        return 3
     try:
+        top = _git(a.repo, "rev-parse", "--show-toplevel")
+        if top.returncode:
+            print("NOT A GIT REPO")
+            return 3
         return run(top.stdout.strip(), a.commit, a.label, a.python, a.scratch_root, a.timeout)
     except KeyboardInterrupt:
         print("INTERRUPTED (scratch cleaned up)")
+        return 3
+    except Exception as e:  # a tool crash must never read as exit 1 (= GREEN)
+        msg = " ".join(f"ERROR: {type(e).__name__}: {e}".split())[:300]
+        print(msg.encode("ascii", "backslashreplace").decode())  # never a second crash on a cp125x pipe
         return 3
 
 

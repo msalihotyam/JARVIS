@@ -97,10 +97,35 @@ class RedFirstTests(unittest.TestCase):
             "test_calc.py": TEST + "    def test_neg(self):\n        self.assertEqual(calc.neg(1), -1)\n",
         })
         with mock.patch.object(red_first, "run_tests", side_effect=RuntimeError("boom")):
-            with self.assertRaises(RuntimeError):
-                self.run_main()
+            code, out = self.run_main()
+        self.assertEqual(code, 3, out)
+        self.assertIn("ERROR: RuntimeError: boom", out)
         self.assert_clean()
         self.assertEqual((self.repo / "calc.py").read_bytes(), (CALC + "\n\ndef neg(a):\n    return -a\n").encode())
+
+    def test_only_testcase_methods_run_and_unloadable_ids_are_error(self):  # CLREV F1
+        self.commit("fix mul", {
+            "calc.py": CALC[:CALC.rindex("a + b")] + "a * b\n",
+            "test_calc.py": TEST + (
+                "\n\nclass Mixin:\n    def test_mul(self):\n        self.assertEqual(calc.mul(2, 3), 6)\n"
+                "\n\nclass MixTests(Mixin, unittest.TestCase):\n    @staticmethod\n    def test_s():\n        pass\n"
+                "\n\nclass Ödd(dict):\n    def test_x(self):\n        pass\n"),
+        })
+        code, out = self.run_main()
+        self.assertEqual(code, 3, out)
+        self.assertIn("test_calc.MixTests.test_mul RED", out)
+        self.assertNotIn("import/syntax", out)
+        self.assertIn("test_calc.Ödd.test_x ERROR", out)
+        self.assertIn("test_calc.MixTests.test_s ERROR", out)
+        self.assertNotIn("Mixin.test", out)
+        self.assert_clean()
+        cyc = "class A(B):\n    def test_a(self): pass\nclass B(A, unittest.TestCase):\n    pass\n"
+        self.assertEqual(red_first.changed_ids("t.py", None, cyc), ["t.A.test_a", "t.B.test_a"])
+
+    def test_unexpected_error_is_one_line_exit_3(self):  # CLREV F2
+        with mock.patch.object(red_first, "run", side_effect=OSError("disk\nfull ş")):
+            code, out = self.run_main()
+        self.assertEqual((code, out), (3, "ERROR: OSError: disk full \\u015f\n"))
 
     def test_changed_ids_only_added_or_changed_methods(self):
         new = TEST.replace("calc.add(1, 2), 3", "calc.add(2, 1), 3") + "    def test_x(self):\n        pass\n"
