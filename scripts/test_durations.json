@@ -1090,6 +1090,7 @@
   "tests.test_recovery.RowAuthorityTests": 17.735,
   "tests.test_recovery.ScopeTests": 3.738,
   "tests.test_recovery.ShownAttemptIdFlowTests": 7.213,
+  "tests.test_red_first.RedFirstTests": 4.1,
   "tests.test_registry_persistence.RegistryAndPersistenceTests": 10.401,
   "tests.test_remembered_grant_admission.AdmissionTests": 21.388,
   "tests.test_remembered_grant_admission.ExistingRowTests": 9.477,
