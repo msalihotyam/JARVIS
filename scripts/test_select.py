@@ -5,9 +5,15 @@ a one-line summary goes to stderr. A test module is selected when it imports, di
 transitively, a changed module (importing a.b.c also runs a/__init__.py and a/b/__init__.py).
 Fails safe to the full suite (every tests/test_*.py) on any doubt: a non-Python, unknown,
 deleted or tests/ helper path, scripts/test_parallel.py, scripts/test_durations.json, pyproject,
-CI config, or any file in the graph that does not parse. A module that loads code dynamically
-(import_module, spec_from_file_location, run_path, exec, ...; for tests also spawning
-sys.executable) is treated as depending on every module, so it is always affected.
+CI config, any file in the graph that does not parse, any read error, or a failing git diff.
+The ALL list is every tests/test_*.py FILE, parsed or not, so a broken test file still runs.
+Dynamic loading (design, kept on purpose): a module that loads code dynamically (import_module,
+reload, runpy, spec_from_file_location, pkgutil, unittest loaders, exec, ...) cannot show its
+edges. A change to such a non-test module selects ALL; whatever else changed, it still seeds the
+walk (it may have loaded the changed code), so its importers' tests always run. A TEST module
+that loads dynamically, spawns sys.executable or scans repo source (read_text/rglob/glob/os.walk
+next to __file__, "jarvis" or "tests") is always selected. A literal "dynamic import anywhere ->
+ALL" rule would fire on every run, since the repo always contains such modules.
 Reuses scripts/code_map.py parsing; source is only read, never imported. No network.
 
     python scripts/test_select.py PATH [PATH ...]
@@ -29,11 +35,21 @@ ALWAYS_ALL = {"scripts/test_parallel.py", "scripts/test_durations.json", "script
               "scripts/test_select.py"}
 # ponytail: textual scan (comments count too, which only over-selects); a test that spawns a plain
 # "python" string instead of sys.executable is not seen, add the marker if one appears.
-OPAQUE = re.compile(rb"import_module|__import__|spec_from_file_location|run_path|SourceFileLoader"
-                    rb"|(?<![.\w])exec\(")
-# A test spawning sys.executable may run any repo script, so it is always selected. Outside tests/
-# sys.executable runs Qt tools or tests, never repo code by name, and keeps its static edges only.
-SPAWN = re.compile(rb"sys\.executable")
+OPAQUE = re.compile(rb"import_module|__import__|\breload\s*\(|runpy|run_path|run_module|spec_from_"
+                    rb"|module_from_spec|SourceFileLoader|SourcelessFileLoader|zipimport|pkgutil"
+                    rb"|TestLoader|loadTestsFrom|\.discover\s*\(|(?<![.\w])exec\s*\(|builtins\.exec"
+                    rb"|exec_module|load_module|(?<![.\w])eval\s*\(")
+# A test spawning an interpreter (sys.executable, "from sys import executable") may run any repo
+# script, so it is always selected. A non-test spawner keeps its static edges only.
+# ponytail: scripts/conveyor.py spawns repo scripts by name; test_conveyor is opaque (spec_from_) today,
+# and a spawn hidden in a tests/ helper or a subclassed TestCase is not seen.
+SPAWN = re.compile(rb"\bexecutable\b")
+# A test reading or listing files next to a repo anchor may scan source it never imports.
+# ponytail: co-occurrence, not data flow; over-selects tests that read temp files and use __file__.
+# A non-test module that scans source is not seen; mark it opaque if one appears.
+SCAN = re.compile(rb"read_text|read_bytes|\bopen\s*\(|glob\s*\(|iterdir|os\.walk|listdir|scandir")
+ANCHOR = re.compile(rb"__file__|[\"'](?:jarvis|tests|scripts)\b|\b(?:jarvis|tests|scripts)[/\\]"
+                    rb"|\b(?:get)?cwd\(")
 
 
 def _is_test(rel: str) -> bool:
@@ -49,11 +65,30 @@ def _parents(rel: str) -> list[str]:
     return [("/".join(parts[:i]) + "/__init__.py") for i in range(1, len(parts) + 1)]
 
 
+def _all(root: Path) -> list[str]:
+    """Every tests/test_*.py file as an id, from the file list, never from the parse."""
+    return sorted(_test_id(rel) for p in (root / "tests").glob("test_*.py")
+                  if _is_test(rel := p.relative_to(root).as_posix()))
+
+
+def _opaque(rel: str, src: bytes) -> bool:
+    if OPAQUE.search(src):
+        return True
+    return _is_test(rel) and bool(SPAWN.search(src) or (SCAN.search(src) and ANCHOR.search(src)))
+
+
 def select(root: Path, changed: list[str]) -> tuple[list[str], str]:
     """Return (sorted test ids, reason). reason starts with "ALL:" when it failed safe."""
+    try:
+        return _select(root, changed)
+    except OSError as exc:  # a file vanished or is unreadable mid-run
+        return _all(root), f"ALL: read error {type(exc).__name__}: {exc}"
+
+
+def _select(root: Path, changed: list[str]) -> tuple[list[str], str]:
     graph = code_map.build(root, ROOTS)
     modules = graph["modules"]
-    tests = sorted(_test_id(r) for r in modules if _is_test(r))
+    tests = _all(root)
     if graph["unparsed"]:
         return tests, f"ALL: parse error in {graph['unparsed'][0]['path']}"
     seeds: set[str] = set()
@@ -70,9 +105,10 @@ def select(root: Path, changed: list[str]) -> tuple[list[str], str]:
         seeds.add(rel)
     if not seeds:
         return [], "no changed paths"
+    opaque = {r for r in modules if _opaque(r, (root / r).read_bytes())}
+    if dyn := sorted(r for r in seeds & opaque if not _is_test(r)):
+        return tests, f"ALL: dynamic-load module changed {dyn[0]}"
     importers: dict[str, set[str]] = {r: set() for r in modules}
-    opaque = {r for r in modules if (src := (root / r).read_bytes()) and (
-        OPAQUE.search(src) or (_is_test(r) and SPAWN.search(src)))}
     for rel, mod in modules.items():
         for dep in set(mod["imports"]) | {p for p in _parents(rel) if p in modules and p != rel}:
             importers[dep].add(rel)
@@ -91,7 +127,8 @@ def select(root: Path, changed: list[str]) -> tuple[list[str], str]:
 
 def _diff_paths(root: Path, spec: str) -> list[str]:
     out = subprocess.run(["git", "diff", "--name-only", "--no-renames", spec],  # nosec B603 B607
-                         cwd=root, capture_output=True, text=True, check=True).stdout
+                         cwd=root, capture_output=True, encoding="utf-8", errors="replace",
+                         check=True).stdout
     return out.splitlines()
 
 
@@ -102,8 +139,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--root", default=str(Path(__file__).resolve().parent.parent))
     args = ap.parse_args(argv)
     root = Path(args.root)
-    changed = list(args.paths) + (_diff_paths(root, args.diff) if args.diff else [])
-    ids, reason = select(root, changed)
+    try:
+        changed = list(args.paths) + (_diff_paths(root, args.diff) if args.diff else [])
+        ids, reason = select(root, changed)
+    except (subprocess.CalledProcessError, OSError) as exc:  # git missing or diff failed
+        ids, reason = _all(root), f"ALL: git diff failed ({type(exc).__name__})"
     for tid in ids:
         print(tid)
     print(f"test_select: {len(ids)} module(s) selected; {reason}", file=sys.stderr)
