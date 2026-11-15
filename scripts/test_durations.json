@@ -1401,6 +1401,7 @@
   "tests.test_test_parallel_infra.UiQueueTests": 0.08,
   "tests.test_test_parallel_memory.PoolTest": 1.118,
   "tests.test_test_parallel_memory.WorkerCountsTest": 0.0,
+  "tests.test_test_select.TestSelectTest": 0.5,
   "tests.test_trusted_exec.ChromeSpawnBoundaryTests": 12.286,
   "tests.test_trusted_exec.ChromeTrustTests": 0.033,
   "tests.test_trusted_exec.ConfiguredPathTests": 0.006,
