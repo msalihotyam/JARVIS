@@ -948,6 +948,7 @@
   "tests.test_policy_proxy.ProxyLifetimeTests": 2.013,
   "tests.test_policy_proxy.ResolvedAddressTests": 0.0,
   "tests.test_policy_proxy.TargetParsingTests": 0.001,
+  "tests.test_privacy_canary.PrivacyCanaryTests": 0.5,
   "tests.test_project_card_ui.ProjectCardTests": 11.22,
   "tests.test_project_files.CanonicalBlockTests": 12.095,
   "tests.test_project_files.IntentPathTests": 0.958,
