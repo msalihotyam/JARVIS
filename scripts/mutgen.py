@@ -158,7 +158,9 @@ def main(argv=None):
     if not tests:
         ap.error("no tests/test_<stem>.py found; pass --tests")
     try:
-        text = path.read_text(encoding="utf-8-sig")  # mutate applies UTF-8 bytes; BOM is fine
+        # bytes, no newline translation: generate() must see a lone CR to reject it, and CRLF
+        # lines keep their \r so specs match mutate's raw bytes; BOM is fine
+        text = path.read_bytes().decode("utf-8-sig")
         specs, stats = generate(text, rel, tests, a.cap)
     except UnicodeDecodeError as e:
         ap.error(f"{rel}: not UTF-8: {e}")

@@ -3,6 +3,7 @@
 import contextlib
 import importlib.util
 import io
+import json
 import os
 import subprocess
 import sys
@@ -153,6 +154,30 @@ class MutgenTests(unittest.TestCase):
             self.assertEqual(rc, 0)
             self.assertIn(b"x = 1 != 2", (Path(tmp) / "b.json").read_bytes())
         mutgen.generate("x = " + "1" * 4300 + "\n", "scripts/fx.py", ["t"])  # int() digit limit
+
+    def test_cli_rejects_lone_cr_and_keeps_crlf(self):  # CLREV-MUT1FIX F1
+        def cli(tmp, data):
+            (Path(tmp) / "scripts" / "fx.py").write_bytes(data)
+            return subprocess.run([sys.executable, str(_ROOT / "scripts" / "mutgen.py"),
+                                   "scripts/fx.py", "--repo", tmp, "--tests", "t"],
+                                  capture_output=True, timeout=120)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "scripts").mkdir()
+            for data in (b"x = 1\ry = 2 == 3\n", b"x = 1 == 2\r\ny = 2\r", b"x = 1\r\r\ny = 2\r\n",
+                         b"\xef\xbb\xbfx = 1\ry = 2\n", b"s = '''a\rb'''\nx = 1 == 2\n"):
+                with self.subTest(data=data):
+                    r = cli(tmp, data)
+                    self.assertEqual(r.returncode, 2, r.stderr[-200:])
+                    self.assertIn(b"lone CR", r.stderr)
+                    self.assertEqual(r.stdout, b"")
+            crlf = b"def f(a):\r\n    if a == 1:\r\n        return True\r\n    return a\r\n"
+            r = cli(tmp, crlf)
+            self.assertEqual(r.returncode, 0, r.stderr[-200:])
+            specs = json.loads(r.stdout)
+            self.assertTrue(specs)
+            for s in specs:
+                self.assertIsNotNone(mutate.apply_text(crlf, s["old"], s["new"])[0], s["name"])
 
     def test_output_is_identical_across_hash_seeds(self):  # CDXINT139 F12
         text = FIXTURE + "".join(f"n{i:03d} = {i + 1000} if a != {i} else True\n"
