@@ -64,8 +64,9 @@ class MutgenTests(unittest.TestCase):
             "cmp-L8C13": "    return a <= b  # a > b in a comment",
         })
         for op, src, new in (("cmp", "x = a >= b\n", "x = a > b"), ("cmp", "x = a < b\n", "x = a <= b"),
-                             ("cmp", "x = a == b\n", "x = a != b"), ("bool", "x = False\n", "x = True"),
-                             ("num", "x = 0\n", "x = 1")):
+                             ("cmp", "x = a == b\n", "x = a != b"), ("cmp", "x = a != b\n", "x = a == b"),
+                             ("cmp", "x = a <= b\n", "x = a < b"), ("cmp", "x = a > b\n", "x = a >= b"),
+                             ("bool", "x = False\n", "x = True"), ("num", "x = 0\n", "x = 1")):
             with self.subTest(src=src):
                 got = mutgen.generate(src, "scripts/fx.py", ["t"])[0]
                 self.assertEqual([(s["name"].split("-")[0], s["new"]) for s in got], [(op, new)])
@@ -80,16 +81,16 @@ class MutgenTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             (Path(tmp) / "scripts").mkdir()
             (Path(tmp) / "scripts" / "fx.py").write_text(FIXTURE, encoding="utf-8")
-            outs = []
-            for n in (1, 2):
-                out = Path(tmp) / f"o{n}.json"
-                with contextlib.redirect_stderr(io.StringIO()):
-                    rc = mutgen.main(["scripts/fx.py", "--repo", tmp, "--tests", "tests.t",
-                                      "--out", str(out)])
-                self.assertEqual(rc, 0)
-                outs.append(out.read_bytes())
+            outs = [self._ok(["scripts/fx.py", "--repo", tmp, "--tests", "tests.t"])
+                    for _ in (1, 2)]
         self.assertEqual(outs[0], outs[1])
-        self.assertTrue(outs[0].startswith(b"[\n"))
+        self.assertTrue(outs[0].startswith("[\n"))
+
+    def _ok(self, argv):
+        with contextlib.redirect_stderr(io.StringIO()), \
+                contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(mutgen.main(argv), 0)
+        return out.getvalue()
 
     def test_cap_is_enforced_and_keeps_every_operator(self):
         text = "".join(f"n{i:03d} = {i + 1000}\n" for i in range(100))
@@ -114,11 +115,12 @@ class MutgenTests(unittest.TestCase):
             mutgen.generate("x = 1\ry = 2\n", "scripts/fx.py", ["t"])
 
     def _run_main(self, repo, rel, *extra):
-        with contextlib.redirect_stderr(io.StringIO()) as err, self.assertRaises(SystemExit) as cm:
-            mutgen.main([rel, "--repo", repo, "--tests", "t", "--out", str(Path(repo) / "o.json"),
-                         *extra])
+        with contextlib.redirect_stderr(io.StringIO()) as err, \
+                contextlib.redirect_stdout(io.StringIO()) as out, \
+                self.assertRaises(SystemExit) as cm:
+            mutgen.main([rel, "--repo", repo, "--tests", "t", *extra])
         self.assertEqual(cm.exception.code, 2)
-        self.assertFalse((Path(repo) / "o.json").exists())
+        self.assertEqual(out.getvalue(), "")
         return err.getvalue()
 
     def test_targets_outside_the_repo_are_refused(self):  # CDXINT139 F9
@@ -143,46 +145,40 @@ class MutgenTests(unittest.TestCase):
                 with self.subTest(rel=rel):
                     self.assertIn("error:", self._run_main(str(repo), rel))
             self.assertIn("protected", self._run_main(str(repo / "data"), "d.py"))
-            for out in (ok, repo / "data" / "o.json", repo / "missing" / "o.json"):
-                with self.subTest(out=out.name):
-                    self.assertIn("--out", self._run_main(str(repo), "scripts/ok.py", "--out", str(out)))
             self.assertEqual(ok.read_text(encoding="utf-8"), "x = 1\n")
-            self.assertFalse((repo / "data" / "o.json").exists())
 
-    def test_out_over_tests_or_a_hard_link_is_refused(self):  # CDXINT140 F1 + F2
+    def test_no_out_option_and_no_file_writes(self):  # MUT1FIX4 (CDXINT140/141 F1-F3 class)
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp)
             (repo / "scripts").mkdir()
-            (repo / "tests" / "sub").mkdir(parents=True)
-            ok = repo / "scripts" / "ok.py"
-            ok.write_text("x = 1 == 2\n", encoding="utf-8")
-            tfile = repo / "tests" / "test_ok.py"
-            tfile.write_text("T\n", encoding="utf-8")
-            (repo / "spec_t.py").write_text("S\n", encoding="utf-8")
-            os.link(ok, repo / "hl.json")
-            os.link(tfile, repo / "hl2.json")
-            outs = [tfile, repo / "TESTS" / "new.json" if os.name == "nt" else tfile,
-                    repo / "tests" / "sub" / "o.json", repo / "tests" / "missing" / "o.json",
-                    repo / "scripts" / ".." / "tests" / "o.json", repo / "tests",
-                    repo / "spec_t.py", repo / "hl.json", repo / "hl2.json"]
-            if os.name == "nt":  # F2-probe hits: Win32 name folding, device prefix, NTFS stream
-                outs += [f"{repo}\\tests \\o.json", f"{repo}\\tests.\\o.json",
-                         "\\\\?\\" + str(repo / "tests" / "o.json"), f"{ok}:ads"]
-            for out in outs:
-                with self.subTest(out=str(out)[-30:]):
-                    self.assertIn("--out", self._run_main(tmp, "scripts/ok.py", "--tests",
-                                                          "tests.test_ok", "spec_t.Case.test",
-                                                          "--out", str(out)))
-            self.assertEqual(ok.read_text(encoding="utf-8"), "x = 1 == 2\n")
-            self.assertEqual(tfile.read_text(encoding="utf-8"), "T\n")
-            self.assertEqual((repo / "spec_t.py").read_text(encoding="utf-8"), "S\n")
-            self.assertEqual(sorted(p.name for p in (repo / "tests").rglob("*")),
-                             ["sub", "test_ok.py"])
-            with contextlib.redirect_stderr(io.StringIO()):  # control: a plain out still works
-                rc = mutgen.main(["scripts/ok.py", "--repo", tmp, "--tests", "tests.test_ok",
-                                  "--out", str(repo / "specs.json")])
-            self.assertEqual(rc, 0)
-            self.assertIn(b"x = 1 != 2", (repo / "specs.json").read_bytes())
+            (repo / "tests").mkdir()
+            (repo / "scripts" / "ok.py").write_text("x = 1 == 2\n", encoding="utf-8")
+            (repo / "tests" / "test_ok.py").write_text("T\n", encoding="utf-8")
+
+            def snapshot():
+                return {p: p.read_bytes() if p.is_file() else None for p in repo.rglob("*")}
+
+            before = snapshot()
+            for opt in ("--out", "--ou", "--o", "--out=o.json"):
+                with self.subTest(opt=opt):
+                    argv = [opt] if "=" in opt else [opt, str(repo / "o.json")]
+                    self.assertIn("unrecognized", self._run_main(tmp, "scripts/ok.py", *argv))
+            out = self._ok(["scripts/ok.py", "--repo", tmp])  # default tests.test_ok
+            self.assertEqual(snapshot(), before)  # stdout only: nothing created or changed
+            self.assertIn("x = 1 != 2", out)
+            self.assertEqual(json.loads(out)[0]["tests"], ["tests.test_ok"])
+
+    def test_bad_test_id_exits_2(self):  # CDXINT141 F4
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "scripts").mkdir()
+            (Path(tmp) / "scripts" / "ok.py").write_text("x = 1 == 2\n", encoding="utf-8")
+            for bad in ("/", "", ".", "a..b", "a.", ".a", "a b", "tests/test_x.py",
+                        "tests.test-x", "1abc", "a\x00b", "tests.test_x\n"):
+                with self.subTest(bad=bad):
+                    err = self._run_main(tmp, "scripts/ok.py", "--tests", "tests.ok", bad)
+                    self.assertIn("not a dotted test id", err)
+            out = self._ok(["scripts/ok.py", "--repo", tmp, "--tests", "tests.t.C.test_x", "_m"])
+            self.assertEqual(json.loads(out)[0]["tests"], ["tests.t.C.test_x", "_m"])
 
     def test_raw_bytes_compile_honours_the_coding_cookie(self):  # CDXINT140 F3
         with tempfile.TemporaryDirectory() as tmp:
@@ -194,10 +190,7 @@ class MutgenTests(unittest.TestCase):
                     (Path(tmp) / "scripts" / "fx.py").write_bytes(data)
                     self.assertIn("does not compile", self._run_main(tmp, "scripts/fx.py"))
             (Path(tmp) / "scripts" / "fx.py").write_bytes(b"# coding: utf-8\ns = '\xc3\xa9'\nx = 1 == 2\n")
-            with contextlib.redirect_stderr(io.StringIO()):
-                rc = mutgen.main(["scripts/fx.py", "--repo", tmp, "--tests", "t",
-                                  "--out", str(Path(tmp) / "c.json")])
-            self.assertEqual(rc, 0)
+            self.assertIn("x = 1 != 2", self._ok(["scripts/fx.py", "--repo", tmp, "--tests", "t"]))
 
     def test_original_must_compile(self):  # CDXINT139 F10
         for text in ("return 1\n", "yield 1\n", "nonlocal x\n", "x = (\n", "x = 1\0\n"):
@@ -213,11 +206,7 @@ class MutgenTests(unittest.TestCase):
             (Path(tmp) / "scripts" / "l1.py").write_bytes(b"s = '\xe9'\n")
             self.assertIn("not UTF-8", self._run_main(tmp, "scripts/l1.py"))
             (Path(tmp) / "scripts" / "bom.py").write_bytes(b"\xef\xbb\xbfx = 1 == 2\n")
-            with contextlib.redirect_stderr(io.StringIO()):
-                rc = mutgen.main(["scripts/bom.py", "--repo", tmp, "--tests", "t",
-                                  "--out", str(Path(tmp) / "b.json")])
-            self.assertEqual(rc, 0)
-            self.assertIn(b"x = 1 != 2", (Path(tmp) / "b.json").read_bytes())
+            self.assertIn("x = 1 != 2", self._ok(["scripts/bom.py", "--repo", tmp, "--tests", "t"]))
         mutgen.generate("x = " + "1" * 4300 + "\n", "scripts/fx.py", ["t"])  # int() digit limit
 
     def test_cli_rejects_lone_cr_and_keeps_crlf(self):  # CLREV-MUT1FIX F1
