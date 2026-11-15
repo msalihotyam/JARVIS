@@ -19,6 +19,7 @@ import argparse
 import ast
 import io
 import json
+import os
 import sys
 import tokenize
 from pathlib import Path
@@ -133,6 +134,41 @@ def _protected(p, root):
     return bool(parts) and (parts[0].lower() == "data" or parts[-1].lower() == "uv.lock")
 
 
+def _canon(p):
+    """resolve() via the deepest existing ancestor: Windows folds 'tests ' / 'tests.' into
+    'tests' on open, so only the real (existing) prefix is trusted for the name."""
+    p = Path(os.path.abspath(p))
+    anc = next((d for d in (p, *p.parents) if d.exists()), p)  # no drive: the write fails later
+    return anc.resolve() / p.relative_to(anc)
+
+
+def _out_refused(out, path, root, tests):
+    """--out may not be the target, tests/**, a file a test id names, data/ or uv.lock.
+
+    An existing file with more than one hard link is refused too: the write would land in
+    names we cannot see (CDXINT140 F2).
+    """
+    s = str(out)
+    if s.startswith(("\\\\?\\", "\\\\.\\")) or ":" in os.path.splitdrive(s)[1]:
+        return True  # device-namespace prefix or NTFS stream (target.py:ads) escape normcase
+    nc, tests_dir = os.path.normcase, os.path.normcase(root / "tests")
+    try:
+        under_tests = os.path.commonpath([nc(out), tests_dir]) == tests_dir
+    except ValueError:  # another drive
+        under_tests = False
+    if under_tests or _protected(out, root):
+        return True
+    guarded = [path] + [root.joinpath(*t.split(".")[:n]).with_suffix(".py")
+                        for t in tests for n in range(1, len(t.split(".")) + 1)]
+    if any(nc(out) == nc(g) for g in guarded):
+        return True
+    if out.exists():
+        if out.is_file() and os.stat(out).st_nlink > 1:
+            return True
+        return any(g.exists() and os.path.samefile(out, g) for g in guarded)
+    return False
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("file", help="repo-relative path of the target")
@@ -150,18 +186,20 @@ def main(argv=None):
     root = Path(a.repo).resolve()
     if why or _protected(path, root):
         ap.error(f"{a.file}: {why or 'file is protected (data/ or uv.lock)'}")
-    out = Path(a.out).resolve() if a.out else None
-    if out and (out == path or _protected(out, root)):
-        ap.error("--out must not be the target, data/ or uv.lock")
     rel = path.relative_to(root).as_posix()
     tests = a.tests or default_tests(a.repo, rel)
     if not tests:
         ap.error("no tests/test_<stem>.py found; pass --tests")
+    out = _canon(a.out) if a.out else None
+    if out and _out_refused(out, path, root, tests):
+        ap.error("--out must not be the target, a test file, tests/, data/, uv.lock or a hard link")
     try:
         # bytes, no newline translation: generate() must see a lone CR to reject it, and CRLF
         # lines keep their \r so specs match mutate's raw bytes; BOM is fine
-        text = path.read_bytes().decode("utf-8-sig")
+        raw = path.read_bytes()
+        text = raw.decode("utf-8-sig")
         specs, stats = generate(text, rel, tests, a.cap)
+        compile(raw, rel, "exec")  # bytes: the coding cookie is honoured as on import
     except UnicodeDecodeError as e:
         ap.error(f"{rel}: not UTF-8: {e}")
     except (SyntaxError, ValueError, RecursionError, MemoryError) as e:
