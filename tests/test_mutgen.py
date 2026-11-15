@@ -52,8 +52,23 @@ class MutgenTests(unittest.TestCase):
             self.assertIsNotNone(mutate.apply_text(data, s["old"], s["new"])[0], s["name"])
             self.assertEqual((s["file"], s["tests"]), ("scripts/fx.py", ["tests.test_fx"]))
             self.assertNotIn("docstring", s["old"])
-        cmp8 = [s["new"] for s in specs if s["name"] == "cmp-L8C13"]
-        self.assertEqual(cmp8, ["    return a <= b  # a > b in a comment"])
+        self.assertEqual({s["name"]: s["new"] for s in specs}, {  # CDXINT140 F5
+            "cmp-L3C9": "    if a != b:",
+            "early-L4C8": "        pass",
+            "ret-L4C8": "        return None",
+            "num-L4C15": "        return 2",
+            "not-L5C7": "    if a:",
+            "raise-L6C8": "        pass",
+            "bool-L7C11": "    flag = False",
+            "ret-L8C4": "    return None  # a > b in a comment",
+            "cmp-L8C13": "    return a <= b  # a > b in a comment",
+        })
+        for op, src, new in (("cmp", "x = a >= b\n", "x = a > b"), ("cmp", "x = a < b\n", "x = a <= b"),
+                             ("cmp", "x = a == b\n", "x = a != b"), ("bool", "x = False\n", "x = True"),
+                             ("num", "x = 0\n", "x = 1")):
+            with self.subTest(src=src):
+                got = mutgen.generate(src, "scripts/fx.py", ["t"])[0]
+                self.assertEqual([(s["name"].split("-")[0], s["new"]) for s in got], [(op, new)])
         self.assertEqual((stats["ambiguous"], stats["invalid"], stats["capped"]), (0, 0, 0))
 
     def test_ambiguous_lines_are_skipped_and_counted(self):
@@ -133,6 +148,56 @@ class MutgenTests(unittest.TestCase):
                     self.assertIn("--out", self._run_main(str(repo), "scripts/ok.py", "--out", str(out)))
             self.assertEqual(ok.read_text(encoding="utf-8"), "x = 1\n")
             self.assertFalse((repo / "data" / "o.json").exists())
+
+    def test_out_over_tests_or_a_hard_link_is_refused(self):  # CDXINT140 F1 + F2
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            (repo / "scripts").mkdir()
+            (repo / "tests" / "sub").mkdir(parents=True)
+            ok = repo / "scripts" / "ok.py"
+            ok.write_text("x = 1 == 2\n", encoding="utf-8")
+            tfile = repo / "tests" / "test_ok.py"
+            tfile.write_text("T\n", encoding="utf-8")
+            (repo / "spec_t.py").write_text("S\n", encoding="utf-8")
+            os.link(ok, repo / "hl.json")
+            os.link(tfile, repo / "hl2.json")
+            outs = [tfile, repo / "TESTS" / "new.json" if os.name == "nt" else tfile,
+                    repo / "tests" / "sub" / "o.json", repo / "tests" / "missing" / "o.json",
+                    repo / "scripts" / ".." / "tests" / "o.json", repo / "tests",
+                    repo / "spec_t.py", repo / "hl.json", repo / "hl2.json"]
+            if os.name == "nt":  # F2-probe hits: Win32 name folding, device prefix, NTFS stream
+                outs += [f"{repo}\\tests \\o.json", f"{repo}\\tests.\\o.json",
+                         "\\\\?\\" + str(repo / "tests" / "o.json"), f"{ok}:ads"]
+            for out in outs:
+                with self.subTest(out=str(out)[-30:]):
+                    self.assertIn("--out", self._run_main(tmp, "scripts/ok.py", "--tests",
+                                                          "tests.test_ok", "spec_t.Case.test",
+                                                          "--out", str(out)))
+            self.assertEqual(ok.read_text(encoding="utf-8"), "x = 1 == 2\n")
+            self.assertEqual(tfile.read_text(encoding="utf-8"), "T\n")
+            self.assertEqual((repo / "spec_t.py").read_text(encoding="utf-8"), "S\n")
+            self.assertEqual(sorted(p.name for p in (repo / "tests").rglob("*")),
+                             ["sub", "test_ok.py"])
+            with contextlib.redirect_stderr(io.StringIO()):  # control: a plain out still works
+                rc = mutgen.main(["scripts/ok.py", "--repo", tmp, "--tests", "tests.test_ok",
+                                  "--out", str(repo / "specs.json")])
+            self.assertEqual(rc, 0)
+            self.assertIn(b"x = 1 != 2", (repo / "specs.json").read_bytes())
+
+    def test_raw_bytes_compile_honours_the_coding_cookie(self):  # CDXINT140 F3
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "scripts").mkdir()
+            for data in (b"# -*- coding: bogus -*-\nx = 1 == 2\n",
+                         b"#!/usr/bin/env python\n# coding: nosuch\nx = 1 == 2\n",
+                         b"# coding: ascii\ns = '\xc3\xa9'\nx = 1 == 2\n"):
+                with self.subTest(data=data[:30]):
+                    (Path(tmp) / "scripts" / "fx.py").write_bytes(data)
+                    self.assertIn("does not compile", self._run_main(tmp, "scripts/fx.py"))
+            (Path(tmp) / "scripts" / "fx.py").write_bytes(b"# coding: utf-8\ns = '\xc3\xa9'\nx = 1 == 2\n")
+            with contextlib.redirect_stderr(io.StringIO()):
+                rc = mutgen.main(["scripts/fx.py", "--repo", tmp, "--tests", "t",
+                                  "--out", str(Path(tmp) / "c.json")])
+            self.assertEqual(rc, 0)
 
     def test_original_must_compile(self):  # CDXINT139 F10
         for text in ("return 1\n", "yield 1\n", "nonlocal x\n", "x = (\n", "x = 1\0\n"):
