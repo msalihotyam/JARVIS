@@ -1,12 +1,15 @@
 """APIBROKER: the guarded Anthropic API client. Fake transport + fake credential reader, temp dirs,
 an injected clock; no network, no real credential read, never data/jarvis.db."""
 import builtins
+import ctypes
 import importlib.util
+import io
 import json
 import os
 import tempfile
 import traceback
 import unittest
+import urllib.error
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -138,7 +141,8 @@ class ApiBrokerTest(unittest.TestCase):
         blocks = [{"role": "user", "content": [{"type": "document", "source": {}}]}]
         for kw in ({"messages": blocks}, {"messages": [{"role": "user", "content": "x", "stream": True}]},
                    {"messages": []}, {"messages": [{"role": "system", "content": "x"}]},
-                   {"max_tokens": 0}, {"max_tokens": True}, {"max_tokens": api.MAX_TOKENS_CAP + 1}):
+                   {"max_tokens": 0}, {"max_tokens": True}, {"max_tokens": api.MAX_TOKENS_CAP + 1},
+                   {"max_tokens": 8193}):  # the cap itself is pinned, not only cap + 1
             self.refused(lambda: self.call(**kw), "text only")
         self.call()
         body = json.loads(self.sent[0][2])
@@ -199,7 +203,7 @@ class ApiBrokerTest(unittest.TestCase):
         (rh, h, rs, s) = self.rows()  # a reserve row before each request, then the settled row
         self.assertEqual((rh["status"], rs["status"], h["status"]), ("sent", "sent", 200))
         self.assertEqual((h["model"], h["in"], h["out"], h["usd"]), (HAIKU, 10**6, 10**6, 0.6))
-        self.assertEqual((s["model"], s["usd"], len(s["purpose"])), (SONNET, 0.022, api.PURPOSE_MAX))
+        self.assertEqual((s["model"], s["usd"], len(s["purpose"])), (SONNET, 0.022, 80))
         self.assertEqual(set(h), {"ts", "purpose", "model", "in", "out", "usd", "status", "release"})
         self.assertEqual((h["ts"], rh["ts"]), (T0, T0))
         self.assertGreater(rh["usd"], 0)
@@ -245,6 +249,58 @@ class ApiBrokerTest(unittest.TestCase):
 
     def test_redirects_are_never_followed(self):
         self.assertIsNone(api._NoRedirect().redirect_request(None, None, 302, "", {}, "https://x"))
+
+    # --- TESTSTR1: the paths MUT1 found unguarded ---------------------------------------------
+    def test_read_credential_returns_the_stored_key(self):
+        keep = []  # the fake credential must outlive CredReadW
+
+        def cred_read(target, kind, flags, pp):
+            ptr = pp._obj
+            blob = KEY.encode("utf-16-le")
+            buf = (ctypes.c_ubyte * len(blob)).from_buffer_copy(blob)
+            cred = ptr._type_()
+            cred.CredentialBlob = ctypes.cast(buf, ctypes.POINTER(ctypes.c_ubyte))
+            cred.CredentialBlobSize = len(blob)
+            ptr.contents = cred
+            keep.extend((buf, cred))
+            return 1
+        dll = mock.Mock()
+        dll.CredReadW.side_effect = cred_read
+        with mock.patch.object(api.ctypes, "WinDLL", return_value=dll) as windll, \
+                mock.patch.object(api.sys, "platform", "win32"):
+            self.assertEqual(api.read_credential(), KEY)
+        windll.assert_called_once_with("advapi32", use_last_error=True)
+        dll.CredFree.assert_called_once()
+
+    def test_https_post_returns_status_and_body(self):  # fake opener: no network
+        resp = mock.MagicMock(status=200)
+        resp.__enter__.return_value = resp
+        resp.read.return_value = b"ok"
+        opener = mock.Mock()
+        opener.open.return_value = resp
+        with mock.patch.object(api.urllib.request, "build_opener", return_value=opener):
+            self.assertEqual(api.https_post("https://x", {}, b"{}", 5), (200, b"ok"))
+            opener.open.side_effect = urllib.error.HTTPError("https://x", 429, "busy", {}, io.BytesIO(b"slow"))
+            self.assertEqual(api.https_post("https://x", {}, b"{}", 5), (429, b"slow"))
+
+    def test_nan_ledger_row_after_a_good_row_is_unreadable(self):
+        self.spend((ts(1), 1.0))
+        with open(self.ledger, "a", encoding="utf-8") as f:
+            f.write('{"ts": NaN, "usd": 1}\n')
+        with self.assertRaisesRegex(api.ApiRefused, "ledger row unreadable"):
+            api.read_ledger(self.ledger)
+
+    def test_budget_boundaries_month_start_midnight_and_exact_cap(self):
+        with self.assertRaisesRegex(api.ApiRefused, "monthly cap"):  # 00:00 on the 1st is this month
+            api.check_budget(T0, [{"ts": ts(1, 0), "usd": 90.0}], 90.0, None, 0.01)
+        api.check_budget(T0, [{"ts": ts(1, 0), "usd": 9.0}], 90.0, None, 0.01)  # ...and before today
+        with self.assertRaisesRegex(api.ApiRefused, "daily share"):  # 00:00 today is today
+            api.check_budget(T0, [{"ts": ts(8, 0), "usd": 9.0}], 90.0, None, 0.01)
+        api.check_budget(ts(17), [{"ts": ts(1), "usd": 89.0}], 90.0, None, 1.0)  # exactly the cap fits
+
+    def test_envelope_opened_at_midnight_lives_all_day(self):
+        eid = api.open_envelope(1.0, "sinav a", root=self.root, clock=lambda: ts(8, 0))
+        self.assertEqual(self.call(purpose="sinav x", envelope=eid), "hello")
 
     # --- APIBUDGET1: no overspend -------------------------------------------------------------
     def caps_file(self, **o):
