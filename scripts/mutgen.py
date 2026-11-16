@@ -168,6 +168,8 @@ def main(argv=None):
         text = raw.decode("utf-8-sig")
         specs, stats = generate(text, rel, tests, a.cap)
         compile(raw, rel, "exec")  # bytes: the coding cookie is honoured as on import
+    except OSError as e:
+        ap.error(f"{rel}: unreadable: {type(e).__name__}: {e}")
     except UnicodeDecodeError as e:
         ap.error(f"{rel}: not UTF-8: {e}")
     except (SyntaxError, ValueError, RecursionError, MemoryError) as e:

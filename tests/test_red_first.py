@@ -116,7 +116,7 @@ class RedFirstTests(unittest.TestCase):
         self.assertIn("test_calc.MixTests.test_mul RED", out)
         self.assertNotIn("import/syntax", out)
         self.assertIn("test_calc.Ödd.test_x ERROR", out)
-        self.assertIn("test_calc.MixTests.test_s ERROR", out)
+        self.assertIn("test_calc.MixTests.test_s ERROR", out)  # POLISH1 F4: staticmethod stays ERROR
         self.assertNotIn("Mixin.test", out)
         self.assert_clean()
         cyc = "class A(B):\n    def test_a(self): pass\nclass B(A, unittest.TestCase):\n    pass\n"
@@ -135,6 +135,72 @@ class RedFirstTests(unittest.TestCase):
         self.assertEqual([red_first.is_test_file(p) for p in
                           ("tests/test_a.py", "tests/helper.py", "test_a.py", "scripts/test_parallel.py", "calc.py")],
                          [True, True, True, False, False])
+
+    def _neg_commit(self, extra_test=""):
+        self.commit("add neg", {
+            "calc.py": CALC + "\n\ndef neg(a):\n    return -a\n",  # source change so the commit is not N/A
+            "test_calc.py": TEST + "    def test_neg(self):\n        self.assertEqual(calc.add(1, 1), 2)\n" + extra_test,
+        })
+
+    def test_error_plus_green_mix_exits_3(self):  # POLISH1 F10
+        self._neg_commit("\n\nclass Odd(dict):\n    def test_x(self):\n        pass\n")
+        code, out = self.run_main()
+        self.assertEqual(code, 3, out)
+        self.assertIn("test_neg GREEN", out)
+        self.assertIn("Odd.test_x ERROR", out)
+
+    def test_runner_timeout_is_error_not_red(self):  # POLISH1 F7
+        self._neg_commit()
+        with mock.patch.object(red_first, "run_tests", return_value=(-1, "timeout")):
+            code, out = self.run_main()
+        self.assertEqual(code, 3, out)
+        self.assertIn("test_neg ERROR", out)
+        self.assertNotIn(" RED ", out)
+        self.assert_clean()
+
+    def test_failed_status_check_is_not_restored(self):  # POLISH1 F8
+        self._neg_commit()
+        real = red_first._git
+
+        def fake(repo, *args):
+            if args and args[0] == "status":
+                return subprocess.CompletedProcess(args, 1, "", "boom")
+            return real(repo, *args)
+
+        with mock.patch.object(red_first, "_git", side_effect=fake):
+            code, out = self.run_main()
+        self.assertEqual(code, 3, out)
+        self.assertIn("RESTORED: False", out)
+
+    def test_failed_blob_read_exits_3(self):  # POLISH1 F6
+        self._neg_commit()
+        with mock.patch.object(red_first, "_blob", return_value=None):
+            code, out = self.run_main()
+        self.assertEqual(code, 3, out)
+        self.assertIn("BLOB READ FAILED", out)
+        self.assert_clean()
+
+    def test_deleted_test_file_is_absent_in_the_overlay(self):  # POLISH1 F3
+        self.commit("old", {"test_old.py": "import unittest\n"})
+        git(self.repo, "rm", "-q", "test_old.py")
+        self._neg_commit("    def test_gone(self):\n        import os\n"
+                         "        self.assertFalse(os.path.exists('test_old.py'))\n")
+        code, out = self.run_main()
+        self.assertEqual(code, 1, out)
+        self.assertIn("test_gone GREEN", out)
+        self.assertIn("RESTORED: True", out)
+        self.assert_clean()
+
+    def test_preexisting_scratch_dir_is_kept_and_overlay_is_contained(self):  # POLISH1 F2/F1
+        import os
+        mine = self.scratch / f"redfirst-t-{os.getpid()}"
+        mine.mkdir()
+        self.commit("more tests", {"test_calc.py": TEST + "    def test_z(self):\n        pass\n"})
+        code, out = self.run_main()
+        self.assertEqual(code, 0, out)
+        self.assertTrue(mine.is_dir())
+        self.assertTrue(red_first._inside(self.root, "a/b.py"))
+        self.assertFalse(red_first._inside(self.root, "a/../../b.py"))
 
 
 if __name__ == "__main__":

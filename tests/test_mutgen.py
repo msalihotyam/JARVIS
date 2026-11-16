@@ -10,6 +10,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 _ROOT = Path(__file__).resolve().parents[1]
 
@@ -205,6 +206,8 @@ class MutgenTests(unittest.TestCase):
             self.assertIn("does not compile", self._run_main(tmp, "scripts/deep.py"))
             (Path(tmp) / "scripts" / "l1.py").write_bytes(b"s = '\xe9'\n")
             self.assertIn("not UTF-8", self._run_main(tmp, "scripts/l1.py"))
+            with mock.patch.object(Path, "read_bytes", side_effect=PermissionError("denied")):  # POLISH1 F9
+                self.assertIn("unreadable", self._run_main(tmp, "scripts/l1.py"))
             (Path(tmp) / "scripts" / "bom.py").write_bytes(b"\xef\xbb\xbfx = 1 == 2\n")
             self.assertIn("x = 1 != 2", self._ok(["scripts/bom.py", "--repo", tmp, "--tests", "t"]))
         mutgen.generate("x = " + "1" * 4300 + "\n", "scripts/fx.py", ["t"])  # int() digit limit

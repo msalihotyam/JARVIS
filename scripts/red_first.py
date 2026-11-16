@@ -10,7 +10,8 @@ parent) run one by one, in sorted order: RED = fails on the parent (it guards th
 change), GREEN = passes on the parent (proves nothing for this change). The test
 files are restored and checked (bytes equal, ``git status --porcelain`` empty);
 the worktree is removed WITHOUT ``--force`` in a finally (also on Ctrl-C).
-Only TestCase subclasses count (test* methods inherited from in-file bases included); an
+Only files named test_*.py are parsed for methods (tests/testcalc.py is overlaid but never
+yields ids: NO NEW TESTS, exit 1). Only TestCase subclasses count (test* methods inherited from in-file bases included); an
 id unittest cannot load as a TestCase test on the commit itself is ERROR, never RED.
 Exit: 0 all RED or N/A (no source change), 1 any GREEN or a source change with
 no new/changed test, 3 any ERROR id, setup, restore or cleanup failed ("SCRATCH LEFT:
@@ -41,6 +42,15 @@ def is_test_file(path):
     """Under a tests/ folder, or a root-level test_*.py (scripts/test_parallel.py is source)."""
     parts = path.split("/")
     return "tests" in parts[:-1] or len(parts) == 1 and parts[0].startswith("test_") and path.endswith(".py")
+
+
+def _inside(root, rel):
+    """True when rel resolves (symlinks/junctions followed) to a path inside root."""
+    try:
+        (Path(root) / rel).resolve().relative_to(Path(root).resolve())
+        return True
+    except (ValueError, OSError):
+        return False
 
 
 def protected(path):
@@ -84,6 +94,7 @@ def test_methods(source):
 
 
 _PROBE = (  # positive OK lines on sys.__stdout__: a hijacked or silent stdout reads as unloadable
+    # POLISH1 F4 (doc-noted): a @staticmethod test stays ERROR on purpose; stock unittest cannot run it by name
     "import importlib, sys, types, unittest\n"
     "for tid in sys.argv[1:]:\n"
     "    mod, cls, meth = tid.rsplit('.', 2)\n"
@@ -120,7 +131,7 @@ def changed_ids(path, old, new):
     return sorted(f"{module}.{c}.{m}" for (c, m), d in after.items() if before.get((c, m)) != d)
 
 
-def _body(repo, commit, scratch, python, timeout, out):
+def _body(repo, commit, scratch, python, timeout, out, state):
     sha = _git(repo, "rev-parse", "--verify", commit + "^{commit}")
     parent = _git(repo, "rev-parse", "--verify", commit + "^1^{commit}")
     if sha.returncode or parent.returncode:
@@ -135,20 +146,26 @@ def _body(repo, commit, scratch, python, timeout, out):
     fields = diff.stdout.split("\0")[:-1]
     changes = sorted(zip(fields[1::2], fields[0::2]))  # (path, status)
     tests = [p for p, s in changes if is_test_file(p) and s != "D"]
+    gone = [p for p, s in changes if is_test_file(p) and s == "D"]
     if not any(not is_test_file(p) for p, _ in changes):
         out("N/A: test-only commit (no source change)")
         return 0
-    bad = [p for p in tests if protected(p)]
+    bad = [p for p in tests + gone if protected(p)]
     if bad:
         out("PROTECTED PATH: " + ", ".join(bad))
         return 3
     overlay, ids = {}, []
+    status = dict(changes)
     for p in tests:
         new = _blob(repo, sha, p)
+        old = _blob(repo, parent, p)
+        if new is None or old is None and status[p] != "A":  # a failed read is not "absent"
+            out(f"BLOB READ FAILED: {p}")
+            return 3
         overlay[p] = new
         if p.endswith(".py") and p.split("/")[-1].startswith("test_"):
             try:
-                ids += changed_ids(p, _blob(repo, parent, p), new)
+                ids += changed_ids(p, old, new)
             except SyntaxError as e:
                 out(f"PARSE FAILED: {p}: {e}")
                 return 3
@@ -159,6 +176,7 @@ def _body(repo, commit, scratch, python, timeout, out):
     if add.returncode:
         out("WORKTREE ADD FAILED: " + add.stderr.strip()[:200])
         return 3
+    state["added"] = True
     bad_ids = unloadable(python, scratch, ids, timeout)  # judged on the commit, never the parent
     if bad_ids is None:
         out("LOAD PROBE FAILED")
@@ -168,10 +186,17 @@ def _body(repo, commit, scratch, python, timeout, out):
         out("CHECKOUT PARENT FAILED: " + co.stderr.strip()[:200])
         return 3
     ids = [t for t in ids if t not in bad_ids]
+    overlay.update({p: None for p in gone})  # the commit deletes them: absent in the overlay
+    if not all(_inside(scratch, p) for p in overlay):
+        out("OVERLAY PATH ESCAPES THE WORKTREE")
+        return 3
     originals = {p: (scratch / p).read_bytes() if (scratch / p).is_file() else None for p in overlay}
     results = {}
     try:
         for p, data in overlay.items():
+            if data is None:
+                (scratch / p).unlink(missing_ok=True)
+                continue
             (scratch / p).parent.mkdir(parents=True, exist_ok=True)
             (scratch / p).write_bytes(data)
         with tempfile.TemporaryDirectory(prefix="redfirst-pyc-") as pyc:
@@ -183,8 +208,8 @@ def _body(repo, commit, scratch, python, timeout, out):
                 (scratch / p).unlink(missing_ok=True)
             else:
                 (scratch / p).write_bytes(data)
-        st = _git(scratch, "status", "--porcelain", "--untracked-files=all").stdout.strip()
-        ok = not st and all(data is None or (scratch / p).read_bytes() == data
+        st = _git(scratch, "status", "--porcelain", "--untracked-files=all")
+        ok = st.returncode == 0 and not st.stdout.strip() and all(data is None or (scratch / p).read_bytes() == data
                             for p, data in originals.items())
         out(f"RESTORED: {ok}")
     if not ok:
@@ -194,7 +219,10 @@ def _body(repo, commit, scratch, python, timeout, out):
         out(f"{tid} ERROR not loadable as a TestCase test on the commit")
     for tid in ids:
         verdict, detail = classify(*results[tid])
-        if verdict == "PASS":
+        if results[tid][0] < 0:  # timeout or killed runner: a tool failure, never RED
+            out(f"{tid} ERROR runner timed out or was killed")
+            code = 3
+        elif verdict == "PASS":
             out(f"{tid} GREEN")
             code = max(code, 1)
         else:
@@ -205,12 +233,13 @@ def _body(repo, commit, scratch, python, timeout, out):
 def run(repo, commit="HEAD", label="rf", python=None, scratch_root=None, timeout=600, out=print):
     """Check one commit in one scratch worktree; return the exit code."""
     scratch = Path(scratch_root or tempfile.gettempdir()) / f"redfirst-{label}-{os.getpid()}"
+    state = {"added": False}
     try:
-        code = _body(repo, commit, scratch, python or sys.executable, timeout, out)
-    finally:
-        if scratch.exists():
+        code = _body(repo, commit, scratch, python or sys.executable, timeout, out, state)
+    finally:  # only a worktree THIS run added is ours (a pid-reused dir is not)
+        if state["added"] and scratch.exists():
             _git(repo, "worktree", "remove", str(scratch))  # never --force
-        left = scratch.exists()
+        left = state["added"] and scratch.exists()
         if left:
             out(f"SCRATCH LEFT: {scratch}")  # the operator decides; no rmtree of unknown paths
     return 3 if left else code
