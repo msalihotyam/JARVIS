@@ -26,7 +26,18 @@ ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "build" / "ledger" / "usage.json"
 PROJECTS = Path(os.environ.get("USERPROFILE") or Path.home()) / ".claude" / "projects"
 # worktree dirs share this prefix: ...Masa-st--JARVIS, ...JARVIS-Claude-x, ...JARVIS--claude-worktrees-x
-PREFIX = "c--users-realk-masa-st--jarvis"
+def project_prefix(root):
+    """Claude Code's ~/.claude/projects dir name for the main checkout: every char outside
+    [A-Za-z0-9] becomes "-", lowercased. A path inside .claude/worktrees maps to its main checkout."""
+    root = Path(root)
+    for i, part in enumerate(root.parts[:-1]):
+        if part == ".claude" and root.parts[i + 1] == "worktrees":
+            root = Path(*root.parts[:i])
+            break
+    return re.sub(r"[^A-Za-z0-9]", "-", str(root)).lower()
+
+
+PREFIX = project_prefix(ROOT)
 FIELDS = ("input_tokens", "output_tokens", "cache_creation_input_tokens", "cache_read_input_tokens")
 LANE_RE = re.compile(r"@jarvis\s+lane=([A-Za-z0-9_-]+)")
 IST = timezone(timedelta(hours=3))  # Europe/Istanbul: fixed UTC+3 since 2016, no tzdata needed

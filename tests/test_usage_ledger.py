@@ -49,6 +49,9 @@ def lines(*xs):
 
 class T(unittest.TestCase):
     def setUp(self):
+        p = mock.patch.object(ul, "PREFIX", "c--users-realk-masa-st--jarvis")  # fixture dirs use this name, not the checkout path
+        p.start()
+        self.addCleanup(p.stop)
         self.tmp = tempfile.TemporaryDirectory()
         self.d = Path(self.tmp.name)
         self.out = self.d / "o" / "usage.json"
@@ -274,6 +277,33 @@ class T(unittest.TestCase):
                     self.run_main()
                 self.assertEqual([s["session_id"] for s in json.loads(self.out.read_text(encoding="utf-8"))["sessions"]],
                                  ["s1"])
+
+
+class PrefixT(unittest.TestCase):
+    def test_main_matches_worktree_dir_under_new_prefix(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "C--dev-JARVIS--claude-worktrees-X").mkdir()
+            (d / "C--dev-JARVIS--claude-worktrees-X" / "a.jsonl").write_bytes(lines(A("m1", 5)))
+            out = d / "o" / "usage.json"
+            with mock.patch.object(ul, "PREFIX", "c--dev-jarvis"):
+                ul.main(projects=d, out=out)
+            ids = [x["session_id"] for x in json.loads(out.read_text(encoding="utf-8"))["sessions"]]
+            self.assertEqual(ids, ["s1"])
+
+    def test_prefix_rule(self):
+        f = ul.project_prefix
+        old = "c--users-realk-masa-st--jarvis"
+        self.assertEqual(f(r"C:\Users\realk\Masaüstü\JARVIS"), old)
+        self.assertEqual(f(r"C:\Users\realk\Masaüstü\JARVIS\.claude\worktrees\X"), old)
+        self.assertEqual(f(r"C:\dev\JARVIS"), "c--dev-jarvis")
+        self.assertEqual(f(r"C:\dev\JARVIS\.claude\worktrees\X"), "c--dev-jarvis")
+        for pre, dirs in ((old, ("c--Users-realk-Masa-st--JARVIS--claude-worktrees-X",
+                                 "c--Users-realk-Masa-st--JARVIS-Claude-x")),
+                          ("c--dev-jarvis", ("C--dev-JARVIS--claude-worktrees-X",))):
+            for d in dirs:
+                self.assertTrue(d.lower().startswith(pre), d)
+        self.assertFalse("c--dev-jarvis--claude-worktrees-x".startswith(old))
 
 
 if __name__ == "__main__":
