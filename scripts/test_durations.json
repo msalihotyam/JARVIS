@@ -1180,6 +1180,7 @@
   "tests.test_session_progress.RestartResumeTests": 5.904,
   "tests.test_session_progress.SessionNextStepTests": 10.858,
   "tests.test_session_progress.StageAccumulationTests": 39.18,
+  "tests.test_setup_tasks.SetupTasksScriptTest": 0.3,
   "tests.test_skill_app.SkillAppTests": 12.09,
   "tests.test_skill_authority_matrix.AuthorityClaimTests": 25.508,
   "tests.test_skill_authority_matrix.AuthorityMatrixTests": 21.662,
