@@ -346,12 +346,15 @@ class N6BreakerGapTest(unittest.TestCase):
     def test_lock_not_acquired_writes_nothing_and_returns_false(self) -> None:
         with tempfile.TemporaryDirectory() as d:
             p = Path(d) / "b.json"
-            self.assertTrue(nb.record_finish(p, "N6-01", "FAIL", T0, T0))
+            for n, s, f in SAME_ROOT:  # an open breaker: reset has a root to close
+                self.assertTrue(nb.record_finish(p, n, s, f, f))
+            self.assertTrue(nb.is_open(nb.load(p)))
             before = p.read_bytes()
             with mock.patch.object(nb, "_os_lock", side_effect=OSError("held")):
-                self.assertIs(nb.record_finish(p, "N6-02", "FAIL", T0 + 1, T0 + 1), False)
-                self.assertIs(nb.reset(p, T0 + 5), False)
+                self.assertIs(nb.record_finish(p, "N6-09", "FAIL", T0 + 200, T0 + 200), False)
+                self.assertIs(nb.reset(p, T0 + 500), False)  # the lock guard, not "closes nothing"
             self.assertEqual(p.read_bytes(), before)
+            self.assertIs(nb.reset(p, T0 + 500), True)  # control: unlocked, the same reset closes it
 
     def test_lock_is_released_only_when_taken(self) -> None:
         with tempfile.TemporaryDirectory() as d:
@@ -383,9 +386,15 @@ class N6BreakerGapTest(unittest.TestCase):
                 with self.assertRaises(OSError):
                     nb._write(p, nb.State())
                 self.assertIs(nb.record_finish(p, *SAME_ROOT[2][:2], T0 + 2, T0 + 2), False)
+            self.assertEqual(p.read_bytes(), before)
+            self.assertIs(nb.record_finish(p, *SAME_ROOT[2][:2], T0 + 2, T0 + 2), True)
+            self.assertTrue(nb.is_open(nb.load(p)))  # open: reset must reach the failing _write
+            before = p.read_bytes()
+            with mock.patch.object(nb.os, "replace", side_effect=OSError("disk")):
                 self.assertIs(nb.reset(p, T0 + 5), False)
             self.assertEqual(p.read_bytes(), before)
             self.assertEqual([x.name for x in Path(d).iterdir() if x.name.endswith(".tmp")], [])
+            self.assertIs(nb.reset(p, T0 + 5), True)  # control: the same reset succeeds unpatched
 
     def test_reset_that_closes_nothing_is_false_not_none(self) -> None:
         with tempfile.TemporaryDirectory() as d:
