@@ -180,6 +180,21 @@ class WriteScopeTests(unittest.TestCase):
                          ["size_cap"])
         self.assertEqual(codes([change("src/a.py", status="D", size=1 << 30)]), [])
 
+    def test_size_cap_is_one_mib_and_empty_file_is_valid(self):
+        # Literals, not MAX_FILE_BYTES: the cap value itself is pinned.
+        self.assertEqual(codes([change("src/a.py", size=1048576)]), [])
+        self.assertEqual(codes([change("src/a.py", size=1048577)]),
+                         ["size_cap"])
+        self.assertEqual(codes([change("src/a.py", size=0)]), [])
+        self.assertEqual(codes([change("src/a.py", size=-1)]), ["unparseable"])
+
+    def test_clipped_detail_is_cut_to_200_and_returned(self):
+        for n, want in ((200, 200), (201, 200), (250, 200)):
+            with self.subTest(n=n):
+                (r,) = check([change("src/a.py", status="Z" * n)], TARGETS,
+                             jarvis_repo=False)
+                self.assertEqual(r, Refusal("unknown_status", "Z" * want))
+
     def test_binary_unless_target_allows(self):
         self.assertRefused("binary", ["src/logo.png"], binary=True)
         self.assertEqual(codes([change("assets/logo.png", binary=True)],
