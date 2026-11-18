@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import sqlite3
 import tempfile
@@ -307,6 +308,89 @@ class N6BreakerTest(unittest.TestCase):
             self.assertTrue(nb.holds(nb.load(p), "N6-05"))
             self.assertTrue(nb.reset(p, T0 + 5))
         self.assertFalse(hasattr(nb, "sqlite3"))
+
+
+class N6BreakerGapTest(unittest.TestCase):
+    """N6GAPBREAKER: boundaries and failure paths the mutation run (MUTPRUNE2) left unpinned."""
+
+    def test_state_is_immutable(self) -> None:
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            nb.State().bad = ()  # type: ignore[misc]
+
+    def test_root_ids_leading_iteration_is_not_an_empty_root(self) -> None:
+        self.assertEqual(nb.root_ids("-1-AFX"), frozenset({"-1"}))  # it.start() == 0: no "" root
+
+    def test_window_edge_drops_bad_and_cleared_at_exactly_the_window(self) -> None:
+        w = nb.BREAKER_WINDOW_S
+        st = nb.State(bad=(("A", T0),), cleared=(("X", T0),))
+        edge = nb.apply_finish(st, "Z", "RUNNING", T0 + w, T0 + w)  # age == window: gone
+        self.assertEqual((edge.bad, edge.cleared), ((), ()))
+        inside = nb.apply_finish(st, "Z", "RUNNING", T0 + w - 1, T0 + w - 1)
+        self.assertEqual((inside.bad, inside.cleared), ((("A", T0),), (("X", T0),)))
+
+    def test_bad_stamped_exactly_at_clear_does_not_count(self) -> None:
+        st = nb.State(bad=(("X", T0), ("X-AFX", T0)), cleared=(("X", T0),))
+        out = nb.apply_finish(st, "X-R", "FAIL", T0 + 1, T0 + 1)  # 1 counted + 2 at == clear
+        self.assertFalse(nb.is_open(out))
+        later = nb.apply_finish(st, "X-R", "FAIL", T0 + 1, T0 + 1)
+        later = nb.apply_finish(later, "X-S", "FAIL", T0 + 2, T0 + 2)
+        later = nb.apply_finish(later, "X-R-S", "FAIL", T0 + 3, T0 + 3)
+        self.assertEqual(roots(later), ["X"])  # three strictly after the clear do open it
+
+    def test_nested_missing_dir_is_created(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "a" / "b" / "state.json"
+            self.assertIs(nb.record_finish(p, "N6-01", "FAIL", T0, T0), True)
+            self.assertTrue(p.is_file())
+
+    def test_lock_not_acquired_writes_nothing_and_returns_false(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "b.json"
+            self.assertTrue(nb.record_finish(p, "N6-01", "FAIL", T0, T0))
+            before = p.read_bytes()
+            with mock.patch.object(nb, "_os_lock", side_effect=OSError("held")):
+                self.assertIs(nb.record_finish(p, "N6-02", "FAIL", T0 + 1, T0 + 1), False)
+                self.assertIs(nb.reset(p, T0 + 5), False)
+            self.assertEqual(p.read_bytes(), before)
+
+    def test_lock_is_released_only_when_taken(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "b.json"
+            with mock.patch.object(nb, "_os_lock") as lk:
+                with nb._locked(p) as got:
+                    self.assertTrue(got)
+                kinds = [c.kwargs.get("unlock", False) for c in lk.call_args_list]
+                self.assertEqual(kinds, [False, True])  # lock, then the unlock call
+            with mock.patch.object(nb, "_os_lock", side_effect=OSError("held")) as lk:
+                with nb._locked(p) as got:
+                    self.assertFalse(got)
+                self.assertEqual(lk.call_count, 1)  # nothing to unlock
+
+    def test_nan_state_is_rejected_and_leaves_no_file(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "b.json"
+            with self.assertRaises(ValueError):
+                nb._write(p, nb.State(bad=(("A", float("nan")),)))
+            self.assertEqual(list(Path(d).iterdir()), [])  # no state file, no tmp leftover
+
+    def test_write_failure_propagates_and_returns_false_from_callers(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "b.json"
+            for n, s, f in SAME_ROOT[:2]:
+                nb.record_finish(p, n, s, f, f)
+            before = p.read_bytes()
+            with mock.patch.object(nb.os, "replace", side_effect=OSError("disk")):
+                with self.assertRaises(OSError):
+                    nb._write(p, nb.State())
+                self.assertIs(nb.record_finish(p, *SAME_ROOT[2][:2], T0 + 2, T0 + 2), False)
+                self.assertIs(nb.reset(p, T0 + 5), False)
+            self.assertEqual(p.read_bytes(), before)
+            self.assertEqual([x.name for x in Path(d).iterdir() if x.name.endswith(".tmp")], [])
+
+    def test_reset_that_closes_nothing_is_false_not_none(self) -> None:
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "b.json"
+            self.assertIs(nb.reset(p, T0), False)  # fresh closed state: nothing to close
 
 
 if __name__ == "__main__":
