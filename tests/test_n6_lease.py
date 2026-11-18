@@ -1,5 +1,6 @@
 """N6-08: single-owner lease with a fencing epoch (temp dirs and explicit clocks only)."""
 
+import dataclasses
 import json
 import os
 import sqlite3
@@ -147,6 +148,111 @@ class N6LeaseTest(unittest.TestCase):
         self.assertEqual(live_slices(self.path, NOW + 2), frozenset())
         leftovers = [p for p in os.listdir(self.path.parent) if p.endswith(".tmp")]
         self.assertEqual(leftovers, [])
+
+    # N6GAPLEASE: pins for the MUTPRUNE2 survivors (all clocks explicit, no waits).
+    # Not asserted: the OS lock byte offset / byte count (msvcrt vs fcntl differ, no portable probe).
+    def _write_state(self, **over):
+        state = {"epoch": 1, "owner": "o", "slice_id": "S1", "expires": NOW + 10, "applied": []}
+        state.update(over)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.write_text(json.dumps(state), encoding="utf-8")
+
+    def test_lease_is_immutable(self):
+        lease = acquire(self.path, "mgr-a", "S1", 60, NOW)
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            lease.epoch = 9  # type: ignore[misc]
+
+    def test_acquire_creates_missing_nested_dirs(self):
+        deep = self.path.parent / "x" / "y" / "lease.json"
+        self.assertIsNotNone(acquire(deep, "mgr-a", "S1", 60, NOW))
+        self.assertTrue(deep.is_file())
+
+    def test_lock_is_released_with_the_unlock_call(self):
+        with mock.patch.object(n6_lease, "_os_lock", wraps=n6_lease._os_lock) as spy:
+            with n6_lease._locked(self.path) as got:
+                self.assertTrue(got)
+        self.assertEqual(len(spy.call_args_list), 2)
+        self.assertFalse(spy.call_args_list[0].kwargs.get("unlock", False))
+        self.assertIs(spy.call_args_list[1].kwargs.get("unlock"), True)
+
+    def test_lock_not_acquired_skips_unlock(self):
+        with mock.patch.object(n6_lease, "_os_lock", side_effect=OSError("busy")) as spy:
+            with n6_lease._locked(self.path) as got:
+                self.assertFalse(got)
+        self.assertEqual(spy.call_count, 1)
+
+    def test_epoch_zero_is_a_valid_lease_file(self):
+        self._write_state(epoch=0)
+        self.assertEqual(live_slices(self.path, NOW), frozenset({"S1"}))
+        self._write_state(epoch=-1)
+        self.assertIs(live_slices(self.path, NOW), HELD_ALL)
+
+    def test_epoch_zero_file_acquires_as_epoch_one_once_expired(self):
+        self._write_state(epoch=0)
+        lease = acquire(self.path, "mgr-b", "S1", 10, NOW + 10)
+        self.assertEqual(lease.epoch, 1)
+
+    def test_expiry_equal_to_now_is_expired(self):
+        lease = acquire(self.path, "mgr-a", "S1", 10, NOW)
+        self.assertTrue(n6_lease.check(self.path, lease, NOW + 9))
+        self.assertFalse(n6_lease.check(self.path, lease, NOW + 10))
+        self.assertIsNone(renew(self.path, lease, 10, NOW + 10))
+        self.assertFalse(release(self.path, lease, NOW + 10))
+        with self.assertRaises(Fenced):
+            apply_event(self.path, lease, "ev", NOW + 10)
+        self.assertEqual(live_slices(self.path, NOW + 10), frozenset())
+
+    def test_acquire_at_the_exact_expiry_of_the_old_lease_succeeds(self):
+        acquire(self.path, "mgr-a", "S1", 10, NOW)
+        self.assertIsNone(acquire(self.path, "mgr-b", "S1", 10, NOW + 9))
+        self.assertEqual(acquire(self.path, "mgr-b", "S1", 10, NOW + 10).epoch, 2)
+
+    def test_acquire_refuses_zero_or_negative_ttl_and_writes_nothing(self):
+        for ttl in (0, -1):
+            with self.subTest(ttl=ttl):
+                self.assertIsNone(acquire(self.path, "mgr-a", "S1", ttl, NOW))
+        self.assertFalse(self.path.exists())
+
+    def test_acquire_refuses_non_finite_clock_or_ttl(self):
+        nan, inf = float("nan"), float("inf")
+        for now, ttl in ((nan, 10), (NOW, nan), (inf, 10), (NOW, inf)):
+            with self.subTest(now=now, ttl=ttl):
+                self.assertIsNone(acquire(self.path, "mgr-a", "S1", ttl, now))
+        self.assertFalse(self.path.exists())
+
+    def test_fenced_runs_write_only_for_the_live_lease(self):
+        lease = acquire(self.path, "mgr-a", "S1", 10, NOW)
+        calls = []
+        self.assertTrue(n6_lease.fenced(self.path, lease, NOW + 1, lambda: calls.append(1)))
+        self.assertEqual(calls, [1])
+        self.assertFalse(n6_lease.fenced(self.path, lease, NOW + 10, lambda: calls.append(2)))
+        stale = n6_lease.Lease("mgr-a", "S1", lease.epoch + 1, lease.expires)
+        self.assertFalse(n6_lease.fenced(self.path, stale, NOW + 1, lambda: calls.append(3)))
+        self.assertEqual(calls, [1])
+
+    def test_lock_held_elsewhere_refuses_every_lease_operation(self):
+        lease = acquire(self.path, "mgr-a", "S1", 100, NOW)
+        calls = []
+        with n6_lease._locked(self.path) as got:
+            self.assertTrue(got)
+            self.assertIsNone(renew(self.path, lease, 100, NOW + 1))
+            self.assertFalse(release(self.path, lease, NOW + 1))
+            with self.assertRaises(Fenced):
+                apply_event(self.path, lease, "ev", NOW + 1)
+            self.assertFalse(n6_lease.fenced(self.path, lease, NOW + 1, lambda: calls.append(1)))
+        self.assertEqual(calls, [])
+        self.assertTrue(n6_lease.check(self.path, lease, NOW + 1))
+        self.assertTrue(release(self.path, lease, NOW + 1))
+
+    def test_apply_event_write_failure_surfaces_as_fenced(self):
+        lease = acquire(self.path, "mgr-a", "S1", 100, NOW)
+        for exc in (OSError("disk"), ValueError("digits")):
+            with self.subTest(exc=type(exc).__name__):
+                with mock.patch.object(n6_lease, "_write", side_effect=exc):
+                    with self.assertRaises(Fenced):
+                        apply_event(self.path, lease, "ev-1", NOW + 1)
+        self.assertEqual(json.loads(self.path.read_text())["applied"], [])
+        self.assertTrue(apply_event(self.path, lease, "ev-1", NOW + 1))
 
     def test_neg_module_names_no_database(self):
         src = Path(n6_lease.__file__).read_text(encoding="utf-8")
