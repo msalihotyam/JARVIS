@@ -460,6 +460,27 @@ class LimitedInputs(unittest.TestCase):
         (self.conv / "PAUSE").write_text("")
         self.assertTrue(lr._situation("A", self.root).operator_pause)
 
+    def test_full_burn_uses_limit_pct_as_the_line(self):
+        from jarvis.work_supervisor import supervise
+        cases = [  # (pace, usage, expected line_pct, expected constraint)
+            ({"mode": "full_burn", "pace_line": None, "limit_pct": 96}, 83.0, 96, "any"),
+            ({"mode": "full_burn", "pace_line": None}, 83.0, None, "non_claude_only"),
+            ({"mode": "full_burn", "pace_line": None, "limit_pct": "96"}, 83.0, None, "non_claude_only"),
+            ({"mode": "paced", "pace_line": None, "limit_pct": 96}, 83.0, None, "non_claude_only"),
+            ({"mode": "paced", "pace_line": 50.0, "limit_pct": 96}, 40.0, 50.0, "any"),
+            ({"mode": "paced", "pace_line": 50.0, "limit_pct": 96}, 60.0, 50.0, "non_claude_only"),
+        ]
+        for pace, used, line, constraint in cases:
+            with self.subTest(pace=pace, used=used):
+                self.status(pace=pace, usage_pct=used)
+                s = lr._situation("A", self.root)
+                self.assertFalse(s.operator_pause)
+                self.assertEqual(s.quota["line_pct"], line)
+                d = supervise(s)
+                self.assertEqual(d.constraint, constraint)
+                if line is None:
+                    self.assertEqual(d.rule_id, "pace.unknown_line")
+
     def test_sync_takes_only_marked_t1_once(self):
         deps = self.root / "build" / "n6" / "deps.json"
         deps.parent.mkdir(parents=True)

@@ -378,6 +378,10 @@ def _situation(sid: str, root: Path | str = ROOT) -> Situation:
     pace, mem = st.get("pace"), st.get("memory")
     used, line = st.get("usage_pct"), pace.get("pace_line") if isinstance(pace, dict) else None
     free = mem.get("free_gb") if isinstance(mem, dict) else None
+    # N6BURN1: full_burn has no pacing line by design; its line is the conveyor's own
+    # limit_pct hold (which still binds there). Anything else missing -> unknown_line.
+    if not _num(line) and isinstance(pace, dict) and pace.get("mode") == "full_burn":
+        line = pace.get("limit_pct")
     if not _num(used) or not _num(free):
         return pause
     return Situation(operator_pause=False, policy=DEFAULT_POLICY,
