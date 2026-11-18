@@ -372,5 +372,11 @@ class N6OutageTests(unittest.TestCase):
             self.assertEqual(o.decide(s, "timeout", now)[0].action, o.NUDGE, now)
 
 
+    def test_stamp_equal_to_now_is_not_a_backwards_clock(self) -> None:
+        for st in (o.State(1, T0, T0), o.State(stall_since=T0), o.State(outage_since=T0)):
+            with self.subTest(state=st):
+                self.assertEqual(o.decide(st, "continue", T0)[0], o.Decision(o.CONTINUE))
+                self.assertEqual(o.decide(st, "continue", T0 - 1)[0], o.Decision(o.HOLD, attention=True))
+
 if __name__ == "__main__":
     unittest.main()

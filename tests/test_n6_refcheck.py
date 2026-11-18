@@ -490,6 +490,32 @@ class N6RefcheckTests(unittest.TestCase):
             with self.subTest(eol=eol):
                 self.assertEqual(parse_picks(report.replace("\n", eol)), want)
 
+    # --- N6GAPREF: mutation survivors (seal flags, error-text cap, arrow gap) -----------
+    def test_seal_is_hidden_from_repr_and_equality(self):
+        ev = _read(FakeGit([HEAD, HEAD]))
+        self.assertTrue(ev.seal)
+        self.assertNotIn("seal", repr(ev))
+        self.assertEqual(ev, dataclasses.replace(ev))  # replace() resets seal; equality ignores it
+
+    def test_neg_error_text_is_capped_at_80_chars(self):
+        long = "x" * 200
+        cap = repr("x" * 80)
+        with self.assertRaises(RefCheckError) as c:
+            n6_refcheck._full_sha(long, "ref")
+        self.assertTrue(str(c.exception).endswith(f": {cap}"), str(c.exception)[-90:])
+        bad_run = "RUN_ID: " + "!" * 100
+        with self.assertRaises(RefCheckError) as c:
+            n6_refcheck._check_run_id(bad_run, RUN)
+        self.assertTrue(str(c.exception).endswith(f": {bad_run[:80]!r}"), str(c.exception)[-90:])
+        other = "a" * 100
+        with self.assertRaises(RefCheckError) as c:
+            n6_refcheck._check_run_id(f"RUN_ID: {other}", RUN)
+        self.assertIn(f"report {'a' * 80!r} !=", str(c.exception))
+        line = f"{SRC1} {NEW1} " + "n" * 100  # no arrow: malformed, text capped
+        with self.assertRaises(RefCheckError) as c:
+            n6_refcheck._parse_pick_line(line)
+        self.assertTrue(str(c.exception).endswith(f": {line[:80]!r}"), str(c.exception)[-90:])
+
 
 def _eol(text: object, ends: tuple[str, ...]) -> object:
     """``text`` with its LF line ends replaced by ``ends`` in turn; non-str (and str
