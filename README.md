@@ -1,6 +1,20 @@
-# JARVIS Core
+# JARVIS
 
-JARVIS, Windows 11 üzerinde yerel çalışan, modelden bağımsız kişisel çalışma orkestratörünün API gerektirmeyen çekirdeğidir. Bu aşama yalnızca standart Python kütüphanesini kullanır ve hiçbir ücretli model çağrısını kendiliğinden başlatmaz.
+JARVIS, Windows 11 üzerinde yerel olarak çalışan, modelden bağımsız bir kişisel çalışma asistanıdır. Asistan hem Türkçe ses hem de metin desteği sunarak ofis ortamında günlük kullanıma yönelik tasarlanmıştır. Çalışmalarını `Claude Code`, `Codex CLI` ve `Jules` gibi agent donanımları aracılığıyla, merkezi bir Core authority/permission katmanı altında güvenle yürütür. Ayrıca, şu anda (N6) kendi geliştirme süreçlerini de yürütmeyi öğrenmektedir.
+
+## Durum (Kasım 2026)
+
+V1, halihazırda tamamlanmış olan önceki uygulamadır. V2 ise Ocak-Şubat 2027 hedefli ilk ana sürümdür ve AC1-AC10 kabul kriterlerini içerir (voice+text, concurrent jobs, panel, model override, office outputs, computer use, project mode, Telegram, continuity, self-development). Şu an geliştirme süreci bağımsız incelemeler, CI ve two-key main push özellikleri taşıyan bir conveyor (`scripts/conveyor.py`) üzerinden yürütülmektedir. N6 ile birlikte bu geliştirme döngüsü bizzat JARVIS'in içine taşınmaktadır.
+
+## Nereden başlamalı
+
+- [PROJECT_CONTEXT.md](PROJECT_CONTEXT.md): Proje durumu, kısıtları ve proje kararları hakkında detaylı bilgi.
+- [ARCHITECTURE.md](ARCHITECTURE.md): Sistem mimarisi ve bileşenlerin çalışma prensipleri.
+- [JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md](JARVIS_V2PLUS_ROADMAP_AND_DECISIONS.md): V2 ve sonrası için yol haritası ve alınmış kararlar.
+- [JARVIS_RUNBOOK.md](JARVIS_RUNBOOK.md): Geliştirme kuralları, süreçler ve operasyonel bilgiler.
+- [AGENTS.md](AGENTS.md): Codex CLI (ve benzeri) agent'ların çalıştırılma ve güvenlik kuralları.
+- [CLAUDE.md](CLAUDE.md): Claude Code çalışma kuralları ve depot güvenliği.
+- [dev/n6/N6_KIT.md](dev/n6/N6_KIT.md): N6 geliştirme döngüsünün devri ve entegrasyonu ile ilgili dokümantasyon.
 
 ## Güvenlik özellikleri
 
