@@ -28,7 +28,7 @@ CRED_TARGET = "konveyor-bekci"
 # USD per million tokens (input, output), from the API credit plan
 PRICES = {"claude-haiku-5-5": (0.10, 0.50), "claude-sonnet-5-5": (2.0, 10.0)}
 MONTHLY_CAP_USD = 90.0  # hard cap, UTC calendar month
-CREDIT_END = datetime(2026, 11, 18, tzinfo=timezone.utc)  # credit expiry; refuse from then on
+CREDIT_END = datetime(2026, 12, 18, tzinfo=timezone.utc)  # credit expiry; refuse from then on
 MAX_TOKENS_CAP = 8192
 PURPOSE_MAX = 80
 LEDGER_NAME = "api_ledger.jsonl"

@@ -30,6 +30,8 @@ def ts(day, hour=12):
 
 
 T0 = ts(8)  # the injected clock: 2026-11-08 12:00 UTC, 10 days (8..17) left; never the wall clock
+REAL_END = api.CREDIT_END  # the module's real credit end; the fixture pins its own below
+FIXTURE_END = datetime(2026, 11, 18, tzinfo=timezone.utc)  # the share arithmetic here assumes 10 days at T0
 
 
 def ok_body(n_in=10, n_out=5, text="hello"):
@@ -45,6 +47,9 @@ class ApiBrokerTest(unittest.TestCase):
         self.ledger = self.root / api.LEDGER_NAME
         self.sent = []
         self.reply = (200, ok_body())
+        pin = mock.patch.object(api, "CREDIT_END", FIXTURE_END)
+        pin.start()
+        self.addCleanup(pin.stop)
 
     def post(self, url, headers, body, timeout):
         self.sent.append((url, headers, body, timeout))
@@ -309,7 +314,16 @@ class ApiBrokerTest(unittest.TestCase):
     def fresh(self):  # a restarted process: a new module instance reading the same ledger directory
         mod = importlib.util.module_from_spec(_SPEC)
         _SPEC.loader.exec_module(mod)
+        mod.CREDIT_END = FIXTURE_END
         return mod
+
+    def test_real_credit_end_refuses_from_2026_12_18_utc(self):
+        self.assertEqual(REAL_END, datetime(2026, 12, 18, tzinfo=timezone.utc))
+        with mock.patch.object(api, "CREDIT_END", REAL_END):
+            self.assertEqual(self.call(now=datetime(2026, 12, 17, 23, 59, tzinfo=timezone.utc).timestamp()),
+                             "hello")
+            self.sent.clear()
+            self.refused(lambda: self.call(now=REAL_END.timestamp()), "API credit period over")
 
     def test_neg_threads_with_budget_for_one_call_send_exactly_once(self):
         self.caps_file(monthly_usd=0.0001)  # on 11-17 the daily share is the whole monthly cap
