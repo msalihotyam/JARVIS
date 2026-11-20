@@ -236,6 +236,7 @@ PACED_LIMIT = 97  # paced mode: no new lanes at or above this % of the weekly pl
 PACE_MARGIN = 2  # paced: usage <= pace_line + this -> max lanes, else min_lanes (Salih 2026-10-12)
 # ponytail: fixed UTC+3 (Turkey has no DST since 2016); zoneinfo needs tzdata, absent on Windows
 IST = timezone(timedelta(hours=3))  # PHONECMD3: plan_targets.json dates are Europe/Istanbul
+TR_DAYS = ("Pzt", "Sal", "Çrş", "Prş", "Cum", "Cmt", "Paz")  # DURUM6: by datetime.weekday()
 KEEP_MAX = 30  # CONVRESERVE: pace.json salih_keep_pct (written by the orchestrator only) 0..KEEP_MAX
 KEEP_ASK_BEFORE_S = 12 * 3600  # Salih is asked once, this long before window_start + days (Thursday 10:00)
 MIN_LANES = 2  # pace.json min_lanes default (not written; capped by the lane cap when not set)
@@ -1872,15 +1873,15 @@ class Conveyor:
                 f"kota {word} ({round(u)}/{round(line)})")
 
     def plan_status(self, subjects):
-        """PHONECMD3: [(detail line, summary part)] per build/orch/plan_targets.json item;
-        subjects = main's commit subjects, None when git could not be read."""
+        """PHONECMD3: [(detail line, summary part, DURUM6 bar line)] per build/orch/plan_targets.json
+        item; subjects = main's commit subjects, None when git could not be read."""
         try:
             doc = json.loads((self.root / "build" / "orch" / "plan_targets.json").read_text(encoding="utf-8"))
             items = doc.get("items") if isinstance(doc, dict) else None
-        except (OSError, ValueError):
+        except (OSError, ValueError, RecursionError):
             items = None
         if not isinstance(items, list):
-            return [("Plan: hedef dosyası okunamadı", "plan ?")]
+            return [("Plan: hedef dosyası okunamadı", "plan ?", "Plan: hedef dosyası okunamadı")]
         now, out = datetime.fromtimestamp(self.now(), IST), []
         for it in items:
             label = str(it.get("label") or it.get("id") or "?")[:30] if isinstance(it, dict) else "?"
@@ -1889,56 +1890,102 @@ class Conveyor:
                 rx, total = re.compile(it["regex"]), it["total"]
                 start = datetime.fromisoformat(it["start"]).replace(tzinfo=IST)
                 due = datetime.fromisoformat(it["due"]).replace(tzinfo=IST) + timedelta(days=1)  # due day counts
-                if not isinstance(total, int) or isinstance(total, bool) or total < 1 or due <= start or rx.groups < 2:
+                # DURUM6FIX2: total bounded so every float/datetime step below stays finite
+                if not isinstance(total, int) or isinstance(total, bool) or not 1 <= total <= 100000 \
+                        or due <= start or rx.groups < 2:
                     raise ValueError(label)
-            except (TypeError, KeyError, ValueError, AttributeError, re.error):
-                out.append((f"{label}: hedef hatalı", f"{short} hatalı"))
+            except (TypeError, KeyError, ValueError, AttributeError, OverflowError, RecursionError, re.error):
+                out.append((f"{label}: hedef hatalı", f"{short} hatalı", f"{label}: hedef hatalı"))
                 continue
             if subjects is None:
-                out.append((f"{label}: bilinmiyor", f"{short} ?"))
+                out.append((f"{label}: bilinmiyor", f"{short} ?", f"{label}: bilinmiyor"))
                 continue
             done = len({m.group(2) for s in subjects for m in [rx.search(s)] if m and m.group(2)})
             exp = total * min(1.0, max(0.0, (now - start) / (due - start)))
             word = ("gecikti" if now >= due and done < total else "öndeyiz" if done > exp + 1
                     else "gerideyiz" if done < exp - 1 else "plandayız")
             sw = {"öndeyiz": "önde", "gerideyiz": "geride", "plandayız": "planda"}.get(word, word)
-            out.append((f"{label}: {done}/{total} (beklenen ~{exp:.0f}) -> {word}", f"{short} {done}/{total} {sw}"))
+            cells = min(10, done * 10 // total)
+            try:  # DURUM6FIX: an absurd total overflows the projection; that item's ETA is "?"
+                eta = "?" if done < 1 or now <= start else (lambda d: f"~{TR_DAYS[d.weekday()]} {d:%d.%m}")(
+                    start + (now - start) * total / done)  # linear projection of the pace so far
+            except (OverflowError, ValueError, ZeroDivisionError):
+                eta = "?"
+            bar = f"{label[:20]} {'▓' * cells}{'░' * (10 - cells)} %{min(100, done * 100 // total)} {done}/{total} {word} {eta}"
+            out.append((f"{label}: {done}/{total} (beklenen ~{exp:.0f}) -> {word}", f"{short} {done}/{total} {sw}", bar))
+        return out
+
+    def durum_notes(self):
+        """DURUM6: only the known fields of the orchestrator's build/orch/durum_notes.json, each
+        redacted (never a topic or key); {} when missing, unreadable or the wrong shape."""
+        try:
+            doc = json.loads((self.root / "build" / "orch" / "durum_notes.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError, RecursionError):
+            return {}
+        if not isinstance(doc, dict):
+            return {}
+        out = {k: redacted(doc[k], "", 220) for k in ("updated", "is", "ozet", "sonraki")
+               if isinstance(doc.get(k), str) and doc[k].strip()}
+        for k in ("plan", "senden"):
+            xs = [redacted(x, "", 220) for x in doc.get(k) or [] if isinstance(x, str) and x.strip()] \
+                if isinstance(doc.get(k), list) else []
+            if xs:
+                out[k] = xs
         return out
 
     def durum_text(self, lanes, items):
-        """The phone's Durum push, from local state only (PHONECMD3: readable in the notification):
-        one summary line <= 90 chars, then <= 6 detail lines <= 60 chars; <= 450 chars in all."""
+        """DURUM6: the phone's Durum reply = the orchestrator's fixed "durum ne" template, from local
+        state only (no model call): a <= 90-char banner line, then always the 6 sections
+        ŞU AN / ÖZET / PLAN / KOTA / SENDEN / SONRA; <= 15 lines, <= 1800 chars."""
         now = self.now()
         run = self.running(lanes)
         awake = self.orch_wake()
         salih = [str(i) for i, _, _ in items if self.for_salih(i, awake)]
         orch = [str(i) for i, _, _ in items if not self.for_salih(i, awake)]
 
-        def ids(xs):
-            return ", ".join(x[:14] for x in xs[:3]) + (f" +{len(xs) - 3}" if len(xs) > 3 else "")
-        try:
-            lines = (self.base / "events.jsonl").read_text(encoding="utf-8", errors="replace").splitlines()
-            push = next((r for r in map(self.push_record, reversed(lines[-2000:])) if r), None)
-        except OSError:
-            push = None
+        def ids(xs, n=14):
+            return ", ".join(x[:n] for x in xs[:3]) + (f" +{len(xs) - 3}" if len(xs) > 3 else "")
+
+        def cut(s, n=220):
+            return s if len(s) <= n else s[:n - 1] + "…"
         try:  # the one git call of the report
             rc, out = self.cmd(["git", "log", "--format=%s", "refs/heads/main"])
             subjects = out.splitlines() if rc == 0 else None
         except Exception:
             subjects = None
         quota, qs = self.quota_pace()
-        if self.pager_flag("auth"):
-            quota, qs = f"{quota} (kota okumasi eski)", f"{qs} (kota okumasi eski)"
+        stale = " (kota okuması eski)" if self.pager_flag("auth") else ""  # usage_stale is this flag
         plan = self.plan_status(subjects)
-        sha = self.main_head()
-        head = " · ".join([f"{len(run)} hat", f"senden {len(salih)}", f"ork {len(orch)}", qs]
-                          + [s for _, s in plan])
-        D = ([f"Çalışan: {ids([f'{n[:8]} {int((now - self.started_ts(lanes[n])) // 60)}dk' for n in run])}"] if run else []) \
-            + ([f"Senden: {ids(salih)}"] if salih else []) + ([f"Ork: {ids(orch)}"] if orch else []) \
-            + [quota] + [d for d, _ in plan] \
-            + [f"main {sha[:7] if sha else '?'} · push {str(push.get('ts', ''))[11:16] if push else '?'}"
-               f" · not {self.inbox_unread()}"]
-        return "\n".join([head[:90]] + [d[:60] for d in D[:6]])[:450]
+        notes = self.durum_notes()
+        head = " · ".join([f"{len(run)} hat", f"senden {len(salih)}", f"ork {len(orch)}", qs + stale]
+                          + [s for _, s, _ in plan])
+        mins = [f"{n[:12]} {int((now - self.started_ts(lanes[n])) // 60)}dk" for n in run[:3]]
+        L = [head[:90], f"ŞU AN: {len(run)} hat" + (f": {ids(mins + run[3:], 20)}" if run else "")]
+        L += [f"  {b}" for _, _, b in plan[:5]] + ([f"  +{len(plan) - 5} hedef"] if len(plan) > 5 else [])
+        L += [f"  is: {cut(notes['is'], 160)}"] if "is" in notes else []
+        age = ""
+        try:
+            u = datetime.fromisoformat(notes["updated"])
+            hours = (now - (u if u.tzinfo else u.replace(tzinfo=IST)).timestamp()) / 3600
+            age = f" (not {int(hours)} sa eski)" if hours > 24 else ""
+        except (KeyError, ValueError):
+            pass
+        L.append(f"ÖZET: {cut(notes['ozet']) if 'ozet' in notes else 'not yok'}{age}")
+        L.append(f"PLAN: {cut(' → '.join(notes['plan'])) if 'plan' in notes else 'not yok'}")
+        try:
+            p = self.pace
+            r = datetime.fromtimestamp(datetime.fromisoformat(p["window_start"]).timestamp()
+                                       + 86400 * p.get("days", PACE_DEFAULTS["days"]), IST)
+            reset = f" · sıfırlanma {TR_DAYS[r.weekday()]} {r:%H:%M}"
+        except (TypeError, KeyError, ValueError, AttributeError, OverflowError, OSError):
+            reset = ""
+        L.append(f"KOTA: {quota.removeprefix('Kota: ')}{reset}{stale}")
+        senden = ([ids(salih)] if salih else []) + notes.get("senden", [])
+        L.append(f"SENDEN: {cut(' · '.join(senden)) if senden else 'yok'}")
+        ready = sum(v.get("state") == "ready" for v in self.backlog_view or [])
+        L.append(f"SONRA: {cut(notes['sonraki']) if 'sonraki' in notes else 'not yok'}"
+                 + (f" · hazır {ready}" if self.backlog_view else ""))
+        return "\n".join(L)[:1800]
 
     def finish(self, name, ln, report, status, **why):
         quiet = ln.get("finished") and "started_ts" not in ln  # a v0 lane already freed: no page
@@ -3455,7 +3502,7 @@ class Conveyor:
                 self.mem_ok_since = None
         if self.mem_hold:
             band = "memory hold"  # running lanes untouched; nothing new starts (hold())
-        self.pace = {"mode": p["mode"], "window_start": p["window_start"], "usage_pct": u,
+        self.pace = {"mode": p["mode"], "window_start": p["window_start"], "days": p["days"], "usage_pct": u,
                      "usage_source": self.usage_source, "pace_line": line if line is None else round(line, 1),
                      "max_lanes": self.max_lanes, "band": band, "limit_pct": limit, "error": err,
                      "presence": self.presence}
