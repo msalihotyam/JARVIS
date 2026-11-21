@@ -958,6 +958,7 @@
   "tests.test_project_files.InvariantTests": 3.307,
   "tests.test_project_files.LifecycleTests": 2.84,
   "tests.test_project_files.PurgeTests": 2.064,
+  "tests.test_project_files.ReadBoundaryTests": 0.1,
   "tests.test_project_files.QuotaTests": 2.203,
   "tests.test_project_files.RestoreTests": 0.938,
   "tests.test_project_files.RetrievalTests": 9.142,

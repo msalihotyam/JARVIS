@@ -20,6 +20,7 @@ No test performs a live model, auth or network call or opens the live DB.
 from __future__ import annotations
 
 import contextlib
+import dataclasses
 import hashlib
 import io
 import json
@@ -90,6 +91,62 @@ class FileCase(unittest.TestCase):
     def state(self) -> tuple:
         return (self.rows("SELECT * FROM project_files ORDER BY id"),
                 self.rows("SELECT * FROM project_file_chunks ORDER BY file_id, chunk_index"))
+
+
+class ReadBoundaryTests(unittest.TestCase):
+    """MUTGAP1: caps, frozen record and refusals of read_project_file (pure, no DB)."""
+
+    def setUp(self) -> None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, temp)
+        self.root = Path(temp.name).resolve()
+
+    def write(self, name: str, data: bytes) -> Path:
+        path = self.root / name
+        path.write_bytes(data)
+        return path
+
+    def test_count_caps_are_pinned(self) -> None:
+        self.assertEqual(20, project_files.PROJECT_FILE_ACTIVE_MAX)
+        self.assertEqual(40, project_files.PROJECT_FILE_RETAINED_MAX)
+        self.assertEqual(3, project_files.PROJECT_FILE_EXCERPT_MAX_ITEMS)
+
+    def test_content_record_is_frozen_and_slotted(self) -> None:
+        content = project_files.ProjectFileContent("n.txt", "s", 1, "t")
+        with self.assertRaises(dataclasses.FrozenInstanceError):
+            content.text = "x"  # type: ignore[misc]
+        self.assertFalse(hasattr(content, "__dict__"))
+        with self.assertRaises(AttributeError):
+            content.extra = 1  # type: ignore[attr-defined]
+
+    def test_missing_path_refuses_at_resolve_time(self) -> None:
+        with mock.patch.object(project_files.os, "stat", side_effect=AssertionError("stat reached")):
+            with self.assertRaisesRegex(ProjectFileRefused, "gone.txt could not be read"):
+                read_project_file(self.root / "gone.txt")
+
+    def test_folder_refusal_message(self) -> None:
+        (self.root / "dir.txt").mkdir()
+        with self.assertRaisesRegex(ProjectFileRefused, r"dir\.txt is a folder\. Choose a file\."):
+            read_project_file(self.root / "dir.txt")
+
+    def test_not_an_ordinary_file_refusal_message(self) -> None:
+        # A regular file the isfile check rejects (device/pipe stand-in): reaches the second refusal.
+        path = self.write("odd.txt", b"x")
+        with mock.patch.object(project_files.os.path, "isfile", return_value=False):
+            with self.assertRaisesRegex(ProjectFileRefused, r"odd\.txt is not an ordinary file\."):
+                read_project_file(path)
+
+    def test_byte_cap_exactly_at_cap_passes_and_cap_plus_one_refuses(self) -> None:
+        with mock.patch.object(project_files, "PROJECT_FILE_MAX_BYTES", 10):
+            self.assertEqual(10, read_project_file(self.write("at.txt", b"x" * 10)).byte_size)
+            with self.assertRaisesRegex(ProjectFileRefused, "larger than"):
+                read_project_file(self.write("over.txt", b"x" * 11))
+
+    def test_char_cap_exactly_at_cap_passes_and_cap_plus_one_refuses(self) -> None:
+        cap = project_files.PROJECT_FILE_MAX_CHARS
+        self.assertEqual(cap, len(read_project_file(self.write("at.txt", b"a" * cap)).text))
+        with self.assertRaisesRegex(ProjectFileRefused, "longer than"):
+            read_project_file(self.write("over.txt", b"a" * (cap + 1)))
 
 
 # --------------------------------------------------------------------------
