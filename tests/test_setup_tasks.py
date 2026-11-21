@@ -29,6 +29,13 @@ def registered_task_names(text):
     return set(re.findall(r"^\s*Name\s*=\s*'([^']+)'", text, re.M))
 
 
+class AsciiCheckCase(unittest.TestCase):
+    def test_ascii_root_check_is_case_sensitive(self):  # POLISH2 F3: -match folds I to dotless i on Turkish locales
+        text = SETUP.read_text(encoding="utf-8")
+        self.assertIn(r"$Root -cmatch '[^\x20-\x7E]'", text)
+        self.assertNotRegex(text, r"\$Root -match ")
+
+
 class SetupTasksScriptTest(unittest.TestCase):
     def setUp(self):
         self.raw = SETUP.read_bytes()

@@ -32,7 +32,7 @@ Set-StrictMode -Version 2
 $ErrorActionPreference = 'Stop'
 
 $Root = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-if ($Root -match '[^\x20-\x7E]') { Write-Warning "repo root is not ASCII: $Root (use e.g. C:\dev\JARVIS)" }
+if ($Root -cmatch '[^\x20-\x7E]') { Write-Warning "repo root is not ASCII: $Root (use e.g. C:\dev\JARVIS)" }
 $User = "$env:USERDOMAIN\$env:USERNAME"
 
 if (-not $PythonW) {

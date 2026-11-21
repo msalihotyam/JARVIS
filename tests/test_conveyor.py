@@ -10091,12 +10091,13 @@ class PhoneCmd(Base):
 
     def test_durum6fix_max_total_tiny_progress_eta_never_raises(self):
         self.t = self.NOW  # 7.5 days since start; 1 of 100000 projects ~2000 years out
-        self.targets({"items": [self.item(total=100000, start="2026-11-01", due="2026-11-20")]})
+        # POLISH2 F2: start in 2000 so (now-start)*100000 leaves the datetime range -> ETA "?"
+        self.targets({"items": [self.item(total=100000, start="2000-01-01", due="2026-12-31")]})
         self.done(1)
         lines = self.c.durum_text({}, []).splitlines()
         bar = [x for x in lines if x.startswith("  P plan ")]
         self.assertEqual(len(bar), 1, lines)
-        self.assertRegex(bar[0], r"^  P plan ░{10} %0 1/100000 gerideyiz (\?|~\S+ \d\d\.\d\d)$")
+        self.assertRegex(bar[0], r"^  P plan ░{10} %0 1/100000 \w+ \?$")
         self.assertEqual([h for h in self.HEADERS if any(x.startswith(h) for x in lines)], list(self.HEADERS))
 
     def test_durum6fix2_absurd_or_overflowing_targets_are_hedef_hatali(self):
@@ -10114,6 +10115,13 @@ class PhoneCmd(Base):
         self.assertEqual([h for h in self.HEADERS if any(x.startswith(h) for x in lines)], list(self.HEADERS))
         self.targets('{"items": ' + "[" * 100000 + "]" * 100000 + "}")  # nesting past the recursion limit
         self.assertEqual(self.c.plan_status([])[0][0], "Plan: hedef dosyası okunamadı")
+
+    def test_polish2_label_newlines_never_add_lines(self):  # POLISH2 F1
+        self.t = self.NOW
+        self.targets({"items": [self.item("A\r\nB\nC")]})
+        text = self.c.durum_text({}, [])
+        self.assertIn("  A B C:", text)
+        self.assertLessEqual(len(text.splitlines()), 15, text)
 
     def test_neg_targets_missing_or_malformed_one_line(self):
         for doc in (None, "{not json", "[]", '{"items": 5}', '{"x": 1}'):

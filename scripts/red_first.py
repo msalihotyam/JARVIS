@@ -203,13 +203,17 @@ def _body(repo, commit, scratch, python, timeout, out, state):
             for i, tid in enumerate(ids):
                 results[tid] = run_tests(python, scratch, [tid], Path(pyc) / f"r{i}", timeout)
     finally:
+        escaped = False
         for p, data in originals.items():
+            if not _inside(scratch, p):  # POLISH2 F1: a path that now resolves outside is never written
+                escaped = True
+                continue
             if data is None:
                 (scratch / p).unlink(missing_ok=True)
             else:
                 (scratch / p).write_bytes(data)
         st = _git(scratch, "status", "--porcelain", "--untracked-files=all")
-        ok = st.returncode == 0 and not st.stdout.strip() and all(data is None or (scratch / p).read_bytes() == data
+        ok = not escaped and st.returncode == 0 and not st.stdout.strip() and all(data is None or (scratch / p).read_bytes() == data
                             for p, data in originals.items())
         out(f"RESTORED: {ok}")
     if not ok:

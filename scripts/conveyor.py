@@ -1884,7 +1884,7 @@ class Conveyor:
             return [("Plan: hedef dosyası okunamadı", "plan ?", "Plan: hedef dosyası okunamadı")]
         now, out = datetime.fromtimestamp(self.now(), IST), []
         for it in items:
-            label = str(it.get("label") or it.get("id") or "?")[:30] if isinstance(it, dict) else "?"
+            label = " ".join(str(it.get("label") or it.get("id") or "?")[:30].split()) or "?" if isinstance(it, dict) else "?"
             short = (label.split() or ["?"])[0]
             try:
                 rx, total = re.compile(it["regex"]), it["total"]

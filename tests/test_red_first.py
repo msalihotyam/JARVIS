@@ -191,6 +191,19 @@ class RedFirstTests(unittest.TestCase):
         self.assertIn("RESTORED: True", out)
         self.assert_clean()
 
+    def test_restore_loop_rechecks_containment(self):  # POLISH2 F1
+        self._neg_commit()
+        state = {"ran": False}
+
+        def fake_run(*a, **k):
+            state["ran"] = True
+            return (1, "FAIL")
+
+        with mock.patch.object(red_first, "run_tests", side_effect=fake_run),                 mock.patch.object(red_first, "_inside", side_effect=lambda r, p: not state["ran"]):
+            code, out = self.run_main()
+        self.assertEqual(code, 3, out)
+        self.assertIn("RESTORED: False", out)
+
     def test_preexisting_scratch_dir_is_kept_and_overlay_is_contained(self):  # POLISH1 F2/F1
         import os
         mine = self.scratch / f"redfirst-t-{os.getpid()}"
