@@ -100,6 +100,74 @@ class PolicyGuardTests(unittest.TestCase):
                 self.assertTrue(tests._is_live("file:///anything.db"))
                 self.assertFalse(tests._is_live("anything.db"))  # a plain path: its own call raises
 
+    def test_win32_spellings_of_the_live_path_are_refused(self) -> None:
+        # Win32 reaches one file by many spellings; every one of them must be refused (fail closed).
+        live = self.stand_in_live()
+        text = str(live)
+        spellings = (
+            "\\\\?\\" + text,  # extended-length prefix
+            "\\\\.\\" + text,  # device prefix
+            "//?/" + text.replace("\\", "/"),  # forward-slash extended-length prefix
+            "\\\\?\\" + text.upper(),  # prefix and case
+            text.lower(),
+            text + ".",  # trailing dot / space: Win32 drops them on a file that does not exist yet
+            text + " ",
+            text + ". .",
+            text + "-wal.",
+            text.replace(live.name, live.name + " "),
+            str(live.parent) + ". \\" + live.name,  # trailing dot and space on a directory component
+            "\\\\?\\" + str(live.parent) + " \\" + live.name + ".",
+            "file:///" + text.replace("\\", "/") + ".",
+        )
+        for spelling in spellings:
+            with self.subTest(spelling=spelling):
+                self.assertTrue(tests._is_live(spelling))
+                with self.assertRaises(AssertionError):
+                    open(spelling, "rb")
+                with self.assertRaises(AssertionError):
+                    sqlite3.connect(spelling)
+                with self.assertRaises(AssertionError):
+                    sqlite3.connect(os.fsencode(spelling))
+        self.assertEqual(os.listdir(live.parent), [], "a refused call must not create anything")
+        self.assertFalse(tests._is_live(text.replace(live.name, "other.db") + "."))  # not over-blocking
+
+    @unittest.skipUnless(os.name == "nt", "Win32 path routes")
+    def test_other_routes_to_the_same_folder_are_refused(self) -> None:
+        # Admin share, NT prefix and volume GUID reach the live folder under a different spelling.
+        live = self.stand_in_live()
+        drive, rest = os.path.splitdrive(str(live))
+        share = f"{drive[0]}$" + rest
+        spellings = [
+            "\\\\??\\"[1:] + str(live),  # NT object-manager prefix \??\
+            "\\\\localhost\\" + share,
+            "\\\\127.0.0.1\\" + share,
+            "//localhost/" + share.replace("\\", "/"),
+            "\\\\localhost\\" + share + ".",
+            "\\\\?\\UNC\\localhost\\" + share,
+            "file:////localhost/" + share.replace("\\", "/"),
+        ]
+        reachable = [s for s in spellings[1:] if os.path.isdir(os.path.dirname(tests._win32_spelling(s))) or s.startswith("file:")]
+        if not reachable:
+            self.skipTest("administrative shares are not reachable on this machine")
+        for spelling in spellings[:1] + reachable:
+            with self.subTest(spelling=spelling):
+                self.assertTrue(tests._is_live(spelling))
+                with self.assertRaises(AssertionError):
+                    open(spelling, "rb")
+                with self.assertRaises(AssertionError):
+                    sqlite3.connect(spelling, uri=spelling.startswith("file:"))
+        self.assertEqual(os.listdir(live.parent), [], "a refused call must not create anything")
+        self.assertFalse(tests._is_live("\\\\localhost\\" + share.replace(live.name, "other.db")))  # not over-blocking
+
+    def test_win32_unc_prefix_is_stripped(self) -> None:
+        self.assertEqual(tests._win32_spelling("\\\\?\\UNC\\host\\share\\a. \\b."), "\\\\host\\share\\a\\b")
+        self.assertEqual(tests._win32_spelling("\\\\?\\C:\\a\\..\\b"), "C:\\a\\..\\b")
+
+    def test_a_spelling_that_fails_to_normalise_is_treated_as_live(self) -> None:
+        self.require_installed()
+        with mock.patch.object(tests, "_win32_spelling", side_effect=ValueError):
+            self.assertTrue(tests._is_live("anything.db"))
+
     def test_wrappers_keep_identity(self) -> None:
         self.require_installed()
         self.assertEqual(sqlite3.connect.__name__, "connect")
