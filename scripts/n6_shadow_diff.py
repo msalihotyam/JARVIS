@@ -61,13 +61,14 @@ def commit_values(text: str) -> list[str]:
 
 
 def read_notes(path: Path) -> tuple[dict[str, int], dict[str, dict[str, Any]], datetime | None,
-                                    list[tuple[int, datetime]]]:
-    """(counts, newest verdict note per lane, first note time, live verdict notes as (line, at));
+                                    list[tuple[str, dict[str, Any], datetime]]]:
+    """(counts, newest verdict note per lane, first note time, EVERY live verdict note as
+    (lane, note, at));
     bad lines are counted. Only a note marked ``[origin=live]`` is live: older notes are unknown."""
     counts = {"lines": 0, "malformed": 0, "other": 0, "agree": 0, "disagree": 0, "false_pass": 0}
     newest: dict[str, dict[str, Any]] = {}
     first: datetime | None = None
-    live: list[tuple[int, datetime]] = []
+    live: list[tuple[str, dict[str, Any], datetime]] = []
     text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
     for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
@@ -88,11 +89,12 @@ def read_notes(path: Path) -> tuple[dict[str, int], dict[str, dict[str, Any]], d
             counts["other"] += 1
             continue
         counts[m.group(2)] += 1
+        note = {"line": number, "verdict": m.group(2),
+                "conveyor": {"verdict": m.group(3), "reason": m.group(4)},
+                "n6": {"verdict": m.group(5), "reason": m.group(6)}}
         if m.group(7) == "live":
-            live.append((number, at))
-        newest[m.group(1)] = {"line": number, "verdict": m.group(2),
-                              "conveyor": {"verdict": m.group(3), "reason": m.group(4)},
-                              "n6": {"verdict": m.group(5), "reason": m.group(6)}}
+            live.append((m.group(1), note, at))
+        newest[m.group(1)] = note
     return counts, newest, first, live
 
 
@@ -225,7 +227,7 @@ def build(root: Path, day: date, since: date | None = None) -> dict[str, Any]:
     after ``since``; unsafe = false_pass + n6_wrong exactly as ``classify`` reports them."""
     n6 = root / "build" / "n6"
     counts, newest, first, live_notes = read_notes(n6 / "notes.jsonl")
-    live_lines = {n for n, at in live_notes if since is None or at.date() >= since}
+    live_in = [(lane, note) for lane, note, at in live_notes if since is None or at.date() >= since]
     if first is None and (n6 / "SHADOW_ON").is_file():
         first = datetime.fromtimestamp((n6 / "SHADOW_ON").stat().st_mtime, timezone.utc)
     events, heals, bad = read_events(root / "build" / "conveyor" / "events.jsonl")
@@ -233,8 +235,10 @@ def build(root: Path, day: date, since: date | None = None) -> dict[str, Any]:
     raw = json.loads(lanes_path.read_text(encoding="utf-8")) if lanes_path.is_file() else {}
     lanes = {k: v for k, v in raw.items() if isinstance(v, dict)} if isinstance(raw, dict) else {}
     split = sorted(lane for lane, note in newest.items() if note["verdict"] != "agree")
+    # live unsafe comes from every live note, not only each lane's newest one
+    live_split = {lane for lane, note in live_in if note["verdict"] != "agree"}
     reports: dict[str, str | None] = {}
-    for lane in split:
+    for lane in sorted(set(split) | live_split):
         path = root / "build" / "reports" / f"{lane}.md"
         if _LANE.fullmatch(lane) and path.is_file():
             reports[lane] = path.read_text(encoding="utf-8", errors="replace")
@@ -246,11 +250,12 @@ def build(root: Path, day: date, since: date | None = None) -> dict[str, Any]:
     def tally(era: str, key: str, names: Any) -> dict[str, int]:
         return {n: sum(r["era"] == era and r[key] == n for r in records) for n in names}
 
-    mine = [r for r in records if newest[r["lane"]]["line"] in live_lines]
+    mine = [classify(lane, note, snap, heals, kpi, shadow) for lane, note in live_in
+            if note["verdict"] != "agree"]
     fp = sum(r["rule"] == "false_pass" for r in mine)
     wrong = sum(r["class"] == "n6_wrong" and r["rule"] != "false_pass" for r in mine)
     return {"date": day.isoformat(), "since": since.isoformat() if since else None,
-            "live_rounds": len(live_lines), "live_false_pass": fp, "live_n6_wrong": wrong,
+            "live_rounds": len(live_in), "live_false_pass": fp, "live_n6_wrong": wrong,
             "live_unsafe": fp + wrong, "shadow_start": first.isoformat() if first else None,
             "notes": counts, "events_malformed": bad, "kpi_slices": len(kpi),
             "live": tally("live", "class", CLASSES), "sweep": tally("sweep", "class", CLASSES),

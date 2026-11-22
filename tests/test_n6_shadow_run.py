@@ -59,6 +59,15 @@ class ShadowRunTest(unittest.TestCase):
         self.assertTrue(all(t.endswith(" [origin=live]") for t in lines), lines)
         self.assertEqual({r.origin for r in rows(self.db)}, {"live"})
 
+    def test_main_says_origin_live_on_stderr_only_when_origin_is_not_given(self) -> None:
+        import contextlib
+        import io
+        for argv, expected in (([], "origin=live (default)\n"),(["--origin", "sweep"], "")):
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                self.assertEqual(run.main(["--root", str(self.root), *argv]), 0)
+            self.assertEqual(err.getvalue(), expected)
+
     def test_explicit_sweep_origin_is_carried(self) -> None:
         self.on()
         self.judge(origin="sweep")

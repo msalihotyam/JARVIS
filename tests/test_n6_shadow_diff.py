@@ -128,6 +128,18 @@ class ShadowDiffTest(unittest.TestCase):
         self.assertEqual((rep["live_rounds"], rep["live_unsafe"]), (0, 0))
         self.assertIn("Live rounds: 4", diff.render_md(diff.build(self.root, DAY)))
 
+    def test_later_agree_note_for_same_lane_does_not_hide_an_earlier_live_unsafe_note(self) -> None:
+        self._live_notes()
+        d = lambda n: SHADOW + timedelta(days=n)  # noqa: E731
+        later = [_onote("FP", "sweep", d(5)), _onote("GOOD", "live", d(5))]  # newest per lane: agree
+        with (self.root / "build/n6/notes.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(later) + "\n")
+        rep = diff.build(self.root, DAY)
+        self.assertEqual((rep["live_rounds"], rep["live_false_pass"], rep["live_n6_wrong"],
+                          rep["live_unsafe"]), (5, 1, 1, 2))
+        rep = diff.build(self.root, DAY, since=date(2026, 11, 6))  # only the later live agree note remains
+        self.assertEqual((rep["live_rounds"], rep["live_unsafe"]), (1, 0))
+
     def test_cli_since_prints_the_counts_and_writes_nothing(self) -> None:
         import contextlib
         import io

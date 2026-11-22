@@ -231,13 +231,16 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="N6 shadow runner (Phase 1)")
     parser.add_argument("--live", type=int, metavar="N", help="print the last N judged slices")
     parser.add_argument("--root", type=Path, default=ROOT)
-    parser.add_argument("--origin", choices=("live", "sweep", "replay"), default="live",
+    parser.add_argument("--origin", choices=("live", "sweep", "replay"), default=None,
                         help="label for this run's notes and KPI rows (default: live)")
     args = parser.parse_args(argv)
     root = cast(Path, args.root)
     if args.live is not None:
         print(live(root, cast(int, args.live)), end="")
         return 0
+    if args.origin is None:
+        args.origin = "live"
+        print("origin=live (default)", file=sys.stderr)  # a manual run is visible; conveyor path stays live
     judge(root, clock=lambda: datetime.now(timezone.utc), origin=cast(str, args.origin))
     return 0
 
