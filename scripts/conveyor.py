@@ -3895,7 +3895,8 @@ class Conveyor:
                 return False
             trial = {k: s[k] for k in ("advisor", "subagent_model") if k in s}
             try:
-                text, base = self.slice_text(s)
+                text, base = self.slice_text(s, lanes)  # BASEAUTO1: the base slice_hold accepted
+                old = self.slice_text(s)[1]
                 lane_id = self.start(sid, s["model"], s["effort"], text, **trial)
             except Exception as exc:  # a raising start never leaves the slice started
                 self.n6_answer(epoch, sid, "refused", f"start_error: {type(exc).__name__}")
@@ -3908,6 +3909,8 @@ class Conveyor:
         self.record(lanes, sid, lane_id, s["model"], s["effort"], base, dest,
                     files=s.get("files", []), slice_=True, **trial)
         busy.add(sid)
+        if old not in ("main", base):  # BASEAUTO1
+            self.event("base_refreshed", slice=sid, old=old, new=base)
         self.event("dispatch", lane=sid, id=lane_id, model=s["model"], effort=s["effort"],
                    file=dest.name, backlog=True, tier=s["tier"], n6=True, **trial)
         self.n6_answer(epoch, sid, "started")
@@ -4048,7 +4051,7 @@ class Conveyor:
             return "int_busy"
         if self.breaker and not INT_RE.match(sid):
             return "breaker_open"
-        if why := self.slice_lint(s):
+        if why := self.slice_lint(s, lanes):
             return "held: " + why  # the lint would drop its header
         return None
 
@@ -4080,9 +4083,25 @@ class Conveyor:
                     choice = choice or s
         return choice, view
 
-    def slice_text(self, s):
+    def unstarted(self, s, lanes):
+        """BASEAUTO1: never dispatched, reviewed, CI-run or chained, and not a stacked FIX: its base
+        may follow main. Anything unreadable or odd answers False (the hold stays)."""
+        sid = s["id"]
+        if "stack" in s or "review_base" in s:
+            return False
+        try:  # a lane record carries any CI receipt; a review lane or report names the slice
+            if any(n in lanes or self.find_report(n) for n in (sid, f"CLREV-{sid}", f"CDX-{sid}", f"INT-{sid}")):
+                return False
+        except (OSError, ValueError):
+            return False
+        ap = self.auto_state()
+        return ap is not None and not any(k.startswith(sid + "@") for k in ap.get("chain", {})) and not any(
+            sid in chain_ids(c) for c in ap.get("chains", {}).values())
+
+    def slice_text(self, s, lanes=None):
         """(prompt text with the backlog's header, base) for a slice; OSError if unreadable.
-        The prompt's own @jarvis line (valid or not) gives way to the backlog's; its base stays."""
+        The prompt's own @jarvis line (valid or not) gives way to the backlog's; its base stays,
+        except that with `lanes` a stale base of an unstarted slice becomes main (BASEAUTO1)."""
         body = (self.root / s["prompt"]).read_text(encoding="utf-8")
         first, _, rest = body.partition("\n")
         hdr = re.match(r"﻿?@jarvis(\s|$)", first)
@@ -4090,6 +4109,9 @@ class Conveyor:
         base = m.group(1) if m else "main"
         if base == "main" and any(INT_RE.match(d) for d in s.get("depends_on", [])) and not INT_RE.match(s["id"]):
             base = self.main_head() or base  # CONVINTDEP: the main int_pushed verified this pass
+        elif (base != "main" and lanes is not None and (main := self.main_head())
+              and not sha_matches(base, main) and self.unstarted(s, lanes)):
+            base = main
         # line 2, not the header: check_header refuses any other key on the @jarvis line
         note = (f"NOTE: this lane runs with CLAUDE_CODE_SUBAGENT_MODEL={s['subagent_model']}: the default "
                 "subagent model; an agent's own model: frontmatter and a per-spawn model still win.\n"
@@ -4097,11 +4119,11 @@ class Conveyor:
         return (f"@jarvis lane={s['id']} model={s['model']} effort={s['effort']} base={base}\n"
                 + note + (rest if hdr else body)), base
 
-    def slice_lint(self, s):
+    def slice_lint(self, s, lanes=None):
         """Why the lint would drop this slice's header, else None (an unreadable prompt: None,
         dispatch reports it)."""
         try:
-            text, base = self.slice_text(s)
+            text, base = self.slice_text(s, lanes)
         except OSError:
             return None
         return check_header(text, self.main_head() if base != "main" else None)[1]
@@ -4130,7 +4152,8 @@ class Conveyor:
                 return started
             name = s["id"]
             try:
-                text, base = self.slice_text(s)
+                text, base = self.slice_text(s, lanes)
+                old = self.slice_text(s)[1]  # the prompt's own base: differs only after a refresh
             except OSError as e:
                 self.error(f"backlog {name}: prompt: {e}", lane=name)
                 slices = [x for x in slices if x is not s]
@@ -4169,6 +4192,8 @@ class Conveyor:
                 self.save_lanes(lanes)
             busy.add(name)
             started = True
+            if old not in ("main", base):  # BASEAUTO1: a stale base of an unstarted slice followed main
+                self.event("base_refreshed", slice=name, old=old, new=base)
             self.event("dispatch", lane=name, id=sid, model=s["model"], effort=s["effort"],
                        file=dest.name, backlog=True, tier=s["tier"],
                        route=s.get("route") if isinstance(s.get("route"), str) else "slice model", **trial)

@@ -612,6 +612,7 @@ class TestBacklog(Base):
         self.backlog({"id": "LOW", "effort": "low"}, {"id": "OLD"}, {"id": "OK"})
         (self.base / "prompts" / "OLD.md").write_text(
             "@jarvis lane=OLD model=opus effort=high base=072d0fe\nTASK\n", encoding="utf-8")
+        self.report("CLREV-OLD", "PASS")  # BASEAUTO1: reviewed, so its stale base keeps the hold
         self.c.pass_once()
         self.assertEqual(self.fake.bg_names(), ["OK"])
         self.assertTrue(self.view()["OLD"].startswith("held: base 072d0fe is not main"))
@@ -626,6 +627,46 @@ class TestBacklog(Base):
         self.backlog({"id": "OK"})
         self.c.pass_once()
         self.assertNotIn(conveyor.BACKLOG_BAD_ID, self.attn())
+
+    # ---- BASEAUTO1: an unstarted slice's stale base follows main at dispatch ----
+    def stale(self, sid, **kw):
+        self.backlog({"id": sid, **kw})
+        (self.base / "prompts" / f"{sid}.md").write_text(
+            f"@jarvis lane={sid} model=opus effort=high base=072d0fe\nTASK\n", encoding="utf-8")
+
+    def test_unstarted_stale_slice_dispatches_on_main_with_event(self):
+        self.stale("OLD")
+        self.c.pass_once()
+        main = self.c.main_head()
+        self.assertEqual(self.fake.bg_names(), ["OLD"])
+        self.assertEqual(self.fake.bg_calls()[0][10],
+                         f"@jarvis lane=OLD model=sonnet effort=medium base={main}\nTASK\n")
+        self.assertEqual(self.lanes()["OLD"]["base"], main)
+        (ev,) = [e for e in self.events() if e["event"] == "base_refreshed"]
+        self.assertEqual((ev["slice"], ev["old"], ev["new"]), ("OLD", "072d0fe", main))
+
+    def test_stale_slice_with_a_review_record_stays_held(self):
+        self.stale("OLD")
+        self.report("CDX-OLD", "BLOCKED")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), [])
+        self.assertTrue(self.view()["OLD"].startswith("held: base 072d0fe is not main"))
+        self.assertEqual([e for e in self.events() if e["event"] == "base_refreshed"], [])
+
+    def test_stale_slice_with_a_chain_record_stays_held(self):
+        self.stale("OLD")
+        self.c.auto_file.write_text(json.dumps({"since": self.t, "chain": {"OLD@" + "a" * 40: {"steps": []}}}),
+                                    encoding="utf-8")
+        self.assertFalse(self.c.unstarted({"id": "OLD"}, {}))
+        self.assertTrue(self.c.unstarted({"id": "NEW"}, {}))
+
+    def test_stacked_slice_base_untouched(self):
+        s = {"id": "FIX", "prompt": "build/conveyor/prompts/FIX.md", "model": "opus", "effort": "high",
+             "stack": ["d" * 40], "review_base": "f" * 40}
+        self.stale("FIX")
+        self.assertFalse(self.c.unstarted(s, {}))
+        self.assertEqual(self.c.slice_text(s, {})[1], "072d0fe")
+        self.assertIn("is not main", self.c.slice_lint(s, {}))
 
     def test_lint_slice_held_others_dispatched(self):
         self.backlog({"id": "DEP", "depends_on": ["GHOST"]}, {"id": "MISS", "files": ["jarvis/nope.py"]},
@@ -5935,7 +5976,7 @@ class TestN6Lease(Base):
         self.c.int_blocked = lambda sid, lanes: True
         self.assertEqual(self.n6_refused(), "int_busy")
         del self.c.int_blocked
-        self.c.slice_lint = lambda s: "no header"
+        self.c.slice_lint = lambda s, lanes=None: "no header"
         self.assertEqual(self.n6_refused(), "held: no header")
 
     def test_neg_raising_start_is_refused_never_started(self):
