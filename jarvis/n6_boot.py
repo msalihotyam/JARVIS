@@ -11,6 +11,8 @@ live git. Each leftover gets exactly one action:
 - HAND_BACK: the slice goes back to the conveyor. Boot records why, then releases the lease
   if it is ours and live. Recording comes first, so a crash between the two keeps the lease held.
 - ATTENTION: the leftover is unknown or not ours. It is left untouched and only recorded.
+- OUTCOME / UNKNOWN_OUTCOME (OUTCOME1): an intent without a receipt is reconciled read-only
+  against reality; positive evidence -> OUTCOME recorded, else ATTENTION UNKNOWN_OUTCOME. Never retried.
 
 A paused or unreadable (HELD_ALL) state sets ``hold``. ``act`` then touches nothing and the
 driver does not run. Boot never calls ``acquire``, so resuming under a new epoch belongs to
@@ -25,6 +27,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from typing import cast
 
 from jarvis import n6_lease
 from jarvis.n6_lease import Lease
@@ -38,11 +41,23 @@ class Action(enum.Enum):
     RESUME = "resume"
     HAND_BACK = "hand_back"
     ATTENTION = "attention"
+    OUTCOME = "outcome"  # an intent reconciled against reality: only recorded
+
+
+UNKNOWN_OUTCOME = "UNKNOWN_OUTCOME"  # REASON_CODES_v1 B: intent without receipt, reality unknown
+
+
+@dataclass(frozen=True)
+class Intent:
+    """A recorded intent without a result receipt (OUTCOME1). kind/ref: "push"/sha,
+    "key1"/approval file name, "dispatch"/lane id, "api"/reserve id."""
+    kind: str
+    ref: str
 
 
 @dataclass(frozen=True)
 class Item:
-    kind: str  # "slice" or "outbox"
+    kind: str  # "slice", "outbox" or "intent"
     ref: str  # slice id, or "<run_id>#<event_seq>"
     action: Action
     reason: str
@@ -64,6 +79,10 @@ class Facts:
     applied: frozenset[str] = frozenset()  # commit shas already integrated (git, as data)
     outbox: tuple[tuple[str, int], ...] = ()  # undelivered (run_id, event_seq) rows
     events: frozenset[tuple[str, int]] = frozenset()  # persisted (run_id, seq) events
+    intents: tuple[Intent, ...] = ()  # caller-journaled intents without a result receipt
+    # kind -> refs reality shows done (origin refs, approval files, lane ids, released api
+    # reserve ids), read-only by the caller. A kind missing here was not read: UNKNOWN_OUTCOME.
+    seen: Mapping[str, frozenset[str]] = field(default_factory=dict[str, frozenset[str]])
 
 
 @dataclass(frozen=True)
@@ -119,6 +138,23 @@ def _slice(sid: str, owner: str, now: float, lease: Lease | None, facts: Facts) 
     return Item("slice", sid, Action.RESUME, "consistent", sha)
 
 
+def _intents(state: object, lease: Lease | None, facts: Facts, resumed: set[str]) -> list[Item]:
+    """OUTCOME1: every intent without a receipt -> OUTCOME "done" only on positive evidence in
+    reality, else ATTENTION UNKNOWN_OUTCOME. Absence is never read as "not done"; nothing is
+    retried. The lease's own apply intents count, except one a slice RESUME already covers
+    (apply_once's receipt path settles it)."""
+    found = [(i.kind, i.ref, facts.seen.get(i.kind)) for i in facts.intents]
+    if lease is not None and isinstance(state, dict):
+        for _, event_id in n6_lease._applied(cast("dict[str, object]", state), lease.epoch):  # pyright: ignore[reportPrivateUsage]
+            if isinstance(event_id, str) and event_id.startswith("apply:"):
+                sha = event_id.rsplit(":", 1)[1]
+                if sha not in resumed:
+                    found.append(("apply", sha, facts.applied))
+    return [Item("intent", f"{kind}:{ref}", Action.OUTCOME, "done") if real is not None and ref and ref in real
+            else Item("intent", f"{kind}:{ref}", Action.ATTENTION, UNKNOWN_OUTCOME)
+            for kind, ref, real in found]
+
+
 def scan(lease_path: Path | str, pause_path: Path | str, owner: str, now: float,
          facts: Facts) -> Report:
     """Classify every leftover. Pure apart from reading the lease and pause files."""
@@ -136,6 +172,7 @@ def scan(lease_path: Path | str, pause_path: Path | str, owner: str, now: float,
         ok = (run_id, seq) in facts.events
         items.append(Item("outbox", f"{run_id}#{seq}", Action.RESUME if ok else Action.ATTENTION,
                           "deliver" if ok else "outbox row without its event"))
+    items += _intents(state, lease, facts, {i.sha for i in items if i.action is Action.RESUME})
     hold = "paused" if read_pause(Path(pause_path)) else "held_all" if held_all else ""
     return Report(owner, hold, lease, tuple(items), Path(lease_path), now)
 

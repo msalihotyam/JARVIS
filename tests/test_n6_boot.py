@@ -9,7 +9,8 @@ from unittest import mock
 
 from jarvis import n6_lease
 from jarvis.memory import SQLiteMemoryStore
-from jarvis.n6_boot import Action, Facts, Item, Report, act, apply_once, recorder, scan
+from jarvis.n6_boot import (UNKNOWN_OUTCOME, Action, Facts, Intent, Item, Report, act, apply_once, recorder,
+                            scan)
 from jarvis.notify import NotificationCore
 from jarvis.work_controls import write_pause
 from jarvis.work_evidence import EvidenceReceipt
@@ -353,6 +354,53 @@ class N6BootTest(unittest.TestCase):
         lease, receipts = self.own(), []
         out = apply_once(self.lease_path, lease, SHA, NOW, frozenset(), lambda: None, lambda: receipts.append(1))
         self.assertEqual((out, receipts), ("applied", [1]))
+
+    # OUTCOME1 (REASON_CODES_v1 B, UNKNOWN_OUTCOME): an intent without a result receipt is
+    # reconciled read-only against reality (given as data); never retried.
+    def outcome(self, kind, ref, seen):
+        report, acted, log = self.run_boot(Facts(intents=(Intent(kind, ref),), seen=seen))
+        self.assertTrue(acted)
+        self.assertTrue(all(e[0] == "record" for e in log))  # never resumed / retried
+        return [(e[1].kind, e[1].ref, e[1].action, e[1].reason) for e in log]
+
+    def test_outcome_push_reconciled_from_git_refs(self):
+        self.assertEqual(self.outcome("push", SHA, {"push": frozenset({SHA})}),
+                         [("intent", "push:" + SHA, Action.OUTCOME, "done")])
+
+    def test_outcome_key1_reconciled_from_approval_file(self):
+        self.assertEqual(self.outcome("key1", "S1.key1", {"key1": frozenset({"S1.key1"})}),
+                         [("intent", "key1:S1.key1", Action.OUTCOME, "done")])
+
+    def test_outcome_dispatch_reconciled_from_lane_state(self):
+        self.assertEqual(self.outcome("dispatch", "S1", {"dispatch": frozenset({"S1"})}),
+                         [("intent", "dispatch:S1", Action.OUTCOME, "done")])
+
+    def test_outcome_api_reconciled_from_ledger_row(self):
+        self.assertEqual(self.outcome("api", "r7", {"api": frozenset({"r7"})}),
+                         [("intent", "api:r7", Action.OUTCOME, "done")])
+
+    def test_outcome_unresolvable_is_unknown_outcome_and_never_retried(self):
+        for kind, ref, seen in (("push", SHA, {}),  # reality not read
+                                ("key1", "S1.key1", {"key1": frozenset()}),  # absent is not "not done"
+                                ("dispatch", "", {"dispatch": frozenset({""})})):  # no ref
+            with self.subTest(kind=kind):
+                self.assertEqual(self.outcome(kind, ref, seen),
+                                 [("intent", f"{kind}:{ref}", Action.ATTENTION, UNKNOWN_OUTCOME)])
+
+    def test_outcome_lease_apply_intent_without_apply_is_unknown_outcome(self):
+        lease = self.own()
+        with self.assertRaises(RuntimeError):
+            apply_once(self.lease_path, lease, SHA, NOW, frozenset(),
+                       lambda: (_ for _ in ()).throw(RuntimeError("crash")), lambda: None)
+        before = n6_lease._read(self.lease_path)["applied"]
+        report, acted, log = self.run_boot(Facts(known=frozenset({"s1"})))
+        got = [(e[0], e[1].ref, e[1].action, e[1].reason) for e in log]
+        self.assertIn(("record", "apply:" + SHA, Action.ATTENTION, UNKNOWN_OUTCOME), got)
+        self.assertNotIn("resume", [e[0] for e in log])
+        self.assertEqual(n6_lease._read(self.lease_path)["applied"], before)  # nothing re-applied
+        report, _, log = self.run_boot(Facts(known=frozenset({"s1"}), applied=frozenset({SHA})))
+        self.assertEqual([(e[1].ref, e[1].action) for e in log if e[1].kind == "intent"],
+                         [("apply:" + SHA, Action.OUTCOME)])
 
     def test_neg_tests_never_open_live_db(self):
         self.store()
