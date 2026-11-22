@@ -402,5 +402,34 @@ class N6BreakerGapTest(unittest.TestCase):
             self.assertIs(nb.reset(p, T0), False)  # fresh closed state: nothing to close
 
 
+class CutSwitchTest(unittest.TestCase):
+    """CUTSWITCH1: the one cut switch is a breaker file with the CUT_ROOT open."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.p = Path(tmp.name) / "cut.json"
+
+    def test_cut_opens_and_reset_closes(self):
+        self.assertFalse(nb.is_open(nb.load(self.p)))  # no file: not cut
+        self.assertTrue(nb.cut(self.p, T0, "operator"))
+        st = nb.load(self.p)
+        self.assertTrue(nb.is_open(st))
+        self.assertEqual(roots(st), [nb.CUT_ROOT])
+        self.assertTrue(nb.reset(self.p, T0))
+        self.assertFalse(nb.is_open(nb.load(self.p)))
+
+    def test_unreadable_switch_is_cut(self):
+        self.p.write_text("{not json", encoding="utf-8")
+        self.assertTrue(nb.is_open(nb.load(self.p)))
+        self.assertTrue(nb.cut(self.p, T0, "repair"))  # cutting over a corrupt file still cuts
+        self.assertEqual(roots(nb.load(self.p)), [nb.CUT_ROOT])
+
+    def test_lost_file_after_cut_stays_cut(self):
+        nb.cut(self.p, T0, "operator")
+        self.p.unlink()
+        self.assertTrue(nb.is_open(nb.load(self.p)))  # the .open marker remains
+
+
 if __name__ == "__main__":
     unittest.main()

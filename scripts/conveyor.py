@@ -38,6 +38,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))  # tests load this file by path
 from conveyor_workers import JULES_MAX_S, WORKERS, CodexWorker, JulesWorker  # noqa: E402
+import conveyor_api  # noqa: E402 - CUTSWITCH1: cut_set() is the one cut switch, read in hold()
 
 ROOT =Path(__file__).resolve().parents[1]  # repo root (scripts/ -> repo)
 SETTINGS = "build/conveyor/lanes.settings.json"
@@ -3375,7 +3376,7 @@ class Conveyor:
             and self.now() - self.last_start < MEM_GAP_S
         return (self.base / "PAUSE").exists() or self.disk_hold() or self.usage_hold \
             or self.mem_hold or throttled or bool(self.pager_flag("outage")) or bool(self.pager_flag("auth")) \
-            or self.cc_hold() \
+            or self.cc_hold() or conveyor_api.cut_set(self.base) \
             or bool(self.pager_flag("uv_prune_run"))  # uv prune: nothing starts while it runs
 
     def cc_version(self):
