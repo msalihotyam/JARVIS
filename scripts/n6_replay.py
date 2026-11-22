@@ -28,6 +28,7 @@ from bisect import bisect_left
 from collections import Counter
 from collections.abc import Callable, Iterable
 from datetime import datetime
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -113,7 +114,7 @@ CODES_A = ("key1_green_chain", "key1_green_protected", "chain_refused_finding", 
 CODES_B = ("packet_too_large", "queue_empty", "overlap", "UNKNOWN_OUTCOME")
 CODES = CODES_A + CODES_B
 KINDS = ("agree", "stricter", "disagree", "unsafe", "not_comparable")
-BAR = 0.95
+BAR = Fraction(95, 100)  # exact: a float 0.95 or a rounded rate lets 94999/100000 pass
 
 
 def reason_code(record: dict[str, Any]) -> str:
@@ -150,12 +151,13 @@ def code_table(items: Iterable[tuple[str, str]]) -> dict[str, dict[str, Any]]:
         covered = c["agree"] + c["stricter"] + c["disagree"] + c["unsafe"]
         raw, excl = _rate(c["agree"], covered - c["agree"]), _rate(
             c["agree"], covered - c["agree"] - c["stricter"])
+        # the bar compares exact counts; the rounded rates are for display only
+        passes = lambda total: bool(total) and c["agree"] >= BAR * total and not c["unsafe"]  # noqa: E731
         table[code] = {
             "section": "A" if code in CODES_A else "B", **{k: c[k] for k in KINDS},
             "agreement_raw": raw, "agreement_excl_stricter": excl,
             "coverage": "no coverage" if not covered else f"{covered} compared",
-            "bar95_raw": raw is not None and raw >= BAR and not c["unsafe"],
-            "bar95_excl_stricter": excl is not None and excl >= BAR and not c["unsafe"]}
+            "bar95_raw": passes(covered), "bar95_excl_stricter": passes(covered - c["stricter"])}
     return table
 
 
@@ -428,8 +430,8 @@ def scenario_code(scenario: dict[str, Any]) -> str:
 
 
 def _exam_kind(row: dict[str, Any]) -> str:
-    if row["verdict"] == "disagree" and row["actual"] == "inbox":
-        return "stricter"  # N6 holds back where the designed answer was to act
+    if row["verdict"] == "disagree" and row["expected"] == "approve_key1" and row["actual"] == "inbox":
+        return "stricter"  # N6 holds back where the designed answer was to act; nothing else is
     return {"uncovered": "not_comparable"}.get(row["verdict"], row["verdict"])
 
 

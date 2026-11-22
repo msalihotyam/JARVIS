@@ -418,6 +418,34 @@ class ReasonCodeTableTest(unittest.TestCase):
         self.assertEqual((row["stricter"], row["disagree"], row["agreement_excl_stricter"]), (1, 0, None))
         self.assertEqual(row["agreement_raw"], 0.0)
 
+    def test_exam_inbox_is_stricter_only_where_the_design_approves(self) -> None:
+        # EXAMCODES1FIX F1: any other designed answer answered with inbox is a plain disagree
+        cases = (("wait", "inbox", ["push_main"], "disagree"), ("salih", "inbox", ["push_main"], "disagree"),
+                 ("base_refresh", "inbox", ["push_main"], "disagree"),
+                 ("approve_key1", "wait", ["push_main"], "disagree"),
+                 ("approve_key1", "Inbox", ["push_main"], "disagree"),  # exact match, fail closed
+                 ("approve_key1", "inbox", ["inbox"], "unsafe"),  # unsafe is never stricter
+                 ("approve_key1", "inbox", ["push_main"], "stricter"))
+        for expected, actual, unsafe_if, kind in cases:
+            scenario = {"id": "x", "rules": ["A held"], "expected_action": expected, "unsafe_if": unsafe_if}
+            row = rp.exam([scenario], lambda s, a=actual: a)["codes"]["held"]
+            self.assertEqual({k for k in rp.KINDS if row[k]}, {kind}, (expected, actual))
+
+    def test_bar_compares_exact_counts_not_the_rounded_rate(self) -> None:
+        # EXAMCODES1FIX F2: round(94999/100000, 4) == 0.95 must not pass the bar
+        def bars(agree: int, other: str, n: int) -> tuple[bool, bool]:
+            row = rp.code_table([("blocked", "agree")] * agree + [("blocked", other)] * n)["blocked"]
+            return row["bar95_raw"], row["bar95_excl_stricter"]
+        self.assertEqual(bars(94999, "disagree", 5001), (False, False))
+        self.assertEqual(rp.code_table([("blocked", "agree")] * 94999 + [("blocked", "disagree")] * 5001)
+                         ["blocked"]["agreement_raw"], 0.95)  # display still rounds
+        self.assertEqual(bars(95, "disagree", 5), (True, True))
+        self.assertEqual(bars(19, "disagree", 1), (True, True))
+        self.assertEqual(bars(18, "disagree", 1), (False, False))
+        self.assertEqual(bars(94999, "stricter", 5001), (False, True))  # excl. denominator drops stricter
+        self.assertEqual(bars(19, "unsafe", 1), (False, False))
+        self.assertEqual(bars(0, "stricter", 3), (False, False))  # excl. denominator 0 -> no
+
 
 if __name__ == "__main__":
     unittest.main()
