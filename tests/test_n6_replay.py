@@ -344,5 +344,80 @@ class ExamScenarioTest(unittest.TestCase):
                 self.assertEqual(len(rp.load_exam(Path(tmp))), 1)
 
 
+class ReasonCodeTableTest(unittest.TestCase):
+    """EXAMCODES1: agreement per REASON_CODES_v1 code; stricter apart; unsafe per code."""
+
+    @staticmethod
+    def _rec(truth: str, why: str, verdict: str) -> dict:
+        return {"conveyor": {"verdict": truth, "reason": why}, "verdict": verdict}
+
+    def test_record_to_code(self) -> None:
+        for truth, why, code in (
+                ("pass", "lane finished PASS", "key1_green_chain"),
+                ("block", "chained check CLREV-X BLOCKED", "chain_refused_finding"),
+                ("block", "chained check CDX-X BLOCKED", "chain_refused_finding"),
+                ("block", "chained check INT-X BLOCKED", "blocked"),
+                ("block", "lane finished BLOCKED", "blocked"),
+                ("excluded", "lane has not finished", "unknown")):
+            self.assertEqual(rp.reason_code(self._rec(truth, why, "agree")), code, why)
+
+    def test_kinds_split_stricter_from_disagree_and_unsafe(self) -> None:
+        kind = lambda t, v: rp._kind(self._rec(t, "x", v))  # noqa: E731
+        self.assertEqual([kind("pass", "disagree"), kind("block", "false_pass"), kind("pass", "agree"),
+                          kind("pass", "unprovable")],
+                         ["stricter", "unsafe", "agree", "not_comparable"])
+
+    def test_table_has_every_code_and_reports_both_agreements(self) -> None:
+        table = rp.code_table([("blocked", "agree")] * 19 + [("blocked", "stricter")] * 2
+                              + [("overlap", "unsafe"), ("nonsense", "agree")])
+        self.assertEqual(list(table), list(rp.CODES))
+        row = table["blocked"]
+        self.assertEqual((row["agreement_raw"], row["agreement_excl_stricter"]), (round(19 / 21, 4), 1.0))
+        self.assertEqual((row["bar95_raw"], row["bar95_excl_stricter"]), (False, True))
+        self.assertEqual(table["held"]["coverage"], "no coverage")  # cannot open
+        self.assertFalse(table["held"]["bar95_raw"])
+        self.assertEqual((table["overlap"]["unsafe"], table["overlap"]["bar95_excl_stricter"]), (1, False))
+        self.assertEqual(table["unknown"]["agree"], 1)  # an unmapped code lands in unknown
+
+    def test_replay_summary_and_report_carry_the_table(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            events = Path(tmp, "build", "conveyor", "events.jsonl")
+            events.parent.mkdir(parents=True)
+            events.write_text("", encoding="utf-8")
+            result = rp.replay(Path(tmp))  # no history: every code is "no coverage"
+        codes = result["summary"]["codes"]
+        self.assertEqual(list(codes), list(rp.CODES))
+        self.assertTrue(all(r["coverage"] == "no coverage" for r in codes.values()))
+        json.dumps(result["summary"])
+        text = rp.report(result)
+        self.assertIn("## per reason code", text)
+        self.assertIn("| key1_green_protected |", text)
+        self.assertIn("no coverage", text)
+
+    def test_exam_scenarios_map_to_codes_and_unsafe_is_counted_per_code(self) -> None:
+        scenarios = rp.load_exam()
+        self.assertEqual(rp.scenario_code({"rules": ["B2", "REASON_CODES B overlap"]}), "overlap")
+        self.assertEqual(rp.scenario_code({"rules": ["B2", "D3"]}), "unknown")
+        by = {s["id"]: s for s in scenarios}
+        self.assertEqual(rp.scenario_code(by["a_held_pos"]), "held")
+        self.assertEqual(rp.scenario_code(by["d12_unsafe_packet"]), "packet_too_large")
+        sid = "a_key1_green_chain_neg"
+        result = rp.exam(scenarios, lambda s: s["unsafe_if"][0] if s["id"] == sid else s["expected_action"])
+        self.assertEqual(result["codes"]["key1_green_chain"]["unsafe"], 1)
+        self.assertEqual(result["codes"]["key1_green_chain"]["agree"], 1)
+        self.assertEqual(sum(r["unsafe"] for r in result["codes"].values()), 1)
+        text = rp.exam_report(result)
+        self.assertIn("## per reason code", text)
+        self.assertIn("| key1_green_chain | 1 | 0 | 0 | 1 |", text)
+        self.assertEqual(rp.exam_report(rp.exam(scenarios, rp.n6_decide)).count("no coverage") > 0, True)
+
+    def test_exam_stricter_is_an_inbox_where_the_design_acts(self) -> None:
+        scenarios = [{"id": "x", "rules": ["A key1_green_chain"], "expected_action": "approve_key1",
+                      "unsafe_if": ["wait"]}]
+        row = rp.exam(scenarios, lambda s: "inbox")["codes"]["key1_green_chain"]
+        self.assertEqual((row["stricter"], row["disagree"], row["agreement_excl_stricter"]), (1, 0, None))
+        self.assertEqual(row["agreement_raw"], 0.0)
+
+
 if __name__ == "__main__":
     unittest.main()

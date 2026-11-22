@@ -26,7 +26,7 @@ import sys
 import tempfile
 from bisect import bisect_left
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -105,6 +105,72 @@ def behaviour(why: str) -> str:
     return "unmapped"
 
 
+# EXAMCODES1 (Gate B B4a): agreement per REASON_CODES_v1 code (sections A and B; C is not a DIGEST
+# code). The 95% bar is applied per code; "stricter" (N6 blocks/inboxes where the truth passed) is
+# shown apart and never decided here: both agreement numbers are printed.
+CODES_A = ("key1_green_chain", "key1_green_protected", "chain_refused_finding", "blocked", "held",
+           "needs_t2_approval", "queue_low_n6", "queue_low_improve", "unknown")
+CODES_B = ("packet_too_large", "queue_empty", "overlap", "UNKNOWN_OUTCOME")
+CODES = CODES_A + CODES_B
+KINDS = ("agree", "stricter", "disagree", "unsafe", "not_comparable")
+BAR = 0.95
+
+
+def reason_code(record: dict[str, Any]) -> str:
+    """The DIGEST reason code of a replayed decision, from the truth (conveyor) verdict.
+
+    DECISION TAKEN: a pass is key1_green_chain (history cannot tell a protected range, so
+    key1_green_protected stays uncovered); a block on a chained CLREV-/CDX- check is
+    chain_refused_finding, any other block is blocked; excluded or anything else is unknown."""
+    verdict, why = record["conveyor"]["verdict"], record["conveyor"]["reason"]
+    if verdict == "pass":
+        return "key1_green_chain"
+    if verdict == "block":
+        found = re.match(r"chained check (\S+)", why)
+        return ("chain_refused_finding" if found and found.group(1).startswith(("CLREV-", "CDX-"))
+                else "blocked")
+    return "unknown"
+
+
+def _kind(record: dict[str, Any]) -> str:
+    verdict = record["verdict"]
+    if verdict == "disagree":  # n6 is never "pass" here, so truth passed and n6 blocked
+        return "stricter" if record["conveyor"]["verdict"] == "pass" else "disagree"
+    return {"agree": "agree", "false_pass": "unsafe"}.get(verdict, "not_comparable")
+
+
+def code_table(items: Iterable[tuple[str, str]]) -> dict[str, dict[str, Any]]:
+    """{code: row} for every code in CODES from (code, kind) pairs; a code outside the list is
+    unknown. A row with nothing comparable has coverage "no coverage" (it cannot open)."""
+    counts = {code: Counter() for code in CODES}
+    for code, kind in items:
+        counts[code if code in counts else "unknown"][kind] += 1
+    table = {}
+    for code, c in counts.items():
+        covered = c["agree"] + c["stricter"] + c["disagree"] + c["unsafe"]
+        raw, excl = _rate(c["agree"], covered - c["agree"]), _rate(
+            c["agree"], covered - c["agree"] - c["stricter"])
+        table[code] = {
+            "section": "A" if code in CODES_A else "B", **{k: c[k] for k in KINDS},
+            "agreement_raw": raw, "agreement_excl_stricter": excl,
+            "coverage": "no coverage" if not covered else f"{covered} compared",
+            "bar95_raw": raw is not None and raw >= BAR and not c["unsafe"],
+            "bar95_excl_stricter": excl is not None and excl >= BAR and not c["unsafe"]}
+    return table
+
+
+def code_table_md(table: dict[str, dict[str, Any]]) -> list[str]:
+    out = ["| code | agree | stricter | disagree | unsafe | not-comparable | raw | excl. stricter "
+           "| 95% raw / excl. | coverage |", "|---|---|---|---|---|---|---|---|---|---|"]
+    for code, r in table.items():
+        bar = ("-" if r["coverage"] == "no coverage" else
+               f"{'yes' if r['bar95_raw'] else 'no'} / {'yes' if r['bar95_excl_stricter'] else 'no'}")
+        out.append(f"| {code} | {r['agree']} | {r['stricter']} | {r['disagree']} | {r['unsafe']} "
+                   f"| {r['not_comparable']} | {_pct(r['agreement_raw'])} "
+                   f"| {_pct(r['agreement_excl_stricter'])} | {bar} | {r['coverage']} |")
+    return out
+
+
 def _class(truth: str, n6: str, why: str) -> str:
     text = _HEX.sub("<sha>", why)
     text = re.sub(r"chained check ([A-Z]+)-\S+", r"chained check \1-*", text)
@@ -153,11 +219,13 @@ def _judge(root: Path, events: list[dict[str, Any]], d: dict[str, Any],
         outcome, verdict, why = "different", "false_pass", truth[1]
     else:
         outcome, verdict, why = "different", "disagree", n6[1]
-    return {"idx": at, "finish": d["f"], "ts": events[at]["ts"], "lane": lane,
-            "outcome": outcome, "verdict": verdict, "behaviour": behaviour(why),
-            "class": _class(truth[0], n6[0], why),
-            "conveyor": {"verdict": truth[0], "reason": truth[1]},
-            "n6": {"verdict": n6[0], "reason": n6[1]}}
+    record = {"idx": at, "finish": d["f"], "ts": events[at]["ts"], "lane": lane,
+              "outcome": outcome, "verdict": verdict, "behaviour": behaviour(why),
+              "class": _class(truth[0], n6[0], why),
+              "conveyor": {"verdict": truth[0], "reason": truth[1]},
+              "n6": {"verdict": n6[0], "reason": n6[1]}}
+    record["code"] = reason_code(record)
+    return record
 
 
 def replay(root: Path, *, head: Callable[[str], str | None] = _no_head) -> dict[str, Any]:
@@ -229,6 +297,7 @@ def replay(root: Path, *, head: Callable[[str], str | None] = _no_head) -> dict[
         "behaviours": {b: {**{o: c[o] for o in OUTCOMES}, "agreement": _rate(c["agree"], c["different"])}
                        for b, c in sorted(rows.items())},
         "classes": {o: dict(sorted(classes[o].items())) for o in OUTCOMES},
+        "codes": code_table((r["code"], _kind(r)) for r in records),
         "last_ts": re.sub(r"[^0-9A-Za-z]", "", events[-1]["ts"]) if events else "empty",
     }
     return {"summary": summary, "records": records}
@@ -273,7 +342,8 @@ def report(result: dict[str, Any]) -> str:
     for name, row in s["behaviours"].items():
         out.append(f"| {name} | {row['agree']} | {row['different']} | {row['not_comparable']} "
                    f"| {_pct(row['agreement'])} |")
-    out += ["", "## top disagreement classes", ""]
+    out += ["", "## per reason code (REASON_CODES_v1 A+B; unknown = unmapped; stricter shown apart)",
+            "", *code_table_md(s["codes"]), "", "## top disagreement classes", ""]
     top = sorted(s["classes"]["different"].items(), key=lambda kv: (-kv[1], kv[0]))[:10]
     for cls, count in top:
         out.append(f"- {count} x {cls}")
@@ -348,6 +418,21 @@ def n6_decide(scenario: dict[str, Any]) -> str | None:
     return "approve_key1" if verdict == "pass" else "inbox"
 
 
+def scenario_code(scenario: dict[str, Any]) -> str:
+    """First rule shaped "A <code>" / "REASON_CODES B <code>"; no such rule -> unknown."""
+    for rule in scenario["rules"]:
+        found = re.fullmatch(r"(?:A|REASON_CODES B) (\w+)", str(rule).strip())
+        if found:
+            return found.group(1)
+    return "unknown"
+
+
+def _exam_kind(row: dict[str, Any]) -> str:
+    if row["verdict"] == "disagree" and row["actual"] == "inbox":
+        return "stricter"  # N6 holds back where the designed answer was to act
+    return {"uncovered": "not_comparable"}.get(row["verdict"], row["verdict"])
+
+
 def exam(scenarios: list[dict[str, Any]],
          decide: Callable[[dict[str, Any]], str | None]) -> dict[str, Any]:
     """agree / disagree / unsafe / uncovered per scenario; any unsafe fails the exam."""
@@ -357,11 +442,12 @@ def exam(scenarios: list[dict[str, Any]],
         verdict = ("uncovered" if got is None else "unsafe" if got in scenario["unsafe_if"]
                    else "agree" if got == scenario["expected_action"] else "disagree")
         rows.append({"id": scenario["id"], "expected": scenario["expected_action"],
-                     "actual": got, "verdict": verdict})
+                     "actual": got, "verdict": verdict, "code": scenario_code(scenario)})
     counts = Counter(row["verdict"] for row in rows)
     summary = {v: counts[v] for v in ("agree", "disagree", "unsafe", "uncovered")}
     return {"rows": rows, "summary": {**summary, "total": len(rows),
-                                      "passed": summary["unsafe"] == 0}}
+                                      "passed": summary["unsafe"] == 0},
+            "codes": code_table((r["code"], _exam_kind(r)) for r in rows)}
 
 
 def exam_report(result: dict[str, Any]) -> str:
@@ -371,6 +457,8 @@ def exam_report(result: dict[str, Any]) -> str:
     summary = result["summary"]
     lines += [""] + [f"{v}: {summary[v]}" for v in ("agree", "disagree", "unsafe", "uncovered")]
     lines.append(f"result: {'PASS' if summary['passed'] else 'FAIL'}")
+    lines += ["", "## per reason code (REASON_CODES_v1 A+B; unknown = unmapped; stricter shown apart)",
+              "", *code_table_md(result["codes"])]
     return "\n".join(lines) + "\n"
 
 
