@@ -431,6 +431,14 @@ class CutSwitchTest(unittest.TestCase):
             self.call()
             self.assertEqual(len(self.sent), 1)
 
+    def test_one_resolver_for_every_reader(self):
+        self.assertEqual(api.cut_path(), api.ROOT / api.CUT_NAME)
+        self.assertEqual(api.cut_path(self.root), self.root / api.CUT_NAME)
+        with mock.patch.object(api, "ROOT", self.root):  # the default follows the one ROOT
+            self.assertTrue(self.nb().cut(api.cut_path(), T0, "operator"))
+            self.assertTrue(api.cut_set())
+        self.assertTrue(api.cut_set(self.root))
+
     def test_unreadable_switch_is_cut(self):
         (self.root / api.CUT_NAME).write_text("{bad", encoding="utf-8")
         self.refused(lambda: self.call(), "cut switch")

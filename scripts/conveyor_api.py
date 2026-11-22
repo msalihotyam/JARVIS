@@ -75,11 +75,16 @@ def _breaker():
     return mod
 
 
-def cut_set(root=ROOT):
+def cut_path(root=None):
+    """The ONE cut.json path: the broker and the conveyor's hold() both resolve it here (default: ROOT)."""
+    return Path(ROOT if root is None else root) / CUT_NAME
+
+
+def cut_set(root=None):
     """True when the cut switch is set; fail closed: unreadable switch or breaker = cut."""
     try:
         nb = _breaker()
-        return nb.is_open(nb.load(Path(root) / CUT_NAME))
+        return nb.is_open(nb.load(cut_path(root)))
     except Exception:
         return True
 
