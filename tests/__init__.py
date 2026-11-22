@@ -87,6 +87,13 @@ if getattr(_memory.SQLiteMemoryStore.__init__, "__name__", "") != _refuse_live_d
 # plain path; a dangling link, a custom opener/factory and a changing __fspath__ are refused or pinned.
 # shortcut: ``os.open``, ``ATTACH`` and ``VACUUM INTO`` are not covered; wrap them if a test needs them.
 _COMPANIONS = ("", "-wal", "-shm", "-journal")
+# POLICYGUARD1FIX4: the guard runs inside every open(), so it calls only these import-time refs; a
+# test that spies on os.stat / os.path.realpath / ... then sees its own calls, never the guard's.
+# shortcut: what ntpath's own functions look up (ntpath.join/normpath, and os.fspath inside
+# join/normcase) stays patchable; capture or reimplement those if a test ever spies on them.
+_stat, _fspath, _fsdecode = os.stat, os.fspath, os.fsdecode
+_abspath, _split, _join, _dirname = os.path.abspath, os.path.split, os.path.join, os.path.dirname
+_realpath, _samestat, _lexists, _exists = os.path.realpath, os.path.samestat, os.path.lexists, os.path.exists
 
 
 def _live_name(name: str) -> bool:
@@ -98,7 +105,7 @@ def _live_name(name: str) -> bool:
 
 def _exact(target):  # type: ignore[no-untyped-def]
     # The exact str/bytes a call opens: a subclass cannot answer == / in differently.
-    raw = os.fspath(target)
+    raw = _fspath(target)
     return str.__str__(raw) if isinstance(raw, str) else bytes(raw)
 
 
@@ -106,35 +113,35 @@ def _decide(text: str, plain: bool = False) -> bool:
     # plain: the path reading of a "file:" string. A path Win32 cannot resolve (invalid name, missing
     # folder) cannot be opened either, so only for that reading such an error means "not live".
     try:
-        live = os.fspath(LIVE_DATABASE)
+        live = _fspath(LIVE_DATABASE)
         # (a) the same file as an existing live file, whatever the spelling or link. The stream suffix
         # and trailing dots/spaces are dropped: a stream on a hard link is a stream on the live file.
         existing = []
         for suffix in _COMPANIONS:
             try:
-                existing.append(os.stat(live + suffix))
+                existing.append(_stat(live + suffix))
             except FileNotFoundError:
                 pass
         if existing:
-            head, tail = os.path.split(os.path.abspath(text))
+            head, tail = _split(_abspath(text))
             try:
-                found = os.stat(os.path.join(head, tail.split(":")[0].rstrip(". ")))
+                found = _stat(_join(head, tail.split(":")[0].rstrip(". ")))
             except (FileNotFoundError, NotADirectoryError):
                 found = None
-            if found is not None and any(os.path.samestat(found, each) for each in existing):
+            if found is not None and any(_samestat(found, each) for each in existing):
                 return True
-        if os.path.lexists(text) and not os.path.exists(text):
+        if _lexists(text) and not _exists(text):
             return True  # a dangling link: realpath can be led elsewhere than the OS will go
         # (b) a jarvis.db* name in the live folder. realpath also follows a link to a missing file.
-        parent, name = os.path.split(os.path.realpath(text))
+        parent, name = _split(_realpath(text))
         if not _live_name(name):
             return False
-        parent_stat = os.stat(parent)  # a missing or unreachable folder raises: live (c)
+        parent_stat = _stat(parent)  # a missing or unreachable folder raises: live (c)
         try:
-            live_folder = os.stat(os.path.dirname(live))
+            live_folder = _stat(_dirname(live))
         except FileNotFoundError:
             return False  # no live folder: an existing folder cannot be it
-        return os.path.samestat(parent_stat, live_folder)
+        return _samestat(parent_stat, live_folder)
     except OSError as error:
         unresolvable = isinstance(error, (FileNotFoundError, NotADirectoryError)) or getattr(error, "winerror", None) == 123
         if plain and unresolvable:
@@ -146,7 +153,7 @@ def _is_live(target) -> bool:  # type: ignore[no-untyped-def]
     if not isinstance(target, (str, bytes, os.PathLike)):
         return False  # a file descriptor is never the path
     try:
-        text = os.fsdecode(_exact(target))
+        text = _fsdecode(_exact(target))
         if text[:5].lower() != "file:":
             return text not in ("", ":memory:") and _decide(text)  # SQLite's in-memory / temporary: no file
         # open() and a connect without uri=True take the same string as a plain relative path

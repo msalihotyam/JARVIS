@@ -209,13 +209,48 @@ class PolicyGuardTests(unittest.TestCase):
         for error in (ValueError, OSError, PermissionError):
             for target in ("file:///anything.db", "anything.db", live):
                 with self.subTest(error=error, target=target):
-                    with mock.patch.object(os, "stat", side_effect=error):
-                        self.assertTrue(tests._is_live(target))
-                    with mock.patch.object(os.path, "realpath", side_effect=error):
-                        self.assertTrue(tests._is_live(target))
+                    # POLICYGUARD1FIX4: the guard calls its import-time refs, so those are what raise.
+                    for name in ("_stat", "_realpath", "_lexists"):
+                        with mock.patch.object(tests, name, side_effect=error):
+                            self.assertTrue(tests._is_live(target), name)
         missing = self.scratch() / "missing"
         self.assertTrue(tests._is_live(missing / "jarvis.db"))
         self.assertFalse(tests._is_live(missing / "other.db"))  # not a live name: no folder to decide
+
+    def test_spies_on_os_helpers_never_see_the_guard(self) -> None:
+        # POLICYGUARD1FIX4 (CLREV F1): a test spying on os.* must not log the guard's own calls inside
+        # open()/connect. The live file exists so rule (a) stats; a jarvis.db name runs rule (b).
+        live = self.stand_in_live()
+        touch(live)
+        other = self.scratch()
+        touch(other / "plain.txt")
+        touch(other / "jarvis.db")
+        # Plain strings only: pathlib itself calls os.fspath, which is not the guard.
+        plain, copy, live_wal, live = str(other / "plain.txt"), str(other / "jarvis.db"), str(live) + "-wal", str(live)
+        names = {
+            # not os.fspath / os.path.abspath, split, join: ntpath.realpath itself calls those (the
+            # shortcut in tests/__init__.py)
+            os: ("stat", "lstat", "fsdecode"),
+            os.path: ("realpath", "exists", "lexists", "dirname", "samestat"),
+        }
+        spies = []
+        for module, attributes in names.items():
+            for attribute in attributes:
+                spy = mock.Mock(side_effect=getattr(module, attribute))
+                patcher = mock.patch.object(module, attribute, spy)
+                patcher.start()
+                self.addCleanup(patcher.stop)
+                spies.append((attribute, spy))
+        with open(plain, "rb"):
+            pass
+        sqlite3.connect(copy).close()
+        self.assertTrue(tests._is_live(live))
+        self.assertTrue(tests._is_live(live_wal.upper()))
+        self.assertFalse(tests._is_live(copy))
+        with self.assertRaises(AssertionError):
+            open(live, "rb")
+        for attribute, spy in spies:
+            self.assertEqual(spy.call_count, 0, attribute)
 
     def test_wrappers_keep_identity(self) -> None:
         self.require_installed()
