@@ -949,6 +949,7 @@
   "tests.test_orphan_parity.OrphanSurfaceTests": 0.612,
   "tests.test_permissions.PermissionPolicyTests": 79.989,
   "tests.test_permissions.ScopeNormalizationTests": 0.007,
+  "tests.test_policy_guard.PolicyGuardTests": 0.1,
   "tests.test_policy_proxy.BrowserConfigurationTests": 0.0,
   "tests.test_policy_proxy.ControlTests": 0.0,
   "tests.test_policy_proxy.ExplicitLocalAuthorityTests": 0.0,
