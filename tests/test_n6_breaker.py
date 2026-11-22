@@ -425,6 +425,15 @@ class CutSwitchTest(unittest.TestCase):
         self.assertTrue(nb.cut(self.p, T0, "repair"))  # cutting over a corrupt file still cuts
         self.assertEqual(roots(nb.load(self.p)), [nb.CUT_ROOT])
 
+    def test_older_cut_never_lowers_a_newer_cut(self):
+        nb.cut(self.p, T0 + 10, "new")
+        nb.cut(self.p, T0, "old")  # an older cut() must not let reset() clear the newer cut
+        self.assertEqual([o[2] for o in nb.load(self.p).opened if o[0] == nb.CUT_ROOT], ["new"])  # reason of the newest
+        self.assertFalse(nb.reset(self.p, T0 + 5))
+        self.assertTrue(nb.is_open(nb.load(self.p)))
+        self.assertTrue(nb.reset(self.p, T0 + 10))
+        self.assertFalse(nb.is_open(nb.load(self.p)))
+
     def test_lost_file_after_cut_stays_cut(self):
         nb.cut(self.p, T0, "operator")
         self.p.unlink()

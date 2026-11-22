@@ -196,6 +196,9 @@ class Base(unittest.TestCase):
         self.addCleanup(env.stop)
         os.environ.pop("JARVIS_NTFY_CMD_TOPIC", None)
         self.base = self.root / "build" / "conveyor"
+        api_root = mock.patch.object(conveyor.conveyor_api, "ROOT", self.base)  # never the real cut.json
+        api_root.start()
+        self.addCleanup(api_root.stop)
         self.hour = 12  # local hour for the night rule: never the real clock's
         hour = mock.patch.object(conveyor, "local_hour", lambda t: self.hour)
         hour.start()
@@ -499,6 +502,18 @@ class TestInbox(Base):
         self.assertFalse(api.cut_set(self.base))
         self.c.pass_once()
         self.assertEqual(self.fake.bg_names(), ["A", "B"])
+
+    def test_hold_reads_the_brokers_cut_path_not_its_own_checkout(self):
+        api = conveyor.conveyor_api
+        other = self.root / "main-checkout"  # the broker's ROOT when the conveyor runs from a worktree
+        other.mkdir()
+        self.c.pass_once()  # learns the free disk, so hold() below is about the cut alone
+        self.assertFalse(self.c.hold())
+        with mock.patch.object(api, "ROOT", other):
+            self.assertTrue(api._breaker().cut(api.cut_path(), self.t, "operator"))
+            self.assertTrue(self.c.hold())
+            self.assertTrue(api.cut_set(other))  # the broker reads the same file
+        self.assertFalse(self.c.hold())  # a cut elsewhere does not hold the other path
 
     def test_unreadable_cut_switch_holds_dispatch(self):
         (self.base / conveyor.conveyor_api.CUT_NAME).write_text("{bad", encoding="utf-8")

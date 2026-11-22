@@ -3376,7 +3376,7 @@ class Conveyor:
             and self.now() - self.last_start < MEM_GAP_S
         return (self.base / "PAUSE").exists() or self.disk_hold() or self.usage_hold \
             or self.mem_hold or throttled or bool(self.pager_flag("outage")) or bool(self.pager_flag("auth")) \
-            or self.cc_hold() or conveyor_api.cut_set(self.base) \
+            or self.cc_hold() or conveyor_api.cut_set() \
             or bool(self.pager_flag("uv_prune_run"))  # uv prune: nothing starts while it runs
 
     def cc_version(self):

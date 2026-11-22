@@ -274,7 +274,10 @@ def cut(path: Path | str, ts: float, reason: str) -> bool:
             return False
         state = load(path)
         state = state if isinstance(state, State) else State()
-        opened = tuple(o for o in state.opened if o[0] != CUT_ROOT) + ((CUT_ROOT, float(ts), reason),)
+        # the newest cut wins (ts and reason): an older cut() never lets reset() clear a newer one
+        new = max([o for o in state.opened if o[0] == CUT_ROOT] + [(CUT_ROOT, float(ts), reason)],
+                  key=lambda o: o[1])
+        opened = tuple(o for o in state.opened if o[0] != CUT_ROOT) + (new,)
         try:
             _write(path, State(state.bad, tuple(sorted(opened)), state.cleared))
         except (OSError, ValueError):
