@@ -4099,11 +4099,21 @@ class Conveyor:
         ap = self.auto_state()
         if ap is None:
             return False
-        chain, gen = ap.get("chain", {}), ap.get("chain_slices", [])
-        steps = {x for r in chain.values() if isinstance(r, dict) for x in r.get("steps") or ()}
-        steps |= {g.get("id") for g in gen if isinstance(g, dict)}
-        return sid.upper() not in {str(x).upper() for x in steps} and not any(k.startswith(sid + "@") for k in chain) and not any(
-            sid in chain_ids(c) for c in ap.get("chains", {}).values())
+        chain = ap.get("chain", {})
+        steps = [g.get("id") for g in ap.get("chain_slices", []) if isinstance(g, dict)]
+        # BASEAUTO1FIX2: auto_state checks only top-level shapes; an odd nested record answers False, never raises
+        for r in chain.values():
+            if not isinstance(r, dict) or not isinstance(r.get("steps", []), list):
+                return False
+            steps += r.get("steps", [])
+        for c in ap.get("chains", {}).values():
+            if not isinstance(c.get("afxs", []), list):
+                return False
+            steps += [c[f] for f in ("s", "afx", "r") if c.get(f) is not None] + c.get("afxs", [])  # raw: 0/[] are odd too
+        if not all(isinstance(x, str) for x in steps):
+            return False
+        sid = sid.upper()
+        return sid not in {x.upper() for x in steps} and not any(k.split("@")[0].upper() == sid for k in chain)
 
     def slice_text(self, s, lanes=None):
         """(prompt text with the backlog's header, base) for a slice; OSError if unreadable.

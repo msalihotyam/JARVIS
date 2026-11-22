@@ -685,6 +685,37 @@ class TestBacklog(Base):
         self.assertFalse(self.c.unstarted({"id": "genx"}, {}))
         self.assertTrue(self.c.unstarted({"id": "NEW"}, {}))
 
+    def test_malformed_chain_records_answer_false(self):  # BASEAUTO1FIX2: never raises
+        def ap(**kw):
+            self.c.auto_file.write_text(json.dumps({"since": self.t, **kw}), encoding="utf-8")
+        key = "SRC@" + "a" * 40
+        bad = [{"chain": {key: {"steps": v}}} for v in (5, {"A": 1}, "NEW", None, [["X"]], [{"id": "X"}], [1], [None])]
+        bad += [{"chain": {key: v}} for v in ("NEW", 5, ["NEW"])]
+        bad += [{"chains": {"k": v}} for v in ({"afxs": 5}, {"afxs": "NEW"}, {"afxs": {"NEW": 1}}, {"afxs": [["X"]]},
+                                                 {"s": ["X"]}, {"afx": {"a": 1}}, {"r": 7}, {"afxs": None},
+                                                 {"s": 0, "afx": [], "r": {}})]  # falsy non-str ids are odd too
+        for state in bad:
+            ap(**state)
+            self.assertIsNotNone(self.c.auto_state(), state)
+            self.assertFalse(self.c.unstarted({"id": "NEW"}, {}), state)
+        ap(chain={key: {"steps": ["X"]}, "T@" + "b" * 40: {}}, chains={"k": {"s": "X", "afxs": ["Y"]}})
+        self.assertTrue(self.c.unstarted({"id": "NEW"}, {}))  # well-formed (and steps-less) records still answer
+        self.assertFalse(self.c.unstarted({"id": "y"}, {}))  # chains ids match case-insensitively
+        self.assertFalse(self.c.unstarted({"id": "src"}, {}))  # so does a chain record key's source
+        ap(chain={"new": {}})
+        self.assertFalse(self.c.unstarted({"id": "NEW"}, {}))  # a key without "@sha" still names its source
+
+    def test_malformed_chain_steps_keep_the_hold_without_raising(self):  # BASEAUTO1FIX2
+        self.backlog({"id": "OLD"}, {"id": "OK"})
+        (self.base / "prompts" / "OLD.md").write_text(
+            "@jarvis lane=OLD model=opus effort=high base=072d0fe\nTASK\n", encoding="utf-8")
+        self.c.auto_file.write_text(json.dumps({"since": self.t, "chain": {"X@" + "a" * 40: {"steps": 5}}}),
+                                    encoding="utf-8")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["OK"])
+        self.assertTrue(self.view()["OLD"].startswith("held: base 072d0fe is not main"))
+        self.assertEqual([e for e in self.events() if e["event"] == "base_refreshed"], [])
+
     def test_stacked_slice_base_untouched(self):
         s = {"id": "FIX", "prompt": "build/conveyor/prompts/FIX.md", "model": "opus", "effort": "high",
              "stack": ["d" * 40], "review_base": "f" * 40}
