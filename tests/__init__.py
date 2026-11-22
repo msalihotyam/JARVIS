@@ -33,6 +33,7 @@ leak into the results:
 
 import atexit
 import builtins
+import functools
 import io
 import os
 import shutil
@@ -83,23 +84,29 @@ if getattr(_memory.SQLiteMemoryStore.__init__, "__name__", "") != _refuse_live_d
 _LIVE_PATHS = {os.path.normcase(str(LIVE_DATABASE) + suffix) for suffix in ("", "-wal", "-shm", "-journal")}
 
 
-def _is_live(target, uri=False) -> bool:  # type: ignore[no-untyped-def]
-    if isinstance(target, bytes):
-        target = os.fsdecode(target)
-    if not isinstance(target, (str, os.PathLike)):
+def _is_live(target) -> bool:  # type: ignore[no-untyped-def]
+    if not isinstance(target, (str, bytes, os.PathLike)):
         return False  # a file descriptor is never the path
+    target = os.fsdecode(os.fspath(target))
+    # Any "file:" string counts as a URI, whatever flag or argument position carried it.
+    uri = target[:5].lower() == "file:"
     try:
-        if isinstance(target, str) and uri and target.startswith("file:"):
+        if uri:
             target = urllib.request.url2pathname(urllib.parse.urlparse(target).path)
+        if uri and "\0" in target:
+            return True  # SQLite cuts the decoded URI path at an encoded NUL ("%00") and opens what is left
         return os.path.normcase(str(Path(target).resolve())) in _LIVE_PATHS
     except (OSError, ValueError):
-        return False  # unreadable spelling: the wrapped call raises its own error
+        # A URI that cannot be resolved (an encoded NUL, ...) may still open the file: refuse it.
+        # A plain path that cannot be read makes the wrapped call raise its own error.
+        return uri
 
 
 def _guarded(function):  # type: ignore[no-untyped-def]
+    @functools.wraps(function)
     def guard(*args, **kwargs):  # type: ignore[no-untyped-def]
         target = args[0] if args else kwargs.get("database", kwargs.get("file"))
-        if _is_live(target, kwargs.get("uri", False)):
+        if _is_live(target):
             raise AssertionError(f"a test tried to open the live database {LIVE_DATABASE}; give it a temporary one")
         return function(*args, **kwargs)
 
@@ -107,9 +114,10 @@ def _guarded(function):  # type: ignore[no-untyped-def]
     return guard
 
 
-for _owner, _name in ((sqlite3, "connect"), (builtins, "open"), (io, "open")):
-    if not getattr(getattr(_owner, _name), "policy_guard", False):
-        setattr(_owner, _name, _guarded(getattr(_owner, _name)))
+if not getattr(sqlite3.connect, "policy_guard", False):
+    sqlite3.connect = _guarded(sqlite3.connect)
+if not getattr(io.open, "policy_guard", False):
+    builtins.open = io.open = _guarded(io.open)  # one wrapper: builtins.open stays io.open
 
 # The CLI moves the legacy Gmail directory out of the data directory at every
 # start, before any store is opened. A test whose settings let the default
