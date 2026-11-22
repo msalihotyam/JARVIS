@@ -47,9 +47,27 @@ class ShadowRunTest(unittest.TestCase):
     def on(self) -> None:
         self.write("build/n6/SHADOW_ON", "")
 
-    def judge(self, head=lambda lane: SHA) -> int:
+    def judge(self, head=lambda lane: SHA, **kw) -> int:
         ticks = iter([0.0, 2.0])
-        return run.judge(self.root, clock=lambda: T0, timer=lambda: next(ticks), head=head)
+        return run.judge(self.root, clock=lambda: T0, timer=lambda: next(ticks), head=head, **kw)
+
+    def test_origin_is_live_by_default_and_carried_to_notes_and_rows(self) -> None:
+        self.on()
+        self.judge()  # the conveyor spawns the runner with no arguments
+        lines = [json.loads(x)["text"] for x in self.notes.read_text(encoding="utf-8").splitlines()]
+        self.assertEqual(len(lines), 2)
+        self.assertTrue(all(t.endswith(" [origin=live]") for t in lines), lines)
+        self.assertEqual({r.origin for r in rows(self.db)}, {"live"})
+
+    def test_explicit_sweep_origin_is_carried(self) -> None:
+        self.on()
+        self.judge(origin="sweep")
+        text = self.notes.read_text(encoding="utf-8")
+        self.assertEqual(text.count(" [origin=sweep]"), 2)
+        self.assertNotIn("origin=live", text)
+        self.assertEqual({r.origin for r in rows(self.db)}, {"sweep"})
+        with self.assertRaises(ValueError):
+            self.judge(origin="manual")
 
     def test_switch_off_writes_nothing(self) -> None:
         self.assertEqual(self.judge(), 0)

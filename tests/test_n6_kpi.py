@@ -75,7 +75,7 @@ class N6KpiTests(unittest.TestCase):
         before = _schema(self.db)
         n6_kpi.record(self.db, _row())
         after = _schema(self.db)
-        self.assertEqual(set(after) - set(before), {"n6_kpi_row"})
+        self.assertEqual(set(after) - set(before), {"n6_kpi_row", "n6_kpi_origin"})
         self.assertEqual({k: after[k] for k in before}, before)  # no ALTER of any table
         SQLiteMemoryStore(self.db)  # a schema-10 reader still opens it ...
         self.assertEqual(memory.SCHEMA_VERSION, 10)
@@ -84,6 +84,23 @@ class N6KpiTests(unittest.TestCase):
                 "SELECT version FROM schema_version ORDER BY rowid DESC").fetchone()[0], 10)
         self.assertEqual(n6_kpi.rows(self.db), (_row(),))
         self.assertEqual({k: _schema(self.db)[k] for k in before}, before)
+
+    def test_origin_round_trips_and_defaults_to_unknown(self):
+        n6_kpi.record(self.db, _row(slice_id="A"))
+        n6_kpi.record(self.db, _row(slice_id="B", origin="live"))
+        n6_kpi.record(self.db, _row(slice_id="C", origin="sweep"))
+        self.assertEqual([(r.slice_id, r.origin) for r in n6_kpi.rows(self.db)],
+                         [("A", "unknown"), ("B", "live"), ("C", "sweep")])
+
+    def test_unknown_origin_value_is_refused(self):
+        with self.assertRaises(n6_kpi.KpiError):
+            _row(origin="manual")
+
+    def test_row_written_before_the_origin_table_reads_unknown(self):
+        n6_kpi.record(self.db, _row())
+        with sqlite3.connect(self.db) as connection:
+            connection.execute("DROP TABLE n6_kpi_origin")
+        self.assertEqual([r.origin for r in n6_kpi.rows(self.db)], ["unknown"])
 
     def test_ensure_table_is_idempotent(self):
         with sqlite3.connect(self.db) as connection:

@@ -22,6 +22,7 @@ from datetime import datetime
 from pathlib import Path
 
 SOURCES = ("conveyor", "n6")
+ORIGINS = ("live", "sweep", "replay", "unknown")  # N6LIVE1: only "live" counts toward Gate B
 _SLICE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 
 _TABLE_SQL = """
@@ -35,6 +36,16 @@ CREATE TABLE IF NOT EXISTS n6_kpi_row (
     finish_seconds REAL NOT NULL CHECK (finish_seconds >= 0),
     security_incidents INTEGER NOT NULL CHECK (security_incidents >= 0),
     recorded_at TEXT NOT NULL,
+    PRIMARY KEY (slice_id, source)
+)
+"""
+# N6LIVE1: origin lives in its own additive table (no ALTER on n6_kpi_row, schema stays 10);
+# a row recorded before this table existed has no origin row and reads "unknown".
+_ORIGIN_SQL = """
+CREATE TABLE IF NOT EXISTS n6_kpi_origin (
+    slice_id TEXT NOT NULL,
+    source TEXT NOT NULL,
+    origin TEXT NOT NULL CHECK (origin IN ('live', 'sweep', 'replay', 'unknown')),
     PRIMARY KEY (slice_id, source)
 )
 """
@@ -66,6 +77,7 @@ class KpiRow:
     finish_seconds: float
     security_incidents: int
     recorded_at: datetime
+    origin: str = "unknown"
 
     def __post_init__(self) -> None:
         if not isinstance(self.slice_id, str) or not _SLICE_ID.fullmatch(self.slice_id):  # pyright: ignore[reportUnnecessaryIsInstance]
@@ -81,14 +93,17 @@ class KpiRow:
         if (isinstance(seconds, bool) or not isinstance(seconds, (int, float))  # pyright: ignore[reportUnnecessaryIsInstance]
                 or not math.isfinite(seconds) or seconds < 0):
             raise KpiError(f"finish_seconds must be a finite number >= 0, got {seconds!r}")
+        if self.origin not in ORIGINS:
+            raise KpiError(f"origin must be one of {ORIGINS}, got {self.origin!r}")
         if (not isinstance(self.recorded_at, datetime)  # pyright: ignore[reportUnnecessaryIsInstance]
                 or self.recorded_at.tzinfo is None):
             raise KpiError("recorded_at must be a timezone-aware datetime")
 
 
 def ensure_table(connection: sqlite3.Connection) -> None:
-    """Idempotent and additive: only creates ``n6_kpi_row`` when it is absent."""
+    """Idempotent and additive: only creates ``n6_kpi_row`` / ``n6_kpi_origin`` when absent."""
     connection.execute(_TABLE_SQL)
+    connection.execute(_ORIGIN_SQL)
 
 
 def record(database_path: str | Path, row: KpiRow) -> None:
@@ -103,6 +118,8 @@ def record(database_path: str | Path, row: KpiRow) -> None:
                      row.salih_interventions, row.quota_tokens, float(row.finish_seconds),
                      row.security_incidents, row.recorded_at.isoformat()),
                 )
+                connection.execute("INSERT INTO n6_kpi_origin (slice_id, source, origin) VALUES (?,?,?)",
+                                   (row.slice_id, row.source, row.origin))
         except sqlite3.IntegrityError as error:
             raise KpiError(f"KPI row refused for {row.slice_id}/{row.source}: {error}") from error
 
@@ -121,8 +138,15 @@ def rows(database_path: str | Path, *, source: str | None = None) -> tuple[KpiRo
             query += " WHERE source = ?"
             args = (source,)
         fetched = connection.execute(query + " ORDER BY slice_id, source", args).fetchall()
+        has_origin = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'n6_kpi_origin'"
+        ).fetchone() is not None
+        origins: dict[tuple[str, str], str] = {}
+        if has_origin:
+            origins = {(str(a), str(b)): str(c) for a, b, c in connection.execute(  # pyright: ignore[reportAny]
+                "SELECT slice_id, source, origin FROM n6_kpi_origin")}
     return tuple(
         KpiRow(str(r[0]), str(r[1]), bool(r[2]), int(r[3]), int(r[4]), int(r[5]), float(r[6]),
-               int(r[7]), datetime.fromisoformat(str(r[8])))
+               int(r[7]), datetime.fromisoformat(str(r[8])), origins.get((str(r[0]), str(r[1])), "unknown"))
         for r in fetched  # pyright: ignore[reportAny]
     )

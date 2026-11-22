@@ -36,7 +36,7 @@ BEHAVIOURS = {"R05": "Independent review routing (chain)", "R06": "Receipts/evid
 # Lane rules v2 (one exact 40-hex COMMIT line, STATUS first) hold from 2026-10-17 (+03:00).
 RULE_V2 = datetime(2026, 10, 17, tzinfo=timezone(timedelta(hours=3))).timestamp()
 _NOTE = re.compile(r"(\S+) (disagree|false_pass|agree): conveyor (\w+) \((.*?)\); "
-                   r"n6 (\w+) \((.*)\)", re.S)
+                   r"n6 (\w+) \((.*)\)(?: \[origin=(\w+)\])?", re.S)  # N6LIVE1: runner's origin marker
 _STATUS = re.compile(r"STATUS:[\s*`]*((?i:CI_PENDING)(?!\w)|[A-Za-z]+)")  # conveyor.STATUS_RE
 _COMMIT = re.compile(r"(?i:COMMIT):(.*)")  # a line that itself starts COMMIT: (never BASE_COMMIT:)
 _HEX = re.compile(r"\b[0-9a-f]{7,40}\b", re.I)
@@ -60,11 +60,14 @@ def commit_values(text: str) -> list[str]:
     return [m.group(1).strip(" \t*`") for m in found if m]
 
 
-def read_notes(path: Path) -> tuple[dict[str, int], dict[str, dict[str, Any]], datetime | None]:
-    """(counts, newest verdict note per lane, first note time); bad lines are counted."""
+def read_notes(path: Path) -> tuple[dict[str, int], dict[str, dict[str, Any]], datetime | None,
+                                    list[tuple[int, datetime]]]:
+    """(counts, newest verdict note per lane, first note time, live verdict notes as (line, at));
+    bad lines are counted. Only a note marked ``[origin=live]`` is live: older notes are unknown."""
     counts = {"lines": 0, "malformed": 0, "other": 0, "agree": 0, "disagree": 0, "false_pass": 0}
     newest: dict[str, dict[str, Any]] = {}
     first: datetime | None = None
+    live: list[tuple[int, datetime]] = []
     text = path.read_text(encoding="utf-8", errors="replace") if path.is_file() else ""
     for number, line in enumerate(text.splitlines(), 1):
         if not line.strip():
@@ -85,10 +88,12 @@ def read_notes(path: Path) -> tuple[dict[str, int], dict[str, dict[str, Any]], d
             counts["other"] += 1
             continue
         counts[m.group(2)] += 1
+        if m.group(7) == "live":
+            live.append((number, at))
         newest[m.group(1)] = {"line": number, "verdict": m.group(2),
                               "conveyor": {"verdict": m.group(3), "reason": m.group(4)},
                               "n6": {"verdict": m.group(5), "reason": m.group(6)}}
-    return counts, newest, first
+    return counts, newest, first, live
 
 
 def read_events(path: Path) -> tuple[list[dict[str, Any]], dict[str, int], int]:
@@ -213,10 +218,14 @@ def classify(lane: str, note: dict[str, Any], snap: Snapshot, heals: dict[str, i
             "kpi": kpi.get(lane, {}), "evidence": evidence}
 
 
-def build(root: Path, day: date) -> dict[str, Any]:
-    """The whole daily diff as data; reads only, never the wall clock."""
+def build(root: Path, day: date, since: date | None = None) -> dict[str, Any]:
+    """The whole daily diff as data; reads only, never the wall clock.
+
+    ``live_*`` (Gate B B4c) counts only notes the runner marked ``[origin=live]`` dated on or
+    after ``since``; unsafe = false_pass + n6_wrong exactly as ``classify`` reports them."""
     n6 = root / "build" / "n6"
-    counts, newest, first = read_notes(n6 / "notes.jsonl")
+    counts, newest, first, live_notes = read_notes(n6 / "notes.jsonl")
+    live_lines = {n for n, at in live_notes if since is None or at.date() >= since}
     if first is None and (n6 / "SHADOW_ON").is_file():
         first = datetime.fromtimestamp((n6 / "SHADOW_ON").stat().st_mtime, timezone.utc)
     events, heals, bad = read_events(root / "build" / "conveyor" / "events.jsonl")
@@ -237,7 +246,12 @@ def build(root: Path, day: date) -> dict[str, Any]:
     def tally(era: str, key: str, names: Any) -> dict[str, int]:
         return {n: sum(r["era"] == era and r[key] == n for r in records) for n in names}
 
-    return {"date": day.isoformat(), "shadow_start": first.isoformat() if first else None,
+    mine = [r for r in records if newest[r["lane"]]["line"] in live_lines]
+    fp = sum(r["rule"] == "false_pass" for r in mine)
+    wrong = sum(r["class"] == "n6_wrong" and r["rule"] != "false_pass" for r in mine)
+    return {"date": day.isoformat(), "since": since.isoformat() if since else None,
+            "live_rounds": len(live_lines), "live_false_pass": fp, "live_n6_wrong": wrong,
+            "live_unsafe": fp + wrong, "shadow_start": first.isoformat() if first else None,
             "notes": counts, "events_malformed": bad, "kpi_slices": len(kpi),
             "live": tally("live", "class", CLASSES), "sweep": tally("sweep", "class", CLASSES),
             "unknown_era": sum(r["era"] == "unknown" for r in records),
@@ -249,6 +263,9 @@ def render_md(rep: dict[str, Any]) -> str:
     out = [f"# N6 shadow diff {rep['date']}", "",
            f"Shadow start: {rep['shadow_start'] or 'unknown'}. Note lines {notes['lines']} "
            f"(malformed {notes['malformed']}), event lines malformed {rep['events_malformed']}.",
+           "", f"Live rounds: {rep['live_rounds']} (origin=live, since {rep['since'] or 'the start'}); "
+           f"live unsafe: {rep['live_unsafe']} (false_pass {rep['live_false_pass']} + n6_wrong "
+           f"{rep['live_n6_wrong']}).",
            "", "## Live disagreements by class", ""]
     out += [f"- {c}: {n}" for c, n in rep["live"].items()]
     out += ["", "## Live disagreements by handover behaviour", ""]
@@ -261,9 +278,9 @@ def render_md(rep: dict[str, Any]) -> str:
     return "\n".join(out) + "\n"
 
 
-def write(root: Path, day: date) -> tuple[Path, Path]:
+def write(root: Path, day: date, since: date | None = None) -> tuple[Path, Path]:
     """Write build/n6/daily/<date>.json and .md; nothing else is written."""
-    rep = build(root, day)
+    rep = build(root, day, since)
     out = root / "build" / "n6" / "daily"
     out.mkdir(parents=True, exist_ok=True)
     js, md = out / f"{day.isoformat()}.json", out / f"{day.isoformat()}.md"
@@ -277,9 +294,19 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="N6 daily shadow diff (read-only inputs)")
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--date", type=date.fromisoformat, default=None)
+    parser.add_argument("--since", type=date.fromisoformat, default=None,
+                        help="count live rounds from this date (inclusive)")
+    parser.add_argument("--summary", action="store_true",
+                        help="print only the live round / unsafe counts; writes nothing")
     args = parser.parse_args(argv)
     try:
-        paths = write(args.root, args.date or date.today())
+        if args.summary:
+            rep = build(args.root, args.date or date.today(), args.since)
+            print(f"SINCE: {rep['since'] or 'start'}\nLIVE ROUNDS: {rep['live_rounds']}\n"
+                  f"LIVE UNSAFE: {rep['live_unsafe']} (false_pass {rep['live_false_pass']}, "
+                  f"n6_wrong {rep['live_n6_wrong']})")
+            return 0
+        paths = write(args.root, args.date or date.today(), args.since)
     except RuntimeError as err:
         print(err, file=sys.stderr)
         return 2

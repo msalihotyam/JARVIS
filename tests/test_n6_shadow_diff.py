@@ -35,6 +35,14 @@ def _note(lane: str, n6_reason: str, at: datetime = SHADOW) -> str:
     return json.dumps({"at": at.isoformat(), "text": text})
 
 
+def _onote(lane: str, origin: str, at: datetime, verdict: str = "agree") -> str:
+    n6, why = ("pass", "agree") if verdict != "disagree" else ("block", "report says ```")
+    conv = "block" if verdict == "false_pass" else "pass"
+    text = (f"{lane} {verdict}: conveyor {conv} (lane finished PASS); n6 {n6} ({why})"
+            f" [origin={origin}]")
+    return json.dumps({"at": at.isoformat(), "text": text})
+
+
 class ShadowDiffTest(unittest.TestCase):
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
@@ -90,6 +98,49 @@ class ShadowDiffTest(unittest.TestCase):
         self.assertEqual(r["kpi"], {"n6": False})
         self.assertEqual(rep["live"]["n6_wrong"], 1)
         self.assertIn("GOOD (live, rule_accepts)", diff.render_md(rep))
+
+    def _live_notes(self) -> None:
+        d = lambda n: SHADOW + timedelta(days=n)  # noqa: E731
+        extra = [_onote("X1", "live", d(1)), _onote("X2", "live", d(2)),
+                 _onote("GOOD", "live", d(3), "disagree"), _onote("FP", "live", d(4), "false_pass"),
+                 _onote("S1", "sweep", d(3)), _onote("R1", "replay", d(3))]
+        with (self.root / "build/n6/notes.jsonl").open("a", encoding="utf-8") as fh:
+            fh.write("\n".join(extra) + "\n")
+        lanes = json.loads((self.root / "build/conveyor/lanes.json").read_text(encoding="utf-8"))
+        lanes["FP"] = {"finished": True, "status": "BLOCKED", "finished_ts": _ts(2026, 11, 5),
+                       "files": ["jarvis/f.py"]}  # measurable, so its n6 pass is a false_pass
+        self._w("build/conveyor/lanes.json", json.dumps(lanes))
+        self._w("build/reports/FP.md", "STATUS: BLOCKED\nCOMMIT: none\n")
+
+    def test_notes_without_an_origin_marker_are_never_live(self) -> None:
+        rep = diff.build(self.root, DAY)
+        self.assertEqual((rep["live_rounds"], rep["live_unsafe"]), (0, 0))
+
+    def test_live_rounds_and_unsafe_count_only_marked_live_notes_since_the_date(self) -> None:
+        self._live_notes()
+        rep = diff.build(self.root, DAY)
+        self.assertEqual((rep["live_rounds"], rep["live_false_pass"], rep["live_n6_wrong"],
+                          rep["live_unsafe"]), (4, 1, 1, 2))
+        rep = diff.build(self.root, DAY, since=date(2026, 11, 3))
+        self.assertEqual((rep["since"], rep["live_rounds"], rep["live_unsafe"]),
+                         ("2026-11-03", 3, 2))
+        rep = diff.build(self.root, DAY, since=date(2026, 11, 6))
+        self.assertEqual((rep["live_rounds"], rep["live_unsafe"]), (0, 0))
+        self.assertIn("Live rounds: 4", diff.render_md(diff.build(self.root, DAY)))
+
+    def test_cli_since_prints_the_counts_and_writes_nothing(self) -> None:
+        import contextlib
+        import io
+        self._live_notes()
+        before = sorted(self.root.rglob("*"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(diff.main(["--root", str(self.root), "--since", "2026-11-03",
+                                        "--summary"]), 0)
+        self.assertEqual(out.getvalue().splitlines(),
+                         ["SINCE: 2026-11-03", "LIVE ROUNDS: 3",
+                          "LIVE UNSAFE: 2 (false_pass 1, n6_wrong 1)"])
+        self.assertEqual(sorted(self.root.rglob("*")), before)
 
     def test_same_inputs_give_identical_json(self) -> None:
         js, _ = diff.write(self.root, DAY)

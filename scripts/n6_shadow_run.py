@@ -106,8 +106,13 @@ def branch_tip(n6: N6, root: Path, lane: str) -> str | None:
 
 def judge(root: Path, *, clock: Callable[[], datetime],
           timer: Callable[[], float] = time.perf_counter,
-          head: Callable[[str], str | None] | None = None) -> int:
-    """Judge every finished lane that has no rows yet; returns the number of rows written."""
+          head: Callable[[str], str | None] | None = None, origin: str = "live") -> int:
+    """Judge every finished lane that has no rows yet; returns the number of rows written.
+
+    ``origin`` (live | sweep | replay) is stamped on each note and KPI row for Gate B counting;
+    the conveyor spawns this with no arguments, so a plain run is "live"."""
+    if origin not in ("live", "sweep", "replay"):
+        raise ValueError(f"origin must be live, sweep or replay, got {origin!r}")
     switch, db, notes_path = _paths(root)
     if not switch.is_file():
         return 0  # off: nothing is read or written
@@ -156,11 +161,11 @@ def judge(root: Path, *, clock: Callable[[], datetime],
         values = {"conveyor": (len(asks), tokens, seconds, 0),
                   "n6": (by_n6, 0, took, notes.count(f'"text": "{lane} refused:'))}
         n6.note(f"{lane} {verdict}: conveyor {rec['conveyor']['verdict']} "
-                f"({rec['conveyor']['reason']}); n6 {rec['n6']['verdict']} ({rec['n6']['reason']})")
+                f"({rec['conveyor']['reason']}); n6 {rec['n6']['verdict']} ({rec['n6']['reason']}) [origin={origin}]")
         for source in missing:
             salih, quota, finish, security = values[source]
             row = KpiRow(lane, source, passed[source], defects if passed[source] else 0, salih,
-                         quota, float(finish), security, clock())
+                         quota, float(finish), security, clock(), origin)
             try:
                 record(db, row)
                 written += 1
@@ -226,12 +231,14 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="N6 shadow runner (Phase 1)")
     parser.add_argument("--live", type=int, metavar="N", help="print the last N judged slices")
     parser.add_argument("--root", type=Path, default=ROOT)
+    parser.add_argument("--origin", choices=("live", "sweep", "replay"), default="live",
+                        help="label for this run's notes and KPI rows (default: live)")
     args = parser.parse_args(argv)
     root = cast(Path, args.root)
     if args.live is not None:
         print(live(root, cast(int, args.live)), end="")
         return 0
-    judge(root, clock=lambda: datetime.now(timezone.utc))
+    judge(root, clock=lambda: datetime.now(timezone.utc), origin=cast(str, args.origin))
     return 0
 
 
