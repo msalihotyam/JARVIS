@@ -13,7 +13,7 @@ import re
 from datetime import datetime, timedelta
 from pathlib import Path
 
-REASONS = ("key1_green_protected", "key1_green_chain", "chain_refused_finding", "blocked", "held",
+REASONS = ("UNKNOWN_OUTCOME", "key1_green_protected", "key1_green_chain", "chain_refused_finding", "blocked", "held",
            "needs_t2_approval", "queue_low_n6", "queue_low_improve", "queue_empty", "overlap", "unknown")
 MAX_CHARS = 8000
 CLIP = 900  # max chars per DIGEST.md line: 7 header lines + 1 truncation line stay under MAX_CHARS
@@ -78,6 +78,8 @@ def events(path, unknown):
 
 def attention_code(reason):
     r = reason.lower()
+    if "unknown_outcome" in r:  # REASON_CODES_v1 B: intent without receipt, never retried
+        return "UNKNOWN_OUTCOME"
     if "chain refused" in r or "finding" in r:
         return "chain_refused_finding"
     if "touches" in r or "protected" in r or "manual key" in r:
@@ -117,6 +119,9 @@ def build(root, now, since):
         t = ts(e.get("ts"))
         if e.get("event") == "chain_refused" and e.get("src") not in (None, "") and t and t >= since:
             add(str(e["src"]), "chain_refused_finding", f"events.jsonl chain_refused: {e.get('reason', '')}", e.get("ts"))
+        elif e.get("event") == "unknown_outcome" and (t is None or t >= since):  # unparseable ts: never dropped
+            add(str(e.get("intent") or f"intent@{e.get('ts')}"), "UNKNOWN_OUTCOME",
+                f"events.jsonl unknown_outcome: {e.get('reason', '')}", e.get("ts"))
     # conveyor view states (slice_hold/pick_slice): "held: <why>", "needs_t2_approval",
     # "ready" (the conveyor dispatches it), "n6" (only N6's claim starts it) and "overlap"; the rest is not ready
     view = status.get("backlog") or []
