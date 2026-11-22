@@ -123,6 +123,7 @@ CLEANUP_RETRY_S = 86400  # a refused rm / worktree removal is retried the next d
 BEAT_S = 60  # the lock heartbeat inside a long pass, at most this often
 REPLACE_TRIES = 5  # os.replace onto a file a reader holds open (Windows) is retried this often ...
 REPLACE_GAP_S = 0.2  # ... this far apart, then skipped with one error event
+STATE_FILES = {"lanes.json", "autopilot.json", "push.json"}  # keep <name>.bak; restored from it (STATEBAK1)
 STATUS_STALE_S = 600  # status.json older than this: a status_stale attention item
 API_PAGE_WINDOW_S = 600  # 2+ lanes on API errors this close together: an account/network page
 API_PAGE_EVERY_S = 7200  # ... repeated this often while it lasts, night hours included
@@ -1385,13 +1386,8 @@ class Conveyor:
     def load_lanes(self):
         """{} only while lanes.json does not exist; an unreadable one sets lanes_bad instead
         (pass_once holds everything and save_lanes never writes over it)."""
-        self.lanes_bad = None
-        try:
-            lanes = json.loads(self.state_file.read_text(encoding="utf-8"))
-        except FileNotFoundError:
-            return {}
-        except (OSError, ValueError) as e:
-            self.lanes_bad = f"{type(e).__name__}: {str(e)[:100]}"
+        lanes, self.lanes_bad = self.load_state(self.state_file, {})
+        if self.lanes_bad:
             return {}
         if not isinstance(lanes, dict):
             self.lanes_bad = f"not an object but {type(lanes).__name__}"
@@ -1404,22 +1400,60 @@ class Conveyor:
         ok = self.write_atomic(self.state_file, json.dumps(lanes, indent=2))
         self.lanes_unsaved = None if ok else lanes
 
+    def load_state(self, path, default):
+        """STATEBAK1: (data, None) from a state file, (default, None) while it does not exist. An
+        empty, NUL-filled or non-JSON one is restored from <name>.bak (event state_restored, the
+        name only); with no valid .bak: PAUSE and (default, reason), never a silent empty start."""
+        def parse(raw):
+            try:
+                return json.loads(raw.decode("utf-8")) if raw.strip() and b"\0" not in raw else None
+            except ValueError:
+                return None
+        try:
+            raw = path.read_bytes()
+        except FileNotFoundError:
+            return default, None
+        except OSError as e:  # unreadable, not corrupt (a reader's lock): held, no PAUSE
+            return default, f"{type(e).__name__}: {str(e)[:100]}"
+        data = parse(raw)
+        if data is not None:
+            return data, None
+        try:
+            raw = path.with_name(path.name + ".bak").read_bytes()
+        except OSError:
+            raw = b""
+        data = parse(raw)
+        if data is None:
+            (self.base / "PAUSE").write_text("")
+            return default, "empty, NUL or invalid JSON and no valid .bak: PAUSE written"
+        self.write_atomic(path, raw.decode("utf-8").replace("\r\n", "\n"))  # text mode adds the \r back
+        self.event("state_restored", file=path.name)
+        return data, None
+
     def write_atomic(self, path, text):
         """tmp + os.replace: a crash mid-write never leaves a torn file. A reader holding the
         target open (panel, pano, bridge mount) makes os.replace raise PermissionError on
         Windows: retried REPLACE_TRIES times, then one error event and False - never raises
-        for that, so the pass goes on (the next pass writes again)."""
-        tmp = path.with_name(path.name + ".tmp")
-        for i in range(REPLACE_TRIES):
-            try:  # the tmp too: a sync mount may hold the leftover of a failed try
-                tmp.write_text(text, encoding="utf-8")
-                os.replace(tmp, path)
-                return True
-            except PermissionError as e:
-                if i == REPLACE_TRIES - 1:
-                    self.error(f"write {path.name}: {e!r} after {REPLACE_TRIES} tries")
-                    return False
-                time.sleep(REPLACE_GAP_S)
+        for that, so the pass goes on (the next pass writes again). STATEBAK1: fsync before the
+        replace (a power cut left NUL-filled state); a STATE_FILES file then also becomes <name>.bak,
+        only after the new file is whole."""
+        targets = [path, path.with_name(path.name + ".bak")] if path.name in STATE_FILES else [path]
+        for target in targets:
+            tmp = target.with_name(target.name + ".tmp")
+            for i in range(REPLACE_TRIES):
+                try:  # the tmp too: a sync mount may hold the leftover of a failed try
+                    with open(tmp, "w", encoding="utf-8") as f:
+                        f.write(text)
+                        f.flush()
+                        os.fsync(f.fileno())
+                    os.replace(tmp, target)
+                    break
+                except PermissionError as e:
+                    if i == REPLACE_TRIES - 1:
+                        self.error(f"write {target.name}: {e!r} after {REPLACE_TRIES} tries")
+                        return False
+                    time.sleep(REPLACE_GAP_S)
+        return True
 
     def event(self, kind, **kw):
         rec = {"ts": iso(self.now()), "event": kind, **kw}
@@ -1539,6 +1573,8 @@ class Conveyor:
             self.backstop(items)
             self.flush_pages()
             return True
+        for f in (self.auto_file, self.push_file):  # STATEBAK1: restored, or PAUSE before any dispatch
+            self.load_state(f, None)
         try:
             agents = self.agents()
         except Exception as e:  # keep going, report it
@@ -4230,7 +4266,12 @@ class Conveyor:
         n6c = self.pager_flag("n6_claim_held")
         if n6c:
             items.append((N6_CLAIM_ID, "build/n6 claim/deps okunamıyor: N6 claim başlatılmadı", n6c))
-        for name, st in self.load_json(self.push_file, {}).items():
+        for f in (self.auto_file, self.push_file):  # STATEBAK1: corrupt with no valid .bak = held
+            data, bad = self.load_state(f, {})
+            if bad:
+                items.append((f"state-invalid-{f.stem}", f"{f.name} unreadable ({bad}): dispatch held, fix it by hand",
+                              mtime_or_0(f)))
+        for name, st in self.load_state(self.push_file, {})[0].items():
             items.append((name, f"push blocked: {st['reason']}", st["since"]))
         # ponytail: acked rejects stay in pager.json (a few bytes each); prune if it ever grows
         for rid, (why, since) in (self.pager_flag("rejects") or {}).items():
@@ -4554,7 +4595,7 @@ class Conveyor:
         when it is unreadable or malformed (fail closed: no autopilot action, no auto slice)."""
         if not self.auto_file.exists():
             return {"since": self.now()}  # lanes finished before the autopilot are not its business
-        ap = self.load_json(self.auto_file, None)
+        ap = self.load_state(self.auto_file, None)[0]
         num = (int, float)
         try:
             b = ap.get("breaker")
@@ -5465,7 +5506,9 @@ class Conveyor:
         if self.push_deferred(self.breaker):
             return  # approvals stay; a later pass retries
         lanes = self.load_lanes() if lanes is None else lanes
-        state = self.load_json(self.push_file, {})
+        state, bad = self.load_state(self.push_file, {})
+        if bad:  # STATEBAK1: never saved over; attention() shows it
+            return
         files = sorted(f for f in self.approvals.glob("push-*") if f.is_file())
         for f in files:
             st = state.get(f.name, {})
