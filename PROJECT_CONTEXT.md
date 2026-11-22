@@ -28,7 +28,7 @@ Kullanıcı, ChatGPT ile doğal biçimde fikir alışverişi yapabildiği; aynı
 ## Mevcut çalışma ortamı
 
 - Platform: Windows 11
-- Proje kökü: `%USERPROFILE%\Masaüstü\JARVIS`
+- Proje kökü: `C:\dev\JARVIS`
 - Proje bir Git deposudur; ilk başarılı live smoke checkpoint'i `main` dalında `bef77e7` (`fix: preserve approved clarification in Claude payload`) üzerinden alınmıştır.
 - İlk iskelette kullanıcı tarafından oluşturulan ve korunmaya devam eden klasör/dosyalar:
   - `Agent Core/agent_core.py`
