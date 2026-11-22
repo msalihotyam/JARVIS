@@ -8729,6 +8729,27 @@ class TestChain(AutopilotBase):
     def test_conveyor_notes_refused_before_int(self):
         self._refused_before_int("build/conveyor/notes/LANE_RULES.md")
 
+    # SEEDGUARD1FIX: NTFS is case-insensitive, so a mixed-case grant must not slip past A18
+    def test_claude_dir_mixed_case_refused_before_int(self):
+        self._refused_before_int(".CLAUDE/settings.json")
+
+    def test_conveyor_notes_mixed_case_refused_before_int(self):
+        self._refused_before_int("Build/Conveyor/Notes/LANE_RULES.md")
+
+    def test_a18_path_variants(self):
+        for p in (".claude/settings.json", ".CLAUDE/settings.json", ".Claude/x", "BUILD/CONVEYOR/NOTES/x",
+                  "Build/Conveyor/Notes/LANE_RULES.md", ".claude\\settings.json", "build\\conveyor\\notes\\x",
+                  ".claude./x", ".claude /x", "build/conveyor./notes /x", "CLAUDE~1/settings.json",
+                  "BUILD~1/conveyor/notes/x", "build/CONVEY~1/x", "build/conveyor/NOTES~1/x",
+                  "build/conveyor/noteſ/x",  # long s casefolds to s
+                  ".claude:stream", ".claude::$INDEX_ALLOCATION/x", "build/conveyor/notes:s/x", "./.claude/x",
+                  "/.claude/x", "build//conveyor/notes/x", "a/../.claude/x", "a/.. /x", ".claude", ".CLAUDE",
+                  "build/conveyor/notes", "build/conveyor", "build"):  # the dir or an ancestor: file/symlink swap
+            self.assertTrue(conveyor.a18_refused(p), p)
+        for p in ("scripts/a.py", "claude/x", ".claudex/x", "build/conveyor/notes.md", "build/conveyor/lanes.json",
+                  "build/reports/X.md", "docs/.claude/x", "a/build/conveyor/notes/x"):
+            self.assertFalse(conveyor.a18_refused(p), p)
+
     def test_commit_already_on_main_refused(self):
         self.git.fail[("git", "merge-base", "--is-ancestor", self.SHA, ORIGIN)] = (0, "")
         self.start()

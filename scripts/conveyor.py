@@ -101,6 +101,17 @@ def protected_path(p):
             or any(s.startswith("riot") for s in p.split("/"))  # SEEDGUARD1 A11: Riot/Vanguard
             or base.endswith((".pem", ".key", ".p12", ".pfx", ".crt", ".cer", ".db", ".sqlite", ".sqlite3")))
 
+def a18_refused(p):
+    """SEEDGUARD1 A18 (SEEDGUARD1FIX): a chain file that NTFS/Win32 resolves into build/conveyor/notes/
+    or .claude/: case-insensitive, either separator, NTFS stream suffix (:x), trailing dots/spaces, empty or
+    "." segments, any ".." or 8.3 alias (~N), and the dirs themselves or their ancestors (file/symlink swap)."""
+    raw = [s.split(":")[0] for s in p.replace("\\", "/").casefold().split("/")]
+    segs = [t for t in (s.rstrip(". ") for s in raw) if t]  # Win32 drops trailing dots/spaces; "." and "" vanish
+    d, roots = "/".join(segs) + "/", ("build/conveyor/notes/", ".claude/")
+    dotdot = any(s not in ("", ".") and not s.rstrip(". ") for s in raw)  # "..", "...", ".. " may climb
+    return (dotdot or d.startswith(roots) or any(r.startswith(d) for r in roots if d != "/")
+            or any(re.search(r"~\d", s) for s in segs))
+
 
 CODEX_VETO = ("scripts/", ".claude/", ".github/", "data/")  # ROUTE1: worker "auto" never sends these to codex
 def codex_veto(p):
@@ -4739,7 +4750,7 @@ class Conveyor:
         main, files = self.chain_verify(s, ln, sha)
         if main is None:
             return files
-        if any(p.startswith(("build/conveyor/notes/", ".claude/")) for p in files):  # SEEDGUARD1 A18
+        if any(a18_refused(p) for p in files):  # SEEDGUARD1 A18
             return "touches build/conveyor/notes/ or .claude/: refused before INT"
         if nid in lanes or nid in ids or self.find_report(nid):
             return f"{nid} already exists"
