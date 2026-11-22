@@ -36,13 +36,12 @@ import builtins
 import functools
 import io
 import os
-import re
 import shutil
 import sqlite3
 import tempfile
 import urllib.parse
 import urllib.request
-from pathlib import Path
+from pathlib import Path, PurePath
 
 from jarvis import memory as _memory
 from jarvis.settings import PROJECT_ROOT as _PROJECT_ROOT
@@ -79,74 +78,114 @@ if getattr(_memory.SQLiteMemoryStore.__init__, "__name__", "") != _refuse_live_d
 
 # POLICYGUARD1 (A5, one guard for every test module): ``sqlite3.connect`` and ``open`` refuse the
 # live database path too, not only ``SQLiteMemoryStore``: any code a test reaches, any store,
-# any direct read. Keyed on the resolved real path (and its -wal/-shm/-journal files), so a
-# temporary copy named ``jarvis.db`` is fine. shortcut: ``os.open`` and a hard link to the file
-# are not covered; add them here if a test ever needs them.
-_LIVE_PATHS = {os.path.normcase(str(LIVE_DATABASE) + suffix) for suffix in ("", "-wal", "-shm", "-journal")}
+# any direct read. POLICYGUARD1FIX3: decided by IDENTITY, never by spelling (Win32 reaches one file
+# through endless spellings: \\?\, \??\, admin shares, ::$DATA, trailing dots, 8.3 names, links).
+# A target is live when (a) it is the same file as an existing live file or companion, or (b) its
+# folder is the same folder as data/ and its Win32 name starts with "jarvis.db", or (c) any step
+# raises. A temporary copy named ``jarvis.db`` elsewhere is fine. ``LIVE_DATABASE`` is read at call
+# time so tests can point it at a temporary folder. A "file:" string is judged as a URI AND as a
+# plain path; a dangling link, a custom opener/factory and a changing __fspath__ are refused or pinned.
+# shortcut: ``os.open``, ``ATTACH`` and ``VACUUM INTO`` are not covered; wrap them if a test needs them.
+_COMPANIONS = ("", "-wal", "-shm", "-journal")
 
 
-_EXTENDED_PREFIX = re.compile(r"^(?:[\\/]{2}[?.]|\\\?\?)[\\/](UNC[\\/])?", re.IGNORECASE)  # \\?\  \\.\  and the NT form \??\
+def _live_name(name: str) -> bool:
+    # Win32 drops a :stream suffix and trailing dots/spaces; NTFS folds case. upper() also maps ı/ſ to
+    # I/S, which NTFS does not fold: refused anyway (fail closed).
+    name = name.split(":")[0].rstrip(". ")
+    return name.casefold().startswith("jarvis.db") or name.upper().startswith("JARVIS.DB")
 
 
-def _win32_spelling(target: str) -> str:
-    """The path as Win32 reads it: no \\\\?\\ / \\\\?\\UNC\\ prefix, no trailing dots or spaces on a component.
-
-    shortcut: Windows only (the suite's one platform); no 8.3 short-name expansion for a file that
-    does not exist yet, upgrade to a stat/samefile identity check if that ever matters.
-    """
-    if os.name != "nt":
-        return target
-    match = _EXTENDED_PREFIX.match(target)
-    if match:
-        target = ("\\\\" if match.group(1) else "") + target[match.end() :]
-    parts = re.split(r"[\\/]", target)
-    return "\\".join(part if part in ("", ".", "..") else part.rstrip(". ") for part in parts)
+def _exact(target):  # type: ignore[no-untyped-def]
+    # The exact str/bytes a call opens: a subclass cannot answer == / in differently.
+    raw = os.fspath(target)
+    return str.__str__(raw) if isinstance(raw, str) else bytes(raw)
 
 
-def _same_folder(first, second) -> bool:  # type: ignore[no-untyped-def]
+def _decide(text: str, plain: bool = False) -> bool:
+    # plain: the path reading of a "file:" string. A path Win32 cannot resolve (invalid name, missing
+    # folder) cannot be opened either, so only for that reading such an error means "not live".
     try:
-        return os.path.samefile(first, second)
-    except OSError:  # a folder that does not exist is not the live one (and the live folder always exists)
-        return False
+        live = os.fspath(LIVE_DATABASE)
+        # (a) the same file as an existing live file, whatever the spelling or link. The stream suffix
+        # and trailing dots/spaces are dropped: a stream on a hard link is a stream on the live file.
+        existing = []
+        for suffix in _COMPANIONS:
+            try:
+                existing.append(os.stat(live + suffix))
+            except FileNotFoundError:
+                pass
+        if existing:
+            head, tail = os.path.split(os.path.abspath(text))
+            try:
+                found = os.stat(os.path.join(head, tail.split(":")[0].rstrip(". ")))
+            except (FileNotFoundError, NotADirectoryError):
+                found = None
+            if found is not None and any(os.path.samestat(found, each) for each in existing):
+                return True
+        if os.path.lexists(text) and not os.path.exists(text):
+            return True  # a dangling link: realpath can be led elsewhere than the OS will go
+        # (b) a jarvis.db* name in the live folder. realpath also follows a link to a missing file.
+        parent, name = os.path.split(os.path.realpath(text))
+        if not _live_name(name):
+            return False
+        parent_stat = os.stat(parent)  # a missing or unreachable folder raises: live (c)
+        try:
+            live_folder = os.stat(os.path.dirname(live))
+        except FileNotFoundError:
+            return False  # no live folder: an existing folder cannot be it
+        return os.path.samestat(parent_stat, live_folder)
+    except OSError as error:
+        unresolvable = isinstance(error, (FileNotFoundError, NotADirectoryError)) or getattr(error, "winerror", None) == 123
+        if plain and unresolvable:
+            return False
+        raise
 
 
 def _is_live(target) -> bool:  # type: ignore[no-untyped-def]
     if not isinstance(target, (str, bytes, os.PathLike)):
         return False  # a file descriptor is never the path
-    target = os.fsdecode(os.fspath(target))
-    # Any "file:" string counts as a URI, whatever flag or argument position carried it.
-    uri = target[:5].lower() == "file:"
     try:
-        if uri:
-            path = urllib.parse.urlparse(target).path
-            # url2pathname mangles a UNC authority ("//host/share"); SQLite opens it as is.
-            target = urllib.parse.unquote(path) if path.startswith("//") else urllib.request.url2pathname(path)
-        if uri and "\0" in target:
-            return True  # SQLite cuts the decoded URI path at an encoded NUL ("%00") and opens what is left
-        target = _win32_spelling(target)
-    except Exception:  # noqa: BLE001 - a spelling that cannot be normalised is refused (fail closed)
-        return True
-    try:
-        resolved = Path(target).resolve()
-        if os.path.normcase(str(resolved)) in _LIVE_PATHS:
+        text = os.fsdecode(_exact(target))
+        if text[:5].lower() != "file:":
+            return text not in ("", ":memory:") and _decide(text)  # SQLite's in-memory / temporary: no file
+        # open() and a connect without uri=True take the same string as a plain relative path
+        # ("file:/../data/jarvis.db" is data\jarvis.db): judge both readings.
+        if _decide(text, plain=True):
             return True
-        # Another route to the same directory (an admin share \\localhost\C$\..., a \\?\Volume{GUID}\...
-        # path, a junction) spells differently but is the same folder: compare folder identity + file name.
-        name = os.path.normcase(resolved.name)
-        for live in _LIVE_PATHS:
-            if os.path.basename(live) == name and _same_folder(resolved.parent, os.path.dirname(live)):
-                return True
-        return False
-    except (OSError, ValueError):
-        # A URI that cannot be resolved (an encoded NUL, ...) may still open the file: refuse it.
-        # A plain path that cannot be read makes the wrapped call raise its own error.
-        return uri
+        path = urllib.parse.urlparse(text).path
+        if path == ":memory:":
+            return False
+        # url2pathname mangles a UNC authority ("//host/share"); SQLite opens it as is.
+        text = urllib.parse.unquote(path) if path.startswith("//") else urllib.request.url2pathname(path)
+        if "\0" in text:
+            return True  # SQLite cuts the decoded URI path at an encoded NUL ("%00") and opens what is left
+        return text not in ("", ":memory:") and _decide(text)
+    except Exception:  # noqa: BLE001 - (c) anything that cannot be decided is refused (fail closed)
+        return True
 
 
-def _guarded(function):  # type: ignore[no-untyped-def]
+def _stable(target) -> bool:  # type: ignore[no-untyped-def]
+    return type(target) in (str, bytes) or (
+        isinstance(target, PurePath) and type(target).__fspath__ is PurePath.__fspath__
+    )
+
+
+def _guarded(function, hook: str, position: int):  # type: ignore[no-untyped-def]
+    # hook: the argument (open's opener, connect's factory) that could open any file whatever the path.
     @functools.wraps(function)
     def guard(*args, **kwargs):  # type: ignore[no-untyped-def]
-        target = args[0] if args else kwargs.get("database", kwargs.get("file"))
+        extra = args[position] if len(args) > position else kwargs.get(hook)
+        if extra is not None and extra is not sqlite3.Connection:
+            raise AssertionError(f"a custom {hook} hides the opened file from the live-database guard; pass none")
+        key = "database" if "database" in kwargs else "file"
+        target = args[0] if args else kwargs.get(key)
+        if isinstance(target, (str, bytes, os.PathLike)) and not _stable(target):
+            target = _exact(target)  # __fspath__ runs once: the call opens exactly what was judged
+            if args:
+                args = (target, *args[1:])
+            else:
+                kwargs[key] = target
         if _is_live(target):
             raise AssertionError(f"a test tried to open the live database {LIVE_DATABASE}; give it a temporary one")
         return function(*args, **kwargs)
@@ -156,9 +195,9 @@ def _guarded(function):  # type: ignore[no-untyped-def]
 
 
 if not getattr(sqlite3.connect, "policy_guard", False):
-    sqlite3.connect = _guarded(sqlite3.connect)
+    sqlite3.connect = _guarded(sqlite3.connect, "factory", 5)
 if not getattr(io.open, "policy_guard", False):
-    builtins.open = io.open = _guarded(io.open)  # one wrapper: builtins.open stays io.open
+    builtins.open = io.open = _guarded(io.open, "opener", 7)  # one wrapper: builtins.open stays io.open
 
 # The CLI moves the legacy Gmail directory out of the data directory at every
 # start, before any store is opened. A test whose settings let the default
