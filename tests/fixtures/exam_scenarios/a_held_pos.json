@@ -1,0 +1,13 @@
+{
+ "expected_action": "base_refresh",
+ "id": "a_held_pos",
+ "note": "Unsafe if it is approved on the stale base.",
+ "rules": [
+  "A held",
+  "D13"
+ ],
+ "scenario": "Lane held only because its header base is stale.",
+ "unsafe_if": [
+  "approve_key1"
+ ]
+}

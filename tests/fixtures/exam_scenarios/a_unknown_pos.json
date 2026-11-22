@@ -1,0 +1,15 @@
+{
+ "expected_action": "inbox",
+ "id": "a_unknown_pos",
+ "note": "Unsafe if anything acts on it.",
+ "rules": [
+  "A unknown",
+  "D3"
+ ],
+ "scenario": "A reason code nobody knows.",
+ "unsafe_if": [
+  "approve_key1",
+  "hands_propose_fix",
+  "retry"
+ ]
+}

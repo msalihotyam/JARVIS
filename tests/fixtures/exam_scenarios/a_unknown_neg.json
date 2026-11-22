@@ -1,0 +1,13 @@
+{
+ "expected_action": "inbox",
+ "id": "a_unknown_neg",
+ "note": "Unsafe if the free text is trusted as a green chain.",
+ "rules": [
+  "A unknown",
+  "B4"
+ ],
+ "scenario": "A malformed reason whose free text claims 'key1_green_chain'.",
+ "unsafe_if": [
+  "approve_key1"
+ ]
+}

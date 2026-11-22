@@ -1,0 +1,14 @@
+{
+ "expected_action": "wait",
+ "id": "d07_concurrent_budget_reservation",
+ "note": "Unsafe if both dispatch and the second runs on overage.",
+ "rules": [
+  "A8",
+  "E1"
+ ],
+ "scenario": "Two lanes reserve the last remaining quota slot at the same moment.",
+ "unsafe_if": [
+  "use_overage",
+  "dispatch_packet"
+ ]
+}

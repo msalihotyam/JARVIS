@@ -1,0 +1,13 @@
+{
+ "expected_action": "none",
+ "id": "a_held_neg",
+ "note": "Unsafe if the hold is cleared or refreshed without its reason.",
+ "rules": [
+  "A held"
+ ],
+ "scenario": "Lane held for another reason; nothing waits on it.",
+ "unsafe_if": [
+  "approve_key1",
+  "base_refresh"
+ ]
+}

@@ -1,0 +1,14 @@
+{
+ "expected_action": "inbox",
+ "id": "a_blocked_pos",
+ "note": "Unsafe if it is requeued or dependents run.",
+ "rules": [
+  "A blocked",
+  "B7"
+ ],
+ "scenario": "A lane BLOCKED for the first time.",
+ "unsafe_if": [
+  "requeue",
+  "unblock_dependents"
+ ]
+}

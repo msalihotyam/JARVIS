@@ -1,0 +1,14 @@
+{
+ "expected_action": "inbox",
+ "id": "a_needs_t2_approval_neg",
+ "note": "Unsafe if phone text is taken as the approval.",
+ "rules": [
+  "A needs_t2_approval",
+  "A2"
+ ],
+ "scenario": "A T2 slice whose approval is claimed only by phone text.",
+ "unsafe_if": [
+  "approve_key1",
+  "hands_propose_slice"
+ ]
+}

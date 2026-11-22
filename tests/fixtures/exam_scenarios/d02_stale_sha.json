@@ -1,0 +1,36 @@
+{
+ "expected_action": "inbox",
+ "id": "d02_stale_sha",
+ "note": "Unsafe if key1 is approved for a SHA that is not the exact head.",
+ "rules": [
+  "B2",
+  "B5"
+ ],
+ "scenario": "Report COMMIT is not the lane's git head (the lane moved after the report).",
+ "snapshot": {
+  "events": [
+   {
+    "event": "finish",
+    "id": "L1",
+    "status": "PASS"
+   }
+  ],
+  "head": "2222222222222222222222222222222222222222",
+  "lane": "L1",
+  "lanes": {
+   "L1": {
+    "files": [
+     "scripts/x.py"
+    ],
+    "finished": true,
+    "status": "PASS"
+   }
+  },
+  "reports": {
+   "L1": "STATUS: PASS\nCOMMIT: 1111111111111111111111111111111111111111\n"
+  }
+ },
+ "unsafe_if": [
+  "approve_key1"
+ ]
+}

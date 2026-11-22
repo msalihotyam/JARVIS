@@ -258,5 +258,91 @@ class ReplayTest(unittest.TestCase):
                          ["decisions.jsonl", "report.md", "summary.json"])
 
 
+SECTION_A = ("key1_green_chain", "key1_green_protected", "chain_refused_finding", "blocked",
+             "held", "needs_t2_approval", "queue_low_n6", "queue_low_improve", "unknown")
+
+
+class ExamScenarioTest(unittest.TestCase):
+    """EXAMSCEN1: designed Gate B scenarios; expected actions come from the rules, not history."""
+
+    def setUp(self) -> None:
+        self.scenarios = rp.load_exam()
+
+    def _unsafe_once(self) -> tuple[str, object]:
+        target = next(s for s in self.scenarios if s["unsafe_if"])
+        sid = target["id"]  # by id: main() reloads the fixtures, so identity would never match
+        return sid, (lambda s: s["unsafe_if"][0] if s["id"] == sid else s["expected_action"])
+
+    def test_fixtures_load_and_cover_every_section_a_code_and_the_designed_set(self) -> None:
+        ids = {s["id"] for s in self.scenarios}
+        for code in SECTION_A:
+            self.assertIn(f"a_{code}_pos", ids)
+            self.assertIn(f"a_{code}_neg", ids)
+        self.assertGreaterEqual(sum(i.startswith("d") for i in ids), 12)
+        for s in self.scenarios:  # expected action is in the closed vocabulary and never unsafe
+            self.assertIn(s["expected_action"], rp.EXAM_ACTIONS, s["id"])
+            self.assertNotIn(s["expected_action"], s["unsafe_if"], s["id"])
+            self.assertTrue(s["rules"] and s["note"], s["id"])
+
+    def test_the_rule_answers_agree_everywhere_and_pass(self) -> None:
+        result = rp.exam(self.scenarios, lambda s: s["expected_action"])
+        total = len(self.scenarios)
+        self.assertEqual(result["summary"]["agree"], total)
+        self.assertEqual(result["summary"]["unsafe"], 0)
+        self.assertTrue(result["summary"]["passed"])
+
+    def test_one_unsafe_deviation_fails_the_exam(self) -> None:
+        sid, decide = self._unsafe_once()
+        result = rp.exam(self.scenarios, decide)
+        self.assertEqual(result["summary"]["unsafe"], 1)
+        self.assertFalse(result["summary"]["passed"])
+        self.assertEqual([r["id"] for r in result["rows"] if r["verdict"] == "unsafe"], [sid])
+        text = rp.exam_report(result)
+        self.assertIn(f"| {sid} |", text)
+        self.assertIn("unsafe: 1", text)
+        self.assertIn("FAIL", text)
+
+    def test_a_plain_disagreement_is_not_unsafe(self) -> None:
+        result = rp.exam(self.scenarios, lambda s: "none" if "none" not in s["unsafe_if"]
+                         and s["expected_action"] != "none" else s["expected_action"])
+        self.assertGreater(result["summary"]["disagree"], 0)
+        self.assertEqual(result["summary"]["unsafe"], 0)
+        self.assertTrue(result["summary"]["passed"])
+
+    def test_no_answer_is_uncovered_never_unsafe(self) -> None:
+        result = rp.exam(self.scenarios, lambda s: None)
+        self.assertEqual(result["summary"]["uncovered"], len(self.scenarios))
+        self.assertTrue(result["summary"]["passed"])
+
+    def test_cli_exit_code_follows_the_unsafe_count(self) -> None:
+        _sid, unsafe = self._unsafe_once()
+        for decide, code in ((lambda s: s["expected_action"], 0), (unsafe, 1)):
+            out = io.StringIO()
+            with mock.patch.object(rp, "n6_decide", decide), contextlib.redirect_stdout(out):
+                self.assertEqual(rp.main(["--exam"]), code)
+            self.assertIn("# Gate B exam", out.getvalue())
+
+    def test_the_n6_subject_answers_only_snapshot_scenarios(self) -> None:
+        for s in self.scenarios:
+            got = rp.n6_decide(s)
+            if "snapshot" in s:
+                self.assertIn(got, ("approve_key1", "inbox"), s["id"])
+            else:
+                self.assertIsNone(got, s["id"])
+
+    def test_a_malformed_fixture_is_refused(self) -> None:
+        good = {"id": "x", "rules": ["A"], "scenario": "s", "note": "n",
+                "expected_action": "inbox", "unsafe_if": ["approve_key1"]}
+        for bad in ({"expected_action": "approve_key1"}, {"unsafe_if": ["typo"]},
+                    {"expected_action": "typo"}, {"id": "y"}, {"note": None}):
+            with tempfile.TemporaryDirectory() as tmp:
+                Path(tmp, "x.json").write_text(json.dumps({**good, **bad}), encoding="utf-8")
+                with self.assertRaises(ValueError, msg=str(bad)):
+                    rp.load_exam(Path(tmp))
+                good_only = Path(tmp, "x.json")
+                good_only.write_text(json.dumps(good), encoding="utf-8")
+                self.assertEqual(len(rp.load_exam(Path(tmp))), 1)
+
+
 if __name__ == "__main__":
     unittest.main()

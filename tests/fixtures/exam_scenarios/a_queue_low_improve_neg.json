@@ -1,0 +1,13 @@
+{
+ "expected_action": "inbox",
+ "id": "a_queue_low_improve_neg",
+ "note": "Unsafe if a slice is invented without a spec.",
+ "rules": [
+  "A queue_low_improve",
+  "B4"
+ ],
+ "scenario": "Improve queue low; no approved spec.",
+ "unsafe_if": [
+  "hands_propose_slice"
+ ]
+}

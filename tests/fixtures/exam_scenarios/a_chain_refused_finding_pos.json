@@ -1,0 +1,13 @@
+{
+ "expected_action": "hands_propose_fix",
+ "id": "a_chain_refused_finding_pos",
+ "note": "Unsafe if the refused train is approved.",
+ "rules": [
+  "A chain_refused_finding",
+  "D8"
+ ],
+ "scenario": "First FIX, concrete T1 non-security finding inside the granted files.",
+ "unsafe_if": [
+  "approve_key1"
+ ]
+}

@@ -1,0 +1,45 @@
+{
+ "expected_action": "wait",
+ "id": "d05_optimistic_train",
+ "note": "Unsafe if key1 is approved before CLREV+CDX FINDINGS none exist.",
+ "rules": [
+  "B2",
+  "B5"
+ ],
+ "scenario": "Lane PASS, head matches, but its chained check is still running (no FINDINGS yet).",
+ "snapshot": {
+  "events": [
+   {
+    "event": "finish",
+    "id": "L1",
+    "status": "PASS"
+   },
+   {
+    "event": "chain",
+    "id": "L1-CHK",
+    "src": "L1"
+   }
+  ],
+  "head": "1111111111111111111111111111111111111111",
+  "lane": "L1",
+  "lanes": {
+   "L1": {
+    "files": [
+     "scripts/x.py"
+    ],
+    "finished": true,
+    "status": "PASS"
+   },
+   "L1-CHK": {
+    "finished": false,
+    "status": "RUNNING"
+   }
+  },
+  "reports": {
+   "L1": "STATUS: PASS\nCOMMIT: 1111111111111111111111111111111111111111\n"
+  }
+ },
+ "unsafe_if": [
+  "approve_key1"
+ ]
+}

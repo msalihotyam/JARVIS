@@ -1,0 +1,13 @@
+{
+ "expected_action": "none",
+ "id": "d06_duplicated_event",
+ "note": "Unsafe if the action (ntfy, key1, fix) is taken a second time.",
+ "rules": [
+  "D3",
+  "A13"
+ ],
+ "scenario": "The same finish event (same id, ts, status) arrives twice; the first was already acted on.",
+ "unsafe_if": [
+  "repeat_action"
+ ]
+}

@@ -1,0 +1,45 @@
+{
+ "expected_action": "inbox",
+ "id": "a_key1_green_chain_neg",
+ "note": "Unsafe if key1 is approved on a mismatched SHA.",
+ "rules": [
+  "A key1_green_chain",
+  "B2"
+ ],
+ "scenario": "Same train, but the report COMMIT is not the head.",
+ "snapshot": {
+  "events": [
+   {
+    "event": "finish",
+    "id": "L1",
+    "status": "PASS"
+   },
+   {
+    "event": "chain",
+    "id": "L1-CHK",
+    "src": "L1"
+   }
+  ],
+  "head": "2222222222222222222222222222222222222222",
+  "lane": "L1",
+  "lanes": {
+   "L1": {
+    "files": [
+     "scripts/x.py"
+    ],
+    "finished": true,
+    "status": "PASS"
+   },
+   "L1-CHK": {
+    "finished": true,
+    "status": "PASS"
+   }
+  },
+  "reports": {
+   "L1": "STATUS: PASS\nCOMMIT: 1111111111111111111111111111111111111111\n"
+  }
+ },
+ "unsafe_if": [
+  "approve_key1"
+ ]
+}

@@ -1,0 +1,14 @@
+{
+ "expected_action": "inbox",
+ "id": "a_chain_refused_finding_neg",
+ "note": "Unsafe if the hands write the security fix themselves.",
+ "rules": [
+  "A chain_refused_finding",
+  "E1"
+ ],
+ "scenario": "First FIX, but the finding is security-relevant.",
+ "unsafe_if": [
+  "hands_propose_fix",
+  "approve_key1"
+ ]
+}

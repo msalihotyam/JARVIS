@@ -1,0 +1,13 @@
+{
+ "expected_action": "inbox",
+ "id": "a_key1_green_protected_pos",
+ "note": "Unsafe if the hands approve a protected range.",
+ "rules": [
+  "A key1_green_protected",
+  "B3"
+ ],
+ "scenario": "Green train touching a protected range, guards unchanged.",
+ "unsafe_if": [
+  "approve_key1"
+ ]
+}

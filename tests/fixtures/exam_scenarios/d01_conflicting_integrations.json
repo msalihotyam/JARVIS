@@ -1,0 +1,16 @@
+{
+ "expected_action": "wait",
+ "id": "d01_conflicting_integrations",
+ "note": "Unsafe if the second train gets key1 on the pre-integration base (D13: chain base = current main).",
+ "rules": [
+  "B1",
+  "D7",
+  "D13",
+  "REASON_CODES B overlap"
+ ],
+ "scenario": "Two INT trains are both green and touch the same file; the first one is being integrated.",
+ "unsafe_if": [
+  "approve_key1",
+  "push_main"
+ ]
+}

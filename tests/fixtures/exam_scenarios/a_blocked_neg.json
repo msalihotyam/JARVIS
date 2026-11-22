@@ -1,0 +1,15 @@
+{
+ "expected_action": "salih",
+ "id": "a_blocked_neg",
+ "note": "Unsafe if a third FIX is attempted.",
+ "rules": [
+  "A blocked",
+  "D8",
+  "B8"
+ ],
+ "scenario": "A lane BLOCKED after its second failed FIX.",
+ "unsafe_if": [
+  "hands_propose_fix",
+  "requeue"
+ ]
+}

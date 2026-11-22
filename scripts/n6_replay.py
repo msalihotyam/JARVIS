@@ -10,6 +10,9 @@ Each pair is agree, different (N6-different) or not_comparable, tagged with the
 N6_HANDOVER_MATRIX behaviour that owns the deciding reason. Inputs are only read; output goes
 to build/n6/replay/<run>/{decisions.jsonl,report.md,summary.json} and nowhere else (never
 kpi.db, SHADOW_ON or LIMITED_ON). No git, network or model call; no wall clock.
+``--exam`` (EXAMSCEN1) instead runs the designed Gate B scenarios in
+tests/fixtures/exam_scenarios/ and prints agree / disagree / unsafe / uncovered; any unsafe
+answer fails the exam (exit 1).
 """
 
 from __future__ import annotations
@@ -307,11 +310,81 @@ def write(root: Path, run: str, result: dict[str, Any]) -> Path:
     return out
 
 
+# EXAMSCEN1 (Gate B B4b): designed scenarios whose expected action comes from the rules
+# (REASON_CODES_v1, ORCH_CORE_v1 A/B/D/E), never from a model's past output.
+EXAM_DIR = ROOT / "tests" / "fixtures" / "exam_scenarios"
+EXAM_ACTIONS = frozenset({
+    "approve_key1", "inbox", "salih", "hands_propose_fix", "hands_propose_slice", "base_refresh",
+    "wait", "reconcile", "ntfy_alarm", "none", "retry", "requeue", "use_overage",
+    "call_fable_api", "continue_fable_background", "brain_provisional", "restart_conveyor",
+    "extend_quarantine", "unblock_dependents", "repeat_action", "push_main", "dispatch_packet"})
+EXAM_KEYS = ("id", "rules", "scenario", "expected_action", "unsafe_if", "note")
+
+
+def load_exam(folder: Path = EXAM_DIR) -> list[dict[str, Any]]:
+    """Every <id>.json under ``folder``; a malformed fixture raises ValueError (fail closed)."""
+    scenarios = []
+    for path in sorted(Path(folder).glob("*.json")):
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        missing = [key for key in EXAM_KEYS if not doc.get(key)]
+        if missing or doc["id"] != path.stem:
+            raise ValueError(f"{path.name}: missing {missing} or id != file name")
+        actions = [doc["expected_action"], *doc["unsafe_if"]]
+        if any(action not in EXAM_ACTIONS for action in actions):
+            raise ValueError(f"{path.name}: action outside the closed vocabulary")
+        if doc["expected_action"] in doc["unsafe_if"]:
+            raise ValueError(f"{path.name}: the expected action is also unsafe")
+        scenarios.append(doc)
+    return scenarios
+
+
+def n6_decide(scenario: dict[str, Any]) -> str | None:
+    """N6's own action on a scenario carrying a ledger snapshot; None (uncovered) otherwise."""
+    snap = scenario.get("snapshot")
+    if snap is None:
+        return None
+    state = Snapshot(snap["lanes"], tuple(snap["events"]), snap["reports"])
+    verdict, _ = n6_verdict(state, snap["lane"], lambda _lane: snap["head"])
+    return "approve_key1" if verdict == "pass" else "inbox"
+
+
+def exam(scenarios: list[dict[str, Any]],
+         decide: Callable[[dict[str, Any]], str | None]) -> dict[str, Any]:
+    """agree / disagree / unsafe / uncovered per scenario; any unsafe fails the exam."""
+    rows = []
+    for scenario in scenarios:
+        got = decide(scenario)
+        verdict = ("uncovered" if got is None else "unsafe" if got in scenario["unsafe_if"]
+                   else "agree" if got == scenario["expected_action"] else "disagree")
+        rows.append({"id": scenario["id"], "expected": scenario["expected_action"],
+                     "actual": got, "verdict": verdict})
+    counts = Counter(row["verdict"] for row in rows)
+    summary = {v: counts[v] for v in ("agree", "disagree", "unsafe", "uncovered")}
+    return {"rows": rows, "summary": {**summary, "total": len(rows),
+                                      "passed": summary["unsafe"] == 0}}
+
+
+def exam_report(result: dict[str, Any]) -> str:
+    lines = ["# Gate B exam", "", "| id | expected | actual | verdict |", "|---|---|---|---|"]
+    lines += [f"| {r['id']} | {r['expected']} | {r['actual'] or '-'} | {r['verdict']} |"
+              for r in sorted(result["rows"], key=lambda r: r["id"])]
+    summary = result["summary"]
+    lines += [""] + [f"{v}: {summary[v]}" for v in ("agree", "disagree", "unsafe", "uncovered")]
+    lines.append(f"result: {'PASS' if summary['passed'] else 'FAIL'}")
+    return "\n".join(lines) + "\n"
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="N6 replay over the recorded conveyor history")
     parser.add_argument("--root", type=Path, default=ROOT)
     parser.add_argument("--run", help="folder under build/n6/replay (default: last event ts)")
+    parser.add_argument("--exam", action="store_true",
+                        help="run the designed Gate B exam scenarios instead (exit 1 if unsafe)")
     args = parser.parse_args(argv)
+    if args.exam:
+        result = exam(load_exam(), n6_decide)
+        print(exam_report(result), end="")
+        return 0 if result["summary"]["passed"] else 1
     root = Path(args.root)
     result = replay(root)
     out = write(root, args.run or result["summary"]["last_ts"], result)
