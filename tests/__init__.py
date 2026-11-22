@@ -36,6 +36,7 @@ import builtins
 import functools
 import io
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -84,6 +85,31 @@ if getattr(_memory.SQLiteMemoryStore.__init__, "__name__", "") != _refuse_live_d
 _LIVE_PATHS = {os.path.normcase(str(LIVE_DATABASE) + suffix) for suffix in ("", "-wal", "-shm", "-journal")}
 
 
+_EXTENDED_PREFIX = re.compile(r"^(?:[\\/]{2}[?.]|\\\?\?)[\\/](UNC[\\/])?", re.IGNORECASE)  # \\?\  \\.\  and the NT form \??\
+
+
+def _win32_spelling(target: str) -> str:
+    """The path as Win32 reads it: no \\\\?\\ / \\\\?\\UNC\\ prefix, no trailing dots or spaces on a component.
+
+    shortcut: Windows only (the suite's one platform); no 8.3 short-name expansion for a file that
+    does not exist yet, upgrade to a stat/samefile identity check if that ever matters.
+    """
+    if os.name != "nt":
+        return target
+    match = _EXTENDED_PREFIX.match(target)
+    if match:
+        target = ("\\\\" if match.group(1) else "") + target[match.end() :]
+    parts = re.split(r"[\\/]", target)
+    return "\\".join(part if part in ("", ".", "..") else part.rstrip(". ") for part in parts)
+
+
+def _same_folder(first, second) -> bool:  # type: ignore[no-untyped-def]
+    try:
+        return os.path.samefile(first, second)
+    except OSError:  # a folder that does not exist is not the live one (and the live folder always exists)
+        return False
+
+
 def _is_live(target) -> bool:  # type: ignore[no-untyped-def]
     if not isinstance(target, (str, bytes, os.PathLike)):
         return False  # a file descriptor is never the path
@@ -92,10 +118,25 @@ def _is_live(target) -> bool:  # type: ignore[no-untyped-def]
     uri = target[:5].lower() == "file:"
     try:
         if uri:
-            target = urllib.request.url2pathname(urllib.parse.urlparse(target).path)
+            path = urllib.parse.urlparse(target).path
+            # url2pathname mangles a UNC authority ("//host/share"); SQLite opens it as is.
+            target = urllib.parse.unquote(path) if path.startswith("//") else urllib.request.url2pathname(path)
         if uri and "\0" in target:
             return True  # SQLite cuts the decoded URI path at an encoded NUL ("%00") and opens what is left
-        return os.path.normcase(str(Path(target).resolve())) in _LIVE_PATHS
+        target = _win32_spelling(target)
+    except Exception:  # noqa: BLE001 - a spelling that cannot be normalised is refused (fail closed)
+        return True
+    try:
+        resolved = Path(target).resolve()
+        if os.path.normcase(str(resolved)) in _LIVE_PATHS:
+            return True
+        # Another route to the same directory (an admin share \\localhost\C$\..., a \\?\Volume{GUID}\...
+        # path, a junction) spells differently but is the same folder: compare folder identity + file name.
+        name = os.path.normcase(resolved.name)
+        for live in _LIVE_PATHS:
+            if os.path.basename(live) == name and _same_folder(resolved.parent, os.path.dirname(live)):
+                return True
+        return False
     except (OSError, ValueError):
         # A URI that cannot be resolved (an encoded NUL, ...) may still open the file: refuse it.
         # A plain path that cannot be read makes the wrapped call raise its own error.
