@@ -35,13 +35,13 @@ concurrency:
 
 jobs:
   shard:
-    name: shard ${{ matrix.shard }}/4
+    name: shard ${{ matrix.shard }}/8
     runs-on: windows-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
     env:
       PYTHONUTF8: "1"
     steps:
@@ -70,7 +70,7 @@ jobs:
       - name: Run this shard
         shell: pwsh
         run: |
-          python scripts/test_parallel.py --shard ${{ matrix.shard }}/4 --durations 30 --report shard-report.json *> shard-summary.txt
+          python scripts/test_parallel.py --shard ${{ matrix.shard }}/8 --durations 30 --report shard-report.json *> shard-summary.txt
           $code = $LASTEXITCODE
           Get-Content shard-summary.txt
           exit $code
@@ -124,7 +124,7 @@ jobs:
       - name: Check and combine the shards
         shell: pwsh
         run: |
-          python scripts/test_parallel.py --aggregate shards --shards 4 --durations 30 --write-durations ci-durations.json *> ci-summary.txt
+          python scripts/test_parallel.py --aggregate shards --shards 8 --durations 30 --write-durations ci-durations.json *> ci-summary.txt
           $code = $LASTEXITCODE
           # Per shard: its workers and totals when green, its whole summary (the traces) when not.
           foreach ($file in Get-ChildItem shards -Recurse -Filter shard-summary.txt | Sort-Object FullName) {
