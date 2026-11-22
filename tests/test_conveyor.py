@@ -8716,6 +8716,19 @@ class TestChain(AutopilotBase):
         self.finish("SRC", "PASS", extra=self.PICK)
         self.refused("files outside the grant")
 
+    # SEEDGUARD1 A18
+    def _refused_before_int(self, f):
+        self.commit(files=("scripts/a.py", f))
+        self.start(files=["scripts/a.py", f])
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.refused("refused before INT")
+
+    def test_claude_dir_refused_before_int(self):
+        self._refused_before_int(".claude/settings.json")
+
+    def test_conveyor_notes_refused_before_int(self):
+        self._refused_before_int("build/conveyor/notes/LANE_RULES.md")
+
     def test_commit_already_on_main_refused(self):
         self.git.fail[("git", "merge-base", "--is-ancestor", self.SHA, ORIGIN)] = (0, "")
         self.start()
@@ -10002,6 +10015,17 @@ class PhoneCmd(Base):
         self.assertNotIn("rm -rf", (self.base / "events.jsonl").read_text(encoding="utf-8"))
         self.assertEqual(self.git.calls, [])
 
+    # SEEDGUARD1 A2
+    def test_neg_seedguard_resume_approve_push_are_refused(self):
+        self.msgs(("s1", "resume"), ("s2", "approve"), ("s3", "push"), ("s4", "Approve key1"),
+                  ("s5", "resume all"))
+        self.tick()
+        self.assertEqual(self.pushes, [])
+        self.assertFalse((self.base / "PAUSE").exists())
+        self.assertEqual(len(self.events("phone_unknown")), 5)
+        self.assertEqual([r for r in self.events() if r["event"] != "phone_unknown"], [])
+        self.assertEqual(self.git.calls, [])
+
     def test_neg_fetch_errors_no_crash_backoff_one_event_per_class(self):
         self.body = TimeoutError(f"https://ntfy.sh/{self.TOPIC}/json timed out")
         self.tick()
@@ -10461,6 +10485,35 @@ class PhoneCmd(Base):
             keys = {k.upper() for k in c.kwargs["env"]}
             self.assertFalse(keys & set(conveyor.NTFY_ENV), c)
             self.assertIn("KEEP_ME", keys)
+
+    # SEEDGUARD1 A7/A8
+    def test_neg_lane_launch_env_has_no_api_key_or_overage(self):
+        bad = {"ANTHROPIC_API_KEY": "sk-x", "anthropic_api_key": "sk-y",
+               "CLAUDE_CODE_OVERAGE_X": "1", "ALLOW_EXTRA_USAGE": "1"}
+        done = subprocess.CompletedProcess([], 0, b"", b"")
+        with mock.patch.dict(os.environ, {**bad, "KEEP_ME": "1"}), \
+                mock.patch("subprocess.run", return_value=done) as run:
+            conveyor.real_runner(["--bg"], env={"CLAUDE_CODE_SUBAGENT_MODEL": "haiku"})
+            keys = {k.upper() for k in run.call_args.kwargs["env"]}
+            self.assertFalse(keys & {k.upper() for k in bad}, keys)
+            self.assertIn("KEEP_ME", keys)
+            self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL", keys)
+            self.assertIn("ANTHROPIC_API_KEY", conveyor.child_env())  # git/gh children unchanged
+
+    # SEEDGUARD1 A12
+    def test_neg_git_worktree_prune_never_runs(self):
+        with mock.patch("subprocess.run") as run:
+            for argv in (["git", "worktree", "prune"], [*conveyor.GIT_PIN, "worktree", "prune", "-v"]):
+                rc, _ = conveyor.real_cmd(argv)
+                self.assertNotEqual(rc, 0, argv)
+        self.assertEqual(run.call_count, 0)
+
+    # SEEDGUARD1 A11
+    def test_neg_riot_paths_never_staged(self):
+        for p in ("C:\\Riot Games\\x.exe", "Program Files/Riot Vanguard/vgtray.exe",
+                  "x/RiotClientServices.exe", "riot/a.txt"):
+            self.assertTrue(conveyor.protected_path(p), p)
+        self.assertFalse(conveyor.protected_path("scripts/patriot.py"))
 
     def test_neg_note_with_topics_is_redacted(self):
         os.environ["JARVIS_NTFY_TOPIC"] = "notifyTopic_5k2P"

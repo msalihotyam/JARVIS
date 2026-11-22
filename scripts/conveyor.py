@@ -98,6 +98,7 @@ def protected_path(p):
     base = p.rsplit("/", 1)[-1]
     return (base == "uv.lock" or base.startswith(".env") or p.startswith(("data/", "dev/dashboard/"))
             or p.startswith(PROTECTED_DIRS) or "/.jarvis/" in "/" + p
+            or any(s.startswith("riot") for s in p.split("/"))  # SEEDGUARD1 A11: Riot/Vanguard
             or base.endswith((".pem", ".key", ".p12", ".pfx", ".crt", ".cer", ".db", ".sqlite", ".sqlite3")))
 
 
@@ -595,7 +596,7 @@ def real_runner(args, timeout=120, cwd=None, env=None):
     # stdin=DEVNULL: under pythonw claude otherwise blocks reading stdin
     p = subprocess.run([claude_exe(), *args], cwd=cwd or ROOT, capture_output=True,
                        stdin=subprocess.DEVNULL,
-                       env=child_env(**(env or {})),
+                       env=lane_env(**(env or {})),
                        timeout=timeout, creationflags=flags)
     out = (p.stdout or b"") + (p.stderr or b"")
     return p.returncode, out.decode("utf-8", "replace")
@@ -747,8 +748,17 @@ def restart_task(argv):
                           env=child_env(), creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0)).returncode
 
 
+def lane_env(**extra):
+    """SEEDGUARD1 A7/A8: a claude lane launch never carries an API key or an overage/extra-usage
+    switch (subscription only); the broker reads its key from the credential store, not env."""
+    return {k: v for k, v in child_env(**extra).items() if k.upper() != "ANTHROPIC_API_KEY"
+            and "OVERAGE" not in k.upper() and "EXTRA_USAGE" not in k.upper()}
+
+
 def real_cmd(args, timeout=120):
     """Run git or gh (args[0]) in the canonical checkout; return (returncode, output)."""
+    if any(a == "worktree" and b == "prune" for a, b in zip(args, args[1:])):  # SEEDGUARD1 A12
+        return 1, "refused: git worktree prune"
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     env = child_env(GIT_TERMINAL_PROMPT="0", GCM_INTERACTIVE="never")  # never wait on a prompt
     p = subprocess.run([shutil.which(args[0]) or args[0], *args[1:]], cwd=ROOT,
@@ -4729,6 +4739,8 @@ class Conveyor:
         main, files = self.chain_verify(s, ln, sha)
         if main is None:
             return files
+        if any(p.startswith(("build/conveyor/notes/", ".claude/")) for p in files):  # SEEDGUARD1 A18
+            return "touches build/conveyor/notes/ or .claude/: refused before INT"
         if nid in lanes or nid in ids or self.find_report(nid):
             return f"{nid} already exists"
         try:
