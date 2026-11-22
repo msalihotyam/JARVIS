@@ -32,9 +32,14 @@ leak into the results:
 """
 
 import atexit
+import builtins
+import io
 import os
 import shutil
+import sqlite3
 import tempfile
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from jarvis import memory as _memory
@@ -69,6 +74,42 @@ def _refuse_live_database(self, database_path) -> None:  # type: ignore[no-untyp
 
 if getattr(_memory.SQLiteMemoryStore.__init__, "__name__", "") != _refuse_live_database.__name__:
     _memory.SQLiteMemoryStore.__init__ = _refuse_live_database
+
+# POLICYGUARD1 (A5, one guard for every test module): ``sqlite3.connect`` and ``open`` refuse the
+# live database path too, not only ``SQLiteMemoryStore``: any code a test reaches, any store,
+# any direct read. Keyed on the resolved real path (and its -wal/-shm/-journal files), so a
+# temporary copy named ``jarvis.db`` is fine. shortcut: ``os.open`` and a hard link to the file
+# are not covered; add them here if a test ever needs them.
+_LIVE_PATHS = {os.path.normcase(str(LIVE_DATABASE) + suffix) for suffix in ("", "-wal", "-shm", "-journal")}
+
+
+def _is_live(target, uri=False) -> bool:  # type: ignore[no-untyped-def]
+    if isinstance(target, bytes):
+        target = os.fsdecode(target)
+    if not isinstance(target, (str, os.PathLike)):
+        return False  # a file descriptor is never the path
+    try:
+        if isinstance(target, str) and uri and target.startswith("file:"):
+            target = urllib.request.url2pathname(urllib.parse.urlparse(target).path)
+        return os.path.normcase(str(Path(target).resolve())) in _LIVE_PATHS
+    except (OSError, ValueError):
+        return False  # unreadable spelling: the wrapped call raises its own error
+
+
+def _guarded(function):  # type: ignore[no-untyped-def]
+    def guard(*args, **kwargs):  # type: ignore[no-untyped-def]
+        target = args[0] if args else kwargs.get("database", kwargs.get("file"))
+        if _is_live(target, kwargs.get("uri", False)):
+            raise AssertionError(f"a test tried to open the live database {LIVE_DATABASE}; give it a temporary one")
+        return function(*args, **kwargs)
+
+    guard.policy_guard = True  # type: ignore[attr-defined]
+    return guard
+
+
+for _owner, _name in ((sqlite3, "connect"), (builtins, "open"), (io, "open")):
+    if not getattr(getattr(_owner, _name), "policy_guard", False):
+        setattr(_owner, _name, _guarded(getattr(_owner, _name)))
 
 # The CLI moves the legacy Gmail directory out of the data directory at every
 # start, before any store is opened. A test whose settings let the default
