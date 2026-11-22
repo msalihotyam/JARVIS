@@ -660,6 +660,31 @@ class TestBacklog(Base):
         self.assertFalse(self.c.unstarted({"id": "OLD"}, {}))
         self.assertTrue(self.c.unstarted({"id": "NEW"}, {}))
 
+    def test_stale_generated_int_of_reviewed_commit_stays_held(self):  # BASEAUTO1FIX
+        self.stale("INT-SRC")
+        self.report("CLREV-SRC", "PASS")
+        self.report("CDX-SRC", "PASS")
+        (self.base / "prompts" / "INT-SRC.md").write_text(  # the body names the old MAIN as well
+            "@jarvis lane=INT-SRC model=opus effort=high base=072d0fe\nCI BRANCH: ci/int-src\n"
+            "PREFLIGHT: local main == 072d0fe\n", encoding="utf-8")
+        self.c.auto_file.write_text(json.dumps({"since": self.t, "chain": {
+            "SRC@" + "a" * 40: {"steps": ["CLREV-SRC", "CDX-SRC", "INT-SRC"]}}}), encoding="utf-8")
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), [])
+        self.assertTrue(self.view()["INT-SRC"].startswith("held: base 072d0fe is not main"))
+        self.assertEqual([e for e in self.events() if e["event"] == "base_refreshed"], [])
+
+    def test_chain_generated_ids_are_never_unstarted(self):  # BASEAUTO1FIX
+        for sid in ("INT-SRC", "INT-SRC-R1", "CLREV-SRC", "CDX-SRC", "SRC-AFX", "SRC-2-AFX", "SRC-S", "SRC-R"):
+            self.assertFalse(self.c.unstarted({"id": sid}, {}), sid)
+        self.c.auto_file.write_text(json.dumps({"since": self.t, "chain": {"SRC@" + "a" * 40: {"steps": ["STEPX"]}},
+                                                "chain_slices": [{"id": "GENX", "model": "opus", "effort": "high",
+                                                                  "tier": "T2", "prompt": "build/x/GENX.md"}]}),
+                                    encoding="utf-8")
+        self.assertFalse(self.c.unstarted({"id": "STEPX"}, {}))
+        self.assertFalse(self.c.unstarted({"id": "genx"}, {}))
+        self.assertTrue(self.c.unstarted({"id": "NEW"}, {}))
+
     def test_stacked_slice_base_untouched(self):
         s = {"id": "FIX", "prompt": "build/conveyor/prompts/FIX.md", "model": "opus", "effort": "high",
              "stack": ["d" * 40], "review_base": "f" * 40}

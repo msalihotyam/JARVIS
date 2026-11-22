@@ -4087,7 +4087,9 @@ class Conveyor:
         """BASEAUTO1: never dispatched, reviewed, CI-run or chained, and not a stacked FIX: its base
         may follow main. Anything unreadable or odd answers False (the hold stays)."""
         sid = s["id"]
-        if "stack" in s or "review_base" in s:
+        # BASEAUTO1FIX: chain-generated lanes (INT/CLREV/CDX/AFX/-R/-S) carry their old MAIN in the body too
+        if ("stack" in s or "review_base" in s or INT_RE.match(sid) or re.match(r"(?i)(clrev|cdx)(?![a-z])", sid)
+                or CHAIN_SUFFIX_RE.search(sid)):
             return False
         try:  # a lane record carries any CI receipt; a review lane or report names the slice
             if any(n in lanes or self.find_report(n) for n in (sid, f"CLREV-{sid}", f"CDX-{sid}", f"INT-{sid}")):
@@ -4095,7 +4097,12 @@ class Conveyor:
         except (OSError, ValueError):
             return False
         ap = self.auto_state()
-        return ap is not None and not any(k.startswith(sid + "@") for k in ap.get("chain", {})) and not any(
+        if ap is None:
+            return False
+        chain, gen = ap.get("chain", {}), ap.get("chain_slices", [])
+        steps = {x for r in chain.values() if isinstance(r, dict) for x in r.get("steps") or ()}
+        steps |= {g.get("id") for g in gen if isinstance(g, dict)}
+        return sid.upper() not in {str(x).upper() for x in steps} and not any(k.startswith(sid + "@") for k in chain) and not any(
             sid in chain_ids(c) for c in ap.get("chains", {}).values())
 
     def slice_text(self, s, lanes=None):
