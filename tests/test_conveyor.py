@@ -3970,6 +3970,17 @@ class TestSharedWrite(Base):
         self.assertNotIsInstance(cm.exception, PermissionError)
         self.assertEqual(self.sleeps, [])
 
+    def test_write_atomic_fsyncs_before_replace_and_keeps_bak(self):  # STATEBAK1
+        calls, real_replace, real_fsync = [], os.replace, os.fsync
+        with mock.patch.object(conveyor.os, "fsync", side_effect=lambda fd: calls.append("fsync") or real_fsync(fd)), \
+                mock.patch.object(conveyor.os, "replace",
+                                  side_effect=lambda s, d: calls.append(Path(d).name) or real_replace(s, d)):
+            self.assertTrue(self.c.write_atomic(self.c.push_file, '{"x": 1}'))
+            self.assertTrue(self.c.write_atomic(self.base / "x.json", "{}"))
+        self.assertEqual(calls, ["fsync", "push.json", "fsync", "push.json.bak", "fsync", "x.json"])
+        self.assertEqual((self.base / "push.json.bak").read_text(encoding="utf-8"), '{"x": 1}')
+        self.assertFalse((self.base / "x.json.bak").exists())
+
     def slow_cli(self):
         """Each stop/rm takes 70 s (> BEAT_S); returns the heartbeat age seen at each call."""
         ages, real = [], self.c.run
@@ -5451,8 +5462,9 @@ class TestAutoApproval(AutopilotBase):
                 self.assertEqual(self.view(), {})
 
     def test_unreadable_state_fails_closed(self):
+        self.int_lane()  # STATEBAK1: corrupt state + bad .bak now PAUSEs all dispatch, so corrupt after INT9 runs
         (self.base / "autopilot.json").write_text("{broken", encoding="utf-8")
-        self.int_lane()
+        (self.base / "autopilot.json.bak").write_text("{broken", encoding="utf-8")  # STATEBAK1: no restore
         self.drop("p.md", HDR.format("P"))
         self.finish("INT9", "GREEN", GREEN)
         self.assertEqual(self.approvals(), [])
@@ -6416,6 +6428,7 @@ class TestCIHandoff(AutopilotBase):
         self.git.ci(SHA_A, "failure")
         self.git.fail[("gh", "run", "rerun")] = (0, "")
         (self.base / "autopilot.json").write_text("{broken", encoding="utf-8")
+        (self.base / "autopilot.json.bak").write_text("{broken", encoding="utf-8")  # STATEBAK1: no restore
         self.c.pass_once()
         self.assertEqual(self.lanes()["INT1"]["status"], "BLOCKED")
         self.assertEqual((self.reruns(), self.ev("ci_rerun")), ([], []))
@@ -7448,6 +7461,36 @@ class TestConvSafe(AutopilotBase):
         self.assertEqual(f.read_text(encoding="utf-8"), "{bad")
         self.assertEqual(self.fake.bg_names(), [])
         self.assertIn("lanes-invalid", [a["id"] for a in self.status()["attention"]])
+
+    def test_nul_lanes_json_restored_from_bak(self):  # STATEBAK1: power loss before the data hit the disk
+        self.c.save_lanes({"A": {"status": "GREEN"}})
+        f, bak = self.base / "lanes.json", self.base / "lanes.json.bak"
+        good = f.read_text(encoding="utf-8")
+        self.assertEqual(bak.read_text(encoding="utf-8"), good)
+        f.write_bytes(b"\0" * 64)
+        self.assertEqual(self.c.load_lanes(), {"A": {"status": "GREEN"}})
+        self.assertIsNone(self.c.lanes_bad)
+        self.assertEqual(f.read_text(encoding="utf-8"), good)
+        self.assertFalse((self.base / "PAUSE").exists())
+        self.assertEqual([{k: v for k, v in e.items() if k != "ts"} for e in self.events()],
+                         [{"event": "state_restored", "file": "lanes.json"}])  # the name only, no content
+
+    def test_corrupt_state_and_bad_bak_pause_attention_no_dispatch(self):  # STATEBAK1
+        for name, item in (("lanes.json", "lanes-invalid"), ("autopilot.json", "state-invalid-autopilot"),
+                           ("push.json", "state-invalid-push")):
+            with self.subTest(name):
+                self.tearDown()
+                self.setUp()
+                f, bak = self.base / name, self.base / (name + ".bak")
+                f.write_bytes(b"\0" * 64)
+                bak.write_text("{bad", encoding="utf-8")
+                self.drop("a.md", HDR.format("A"))
+                self.c.pass_once()
+                self.assertEqual((f.read_bytes(), bak.read_text(encoding="utf-8")), (b"\0" * 64, "{bad"))
+                self.assertTrue((self.base / "PAUSE").exists())
+                self.assertEqual(self.fake.bg_names(), [])
+                self.assertIn(item, [a["id"] for a in self.status()["attention"]])
+                self.assertNotIn("state_restored", [e["event"] for e in self.events()])
 
     def test_api_outage_pages_and_a_stale_orchestrator_does_not(self):
         def pages(word):
@@ -8717,6 +8760,7 @@ class TestChain(AutopilotBase):
     def test_malformed_autopilot_nothing(self):
         self.start()
         (self.base / "autopilot.json").write_text("{broken", encoding="utf-8")
+        (self.base / "autopilot.json.bak").write_text("{broken", encoding="utf-8")  # STATEBAK1: no restore
         self.finish("SRC", "PASS", extra=self.PICK)
         self.assertEqual((self.base / "autopilot.json").read_text(encoding="utf-8"), "{broken")
         self.assertEqual((self.ev("chain"), self.ev("chain_refused")), ([], []))
