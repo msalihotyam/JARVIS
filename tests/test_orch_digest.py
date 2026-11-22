@@ -215,13 +215,28 @@ class DigestTests(unittest.TestCase):
 
     def test_section_b_closed_list(self):
         self.assertEqual(orch_digest.REASONS[-3:], ("queue_empty", "overlap", "unknown"))
-        for out_of_scope in ("UNKNOWN_OUTCOME", "packet_too_large"):  # B2a / no packet-size measure in the digest
-            self.assertNotIn(out_of_scope, orch_digest.REASONS)
+        self.assertIn("UNKNOWN_OUTCOME", orch_digest.REASONS)  # OUTCOME1 (B2a)
+        self.assertNotIn("packet_too_large", orch_digest.REASONS)  # no packet-size measure in the digest
         att = [{"id": "Q", "reason": "something unmapped"}]
         with tempfile.TemporaryDirectory() as t:
             tree(t, att)
             _, d = run(t)
         self.assertEqual({i["id"]: i["reason"] for i in d["items"]}, {"Q": "unknown"})
+
+    def test_unknown_outcome_event_is_listed_first_and_never_dropped(self):
+        ev = [json.dumps({"ts": "2026-11-14T08:00:00", "event": "unknown_outcome", "intent": "push:" + "a" * 40,
+                          "reason": "UNKNOWN_OUTCOME"}),
+              json.dumps({"ts": "bad", "event": "unknown_outcome"}),  # no id, no ts: still listed
+              json.dumps({"ts": "2026-11-13T08:00:00", "event": "unknown_outcome", "intent": "api:old"})]
+        att = [{"id": "B", "reason": "blocked"}, {"id": "U", "reason": "UNKNOWN_OUTCOME: apply"}]
+        with tempfile.TemporaryDirectory() as t:
+            tree(t, att, events=ev)
+            md, d = run(t)
+        got = [(i["id"], i["reason"]) for i in d["items"]][:3]
+        self.assertEqual(got, [("U", "UNKNOWN_OUTCOME"), ("intent@bad", "UNKNOWN_OUTCOME"),
+                               ("push:" + "a" * 40, "UNKNOWN_OUTCOME")])
+        self.assertNotIn("api:old", {i["id"] for i in d["items"]})  # before --since
+        self.assertIn(b"- UNKNOWN_OUTCOME push:", md)
 
 
 if __name__ == "__main__":
