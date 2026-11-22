@@ -34,14 +34,17 @@ leak into the results:
 import atexit
 import builtins
 import functools
+import importlib.util
 import io
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
+import types
 import urllib.parse
 import urllib.request
-from pathlib import Path, PurePath
+from pathlib import Path
 
 from jarvis import memory as _memory
 from jarvis.settings import PROJECT_ROOT as _PROJECT_ROOT
@@ -89,11 +92,25 @@ if getattr(_memory.SQLiteMemoryStore.__init__, "__name__", "") != _refuse_live_d
 _COMPANIONS = ("", "-wal", "-shm", "-journal")
 # POLICYGUARD1FIX4: the guard runs inside every open(), so it calls only these import-time refs; a
 # test that spies on os.stat / os.path.realpath / ... then sees its own calls, never the guard's.
-# shortcut: what ntpath's own functions look up (ntpath.join/normpath, and os.fspath inside
-# join/normcase) stays patchable; capture or reimplement those if a test ever spies on them.
-_stat, _fspath, _fsdecode = os.stat, os.fspath, os.fsdecode
-_abspath, _split, _join, _dirname = os.path.abspath, os.path.split, os.path.join, os.path.dirname
-_realpath, _samestat, _lexists, _exists = os.path.realpath, os.path.samestat, os.path.lexists, os.path.exists
+# POLICYGUARD1FIX5: os.path's own functions look up os.fspath / os.path.join / ... at call time, so
+# the guard uses a private copy of os.path (not in sys.modules) bound to an import-time snapshot of os.
+# shortcut: a freshly built Path LIVE_DATABASE parses through the real os.path on its first str();
+# a test spying on os.fspath calls str() on it before the spy window.
+_os = types.ModuleType("os")
+_os.__dict__.update(os.__dict__)
+_spec = importlib.util.find_spec(os.path.__name__)
+_path = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_path)  # type: ignore[union-attr]
+_path.os = _os  # type: ignore[attr-defined]
+_stat, _fspath = os.stat, os.fspath
+_ENCODING, _ERRORS = sys.getfilesystemencoding(), sys.getfilesystemencodeerrors()
+_abspath, _split, _join, _dirname = _path.abspath, _path.split, _path.join, _path.dirname
+_realpath, _samestat, _lexists, _exists = _path.realpath, _path.samestat, _path.lexists, _path.exists
+
+
+def _fsdecode(raw):  # type: ignore[no-untyped-def]
+    # os.fsdecode of an exact str/bytes (from _exact), without its call-time os.fspath lookup.
+    return raw if isinstance(raw, str) else raw.decode(_ENCODING, _ERRORS)
 
 
 def _live_name(name: str) -> bool:
@@ -106,7 +123,7 @@ def _live_name(name: str) -> bool:
 def _exact(target):  # type: ignore[no-untyped-def]
     # The exact str/bytes a call opens: a subclass cannot answer == / in differently.
     raw = _fspath(target)
-    return str.__str__(raw) if isinstance(raw, str) else bytes(raw)
+    return str.__str__(raw) if isinstance(raw, str) else bytes.__bytes__(raw)
 
 
 def _decide(text: str, plain: bool = False) -> bool:
@@ -172,12 +189,6 @@ def _is_live(target) -> bool:  # type: ignore[no-untyped-def]
         return True
 
 
-def _stable(target) -> bool:  # type: ignore[no-untyped-def]
-    return type(target) in (str, bytes) or (
-        isinstance(target, PurePath) and type(target).__fspath__ is PurePath.__fspath__
-    )
-
-
 def _guarded(function, hook: str, position: int):  # type: ignore[no-untyped-def]
     # hook: the argument (open's opener, connect's factory) that could open any file whatever the path.
     @functools.wraps(function)
@@ -187,8 +198,10 @@ def _guarded(function, hook: str, position: int):  # type: ignore[no-untyped-def
             raise AssertionError(f"a custom {hook} hides the opened file from the live-database guard; pass none")
         key = "database" if "database" in kwargs else "file"
         target = args[0] if args else kwargs.get(key)
-        if isinstance(target, (str, bytes, os.PathLike)) and not _stable(target):
-            target = _exact(target)  # __fspath__ runs once: the call opens exactly what was judged
+        if isinstance(target, (str, bytes, os.PathLike)):
+            # every PathLike, PurePath too (its __fspath__ is str(self)): __fspath__ runs once and
+            # the call opens exactly the str/bytes that was judged
+            target = _exact(target)
             if args:
                 args = (target, *args[1:])
             else:

@@ -228,10 +228,11 @@ class PolicyGuardTests(unittest.TestCase):
         # Plain strings only: pathlib itself calls os.fspath, which is not the guard.
         plain, copy, live_wal, live = str(other / "plain.txt"), str(other / "jarvis.db"), str(live) + "-wal", str(live)
         names = {
-            # not os.fspath / os.path.abspath, split, join: ntpath.realpath itself calls those (the
-            # shortcut in tests/__init__.py)
-            os: ("stat", "lstat", "fsdecode"),
-            os.path: ("realpath", "exists", "lexists", "dirname", "samestat"),
+            # POLICYGUARD1FIX5 (CDX F2): os.fspath and the os.path helpers os.path's own functions call
+            # too: the guard runs on a private os.path copy bound to an import-time os snapshot.
+            os: ("stat", "lstat", "fsdecode", "fsencode", "fspath", "getcwd"),
+            os.path: ("realpath", "exists", "lexists", "dirname", "samestat", "abspath", "split", "join",
+                      "normpath", "normcase", "isabs", "splitroot"),
         }
         spies = []
         for module, attributes in names.items():
@@ -270,7 +271,7 @@ class PolicyGuardTests(unittest.TestCase):
                 self.assertTrue(handle.read(16).startswith(b"SQLite format 3"))
             readonly = sqlite3.connect(f"{copy.as_uri()}?mode=ro", uri=True)
             readonly.close()
-            with open(BytesPath(copy), "rb") as handle:  # a bytes PathLike passes through untouched
+            with open(BytesPath(copy), "rb") as handle:  # a bytes PathLike is pinned to its bytes
                 self.assertTrue(handle.read(16).startswith(b"SQLite format 3"))
             sqlite3.connect(str(copy) + "-wal").close()  # a companion name elsewhere is fine
 
@@ -286,7 +287,7 @@ class PolicyGuardTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as folder:
             other = Path(folder) / "jarvis.db"
             guarded(other)
-            self.assertEqual(calls, [other])
+            self.assertEqual(calls, [str(other)])  # POLICYGUARD1FIX5: every PathLike is pinned to its str
             with self.assertRaises(AssertionError):
                 guarded(live)
             self.assertEqual(len(calls), 1)
@@ -353,6 +354,54 @@ class PolicyGuardTests(unittest.TestCase):
         with self.assertRaises(AssertionError):
             guarded(Flip(str(live), safe))
         self.assertEqual(len(calls), 1)
+
+    def test_a_path_subclass_with_a_changing_str_is_pinned_too(self) -> None:
+        # POLICYGUARD1FIX5 (CDX F1): PurePath.__fspath__ is str(self), so a subclass overriding __str__
+        # changes its fspath per call; no PathLike is trusted as stable: each is pinned once.
+        live = self.stand_in_live()
+        folder = self.scratch()
+        safe, safe_db = folder / "safe.txt", str(folder / "safe.db")
+        for path, marker in ((live, b"live"), (safe, b"safe")):
+            handle = os.open(path, os.O_CREAT | os.O_WRONLY)  # os.open: the guard is not in the way
+            os.write(handle, marker)
+            os.close(handle)
+
+        class Alternating(type(Path())):  # type: ignore[misc]
+            # str() is called through a counter only: == / hash / repr would use alternations too.
+            def __init__(self, *answers: str) -> None:
+                super().__init__(answers[0])
+                self.answers, self.count = answers, 0
+
+            def __str__(self) -> str:
+                self.count += 1
+                return self.answers[(self.count - 1) % 2]
+
+        first = Alternating(str(safe), str(live))
+        with open(first, "rb") as handle:
+            self.assertEqual(handle.read(), b"safe")
+        self.assertEqual(first.count, 1)
+        connection = sqlite3.connect(Alternating(safe_db, str(live)))
+        self.addCleanup(connection.close)
+        self.assertEqual(Path(connection.execute("pragma database_list").fetchone()[2]), Path(safe_db))
+        for call in (lambda p: open(p, "rb"), sqlite3.connect):
+            second = Alternating(str(live), str(safe))
+            with self.assertRaises(AssertionError):
+                call(second)
+            self.assertEqual(second.count, 1)
+        calls: list[object] = []
+        guarded = tests._guarded(lambda *args, **kwargs: calls.append(args[0]), "factory", 5)
+        guarded(Alternating(safe_db, str(live)))
+        self.assertEqual(calls, [safe_db])
+        self.assertIs(type(calls[0]), str)
+
+        def other_bytes(target: Path) -> type:
+            # a bytes subclass whose __bytes__ names another file: bytes(x) would judge that one
+            return type("Other", (bytes,), {"__bytes__": lambda self: os.fsencode(target)})
+
+        with self.assertRaises(AssertionError):
+            open(other_bytes(safe)(os.fsencode(live)), "rb")
+        with open(other_bytes(live)(os.fsencode(safe)), "rb") as handle:
+            self.assertEqual(handle.read(), b"safe")
 
     def test_a_custom_opener_or_factory_is_refused(self) -> None:
         # CLREV F2 G1/G2: an opener or a Connection factory could open any file whatever the path.
