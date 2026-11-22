@@ -176,6 +176,53 @@ class DigestTests(unittest.TestCase):
         self.assertIn(f"truncated {200 - shown} more items", text)
         self.assertGreater(200 - shown, 0)
 
+    def test_queue_empty_positive(self):
+        view = [{"id": "A", "state": "PASS"}, {"id": "B", "state": "waiting_deps"}]
+        with tempfile.TemporaryDirectory() as t:
+            tree(t, view=view)
+            _, d = run(t)
+        it = [i for i in d["items"] if i["reason"] == "queue_empty"]
+        self.assertEqual([i["id"] for i in it], ["queue:all"])
+        self.assertEqual(d["ready"], {"n6": 0, "improve": 0, "other": 0})
+
+    def test_queue_empty_negative(self):
+        with tempfile.TemporaryDirectory() as t:  # ready slices exist
+            tree(t)
+            _, d = run(t)
+        self.assertEqual([i for i in d["items"] if i["reason"] == "queue_empty"], [])
+        with tempfile.TemporaryDirectory() as t:  # view unreadable: unknown, never a false "empty"
+            tree(t)
+            (Path(t) / "build" / "conveyor" / "status.json").write_text(json.dumps({"attention": []}), encoding="utf-8")
+            _, d = run(t)
+        self.assertEqual([i for i in d["items"] if i["reason"] == "queue_empty"], [])
+
+    def test_overlap_positive(self):
+        bl = slices()
+        view = [{"id": s["id"], "state": "n6" if s.get("n6") else "ready"} for s in bl] + [{"id": "OV1", "state": "overlap"}]
+        with tempfile.TemporaryDirectory() as t:
+            tree(t, backlog=bl, view=view)
+            _, d = run(t)
+        self.assertEqual({i["id"]: i["reason"] for i in d["items"]}, {"OV1": "overlap"})
+        self.assertEqual(d["ready"], {"n6": 3, "improve": 3, "other": 2})  # an overlap slice is not counted ready
+
+    def test_overlap_negative(self):
+        view = [{"id": s["id"], "state": "ready"} for s in slices()] + [
+            {"id": "W1", "state": "waiting_deps"}, {"id": "W2", "state": "same_name_busy"}, {"id": "W3", "state": "overlapping"}]
+        with tempfile.TemporaryDirectory() as t:
+            tree(t, view=view)
+            _, d = run(t)
+        self.assertEqual([i for i in d["items"] if i["reason"] == "overlap"], [])
+
+    def test_section_b_closed_list(self):
+        self.assertEqual(orch_digest.REASONS[-3:], ("queue_empty", "overlap", "unknown"))
+        for out_of_scope in ("UNKNOWN_OUTCOME", "packet_too_large"):  # B2a / no packet-size measure in the digest
+            self.assertNotIn(out_of_scope, orch_digest.REASONS)
+        att = [{"id": "Q", "reason": "something unmapped"}]
+        with tempfile.TemporaryDirectory() as t:
+            tree(t, att)
+            _, d = run(t)
+        self.assertEqual({i["id"]: i["reason"] for i in d["items"]}, {"Q": "unknown"})
+
 
 if __name__ == "__main__":
     unittest.main()

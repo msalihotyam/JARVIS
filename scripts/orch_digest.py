@@ -14,7 +14,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 REASONS = ("key1_green_protected", "key1_green_chain", "chain_refused_finding", "blocked", "held",
-           "needs_t2_approval", "queue_low_n6", "queue_low_improve", "unknown")
+           "needs_t2_approval", "queue_low_n6", "queue_low_improve", "queue_empty", "overlap", "unknown")
 MAX_CHARS = 8000
 CLIP = 900  # max chars per DIGEST.md line: 7 header lines + 1 truncation line stay under MAX_CHARS
 LOW = 2  # a track with fewer ready slices than this raises queue_low_*
@@ -118,7 +118,7 @@ def build(root, now, since):
         if e.get("event") == "chain_refused" and e.get("src") not in (None, "") and t and t >= since:
             add(str(e["src"]), "chain_refused_finding", f"events.jsonl chain_refused: {e.get('reason', '')}", e.get("ts"))
     # conveyor view states (slice_hold/pick_slice): "held: <why>", "needs_t2_approval",
-    # "ready" (the conveyor dispatches it) and "n6" (only N6's claim starts it); the rest is not ready
+    # "ready" (the conveyor dispatches it), "n6" (only N6's claim starts it) and "overlap"; the rest is not ready
     view = status.get("backlog") or []
     if not isinstance(view, list):
         unk.append(("input:status.backlog", "status.json: backlog view is not a list"))
@@ -133,6 +133,8 @@ def build(root, now, since):
             add(i, "held", f"status.json backlog {st}", None)
         elif st == "needs_t2_approval":
             add(i, "needs_t2_approval", "status.json backlog state needs_t2_approval", None)
+        elif st == "overlap":  # conveyor slice_hold: file set conflicts with a running lane, every earlier gate passed
+            add(i, "overlap", "status.json backlog state overlap", None)
         elif st == "n6":
             ready["n6"] += 1
         elif st == "ready":
@@ -141,6 +143,8 @@ def build(root, now, since):
     for track in ("n6", "improve"):
         if ready[track] < LOW:
             add(f"queue:{track}", f"queue_low_{track}", f"{ready[track]} ready < {LOW}", None)
+    if isinstance(status.get("backlog"), list) and not any(ready.values()):  # an unreadable view is not "empty"
+        add("queue:all", "queue_empty", "0 ready slices", None)
     for i, why in unk:
         add(i, "unknown", why, None)
     out_items = []
