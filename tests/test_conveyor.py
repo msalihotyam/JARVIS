@@ -7042,6 +7042,48 @@ class TestLock(Base):
         take = [e for e in self.events() if e["event"] == "lock_takeover"]
         self.assertEqual([(e["old_pid"], e["reason"]) for e in take], [(self.c.pid, "os_lock")])
 
+    def foreign(self):
+        """conveyor.lock as another live conveyor writes it."""
+        (self.base / "conveyor.lock").write_text(json.dumps({"pid": -7, "heartbeat": self.t}))
+
+    def test_leasegate1_second_conveyor_with_a_live_owner_never_dispatches(self):
+        self.assertTrue(self.c.acquire_lock())
+        second = self.other()
+        second.cmd = self.git  # same fake git as the owner, so the header check passes
+        self.assertFalse(second.acquire_lock())
+        self.drop("a.md", HDR.format("A") + "do things")
+        second.pass_once()  # even if a loser were driven, nothing launches
+        self.assertEqual(self.fake.bg_calls(), [])
+        self.assertIsNone(second.start("A", "opus", "high", "x"))
+        self.assertEqual(self.fake.bg_calls(), [])
+        self.assertEqual(len(list((self.base / "inbox").glob("*.md"))), 1)  # still queued
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])  # the owner dispatches it
+
+    def test_leasegate1_stale_heartbeat_is_not_a_takeover_only_a_free_os_lock_is(self):
+        self.assertTrue(self.c.acquire_lock())
+        (self.base / "conveyor.lock").write_text(json.dumps({"pid": self.c.pid, "heartbeat": self.t - 10**6}))
+        second = self.other()
+        self.assertFalse(second.acquire_lock())  # OS lock held: stale age changes nothing
+        self.assertIsNone(second.start("A", "opus", "high", "x"))
+        self.assertEqual(self.fake.bg_calls(), [])
+        self.c.release_lock()  # the owner died
+        self.assertTrue(second.acquire_lock())  # the documented rule: free OS lock
+        self.assertEqual(second.start("A", "opus", "high", "x") is not None, True)
+        self.assertEqual(self.fake.bg_names(), ["A"])
+
+    def test_leasegate1_ownership_is_rechecked_right_before_each_launch(self):
+        self.assertTrue(self.c.acquire_lock())
+        self.foreign()  # a conveyor took the info file after our lock check
+        self.assertIsNone(self.c.start("A", "opus", "high", "x"))
+        self.assertIsNone(self.c.start_codex("A", "main", "x"))
+        self.assertIsNone(self.c.start_jules("A", "main", "x", []))
+        self.assertEqual(self.fake.bg_calls(), [])
+        held = [e for e in self.events() if e["event"] == "dispatch_not_owner"]
+        self.assertEqual(len(held), 3)
+        self.c.heartbeat()  # ours again
+        self.assertIsNotNone(self.c.start("A", "opus", "high", "x"))
+
     def test_a_lock_call_that_raises_means_exit(self):
         def broken(fd, unlock=False):
             raise RuntimeError("no lock primitive")

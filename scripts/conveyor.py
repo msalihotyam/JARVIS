@@ -2859,8 +2859,18 @@ class Conveyor:
         and run the full suite), whatever max_lanes allows."""
         return bool(INT_RE.match(name)) and any(INT_RE.match(n) for n in self.running(lanes))
 
+    def not_owner(self, name):
+        """LEASEGATE1: right before any launch, conveyor.lock must not name another pid.
+        True: refuse (fail closed, the lane is not failed; the next pass decides again)."""
+        if self.own_lock():
+            return False
+        self.event("dispatch_not_owner", lane=name)
+        return True
+
     def start(self, name, model, effort, text, advisor=None, subagent_model=None):
         """`claude --bg` one lane; returns its short id or None."""
+        if self.not_owner(name):
+            return None
         if self.cc_hold():  # every dispatch path ends here; not an error, the lane is not failed
             return None
         text = self.lane_rules(name, text)
@@ -2933,6 +2943,8 @@ class Conveyor:
         """`codex exec` one lane in a worktree the conveyor creates; returns its session id
         or None. Admission refused (unknown/stale reading, not the ChatGPT route, limit
         reached, credits, low headroom) holds the lane (fail closed, never credits)."""
+        if self.not_owner(name):
+            return None
         h, why = self.codex.admit()
         if why:
             self.event("codex_hold", lane=name, headroom=h, reason=why)
@@ -2961,6 +2973,8 @@ class Conveyor:
     def start_jules(self, name, base, text, files):
         """One Jules session for a linux_ok slice, pinned to the base sha (= origin/main);
         the lane worktree only receives the verified result. Refusal holds (fail closed)."""
+        if self.not_owner(name):
+            return None
         sha = self.main_head() if base == "main" else base
         h, why = self.jules.admit(sha)
         if why:
