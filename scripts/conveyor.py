@@ -1238,6 +1238,23 @@ def chain_findings(text):
     ponytail: a prose finding, a numbered "1. F1: x" or a homoglyph severity passes; the orchestrator's key 1 is the check."""
     return text is None or any(CHAIN_FINDING_RE.match(x) for x in text.splitlines())
 
+CHAIN_GRAVE_RE = re.compile(r"(?i)\b(blocker|blocking|major|critical|high|medium|severe|serious|fatal|data loss|p[0-2])\b")
+
+def chain_strict(tier, files):
+    """U1RULE1 (Salih 11-22): any finding stops the chain unless the slice is T1 and every file it
+    changes is product code (no protected, security or conveyor-core path); no files = strict."""
+    return tier != "T1" or not files or any(
+        protected_path(p) or p.replace("\\", "/").lower() in PROTECTED_FILES or SKIPLIST_RE.search(p)
+        or any(d in p.replace("\\", "/").lower() for d in GRANT_DENY) for p in files)
+
+def chain_minor_only(text):
+    """U1RULE1: the report's finding lines when every one is "F<n> MINOR|NIT" (case-sensitive), the
+    report has no non-ASCII letter and names no graver severity; else None (the strict gate decides)."""
+    fl = [x.strip() for x in (text or "").splitlines() if CHAIN_FINDING_RE.match(x)]
+    ok = (fl and all((m := AUTOFIX_F_RE.match(x)) and m.group(1) in ("MINOR", "NIT") for x in fl)
+          and not any(c.isalpha() and not c.isascii() for c in text) and not CHAIN_GRAVE_RE.search(text))
+    return fl if ok else None
+
 def chain_codex_ran(text):
     """CONVCHAIN1FIXD: a CDX report has one exact marker, no other CODEX RUN: line and neither refusal phrase.
     ponytail: self-attested, report text cannot prove a process ran."""
@@ -4940,6 +4957,7 @@ class Conveyor:
                 return f"malformed chain record {key}"
         if len(done) >= len(wanted):
             return None
+        polish = []  # U1RULE1: (step, MINOR/NIT line) of a T1 chain, checked against its files below
         for d in done:  # every earlier step, so the INT stands on all of its reviews
             prev = lanes.get(d)
             if not prev or not prev.get("finished"):
@@ -4949,9 +4967,12 @@ class Conveyor:
             text = chain_report(prev)
             if not chain_review_pass(text) or chain_labelled(text, "COMMIT:") != [f"COMMIT: {sha}"]:
                 return f"{d} did not PASS naming {sha[:7]}"
-            if chain_findings(text):
+            minor = chain_minor_only(text) if s.get("tier") == "T1" else None
+            if minor:
+                polish += [(d, x) for x in minor]
+            elif chain_findings(text):
                 return f"{d} report has a finding line"
-            if chain_labelled(text, "FINDINGS:") != ["FINDINGS: none"]:
+            elif chain_labelled(text, "FINDINGS:") != ["FINDINGS: none"]:
                 return f'{d} report needs exactly one "FINDINGS: none" line'
             if d.startswith("CDX-") and not chain_codex_ran(text):
                 return f"{d} report does not prove Codex ran"
@@ -4962,6 +4983,8 @@ class Conveyor:
             return files
         if any(a18_refused(p) for p in files):  # SEEDGUARD1 A18
             return "touches build/conveyor/notes/ or .claude/: refused before INT"
+        if polish and chain_strict(s.get("tier"), files):
+            return f"{polish[0][0]} report has a finding line"
         if nid in lanes or nid in ids or self.find_report(nid):
             return f"{nid} already exists"
         try:
@@ -5014,6 +5037,17 @@ class Conveyor:
         dest = self.root / new["prompt"]
         if dest.exists() and dest.read_text(encoding="utf-8") != text:
             return f"{new['prompt']} exists with other text"
+        if polish:  # U1RULE1: the chain proceeds, each MINOR/NIT line lands once in POLISH.md
+            pol = self.root / "build" / "orch" / "POLISH.md"
+            try:
+                pol.parent.mkdir(parents=True, exist_ok=True)
+                have = set(pol.read_text(encoding="utf-8").splitlines()) if pol.exists() else set()
+                add = [y for y in dict.fromkeys(f"- {src} | {d} | {x}" for d, x in polish) if y not in have]
+                if add:
+                    with pol.open("a", encoding="utf-8") as f:
+                        f.write("".join(y + "\n" for y in add))
+            except (OSError, UnicodeDecodeError):
+                return "build/orch/POLISH.md not writable"
         dest.parent.mkdir(parents=True, exist_ok=True)
         if not self.write_atomic(dest, text):
             raise OSError(f"{new['prompt']} not written")

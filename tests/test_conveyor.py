@@ -9958,6 +9958,54 @@ class TestChain(AutopilotBase):
         self.assertEqual(why, "CLREV-SRC report has a finding line")
         self.assertNotIn("chain_slices", ap)
 
+    def u1(self, files, extra, tier="T1"):
+        """U1RULE1 (Salih 11-22): the INT step after a CLREV report carrying extra, for a diff of files."""
+        self.commit(files)
+        lanes = {"CLREV-SRC": self.step_ln("CLREV-SRC", extra=f"COMMIT: {self.SHA}\nFINDINGS: 2\n" + extra),
+                 "CDX-SRC": self.step_ln("CDX-SRC")}
+        return self.direct(lanes, done=("CLREV-SRC", "CDX-SRC"), tier=tier, files=list(files))
+
+    def polish(self):
+        p = self.root / "build" / "orch" / "POLISH.md"
+        return p.read_text(encoding="utf-8").splitlines() if p.exists() else []
+
+    MINOR = "F1 MINOR: jarvis/x.py:3 - nit - fix\nF2 NIT: jarvis/x.py:4 - style\n"
+
+    def test_u1rule1_t1_product_minor_proceeds_and_goes_to_polish(self):
+        why, ap = self.u1(("jarvis/x.py",), self.MINOR)
+        self.assertIsNone(why)
+        self.assertEqual([n["id"] for n in ap["chain_slices"]], ["INT-SRC"])
+        want = ["- SRC | CLREV-SRC | F1 MINOR: jarvis/x.py:3 - nit - fix",
+                "- SRC | CLREV-SRC | F2 NIT: jarvis/x.py:4 - style"]
+        self.assertEqual(self.polish(), want)
+        self.u1(("jarvis/x.py",), self.MINOR)  # a later pass re-reads the same report: no duplicate line
+        self.assertEqual(self.polish(), want)
+
+    def test_u1rule1_t1_protected_security_or_core_minor_stops(self):
+        for files in (("scripts/a.py",), ("jarvis/auth.py",), ("jarvis/x.py", "scripts/conveyor.py"),
+                      ("jarvis/x.py", ".claude/settings.json"), ("jarvis/x.py", "data/x.db")):
+            with self.subTest(files=files):
+                why, ap = self.u1(files, self.MINOR)
+                self.assertEqual(why, "CLREV-SRC report has a finding line")
+                self.assertNotIn("chain_slices", ap)
+                self.assertEqual(self.polish(), [])
+
+    def test_u1rule1_t2_minor_stops(self):
+        why, ap = self.u1(("jarvis/x.py",), self.MINOR, tier="T2")
+        self.assertEqual(why, "CLREV-SRC report has a finding line")
+        self.assertNotIn("chain_slices", ap)
+        self.assertEqual(self.polish(), [])
+
+    def test_u1rule1_major_stops_everywhere(self):
+        for tier in ("T1", "T2"):
+            for extra in ("F1 MAJOR: jarvis/x.py:3 - bug\n", "F1 BLOCKER: x\n", self.MINOR + "F3 MAJOR: y\n",
+                          "F1 MINOR: x (really major)\n", "f1 minor: x\n", "MINOR: x\n", "F1 MINΟR: x\n"):
+                with self.subTest(tier=tier, extra=extra):
+                    why, ap = self.u1(("jarvis/x.py",), extra, tier=tier)
+                    self.assertEqual(why, "CLREV-SRC report has a finding line")
+                    self.assertNotIn("chain_slices", ap)
+                    self.assertEqual(self.polish(), [])
+
     def test_the_templates_own_clean_pass_writes_the_int(self):
         """Built from the lines the templates quote, so a template rule the detector refuses fails here."""
         lanes = {}

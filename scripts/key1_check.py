@@ -133,8 +133,17 @@ def verify(lane, root, git, gh, operator_tool=False, rep=None):
     else:
         put(2, "PASS", f"{len(pick_shas)} pick(s) patch-id equal to {len(rev)} review commit(s)")
 
+    allowed = [f.replace("\\", "/") for s in srcs for f in slices.get(s, {}).get("files") or []]
+    touched = set(git(["diff", "--name-only", "--no-renames", f"{base}...{cand}"])[1].split())
+    for s in pick_shas:
+        touched |= set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames", s])[1].split())
+    # U1RULE1 (Salih 11-22): a T1 source whose diff and backlog files are product code sends MINOR/NIT to POLISH.md
+    polish_ok = bool(srcs) and not any(
+        conveyor.chain_strict(slices.get(s, {}).get("tier"), sorted(touched | set(allowed))) for s in srcs)
+
     # 3: every review report passes the conveyor's own chain gate (STATUS PASS, exactly one "FINDINGS: none", no finding line);
-    # --operator-tool turns a report whose finding lines are all F<n> MINOR/NIT (and names no graver severity) into WARN
+    # --operator-tool or a U1RULE1 T1 product chain turns a report whose finding lines are all F<n> MINOR/NIT
+    # (and names no graver severity) into WARN
     # the gate runs on the raw text AND on a normalised copy, so decoration cannot hide a line from it
     # shortcut: a finding written as plain prose (no severity/F<n> token) still passes, exactly as in the
     # conveyor's own gate; closing it needs a stricter report format for every reviewer
@@ -151,9 +160,9 @@ def verify(lane, root, git, gh, operator_tool=False, rep=None):
         elif (not fl and not conveyor.chain_findings(t)
               and conveyor.chain_labelled(t, "FINDINGS:") == conveyor.chain_labelled(nt, "FINDINGS:") == ["FINDINGS: none"]):
             continue
-        elif (operator_tool and fl and all(s in ("MINOR", "NIT") for s in sev)
+        elif ((operator_tool or polish_ok) and fl and all(s in ("MINOR", "NIT") for s in sev)
               and not any(c.isalpha() and not c.isascii() for c in t)
-              and not re.search(r"(?i)\b(blocker|blocking|major|critical|high|medium|severe|serious|fatal|data loss|p[0-2])\b", nt)):
+              and not conveyor.CHAIN_GRAVE_RE.search(nt)):
             warns.append(f"{n} {len(fl)} MINOR/NIT finding(s)")
         else:
             probs.append(f"{n} findings gate: " + ("; ".join(x[:60] for x in fl[:3]) if fl else
@@ -161,7 +170,8 @@ def verify(lane, root, git, gh, operator_tool=False, rep=None):
     if probs:
         put(3, "FAIL", "; ".join(probs))
     elif warns:
-        put(3, "WARN", "MINOR allowed by --operator-tool: " + "; ".join(warns))
+        put(3, "WARN", "MINOR " + ("allowed by --operator-tool" if operator_tool else
+                                   "to POLISH.md (U1RULE1, T1 product chain)") + ": " + "; ".join(warns))
     else:
         put(3, "PASS", f"{', '.join(reviews)}: STATUS PASS, FINDINGS none")
 
@@ -170,11 +180,7 @@ def verify(lane, root, git, gh, operator_tool=False, rep=None):
     put(4, "PASS" if state == "success" else "FAIL",
         f"CI {state} on {branch} for {cand[:7]}" + (f": {urls}" if state == "success" else f": {why}"))
 
-    # 5: touched files only those the source slices list
-    allowed = [f.replace("\\", "/") for s in srcs for f in slices.get(s, {}).get("files") or []]
-    touched = set(git(["diff", "--name-only", "--no-renames", f"{base}...{cand}"])[1].split())
-    for s in pick_shas:
-        touched |= set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames", s])[1].split())
+    # 5: touched files only those the source slices list (allowed/touched computed above check 3)
     stray = sorted(f for f in touched if not any(fnmatch.fnmatch(f, a) or (a.endswith("/") and f.startswith(a))
                                                  for a in allowed))
     if not allowed or stray:

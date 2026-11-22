@@ -21,6 +21,7 @@ def git(cwd, *a):
 
 
 def commit(root, name, text):
+    (root / name).parent.mkdir(parents=True, exist_ok=True)
     (root / name).write_text(text, encoding="utf-8")
     git(root, "add", name)
     git(root, "commit", "-m", f"{name} {text.strip()}")
@@ -28,7 +29,7 @@ def commit(root, name, text):
 
 
 def make(tmp, chain=("CLREV", "CDX", "INT"), status="PASS", findings="none", files=("a.txt",),
-         on_main=False, review_commit=None, ci_branch="ci/int-x"):
+         on_main=False, review_commit=None, ci_branch="ci/int-x", tier=None, src_file="a.txt"):
     """origin/main=base; source commit S on a branch; candidate C = S cherry-picked onto base
     (same patch-id). Reports and backlog live under <root>/build like the conveyor's."""
     root = Path(tmp)
@@ -37,7 +38,7 @@ def make(tmp, chain=("CLREV", "CDX", "INT"), status="PASS", findings="none", fil
     git(root, "checkout", "-q", "-b", "other")
     other = commit(root, "b.txt", "other\n")
     git(root, "checkout", "-q", "-b", "src", "main")
-    src = commit(root, "a.txt", "2\n")
+    src = commit(root, src_file, "2\n")
     git(root, "checkout", "-q", "-b", "cand", "main")
     git(root, "cherry-pick", src)
     cand = git(root, "rev-parse", "HEAD")
@@ -52,7 +53,8 @@ def make(tmp, chain=("CLREV", "CDX", "INT"), status="PASS", findings="none", fil
             f"STATUS: {status}\nCOMMIT: {review_commit or src}\nFINDINGS: {findings}\n", encoding="utf-8")
     (root / "build" / "conveyor").mkdir()
     (root / "build" / "conveyor" / "backlog.json").write_text(
-        json.dumps({"slices": [{"id": "X", "files": list(files), "chain": list(chain)}]}), encoding="utf-8")
+        json.dumps({"slices": [{"id": "X", "files": list(files), "chain": list(chain),
+                                **({"tier": tier} if tier else {})}]}), encoding="utf-8")
     return SimpleNamespace(root=root, base=base, src=src, cand=cand, other=other)
 
 
@@ -155,6 +157,25 @@ class Key1CheckTests(unittest.TestCase):
                          "1\nF1 MINOR x\nblocking: severe data loss"):
             with self.subTest(findings=findings):
                 text, ok = self.run_lane(self.fx(findings=findings), operator_tool=True)
+                self.assertFalse(ok, text)
+                self.assertIn("FAIL 3", text)
+
+    def test_u1rule1_t1_product_minor_warns_without_operator_tool(self):
+        """U1RULE1 (Salih 11-22): a T1 slice whose diff is product code passes check 3 with MINOR/NIT as WARN."""
+        minor = "1\nF1 MINOR: a.txt:1 - nit - fix\nF2 NIT: a.txt:2 - style"
+        text, ok = self.run_lane(self.fx(findings=minor, tier="T1"))
+        self.assertTrue(ok, text)
+        self.assertIn("WARN 3", text)
+        self.assertIn("POLISH.md", text)
+
+    def test_u1rule1_strict_classes_and_major_still_fail(self):
+        minor = "1\nF1 MINOR: a.txt:1 - nit - fix"
+        for kw in ({"tier": "T2"}, {}, {"tier": "T1", "src_file": "scripts/x.py", "files": ("a.txt", "scripts/x.py")},
+                   {"tier": "T1", "files": ("a.txt", "jarvis/auth.py")},
+                   {"tier": "T1", "findings": "1\nF1 MAJOR: a.txt:1 - bug"},
+                   {"tier": "T1", "findings": "1\nF1 MINOR: x (really major)"}):
+            with self.subTest(**kw):
+                text, ok = self.run_lane(self.fx(**{"findings": minor, **kw}))
                 self.assertFalse(ok, text)
                 self.assertIn("FAIL 3", text)
 
