@@ -412,5 +412,34 @@ class ApiBrokerTest(unittest.TestCase):
             self.refused(lambda: api.caller_cap(self.root, "orch", T0), api.CAPS_NAME)
 
 
+class CutSwitchTest(unittest.TestCase):
+    """CUTSWITCH1: the cut switch refuses every broker call before any send; clearing reopens."""
+    setUp, post, call, refused = ApiBrokerTest.setUp, ApiBrokerTest.post, ApiBrokerTest.call, ApiBrokerTest.refused
+
+    def nb(self):
+        return api._breaker()
+
+    def test_cut_refuses_call_and_envelope_then_reset_reopens(self):
+        self.assertTrue(self.nb().cut(self.root / api.CUT_NAME, T0, "operator"))
+        self.refused(lambda: self.call(), "cut switch")
+        self.refused(lambda: api.open_envelope(1.0, "orch test", root=self.root, clock=lambda: T0),
+                     "cut switch")
+        self.assertEqual(self.sent, [])
+        self.assertTrue(self.nb().reset(self.root / api.CUT_NAME, T0))
+        self.assertFalse(api.cut_set(self.root))
+        if os.name == "nt":  # the broker itself refuses off Windows
+            self.call()
+            self.assertEqual(len(self.sent), 1)
+
+    def test_unreadable_switch_is_cut(self):
+        (self.root / api.CUT_NAME).write_text("{bad", encoding="utf-8")
+        self.refused(lambda: self.call(), "cut switch")
+        self.assertEqual(self.sent, [])
+
+    def test_breaker_module_failing_to_load_is_cut(self):
+        with mock.patch.object(api, "_breaker", side_effect=ImportError("gone")):
+            self.assertTrue(api.cut_set(self.root))
+
+
 if __name__ == "__main__":
     unittest.main()

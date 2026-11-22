@@ -470,6 +470,43 @@ class TestInbox(Base):
         self.assertEqual(self.pushes, [])  # paused is not "dry"
         self.assertNotIn(conveyor.DRY_ID, self.attn())
 
+    def test_cut_switch_holds_dispatch_and_api_together_never_touching_running_lanes(self):
+        api = conveyor.conveyor_api
+        cut = self.base / api.CUT_NAME
+        self.drop("a.md", HDR.format("A"))
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])  # A is running before the cut
+        before = list(self.fake.calls)
+        nb = api._breaker()
+        self.assertTrue(nb.cut(cut, self.t, "operator"))
+        self.drop("b.md", HDR.format("B"))
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A"])  # B is not dispatched
+        self.assertTrue((self.base / "inbox" / "b.md").exists())
+        new = self.fake.calls[len(before):]
+        self.assertFalse([c for c in new if c[0] in ("stop", "rm", "respawn", "--bg")])  # A untouched
+        self.assertIn("pid", self.fake.agent("A"))
+        self.assertFalse(self.lanes()["A"].get("finished"))
+        sent = []
+        with self.assertRaises(api.ApiRefused) as cm:  # the same switch refuses the API path
+            api.call("claude-haiku-5-5", "s", [{"role": "user", "content": "x"}], 10, "orch test",
+                     root=self.base, clock=lambda: self.t, reader=lambda: "k",
+                     post=lambda *a: sent.append(a))
+        self.assertIn("cut switch", str(cm.exception))
+        self.assertEqual(sent, [])
+        self.assertTrue(nb.reset(cut, self.t))  # clearing reopens both together
+        self.assertFalse(api.cut_set(self.base))
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_names(), ["A", "B"])
+
+    def test_unreadable_cut_switch_holds_dispatch(self):
+        (self.base / conveyor.conveyor_api.CUT_NAME).write_text("{bad", encoding="utf-8")
+        self.drop("a.md", HDR.format("A"))
+        self.c.pass_once()
+        self.assertEqual(self.fake.bg_calls(), [])
+        self.assertTrue((self.base / "inbox" / "a.md").exists())
+
     def test_max_three_lanes_oldest_first(self):
         for i, n in enumerate("EDCBA"):
             self.drop(f"{n}.md", HDR.format(n), age=i)

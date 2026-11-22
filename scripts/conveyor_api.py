@@ -55,6 +55,35 @@ def main_checkout(here):
 ROOT = main_checkout(Path(__file__).resolve().parents[1]) / "build" / "conveyor"
 
 
+CUT_NAME = "cut.json"  # CUTSWITCH1: the one cut switch (a jarvis/n6_breaker.py file); also read by conveyor hold()
+
+
+def _breaker():
+    """jarvis/n6_breaker.py by path: importing the jarvis package would pull in its heavy core."""
+    mod = sys.modules.get("jarvis_n6_breaker")
+    if mod is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "jarvis_n6_breaker", Path(__file__).resolve().parents[1] / "jarvis" / "n6_breaker.py")
+        mod = importlib.util.module_from_spec(spec)
+        sys.modules["jarvis_n6_breaker"] = mod  # the dataclass resolves its module while executing
+        try:
+            spec.loader.exec_module(mod)
+        except BaseException:
+            sys.modules.pop("jarvis_n6_breaker", None)
+            raise
+    return mod
+
+
+def cut_set(root=ROOT):
+    """True when the cut switch is set; fail closed: unreadable switch or breaker = cut."""
+    try:
+        nb = _breaker()
+        return nb.is_open(nb.load(Path(root) / CUT_NAME))
+    except Exception:
+        return True
+
+
 class ApiRefused(Exception):
     """A guard refused the call before any request was sent."""
 
@@ -291,6 +320,8 @@ def open_envelope(ceiling_usd, purpose, *, root=ROOT, clock=None):
     """Id of a new batch envelope: `ceiling_usd` held for the purpose's caller until the end of
     today (UTC), booked in the ledger so it survives a restart; refused when the remaining
     monthly / daily / caller budget cannot cover the whole ceiling now."""
+    if cut_set(root):
+        raise ApiRefused("cut switch set: every API call and new lane dispatch is held")
     name = _caller(purpose)
     if not _num(ceiling_usd) or not ceiling_usd > 0:
         raise ApiRefused("envelope ceiling must be a positive USD number")
@@ -311,6 +342,8 @@ def call(model, system, messages, max_tokens, purpose, *, root=ROOT, clock=None,
          envelope=None):
     """Response text of one Messages API call, or ApiRefused (nothing sent) / ApiError (sent, failed).
     With `envelope` (from open_envelope, same caller) the call spends that envelope's remainder."""
+    if cut_set(root):
+        raise ApiRefused("cut switch set: every API call and new lane dispatch is held")
     name = _caller(purpose)
     if not isinstance(model, str) or model not in PRICES:
         raise ApiRefused("model not allowed (Haiku / Sonnet only)")

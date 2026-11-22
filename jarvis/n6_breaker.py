@@ -260,6 +260,28 @@ def record_finish(path: Path | str, name: str, status: str, fin: float, now: flo
         return True
 
 
+CUT_ROOT = "*"  # CUTSWITCH1: the one cut switch is a breaker file with this root open
+
+
+def cut(path: Path | str, ts: float, reason: str) -> bool:
+    """Open ``CUT_ROOT`` (an unreadable state is replaced). Cleared only by ``reset``.
+    False when the lock is held elsewhere or the write fails."""
+    if _num(ts) is None:
+        raise ValueError(f"bad cut ts: {ts!r}")
+    path = Path(path)
+    with _locked(path) as got:
+        if not got:
+            return False
+        state = load(path)
+        state = state if isinstance(state, State) else State()
+        opened = tuple(o for o in state.opened if o[0] != CUT_ROOT) + ((CUT_ROOT, float(ts), reason),)
+        try:
+            _write(path, State(state.bad, tuple(sorted(opened)), state.cleared))
+        except (OSError, ValueError):
+            return False
+        return True
+
+
 def reset(path: Path | str, ts: float) -> bool:
     """Operator reset record: closes every root opened at or before ``ts`` and drops the BAD
     finishes up to ``ts``. False when it closes nothing (a reset older than every opening is
