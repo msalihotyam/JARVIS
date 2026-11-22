@@ -13,6 +13,7 @@ import re
 import shutil
 import subprocess
 import sys
+import unicodedata
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -46,6 +47,17 @@ def read(root, name):
         return (Path(root) / "build" / "reports" / f"{name}.md").read_text(encoding="utf-8")
     except OSError:
         return None
+
+
+def _norm(text):
+    """Report lines as check 3 reads them: NFKC (fullwidth colon), no zero-width/BOM, no bold, leading
+    bullets/quotes/numbering stripped, "LABEL :" -> "LABEL:"."""
+    out = []
+    for x in unicodedata.normalize("NFKC", text).splitlines():
+        x = re.sub(r"[​-‍⁠﻿]", "", x).replace("**", "").replace("__", "")
+        x = re.sub(r"^[\s\-*>|#`]*(?:\d+[.)][ \t]*)?", "", x)
+        out.append(re.sub(r"^([A-Za-z][A-Za-z ]*?)[ \t]+:", r"\1:", x))
+    return "\n".join(out)
 
 
 def patch_id(git, sha):
@@ -114,19 +126,31 @@ def verify(lane, root, git, gh, operator_tool=False):
     else:
         put(2, "PASS", f"{len(pick_shas)} pick(s) patch-id equal to {len(rev)} review commit(s)")
 
-    # 3: every review report STATUS PASS and FINDINGS none
+    # 3: every review report passes the conveyor's own chain gate (STATUS PASS, exactly one "FINDINGS: none", no finding line);
+    # --operator-tool turns a report whose finding lines are all F<n> MINOR/NIT (and names no graver severity) into WARN
+    # the gate runs on the raw text AND on a normalised copy, so decoration cannot hide a line from it
+    # shortcut: a finding written as plain prose (no severity/F<n> token) still passes, exactly as in the
+    # conveyor's own gate; closing it needs a stricter report format for every reviewer
     probs, warns = [], []
     for n in reviews:
         t = rev[n]
-        f = (field(t, "FINDINGS") or "").lower() if t else None
+        nt = _norm(t or "")
+        fl = [x.strip() for x in nt.splitlines() if conveyor.CHAIN_FINDING_RE.match(x)]
+        sev = [m.group(1) if m else None for m in map(conveyor.AUTOFIX_F_RE.match, fl)]
         if t is None:
             probs.append(f"{n} report missing")
-        elif t.splitlines()[:1] != ["STATUS: PASS"]:
-            probs.append(f"{n} {(t.splitlines() or [''])[0]}")
-        elif f.startswith("minor") and operator_tool:
-            warns.append(f"{n} FINDINGS {f}")
-        elif not f.startswith("none"):
-            probs.append(f"{n} FINDINGS {f or 'missing'}")
+        elif not (conveyor.chain_review_pass(t) and conveyor.chain_review_pass(nt)):
+            probs.append(f"{n} {(t.strip().splitlines() or [''])[0][:80]} (needs exactly one STATUS: PASS, first)")
+        elif (not fl and not conveyor.chain_findings(t)
+              and conveyor.chain_labelled(t, "FINDINGS:") == conveyor.chain_labelled(nt, "FINDINGS:") == ["FINDINGS: none"]):
+            continue
+        elif (operator_tool and fl and all(s in ("MINOR", "NIT") for s in sev)
+              and not any(c.isalpha() and not c.isascii() for c in t)
+              and not re.search(r"(?i)\b(blocker|blocking|major|critical|high|medium|severe|serious|fatal|data loss|p[0-2])\b", nt)):
+            warns.append(f"{n} {len(fl)} MINOR/NIT finding(s)")
+        else:
+            probs.append(f"{n} findings gate: " + ("; ".join(x[:60] for x in fl[:3]) if fl else
+                         "needs exactly one 'FINDINGS: none' line, got " + repr(conveyor.chain_labelled(t, "FINDINGS:"))[:80]))
     if probs:
         put(3, "FAIL", "; ".join(probs))
     elif warns:

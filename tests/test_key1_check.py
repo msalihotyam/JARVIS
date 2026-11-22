@@ -121,16 +121,41 @@ class Key1CheckTests(unittest.TestCase):
         self.assertIn("FAIL 3", text)
 
     def test_findings_and_status_gate(self):
-        text, ok = self.run_lane(self.fx(findings="MINOR: nit"))
+        # real MINOR format: a count plus F-lines; WARN only with --operator-tool
+        minor = "1\nF1 MINOR: a.py:1 - nit - fix\nF2 NIT: b.py:2 - style"
+        text, ok = self.run_lane(self.fx(findings=minor))
         self.assertFalse(ok)
         self.assertIn("FAIL 3", text)
-        text, ok = self.run_lane(self.fx(findings="MINOR: nit"), operator_tool=True)
+        text, ok = self.run_lane(self.fx(findings=minor), operator_tool=True)
         self.assertTrue(ok, text)
         self.assertIn("WARN 3", text)
         text, ok = self.run_lane(self.fx(status="FAIL"), operator_tool=True)
         self.assertFalse(ok)
-        text, ok = self.run_lane(self.fx(findings="MAJOR: bug"), operator_tool=True)
-        self.assertFalse(ok)
+        text, ok = self.run_lane(self.fx(findings="none\nSTATUS: BLOCKED"))
+        self.assertIn("FAIL 3", text)
+
+    def test_findings_none_with_a_finding_line_fails(self):
+        for findings in ("none\nF1 MAJOR: x", "none\n- F1 BLOCKER: x", "none\n* MINOR: x","none\n> MAJOR: x", "none\n  P0 crash",
+                         "none\nFINDINGS: 2", "none\nfindings: none", "nonesuch", "", "none.", "NONE",
+                         # decorated variants (F2 probe): numbering, zero-width, spaced/fullwidth colon, bullets, bold
+                         "none\n1. F1 MAJOR bug", "none\nF1​ MAJOR bug", "none\nFINDINGS : F1 MAJOR",
+                         "none\n- FINDINGS: F1 BLOCKER", "none\nFINDINGS： F1 MAJOR", "none\n**STATUS: BLOCKED**",
+                         "none\nSTATUS : BLOCKED"):
+            for op in (False, True):
+                with self.subTest(findings=findings, operator_tool=op):
+                    text, ok = self.run_lane(self.fx(findings=findings), operator_tool=op)
+                    self.assertFalse(ok, text)
+                    self.assertIn("FAIL 3", text)
+
+    def test_operator_tool_warns_only_for_classified_minor(self):
+        for findings in ("1\nF1 MINOR: x\nF2 MAJOR: y", "1\nf1 minor: x", "1\nF1 MINΟR: x",
+                         "1\nF1 MINOR: x (was MAJOR)", "1\nF1 MINOR: x\nBLOCKER: y", "1\nF1: x", "MINOR: nit",
+                         "1\nF1 MINOR: x\n1. F2 МAJOR x", "1\nF2 MINOR (really MEDIUM, data loss)",
+                         "1\nF1 MINOR x\nblocking: severe data loss"):
+            with self.subTest(findings=findings):
+                text, ok = self.run_lane(self.fx(findings=findings), operator_tool=True)
+                self.assertFalse(ok, text)
+                self.assertIn("FAIL 3", text)
 
     def test_ci_must_be_success_on_exactly_the_candidate(self):
         fx = self.fx()
