@@ -9,8 +9,8 @@ Tasks (reproduced from the live definitions, 2026-11-17):
                             of pythonw.exe) scripts\conveyor.py; no time limit,
                             3 restarts 1 min apart, wake to run, runs on battery
   \Konveyor Yeniden Baslat  no trigger (conveyor.py runs it with schtasks /Run);
-                            powershell -File scripts\konveyor_restart.ps1; 5 min
-  \JARVIS Watchdog          every 5 min; powershell -File scripts\watchdog.ps1
+                            conhost --headless powershell -File scripts\konveyor_restart.ps1; 5 min
+  \JARVIS Watchdog          every 5 min; conhost --headless powershell -File scripts\watchdog.ps1
                             (named in watchdog.ps1; not registered on the old box)
 
 All run as the current user, interactive logon, least privilege.
@@ -44,8 +44,9 @@ if (-not $PythonW -or $PythonW -like '*\WindowsApps\*') {
 }
 $KonvExe = Join-Path (Split-Path -Parent $PythonW) 'JARVIS-Konveyor.exe'
 
-$ps = 'powershell.exe'
-$psArgs = '-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File'
+# conhost --headless: a hidden window style still flashes a window under Windows Terminal (Win11).
+$ps = "$env:SystemRoot\System32\conhost.exe"
+$psArgs = '--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File'
 $every5 = { New-ScheduledTaskTrigger -Once -At (Get-Date).Date -RepetitionInterval (New-TimeSpan -Minutes 5) }
 
 $tasks = @(

@@ -36,6 +36,15 @@ class AsciiCheckCase(unittest.TestCase):
         self.assertNotRegex(text, r"\$Root -match ")
 
 
+class HeadlessTasksTest(unittest.TestCase):
+    def test_powershell_tasks_run_via_conhost_headless(self):  # SETUPHIDE1: -WindowStyle Hidden flashes under Windows Terminal
+        text = SETUP.read_text(encoding="utf-8")
+        self.assertIn(r'$ps = "$env:SystemRoot\System32\conhost.exe"', text)
+        self.assertIn("'--headless powershell.exe -NoProfile -ExecutionPolicy Bypass -File'", text)
+        self.assertEqual(len(re.findall(r"Exe\s*=\s*\$ps\b", text)), 2)
+        self.assertNotIn("WindowStyle", text.split("#>", 1)[1])
+
+
 class SetupTasksScriptTest(unittest.TestCase):
     def setUp(self):
         self.raw = SETUP.read_bytes()
