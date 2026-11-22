@@ -137,9 +137,12 @@ def verify(lane, root, git, gh, operator_tool=False, rep=None):
     touched = set(git(["diff", "--name-only", "--no-renames", f"{base}...{cand}"])[1].split())
     for s in pick_shas:
         touched |= set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames", s])[1].split())
-    # U1RULE1 (Salih 11-22): a T1 source whose diff and backlog files are product code sends MINOR/NIT to POLISH.md
-    polish_ok = bool(srcs) and not any(
-        conveyor.chain_strict(slices.get(s, {}).get("tier"), sorted(touched | set(allowed))) for s in srcs)
+    # U1RULE1 (Salih 11-22): a T1 source whose diff and backlog files are product code sends MINOR/NIT to POLISH.md;
+    # build/reports/ is dropped as conveyor.chain_verify drops it; a name chain_verify would refuse (unsafe charset,
+    # ".." anywhere) is kept, so "build/" in GRANT_DENY keeps the chain strict
+    pf = sorted(p for p in touched | set(allowed) if not (
+        p.startswith("build/reports/") and conveyor.CHAIN_NAME_RE.fullmatch(p) and ".." not in p))
+    polish_ok = bool(srcs) and not any(conveyor.chain_strict(slices.get(s, {}).get("tier"), pf) for s in srcs)
 
     # 3: every review report passes the conveyor's own chain gate (STATUS PASS, exactly one "FINDINGS: none", no finding line);
     # --operator-tool or a U1RULE1 T1 product chain turns a report whose finding lines are all F<n> MINOR/NIT

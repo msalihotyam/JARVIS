@@ -168,6 +168,25 @@ class Key1CheckTests(unittest.TestCase):
         self.assertIn("WARN 3", text)
         self.assertIn("POLISH.md", text)
 
+    def test_u1rule1fix_backlog_build_reports_entry_is_ignored_like_chain_verify(self):
+        """U1RULE1FIX: backlog files list build/reports/<id>.md by convention; chain_verify drops it, so key1 does too."""
+        minor = "1\nF1 MINOR: a.txt:1 - nit - fix"
+        for files in (("a.txt", "build/reports/X.md"), ("a.txt", "build\\reports\\X.md")):
+            with self.subTest(files=files):
+                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", files=files))
+                self.assertTrue(ok, text)
+                self.assertIn("WARN 3", text)
+        # only the exact build/reports/ prefix without ".." is dropped; anything else keeps the chain strict
+        for files in (("a.txt", "build/reports/../scripts/x.py"), ("a.txt", "Build/Reports/X.md"),
+                      ("a.txt", "build/reports-old/X.md"), ("a.txt", "build/reports/X.md", "jarvis/auth.py"),
+                      ("a.txt", "build/reports/a..b"), ("a.txt", "build/reports/x y"), ("a.txt", "build/reports/x "),
+                      ("a.txt", "build/reports/а.md"), ("a.txt", "build/reports/x\x00y"),
+                      ("a.txt", "build/reports/x\n")):
+            with self.subTest(files=files):
+                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", files=files))
+                self.assertFalse(ok, text)
+                self.assertIn("FAIL 3", text)
+
     def test_u1rule1_strict_classes_and_major_still_fail(self):
         minor = "1\nF1 MINOR: a.txt:1 - nit - fix"
         for kw in ({"tier": "T2"}, {}, {"tier": "T1", "src_file": "scripts/x.py", "files": ("a.txt", "scripts/x.py")},
