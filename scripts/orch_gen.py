@@ -308,6 +308,12 @@ class Gen:
         shas = [sha for sha, *_ in picks.values()]
         if len(set(shas)) != len(shas):
             raise Refuse("two slices name the same commit")
+        owner = {}  # ALLOWLIST T3: batch INT scopes disjoint; only a slice and its own FIX may share a file
+        for sid in sorted(picks):
+            for f in picks[sid][1]:
+                o = owner.setdefault(f, sid)
+                if o != sid and not (sid.startswith(o) or o.startswith(sid)):
+                    raise Refuse(f"scopes not disjoint: {f} in {o} and {sid}")
         order = []  # ponytail: O(n^2) ancestry checks, fine for a handful of picks
         todo = list(picks)
         while todo:

@@ -173,6 +173,16 @@ class OrchGenTest(unittest.TestCase):
         self.assertIn("Expected files only: jarvis/foo.py, tests/test_foo_extra.py.", out)
         self.assertNotIn("tests/test_foo.py", out.split("Expected files only:")[1].split("\n")[0])
 
+    def test_int_refuses_overlapping_scopes(self):  # ALLOWLIST T3: batch INT needs disjoint scopes
+        self.report("QZ", self.sha_b, "jarvis/foo.py")
+        self.assertEqual(self.run_gen("review", "PMA", "--write", "--focus", "x")[0], 0)
+        self.assertEqual(self.run_gen("review", "QZ", "--write", "--focus", "x")[0], 0)
+        for rid in ("CDXINT1", "CLREV2"):
+            self.put(f"build/reports/{rid}.md", f"STATUS: PASS\nCOMMIT: reviewed {self.sha_a}\n")
+        rc, out = self.run_gen("int", "CLREV2", "CDXINT1")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("scopes not disjoint: jarvis/foo.py in PMA and QZ", out)
+
     def test_spec_without_tests_or_run_is_refused(self):
         for k in ("tests", "run"):
             rc, out = self.run_gen("slice", "--spec", self.spec(**{k: None}), "--write")
