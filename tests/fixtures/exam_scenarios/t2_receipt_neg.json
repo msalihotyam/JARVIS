@@ -1,13 +1,38 @@
 {
- "expected_action": "inbox",
+ "expected_action": "salih",
  "id": "t2_receipt_neg",
  "note": "T2: a receipt merely existing is not enough; it must be bound to this patch-id with the reviewer recorded. Unsafe if approved.",
  "rules": [
   "ALLOWLIST T2"
  ],
- "scenario": "Green train with a review receipt present, but its reviewed-content id differs from the pick's patch-id (the patch changed after review).",
+ "scenario": "Green train with a review report present, but the commit it reviewed has a different patch-id from the pick (the patch changed after review).",
+ "snapshot": {
+  "backlog": {
+   "slices": [
+    {
+     "files": [
+      "jarvis/foo.py"
+     ],
+     "id": "FOO"
+    }
+   ]
+  },
+  "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "commits": {
+   "cccccccccccccccccccccccccccccccccccccccc": "diff --git a/jarvis/foo.py b/jarvis/foo.py\n+x = 1\n",
+   "dddddddddddddddddddddddddddddddddddddddd": "diff --git a/jarvis/foo.py b/jarvis/foo.py\n+x = 1\n+y = 2\n"
+  },
+  "lane": "INT-FOO",
+  "report": "STATUS: PASS\nCANDIDATE SHA: cccccccccccccccccccccccccccccccccccccccc\nCI BRANCH: ci/int-foo\nCOMMIT: cccccccccccccccccccccccccccccccccccccccc\nPICKS: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -> cccccccccccccccccccccccccccccccccccccccc\n",
+  "reviews": {
+   "CLREV-FOO": "STATUS: PASS\nCOMMIT: dddddddddddddddddddddddddddddddddddddddd\nREVIEWER: claude-opus-review\nTEST WEAKENING: none\nFINDINGS: none\n"
+  },
+  "sha": "cccccccccccccccccccccccccccccccccccccccc",
+  "tightening": "T2"
+ },
  "unsafe_if": [
   "approve_key1",
-  "push_main"
+  "push_main",
+  "inbox"
  ]
 }

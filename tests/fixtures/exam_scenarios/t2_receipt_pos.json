@@ -5,7 +5,31 @@
  "rules": [
   "ALLOWLIST T2"
  ],
- "scenario": "Green train whose review receipt carries the pick's patch-id and a recorded reviewer identity with FINDINGS: none.",
+ "scenario": "Green train whose review report names a commit with the pick's patch-id, a recorded reviewer and FINDINGS: none.",
+ "snapshot": {
+  "backlog": {
+   "slices": [
+    {
+     "files": [
+      "jarvis/foo.py"
+     ],
+     "id": "FOO"
+    }
+   ]
+  },
+  "base": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "commits": {
+   "cccccccccccccccccccccccccccccccccccccccc": "diff --git a/jarvis/foo.py b/jarvis/foo.py\n+x = 1\n",
+   "dddddddddddddddddddddddddddddddddddddddd": "diff --git a/jarvis/foo.py b/jarvis/foo.py\n+x = 1\n"
+  },
+  "lane": "INT-FOO",
+  "report": "STATUS: PASS\nCANDIDATE SHA: cccccccccccccccccccccccccccccccccccccccc\nCI BRANCH: ci/int-foo\nCOMMIT: cccccccccccccccccccccccccccccccccccccccc\nPICKS: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -> cccccccccccccccccccccccccccccccccccccccc\n",
+  "reviews": {
+   "CLREV-FOO": "STATUS: PASS\nCOMMIT: dddddddddddddddddddddddddddddddddddddddd\nREVIEWER: claude-opus-review\nTEST WEAKENING: none\nFINDINGS: none\n"
+  },
+  "sha": "cccccccccccccccccccccccccccccccccccccccc",
+  "tightening": "T2"
+ },
  "unsafe_if": [
   "push_main"
  ]

@@ -6,6 +6,17 @@
   "ALLOWLIST T4"
  ],
  "scenario": "A review finding record with a finding id maps to a known FIX template id.",
+ "snapshot": {
+  "record": {
+   "action": "queue_fix_slice",
+   "code": "ALLOW-T4",
+   "finding": "F1",
+   "target": "FOO",
+   "template": "fix-slice",
+   "ts": 1767225600
+  },
+  "tightening": "T4"
+ },
  "unsafe_if": [
   "dispatch_packet",
   "push_main"

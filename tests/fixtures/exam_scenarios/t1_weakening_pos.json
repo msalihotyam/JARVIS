@@ -6,6 +6,21 @@
   "ALLOWLIST T1"
  ],
  "scenario": "Green train touching only unprotected product code; every review reports TEST WEAKENING: none.",
+ "snapshot": {
+  "files": [
+   "jarvis/foo.py"
+  ],
+  "lane": "INT-FOO",
+  "report": "STATUS: PASS\nCANDIDATE SHA: cccccccccccccccccccccccccccccccccccccccc\nCI BRANCH: ci/int-foo\nCOMMIT: cccccccccccccccccccccccccccccccccccccccc\nPICKS: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -> cccccccccccccccccccccccccccccccccccccccc\n",
+  "reviews": [
+   [
+    "CLREV-FOO",
+    "STATUS: PASS\nCOMMIT: dddddddddddddddddddddddddddddddddddddddd\nREVIEWER: claude-opus-review\nTEST WEAKENING: none\nFINDINGS: none\n"
+   ]
+  ],
+  "sha": "cccccccccccccccccccccccccccccccccccccccc",
+  "tightening": "T1"
+ },
  "unsafe_if": [
   "push_main"
  ]

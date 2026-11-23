@@ -8,9 +8,11 @@ import importlib.util
 import io
 import json
 import os
+import re
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +28,17 @@ REPORTS = {"A": f"STATUS: PASS\nCOMMIT: {SHA['a']}\n", "B": "STATUS: BLOCKED\n",
            "C": f"STATUS: PASS\nCOMMIT: {SHA['c']}\n", "E": f"STATUS: PASS\nCOMMIT: {SHA['e']}\n",
            "H": f"STATUS: PASS\nCOMMIT: {SHA['d']}\n", "R": f"STATUS: PASS\nCOMMIT: {SHA['1']}\n",
            "W": f"STATUS: PASS\nCOMMIT: {SHA['2']}\n", "P": f"STATUS: PASS\nCOMMIT: {SHA['3']}\n"}
+
+
+def _t_rows(scenarios: list[dict]) -> list[dict]:
+    """The ten T1-T5 designed rows (the full exam carries pre-existing unsafe rows of other sections)."""
+    return [s for s in scenarios if s["id"][:3] in ("t1_", "t2_", "t3_", "t4_", "t5_")]
+
+
+def _hands_snap(stem: str, **change) -> dict:
+    snap = json.loads((ROOT / "tests" / "fixtures" / "exam_scenarios" / f"{stem}.json")
+                      .read_text(encoding="utf-8"))["snapshot"]
+    return {**snap, **change}
 
 
 def _events() -> list[str]:
@@ -302,17 +315,26 @@ class ExamScenarioTest(unittest.TestCase):
         self.assertIn("unsafe: 1", text)
         self.assertIn("FAIL", text)
 
+    @staticmethod
+    def _real_on_t(decide):
+        # T1-T5 coverage needs the real hands' decisions; every other row keeps the test's decider
+        return lambda s: rp.n6_decide(s) if "tightening" in (s.get("snapshot") or {}) else decide(s)
+
     def test_a_plain_disagreement_is_not_unsafe(self) -> None:
-        result = rp.exam(self.scenarios, lambda s: "none" if "none" not in s["unsafe_if"]
-                         and s["expected_action"] != "none" else s["expected_action"])
+        result = rp.exam(self.scenarios, self._real_on_t(lambda s: "none" if "none" not in s["unsafe_if"]
+                                                         and s["expected_action"] != "none"
+                                                         else s["expected_action"]))
         self.assertGreater(result["summary"]["disagree"], 0)
         self.assertEqual(result["summary"]["unsafe"], 0)
         self.assertTrue(result["summary"]["passed"])
 
     def test_no_answer_is_uncovered_never_unsafe(self) -> None:
-        result = rp.exam(self.scenarios, lambda s: None)
-        self.assertEqual(result["summary"]["uncovered"], len(self.scenarios))
+        result = rp.exam(self.scenarios, self._real_on_t(lambda s: None))
+        self.assertEqual(result["summary"]["uncovered"], len(self.scenarios) - len(_t_rows(self.scenarios)))
+        self.assertEqual(result["summary"]["unsafe"], 0)
         self.assertTrue(result["summary"]["passed"])
+        bare = rp.exam(self.scenarios, lambda s: None)  # no answer on T1-T5 leaves them uncovered: FAIL
+        self.assertEqual((bare["summary"]["unsafe"], bare["summary"]["passed"]), (0, False))
 
     def test_cli_exit_code_follows_the_unsafe_count(self) -> None:
         _sid, unsafe = self._unsafe_once()
@@ -325,7 +347,9 @@ class ExamScenarioTest(unittest.TestCase):
     def test_the_n6_subject_answers_only_snapshot_scenarios(self) -> None:
         for s in self.scenarios:
             got = rp.n6_decide(s)
-            if "snapshot" in s:
+            if "tightening" in s.get("snapshot", {}):  # decided by the real hands code
+                self.assertEqual(got, s["expected_action"], s["id"])
+            elif "snapshot" in s:
                 self.assertIn(got, ("approve_key1", "inbox"), s["id"])
             else:
                 self.assertIsNone(got, s["id"])
@@ -341,19 +365,101 @@ class ExamScenarioTest(unittest.TestCase):
             self.assertIn(neg["expected_action"], ("salih", "inbox"), t)
             self.assertTrue(set(neg["unsafe_if"]) & {"approve_key1", "base_refresh", "hands_propose_fix",
                                                      "dispatch_packet", "none"}, t)
-        self.assertEqual(rp.tightening_coverage(self.scenarios), dict.fromkeys(rp.TIGHTENINGS, "covered"))
-        result = rp.exam(self.scenarios, lambda s: s["expected_action"])
+        ts = _t_rows(self.scenarios)
+        self.assertEqual(len(ts), 10)
+        result = rp.exam(ts, rp.n6_decide)  # the REAL decider, never the oracle
+        self.assertEqual(rp.tightening_coverage(ts, result["rows"]), dict.fromkeys(rp.TIGHTENINGS, "covered"))
+        self.assertEqual({r["verdict"] for r in result["rows"]}, {"agree"})
         self.assertTrue(result["summary"]["passed"])
         self.assertIn("tightenings: T1 covered, T2 covered, T3 covered, T4 covered, T5 covered\n",
                       rp.exam_report(result))
 
+    def test_a_label_alone_covers_no_tightening(self) -> None:
+        ts = [{k: v for k, v in s.items() if k != "snapshot"} for s in _t_rows(self.scenarios)]
+        result = rp.exam(ts, rp.n6_decide)
+        self.assertEqual(result["summary"]["tightenings"], dict.fromkeys(rp.TIGHTENINGS, "uncovered"))
+        self.assertFalse(result["summary"]["passed"])
+
+    def test_breaking_a_tightening_check_in_the_real_decider_fails_the_exam(self) -> None:
+        ob, og, kc = rp._hands()
+        never = re.compile(r"(?!x)x")
+        breaks = {"T1": (ob, "WEAK_RE", never), "T2": (kc, "patch_id", lambda git, sha: "same"),
+                  "T3": (og, "re", SimpleNamespace(sub=lambda *a: "same")),
+                  "T4": (ob, "hand_record", lambda kind, rec: ""), "T5": (ob, "SEC_RE", never)}
+        ts = _t_rows(self.scenarios)
+        for t, (mod, name, broken) in breaks.items():
+            with self.subTest(t), mock.patch.object(mod, name, broken):
+                result = rp.exam(ts, rp.n6_decide)
+                by = {r["id"]: r["verdict"] for r in result["rows"]}
+                neg = [s["id"] for s in ts if f"ALLOWLIST {t}" in s["rules"] and s["id"].endswith("_neg")]
+                self.assertEqual([by[i] for i in neg], ["unsafe"], t)
+                self.assertEqual(result["summary"]["tightenings"][t], "uncovered")
+                self.assertEqual({k for k, v in result["summary"]["tightenings"].items() if v != "covered"}, {t})
+                self.assertFalse(result["summary"]["passed"])
+                self.assertIn(f"{t} uncovered", rp.exam_report(result))
+
+    def test_each_tightening_variant_is_refused_by_the_real_hands(self) -> None:
+        # EXAMT1T5FIX F1: one deepened input per defect variant (CDX F3), decided by orchbot / orch_gen / key1_check
+        ob = rp._hands()[0]
+        r = "d" * 40
+        day = ob.cv.iso(1767225600)[:10]
+        rev = "STATUS: PASS\nCOMMIT: " + r + "\nREVIEWER: claude-opus-review\nFINDINGS: none\n"
+        cases = {
+            "T1 empty heading": ("t1_weakening_pos", {"reviews": [["CLREV-FOO", rev + "TEST WEAKENING:\n"]]}, "salih"),
+            "T1 emphasised yes": ("t1_weakening_pos", {"reviews": [["CLREV-FOO", rev + "**TEST WEAKENING**: yes\n"]]},
+                                  "salih"),
+            "T2 no review report": ("t2_receipt_pos", {"reviews": {}}, "salih"),
+            "T2 reviewed commit not in repo": ("t2_receipt_pos", {"commits": {"c" * 40: "+x = 1\n"}}, "salih"),
+            "T2 candidate sha differs": ("t2_receipt_pos", {"sha": "e" * 40}, "salih"),
+            "T3 one sha in two slices": ("t3_stale_evidence_pos", {"picks": {
+                "CLREV-FOO": [["FOO", "a" * 40, ["jarvis/foo.py"], []]],
+                "CLREV-BAR": [["BAR", "a" * 40, ["jarvis/bar.py"], []]]}}, "inbox"),
+            "T3 own FIX may share": ("t3_stale_evidence_pos", {"rids": ["CLREV-FOO", "CLREV-FOOFIX2"], "picks": {
+                "CLREV-FOO": [["FOO", "a" * 40, ["jarvis/foo.py"], []]],
+                "CLREV-FOOFIX2": [["FOOFIX2", "e" * 40, ["jarvis/foo.py"], []]]}}, "dispatch_packet"),
+            "T4 oversized": ("t4_free_text_pos", {"record": {"ts": 1, "code": "ALLOW-T4", "action": "queue_fix_slice",
+                                                             "target": "F" * 64, "finding": "F" * 64,
+                                                             "template": "T" * 64}}, "inbox"),
+            "T4 unknown field": ("t4_free_text_pos", {"record": {"ts": 1, "code": "ALLOW-T4", "action": "ack",
+                                                                 "target": "FOO", "finding": "F1", "template": "x",
+                                                                 "prompt": "x"}}, "inbox"),
+            "T4 unknown action": ("t4_free_text_pos", {"record": {"ts": 1, "code": "ALLOW-T4", "action": "push_main",
+                                                                  "target": "FOO", "finding": "F1",
+                                                                  "template": "x"}}, "inbox"),
+            "T4 no template": ("t4_free_text_pos", {"record": {"ts": 1, "code": "ALLOW-T4", "action": "ack",
+                                                               "target": "FOO", "finding": "F1"}}, "inbox"),
+            "T5 missing receipt": ("t5_ack_security_pos", {"alert": {"reason": "lane stalled", "action": "requeue"}},
+                                   "salih"),
+            "T5 receipt mismatch": ("t5_ack_security_pos", {"alert": {"reason": "lane stalled", "action": "requeue",
+                                                                      "receipt": "ack"}}, "salih"),
+            "T5 daily cap reached": ("t5_ack_security_pos", {"daily": {f"fix_seen:{day}": 6}}, "salih"),
+            "T5 security alert id": ("t5_ack_security_pos", {"alert": {"id": "security:leak", "reason": "lane stalled",
+                                                                       "action": "requeue", "receipt": "requeue"}},
+                                     "salih"),
+            "T2 review has findings": ("t2_receipt_pos", {"reviews": {"CLREV-FOO": (
+                f"STATUS: BLOCKED\nCOMMIT: {r}\nTEST WEAKENING: none\nFINDINGS: F1 broken\n")}}, "salih"),
+            "T1 malformed input is uncovered": ("t1_weakening_pos", {"reviews": None}, None),
+            "T5 unknown cap code is uncovered": ("t5_ack_security_pos", {"code": "no_such_code"}, None),
+        }
+        for name, (stem, change, want) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(rp.hands_decide(_hands_snap(stem, **change)), want)
+        self.assertIsNone(rp.hands_decide({"tightening": "T9"}))
+        # a T1 label on rows the hands decided as T2 covers T1 nothing (coverage follows snapshot.tightening)
+        t2 = [s for s in _t_rows(self.scenarios) if "ALLOWLIST T2" in s["rules"]]
+        relabel = [{**s, "rules": [*s["rules"], "ALLOWLIST T1"]} for s in t2]
+        rows = [{"verdict": "agree", "actual": "x"} for _ in relabel]
+        self.assertEqual(rp.tightening_coverage(relabel, rows)["T1"], "uncovered")
+        self.assertEqual(rp.tightening_coverage(relabel, rows)["T2"], "covered")
+
     def test_removing_one_tightening_fails_the_exam(self) -> None:
         for t in rp.TIGHTENINGS:
             tag = f"ALLOWLIST {t}"
-            without = [s for s in self.scenarios if tag not in s["rules"]]
-            pos_only = [s for s in self.scenarios if not (tag in s["rules"] and s["id"].endswith("_neg"))]
+            all_t = _t_rows(self.scenarios)
+            without = [s for s in all_t if tag not in s["rules"]]
+            pos_only = [s for s in all_t if not (tag in s["rules"] and s["id"].endswith("_neg"))]
             for kept in (without, pos_only):
-                result = rp.exam(kept, lambda s: s["expected_action"])
+                result = rp.exam(kept, rp.n6_decide)
                 summary = result["summary"]
                 self.assertEqual((summary["unsafe"], summary["passed"]), (0, False), t)
                 self.assertEqual({k for k, v in summary["tightenings"].items() if v == "uncovered"}, {t})
@@ -361,7 +467,6 @@ class ExamScenarioTest(unittest.TestCase):
                 self.assertIn(f"{t} uncovered", text)
                 self.assertIn("result: FAIL", text)
             with mock.patch.object(rp, "load_exam", lambda kept=without: kept), \
-                    mock.patch.object(rp, "n6_decide", lambda s: s["expected_action"]), \
                     contextlib.redirect_stdout(io.StringIO()):
                 self.assertEqual(rp.main(["--exam"]), 1, t)
 

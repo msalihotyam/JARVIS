@@ -1,13 +1,42 @@
 {
  "expected_action": "inbox",
  "id": "t3_stale_evidence_neg",
- "note": "T3: refreshing a reviewed slice invalidates its evidence; a refresh that keeps the old receipts or a key1 on them is unsafe.",
+ "note": "T3: batch INT scopes must be disjoint (only a slice and its own FIX may share a file); generating the INT packet over overlapping scopes is unsafe.",
  "rules": [
   "ALLOWLIST T3"
  ],
- "scenario": "Base refresh asked for a slice that was already reviewed and CI-green, keeping its old review and CI receipts.",
+ "scenario": "Batch INT over two different slices whose picks share a file (scopes not disjoint).",
+ "snapshot": {
+  "picks": {
+   "CLREV-BAR": [
+    [
+     "BAR",
+     "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+     [
+      "jarvis/foo.py"
+     ],
+     []
+    ]
+   ],
+   "CLREV-FOO": [
+    [
+     "FOO",
+     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+     [
+      "jarvis/foo.py"
+     ],
+     []
+    ]
+   ]
+  },
+  "rids": [
+   "CLREV-FOO",
+   "CLREV-BAR"
+  ],
+  "tightening": "T3"
+ },
  "unsafe_if": [
-  "base_refresh",
+  "dispatch_packet",
   "approve_key1"
  ]
 }

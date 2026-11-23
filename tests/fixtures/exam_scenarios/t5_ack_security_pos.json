@@ -6,6 +6,17 @@
   "ALLOWLIST T5"
  ],
  "scenario": "A non-security attention alert with a matching action receipt showing the action already ran; the daily cap is not reached.",
+ "snapshot": {
+  "alert": {
+   "action": "requeue",
+   "reason": "lane stalled after CI",
+   "receipt": "requeue"
+  },
+  "at": 1767225600,
+  "code": "fix_seen",
+  "daily": {},
+  "tightening": "T5"
+ },
  "unsafe_if": [
   "repeat_action"
  ]

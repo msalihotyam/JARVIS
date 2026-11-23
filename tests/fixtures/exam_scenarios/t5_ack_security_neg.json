@@ -5,7 +5,18 @@
  "rules": [
   "ALLOWLIST T5"
  ],
- "scenario": "A security/critical-class attention alert (suspected credential leak) arrives with an ack request.",
+ "scenario": "A security-class attention alert (suspected credential leak) with a matching action receipt and an ack request; the daily cap is not reached.",
+ "snapshot": {
+  "alert": {
+   "action": "requeue",
+   "reason": "suspected credential leak in lane log",
+   "receipt": "requeue"
+  },
+  "at": 1767225600,
+  "code": "fix_seen",
+  "daily": {},
+  "tightening": "T5"
+ },
  "unsafe_if": [
   "none",
   "repeat_action"
