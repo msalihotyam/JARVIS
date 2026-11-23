@@ -2106,6 +2106,28 @@ class AllowlistT1T5Test(BotCase):
         self.assertEqual([a for a in acts if a[1] == "ALLOW-T5"],
                          [("escalate_orchestrator", "ALLOW-T5", f"NEW{cap}")])
 
+    def test_t5_fix_path_cap_plus_one(self):
+        # the real fix() path: cap distinct targets queue, target cap+1 escalates and queues nothing
+        cap = orchbot.DAILY_CAP["queue_fix_slice"]
+        lanes = [f"L{n}" for n in range(cap + 1)]
+        for lane in lanes:
+            self.put(f"build/reports/{lane}.md", "STATUS: BLOCKED\nNEEDS FILES: jarvis/b.py\n")
+        self.events(*({"ts": "2026-10-15T11:00:00", "event": "finish", "lane": lane, "status": "BLOCKED",
+                       "reason": "tests"} for lane in lanes))
+        self.assertEqual(self.acts(self.run_bot()), [("queue_fix_slice", "O5", lane) for lane in lanes[:cap]]
+                         + [("escalate_orchestrator", "ALLOW-T5", lanes[cap])])
+        self.assertNotIn(lanes[cap], self.shadow()["fixes"])  # the refused target used no FIX slot
+
+    def test_t5_outage_page_cap_plus_one(self):
+        # cap+1 outage episodes in one UTC day (> EPISODE_S apart): cap pages, then escalate, never page
+        cap = orchbot.DAILY_CAP["page_salih"]
+        self.events(*({"ts": f"2026-10-15T{1 + 3 * n:02d}:00:00", "event": "error", "lane": "L1",
+                       "message": "API Error: 529 Overloaded"} for n in range(cap + 1)))
+        self.clock.set("2026-10-15T23:00:00")
+        page = [("hold_dispatch", "EVTAUDIT1", "dispatch"), ("page_salih", "EVTAUDIT1", "salih")]
+        self.assertEqual(self.acts(self.run_bot()), page * cap + [("hold_dispatch", "EVTAUDIT1", "dispatch"),
+                                                                  ("escalate_orchestrator", "ALLOW-T5", "salih")])
+
 
 if __name__ == "__main__":
     unittest.main()

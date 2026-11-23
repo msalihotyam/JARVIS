@@ -131,6 +131,35 @@ class OrchGenTest(unittest.TestCase):
         rc, out = write(f"PV{cap}")
         self.assertEqual(rc, 0, out)
 
+    def test_fix_daily_cap(self):
+        day = [1_800_000_000.0]  # injected clock: the cap counts per UTC day
+        self.put("build/reports/CLREV7.md", "STATUS: BLOCKED\nF1 MAJOR foo breaks\n")
+        self.put("build/conveyor/backlog.json", json.dumps({"slices": [
+            {"id": "PMAFIX", "tier": "T2", "files": ["jarvis/foo.py"], "prompt": "build/conveyor/prompts/PMAFIX.md"}]}))
+
+        def write(fid):
+            out = []
+            rc = orch_gen.main(["--root", str(self.root), "fix", "--spec",
+                                self.spec(id=fid, review="CLREV7", source="PMAFIX", size="SMALL",
+                                          commit=f"fix: {fid} y"), "--write"],
+                               out=out.append, now=lambda: day[0])
+            return rc, "\n".join(out)
+
+        cap = orch_gen.DAILY_CAP["fix"]
+        fids = [f"PV9FIX{chr(65 + n)}" for n in range(cap + 1)]
+        for fid in fids[:cap]:
+            rc, out = write(fid)
+            self.assertEqual(rc, 0, out)
+        before = (self.root / "build/conveyor/backlog.json").read_bytes()
+        rc, out = write(fids[cap])
+        self.assertEqual(rc, 2, out)
+        self.assertIn(f"REFUSED: ALLOW-T5 daily fix cap {cap} reached; escalate to the orchestrator", out)
+        self.assertEqual((self.root / "build/conveyor/backlog.json").read_bytes(), before)
+        self.assertFalse((self.root / f"build/conveyor/prompts/{fids[cap]}.md").exists())
+        day[0] += 86400  # a new UTC day resets it
+        rc, out = write(fids[cap])
+        self.assertEqual(rc, 0, out)
+
     def test_slice_spec_chained_lints_and_dry_run_writes_nothing(self):
         before = (self.root / "build/conveyor/backlog.json").read_bytes()
         rc, out = self.run_gen("slice", "--spec", self.spec(chain=True, split_ok=True))
