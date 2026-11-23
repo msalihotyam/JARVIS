@@ -67,16 +67,14 @@ def load_actuals(root, since, until):
             name = ob.STAMP_RE.sub("", raw)
             if not cv.APPROVAL_RE.fullmatch(name):
                 continue
-            with open(Path(d) / raw, encoding="utf-8", errors="replace") as f:
-                text = f.read(512)
-            key = ob.agree_key("write_key1", name)
-            if text.startswith("auto-approved by the conveyor"):
-                act, side = "write_key1", "conveyor"
-            elif re.search(r"\bby salih\b", text, re.I):
-                act, side = "ask_salih_key1", "orchestrator"
-            else:
-                act, side = "write_key1", "orchestrator"
-            out.append({"at": mt, "action": act, "key": key, "side": side, "what": f"{raw}: {text}"[:200]})
+            # KEY1PATH1FIX4: the side is the validated header's (Bot.observe's function), never a body;
+            # an invalid or .refused file is no key 1 write
+            got = ob.key1_side(Path(d) / raw, name)
+            if got is None:
+                continue
+            act, side, header = got
+            out.append({"at": mt, "action": act, "key": ob.agree_key("write_key1", name), "side": side,
+                        "what": f"{raw}: {header}"[:200]})
     backlogs, known = [], None
     for name, mt in sorted(files(conv / "hold"), key=lambda x: (x[1], x[0])):
         if not name.startswith("backlog.json.bak-"):

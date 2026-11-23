@@ -43,7 +43,7 @@ class ReplayTest(unittest.TestCase):
                                   lambda bot, lane, sha: self.verify_calls.append((lane, sha)) or (True, "PASS"))
         patch.start()
         self.addCleanup(patch.stop)
-        self.put(f"build/approvals/done/push-{SHA}-l1", "approved by the orchestrator\n", "2026-10-15T11:10:00")
+        self.key1(f"build/approvals/done/push-{SHA}-l1", "2026-10-15T11:10:00")
         self.put("build/conveyor/ack/L2", "", "2026-10-15T12:40:00")
         self.put("build/conveyor/hold/backlog.json.bak-1", {"slices": [{"id": "A1"}]}, "2026-10-15T09:00:00")
         self.put("build/conveyor/hold/backlog.json.bak-2", {"slices": [{"id": "A1"}, {"id": "L1FIX-1"}]},
@@ -55,6 +55,47 @@ class ReplayTest(unittest.TestCase):
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
         os.utime(p, (ts(at),) * 2)
+
+    def key1(self, rel, at, by="key1_check", reason=None, base=None, tail=""):
+        """KEY1PATH1FIX4: a real write_key1 file for base or rel's name, moved to rel as a push (done/) or a
+        forger (mismatched name) would; tail is text appended after the header the writer wrote."""
+        m = orchbot.cv.APPROVAL_RE.fullmatch(base or Path(rel).name)
+        p = orchbot.cv.write_key1(self.root / "keys", m.group(1), f"ci/{m.group(2)}", m.group(2), by,
+                                  ("approval-for",), reason, now=0)
+        dest = self.root / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(p, dest)
+        with open(dest, "a", encoding="ascii") as f:
+            f.write(tail)
+        os.utime(dest, (ts(at),) * 2)
+        return dest
+
+    def test_load_actuals_takes_the_key1_side_from_the_validated_header_never_the_body(self):
+        b, c, d, e, f = (x * 40 for x in "bcdef")
+        at = "2026-10-15T11:30:00"
+        self.key1(f"build/approvals/push-{b}-l2", at, by="conveyor", tail="approved by salih\n")
+        self.key1(f"build/approvals/done/push-{c}-l3.20261015-113000", at, base=f"push-{c}-l3",
+                  tail="auto-approved by the conveyor\n")
+        self.key1(f"build/approvals/push-{d}-l4", at, by="manual", reason="approved by salih")
+        self.key1(f"build/approvals/push-{e}-l5", at, by="manual", reason="approved under O42 pre-approval")
+        self.key1(f"build/approvals/push-{f}-l6", at, by="manual", reason="checked by hand",
+                  tail="auto-approved by the conveyor\n")
+        # no key 1: a body-only file, a header under another sha's name, a .refused record
+        self.put(f"build/approvals/push-{'1' * 40}-l7", "auto-approved by the conveyor\n", at)
+        self.key1(f"build/approvals/push-{'2' * 40}-l8", at, base=f"push-{'3' * 40}-l8")
+        self.key1(f"build/approvals/done/push-{'4' * 40}-l9.refused", at, base=f"push-{'4' * 40}-l9")
+        acts, _ = orchbot_replay.load_actuals(self.root, ts("2026-10-15T00:00:00"), ts("2026-10-15T23:00:00"))
+        got = {a["what"].split(":")[0]: (a["action"], a["side"]) for a in acts if a["action"] != "ack"
+               and a["action"] != "queue_fix_slice"}
+        self.assertEqual(got, {
+            f"push-{SHA}-l1": ("write_key1", "orchestrator"),
+            f"push-{b}-l2": ("write_key1", "conveyor"),
+            f"push-{c}-l3.20261015-113000": ("write_key1", "orchestrator"),
+            f"push-{d}-l4": ("ask_salih_key1", "orchestrator"),
+            f"push-{e}-l5": ("write_key1", "conveyor"),
+            f"push-{f}-l6": ("write_key1", "orchestrator")})
+        self.assertTrue(all(a["what"].split(": ", 1)[1].startswith("KEY1 v1 ") for a in acts
+                            if a["action"] in ("write_key1", "ask_salih_key1")))
 
     def snapshot(self):
         return {str(p): (p.stat().st_mtime, hashlib.sha256(p.read_bytes()).hexdigest())
@@ -138,7 +179,7 @@ def old_load_events(conv, since, until):
 class StreamTest(unittest.TestCase):
     """REPLAYSTREAM (CDXINT65 F6): logs are streamed line by line, never read whole, with unchanged results."""
 
-    setUp, put, run_replay = ReplayTest.setUp, ReplayTest.put, ReplayTest.run_replay
+    setUp, put, key1, run_replay = ReplayTest.setUp, ReplayTest.put, ReplayTest.key1, ReplayTest.run_replay
 
     def no_whole_reads(self):
         real_text, real_bytes = Path.read_text, Path.read_bytes
