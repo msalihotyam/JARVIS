@@ -5246,26 +5246,57 @@ class TestPushGate(Base):
             with self.subTest(missing=entry):
                 write_settings(self.root, tuple(d for d in conveyor.REQUIRED_DENY if d != entry))
                 self.assertIn(repr(entry), conveyor.settings_refusal(self.root) or "")
-        self.assertIn("Bash(*key1_check*--write*)", conveyor.REQUIRED_DENY)
-        self.assertIn("Bash(*write_key1(*)", conveyor.REQUIRED_DENY)
+        self.assertIn("Bash(py*key1_check*--write*)", conveyor.REQUIRED_DENY)
+        self.assertIn("Bash(py*write_key1(*)", conveyor.REQUIRED_DENY)
+        self.assertNotIn("Bash(*key1_check*--write*)", conveyor.REQUIRED_DENY)  # KEY1PATH1FIX2: hit quoted text
 
-    def test_lane_commands_that_reach_the_key1_writer_match_a_bash_deny(self):  # KEY1PATH1FIX V1-V5
+    @staticmethod
+    def subcommands(cmd):
+        """KEY1PATH1FIX2: split as Claude Code does before matching each part (unquoted && || ; | newline)."""
+        out, cur, q, i = [], "", None, 0
+        while i < len(cmd):
+            c = cmd[i]
+            if q or c in "'\"":
+                q = None if c == q else (q or c)
+            elif cmd.startswith(("&&", "||"), i):
+                out, cur, i = out + [cur], "", i + 2
+                continue
+            elif c in ";|\n":
+                out, cur, i = out + [cur], "", i + 1
+                continue
+            cur, i = cur + c, i + 1
+        return [s.strip() for s in out + [cur] if s.strip()]
+
+    def test_bash_denies_match_writer_invocations_not_quoted_text(self):  # KEY1PATH1FIX V1-V5, KEY1PATH1FIX2 F1
         import fnmatch
         pats = [d[5:-1] for d in conveyor.REQUIRED_DENY if d.startswith("Bash(")]
+        self.assertEqual(self.subcommands("a 'b;c' && d \"e|f\" | g\nh"), ["a 'b;c'", 'd "e|f"', "g", "h"])
+
+        def hit(cmd):
+            return any(fnmatch.fnmatchcase(s, p) for s in self.subcommands(cmd) for p in pats)
         for cmd in ("python scripts/key1_check.py INT-X --write",                      # V1
                     'python scripts/key1_check.py INT-X --manual "ok"',                # V2
+                    "python3 scripts/key1_check.py INT-X --write", "py scripts/key1_check.py INT-X --write",
                     "python -m key1_check INT-X --write", "cd scripts && py key1_check.py INT-X --write",
                     r"python scripts\key1_check.py INT-X --write",                      # V3
+                    r"scripts\key1_check.py INT-X --write", "./scripts/key1_check.py INT-X --write",
+                    r"C:\Python312\python.exe scripts\key1_check.py INT-X --write",
+                    "uv run python scripts/key1_check.py INT-X --write", "echo hi; python key1_check.py INT-X --write",
+                    "git status || python scripts/key1_check.py INT-X --manual x",
                     "python -c \"import conveyor; conveyor.write_key1('a', 1, 2, 3, 4, ())\"",  # V4
                     "echo x > build/approvals/push-1", r"copy x build\approvals\push-1"):  # V5
-            with self.subTest(cmd=cmd):
-                self.assertTrue(any(fnmatch.fnmatchcase(cmd, p) for p in pats), cmd)
+            with self.subTest(denied=cmd):
+                self.assertTrue(hit(cmd), cmd)
         for cmd in ("python scripts/test_parallel.py tests.test_key1_check",  # lanes owning the writer still work
                     "git add scripts/key1_check.py tests/test_key1_check.py", "git diff -- scripts/key1_check.py",
                     'git commit -m "fix: make key1_check the only reachable writer"',
+                    'git commit -m "fix: python key1_check --write and write_key1( are denied"', "git commit -F msg.txt",
+                    "git diff -S 'write_key1(' -- scripts", "git diff -G 'key1_check.*--write'",
+                    'grep -n "key1_check.*--write" scripts/key1_check.py', r'rg "write_key1\(" scripts',
+                    "echo key1_check --write", "echo key1_check --manual | grep -c manual",
                     "python -m unittest -k write_key1 tests.test_conveyor"):
             with self.subTest(allowed=cmd):
-                self.assertFalse(any(fnmatch.fnmatchcase(cmd, p) for p in pats), cmd)
+                self.assertFalse(hit(cmd), cmd)
 
     def assert_blocked(self, name, why):
         self.c.pass_once()

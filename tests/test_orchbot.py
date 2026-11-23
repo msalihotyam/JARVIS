@@ -54,6 +54,13 @@ class BotCase(unittest.TestCase):
         p.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
         return p
 
+    def key1(self, name, body="", d="build/approvals", base=None):
+        """KEY1PATH1FIX2: a valid key 1 at d/name for base or name (push-<sha40>-<ci>), body after the header."""
+        m = orchbot.cv.APPROVAL_RE.fullmatch(base or name)
+        h = orchbot.cv.key1_header(sha=m.group(1), ci=f"ci/{m.group(2)}", lane=m.group(2), by="key1_check",
+                                   checks=("approval-for",), now=0)
+        return self.put(f"{d}/{name}", h + "\n" + body)
+
     def events(self, *evs):
         with open(self.conv / "events.jsonl", "a", encoding="utf-8") as f:
             for e in evs:
@@ -141,7 +148,7 @@ class O26Key1Test(BotCase):
         self.lane(["jarvis/a.py"], cand=False)
         self.green()
         self.assertEqual(self.acts(self.run_bot()), [("none", "O26", "L1")])
-        self.put(f"build/approvals/push-{SHA[:12]}-L9", "")
+        self.key1(f"push-{SHA}-L9")  # KEY1PATH1FIX2: only a valid key 1 (full sha, header) counts
         self.put("build/conveyor/lanes.json", {"L9": {"files": ["jarvis/a.py"], "ci": {"cand": True}},
                                                "L8": {"files": ["jarvis/a.py"], "ci": {"cand": True}}})
         self.events({"ts": "2026-10-15T11:00:00", "event": "ci_result", "lane": "L9", "sha": SHA,
@@ -530,8 +537,8 @@ class AgreementTest(BotCase):
                      "result": "success"})
         self.assertEqual(self.acts(self.run_bot()), [("write_key1", "O26", "L1")])  # pending at 11:00, baseline
 
-    def approve(self, at, text="approved", name=f"push-{SHA}-L1"):
-        p = self.put(f"build/approvals/{name}", text)
+    def approve(self, at, text="approved", name=f"push-{SHA}-L1", valid=True):
+        p = self.key1(name, text) if valid else self.put(f"build/approvals/{name}", text)
         os.utime(p, (ts(at), ts(at)))
 
     def seed(self, agreement):
@@ -607,18 +614,17 @@ class AgreementTest(BotCase):
         self.assertEqual(k("write_key1", f"push-{SHA}-L"), f"key1:l@{SHA[:7]}")
         self.assertEqual(k("write_key1", "L"), "key1:l")
 
-    def test_laneless_approval_agrees_with_its_lane(self):
-        self.approve("2026-10-15T11:30:00", name=f"push-{SHA}")  # key1:@sha7, the bot's is key1:l1@sha7
+    def test_laneless_approval_is_no_key1_write(self):  # KEY1PATH1FIX2: no ci, never a valid key 1
+        self.approve("2026-10-15T11:30:00", name=f"push-{SHA}", valid=False)
         self.clock.set("2026-10-15T12:05:00")
         self.run_bot()
-        self.assertEqual(self.kinds(), ["agree"])
-        self.assertEqual(self.verdicts()[0]["key"], f"key1:l1@{SHA[:7]}")
+        self.assertNotIn("agree", self.kinds())
 
-    def test_laneless_approval_of_another_sha_never_matches(self):
-        self.approve("2026-10-15T11:30:00", name=f"push-{SHA2}")
+    def test_laneless_approval_of_another_sha_is_no_key1_write(self):
+        self.approve("2026-10-15T11:30:00", name=f"push-{SHA2}", valid=False)
         self.clock.set("2026-10-16T11:00:01")
         self.run_bot()
-        self.assertEqual(sorted(self.kinds()), ["missed", "unmatched"])
+        self.assertEqual(self.kinds(), ["unmatched"])  # only the bot ask; a ci-less file is no write (was missed+unmatched)
 
     def test_same_key(self):
         s, k7 = orchbot.same_key, SHA[:7]
@@ -950,7 +956,7 @@ class FactsTest(BotCase):
         self.report("OLD", f"STATUS: BLOCKED\nCOMMIT: {SHA2}\n", "2026-10-15T09:00:00")
         self.report("NEW", f"STATUS: PASS\nBRANCH: new\nCOMMIT: {SHA}\nCANDIDATE SHA: {SHA2}\nCI BRANCH: ci/new\n",
                     "2026-10-15T10:00:00")
-        self.put(f"build/approvals/push-{SHA}-botfacts", "ok")
+        self.key1(f"push-{SHA}-botfacts", "ok")
         self.put(f"build/approvals/done/push-{SHA2[:12]}", "ok")
         self.put(".git/refs/heads/main", SHA + "\n")
         self.put(".git/packed-refs", f"# pack-refs with: peeled\n{SHA2} refs/remotes/origin/main\n")
@@ -1161,12 +1167,33 @@ class AsksTest(BotCase):
         self.run_bot()  # still open: logged once, since kept
         self.assertEqual(self.asks()[0]["since"], a["since"])
         self.assertEqual(self.shadow()["asks_open"], 1)
-        self.put(f"build/approvals/push-{SHA}-INT63", "")
+        self.put(f"build/approvals/push-{SHA}-INT63", "")  # KEY1PATH1FIX2: an empty file is no key 1
+        self.run_bot()
+        self.assertEqual(self.shadow()["asks_open"], 1)
+        self.assertEqual(self.ask_log(), ["open key1:INT63"])
+        self.key1(f"push-{SHA}-INT63")
         self.clock.set("2026-10-15T12:10:00")
         self.run_bot()
         self.assertEqual(self.asks(), [])
         self.assertEqual(self.shadow()["asks_open"], 0)
         self.assertEqual(self.ask_log(), ["open key1:INT63", "close key1:INT63"])
+
+    def test_key1_ask_stays_open_on_mismatched_or_refused_files(self):  # KEY1PATH1FIX2 F3
+        self.key1_lane()
+        self.run_bot()
+        n = f"push-{SHA}-INT63"
+        self.key1(n + ".refused", d="build/approvals/done", base=n)
+        self.key1(n + ".refused.20261015-120000", d="build/approvals/done", base=n)
+        self.key1(n, base=f"push-{SHA2}-INT63")  # header sha != name sha
+        self.clock.set("2026-10-15T12:10:00")
+        self.run_bot()
+        self.assertEqual(self.shadow()["asks_open"], 1)
+        self.assertEqual(self.ask_log(), ["open key1:INT63"])
+
+    def test_push_refused_is_reported_as_a_key1_ask(self):  # KEY1PATH1FIX2 F3
+        n = f"push-{SHA}-INT63"
+        self.events({"ts": "2026-10-15T11:00:00", "event": "push_refused", "approval": n, "reason": "no KEY1 v1 header"})
+        self.assertIn(("ask_salih_key1", "KEY1PATH1", n), self.acts(self.run_bot()))
 
     def test_key1_not_protected_or_not_green_is_no_ask(self):
         self.key1_lane(files=["jarvis/a.py"])
@@ -1374,7 +1401,7 @@ class AsksTest(BotCase):
                 raise PermissionError("held")
             return real(a, b)
 
-        self.put(f"build/approvals/push-{SHA}-INT63", "")
+        self.key1(f"push-{SHA}-INT63")
         self.clock.set("2026-10-15T13:00:00")
         with mock.patch.object(orchbot.os, "replace", side_effect=held):
             ds = self.run_bot()

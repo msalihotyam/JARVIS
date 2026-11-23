@@ -150,7 +150,7 @@ DIGEST_EVENTS = {
     "blocked_attention": ("lane", "id", "nudges"), "resume_in_place": ("lane", "id"),
     "heal": ("lane", "was", "status"),
     "ci_result": ("lane", "sha", "result"), "ci_rerun": ("lane", "sha", "rc"),
-    "push": ("sha", "ci_run"), "push_blocked": ("approval", "reason"), "fast_forward": ("sha",),
+    "push": ("sha", "ci_run"), "push_blocked": ("approval", "reason"), "push_refused": ("approval", "reason"), "fast_forward": ("sha",),
     "page": ("result",), "pace": ("band", "mode", "usage_pct"), "disk_hold": ("free_gb",),
     "outage_hold": ("why",), "outage_clear": (), "quota_reset": (), "breaker": ("state", "reason"),
 }
@@ -185,6 +185,13 @@ LIVE_KEYS = ("ack", "asks", "hold_dispatch", "page_salih")  # the live.json sche
 # only, which is outside what the bot may write; everything else in ACTIONS is never live.
 LIVE_OK = ("ack", "asks", "hold_dispatch")
 PAUSE_TEXT = "bot: "  # + rule; a PAUSE with other text is not the bot's and is never removed
+
+
+def key1_ok(path, name=None):
+    """KEY1PATH1FIX2: a valid key 1 for its (unstamped) name, as the push gate checks it; a .refused
+    record in done/ never counts."""
+    name = name or Path(path).name
+    return not name.endswith(".refused") and cv.key1_refusal(path, name) is None
 
 
 def clean(line):
@@ -1185,13 +1192,14 @@ class Bot:
         return rows
 
     def fact_approvals(self):
-        """Pending approval files (build/approvals, not done/)."""
+        """Pending approval files (build/approvals, not done/); KEY1PATH1FIX2: only a valid key 1 is pending."""
+        d = self.root / "build" / "approvals"
         try:
-            names = sorted(n for n in os.listdir(self.root / "build" / "approvals")
-                           if cv.APPROVAL_RE.fullmatch(n) and (self.root / "build" / "approvals" / n).is_file())
+            names = sorted(n for n in os.listdir(d) if cv.APPROVAL_RE.fullmatch(n) and (d / n).is_file())
         except OSError:
             return None
-        return [f"{n} pending (build/approvals)" for n in names]
+        return [f"{n} pending (build/approvals)" if key1_ok(d / n) else f"{n} not a valid key 1 (build/approvals)"
+                for n in names]
 
     # ---- digest (BOTDIGEST) ------------------------------------------------------------------
     def write_digest(self):
@@ -1392,8 +1400,8 @@ class Bot:
             for raw, path, mt in files(d):
                 name = STAMP_RE.sub("", raw)
                 ident = f"{name}@{int(mt)}"  # a push renames it into done/, keeping its mtime
-                if not cv.APPROVAL_RE.fullmatch(name) or ident in approvals:
-                    continue
+                if not cv.APPROVAL_RE.fullmatch(name) or ident in approvals or not key1_ok(path, name):
+                    continue  # KEY1PATH1FIX2: an invalid or refused file is no key 1 write
                 approvals.add(ident)
                 if ident in known["approvals"] or first:
                     continue
@@ -1403,6 +1411,7 @@ class Bot:
                 except FileNotFoundError:  # moved into done/ mid-pass: seen there, or next pass
                     approvals.discard(ident)
                     continue
+                text = text.partition("\n")[2]  # KEY1PATH1FIX2: key1_ok validated line 1; classify the body
                 key = agree_key("write_key1", name)
                 # DECISION TAKEN: an O42 pre-approval is conveyor-side, outside key-1 graduation (alternative: skip it)
                 if text.startswith("auto-approved by the conveyor") or PRE_RE.search(text):
@@ -1583,22 +1592,24 @@ class Bot:
         return files
 
     def approved(self, sha, done=False):
-        names = []
         for d in ("approvals", "approvals/done")[:1 + done]:  # done: a pushed approval moved to done/
+            p = self.root / "build" / d
             try:
-                names += os.listdir(self.root / "build" / d)
+                names = os.listdir(p)
             except OSError:
-                pass
-        for n in names:
-            m = cv.APPROVAL_RE.search(n)
-            if m and sha.startswith(m.group(1)):
-                return True
+                continue
+            for n in names:
+                name = STAMP_RE.sub("", n)
+                m = cv.APPROVAL_RE.fullmatch(name)
+                if m and sha.startswith(m.group(1)) and key1_ok(p / n, name):
+                    return True
         return False
 
     # ---- event rules -------------------------------------------------------------------------
     def on_event(self, ev, at):
         handler = {"ci_result": self.ci_result, "finish": self.finish, "respawn": self.respawn,
                    "error": self.error, "push_blocked": self.push_blocked, "pace": self.pace,
+                   "push_refused": self.push_refused,
                    "page": self.seen_page, "ci_rerun": self.seen_rerun,
                    "push": self.seen_push, "auto_approve": self.seen_auto,
                    "auto_approve_refused": self.seen_auto}.get(ev.get("event"))
@@ -1750,6 +1761,12 @@ class Bot:
                                f"daily FIX cap {DAILY_CAP['queue_fix_slice']} reached; {detail}")
         self.st["fixes"][target] = n + 1
         self.decide(at, saw, "queue_fix_slice", "O5", target, detail)
+
+    def push_refused(self, ev, at, lane):
+        """KEY1PATH1FIX2: the gate refused a key 1 (bad header, sha/ci mismatch); it is in done/ as .refused,
+        which never counts, so ask_key1 keeps or re-opens the ask; this reports why."""
+        self.decide(at, f"push refused {ev.get('approval', '')}", "ask_salih_key1", "KEY1PATH1",
+                    str(ev.get("approval") or "main"), str(ev.get("reason") or ""))
 
     def push_blocked(self, ev, at, lane):
         self.decide(at, f"push blocked {ev.get('approval', '')}", "ask_salih_key1", "R7/O19",
