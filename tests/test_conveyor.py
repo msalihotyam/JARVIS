@@ -5326,8 +5326,8 @@ class TestPushGate(Base):
         bash = [d[5:-1] for d in conveyor.REQUIRED_DENY if d.startswith("Bash(")]
         globs = {k: [d[len(k) + 1:-1] for d in conveyor.REQUIRED_DENY if d.startswith(k + "(")] for k in ("Write", "Edit")}
 
-        def bash_hits(cmd):
-            return {f"Bash({p})" for s in self.subcommands(cmd) for p in bash if fnmatch.fnmatchcase(s, p)}
+        def bash_hits(cmd, pats=bash):
+            return {f"Bash({p})" for s in self.subcommands(cmd) for p in pats if fnmatch.fnmatchcase(s, p)}
 
         def tool_hits(tool, path):
             path = path.replace("\\", "/").removeprefix("./")
@@ -5338,13 +5338,14 @@ class TestPushGate(Base):
         shapes = ("echo x > {}", "cp a.md {}", "python -c \"open(r'{}', 'w')\"", "python -c \"open('{}', 'w')\"")
         misses, sole = [], set()  # sole: entries that are the only match of some spelling, so removing one fails
         for p in conveyor.CONTROL_PATHS:
-            rel = p.removesuffix("/**") + ("/sub/x.md" if p.endswith("/**") else "")
-            for path in self.bash_spellings(rel):
+            stem = p.removesuffix("/**")  # DENYRULES1FIX3: a directory control's bare stem too, not only descendants
+            rels = (stem, stem + "/sub/x.md") if p.endswith("/**") else (stem,)
+            for path in (x for r in rels for x in self.bash_spellings(r)):
                 for shape in shapes:
                     hits = bash_hits(shape.format(path))
                     misses += [] if hits else [shape.format(path)]
                     sole |= hits if len(hits) == 1 else set()
-            for path in self.spellings(rel):
+            for path in self.spellings(rels[-1]):  # Write/Edit write files; a bare directory is not one
                 for tool in ("Write", "Edit"):
                     hits = tool_hits(tool, path)
                     misses += [] if hits else [(tool, path)]
@@ -5353,6 +5354,14 @@ class TestPushGate(Base):
         generated = {d for d in conveyor.REQUIRED_DENY if any(p.removesuffix("/**") in re.sub(r"[\\/]+", "/", d)
                                                               for p in conveyor.CONTROL_PATHS)}
         self.assertEqual(sorted(generated - sole)[:5], [])  # every control entry is load-bearing
+        dirs = {p.removesuffix("/**") for p in conveyor.CONTROL_PATHS if p.endswith("/**")}
+        stem_entries = [d for d in generated if d.startswith("Bash(*") and re.sub(r"[\\/]+", "/", d[6:-2]) in dirs]
+        self.assertEqual(len(stem_entries), 3 * 9 + 3 + 3)  # ack/prompts/notes: 9 spellings; orch, approvals: 3
+        for d in stem_entries:  # DENYRULES1FIX3: a mistyped stem like Bash(*build/orch?*) leaves the bare stem undenied
+            with self.subTest(mistyped=d):
+                cmd = "echo x > " + d[6:-2]  # bash_spellings(<stem>) with prefix "" yields this, so the probe above misses it
+                self.assertTrue(bash_hits(cmd))
+                self.assertFalse(bash_hits(cmd, [x for x in bash if x != d[5:-1]] + [d[5:-2] + "?*"]))
         report = "build/reports/DENYRULES1FIX2.md"  # the lane's own report stays writable
         for path in self.spellings(report):
             for tool in ("Write", "Edit"):
