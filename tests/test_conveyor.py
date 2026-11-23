@@ -10297,17 +10297,40 @@ class TestChain(AutopilotBase):
         text = self.prompt("CLREV-SRC").read_text(encoding="utf-8")
         self.assertIn(f"{self.S1} build/reports/FIXA.md; {self.S2} build/reports/FIXB.md", text)
 
+    def abbreviated_second(self, rc, out):
+        """FIXB names S2 by a 9-hex abbreviation git answers with (rc, out); git proves the stack, so only the
+        abbreviation handling decides."""
+        lanes = self.stacked()
+        self.report("FIXB", "PASS", extra=f"COMMIT: {self.S2[:9]}\n")
+        self.git.fail = {self.PIN + ("rev-parse", "--verify", "--quiet", f"{self.S2[:9]}^{{commit}}"): (rc, out),
+                         **self.git.fail}
+        self.range_git(f"{self.S1} {self.RB}\n{self.S2} {self.S1}\n{self.SHA} {self.S2}\n")
+        return self.direct(lanes, **self.STACK)
+
     def test_stack_neg_an_abbreviation_resolving_elsewhere_or_failing_names_nothing(self):
-        for rc, out in ((0, "c" * 40 + "\n"), (128, ""), (1, "")):
-            with self.subTest(rc=rc, out=out):
-                lanes = self.stacked()
-                self.report("FIXB", "PASS", extra=f"COMMIT: {self.S2[:9]}\n")
-                self.git.fail = {self.PIN + ("rev-parse", "--verify", "--quiet", f"{self.S2[:9]}^{{commit}}"): (rc, out),
-                                 **self.git.fail}
-                self.range_git("", rc=128)
-                why, ap = self.direct(lanes, **self.STACK)
-                self.assertEqual(why, f"no single report names stack commit {self.S2[:7]}")
+        # CHAINSTACK1FIX: the stack is proven, so an abbreviation git cannot resolve (unknown or ambiguous: rc 1 under
+        # --quiet; or rc 0 without a sha) must refuse here, never chain as "(no lane report)"
+        base = dict(self.git.fail)
+        for name, rc, out in (("unknown or ambiguous", 1, ""), ("rc 0 no sha", 0, "\n"),
+                              ("rc 0 not a sha", 0, "e" * 39 + "\n")):
+            with self.subTest(name):
+                self.git.fail = dict(base)  # an earlier subtest's key would otherwise win the merge
+                why, ap = self.abbreviated_second(rc, out)
+                self.assertEqual(why, f"build/reports/FIXB.md COMMIT abbreviation of {self.S2[:7]} does not resolve")
                 self.assertNotIn("chain_slices", ap)
+                self.assertFalse(self.prompt("CLREV-SRC").exists())
+
+    def test_stack_neg_a_broken_git_on_the_abbreviation_defers_the_pass(self):
+        # CHAINSTACK1FIX: as chain_verify, a git error (rc 128) raises, so the pass retries instead of a sticky refusal
+        with self.assertRaisesRegex(RuntimeError, r"unreadable \(git rc 128\)"):
+            self.abbreviated_second(128, "")
+        self.assertFalse(self.prompt("CLREV-SRC").exists())
+
+    def test_stack_an_abbreviation_resolving_elsewhere_names_nothing(self):
+        why, ap = self.abbreviated_second(0, "c" * 40 + "\n")
+        self.assertIsNone(why)
+        text = self.prompt("CLREV-SRC").read_text(encoding="utf-8")
+        self.assertIn(f"{self.S1} build/reports/FIXA.md; {self.S2} (no lane report)", text)
 
     def test_stack_neg_unproven_history_refuses_the_report_less_commit(self):
         X = "c" * 40

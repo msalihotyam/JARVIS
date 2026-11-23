@@ -4973,14 +4973,19 @@ class Conveyor:
         return main, sorted(union)
 
     def names_commit(self, text, x):
-        """CHAINSTACK1: the report's single COMMIT line names x in full, or by an abbreviation git resolves to x."""
+        """CHAINSTACK1: the report's single COMMIT line names x in full, or by an abbreviation git resolves to x.
+        CHAINSTACK1FIX: None when it holds an abbreviation of x that git cannot resolve to one commit (an error)."""
         tok = chain_commit_token(text)
         if tok == x:
             return True
         if not tok or not re.fullmatch(r"[0-9a-f]{4,39}", tok) or not x.startswith(tok):
             return False
         rc, out = self.cmd([*GIT_PIN, "rev-parse", "--verify", "--quiet", f"{tok}^{{commit}}"])
-        return rc == 0 and out.strip() == x
+        if rc not in (0, 1):  # as chain_verify: a broken git defers the pass, it does not refuse the chain
+            raise RuntimeError(f"commit {tok} unreadable (git rc {rc})")
+        if rc or not SHA_RE.fullmatch(out.strip()):  # unknown or ambiguous (--quiet gives rc 1)
+            return None
+        return out.strip() == x
 
     def stack_proven(self, rb, stack, sha):
         """CHAINSTACK1: git shows review_base..sha is exactly the stack then sha, in order, each with the one before
@@ -5061,9 +5066,12 @@ class Conveyor:
             else:
                 refs, proven = [], None
                 for x in stack:  # fail-closed: one non-chain lane report names each stacked commit, or git proves the stack
-                    hit = [n for n, o in lanes.items() if o.get("report") and not (
-                        INT_RE.match(n) or re.match(r"(?i)clrev|cdx", n) or CHAIN_SUFFIX_RE.search(n))
-                        and self.names_commit(chain_report(o), x)]
+                    named = {n: self.names_commit(chain_report(o), x) for n, o in lanes.items() if o.get("report") and not (
+                        INT_RE.match(n) or re.match(r"(?i)clrev|cdx", n) or CHAIN_SUFFIX_RE.search(n))}
+                    bad = [n for n, v in named.items() if v is None]
+                    if bad:  # CHAINSTACK1FIX: an unresolvable abbreviation is this report's error, never "names nothing"
+                        return f"build/reports/{bad[0]}.md COMMIT abbreviation of {x[:7]} does not resolve"
+                    hit = [n for n, v in named.items() if v]
                     if not hit and proven is None:
                         proven = self.stack_proven(s["review_base"], stack, sha)
                     if len(hit) > 1 or not (hit or proven):
