@@ -422,24 +422,30 @@ def write_key1(approvals, sha, ci, lane, by, checks, reason=None, now=None):
 def key1_refusal(path, name=None):
     """-> None when the approval file at path is a valid key 1 for its own name (or name: a done/ file's
     unstamped name), else the reason."""
+    return key1_validated(path, name)[0]
+
+
+def key1_validated(path, name=None):
+    """-> (refusal, header match) from ONE read: (None, match) for a valid key 1, else (reason, None).
+    KEY1PATH1FIX3: readers that classify a key 1 use this match, so validation and side never diverge."""
     m = APPROVAL_RE.fullmatch(name or Path(path).name)
     if not m or len(m.group(1)) != 40 or not m.group(2):
-        return "approval name is not push-<sha40>-<ci>"
+        return "approval name is not push-<sha40>-<ci>", None
     try:
         with open(path, "rb") as f:
             raw = f.read(1024)
         first, nl, _ = raw.partition(b"\n")
         first = first.decode("ascii").rstrip("\r")
     except (OSError, UnicodeDecodeError) as e:
-        return f"approval unreadable or not ascii: {type(e).__name__}"
+        return f"approval unreadable or not ascii: {type(e).__name__}", None
     if not nl and len(raw) == 1024:  # the whole first line is validated, never a prefix of it
-        return "first line too long for a KEY1 v1 header"
+        return "first line too long for a KEY1 v1 header", None
     h = KEY1_HEADER_RE.fullmatch(first)
     if not h:
-        return "first line is not a KEY1 v1 header (only key1_check --write makes key 1)"
+        return "first line is not a KEY1 v1 header (only key1_check --write makes key 1)", None
     if h["sha"] != m.group(1) or h["ci"] != f"ci/{m.group(2)}":
-        return f"header sha/ci {h['sha'][:7]} {h['ci']} do not match the file name"
-    return None
+        return f"header sha/ci {h['sha'][:7]} {h['ci']} do not match the file name", None
+    return None, h
 
 
 def settings_refusal(root):

@@ -54,12 +54,16 @@ class BotCase(unittest.TestCase):
         p.write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
         return p
 
-    def key1(self, name, body="", d="build/approvals", base=None):
-        """KEY1PATH1FIX2: a valid key 1 at d/name for base or name (push-<sha40>-<ci>), body after the header."""
+    def key1(self, name, d="build/approvals", base=None, by="key1_check", reason=None):
+        """KEY1PATH1FIX3: a real write_key1 file for base or name (push-<sha40>-<ci>), moved to d/name as a
+        push (done/) or a forger (mismatched name) would; the writer writes the header only."""
         m = orchbot.cv.APPROVAL_RE.fullmatch(base or name)
-        h = orchbot.cv.key1_header(sha=m.group(1), ci=f"ci/{m.group(2)}", lane=m.group(2), by="key1_check",
-                                   checks=("approval-for",), now=0)
-        return self.put(f"{d}/{name}", h + "\n" + body)
+        p = orchbot.cv.write_key1(self.root / "keys", m.group(1), f"ci/{m.group(2)}", m.group(2), by,
+                                  ("approval-for",), reason, now=0)
+        dest = self.root / d / name
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(p, dest)
+        return dest
 
     def events(self, *evs):
         with open(self.conv / "events.jsonl", "a", encoding="utf-8") as f:
@@ -537,8 +541,11 @@ class AgreementTest(BotCase):
                      "result": "success"})
         self.assertEqual(self.acts(self.run_bot()), [("write_key1", "O26", "L1")])  # pending at 11:00, baseline
 
-    def approve(self, at, text="approved", name=f"push-{SHA}-L1", valid=True):
-        p = self.key1(name, text) if valid else self.put(f"build/approvals/{name}", text)
+    def approve(self, at, by="key1_check", reason=None, name=f"push-{SHA}-L1", valid=True, tail=""):
+        p = self.key1(name, by=by, reason=reason) if valid else self.put(f"build/approvals/{name}", "approved")
+        if tail:  # bytes appended after a real header: never the writer's, must not change the side
+            with open(p, "a", encoding="ascii") as f:
+                f.write(tail)
         os.utime(p, (ts(at), ts(at)))
 
     def seed(self, agreement):
@@ -572,7 +579,7 @@ class AgreementTest(BotCase):
                          {k: ag[k] for k in ("totals", "rules", "key1", "recent")})
 
     def test_disagree_keeps_both_sides(self):
-        self.approve("2026-10-15T11:30:00", "approved by salih")
+        self.approve("2026-10-15T11:30:00", "manual", "approved by salih")
         self.clock.set("2026-10-15T12:05:00")
         self.run_bot()
         self.assertEqual(self.kinds(), ["disagree"])
@@ -700,26 +707,61 @@ class AgreementTest(BotCase):
                 ag = self.shadow()["agreement"]
                 self.assertEqual((ag["version"], ag["key1"]), (orchbot.AGREE_VERSION, {"agree": 0, "total": 0}))
 
-    def key1_after(self, text):
-        self.approve("2026-10-15T11:30:00", text)
+    def key1_after(self, by="key1_check", reason=None, tail="", name=f"push-{SHA}-L1"):
+        self.approve("2026-10-15T11:30:00", by, reason, name, tail=tail)
         self.clock.set("2026-10-15T12:05:00")
         self.run_bot()
         ag = self.shadow()["agreement"]
         return ag["classes"], ag["key1"]
 
     def test_conveyor_auto_approval_stays_out_of_graduation(self):
-        self.assertEqual(self.key1_after("auto-approved by the conveyor"),
+        self.assertEqual(self.key1_after("conveyor"),  # KEY1PATH1FIX3: the real by=conveyor file, header only
                          ({"key1_conveyor": {"agree": 1}}, {"agree": 0, "total": 0}))
 
+    def test_key1_check_approval_is_an_orchestrator_key1(self):  # KEY1PATH1FIX3
+        self.assertEqual(self.key1_after(), ({"key1_orch": {"agree": 1}}, {"agree": 1, "total": 1}))
+
+    def test_manual_approval_with_a_plain_reason_is_an_orchestrator_key1(self):  # KEY1PATH1FIX3
+        self.assertEqual(self.key1_after("manual", "checked by hand"),
+                         ({"key1_orch": {"agree": 1}}, {"agree": 1, "total": 1}))
+
+    def test_appended_text_never_changes_the_header_side(self):  # KEY1PATH1FIX3 negative
+        self.assertEqual(self.key1_after("conveyor", tail="approved by salih\n"),
+                         ({"key1_conveyor": {"agree": 1}}, {"agree": 0, "total": 0}))
+
+    def test_appended_conveyor_text_never_hides_an_orchestrator_key1(self):  # KEY1PATH1FIX3 negative
+        self.assertEqual(self.key1_after(tail="auto-approved by the conveyor under O42 pre-approval\n"),
+                         ({"key1_orch": {"agree": 1}}, {"agree": 1, "total": 1}))
+
+    def test_key1_side_refuses_what_the_push_gate_refuses(self):  # KEY1PATH1FIX3 negative: one validated read
+        other = f"push-{'b' * 40}-L1"
+        p = self.key1(f"push-{SHA}-L1", base=other)  # a real header for another sha, as if replaced after key1_ok
+        self.assertIsNone(orchbot.key1_side(p, p.name))
+        p.write_bytes(b"x" * 1024)  # no newline in 1024 bytes: never a prefix of a header
+        self.assertIsNone(orchbot.key1_side(p, p.name))
+        good = self.key1(other)
+        self.assertEqual(orchbot.key1_side(good, good.name)[:2], ("write_key1", "orchestrator"))
+        self.assertIsNone(orchbot.key1_side(good, good.name + ".refused"))
+        good.unlink()  # gone mid-pass: skipped, never raised
+        self.assertIsNone(orchbot.key1_side(good, good.name))
+
+    def test_header_over_512_bytes_is_still_classified(self):  # KEY1PATH1FIX3 negative: key1_ok reads 1024
+        lane = "L" * 140
+        self.key1_after("manual", "approved under O42 pre-approval", name=f"push-{SHA}-{lane}")
+        self.assertIn(("write_key1", "conveyor"), [(a["action"], a["side"]) for a in
+                                                   self.shadow()["agreement"]["actual"] if lane.lower() in a["key"]])
+
     def test_o42_pre_approval_stays_out_of_graduation(self):
-        self.assertEqual(self.key1_after("approved under O42 pre-approval"),
+        self.assertEqual(self.key1_after("manual", "approved under O42 pre-approval"),
                          ({"key1_conveyor": {"agree": 1}}, {"agree": 0, "total": 0}))
 
     def test_salih_chat_approval_is_ask_salih(self):
-        self.assertEqual(self.key1_after("salih onay verdi"), ({"key1_orch": {"disagree": 1}}, {"agree": 0, "total": 1}))
+        self.assertEqual(self.key1_after("manual", "salih onay verdi"),
+                         ({"key1_orch": {"disagree": 1}}, {"agree": 0, "total": 1}))
 
     def test_manual_key1_is_ask_salih(self):
-        self.assertEqual(self.key1_after("manual key 1 in chat"), ({"key1_orch": {"disagree": 1}}, {"agree": 0, "total": 1}))
+        self.assertEqual(self.key1_after("manual", "Manual Key 1 in chat"),
+                         ({"key1_orch": {"disagree": 1}}, {"agree": 0, "total": 1}))
 
     def test_windows_by_key(self):
         h = orchbot.horizon
@@ -803,7 +845,7 @@ class AgreementTest(BotCase):
         self.assertEqual([(v["verdict"], v["key"]) for v in self.verdicts()], [("disagree", "ask:q1")])
 
     def test_salih_decision_is_a_real_ask(self):  # BOTFIX3D M2
-        self.approve("2026-10-15T11:30:00", "approved by salih")
+        self.approve("2026-10-15T11:30:00", "manual", "approved by salih")
         self.clock.set("2026-10-15T12:05:00")
         self.run_bot()
         self.assertIn(("ask:key1:l1", "salih"), [(a["key"], a["side"]) for a in self.shadow()["agreement"]["actual"]])
@@ -956,7 +998,7 @@ class FactsTest(BotCase):
         self.report("OLD", f"STATUS: BLOCKED\nCOMMIT: {SHA2}\n", "2026-10-15T09:00:00")
         self.report("NEW", f"STATUS: PASS\nBRANCH: new\nCOMMIT: {SHA}\nCANDIDATE SHA: {SHA2}\nCI BRANCH: ci/new\n",
                     "2026-10-15T10:00:00")
-        self.key1(f"push-{SHA}-botfacts", "ok")
+        self.key1(f"push-{SHA}-botfacts")
         self.put(f"build/approvals/done/push-{SHA2[:12]}", "ok")
         self.put(".git/refs/heads/main", SHA + "\n")
         self.put(".git/packed-refs", f"# pack-refs with: peeled\n{SHA2} refs/remotes/origin/main\n")

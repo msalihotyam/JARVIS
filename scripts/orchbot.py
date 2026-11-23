@@ -194,6 +194,24 @@ def key1_ok(path, name=None):
     return not name.endswith(".refused") and cv.key1_refusal(path, name) is None
 
 
+def key1_side(path, name):
+    """KEY1PATH1FIX3: (action, side, header) of a key 1 from the header the push gate validates, in the same
+    read; write_key1 writes no body, so appended text never counts. None if it is no valid key 1 (now)."""
+    if name.endswith(".refused"):
+        return None
+    why, h = cv.key1_validated(path, name)
+    if why:
+        return None
+    first = h.group(0)
+    if h["by"]:
+        return "write_key1", "conveyor" if h["by"] == "conveyor" else "orchestrator", first
+    # DECISION TAKEN: by=manual classifies on its header reason, the only free text the writer produces
+    # (alternative: the body); an O42 pre-approval is conveyor-side, outside key-1 graduation
+    if PRE_RE.search(h["reason"]):
+        return "write_key1", "conveyor", first
+    return "ask_salih_key1" if SALIH_RE.search(h["reason"]) else "write_key1", "orchestrator", first
+
+
 def clean(line):
     """One facts.md line with no secret: cv.redacted (sk-ant-, the ntfy topic) then SECRET_RES."""
     line = cv.redacted(line, "", 400)
@@ -1405,23 +1423,15 @@ class Bot:
                 approvals.add(ident)
                 if ident in known["approvals"] or first:
                     continue
-                try:
-                    with open(path, encoding="utf-8", errors="replace") as f:
-                        text = f.read(512)
-                except FileNotFoundError:  # moved into done/ mid-pass: seen there, or next pass
+                got = key1_side(path, name)  # KEY1PATH1FIX3: the side is the validated header's, never a body
+                if got is None:  # moved into done/ mid-pass, unreadable, or replaced since key1_ok: next pass
                     approvals.discard(ident)
                     continue
-                text = text.partition("\n")[2]  # KEY1PATH1FIX2: key1_ok validated line 1; classify the body
-                key = agree_key("write_key1", name)
-                # DECISION TAKEN: an O42 pre-approval is conveyor-side, outside key-1 graduation (alternative: skip it)
-                if text.startswith("auto-approved by the conveyor") or PRE_RE.search(text):
-                    act(mt, "write_key1", key, "conveyor", f"{raw}: {text}")
-                elif SALIH_RE.search(text):
-                    act(mt, "ask_salih_key1", key, "orchestrator", f"{raw}: {text}")
-                    if key.split("@")[0] != "key1:":  # BOTFIX3D: Salih's decision is a real key-1 ask, closed
-                        act(mt, "none", "ask:" + key.split("@")[0], "salih", f"{raw}: {text}")
-                else:
-                    act(mt, "write_key1", key, "orchestrator", f"{raw}: {text}")
+                action, side, header = got
+                key, what = agree_key("write_key1", name), f"{raw}: {header}"
+                act(mt, action, key, side, what)
+                if action == "ask_salih_key1" and key.split("@")[0] != "key1:":  # BOTFIX3D: a real key-1 ask, closed
+                    act(mt, "none", "ask:" + key.split("@")[0], "salih", what)
         slices = self.backlog.get("slices")
         ids = sorted({str(s.get("id")) for s in slices if isinstance(s, dict) and s.get("id")}) \
             if isinstance(slices, list) else known["backlog"]
