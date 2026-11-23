@@ -138,10 +138,9 @@ def verify(lane, root, git, gh, operator_tool=False, rep=None):
     for s in pick_shas:
         touched |= set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames", s])[1].split())
     # U1RULE1 (Salih 11-22): a T1 source whose diff and backlog files are product code sends MINOR/NIT to POLISH.md;
-    # build/reports/ is dropped as conveyor.chain_verify drops it; a name chain_verify would refuse (unsafe charset,
-    # ".." anywhere) is kept, so "build/" in GRANT_DENY keeps the chain strict
-    pf = sorted(p for p in touched | set(allowed) if not (
-        p.startswith("build/reports/") and conveyor.CHAIN_NAME_RE.fullmatch(p) and ".." not in p))
+    # only a report build/reports/<NAME>.md is dropped, by the same conveyor.chain_report_file chain_verify uses;
+    # anything else under build/reports/ is kept, so "build/" in GRANT_DENY keeps the chain strict
+    pf = sorted(p for p in touched | set(allowed) if not conveyor.chain_report_file(p))
     polish_ok = bool(srcs) and not any(conveyor.chain_strict(slices.get(s, {}).get("tier"), pf) for s in srcs)
 
     # 3: every review report passes the conveyor's own chain gate (STATUS PASS, exactly one "FINDINGS: none", no finding line);

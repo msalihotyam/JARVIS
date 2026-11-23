@@ -462,6 +462,15 @@ SHA_RE = re.compile(r"[0-9a-f]{40}")
 CHAIN_GOOD = GOOD - {"GREEN"}  # CONVCHAIN1: a lane's own finish; GREEN is an INT's CI verdict
 CHAIN_COMMIT_RE = re.compile(r"(?m)^[ \t]*COMMIT:(.*)$")  # anchored: "FIX COMMIT:" does not count
 CHAIN_NAME_RE = re.compile(r"[A-Za-z0-9._/-]+")  # CONVCHAIN1FIXA: the only file names a generated prompt may carry
+
+
+def chain_report_file(p):
+    """U1RULE1FIX2: only a report build/reports/<NAME>.md is outside the chain's file checks (chain_verify and key1_check
+    polish_ok share this); a nested or non-.md path under build/reports/ is counted like any other file."""
+    return (bool(re.fullmatch(r"build/reports/[^/]+\.md", p) and CHAIN_NAME_RE.fullmatch(p)) and ".." not in p
+            and not protected_path(p))
+
+
 # CONVCHAIN1FIXD: a review qualifies by exact machine lines only, prose is ignored: the orchestrator's key 1 is the check on it
 CHAIN_FINDING_RE = re.compile(r"[\s\-*|#>]*(?:F\d+|BLOCKER|MAJOR|MINOR|NIT|HIGH|CRITICAL|MEDIUM|LOW|P[0-3])s?(?:[:\s|\-*]|$)", re.I)
 CHAIN_CODEX_RE = re.compile(r"CODEX RUN: rc=0 calls=[12]")  # the marker chain_templates/CDX.md mandates
@@ -4926,7 +4935,7 @@ class Conveyor:
             names = [p for p in out.split("\0") if p]
             if any(not CHAIN_NAME_RE.fullmatch(p) or ".." in p for p in names):  # checked before the exclusion
                 return None, f"{c[:7]} changes an unsafe file name"
-            files = sorted(p for p in names if not p.startswith("build/reports/"))
+            files = sorted(p for p in names if not chain_report_file(p))
             outside = [p for p in files if not any(
                 p == g or (p.count("/") == g.count("/") and fnmatch.fnmatchcase(p, g)) for g in s.get("files", []))]
             if outside:
@@ -5041,11 +5050,12 @@ class Conveyor:
             pol = self.root / "build" / "orch" / "POLISH.md"
             try:
                 pol.parent.mkdir(parents=True, exist_ok=True)
-                have = set(pol.read_text(encoding="utf-8").splitlines()) if pol.exists() else set()
+                old = pol.read_text(encoding="utf-8") if pol.exists() else ""
+                have = set(old.splitlines())
                 add = [y for y in dict.fromkeys(f"- {src} | {d} | {x}" for d, x in polish) if y not in have]
-                if add:
+                if add:  # U1RULE1FIX2: a hand-edited file without a final newline must not swallow the first entry
                     with pol.open("a", encoding="utf-8") as f:
-                        f.write("".join(y + "\n" for y in add))
+                        f.write(("\n" if old and not old.endswith(("\n", "\r")) else "") + "".join(y + "\n" for y in add))
             except (OSError, UnicodeDecodeError):
                 return "build/orch/POLISH.md not writable"
         dest.parent.mkdir(parents=True, exist_ok=True)

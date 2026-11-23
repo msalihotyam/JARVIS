@@ -101,6 +101,14 @@ class FakeProcs:
 
 MAIN = "1234567" + "a" * 33  # local main (the approved sha)
 ORIGIN = "b" * 40  # origin/main, its parent
+# U1RULE1FIX2: one table for both gates (Conveyor.chain_verify here, key1_check polish_ok in tests.test_key1_check):
+# only build/reports/<NAME>.md is exempt, every other path under build/reports/ is counted
+REPORT_EXEMPT = ("build/reports/X.md", "build/reports/CDX-U1RULE1FIX.md", "build/reports/a.b_c-d.md")
+REPORT_COUNTED = ("build/reports/x/auth.py", "build/reports/a.py", "build/reports/.env", "build/reports/x/X.md",
+                  "build/reports/X.md.py", "build/reports/X.txt", "build/reports/X.MD", "build/reports/.md",
+                  "build/reports/X", "build/reports/X.md/", "build/reports//X.md", "build/reports/a..md",
+                  "build/reports/../X.md", "build/reportsX.md", "Build/Reports/X.md", "build/reports/X.md\n",
+                  "build/reports/.env.md")
 SCHEMA = "X = 1\nSCHEMA_VERSION = 10\n"
 # powercfg /getactivescheme answers (GUIDs from LaptopControl PowerProfileApplyService.cs)
 BAG_ACTIVE = "Power Scheme GUID: 9b1e4f52-2c7d-4a8e-b6f3-1d0a7c55b205  (LaptopControl - Çanta)"
@@ -9458,6 +9466,24 @@ class TestChain(AutopilotBase):
                 self.assertIn("unsafe file name", why)
                 self.assertNotIn(name, why)
 
+    def test_u1rule1fix2_only_a_report_md_is_exempt_from_the_grant(self):
+        self.git.fail[self.PIN + ("rev-list",)] = (0, f"{self.SHA} {MAIN}\n")
+        for p in REPORT_EXEMPT:
+            with self.subTest(p=p):
+                self.assertTrue(conveyor.chain_report_file(p))
+                self.commit(files=("scripts/a.py", p))
+                self.assertEqual(self.c.chain_verify({"files": ["scripts/a.py"]}, {"base": MAIN}, self.SHA),
+                                 (ORIGIN, ["scripts/a.py"]))
+        for p in REPORT_COUNTED:
+            with self.subTest(p=p):
+                self.assertFalse(conveyor.chain_report_file(p))
+                if not conveyor.CHAIN_NAME_RE.fullmatch(p) or ".." in p:
+                    continue  # refused earlier as an unsafe name (test_unsafe_file_name_refused_even_under_a_glob_grant)
+                self.commit(files=("scripts/a.py", p))
+                main, why = self.c.chain_verify({"files": ["scripts/a.py"]}, {"base": MAIN}, self.SHA)
+                self.assertIsNone(main)
+                self.assertIn("files outside the grant", why)
+
     def test_unsafe_report_path_refused_in_the_pass(self):
         self.commit(files=("scripts/a.py", "build/reports/x y.md"))
         self.start()
@@ -9980,6 +10006,16 @@ class TestChain(AutopilotBase):
         self.assertEqual(self.polish(), want)
         self.u1(("jarvis/x.py",), self.MINOR)  # a later pass re-reads the same report: no duplicate line
         self.assertEqual(self.polish(), want)
+
+    def test_u1rule1fix2_polish_append_after_a_file_without_final_newline(self):
+        p = self.root / "build" / "orch" / "POLISH.md"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text("# polish\n- hand edited", encoding="utf-8")
+        for _ in range(2):  # the retry re-reads the same report: still one entry each
+            self.assertIsNone(self.u1(("jarvis/x.py",), self.MINOR)[0])
+        self.assertEqual(self.polish(), ["# polish", "- hand edited",
+                                         "- SRC | CLREV-SRC | F1 MINOR: jarvis/x.py:3 - nit - fix",
+                                         "- SRC | CLREV-SRC | F2 NIT: jarvis/x.py:4 - style"])
 
     def test_u1rule1_t1_protected_security_or_core_minor_stops(self):
         for files in (("scripts/a.py",), ("jarvis/auth.py",), ("jarvis/x.py", "scripts/conveyor.py"),

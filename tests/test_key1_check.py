@@ -187,6 +187,23 @@ class Key1CheckTests(unittest.TestCase):
                 self.assertFalse(ok, text)
                 self.assertIn("FAIL 3", text)
 
+    def test_u1rule1fix2_same_report_table_as_chain_verify(self):
+        """U1RULE1FIX2: polish_ok drops exactly what chain_verify drops: build/reports/<NAME>.md, nothing nested."""
+        from tests.test_conveyor import REPORT_COUNTED, REPORT_EXEMPT
+        minor = "1\nF1 MINOR: a.txt:1 - nit - fix"
+        for p in REPORT_EXEMPT:
+            with self.subTest(p=p):
+                self.assertTrue(k1.conveyor.chain_report_file(p))
+                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", files=("a.txt", p)))
+                self.assertTrue(ok, text)
+                self.assertIn("WARN 3", text)
+        for p in REPORT_COUNTED:
+            with self.subTest(p=p):
+                self.assertFalse(k1.conveyor.chain_report_file(p))
+                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", files=("a.txt", p)))
+                self.assertFalse(ok, text)
+                self.assertIn("FAIL 3", text)
+
     def test_u1rule1_strict_classes_and_major_still_fail(self):
         minor = "1\nF1 MINOR: a.txt:1 - nit - fix"
         for kw in ({"tier": "T2"}, {}, {"tier": "T1", "src_file": "scripts/x.py", "files": ("a.txt", "scripts/x.py")},
