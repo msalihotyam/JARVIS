@@ -2040,6 +2040,32 @@ class AllowlistT1T5Test(BotCase):
                      "TEST WEAKENING: no", "TEST WEAKENING: -", "STATUS: PASS\nCHANGED ASSERTS: none"):
             self.assertIsNone(orchbot.WEAK_RE.search(text), repr(text))
 
+    def test_t1_weak_re_flags_decorated_labels(self):  # FIX4 F1: emphasis and list markers around the label
+        for text in ("__TEST WEAKENING__: x", "_TEST WEAKENING_: x", "1. **TEST WEAKENING**: x",
+                     "2) __TEST WEAKENING__: x", "- 1. `TEST WEAKENING`: x", "1.2. TEST WEAKENING: x",
+                     "a) TEST WEAKENING: x", "iv. TEST WEAKENING: x", "*TEST WEAKENING*: x", "***TEST WEAKENING***",
+                     "TEST** **WEAKENING: x", "TEST WEAKENING: x", "​TEST​WEAKENING: x",
+                     "TESTS WEAKENED: 2 asserts", "TEST WEAKEN: x", "__TEST WEAKENING__: none",
+                     "1. **TEST WEAKENING:** none", "**CHANGED ASSERTS**: removed one", "__CHANGED ASSERTS__: relaxed",
+                     "CHANGED ASSERTS: __removed__ one", "1. **CHANGED ASSERTS:** loosened a bound",
+                     # F2 probe: labels/words before the keyword, review finding lines, markup inside the word
+                     "F1 MAJOR: tests/test_x.py:40 test weakened: assertEqual replaced by assertTrue",
+                     "RISK: test weakening in test_foo", "<b>TEST WEAKENING</b>: removed", "| T1 | TEST WEAKENING | yes |",
+                     "Q3. TEST WEAKENING: yes", "xviii. TEST WEAKENING: yes", "TESTS: 41 OK, 2 asserts weakened",
+                     "Weakened tests: 2 asserts", "ASSERTS CHANGED: 2 removed", "CHANGED ASSERTIONS: 2 removed",
+                     "CHANGED TEST ASSERTS: 2 dropped", "CHANGED ASSERTS: assertIn (looser)", "CHANGED ASSERTS: 3 commented out",
+                     "TEST WEAK**ENING**: yes", "TEST WEAK​ENING: yes", "TеST WEAKENING: yes",
+                     "TEST WEAKENING: nоne", "x\nTEST WEAKENING: none, but one relaxed"):
+            self.assertTrue(orchbot.WEAK_RE.search(text), repr(text))
+        for text in ("- 1. TEST WEAKENING: none", "a) TEST WEAKENING: no", "_ TEST WEAKENING: 0",
+                     "TESTS WEAKENED: none", "1. CHANGED ASSERTS: none", "STATUS: PASS\nRUNS: 3 tests"):
+            self.assertIsNone(orchbot.WEAK_RE.search(text), repr(text))
+
+    def test_t1_decorated_weakening_never_auto_key1(self):  # FIX4 F1: the hands path, not only the regex
+        self.key1_lane("L1", ["jarvis/a.py"])
+        self.put("build/reports/L1.md", "STATUS: PASS\n1. **TEST WEAKENING**: removed an assert in test_a\n")
+        self.assertEqual(self.acts(self.run_bot()), [("ask_salih_key1", "ALLOW-T1", "L1")])
+
     def test_t1_empty_weakening_heading_never_auto_key1(self):
         self.key1_lane("L1", ["jarvis/a.py"])
         self.put("build/reports/L1.md", "STATUS: PASS\nTEST WEAKENING:\n  - removed an assert in test_a\n")

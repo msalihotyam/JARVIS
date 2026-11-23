@@ -65,9 +65,14 @@ T1_RE = re.compile(r"(^|/)(conftest[^/]*\.py|pytest\.ini|tox\.ini|setup\.cfg|pyp
                    r"|route\.py|test\.ps1|test_parallel\.py)$|(^|/)(tests/)?fixtures?/|quarantine|test[_-]?ids?\b"
                    r"|allowlist")
 # a report flags test weakening: a TEST WEAKENING line (unless its value is exactly none/no/0/-; an empty
-# value is a heading with details below) or CHANGED ASSERTS naming a weakening
-WEAK_RE = re.compile(r"(?im)^[^\w\n]*(?:\d+[.)][ \t]*)?(?:test[-_ \t]*weakenings?\b(?![ \t]*:[ \t]*(?:none|no|0|-)[ \t.]*$)"
-                     r"|CHANGED ASSERTS:.*\b(?:weaken|remov|delet|relax|loosen|skip|disabl))")
+# value is a heading with details below) or CHANGED ASSERTS naming a weakening. Fail closed: any line holding
+# "weak" anywhere (review finding lines, tables, HTML, in-word markup) is flagged unless the whole line is a clean
+# TEST WEAKENING label; any line naming an assert and a removal verb, in either order, is flagged
+_WEAK_CLEAN = (r"(?:[^\w\n]|[\d_]|[a-z]{1,4}[.)])*tests?(?:[^\w\n]|_)*weaken[a-z0-9]*[ \t]*:[ \t]*"
+               r"(?:none|no|0|-)[ \t.]*$")
+WEAK_RE = re.compile(r"(?im)^(?!" + _WEAK_CLEAN + r")[^\n]*weak"
+                     r"|^(?=[^\n]*assert)[^\n]*(?<![a-z0-9])(?:remov|delet|relax|loose|skip|disabl|drop|comment|replac"
+                     r"|xfail|fewer|downgrad)")
 REVIEWER_RE = re.compile(r"(?im)^[ \t]*(?:reviewer|worker):[ \t]*(.+)$")
 SEC_RE = re.compile(r"(?i)secur|critical|secret|credential|breach|leak|incident")  # T5: never auto-acked
 DAILY_CAP = {"queue_fix_slice": 6, "page_salih": 3,  # T5: per-code daily caps (items 2 and 9)
