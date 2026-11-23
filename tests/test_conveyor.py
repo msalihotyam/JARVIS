@@ -5310,6 +5310,13 @@ class TestPushGate(Base):
     def spellings(rel):
         return (rel, "./" + rel, "C:/dev/JARVIS/" + rel, "C:\\dev\\JARVIS\\" + rel.replace("/", "\\"))
 
+    @classmethod
+    def bash_spellings(cls, rel):  # DENYRULES1FIX: mixed slashes and the escaped backslash of a Python/JSON literal
+        head, _, tail = rel.rpartition("/")
+        return cls.spellings(rel) + (rel.replace("/", "\\", 1), head + "\\" + tail, rel.replace("/", "\\\\"),
+                                     rel.replace("/", "\\\\", 1), "C:\\\\dev\\\\JARVIS\\\\" + rel.replace("/", "\\\\"),
+                                     head.replace("/", "\\") + "/" + tail)
+
     def test_control_path_denies_match_every_spelling_not_the_report(self):  # DENYRULES1 B1b
         import fnmatch
         bash = [d[5:-1] for d in conveyor.REQUIRED_DENY if d.startswith("Bash(")]
@@ -5323,17 +5330,20 @@ class TestPushGate(Base):
             return any(fnmatch.fnmatchcase(path, g) for g in globs[tool])
         for p in conveyor.CONTROL_PATHS:
             rel = p.removesuffix("/**") + ("/sub/x.md" if p.endswith("/**") else "")
-            for path in self.spellings(rel):
-                for cmd in (f"echo x > {path}", f"cp a.md {path}", f'python -c "open(r\'{path}\', \'w\')"'):
+            for path in self.bash_spellings(rel):
+                for cmd in (f"echo x > {path}", f"cp a.md {path}", f'python -c "open(r\'{path}\', \'w\')"',
+                            f'python -c "open(\'{path}\', \'w\')"'):
                     with self.subTest(denied=cmd):
                         self.assertTrue(bash_hit(cmd), cmd)
+            for path in self.spellings(rel):
                 for tool in ("Write", "Edit"):
                     with self.subTest(tool=tool, path=path):
                         self.assertTrue(tool_hit(tool, path), (tool, path))
-        for path in self.spellings("build/reports/DENYRULES1.md"):  # the lane's own report stays writable
+        for path in self.spellings("build/reports/DENYRULES1FIX.md"):  # the lane's own report stays writable
             for tool in ("Write", "Edit"):
                 with self.subTest(tool=tool, report=path):
                     self.assertFalse(tool_hit(tool, path), (tool, path))
+        for path in self.bash_spellings("build/reports/DENYRULES1FIX.md"):
             for cmd in (f"cat {path}", f"echo x > {path}", f"git add {path}"):
                 with self.subTest(report_cmd=cmd):
                     self.assertFalse(bash_hit(cmd), cmd)
@@ -5344,12 +5354,13 @@ class TestPushGate(Base):
         self.assertFalse(tool_hit("Write", "build/conveyor/lanes.json"))  # never the bare lanes stem
 
     def test_dispatch_refused_for_settings_missing_any_control_deny(self):  # DENYRULES1 B1b
-        new = [d for d in conveyor.REQUIRED_DENY if any(p.removesuffix("/**") in d.replace("\\", "/")
+        new = [d for d in conveyor.REQUIRED_DENY if any(p.removesuffix("/**") in re.sub(r"[\\/]+", "/", d)
                                                       for p in conveyor.CONTROL_PATHS if "approvals" not in p)]
-        self.assertEqual(len(new), 7 * 6)
-        for d in ("Write(**/build/approvals/**)", "Edit(**/build/approvals/**)"):
+        self.assertEqual(len(new), 6 * (4 + 9) + (4 + 3))  # 3-segment paths: 9 Bash stem spellings; build/orch: 3
+        appr = ["Write(**/build/approvals/**)", "Edit(**/build/approvals/**)", "Bash(*build" + "\\" * 2 + "approvals*)"]
+        for d in appr:
             self.assertIn(d, conveyor.REQUIRED_DENY)
-        for entry in new + ["Write(**/build/approvals/**)", "Edit(**/build/approvals/**)"]:
+        for entry in new + appr:
             with self.subTest(missing=entry):
                 write_settings(self.root, tuple(d for d in conveyor.REQUIRED_DENY if d != entry))
                 self.assertIn(repr(entry), conveyor.settings_refusal(self.root) or "")
@@ -9162,36 +9173,16 @@ class TestChain(AutopilotBase):
                 self.finish(f"S{status[0]}", status, extra=self.PICK)
                 self.nothing()
 
-    def test_unexplained_control_file_change_refuses_the_chain(self):  # DENYRULES1 B1b
-        for case in ("new orch file", "backlog touched", "no baseline"):
-            with self.subTest(case=case):
-                self.tearDown()
-                self.setUp()
-                self.start()
-                if case == "new orch file":
-                    (self.root / "build" / "orch").mkdir(parents=True, exist_ok=True)
-                    (self.root / "build" / "orch" / "forged.md").write_text("x", encoding="utf-8")
-                elif case == "backlog touched":
-                    f = self.base / "backlog.json"
-                    os.utime(f, ns=(f.stat().st_atime_ns, f.stat().st_mtime_ns + 10 ** 9))
-                else:
-                    self.c.control_snap.clear()
-                    lanes = self.lanes()
-                    lanes["SRC"].pop("control_digest")
-                    (self.base / "lanes.json").write_text(json.dumps(lanes), encoding="utf-8")
-                self.finish("SRC", "PASS", extra=self.PICK)
-                frag = {"new orch file": "build/orch/forged.md", "backlog touched": "build/conveyor/backlog.json",
-                        "no baseline": "no control-file baseline"}[case]
-                self.refused(frag)
-                self.assertIn(frag, self.lanes()["SRC"]["chain_refused"])
-                self.assertEqual(self.ev("chain"), [])
-
-    def test_conveyor_own_control_writes_do_not_refuse_the_chain(self):  # DENYRULES1 B1b
+    def test_control_file_writes_beside_a_lane_do_not_refuse_its_chain(self):  # DENYRULES1FIX: watch withdrawn
         self.start()
-        self.c.write_atomic(self.base / "pace.json", json.dumps(conveyor.PACE_DEFAULTS))
-        self.assertIn("control_digest", self.lanes()["SRC"])
+        (self.root / "build" / "orch").mkdir(parents=True, exist_ok=True)
+        (self.root / "build" / "orch" / "hb_watch_last").write_text("x", encoding="utf-8")  # Pano's 5-minute write
+        f = self.base / "backlog.json"
+        os.utime(f, ns=(f.stat().st_atime_ns, f.stat().st_mtime_ns + 10 ** 9))
         self.finish("SRC", "PASS", extra=self.PICK)
-        self.assertNotIn("control files", json.dumps(self.ev("chain_refused")))
+        self.assertNotIn("control_digest", self.lanes()["SRC"])
+        self.assertNotIn("chain_refused", self.lanes()["SRC"])
+        self.assertEqual(self.ev("chain_refused"), [])
 
     def test_green_is_not_good(self):
         self.start()

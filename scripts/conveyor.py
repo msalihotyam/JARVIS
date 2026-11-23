@@ -21,6 +21,7 @@ import calendar
 import contextlib
 import fnmatch
 import hashlib
+import itertools
 import json
 import math
 import os
@@ -382,12 +383,21 @@ REQUIRED_DENY = ("Write(build/approvals/**)", "Edit(build/approvals/**)",
 CONTROL_PATHS = ("build/conveyor/backlog.json", "build/conveyor/pace.json", "build/conveyor/lanes.settings.json",
                  "build/conveyor/ack/**", "build/conveyor/prompts/**", "build/conveyor/notes/**",
                  "build/orch/**", "build/approvals/**")
-# Write/Edit plain and **/-anchored (absolute and worktree spellings); Bash on the path's stem in
-# both slash forms (relative, ./, absolute all contain it). Never the bare "build/conveyor/lanes"
-# stem: lanes.json is the lanes' own read-only one-liner.
+STEM_JOINS = ("/", "\\", "\\\\")  # DENYRULES1FIX: slash, backslash, a Python/JSON-escaped backslash
+
+
+def stem_spellings(p):
+    """Every joint of the path stem as / or \\ or an escaped \\\\ (mixed too): what a Bash command can contain."""
+    parts = p.removesuffix("/**").split("/")
+    return ["".join(x for pair in zip(parts, js + ("",)) for x in pair)
+            for js in itertools.product(STEM_JOINS, repeat=len(parts) - 1)]
+
+
+# Write/Edit plain and **/-anchored (absolute and worktree spellings); Bash on every stem spelling
+# (relative, ./, absolute all contain it). Never the bare "build/conveyor/lanes" stem: lanes.json
+# is the lanes' own read-only one-liner.
 REQUIRED_DENY += tuple(dict.fromkeys(d for p in CONTROL_PATHS for d in (
-    f"Write({p})", f"Edit({p})", f"Write(**/{p})", f"Edit(**/{p})",
-    f"Bash(*{p.removesuffix('/**')}*)", "Bash(*{}*)".format(p.removesuffix("/**").replace("/", "\\")))
+    f"Write({p})", f"Edit({p})", f"Write(**/{p})", f"Edit(**/{p})", *(f"Bash(*{s}*)" for s in stem_spellings(p)))
     if d not in REQUIRED_DENY))
 
 
@@ -468,28 +478,6 @@ def settings_refusal(root):
         return f"{SETTINGS} unreadable or without permissions.deny: {type(e).__name__}"
     missing = [d for d in REQUIRED_DENY if not isinstance(deny, list) or d not in deny]
     return f"{SETTINGS} deny lacks {missing}" if missing else None
-
-
-def control_key(path):
-    return os.path.normcase(os.path.abspath(path))
-
-
-def control_state(root):
-    """DENYRULES1: {path: (mtime_ns, size)} of every file under CONTROL_PATHS right now."""
-    root, out = Path(root), {}
-    for p in CONTROL_PATHS:
-        top = root / p.removesuffix("/**")
-        walk = (Path(d) / n for d, _, ns in os.walk(top) for n in ns)  # os.walk: Path.glob is patched in tests
-        for f in (walk if p.endswith("/**") else [top]):
-            with contextlib.suppress(OSError):
-                if f.is_file():
-                    s = f.stat()
-                    out[control_key(f)] = (s.st_mtime_ns, s.st_size)
-    return out
-
-
-def control_digest(state):
-    return hashlib.sha256(json.dumps(sorted(state.items())).encode()).hexdigest()
 REQUIRED_WORKFLOWS = ("tests",)  # .github/workflows/tests.yml (runs on ci/** pushes)
 SCHEMA_LINE = "SCHEMA_VERSION = 10"  # jarvis/memory.py; rollback targets read schema 10
 SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -1417,7 +1405,6 @@ class Conveyor:
         self.net = net
         self.nudge_s = PACE_DEFAULTS["blocked_nudge_min"] * 60  # from pace.json every pass
         self.approvals = self.root / "build" / "approvals"
-        self.control_snap = {}  # DENYRULES1: lane -> control_state at dispatch, plus the conveyor's own writes
         self.push_file = self.base / "push.json"
         self.free_gb = None
         self.inbox = self.base / "inbox"
@@ -1610,40 +1597,6 @@ class Conveyor:
         self.event("state_restored", file=path.name)
         return data, None
 
-    def mine(self, *paths):
-        """DENYRULES1: the conveyor's own write to a control file is folded into every running
-        lane's baseline, so only a change nobody here made refuses a chain."""
-        tops = [(control_key(self.root / c.removesuffix("/**")), c.endswith("/**")) for c in CONTROL_PATHS]
-        for p in (q for q in paths if any(control_key(q) == t or (d and control_key(q).startswith(t + os.sep))
-                                          for t, d in tops)):
-            k = control_key(p)
-            try:
-                s = os.stat(k)
-                now = (s.st_mtime_ns, s.st_size)
-            except OSError:
-                now = None
-            for snap in self.control_snap.values():
-                if now is None:
-                    snap.pop(k, None)
-                else:
-                    snap[k] = now
-
-    def control_refusal(self, name, ln):
-        """-> why a finished lane's chain is refused for a control-file change it ran beside, else None."""
-        now = control_state(self.root)
-        snap = self.control_snap.pop(name, None)
-        if snap is None:
-            if "control_digest" not in ln:
-                return "no control-file baseline recorded at dispatch"
-            return None if control_digest(now) == ln["control_digest"] else \
-                "control files changed while the lane ran (details lost across a conveyor restart)"
-        changed = sorted(k for k in set(now) | set(snap) if now.get(k) != snap.get(k))
-        if not changed:
-            return None
-        rel = [os.path.relpath(k, control_key(self.root)).replace("\\", "/") for k in changed]
-        return f"control files changed while the lane ran: {', '.join(rel[:5])}" + \
-            (f" (+{len(rel) - 5})" if len(rel) > 5 else "")
-
     def write_atomic(self, path, text):
         """tmp + os.replace: a crash mid-write never leaves a torn file. A reader holding the
         target open (panel, pano, bridge mount) makes os.replace raise PermissionError on
@@ -1667,7 +1620,6 @@ class Conveyor:
                         self.error(f"write {target.name}: {e!r} after {REPLACE_TRIES} tries")
                         return False
                     time.sleep(REPLACE_GAP_S)
-            self.mine(target)
         return True
 
     def event(self, kind, **kw):
@@ -1986,7 +1938,6 @@ class Conveyor:
             orch.mkdir(parents=True, exist_ok=True)
             with open(orch / "INBOX.jsonl", "a", encoding="utf-8") as fh:  # one write: one whole line
                 fh.write(json.dumps({"id": m["id"], "ts": iso(self.now()), "text": note}, ensure_ascii=False) + "\n")
-            self.mine(orch / "INBOX.jsonl")
             self.phone_send(word, f"Not alındı ({self.inbox_unread()} okunmamış)", "Not")
 
     def phone_send(self, cmd, text, title):
@@ -2252,10 +2203,6 @@ class Conveyor:
         if quiet:
             return
         ln["finished_ts"] = self.now()  # since of its attention item (bad STATUS, non-pass reading)
-        why_c = self.control_refusal(name, ln)  # DENYRULES1: fail closed, one quiet item via attention
-        if why_c:
-            self.event("chain_refused", src=ln["id"], reason=why_c)
-            ln["chain_refused"], ln["chain_refused_at"] = why_c, self.now()
         if status == CI_PENDING:
             return  # read when ci_wait turns it GREEN or BLOCKED
         try:
@@ -3317,9 +3264,6 @@ class Conveyor:
         if worker:
             lanes[name]["worker"] = worker
         lanes[name].update(trial)  # advisor, subagent_model: nudge and re-dispatch launch with them too
-        snap = control_state(self.root)  # DENYRULES1: finish refuses the chain on any change since
-        self.control_snap[name] = dict(snap)
-        lanes[name]["control_digest"] = control_digest(snap)
         self.save_lanes(lanes)  # a started session is never lost to a later crash
 
     def usage_pct(self):
@@ -3677,7 +3621,6 @@ class Conveyor:
         f = self.base / "pace.json"
         if not f.exists():
             f.write_text(json.dumps(PACE_DEFAULTS, indent=2), encoding="utf-8")
-            self.mine(f)
             return dict(PACE_DEFAULTS), None
         raw = None
         try:
@@ -3754,7 +3697,6 @@ class Conveyor:
                                                       "claude_version", "autofix_fable") if k in p)]
                 (self.base / "pace.json").write_text(
                     json.dumps({k: p[k] for k in keep}, indent=2), encoding="utf-8")
-                self.mine(self.base / "pace.json")
                 self.event("quota_reset", before=prev, after=u, window_start=p["window_start"])
                 self.pager_flag("quota_reset", self.now())
             self.pager_flag("last_usage", u)
@@ -5290,7 +5232,6 @@ class Conveyor:
         a.parent.mkdir(parents=True, exist_ok=True)
         a.write_text("", encoding="utf-8")
         os.utime(a, (self.now(), self.now()))
-        self.mine(a)
 
     def chain_int_rerun(self, name, ln, ap):
         """CONVCHAIN3: a GREEN chain INT whose candidate is no longer a fast-forward of origin/main
@@ -5388,7 +5329,6 @@ class Conveyor:
             if why is None:  # KEY1PATH1: the same header writer key1_check --write uses
                 write_key1(self.approvals, approval[5:45], "ci/" + approval[46:], name, "conveyor",
                            ("approval-for",), now=self.now())
-                self.mine(self.approvals / approval)
         except FileExistsError:  # the orchestrator's own valid key 1 for this exact name, else refused
             try:
                 there = (approval in os.listdir(self.approvals) and (self.approvals / approval).is_file()
@@ -5745,7 +5685,6 @@ class Conveyor:
         if not tpl.exists():
             prompts.mkdir(parents=True, exist_ok=True)
             tpl.write_text(default, encoding="utf-8")
-            self.mine(tpl)
         rest = (self.base / ln["prompt"]).read_text(encoding="utf-8").partition("\n")[2]
         note = "" if not (ci or {}).get("cand") else fill(
             "\nCONVINT: {INT}'s picks are not on local main: branch {BRANCH} from the candidate {SHA}, "
@@ -5766,7 +5705,6 @@ class Conveyor:
         (prompts / "auto").mkdir(parents=True, exist_ok=True)
         for s in slices:
             (self.root / s["prompt"]).write_text(texts[s["id"]], encoding="utf-8")
-            self.mine(self.root / s["prompt"])
         return None, slices
 
     def split_chain(self, name, ln):
@@ -5817,7 +5755,6 @@ class Conveyor:
         if not tpl.exists():
             prompts.mkdir(parents=True, exist_ok=True)
             tpl.write_text(AUTOFIX_CI_TEMPLATE, encoding="utf-8")
-            self.mine(tpl)
         rest = (self.base / ln["prompt"]).read_text(encoding="utf-8").partition("\n")[2]
         kw = {"INT": name, "S": s_id, "SLOW": s_id.lower(), "SHA": sha, "RUN": run.group(1),
               "TAKE": "\n".join(f"  {p[0]} {p[1]}" for p in keep),
@@ -5842,7 +5779,6 @@ class Conveyor:
         (prompts / "auto").mkdir(parents=True, exist_ok=True)
         for s in slices:
             (self.root / s["prompt"]).write_text(texts[s["id"]], encoding="utf-8")
-            self.mine(self.root / s["prompt"])
         listing = (f"{s_id} takes {', '.join(p[0][:7] for p in keep)}; "
                    + "; ".join(f"{s['id']} fixes {p[0][:7]}" for s, p in zip(slices[1:], bad)))
         return slices, listing
@@ -5928,7 +5864,6 @@ class Conveyor:
                 ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.now()))
                 dest = done / f"{f.name}{suffix}.{ts}"
             os.replace(f, dest)
-            self.mine(f, dest)
         except OSError as e:  # pushed: the next check finds sha == origin/main and blocks; refused: re-refused
             self.error(f"push: move {f.name}: {e}")
 
