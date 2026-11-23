@@ -108,6 +108,29 @@ class OrchGenTest(unittest.TestCase):
         self.put("spec.json", json.dumps(sp))
         return str(self.root / "spec.json")
 
+    def test_slice_daily_cap(self):
+        day = [1_800_000_000.0]  # injected clock: the cap counts per UTC day
+
+        def write(sid):
+            out = []
+            rc = orch_gen.main(["--root", str(self.root), "slice", "--spec",
+                                self.spec(id=sid, commit=f"feat: {sid} x"), "--write"],
+                               out=out.append, now=lambda: day[0])
+            return rc, "\n".join(out)
+
+        cap = orch_gen.DAILY_CAP["slice"]
+        for n in range(cap):
+            rc, out = write(f"PV{n}")
+            self.assertEqual(rc, 0, out)
+        rc, out = write(f"PV{cap}")
+        self.assertEqual(rc, 2, out)
+        self.assertIn(f"REFUSED: ALLOW-T5 daily slice cap {cap} reached; escalate to the orchestrator", out)
+        self.assertNotIn(f"PV{cap}", [s["id"] for s in self.backlog()["slices"]])
+        self.assertFalse((self.root / f"build/conveyor/prompts/PV{cap}.md").exists())
+        day[0] += 86400  # a new UTC day resets it
+        rc, out = write(f"PV{cap}")
+        self.assertEqual(rc, 0, out)
+
     def test_slice_spec_chained_lints_and_dry_run_writes_nothing(self):
         before = (self.root / "build/conveyor/backlog.json").read_bytes()
         rc, out = self.run_gen("slice", "--spec", self.spec(chain=True, split_ok=True))

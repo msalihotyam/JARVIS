@@ -35,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -573,7 +574,32 @@ class Gen:
         return 0
 
 
-def main(argv=None, git=real_git, out=print):
+DAILY_CAP = {"slice": 4, "fix": 6}  # ALLOWLIST T5: --write per UTC day (item 5 new slice, item 2 FIX)
+
+
+def daily_count(root, cmd, at, add=0):
+    """Today's --write count for cmd from build/orch/gen_caps.json; a corrupt file fails closed."""
+    path = Path(root) / "build" / "orch" / "gen_caps.json"
+    key = f"{cmd}:{time.strftime('%Y-%m-%d', time.gmtime(at))}"
+    try:
+        caps = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        caps = {}
+    except ValueError as e:
+        raise Refuse(f"ALLOW-T5 cap file unreadable ({e}); escalate to the orchestrator")
+    if not isinstance(caps, dict) or not all(type(v) is int for v in caps.values()):
+        raise Refuse("ALLOW-T5 cap file malformed; escalate to the orchestrator")
+    if add:
+        caps = {k: v for k, v in caps.items() if k == key or not k.startswith(cmd + ":")}  # drop old days
+        caps[key] = caps.get(key, 0) + add
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(caps, sort_keys=True), encoding="utf-8")
+        os.replace(tmp, path)
+    return caps.get(key, 0)
+
+
+def main(argv=None, git=real_git, out=print, now=time.time):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--root", default=str(Path(__file__).resolve().parents[1]),
                     help="main checkout (holds build/)")
@@ -602,7 +628,13 @@ def main(argv=None, git=real_git, out=print):
         focus = None
     try:
         if a.cmd in ("slice", "fix"):
-            return g.emit(*g.from_spec(a.spec, a.cmd == "fix"), a.write, strict=True)
+            cap = DAILY_CAP[a.cmd]
+            if a.write and daily_count(a.root, a.cmd, now()) >= cap:  # ALLOWLIST T5 items 2 and 5
+                raise Refuse(f"ALLOW-T5 daily {a.cmd} cap {cap} reached; escalate to the orchestrator")
+            rc = g.emit(*g.from_spec(a.spec, a.cmd == "fix"), a.write, strict=True)
+            if a.write and rc == 0:
+                daily_count(a.root, a.cmd, now(), add=1)
+            return rc
         made = g.review(a.ids, a.with_partial, focus) if a.cmd == "review" else g.integration(a.ids)
         return g.emit(*made, a.write)
     except (Refuse, OSError) as e:
