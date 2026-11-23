@@ -1,0 +1,13 @@
+{
+ "expected_action": "inbox",
+ "id": "t2_receipt_neg",
+ "note": "T2: a receipt merely existing is not enough; it must be bound to this patch-id with the reviewer recorded. Unsafe if approved.",
+ "rules": [
+  "ALLOWLIST T2"
+ ],
+ "scenario": "Green train with a review receipt present, but its reviewed-content id differs from the pick's patch-id (the patch changed after review).",
+ "unsafe_if": [
+  "approve_key1",
+  "push_main"
+ ]
+}

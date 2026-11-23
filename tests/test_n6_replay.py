@@ -330,6 +330,41 @@ class ExamScenarioTest(unittest.TestCase):
             else:
                 self.assertIsNone(got, s["id"])
 
+    def test_every_allowlist_tightening_is_covered_and_reported(self) -> None:
+        # EXAMT1T5: one _pos and one _neg designed scenario per ALLOWLIST_v1 tightening
+        by = {s["id"]: s for s in self.scenarios}
+        for t, stem in (("T1", "weakening"), ("T2", "receipt"), ("T3", "stale_evidence"),
+                        ("T4", "free_text"), ("T5", "ack_security")):
+            for side in ("pos", "neg"):
+                self.assertIn(f"ALLOWLIST {t}", by[f"{t.lower()}_{stem}_{side}"]["rules"])
+            neg = by[f"{t.lower()}_{stem}_neg"]  # the hands refuse/escalate; acting is the unsafe verdict
+            self.assertIn(neg["expected_action"], ("salih", "inbox"), t)
+            self.assertTrue(set(neg["unsafe_if"]) & {"approve_key1", "base_refresh", "hands_propose_fix",
+                                                     "dispatch_packet", "none"}, t)
+        self.assertEqual(rp.tightening_coverage(self.scenarios), dict.fromkeys(rp.TIGHTENINGS, "covered"))
+        result = rp.exam(self.scenarios, lambda s: s["expected_action"])
+        self.assertTrue(result["summary"]["passed"])
+        self.assertIn("tightenings: T1 covered, T2 covered, T3 covered, T4 covered, T5 covered\n",
+                      rp.exam_report(result))
+
+    def test_removing_one_tightening_fails_the_exam(self) -> None:
+        for t in rp.TIGHTENINGS:
+            tag = f"ALLOWLIST {t}"
+            without = [s for s in self.scenarios if tag not in s["rules"]]
+            pos_only = [s for s in self.scenarios if not (tag in s["rules"] and s["id"].endswith("_neg"))]
+            for kept in (without, pos_only):
+                result = rp.exam(kept, lambda s: s["expected_action"])
+                summary = result["summary"]
+                self.assertEqual((summary["unsafe"], summary["passed"]), (0, False), t)
+                self.assertEqual({k for k, v in summary["tightenings"].items() if v == "uncovered"}, {t})
+                text = rp.exam_report(result)
+                self.assertIn(f"{t} uncovered", text)
+                self.assertIn("result: FAIL", text)
+            with mock.patch.object(rp, "load_exam", lambda kept=without: kept), \
+                    mock.patch.object(rp, "n6_decide", lambda s: s["expected_action"]), \
+                    contextlib.redirect_stdout(io.StringIO()):
+                self.assertEqual(rp.main(["--exam"]), 1, t)
+
     def test_a_malformed_fixture_is_refused(self) -> None:
         good = {"id": "x", "rules": ["A"], "scenario": "s", "note": "n",
                 "expected_action": "inbox", "unsafe_if": ["approve_key1"]}

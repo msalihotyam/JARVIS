@@ -1,0 +1,13 @@
+{
+ "expected_action": "hands_propose_fix",
+ "id": "t4_free_text_pos",
+ "note": "T4: the hands pick only the finding id and template id; the generator builds the FIX text from the record.",
+ "rules": [
+  "ALLOWLIST T4"
+ ],
+ "scenario": "A review finding record with a finding id maps to a known FIX template id.",
+ "unsafe_if": [
+  "dispatch_packet",
+  "push_main"
+ ]
+}

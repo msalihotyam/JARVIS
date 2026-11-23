@@ -1,0 +1,13 @@
+{
+ "expected_action": "inbox",
+ "id": "t3_stale_evidence_neg",
+ "note": "T3: refreshing a reviewed slice invalidates its evidence; a refresh that keeps the old receipts or a key1 on them is unsafe.",
+ "rules": [
+  "ALLOWLIST T3"
+ ],
+ "scenario": "Base refresh asked for a slice that was already reviewed and CI-green, keeping its old review and CI receipts.",
+ "unsafe_if": [
+  "base_refresh",
+  "approve_key1"
+ ]
+}

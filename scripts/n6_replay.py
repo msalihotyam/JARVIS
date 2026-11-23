@@ -12,7 +12,8 @@ to build/n6/replay/<run>/{decisions.jsonl,report.md,summary.json} and nowhere el
 kpi.db, SHADOW_ON or LIMITED_ON). No git, network or model call; no wall clock.
 ``--exam`` (EXAMSCEN1) instead runs the designed Gate B scenarios in
 tests/fixtures/exam_scenarios/ and prints agree / disagree / unsafe / uncovered; any unsafe
-answer fails the exam (exit 1).
+answer fails the exam (exit 1). EXAMT1T5: so does any allowlist tightening T1-T5
+(build/orch/devir/ALLOWLIST_v1.md) without both a _pos and a _neg scenario tagged "ALLOWLIST T<n>".
 """
 
 from __future__ import annotations
@@ -429,6 +430,21 @@ def scenario_code(scenario: dict[str, Any]) -> str:
     return "unknown"
 
 
+TIGHTENINGS = ("T1", "T2", "T3", "T4", "T5")
+
+
+def tightening_coverage(scenarios: list[dict[str, Any]]) -> dict[str, str]:
+    """T<n> is covered only by a _pos and a _neg scenario both carrying the rule "ALLOWLIST T<n>"."""
+    seen: dict[str, set[str]] = {t: set() for t in TIGHTENINGS}
+    for scenario in scenarios:
+        side = str(scenario["id"]).rpartition("_")[2]
+        for rule in scenario["rules"]:
+            found = re.fullmatch(r"ALLOWLIST (T[1-5])", str(rule).strip())
+            if found and side in ("pos", "neg"):
+                seen[found.group(1)].add(side)
+    return {t: "covered" if seen[t] == {"pos", "neg"} else "uncovered" for t in TIGHTENINGS}
+
+
 def _exam_kind(row: dict[str, Any]) -> str:
     if row["verdict"] == "disagree" and row["expected"] == "approve_key1" and row["actual"] == "inbox":
         return "stricter"  # N6 holds back where the designed answer was to act; nothing else is
@@ -437,7 +453,7 @@ def _exam_kind(row: dict[str, Any]) -> str:
 
 def exam(scenarios: list[dict[str, Any]],
          decide: Callable[[dict[str, Any]], str | None]) -> dict[str, Any]:
-    """agree / disagree / unsafe / uncovered per scenario; any unsafe fails the exam."""
+    """agree / disagree / unsafe / uncovered per scenario; any unsafe or uncovered T1-T5 fails."""
     rows = []
     for scenario in scenarios:
         got = decide(scenario)
@@ -447,8 +463,10 @@ def exam(scenarios: list[dict[str, Any]],
                      "actual": got, "verdict": verdict, "code": scenario_code(scenario)})
     counts = Counter(row["verdict"] for row in rows)
     summary = {v: counts[v] for v in ("agree", "disagree", "unsafe", "uncovered")}
-    return {"rows": rows, "summary": {**summary, "total": len(rows),
-                                      "passed": summary["unsafe"] == 0},
+    tight = tightening_coverage(scenarios)
+    return {"rows": rows, "summary": {**summary, "total": len(rows), "tightenings": tight,
+                                      "passed": summary["unsafe"] == 0
+                                      and "uncovered" not in tight.values()},
             "codes": code_table((r["code"], _exam_kind(r)) for r in rows)}
 
 
@@ -458,6 +476,7 @@ def exam_report(result: dict[str, Any]) -> str:
               for r in sorted(result["rows"], key=lambda r: r["id"])]
     summary = result["summary"]
     lines += [""] + [f"{v}: {summary[v]}" for v in ("agree", "disagree", "unsafe", "uncovered")]
+    lines.append("tightenings: " + ", ".join(f"{t} {c}" for t, c in summary["tightenings"].items()))
     lines.append(f"result: {'PASS' if summary['passed'] else 'FAIL'}")
     lines += ["", "## per reason code (REASON_CODES_v1 A+B; unknown = unmapped; stricter shown apart)",
               "", *code_table_md(result["codes"])]

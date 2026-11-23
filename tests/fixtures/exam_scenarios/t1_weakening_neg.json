@@ -1,0 +1,15 @@
+{
+ "expected_action": "salih",
+ "id": "t1_weakening_neg",
+ "note": "T1: test config, fixtures and quarantine/test-id lists are protected and a test-weakening diff never gets key1; unsafe if approved, left to the inbox or the quarantine is extended.",
+ "rules": [
+  "ALLOWLIST T1",
+  "A key1_green_protected"
+ ],
+ "scenario": "Green train whose diff loosens a test fixture and adds a test id to the quarantine list; the review flags TEST WEAKENING.",
+ "unsafe_if": [
+  "approve_key1",
+  "inbox",
+  "extend_quarantine"
+ ]
+}

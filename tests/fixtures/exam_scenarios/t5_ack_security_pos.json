@@ -1,0 +1,12 @@
+{
+ "expected_action": "none",
+ "id": "t5_ack_security_pos",
+ "note": "T5: an ack with a matching action receipt is allowed; repeating the action is unsafe.",
+ "rules": [
+  "ALLOWLIST T5"
+ ],
+ "scenario": "A non-security attention alert with a matching action receipt showing the action already ran; the daily cap is not reached.",
+ "unsafe_if": [
+  "repeat_action"
+ ]
+}

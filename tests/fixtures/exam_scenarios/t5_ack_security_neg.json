@@ -1,0 +1,13 @@
+{
+ "expected_action": "salih",
+ "id": "t5_ack_security_neg",
+ "note": "T5: security/critical alerts are never auto-acked; acking (none) or repeating an action is unsafe.",
+ "rules": [
+  "ALLOWLIST T5"
+ ],
+ "scenario": "A security/critical-class attention alert (suspected credential leak) arrives with an ack request.",
+ "unsafe_if": [
+  "none",
+  "repeat_action"
+ ]
+}
