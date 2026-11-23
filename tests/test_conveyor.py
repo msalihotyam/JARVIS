@@ -6119,12 +6119,12 @@ class TestN6Lease(Base):
                     self.c.release_lock()
                 else:
                     (self.base / "conveyor.lock").write_text(json.dumps({"pid": -7, "heartbeat": self.t}))
-                n = len([e for e in self.events() if e["event"] == "dispatch_pass_not_owner"])
+                n = len([e for e in self.events() if e["event"] == "pass_not_owner"])  # LEASEGATE1FIX3: whole pass skipped
                 self.c.pass_once()
                 self.assertEqual(self.fake.bg_calls(), [])
                 self.assertFalse(self.c.pager_flag("inbox_stuck"))
                 self.assertFalse((self.root / "build" / "n6" / "claim_result.json").exists())
-                skips = [e for e in self.events() if e["event"] == "dispatch_pass_not_owner"]
+                skips = [e for e in self.events() if e["event"] == "pass_not_owner"]
                 self.assertEqual(len(skips), n + 1)
                 self.assertEqual([e for e in self.events() if e["event"] == "dispatch_not_owner"], [])
                 self.assertEqual(len(list(self.c.inbox.glob("*.md"))), 1)  # still queued
@@ -11754,6 +11754,68 @@ class TestLeasegate1fix2NonOwner(Base):
     def test_codex_restart_stop(self):
         self.patch(find_report=lambda *a: None)
         self.codex("unknown", {"codex": {"pid": 1}}, **{"attach.return_value": "unverified"})
+
+
+class TestLeasegate1fix3NoPass(Base):
+    """LEASEGATE1FIX3: a non-owner runs no pass at all: one pass_not_owner event, every file
+    byte-identical, no claude/git/popen call; the loop tick skips its other writers too."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(conveyor, "LOCK_RETRY_S", 0))
+
+    def snap(self):
+        skip = ("events.jsonl", self.c.instance.name)  # the OS-locked instance file is unreadable while held
+        return {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file() and p.name not in skip}
+
+    def fixture(self):
+        self.drop("a.md", HDR.format("A") + "do things")
+        self.c.pass_once()  # the owner dispatches A: a running lane
+        self.assertEqual(self.fake.bg_names(), ["A"])
+        d = self.lanes()
+        d["A"].update(budget_ts=0, idle_since=0)  # stale throttles: budget and idle checks are due
+        (self.base / "lanes.json").write_text(json.dumps(d))
+        self.drop("b.md", HDR.format("B") + "do things")  # a pending inbox
+        self.backlog({"id": "C"})  # a queued backlog
+
+    def test_non_owner_pass_touches_nothing(self):
+        self.fixture()
+        calls, git = len(self.fake.calls), len(self.git.calls)
+        for way in LG2_WAYS:
+            with self.subTest(way=way):
+                lg2_lose(self, way)
+                before = self.snap()
+                n = len(self.events())
+                self.assertTrue(self.c.pass_once())
+                self.assertEqual(self.snap(), before)
+                self.assertEqual(self.fake.calls[calls:], [])
+                self.assertEqual(self.git.calls[git:], [])
+                self.assertEqual(self.ledger_procs, [])
+                self.assertEqual([e["event"] for e in self.events()[n:]], ["pass_not_owner"])  # the only write
+                lg2_regain(self)
+        before = self.snap()
+        self.c.pass_once()  # the same fixture is live for the owner: B is dispatched
+        self.assertNotEqual(self.snap(), before)
+        self.assertIn("B", self.fake.bg_names())
+
+    def test_non_owner_loop_tick_skips_its_writers(self):
+        lg2_lose(self, "acquire_lock failed")
+        spies = {k: mock.Mock(return_value=True) for k in (
+            "note_pass", "flush_pages", "restart_go", "usage_ledger", "n6_shadow", "n6_limited",
+            "write_info", "restart_confirm")}  # write_info/restart_confirm: the real heartbeat's writers
+        for k, v in spies.items():
+            self.enterContext(mock.patch.object(self.c, k, v))
+        self.enterContext(mock.patch.object(conveyor.time, "sleep", lambda s: None))
+        self.enterContext(mock.patch.object(self.c, "own_lock", lambda: False))
+        self.c.beats, self.c.restart_done = 5, False  # a restart confirm is due on the next heartbeat
+        self.assertEqual(self.c._loop(False), 0)
+        self.assertEqual(self.c._loop(True), 0)  # once: no write_info(0) over the owner's file
+        self.assertEqual({k: v.call_count for k, v in spies.items()}, dict.fromkeys(spies, 0))
+        lg2_regain(self)
+        self.assertEqual(self.c._loop(False), 0)  # the owner's tick runs every writer
+        self.assertEqual(self.c._loop(True), 0)
+        self.assertEqual([k for k, v in spies.items() if not v.called], [])
+        self.assertEqual(spies["write_info"].call_args.args, (0,))
 
 
 if __name__ == "__main__":

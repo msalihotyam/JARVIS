@@ -1580,6 +1580,9 @@ class Conveyor:
 
     def pass_once(self):
         """One pass; returns False when `claude agents` could not be read."""
+        if not self.owner():  # LEASEGATE1FIX3: a non-owner runs no pass and touches no state
+            self.event("pass_not_owner")
+            return True
         self.last_error = None
         self.main_sha = False  # not looked up yet this pass
         self.cc_ok = None  # `claude --version` read again at most once this pass
@@ -6489,7 +6492,8 @@ class Conveyor:
         while True:
             ok = False
             try:
-                self.heartbeat()
+                if self.instance_fd is not None:  # LEASEGATE1FIX3: no OS lock, no info write or restart confirm
+                    self.heartbeat()
                 ok = self.pass_once()
             except Exception as e:
                 try:
@@ -6497,7 +6501,8 @@ class Conveyor:
                     self.error(f"pass: {e!r}", file=fn and str(fn), at=at)
                 except Exception:
                     pass
-            if not once:  # reaps / starts the ledger subprocess, never waits on it; a raising pass cannot skip the kill
+            owned = self.owner()  # LEASEGATE1FIX3: a non-owner launches nothing and writes no pager/restart state
+            if owned and not once:  # reaps / starts the ledger subprocess, never waits on it; a raising pass cannot skip the kill
                 try:
                     self.usage_ledger()
                 except Exception as e:
@@ -6514,8 +6519,9 @@ class Conveyor:
                 except Exception:
                     pass
             try:
-                self.note_pass(ok)
-                self.flush_pages()
+                if owned:
+                    self.note_pass(ok)
+                    self.flush_pages()
             except Exception as e:  # never stops the pass; one event per distinct error
                 if repr(e) not in flush_errors:
                     flush_errors.add(repr(e))
@@ -6524,9 +6530,11 @@ class Conveyor:
                         self.event("flush_error", error=repr(e), file=fn and str(fn), at=at)
                     except Exception:
                         pass  # the event log itself is unwritable: nowhere left to record it
-            self.restart_go()  # after the tick: never mid push or integration write
+            if owned:
+                self.restart_go()  # after the tick: never mid push or integration write
             if once:  # a zero heartbeat tells readers no conveyor runs; loop() drops the OS lock
-                self.write_info(0)
+                if owned:  # a non-owner never overwrites the owner's info file
+                    self.write_info(0)
                 return 0
             time.sleep(PASS_S)
             if not self.own_lock():
