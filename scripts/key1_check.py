@@ -1,10 +1,16 @@
-"""Read-only verifier for the orchestrator's key1 decision (one command instead of many).
+"""Verifier for the orchestrator's key1 decision, and the ONLY writer of key 1.
 
     python scripts/key1_check.py INT-DOCPATH1 [--operator-tool] [--root <main checkout>]
+    python scripts/key1_check.py INT-DOCPATH1 --write [--root ...]
+    python scripts/key1_check.py INT-DOCPATH1 --manual "<reason>" [--root ...]
 
 Prints one PASS / FAIL / WARN line per check and a final VERDICT; exit 0 only when no check
-FAILs. It writes NOTHING (no build/approvals, no file), never pushes, calls no model and no
-network beyond the read-only `gh run list` the conveyor's own CI gate uses (ci_runs, imported).
+FAILs. Without --write / --manual it writes NOTHING. --write writes build/approvals/push-<sha40>-<ci>
+(atomically, first line the KEY1 v1 header, conveyor.write_key1) only when EVERY check is PASS
+(a WARN refuses). --manual is for reviewed manual INTs: check 3 (review reports) is not required,
+checks 1, 2, 4, 5 and 6 still must PASS; the header says by=manual reason=<reason>. It never
+pushes, calls no model and no network beyond the read-only `gh run list` the conveyor's own CI
+gate uses (ci_runs, imported).
 """
 import argparse
 import fnmatch
@@ -184,14 +190,39 @@ def verify(lane, root, git, gh, operator_tool=False):
     return out, ok
 
 
+def run(lane, root, git, gh, operator_tool=False, write=False, manual=None):
+    """verify, then (write or manual) write key 1 only when the required checks PASS -> (lines, ok)."""
+    if manual is not None and not re.fullmatch(conveyor._KEY1_REASON, manual):
+        return ["FAIL write --manual reason must be 1-120 printable ASCII chars, no '=', no edge spaces"], False
+    out, ok = verify(lane, root, git, gh, operator_tool and manual is None and not write)
+    if not (write or manual is not None):
+        return out, ok
+    need = ("1", "2", "4", "5", "6") if manual is not None else ("1", "2", "3", "4", "5", "6")
+    got = {x.split()[1]: x.split()[0] for x in out if len(x.split()) > 1}
+    if any(got.get(n) != "PASS" for n in need):
+        return out + [f"FAIL write refused: checks {', '.join(n for n in need if got.get(n) != 'PASS')} not PASS"], False
+    rep = read(root, lane) or ""
+    checks = ("ci", "ff", "files", "name", "patch-id") + (() if manual is not None else ("reviews",))
+    try:
+        p = conveyor.write_key1(Path(root) / "build" / "approvals", field(rep, "CANDIDATE SHA"),
+                                field(rep, "CI BRANCH"), lane, "key1_check" if manual is None else "manual",
+                                checks, manual)
+    except (ValueError, OSError) as e:  # FileExistsError is an OSError: never overwritten
+        return out + [f"FAIL write {type(e).__name__}: {e}"], False
+    return out + [f"WROTE build/approvals/{p.name}"], True
+
+
 def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("lane", help="INT lane id, e.g. INT-DOCPATH1")
     ap.add_argument("--operator-tool", action="store_true", help="MINOR review findings are WARN, not FAIL")
+    ap.add_argument("--write", action="store_true", help="write key 1 when every check PASSes")
+    ap.add_argument("--manual", metavar="REASON", default=None,
+                    help="reviewed manual INT: write key 1 without check 3 (implies --write)")
     ap.add_argument("--root", default=None, help="main checkout (default: this repo's main checkout)")
     a = ap.parse_args(argv)
     root = Path(a.root) if a.root else main_checkout(Path(__file__).resolve().parents[1])
-    out, ok = verify(a.lane, root, make_git(root), make_gh(root), a.operator_tool)
+    out, ok = run(a.lane, root, make_git(root), make_gh(root), a.operator_tool, a.write, a.manual)
     print("\n".join(out))
     print(f"VERDICT: {'PASS' if ok else 'FAIL'} {a.lane}")
     return 0 if ok else 1

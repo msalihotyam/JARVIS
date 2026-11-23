@@ -168,10 +168,22 @@ class FakeProc:
         self.killed = True
 
 
+def write_settings(root, deny=conveyor.REQUIRED_DENY):
+    p = Path(root) / conveyor.SETTINGS
+    p.parent.mkdir(parents=True, exist_ok=True)
+    p.write_text(json.dumps({"permissions": {"deny": list(deny)}}), encoding="utf-8")
+
+
+def key1(d, sha, ci, by="conveyor", lane="INT1"):
+    """A valid key 1 written the only way one is made (conveyor.write_key1)."""
+    return conveyor.write_key1(Path(d), sha, ci, lane, by, ("approval-for",))
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
         self.root = Path(self.tmp.name)
+        write_settings(self.root)  # KEY1PATH1: dispatch refuses without the approvals deny
         self.fake = FakeClaude()
         self.git = FakeGit()
         self.free = 100e9
@@ -2179,7 +2191,7 @@ class TestPaceGovernor(TestUsageGuard):
         self.ledger(70)  # ahead of the 50 % line
         d = self.root / "build" / "approvals"
         d.mkdir(parents=True, exist_ok=True)
-        (d / f"push-{MAIN}-p2b").write_text("integration report read, ok\n", encoding="utf-8")
+        key1(d, MAIN, "ci/p2b")
         self.drop("a.md", HDR.format("A"))
         self.c.pass_once()
         self.assertEqual(self.fake.bg_calls(), [])
@@ -5161,11 +5173,73 @@ class TestEarlyStop(Base):
 
 
 class TestPushGate(Base):
-    def approve(self, name=f"push-{MAIN}-p2b"):
+    def approve(self, name=f"push-{MAIN}-p2b", text=None):
+        """A header key 1 for a push-<sha40>-<ci> name; raw `text` (or a short name) is a lane-shaped write."""
         d = self.root / "build" / "approvals"
         d.mkdir(parents=True, exist_ok=True)
-        (d / name).write_text("integration report read, ok\n", encoding="utf-8")
+        m = conveyor.APPROVAL_RE.fullmatch(name)
+        if text is None and m and len(m.group(1)) == 40 and m.group(2):
+            return key1(d, m.group(1), "ci/" + m.group(2))
+        (d / name).write_text("integration report read, ok\n" if text is None else text, encoding="utf-8")
         return d / name
+
+    def assert_refused(self, name, why):
+        self.c.pass_once()
+        self.assertFalse([c for c in self.git.calls if c[:2] == ["git", "push"]])
+        d = self.root / "build" / "approvals"
+        self.assertFalse((d / name).exists())
+        self.assertTrue((d / "done" / f"{name}.refused").is_file())
+        (ev,) = [e for e in self.events() if e["event"] == "push_refused"]
+        self.assertEqual(ev["approval"], name)
+        self.assertIn(why, ev["reason"])
+        self.c.pass_once()  # moved: never retried, never pushed
+        self.assertEqual(self.git.pushes(), [])
+
+    def test_lane_shaped_approvals_are_refused_never_pushed(self):  # KEY1PATH1
+        other = "e" * 40
+        hdr = conveyor.key1_header
+        for text, why in (("", "not a KEY1 v1 header"), ("integration report read, ok\n", "not a KEY1 v1 header"),
+                          ("orchestrator\n", "not a KEY1 v1 header"),
+                          (f"KEY1 v1 sha={MAIN} ci=ci/p2b lane=X by=lane checks=ci at=2026-01-01T00:00:00Z\n",
+                           "not a KEY1 v1 header"),  # forged writer
+                          ("\xff\n", "not ascii"),
+                          (hdr(other, "ci/p2b", "X", "key1_check", ("ci",)) + "\n", "do not match the file name"),
+                          (hdr(MAIN, "ci/other", "X", "key1_check", ("ci",)) + "\n", "do not match the file name"),
+                          ("\n" + hdr(MAIN, "ci/p2b", "X", "key1_check", ("ci",)) + "\n", "not a KEY1 v1 header")):
+            with self.subTest(text=text):
+                self.tearDown()
+                self.setUp()
+                f = self.approve(text=text)
+                if text == "\xff\n":
+                    f.write_bytes(b"\xff\n")
+                self.assert_refused(f.name, why)
+
+    def test_header_for_another_candidate_is_blocked(self):  # KEY1PATH1: the sha it would push
+        self.approve(f"push-{'e' * 40}-p2b")  # valid header, but ci/p2b resolves to MAIN
+        self.c.pass_once()
+        self.assertEqual(self.git.pushes(), [])
+        (ev,) = [e for e in self.events() if e["event"] == "push_blocked"]
+        self.assertTrue(ev["approval"].startswith("push-eeee"))
+
+    def test_lane_settings_without_the_approvals_deny_refuse_dispatch(self):  # KEY1PATH1
+        p = self.root / conveyor.SETTINGS
+        self.assertIsNone(conveyor.settings_refusal(self.root))
+        for case in ("missing", "bad json", "no bash deny"):
+            with self.subTest(case=case):
+                self.tearDown()
+                self.setUp()
+                p = self.root / conveyor.SETTINGS
+                if case == "missing":
+                    p.unlink()
+                elif case == "bad json":
+                    p.write_text("{", encoding="utf-8")
+                else:
+                    write_settings(self.root, conveyor.REQUIRED_DENY[:2])
+                self.assertIsNotNone(conveyor.settings_refusal(self.root))
+                self.drop("a.md", HDR.format("A"))
+                self.c.pass_once()
+                self.assertEqual(self.fake.bg_calls(), [])
+                self.assertTrue([e for e in self.events() if e["event"] == "dispatch_refused"])
 
     def assert_blocked(self, name, why):
         self.c.pass_once()
@@ -5196,15 +5270,13 @@ class TestPushGate(Base):
         self.c.pass_once()  # moved: never pushed twice
         self.assertEqual(len(self.git.pushes()), 1)
 
-    def test_short_sha_and_ci_branch_by_contains(self):
+    def test_short_sha_name_is_refused(self):  # KEY1PATH1: was pushed via ci-branch-by-contains
         self.approve("push-1234567")
-        self.c.pass_once()
-        self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{MAIN}:refs/heads/main"]])
-        self.assertIn(["git", "branch", "-r", "--contains", MAIN], self.git.calls)
+        self.assert_refused("push-1234567", "push-<sha40>-<ci>")
 
     def test_pause_touched_during_the_loop_stops_the_next_approval(self):
         """F1: PAUSE appearing while one approval pushes defers the rest of that same loop."""
-        first, second = self.approve(), self.approve("push-1234567")
+        first, second = self.approve(), self.approve(f"push-{MAIN}-p2c")
         orig = self.c.cmd
 
         def cmd(args, *a, **kw):
@@ -5298,7 +5370,7 @@ class TestPushGate(Base):
 
     def test_bad_approval_name(self):
         self.approve("push-xyz1234")
-        self.assert_blocked("push-xyz1234", "approval name")
+        self.assert_refused("push-xyz1234", "push-<sha40>-<ci>")
         self.assertEqual(self.git.calls, [])
 
     def test_local_main_mismatch(self):
@@ -5370,14 +5442,10 @@ class TestPushGate(Base):
                 self.git.fail[("gh",)] = ans
                 self.assert_blocked(f"push-{MAIN}-p2b", "gh run list ci/p2b")
 
-    def test_ci_branch_not_unique(self):
-        for contains in ("  origin/feature\n", "  origin/ci/a\n  origin/ci/b\n"):
-            with self.subTest(contains=contains):
-                self.tearDown()
-                self.setUp()
-                self.approve("push-1234567")
-                self.git.contains = contains
-                self.assert_blocked("push-1234567", "name the approval push-<sha>-<ci>")
+    def test_ci_branch_not_unique(self):  # KEY1PATH1: a ci-less name never reaches the lookup
+        self.approve(f"push-{MAIN}")
+        self.assert_refused(f"push-{MAIN}", "push-<sha40>-<ci>")
+        self.assertFalse([c for c in self.git.calls if c[:3] == ["git", "branch", "-r"]])
 
     def test_check_exception_blocks(self):
         self.approve()
@@ -5463,7 +5531,7 @@ class TestAutoApproval(AutopilotBase):
         name = f"push-{MAIN}-p2b"
         self.assertEqual(self.approvals(), [f"done/{name}"])
         self.assertTrue((self.root / "build" / "approvals" / "done" / name).read_text(
-            encoding="utf-8").startswith("auto-approved by the conveyor"))
+            encoding="utf-8").startswith(f"KEY1 v1 sha={MAIN} ci=ci/p2b "))
         self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{MAIN}:refs/heads/main"]])
         (ev,) = self.ev("auto_approve")
         self.assertEqual((ev["lane"], ev["approval"], ev["ci_run"]),
@@ -5478,9 +5546,9 @@ class TestAutoApproval(AutopilotBase):
         self.int_lane()
         d = self.root / "build" / "approvals"
         d.mkdir(parents=True)
-        (d / f"push-{MAIN}-p2b").write_text("orchestrator\n", encoding="utf-8")
+        mine = key1(d, MAIN, "ci/p2b", by="key1_check", lane="INT9").read_text(encoding="utf-8")
         self.finish("INT9", "GREEN", GREEN)
-        self.assertEqual((d / "done" / f"push-{MAIN}-p2b").read_text(encoding="utf-8"), "orchestrator\n")
+        self.assertEqual((d / "done" / f"push-{MAIN}-p2b").read_text(encoding="utf-8"), mine)
         self.assertEqual(len(self.git.pushes()), 1)
 
     def test_pause_holds_auto_approval_and_an_orchestrator_key(self):
@@ -6732,7 +6800,7 @@ class TestCIHandoff(AutopilotBase):
         self.git.ci(SHA_B)
         d = self.root / "build" / "approvals"
         d.mkdir(parents=True, exist_ok=True)
-        (d / f"push-{SHA_B}-int2").write_text("orchestrator\n", encoding="utf-8")
+        key1(d, SHA_B, "ci/int2", by="key1_check")
         self.c.pass_once()
         self.assertEqual(self.git.pushes(), [])
         (ev,) = self.ev("push_blocked")
@@ -6793,7 +6861,7 @@ class TestCIHandoff(AutopilotBase):
         self.t += 2 * 86400  # older than CI_STACK_S: a failure still counts
         d = self.root / "build" / "approvals"
         d.mkdir(parents=True, exist_ok=True)
-        (d / f"push-{SHA_B}-int2").write_text("orchestrator\n", encoding="utf-8")
+        key1(d, SHA_B, "ci/int2", by="key1_check")
         self.c.pass_once()
         self.assertEqual(self.git.pushes(), [])
         self.assertEqual(self.ev("push_blocked")[-1]["reason"], f"stacked on INT1 {SHA_A[:7]} whose CI is failed")
@@ -9537,7 +9605,7 @@ class TestChain(AutopilotBase):
         self.assertEqual([p for p in self.pushes if "INT-SRC" in str(p)], [])
         approvals = self.root / "build" / "approvals"
         approvals.mkdir(parents=True, exist_ok=True)
-        (approvals / f"push-{SHA_B}-int-src").write_text("orchestrator\n", encoding="utf-8")
+        key1(approvals, SHA_B, "ci/int-src", by="key1_check", lane="INT-SRC")
         self.c.pass_once()
         self.assertEqual(self.git.pushes(), [["git", "push", "origin", f"{SHA_B}:refs/heads/main"]])
 

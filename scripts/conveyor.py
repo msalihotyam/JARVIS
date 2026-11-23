@@ -3,7 +3,9 @@
 Stdlib only. Deletes no file itself; finished lane sessions it started are
 removed with `claude rm` after a grace period. Its only git/gh calls are the push
 gate: main is pushed to origin (fast-forward only) when the orchestrator's approval
-file build/approvals/push-<sha>[-<ci>] exists AND every deterministic check passes.
+file build/approvals/push-<sha40>-<ci> exists, its first line is the KEY1 v1 header for that
+sha/ci (written only by write_key1: key1_check --write or the autopilot) AND every deterministic
+check passes; any other approval file is refused and moved to done/ as <name>.refused.
 The autopilot (CONV7) writes that file itself for a strictly GREEN integration report whose
 checks already pass, queues one fix-forward chain for a BLOCKED one, and opens a breaker
 that holds new product lanes after repeated failures; it never pushes (only the gate does).
@@ -359,6 +361,75 @@ READER_FOREIGN_RE = re.compile(
     "\ud800-\udfff]")
 PUSH_RETRY_S = 600  # a blocked approval is re-checked at most once per 10 min
 APPROVAL_RE = re.compile(r"push-([0-9a-f]{7,40})(?:-([A-Za-z0-9._-]+))?")
+# KEY1PATH1: key 1 is honoured only when its first line is this header (written by write_key1 alone);
+# reason (1-120 printable ASCII, no "=", no edge space) appears iff by=manual
+_KEY1_REASON = r"[\x21-\x3c\x3e-\x7e](?:[\x20-\x3c\x3e-\x7e]{0,118}[\x21-\x3c\x3e-\x7e])?"
+KEY1_HEADER_RE = re.compile(
+    r"KEY1 v1 sha=(?P<sha>[0-9a-f]{40}) ci=(?P<ci>ci/[A-Za-z0-9._-]+) lane=(?P<lane>[A-Za-z0-9._-]+) "
+    rf"by=(?:(?P<by>key1_check|conveyor)|(?P<manual>manual) reason=(?P<reason>{_KEY1_REASON})) "
+    r"checks=(?P<checks>[a-z0-9-]+(?:,[a-z0-9-]+)*) at=(?P<at>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
+# lanes run with --settings SETTINGS; dispatch refuses unless its deny list keeps lanes away from key 1
+REQUIRED_DENY = ("Write(build/approvals/**)", "Edit(build/approvals/**)",
+                 "Bash(*build/approvals*)", "Bash(*build\\approvals*)")
+
+
+def key1_header(sha, ci, lane, by, checks, reason=None, now=None):
+    """The canonical key 1 first line; raises ValueError for anything KEY1_HEADER_RE would refuse."""
+    at = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() if now is None else now))
+    h = (f"KEY1 v1 sha={sha} ci={ci} lane={lane} by={by} " + (f"reason={reason} " if reason is not None else "")
+         + f"checks={','.join(sorted(checks))} at={at}")
+    if not KEY1_HEADER_RE.fullmatch(h):
+        raise ValueError(f"invalid key 1 header: {h[:200]!r}")
+    return h
+
+
+def write_key1(approvals, sha, ci, lane, by, checks, reason=None, now=None):
+    """KEY1PATH1: the one writer of build/approvals/push-<sha40>-<ci>; atomic (temp + replace), never
+    overwrites. The temp name must not start with "push-" (APPROVAL_RE would match it)."""
+    h = key1_header(sha, ci, lane, by, checks, reason, now)
+    name = f"push-{sha}-{ci[3:]}"
+    if not APPROVAL_RE.fullmatch(name):
+        raise ValueError(f"invalid approval name {name!r}")
+    approvals = Path(approvals)
+    approvals.mkdir(parents=True, exist_ok=True)
+    target = approvals / name
+    if target.exists():
+        raise FileExistsError(str(target))
+    tmp = approvals / f".key1-{os.getpid()}-{threading.get_ident()}.tmp"
+    with open(tmp, "w", encoding="ascii", newline="\n") as f:
+        f.write(h + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, target)
+    return target
+
+
+def key1_refusal(path):
+    """-> None when the approval file at path is a valid key 1 for its own name, else the reason."""
+    m = APPROVAL_RE.fullmatch(Path(path).name)
+    if not m or len(m.group(1)) != 40 or not m.group(2):
+        return "approval name is not push-<sha40>-<ci>"
+    try:
+        with open(path, "rb") as f:
+            first = f.read(512).decode("ascii").split("\n", 1)[0].rstrip("\r")
+    except (OSError, UnicodeDecodeError) as e:
+        return f"approval unreadable or not ascii: {type(e).__name__}"
+    h = KEY1_HEADER_RE.fullmatch(first)
+    if not h:
+        return "first line is not a KEY1 v1 header (only key1_check --write makes key 1)"
+    if h["sha"] != m.group(1) or h["ci"] != f"ci/{m.group(2)}":
+        return f"header sha/ci {h['sha'][:7]} {h['ci']} do not match the file name"
+    return None
+
+
+def settings_refusal(root):
+    """-> None when the lane settings file denies lanes every write path to build/approvals, else why."""
+    try:
+        deny = json.loads((Path(root) / SETTINGS).read_text(encoding="utf-8"))["permissions"]["deny"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        return f"{SETTINGS} unreadable or without permissions.deny: {type(e).__name__}"
+    missing = [d for d in REQUIRED_DENY if not isinstance(deny, list) or d not in deny]
+    return f"{SETTINGS} deny lacks {missing}" if missing else None
 REQUIRED_WORKFLOWS = ("tests",)  # .github/workflows/tests.yml (runs on ci/** pushes)
 SCHEMA_LINE = "SCHEMA_VERSION = 10"  # jarvis/memory.py; rollback targets read schema 10
 SHA_RE = re.compile(r"[0-9a-f]{40}")
@@ -2752,6 +2823,10 @@ class Conveyor:
         if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", sid):
             self.event(kind, lane=name, id=ln["id"], steps=[{"error": "no session id"}], **kw)
             return False
+        why = settings_refusal(self.root)  # KEY1PATH1: a resumed lane gets the same settings file
+        if why:
+            self.event(kind, lane=name, id=ln["id"], steps=[{"error": why}], **kw)
+            return False
         if kind in ("nudge", "resume_in_place"):  # CTXRESUME: the copy must not start blind
             try:
                 note = fact_note(self.cmd, self.worktree_of(a), ln.get("base") or "main", name)
@@ -2910,6 +2985,11 @@ class Conveyor:
         if self.not_owner(name):
             return None
         if self.cc_hold():  # every dispatch path ends here; not an error, the lane is not failed
+            return None
+        why = settings_refusal(self.root)  # KEY1PATH1: no lane without the build/approvals denies
+        if why:
+            self.error(f"dispatch {name}: {why}")
+            self.event("dispatch_refused", lane=name, reason=why)
             return None
         text = self.lane_rules(name, text)
         try:
@@ -5154,16 +5234,16 @@ class Conveyor:
         attention item on the lane; push_gate still runs every key-2 check before a push."""
         try:
             why, approval, url = self.approval_for(name, ln, lanes, ap)
-            if why is None:
-                self.approvals.mkdir(parents=True, exist_ok=True)
-                with open(self.approvals / approval, "x", encoding="utf-8") as f:
-                    f.write(f"auto-approved by the conveyor from {ln['report']} at {iso(self.now())}\n")
-        except FileExistsError:  # the orchestrator's own key 1 for this exact name, else refused
+            if why is None:  # KEY1PATH1: the same header writer key1_check --write uses
+                write_key1(self.approvals, approval[5:45], "ci/" + approval[46:], name, "conveyor",
+                           ("approval-for",), now=self.now())
+        except FileExistsError:  # the orchestrator's own valid key 1 for this exact name, else refused
             try:
-                there = approval in os.listdir(self.approvals) and (self.approvals / approval).is_file()
+                there = (approval in os.listdir(self.approvals) and (self.approvals / approval).is_file()
+                         and key1_refusal(self.approvals / approval) is None)
             except OSError:  # build/approvals is not a folder
                 there = False
-            why = None if there else "approval path exists but is not that approval file"
+            why = None if there else "approval path exists but is not a valid key 1 for it"
         except Exception as e:  # unreadable report, a git/gh timeout: refused, never approved
             why = f"check error: {type(e).__name__}"
         if why:
@@ -5645,11 +5725,19 @@ class Conveyor:
             if self.push_deferred(self.breaker or (ap.get("breaker") if ap is not None else {
                     "reason": "build/conveyor/autopilot.json unreadable (fix it by hand)"})):
                 break  # this and later approvals stay; a later pass retries
+            why = key1_refusal(f)  # KEY1PATH1: headerless / forged / mismatched -> refused, never pushed
+            if why:
+                state.pop(f.name, None)
+                self.event("push_refused", approval=f.name, reason=why)
+                self.to_done(f, ".refused")
+                continue
             st["tried"] = self.now()
             sha = url = None
             self.push_paths = []  # filled by push_checks' diff; never a previous approval's range
             try:
                 why, sha, url = self.push_checks(f.name, lanes)
+                if why is None and sha != f.name[5:45]:
+                    why = f"resolved candidate {str(sha)[:7]} is not the header sha {f.name[5:12]}"
                 if why is None:
                     why = self.fast_forward(sha)
                 if why is None:
@@ -5668,20 +5756,24 @@ class Conveyor:
             self.event("push", sha=sha, ci_run=url, approval=f.name)
             if self.loads_any(self.push_paths):
                 self.page(f"main {sha[:7]}: konveyör kodu, panelden yeniden başlat")  # else silent
-            done = self.approvals / "done"
-            dest = done / f.name
-            try:
-                done.mkdir(exist_ok=True)
-                if dest.exists():  # never overwrite an earlier record
-                    ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.now()))
-                    dest = done / f"{f.name}.{ts}"
-                os.replace(f, dest)
-            except OSError as e:  # the next check finds sha == origin/main and blocks
-                self.error(f"push: move {f.name}: {e}")
+            self.to_done(f)
         names = {f.name for f in files}
         state = {k: v for k, v in state.items() if k in names}  # approval gone: item gone
         if state or self.push_file.exists():
             self.write_atomic(self.push_file, json.dumps(state, indent=2))
+
+    def to_done(self, f, suffix=""):
+        """Move an approval to build/approvals/done/<name><suffix>, never over an earlier record."""
+        done = self.approvals / "done"
+        dest = done / f"{f.name}{suffix}"
+        try:
+            done.mkdir(exist_ok=True)
+            if dest.exists():
+                ts = time.strftime("%Y%m%d-%H%M%S", time.localtime(self.now()))
+                dest = done / f"{f.name}{suffix}.{ts}"
+            os.replace(f, dest)
+        except OSError as e:  # pushed: the next check finds sha == origin/main and blocks; refused: re-refused
+            self.error(f"push: move {f.name}: {e}")
 
     def fast_forward(self, sha):
         """CONVINT: None when local main holds `sha` (already, or after `git merge --ff-only` in
