@@ -3,6 +3,7 @@ import contextlib
 import errno
 import importlib.util
 import io
+import itertools
 import json
 import os
 import re
@@ -5310,40 +5311,54 @@ class TestPushGate(Base):
     def spellings(rel):
         return (rel, "./" + rel, "C:/dev/JARVIS/" + rel, "C:\\dev\\JARVIS\\" + rel.replace("/", "\\"))
 
-    @classmethod
-    def bash_spellings(cls, rel):  # DENYRULES1FIX: mixed slashes and the escaped backslash of a Python/JSON literal
-        head, _, tail = rel.rpartition("/")
-        return cls.spellings(rel) + (rel.replace("/", "\\", 1), head + "\\" + tail, rel.replace("/", "\\\\"),
-                                     rel.replace("/", "\\\\", 1), "C:\\\\dev\\\\JARVIS\\\\" + rel.replace("/", "\\\\"),
-                                     head.replace("/", "\\") + "/" + tail)
+    SEPS = ("/", "\\", "\\\\")  # slash, backslash, the escaped backslash of a Python/JSON literal
+    PREFIXES = ("", "./", ".\\", ".\\\\") + tuple("C:" + a + "dev" + b + "JARVIS" + c
+                                                  for a, b, c in itertools.product(SEPS, repeat=3))
 
-    def test_control_path_denies_match_every_spelling_not_the_report(self):  # DENYRULES1 B1b
+    @classmethod
+    def bash_spellings(cls, rel):  # DENYRULES1FIX2: every separator at every joint, not derived from conveyor
+        parts = rel.split("/")
+        return [pre + parts[0] + "".join(j + s for j, s in zip(js, parts[1:]))
+                for pre in cls.PREFIXES for js in itertools.product(cls.SEPS, repeat=len(parts) - 1)]
+
+    def test_control_path_denies_match_every_spelling_not_the_report(self):  # DENYRULES1 B1b, DENYRULES1FIX2
         import fnmatch
         bash = [d[5:-1] for d in conveyor.REQUIRED_DENY if d.startswith("Bash(")]
         globs = {k: [d[len(k) + 1:-1] for d in conveyor.REQUIRED_DENY if d.startswith(k + "(")] for k in ("Write", "Edit")}
 
-        def bash_hit(cmd):
-            return any(fnmatch.fnmatchcase(s, p) for s in self.subcommands(cmd) for p in bash)
+        def bash_hits(cmd):
+            return {f"Bash({p})" for s in self.subcommands(cmd) for p in bash if fnmatch.fnmatchcase(s, p)}
 
-        def tool_hit(tool, path):
+        def tool_hits(tool, path):
             path = path.replace("\\", "/").removeprefix("./")
-            return any(fnmatch.fnmatchcase(path, g) for g in globs[tool])
+            return {f"{tool}({g})" for g in globs[tool] if fnmatch.fnmatchcase(path, g)}
+
+        def bash_hit(cmd):
+            return bool(bash_hits(cmd))
+        shapes = ("echo x > {}", "cp a.md {}", "python -c \"open(r'{}', 'w')\"", "python -c \"open('{}', 'w')\"")
+        misses, sole = [], set()  # sole: entries that are the only match of some spelling, so removing one fails
         for p in conveyor.CONTROL_PATHS:
             rel = p.removesuffix("/**") + ("/sub/x.md" if p.endswith("/**") else "")
             for path in self.bash_spellings(rel):
-                for cmd in (f"echo x > {path}", f"cp a.md {path}", f'python -c "open(r\'{path}\', \'w\')"',
-                            f'python -c "open(\'{path}\', \'w\')"'):
-                    with self.subTest(denied=cmd):
-                        self.assertTrue(bash_hit(cmd), cmd)
+                for shape in shapes:
+                    hits = bash_hits(shape.format(path))
+                    misses += [] if hits else [shape.format(path)]
+                    sole |= hits if len(hits) == 1 else set()
             for path in self.spellings(rel):
                 for tool in ("Write", "Edit"):
-                    with self.subTest(tool=tool, path=path):
-                        self.assertTrue(tool_hit(tool, path), (tool, path))
-        for path in self.spellings("build/reports/DENYRULES1FIX.md"):  # the lane's own report stays writable
+                    hits = tool_hits(tool, path)
+                    misses += [] if hits else [(tool, path)]
+                    sole |= hits if len(hits) == 1 else set()
+        self.assertEqual(misses[:5], [])
+        generated = {d for d in conveyor.REQUIRED_DENY if any(p.removesuffix("/**") in re.sub(r"[\\/]+", "/", d)
+                                                              for p in conveyor.CONTROL_PATHS)}
+        self.assertEqual(sorted(generated - sole)[:5], [])  # every control entry is load-bearing
+        report = "build/reports/DENYRULES1FIX2.md"  # the lane's own report stays writable
+        for path in self.spellings(report):
             for tool in ("Write", "Edit"):
                 with self.subTest(tool=tool, report=path):
-                    self.assertFalse(tool_hit(tool, path), (tool, path))
-        for path in self.bash_spellings("build/reports/DENYRULES1FIX.md"):
+                    self.assertFalse(tool_hits(tool, path), (tool, path))
+        for path in self.bash_spellings(report):
             for cmd in (f"cat {path}", f"echo x > {path}", f"git add {path}"):
                 with self.subTest(report_cmd=cmd):
                     self.assertFalse(bash_hit(cmd), cmd)
@@ -5351,7 +5366,7 @@ class TestPushGate(Base):
                     "git add scripts/conveyor.py tests/test_conveyor.py", "python scripts/test_parallel.py tests.test_conveyor"):
             with self.subTest(allowed=cmd):
                 self.assertFalse(bash_hit(cmd), cmd)
-        self.assertFalse(tool_hit("Write", "build/conveyor/lanes.json"))  # never the bare lanes stem
+        self.assertFalse(tool_hits("Write", "build/conveyor/lanes.json"))  # never the bare lanes stem
 
     def test_dispatch_refused_for_settings_missing_any_control_deny(self):  # DENYRULES1 B1b
         new = [d for d in conveyor.REQUIRED_DENY if any(p.removesuffix("/**") in re.sub(r"[\\/]+", "/", d)
