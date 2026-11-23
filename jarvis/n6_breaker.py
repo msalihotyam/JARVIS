@@ -131,6 +131,21 @@ def _marker(path: Path) -> Path:
     return Path(f"{path}.open")
 
 
+def _floor(path: Path) -> float | None:
+    """Newest opening ts kept in the open marker: -inf with no marker (the last landed state was
+    closed); None when the marker is unreadable or holds no finite number (fail closed)."""
+    try:
+        raw = _marker(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return -math.inf
+    except (OSError, UnicodeError):
+        return None
+    try:
+        return _num(json.loads(raw))
+    except (ValueError, RecursionError):
+        return None
+
+
 def load(path: Path | str) -> State | _Unreadable:
     """The breaker state; a fresh closed State when there is no file and no open marker;
     UNREADABLE otherwise (a lost file while a root was open stays open)."""
@@ -229,8 +244,16 @@ def _write(path: Path, state: State) -> None:
     after a fully closed state has landed, so a lost state file never reads as closed."""
     data = {"bad": [list(b) for b in state.bad], "open": [list(o) for o in state.opened],
             "cleared": [list(c) for c in state.cleared]}
-    if state.opened:
-        _marker(path).touch()
+    if state.opened:  # the marker keeps the newest opening ts (only raised) for a lost/corrupt state
+        floor, old = max(o[1] for o in state.opened), _floor(path)
+        mfd, mtmp = tempfile.mkstemp(dir=path.parent, prefix=_marker(path).name + ".", suffix=".tmp")
+        try:  # atomic like the state file: a torn marker write must never lower the floor
+            with os.fdopen(mfd, "w", encoding="utf-8") as f:
+                f.write(json.dumps(floor if old is None else max(floor, old)))
+            os.replace(mtmp, _marker(path))
+        except BaseException:
+            Path(mtmp).unlink(missing_ok=True)
+            raise
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
@@ -264,7 +287,9 @@ CUT_ROOT = "*"  # CUTSWITCH1: the one cut switch is a breaker file with this roo
 
 
 def cut(path: Path | str, ts: float, reason: str) -> bool:
-    """Open ``CUT_ROOT`` (an unreadable state is replaced). Cleared only by ``reset``.
+    """Open ``CUT_ROOT``; the newest cut wins. An unreadable state is replaced by a cut no older
+    than the floor the open marker keeps; with an unknown floor it is left as is (already cut).
+    Cleared only by ``reset``.
     False when the lock is held elsewhere or the write fails."""
     if _num(ts) is None:
         raise ValueError(f"bad cut ts: {ts!r}")
@@ -273,7 +298,11 @@ def cut(path: Path | str, ts: float, reason: str) -> bool:
         if not got:
             return False
         state = load(path)
-        state = state if isinstance(state, State) else State()
+        if not isinstance(state, State):
+            floor = _floor(path)
+            if floor is None:
+                return True  # unreadable = cut, and a rewrite could lower its unknown floor
+            state, ts = State(), max(float(ts), floor)
         # the newest cut wins (ts and reason): an older cut() never lets reset() clear a newer one
         new = max([o for o in state.opened if o[0] == CUT_ROOT] + [(CUT_ROOT, float(ts), reason)],
                   key=lambda o: o[1])
@@ -289,7 +318,8 @@ def reset(path: Path | str, ts: float) -> bool:
     """Operator reset record: closes every root opened at or before ``ts`` and drops the BAD
     finishes up to ``ts``. False when it closes nothing (a reset older than every opening is
     ignored). On an unreadable state (or a lost file with the open marker) the reset is the
-    repair: it writes a fresh closed state and removes the marker."""
+    repair: it writes a fresh closed state and removes the marker, but only when ``ts`` is not
+    below the floor the marker keeps; an unknown floor is never cleared (fail closed)."""
     if _num(ts) is None:
         raise ValueError(f"bad reset ts: {ts!r}")
     path = Path(path)
@@ -298,7 +328,11 @@ def reset(path: Path | str, ts: float) -> bool:
             return False
         state = load(path)
         new = State()
-        if isinstance(state, State):
+        if not isinstance(state, State):
+            floor = _floor(path)
+            if floor is None or ts < floor:
+                return False  # cannot prove the lost openings older than this reset
+        else:
             keep = tuple(o for o in state.opened if o[1] > ts)
             if len(keep) == len(state.opened):
                 return False
