@@ -5306,6 +5306,56 @@ class TestPushGate(Base):
             with self.subTest(allowed=cmd):
                 self.assertFalse(hit(cmd), cmd)
 
+    @staticmethod
+    def spellings(rel):
+        return (rel, "./" + rel, "C:/dev/JARVIS/" + rel, "C:\\dev\\JARVIS\\" + rel.replace("/", "\\"))
+
+    def test_control_path_denies_match_every_spelling_not_the_report(self):  # DENYRULES1 B1b
+        import fnmatch
+        bash = [d[5:-1] for d in conveyor.REQUIRED_DENY if d.startswith("Bash(")]
+        globs = {k: [d[len(k) + 1:-1] for d in conveyor.REQUIRED_DENY if d.startswith(k + "(")] for k in ("Write", "Edit")}
+
+        def bash_hit(cmd):
+            return any(fnmatch.fnmatchcase(s, p) for s in self.subcommands(cmd) for p in bash)
+
+        def tool_hit(tool, path):
+            path = path.replace("\\", "/").removeprefix("./")
+            return any(fnmatch.fnmatchcase(path, g) for g in globs[tool])
+        for p in conveyor.CONTROL_PATHS:
+            rel = p.removesuffix("/**") + ("/sub/x.md" if p.endswith("/**") else "")
+            for path in self.spellings(rel):
+                for cmd in (f"echo x > {path}", f"cp a.md {path}", f'python -c "open(r\'{path}\', \'w\')"'):
+                    with self.subTest(denied=cmd):
+                        self.assertTrue(bash_hit(cmd), cmd)
+                for tool in ("Write", "Edit"):
+                    with self.subTest(tool=tool, path=path):
+                        self.assertTrue(tool_hit(tool, path), (tool, path))
+        for path in self.spellings("build/reports/DENYRULES1.md"):  # the lane's own report stays writable
+            for tool in ("Write", "Edit"):
+                with self.subTest(tool=tool, report=path):
+                    self.assertFalse(tool_hit(tool, path), (tool, path))
+            for cmd in (f"cat {path}", f"echo x > {path}", f"git add {path}"):
+                with self.subTest(report_cmd=cmd):
+                    self.assertFalse(bash_hit(cmd), cmd)
+        for cmd in ("python -c \"import json; print(json.load(open('build/conveyor/lanes.json')))\"",
+                    "git add scripts/conveyor.py tests/test_conveyor.py", "python scripts/test_parallel.py tests.test_conveyor"):
+            with self.subTest(allowed=cmd):
+                self.assertFalse(bash_hit(cmd), cmd)
+        self.assertFalse(tool_hit("Write", "build/conveyor/lanes.json"))  # never the bare lanes stem
+
+    def test_dispatch_refused_for_settings_missing_any_control_deny(self):  # DENYRULES1 B1b
+        new = [d for d in conveyor.REQUIRED_DENY if any(p.removesuffix("/**") in d.replace("\\", "/")
+                                                      for p in conveyor.CONTROL_PATHS if "approvals" not in p)]
+        self.assertEqual(len(new), 7 * 6)
+        for d in ("Write(**/build/approvals/**)", "Edit(**/build/approvals/**)"):
+            self.assertIn(d, conveyor.REQUIRED_DENY)
+        for entry in new + ["Write(**/build/approvals/**)", "Edit(**/build/approvals/**)"]:
+            with self.subTest(missing=entry):
+                write_settings(self.root, tuple(d for d in conveyor.REQUIRED_DENY if d != entry))
+                self.assertIn(repr(entry), conveyor.settings_refusal(self.root) or "")
+        write_settings(self.root, conveyor.REQUIRED_DENY)
+        self.assertIsNone(conveyor.settings_refusal(self.root))
+
     def assert_blocked(self, name, why):
         self.c.pass_once()
         self.assertEqual(self.git.pushes(), [])
@@ -9111,6 +9161,37 @@ class TestChain(AutopilotBase):
                 self.start(id=f"S{status[0]}")
                 self.finish(f"S{status[0]}", status, extra=self.PICK)
                 self.nothing()
+
+    def test_unexplained_control_file_change_refuses_the_chain(self):  # DENYRULES1 B1b
+        for case in ("new orch file", "backlog touched", "no baseline"):
+            with self.subTest(case=case):
+                self.tearDown()
+                self.setUp()
+                self.start()
+                if case == "new orch file":
+                    (self.root / "build" / "orch").mkdir(parents=True, exist_ok=True)
+                    (self.root / "build" / "orch" / "forged.md").write_text("x", encoding="utf-8")
+                elif case == "backlog touched":
+                    f = self.base / "backlog.json"
+                    os.utime(f, ns=(f.stat().st_atime_ns, f.stat().st_mtime_ns + 10 ** 9))
+                else:
+                    self.c.control_snap.clear()
+                    lanes = self.lanes()
+                    lanes["SRC"].pop("control_digest")
+                    (self.base / "lanes.json").write_text(json.dumps(lanes), encoding="utf-8")
+                self.finish("SRC", "PASS", extra=self.PICK)
+                frag = {"new orch file": "build/orch/forged.md", "backlog touched": "build/conveyor/backlog.json",
+                        "no baseline": "no control-file baseline"}[case]
+                self.refused(frag)
+                self.assertIn(frag, self.lanes()["SRC"]["chain_refused"])
+                self.assertEqual(self.ev("chain"), [])
+
+    def test_conveyor_own_control_writes_do_not_refuse_the_chain(self):  # DENYRULES1 B1b
+        self.start()
+        self.c.write_atomic(self.base / "pace.json", json.dumps(conveyor.PACE_DEFAULTS))
+        self.assertIn("control_digest", self.lanes()["SRC"])
+        self.finish("SRC", "PASS", extra=self.PICK)
+        self.assertNotIn("control files", json.dumps(self.ev("chain_refused")))
 
     def test_green_is_not_good(self):
         self.start()
