@@ -254,7 +254,10 @@ class N6BreakerTest(unittest.TestCase):
             self.assertTrue(nb.holds(nb.load(p), "Z"))
             self.assertFalse(nb.record_finish(p, "N6-05", "PASS", T0 + 9, T0 + 9))
             self.assertFalse(p.exists())
-            self.assertTrue(nb.reset(p, T0))  # the reset is the repair
+            floor = max(f for _, _, f in SAME_ROOT)  # the marker keeps the newest opening's ts
+            self.assertFalse(nb.reset(p, floor - 1))  # cannot prove the lost opening older: refused
+            self.assertTrue(Path(f"{p}.open").exists())
+            self.assertTrue(nb.reset(p, floor))  # the reset is the repair
             self.assertEqual(nb.load(p), nb.State())
             self.assertFalse(Path(f"{p}.open").exists())
 
@@ -438,6 +441,45 @@ class CutSwitchTest(unittest.TestCase):
         nb.cut(self.p, T0, "operator")
         self.p.unlink()
         self.assertTrue(nb.is_open(nb.load(self.p)))  # the .open marker remains
+
+    # ---- CUTSWITCH1FIX2 F1 NEG: an unreadable state never loses the cut floor ----
+    def corrupt(self):
+        self.p.write_text("{not json", encoding="utf-8")
+
+    def test_neg_cut_over_unreadable_keeps_the_floor(self):
+        for lose in (self.corrupt, self.p.unlink):
+            with self.subTest(lose=lose.__name__):
+                self.assertTrue(nb.cut(self.p, T0 + 20, "new"))
+                lose()
+                self.assertTrue(nb.cut(self.p, T0 + 10, "old"))
+                self.assertFalse(nb.reset(self.p, T0 + 15))  # the lost cut at T0+20 is newer
+                self.assertTrue(nb.is_open(nb.load(self.p)))
+                self.assertTrue(nb.reset(self.p, T0 + 20))
+                self.assertFalse(nb.is_open(nb.load(self.p)))
+
+    def test_neg_reset_over_unreadable_below_the_floor_is_refused(self):
+        for lose in (self.corrupt, self.p.unlink):
+            with self.subTest(lose=lose.__name__):
+                self.assertTrue(nb.cut(self.p, T0 + 20, "operator"))
+                lose()
+                before = self.p.read_bytes() if self.p.exists() else None
+                self.assertFalse(nb.reset(self.p, T0 + 15))
+                self.assertEqual(self.p.read_bytes() if self.p.exists() else None, before)
+                self.assertIs(nb.load(self.p), nb.UNREADABLE)
+                self.assertTrue(nb.reset(self.p, T0 + 20))  # ts == floor: provably not older, the repair
+                self.assertEqual(nb.load(self.p), nb.State())
+                self.assertFalse(Path(f"{self.p}.open").exists())
+
+    def test_neg_unknown_floor_is_never_cleared(self):
+        marker = Path(f"{self.p}.open")
+        for raw in (b"", b"x", b"NaN", b"1e999", b"true", b"[20]", b"\xff\xfe"):  # b"": a legacy marker
+            with self.subTest(raw=raw):
+                self.corrupt()
+                marker.write_bytes(raw)
+                self.assertTrue(nb.cut(self.p, T0, "operator"))  # already cut: kept as is
+                self.assertEqual((self.p.read_text(encoding="utf-8"), marker.read_bytes()), ("{not json", raw))
+                self.assertFalse(nb.reset(self.p, T0 + 10**6))
+                self.assertTrue(nb.is_open(nb.load(self.p)))
 
 
 if __name__ == "__main__":

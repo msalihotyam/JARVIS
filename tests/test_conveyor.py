@@ -499,7 +499,7 @@ class TestInbox(Base):
         self.assertIn("cut switch", str(cm.exception))
         self.assertEqual(sent, [])
         self.assertTrue(nb.reset(cut, self.t))  # clearing reopens both together
-        self.assertFalse(api.cut_set(self.base))
+        self.assertFalse(api.cut_set())
         self.c.pass_once()
         self.assertEqual(self.fake.bg_names(), ["A", "B"])
 
@@ -512,7 +512,7 @@ class TestInbox(Base):
         with mock.patch.object(api, "ROOT", other):
             self.assertTrue(api._breaker().cut(api.cut_path(), self.t, "operator"))
             self.assertTrue(self.c.hold())
-            self.assertTrue(api.cut_set(other))  # the broker reads the same file
+            self.assertTrue(api.cut_set())  # the broker reads the same file
         self.assertFalse(self.c.hold())  # a cut elsewhere does not hold the other path
 
     def test_unreadable_cut_switch_holds_dispatch(self):

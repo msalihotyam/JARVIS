@@ -47,9 +47,10 @@ class ApiBrokerTest(unittest.TestCase):
         self.ledger = self.root / api.LEDGER_NAME
         self.sent = []
         self.reply = (200, ok_body())
-        pin = mock.patch.object(api, "CREDIT_END", FIXTURE_END)
-        pin.start()
-        self.addCleanup(pin.stop)
+        for pin in (mock.patch.object(api, "CREDIT_END", FIXTURE_END),
+                    mock.patch.object(api, "ROOT", self.root)):  # the cut switch is read from the live ROOT
+            pin.start()
+            self.addCleanup(pin.stop)
 
     def post(self, url, headers, body, timeout):
         self.sent.append((url, headers, body, timeout))
@@ -314,7 +315,7 @@ class ApiBrokerTest(unittest.TestCase):
     def fresh(self):  # a restarted process: a new module instance reading the same ledger directory
         mod = importlib.util.module_from_spec(_SPEC)
         _SPEC.loader.exec_module(mod)
-        mod.CREDIT_END = FIXTURE_END
+        mod.CREDIT_END, mod.ROOT = FIXTURE_END, self.root
         return mod
 
     def test_real_credit_end_refuses_from_2026_12_18_utc(self):
@@ -426,18 +427,37 @@ class CutSwitchTest(unittest.TestCase):
                      "cut switch")
         self.assertEqual(self.sent, [])
         self.assertTrue(self.nb().reset(self.root / api.CUT_NAME, T0))
-        self.assertFalse(api.cut_set(self.root))
+        self.assertFalse(api.cut_set())
         if os.name == "nt":  # the broker itself refuses off Windows
             self.call()
             self.assertEqual(len(self.sent), 1)
 
     def test_one_resolver_for_every_reader(self):
-        self.assertEqual(api.cut_path(), api.ROOT / api.CUT_NAME)
-        self.assertEqual(api.cut_path(self.root), self.root / api.CUT_NAME)
-        with mock.patch.object(api, "ROOT", self.root):  # the default follows the one ROOT
-            self.assertTrue(self.nb().cut(api.cut_path(), T0, "operator"))
-            self.assertTrue(api.cut_set())
-        self.assertTrue(api.cut_set(self.root))
+        self.assertEqual(api.cut_path(), self.root / api.CUT_NAME)  # setUp patched ROOT: read per call
+        self.assertTrue(self.nb().cut(api.cut_path(), T0, "operator"))
+        self.assertTrue(api.cut_set())
+        other = self.root / "elsewhere"
+        with mock.patch.object(api, "ROOT", other):
+            self.assertEqual(api.cut_path(), other / api.CUT_NAME)
+            self.assertFalse(api.cut_set())
+
+    # ---- CUTSWITCH1FIX2 F2 NEG: call()/open_envelope() read the one live cut, never a ledger root's ----
+    def test_neg_call_and_envelope_read_the_live_cut_not_the_ledger_root(self):
+        ledger = self.root / "ledger"
+        self.assertTrue(self.nb().cut(api.cut_path(), T0, "operator"))  # the file hold() reads
+
+        def call(**kw):
+            return api.call(HAIKU, "sys", MSG, 100, "orch test", clock=lambda: T0, reader=lambda: KEY,
+                            post=self.post, **kw)
+        # a ledger root first: before the fix it read ledger/cut.json (absent) and sent
+        self.refused(lambda: call(root=ledger), "cut switch")
+        self.refused(lambda: api.open_envelope(1.0, "orch test", root=ledger, clock=lambda: T0), "cut switch")
+        self.refused(call, "cut switch")
+        self.refused(lambda: api.open_envelope(1.0, "orch test", clock=lambda: T0), "cut switch")
+        self.assertFalse(ledger.exists())  # refused before any ledger write
+        self.assertTrue(self.nb().reset(api.cut_path(), T0))
+        self.assertTrue(self.nb().cut(ledger / api.CUT_NAME, T0, "decoy"))
+        self.assertFalse(api.cut_set())  # a ledger root's cut.json is not the switch
 
     def test_unreadable_switch_is_cut(self):
         (self.root / api.CUT_NAME).write_text("{bad", encoding="utf-8")
@@ -446,7 +466,7 @@ class CutSwitchTest(unittest.TestCase):
 
     def test_breaker_module_failing_to_load_is_cut(self):
         with mock.patch.object(api, "_breaker", side_effect=ImportError("gone")):
-            self.assertTrue(api.cut_set(self.root))
+            self.assertTrue(api.cut_set())
 
 
 if __name__ == "__main__":

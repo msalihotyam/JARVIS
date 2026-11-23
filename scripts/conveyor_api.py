@@ -75,16 +75,17 @@ def _breaker():
     return mod
 
 
-def cut_path(root=None):
-    """The ONE cut.json path: the broker and the conveyor's hold() both resolve it here (default: ROOT)."""
-    return Path(ROOT if root is None else root) / CUT_NAME
+def cut_path():
+    """The ONE cut.json path: the broker and the conveyor's hold() both resolve it here, from the
+    module ROOT read at call time; no caller (ledger) root redirects it."""
+    return Path(ROOT) / CUT_NAME
 
 
-def cut_set(root=None):
+def cut_set():
     """True when the cut switch is set; fail closed: unreadable switch or breaker = cut."""
     try:
         nb = _breaker()
-        return nb.is_open(nb.load(cut_path(root)))
+        return nb.is_open(nb.load(cut_path()))
     except Exception:
         return True
 
@@ -321,16 +322,16 @@ def _caller(purpose):
     return name
 
 
-def open_envelope(ceiling_usd, purpose, *, root=ROOT, clock=None):
+def open_envelope(ceiling_usd, purpose, *, root=None, clock=None):
     """Id of a new batch envelope: `ceiling_usd` held for the purpose's caller until the end of
     today (UTC), booked in the ledger so it survives a restart; refused when the remaining
     monthly / daily / caller budget cannot cover the whole ceiling now."""
-    if cut_set(root):
+    if cut_set():
         raise ApiRefused("cut switch set: every API call and new lane dispatch is held")
     name = _caller(purpose)
     if not _num(ceiling_usd) or not ceiling_usd > 0:
         raise ApiRefused("envelope ceiling must be a positive USD number")
-    root = Path(root)
+    root = Path(ROOT if root is None else root)
     root.mkdir(parents=True, exist_ok=True)
     ledger = root / LEDGER_NAME
     with _locked(root / (LEDGER_NAME + ".lock")):
@@ -343,11 +344,11 @@ def open_envelope(ceiling_usd, purpose, *, root=ROOT, clock=None):
     return eid
 
 
-def call(model, system, messages, max_tokens, purpose, *, root=ROOT, clock=None, reader=None, post=None,
+def call(model, system, messages, max_tokens, purpose, *, root=None, clock=None, reader=None, post=None,
          envelope=None):
     """Response text of one Messages API call, or ApiRefused (nothing sent) / ApiError (sent, failed).
     With `envelope` (from open_envelope, same caller) the call spends that envelope's remainder."""
-    if cut_set(root):
+    if cut_set():
         raise ApiRefused("cut switch set: every API call and new lane dispatch is held")
     name = _caller(purpose)
     if not isinstance(model, str) or model not in PRICES:
@@ -364,7 +365,7 @@ def call(model, system, messages, max_tokens, purpose, *, root=ROOT, clock=None,
     p_in, p_out = PRICES[model]
     est = (len(raw) * p_in + max_tokens * p_out) / 1e6  # a byte is never less than a token
     reserve = math.ceil(est * 1e6) / 1e6
-    root = Path(root)
+    root = Path(ROOT if root is None else root)
     root.mkdir(parents=True, exist_ok=True)
     ledger = root / LEDGER_NAME
     with _locked(root / (LEDGER_NAME + ".lock")):
