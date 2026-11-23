@@ -50,6 +50,7 @@ class Snapshot:
     lanes: dict[str, dict[str, Any]]
     events: tuple[dict[str, Any], ...]
     reports: dict[str, str | None]
+    padded: tuple[int, ...] = ()  # events.jsonl line numbers whose leading NUL fill was dropped
 
 
 def _json(text: str, what: str) -> Any:
@@ -75,17 +76,34 @@ def load(root: str | os.PathLike[str], *, read: Callable[[Path], str]) -> Snapsh
             reports[lane] = read(Path(root) / "build" / "reports" / f"{lane}.md")
         except FileNotFoundError:
             reports[lane] = None
-    text = read(conveyor / "events.jsonl")
+    # A writer that dies mid-append can leave NUL zero fill; the next append lands after it.
+    # Only that fill is dropped (leading, or trailing at EOF); any other bad line stays fatal.
+    raw = read(conveyor / "events.jsonl")
+    text = raw.rstrip("\x00")
+    if raw and not text:
+        raise TornSnapshot("events.jsonl is only NUL fill")  # a lost ledger is not an empty one
     if text and not text.endswith("\n"):
         raise TornSnapshot("events.jsonl ends in a partial line")
-    events = tuple(_json(line, "an events.jsonl line") for line in text.splitlines() if line.strip())
+    # split on "\n" only: splitlines would cut a record at a U+2028 / U+0085 inside a string
+    lines = text.split("\n")[:-1] if text else []
+    parsed: list[Any] = []
+    padded: list[int] = []
+    for number, line in enumerate(lines, 1):
+        body = line.lstrip("\x00")
+        if body != line:
+            padded.append(number)
+        if body.strip():
+            parsed.append(_json(body, f"events.jsonl line {number}"))
+    if raw != text:
+        padded.append(len(lines) + 1)  # NUL fill at EOF, reported as the line after the last
+    events = tuple(parsed)
     if not all(isinstance(e, dict) for e in events):
         raise TornSnapshot("an events.jsonl line is not an object")
     # ponytail: lanes.json is the re-read anchor; events.jsonl is append-only, so a late
     # append only adds evidence. Re-read it too if the ledger is ever rewritten in place.
     if read(conveyor / "lanes.json") != first:
         raise TornSnapshot("lanes.json changed while the snapshot was read")
-    return Snapshot(lanes, cast(tuple[dict[str, Any], ...], events), reports)
+    return Snapshot(lanes, cast(tuple[dict[str, Any], ...], events), reports, tuple(padded))
 
 
 def _blocked_child(snap: Snapshot, lane: str) -> str | None:

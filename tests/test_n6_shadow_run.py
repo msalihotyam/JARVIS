@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import subprocess
 import tempfile
@@ -185,6 +187,20 @@ class ShadowRunTest(unittest.TestCase):
         (self.root / ".git" / "reftable").mkdir()
         with self.assertRaises(RuntimeError):
             self.tip()
+
+    def test_a_nul_padded_ledger_line_and_one_bad_ref_do_not_stop_the_pass(self) -> None:
+        self.on()
+        with (self.root / "build/conveyor/events.jsonl").open("a", encoding="utf-8", newline="") as f:
+            f.write("\x00" * 359 + json.dumps({"ts": "2026-11-19T22:34:21", "event": "lock_takeover"}) + "\n")
+        self.write(".git/refs/heads/worktree-A", "")
+        (self.root / ".git/refs/heads/worktree-A").write_bytes(b"\xff\xfe garbage\n")  # one lane's ref is garbage
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            written = self.judge(head=None)
+        self.assertEqual(written, 2)  # B judged; A has no independent sha, so unknown and no rows
+        self.assertEqual({r.slice_id for r in rows(self.db)}, {"B"})
+        self.assertIn("events.jsonl line 2", err.getvalue())
+        self.assertIn("N6 A: N6 head: refs/heads/worktree-A is not text", err.getvalue())
 
     def test_no_git_dir_fails_the_run_instead_of_writing_nothing(self) -> None:
         self.on()

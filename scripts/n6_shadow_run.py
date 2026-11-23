@@ -67,20 +67,27 @@ _LANE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]*(\.[A-Za-z0-9_-]+)*")
 _TIP = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 
 
-def branch_tip(n6: N6, root: Path, lane: str) -> str | None:
-    """The sha of ``refs/heads/worktree-<lane>``, read from the ref files through ``n6.read``.
-
-    No git process: stage_git refuses the live repo (it has a multi-pack-index) and walks all
-    of .git per call. None only when neither a loose nor a packed ref exists (branch deleted)
-    or the lane name cannot be a plain ref file; any other oddity raises, so the run fails.
-    """
-    if not _LANE.fullmatch(lane) or lane.endswith(".lock"):
-        return None  # no such branch can be read as one plain file under refs/heads
+def _git_dir(root: Path) -> Path:
+    """The repo's .git directory; a missing one or a reftable store fails the whole run."""
     git_dir = root / ".git"
     if not git_dir.is_dir():
         raise RuntimeError(f"N6 head: {git_dir} is not a git directory")
     if (git_dir / "reftable").exists():
         raise RuntimeError("N6 head: reftable ref storage is not read")
+    return git_dir
+
+
+def branch_tip(n6: N6, root: Path, lane: str) -> str | None:
+    """The sha of ``refs/heads/worktree-<lane>``, read from the ref files through ``n6.read``.
+
+    No git process: stage_git refuses the live repo (it has a multi-pack-index) and walks all
+    of .git per call. None only when neither a loose nor a packed ref exists (branch deleted)
+    or the lane name cannot be a plain ref file; any other oddity raises (``judge`` makes a
+    bad ref that lane's unknown; a missing .git or a reftable store fails the run).
+    """
+    if not _LANE.fullmatch(lane) or lane.endswith(".lock"):
+        return None  # no such branch can be read as one plain file under refs/heads
+    git_dir = _git_dir(root)
     name = f"refs/heads/worktree-{lane}"
     loose = git_dir / name
     if not loose.is_dir():  # a directory there holds worktree-<lane>/... refs, not this one
@@ -88,6 +95,8 @@ def branch_tip(n6: N6, root: Path, lane: str) -> str | None:
             text: str | None = n6.read(loose)
         except FileNotFoundError:
             text = None
+        except UnicodeDecodeError as error:  # one lane's garbage ref, not a git-wide fault
+            raise RuntimeError(f"N6 head: {name} is not text: {error}") from error
         if text is not None:
             sha = text.strip()
             if not _TIP.fullmatch(sha):
@@ -125,11 +134,19 @@ def judge(root: Path, *, clock: Callable[[], datetime],
         except PermissionError as error:
             n6.note(f"{lane} refused: {error}")
             return None
+        except RuntimeError as error:  # one lane's bad ref: that lane is unknown, the pass goes on
+            print(f"N6 {lane}: {error}", file=sys.stderr)
+            return None
 
+    if head is None:
+        _git_dir(root)  # global git trouble fails the run once, not as a per-lane unknown
     started = timer()
     result = compare(root, clock=clock, read=n6.read, head=head or git_head)
     took = (timer() - started) / max(len(result["records"]), 1)
     snap = load(root, read=n6.read)
+    for number in snap.padded:
+        print(f"n6_shadow: events.jsonl line {number}: dropped NUL fill from a crashed append",
+              file=sys.stderr)
     usage_text = _read(n6, root / "build" / "ledger" / "usage.json")
     usage = json.loads(usage_text).get("by_lane", {}) if usage_text else {}
     notes = _read(n6, notes_path)

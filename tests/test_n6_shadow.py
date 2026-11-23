@@ -128,6 +128,33 @@ class N6ShadowTests(unittest.TestCase):
         with self.assertRaises(n6_shadow.TornSnapshot):
             n6_shadow.load(self.root, read=guarded)
 
+    def test_neg_nul_padding_from_a_crashed_append_is_recovered_other_garbage_raises(self) -> None:
+        ledger = self.conveyor / "events.jsonl"
+        clean = ledger.read_text(encoding="utf-8")
+        base = len(clean.splitlines())
+        takeover = {"ts": "2026-11-19T22:34:21", "event": "lock_takeover", "old_pid": 4192, "reason": "os_lock"}
+        # the live 2026-11-19 shape: zero fill left by a dead writer, then the next append after it
+        ledger.write_text(clean + "\x00" * 359 + json.dumps(takeover) + "\n" + "\x00" * 7 + "\n"
+                          + "\x00" * 5, encoding="utf-8", newline="")
+        snap = n6_shadow.load(self.root, read=guarded)
+        self.assertEqual(snap.events[-1], takeover)
+        self.assertEqual(snap.padded, (base + 1, base + 2, base + 3))  # EOF fill reported too
+        self.assertEqual(len(n6_shadow.compare(self.root, clock=clock, read=guarded)["records"]),
+                         len(snap.lanes))
+        # the conveyor writes ensure_ascii=False: a U+2028 / U+0085 in a string is not a line end
+        odd = dict(takeover, reason="a b\u0085c")
+        ledger.write_text(clean + json.dumps(odd, ensure_ascii=False) + "\n", encoding="utf-8", newline="")
+        self.assertEqual(n6_shadow.load(self.root, read=guarded).events[-1], odd)
+        ledger.write_text("\x00" * 359, encoding="utf-8", newline="")  # a lost ledger, not an empty one
+        with self.assertRaises(n6_shadow.TornSnapshot):
+            n6_shadow.load(self.root, read=guarded)
+        for bad in ("\x00" * 3 + '{"ts": "x", "ev\n', '{"ts":\x00 "x"}\n', "not json\n", "[1]\n",
+                    '{"ts": "x", "ev' + "\x00" * 4):
+            ledger.write_text(clean + bad + json.dumps(takeover) + "\n" if bad.endswith("\n")
+                              else clean + bad, encoding="utf-8", newline="")
+            with self.assertRaises(n6_shadow.TornSnapshot, msg=repr(bad)):
+                n6_shadow.load(self.root, read=guarded)
+
     def test_neg_report_text_alone_never_passes(self) -> None:
         lanes = json.loads((self.conveyor / "lanes.json").read_text(encoding="utf-8"))
         lanes["N6-02"]["status"] = "BLOCKED"
