@@ -69,7 +69,35 @@ WEAK_RE = re.compile(r"(?im)^[ \t>*-]*(?:test[- ]weakening\b(?![ \t]*:[ \t]*(?:n
                      r"|CHANGED ASSERTS:.*\b(?:weaken|remov|delet|relax|loosen|skip|disabl))")
 REVIEWER_RE = re.compile(r"(?im)^[ \t]*(?:reviewer|worker):[ \t]*(.+)$")
 SEC_RE = re.compile(r"(?i)secur|critical|secret|credential|breach|leak|incident")  # T5: never auto-acked
-DAILY_CAP = {"queue_fix_slice": 6, "page_salih": 3}  # T5: per-code daily caps (items 2 and 9)
+DAILY_CAP = {"queue_fix_slice": 6, "page_salih": 3,  # T5: per-code daily caps (items 2 and 9)
+             "fix_seen": 6, "new_slice": 4}  # T5: observed FIX (item 2) and new slice (item 5) on the agree path
+CHAIN_ID_RE = re.compile(r"(?i)^(?:CDXINT|CLREV|CDX|INT|AFX)\d")  # ids the chain generates itself
+# T4: the hands write only schema-bound records of ids/enums, never free text, under a size cap (items 7, 10)
+HAND_FIELDS = {"notebook": {"ts": "int", "code": "rule", "action": "action", "target": "id", "ref": "id"},
+               "inbox": {"ts": "int", "code": "rule", "action": "action", "target": "id", "finding": "id",
+                         "template": "id"}}
+HAND_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:@/-]{0,63}")
+HAND_RULE_RE = re.compile(r"[A-Z][A-Z0-9-]{0,31}")
+HAND_MAX = 256
+
+
+def hand_record(kind, rec):
+    """One notebook/inbox record as a compact json line; ValueError on anything but ids/enums (KeyError: kind)."""
+    fields = HAND_FIELDS[kind]
+    if not isinstance(rec, dict) or not rec:
+        raise ValueError(f"{kind} record must be a non-empty object")
+    for k, v in rec.items():
+        if k not in fields:
+            raise ValueError(f"{kind} record: unknown field {k!r}")
+        t = fields[k]
+        ok = (type(v) is int and v >= 0) if t == "int" else isinstance(v, str) and (
+            v in ACTIONS if t == "action" else (HAND_RULE_RE if t == "rule" else HAND_ID_RE).fullmatch(v))
+        if not ok:
+            raise ValueError(f"{kind} record: {k} is not an id/enum")
+    line = json.dumps(rec, sort_keys=True, separators=(",", ":"))
+    if len(line.encode()) > HAND_MAX:
+        raise ValueError(f"{kind} record is over the {HAND_MAX} byte cap")
+    return line
 TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{20,64}")  # unguessable: token_urlsafe(24) gives 32
 REPORT_MAX = 256 * 1024
 ROUTINE_RE = re.compile(r"^(reader needs_orchestrator|FINDINGS):")
@@ -1382,9 +1410,18 @@ class Bot:
         ids = sorted({str(s.get("id")) for s in slices if isinstance(s, dict) and s.get("id")}) \
             if isinstance(slices, list) else known["backlog"]
         for i in ids:  # BOTFIX3C: only a new id whose prefix is a lane that finished BLOCKED before it
-            if i not in known["backlog"] and self.st["blocked"].get(i.split("-")[0].lower(), now + 1) <= now:
-                act(now, "queue_fix_slice", agree_key("queue_fix_slice", i.split("-")[0]), "orchestrator",
-                    f"backlog id {i}")
+            if i in known["backlog"] or first:
+                continue
+            pre = i.split("-")[0]
+            fix = self.st["blocked"].get(pre.lower(), now + 1) <= now
+            if fix:
+                act(now, "queue_fix_slice", agree_key("queue_fix_slice", pre), "orchestrator", f"backlog id {i}")
+            elif CHAIN_ID_RE.match(i):  # a review/INT id the chain made is not an item-5 new slice
+                continue
+            # ALLOWLIST T5: every FIX/new slice queued counts; over the cap, escalate (the actual is never dropped)
+            if self.capped("fix_seen" if fix else "new_slice", now):
+                self.decide(now, f"backlog id {i}", "escalate_orchestrator", "ALLOW-T5", pre,
+                            f"daily {'FIX' if fix else 'new slice'} cap reached (observed)")
         p, old = self.read_json(self.conv / "pace.json", {}), known["pace"]
         pace = dict({k: p[k] for k in PACE_KEYS if num(p.get(k))}, paused=bool(p.get("pause") or p.get("paused"))) \
             if p else old
