@@ -184,6 +184,8 @@ def _save(path: Path, s: _State) -> None:
         "version": 1, "pending": [asdict(e) for e in s.pending], "daily": s.daily,
         "ask_day": s.ask_day, "asks": s.asks, "outbox": s.outbox, "outbox_asks": s.outbox_asks,
     }  # exactly _KEYS: the 00f3a20 reader rejects any other key (refusal counts: sidecar)
+    if s.refused:  # only a legacy key whose move to the sidecar failed: never drop counts
+        data["refused"] = s.refused
     _write(path, data)
 
 
@@ -204,6 +206,30 @@ def _load_counts(path: Path) -> dict[str, int]:
             for k, v in cast("dict[object, object]", data).items()):
         raise _bad("refused")
     return cast("dict[str, int]", data)
+
+
+def _open(path: Path, soft: bool = False) -> tuple[_State, dict[str, int]]:
+    """State and refusal counts. A DORAGATE1 state kept its counts in the state file:
+    they move to the sidecar here, before any save can drop that key (DORAGATE1FIX2).
+    ``soft`` (submit): a sidecar problem never blocks storing an event; the legacy counts
+    then stay in the state (_save keeps them) for a later load to move."""
+    s = _load(path)
+    if soft and not s.refused:
+        return s, {}  # submit needs no counts
+    try:
+        counts = _load_counts(path)
+        if s.refused:
+            for why, n in s.refused.items():
+                counts[why] = counts.get(why, 0) + n
+            # shortcut: a failed save right after this fold folds again next load (counts
+            # only, never events), upgrade if counts must be exact
+            _write(_counts_path(path), counts)
+            s.refused = {}
+    except (OSError, StateError):
+        if not soft:
+            raise
+        return s, {}
+    return s, counts
 
 
 def _write(path: Path, data: object) -> None:
@@ -235,7 +261,7 @@ def submit(state_path: Path | str, event: Event) -> Route:
     if not event.key.strip():
         raise ValueError("event key must not be empty")
     path = Path(state_path)
-    s = _load(path)
+    s, _ = _open(path, soft=True)
     if route is Route.DAILY:
         if (line := clean(event.text)) and line not in s.daily:
             s.daily.append(line)  # ponytail: dedupe by text, store keys if distinct items collide
@@ -262,16 +288,14 @@ def flush(
     malformed deny list raises before state is touched: nothing sent or consumed.
     DORAGATE1FIX: the joined message is screened too; a line whose join is refused waits
     for the next flush, so the text sent is always the text screened.
+    DORAGATE1FIX2: a persisted outbox is screened joined and per line; the state is saved
+    before the sidecar, so a sidecar write error can lose a count, never an event.
     """
     if at.utcoffset() is None:
         raise ValueError("at must be timezone-aware")
     deny = dora_screen.load_deny()  # fail closed: raises, nothing sent
     path = Path(state_path)
-    s = _load(path)
-    counts = _load_counts(path)
-    for why, n in s.refused.items():  # a DORAGATE1 state kept its counts in the state file
-        counts[why] = counts.get(why, 0) + n
-    s.refused = {}
+    s, counts = _open(path)
 
     def refuse(text: str) -> bool:
         ok, why = dora_screen.screen(text, deny)
@@ -279,7 +303,7 @@ def flush(
             counts[why] = counts.get(why, 0) + 1
         return not ok
 
-    if s.outbox and refuse(s.outbox):
+    if s.outbox and (refuse(s.outbox) or any(refuse(x) for x in s.outbox.split("\n"))):
         s.asks -= s.outbox_asks  # its asks were never sent: free them for today
         s.outbox, s.outbox_asks = "", 0
     day = at.astimezone(ISTANBUL).date().isoformat()
@@ -312,9 +336,9 @@ def flush(
     finally:
         s.pending += queue
         s.outbox = "\n".join(lines)
+        _save(path, s)  # first: the sidecar may fail, the events must not
         if counts:
             _write(_counts_path(path), counts)
-        _save(path, s)
     if not s.outbox:
         return None
     text = s.outbox
@@ -328,14 +352,15 @@ def _head(i: int, n: int) -> str:
     return f"Akşam özeti {i}/{n}\n"
 
 
-def _parts(items: list[str]) -> list[list[str]]:
-    """Pack items in order into parts that fit MAX_CHARS with any header; one line per item."""
+def _parts(items: list[str], joins: Callable[[str], bool]) -> list[list[str]]:
+    """Pack items in order into parts that fit MAX_CHARS with any header; one line per item.
+    A line joins a part only if ``joins`` passes the joined text."""
     room = MAX_CHARS - len(_head(len(items), len(items)))  # widest header: parts <= items
     parts: list[list[str]] = []
     size = 0
     for item in items:
         line = _clip(item, room)  # an item longer than a part is clipped, never dropped
-        if parts and size + 1 + len(line) <= room:
+        if parts and size + 1 + len(line) <= room and joins("\n".join([*parts[-1], line])):
             parts[-1].append(line)
             size += 1 + len(line)
         else:
@@ -349,17 +374,36 @@ def evening_summary(state_path: Path | str, deliver: Callable[[str], None]) -> l
 
     An item leaves state only after ``deliver`` returned for the part holding it, so
     a failed delivery keeps every undelivered item for the next call (nothing dropped).
+    DORAGATE1FIX2: every item and every delivered text is screened like flush; a refused
+    item or part is dropped, never delivered, and counted by label in the sidecar.
     """
+    deny = dora_screen.load_deny()  # fail closed: raises, nothing delivered or consumed
     path = Path(state_path)
-    s = _load(path)
-    parts = _parts(s.daily)
+    s, counts = _open(path)
+
+    def ok(text: str) -> bool:
+        good, why = dora_screen.screen(text, deny)
+        if not good:
+            counts[why] = counts.get(why, 0) + 1
+        return good
+
+    keep = [item for item in s.daily if ok(item)]
+    if len(keep) < len(s.daily):
+        s.daily = keep
+        _save(path, s)  # state first, as in flush
+        _write(_counts_path(path), counts)
+    parts = _parts(s.daily, lambda t: dora_screen.screen(t, deny)[0])
     sent: list[str] = []
     for i, part in enumerate(parts, 1):
         text = "\n".join(part)
         if len(parts) > 1:
             text = _head(i, len(parts)) + text
-        deliver(text)
+        good = ok(text)  # the clipped line and the header are screened too
+        if good:
+            deliver(text)
+            sent.append(text)
         s.daily = s.daily[len(part):]
         _save(path, s)
-        sent.append(text)
+        if not good:
+            _write(_counts_path(path), counts)
     return sent

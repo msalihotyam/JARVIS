@@ -431,6 +431,87 @@ class N6ScreenTests(N6NotifyTests.__base__):
         with self.assertRaises(StateError):
             self.flush()
 
+    def test_neg_evening_summary_screens_every_item(self):  # CDX-DORAGATE1FIX F1
+        submit(self.path, Event("status", "a", f"kota {self.WORD}"))
+        submit(self.path, Event("status", "b", "API_" + "KEY=" + "x" * 40))
+        submit(self.path, Event("status", "c", "kota bitti"))
+        got = []
+        self.assertEqual(evening_summary(self.path, got.append), ["kota bitti"])
+        self.assertEqual(got, ["kota bitti"])
+        self.assertEqual(self.state()["daily"], [])
+        self.assertEqual(self.counts(), {"deny": 1, "secret": 1})
+        submit(self.path, Event("status", "d", "yarin"))
+        before = self.path.read_text("utf-8")
+        self.set_words()
+        with self.assertRaises(ValueError):  # empty list: nothing delivered or consumed
+            evening_summary(self.path, got.append)
+        self.assertEqual((got[1:], self.path.read_text("utf-8")), ([], before))
+
+    def test_neg_outbox_screened_per_line(self):  # CDX-DORAGATE1FIX F2
+        self.deny.write_text(json.dumps({"version": 1, "shapes": ["^QQ-1234$"], "words": []}),
+                             encoding="utf-8")
+        submit(self.path, Event("status", "a", "not"))
+        state = self.state()
+        state["outbox"] = "safe\nQQ-1234"
+        self.path.write_text(json.dumps(state), encoding="utf-8")
+        self.assertIsNone(self.flush())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.counts(), {"deny": 1})
+
+    def test_neg_sidecar_write_error_never_drops_the_event(self):  # CDX-DORAGATE1FIX F3
+        submit(self.path, Event("urgent", "a", f"kota {self.WORD}"))
+        submit(self.path, Event("urgent", "b", "kota bitti"))
+        real = n6_notify._write
+
+        def write(path, data):
+            if path.name.endswith(".refused"):
+                raise OSError("disk full")
+            real(path, data)
+
+        with mock.patch.object(n6_notify, "_write", write), self.assertRaises(OSError):
+            self.flush()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.flush(), "kota bitti")  # the retry still sends it
+        self.assertEqual(self.sent, ["kota bitti"])
+
+    def test_legacy_refused_kept_on_first_load(self):  # CDX-DORAGATE1FIX F4
+        for first in (lambda: submit(self.path, Event("urgent", "b", "kota bitti")),
+                      lambda: evening_summary(self.path, lambda _t: None)):
+            submit(self.path, Event("status", "a", "not"))
+            state = self.state()
+            state["refused"] = {"deny": 2}  # written by DORAGATE1
+            self.path.write_text(json.dumps(state), encoding="utf-8")
+            self.sidecar.unlink(missing_ok=True)
+            first()
+            self.assertEqual(set(self.state()), self.OLD_KEYS)
+            self.assertEqual(self.counts(), {"deny": 2})
+
+    def test_neg_bad_sidecar_never_blocks_submit(self):  # F2 probe H1
+        submit(self.path, Event("urgent", "a", "kota bitti"))
+        self.sidecar.write_text("{bad", encoding="utf-8")
+        submit(self.path, Event("urgent", "b", "kota yine bitti"))
+        self.assertEqual([e["key"] for e in self.state()["pending"]], ["a", "b"])
+
+    def test_neg_legacy_fold_error_keeps_event_and_counts(self):  # F2 probe H2
+        submit(self.path, Event("status", "a", "not"))
+        state = self.state()
+        state["refused"] = {"deny": 2}
+        self.path.write_text(json.dumps(state), encoding="utf-8")
+        real = n6_notify._write
+
+        def write(path, data):
+            if path.name.endswith(".refused"):
+                raise OSError("disk full")
+            real(path, data)
+
+        with mock.patch.object(n6_notify, "_write", write):
+            submit(self.path, Event("urgent", "b", "kota bitti"))
+        self.assertEqual([e["key"] for e in self.state()["pending"]], ["b"])
+        self.assertEqual(self.state()["refused"], {"deny": 2})  # kept for the next load
+        submit(self.path, Event("urgent", "c", "kota yine bitti"))
+        self.assertEqual(set(self.state()), self.OLD_KEYS)
+        self.assertEqual(self.counts(), {"deny": 2})
+
 
 if __name__ == "__main__":
     unittest.main()
