@@ -10272,7 +10272,9 @@ class TestChain(AutopilotBase):
     # CHAINSTACK1: an early report without a full COMMIT line chains only when git proves the linear stack
     def range_git(self, out, rc=0):
         key = self.PIN + ("rev-list", "--reverse", "--parents", f"{self.RB}..{self.SHA}")
-        self.git.fail = {key: (rc, out), **self.git.fail}
+        # CHAINSTACK1FIX2: the new answer replaces an earlier one ({key: new, **old} kept the old value)
+        self.git.fail = {key: (rc, out), **{k: v for k, v in self.git.fail.items() if k != key}}
+        return key
 
     def no_commit_first(self):
         lanes = self.stacked()
@@ -10333,16 +10335,21 @@ class TestChain(AutopilotBase):
         self.assertIn(f"{self.S1} build/reports/FIXA.md; {self.S2} (no lane report)", text)
 
     def test_stack_neg_unproven_history_refuses_the_report_less_commit(self):
-        X = "c" * 40
+        X = "9" * 40  # CHAINSTACK1FIX2: not self.SHA ("c" * 40), so "extra commit" really adds a foreign commit
+        self.assertNotIn(X, (self.RB, self.S1, self.S2, self.SHA))
         cases = {"non-ancestor": (0, f"{self.S2} {self.RB}\n{self.SHA} {self.S2}\n"),
                  "reordered": (0, f"{self.S2} {self.RB}\n{self.S1} {self.S2}\n{self.SHA} {self.S1}\n"),
                  "extra commit": (0, f"{self.S1} {self.RB}\n{X} {self.S1}\n{self.S2} {X}\n{self.SHA} {self.S2}\n"),
                  "merge": (0, f"{self.S1} {self.RB} {X}\n{self.S2} {self.S1}\n{self.SHA} {self.S2}\n"),
                  "git error": (128, f"{self.S1} {self.RB}\n{self.S2} {self.S1}\n{self.SHA} {self.S2}\n")}
+        base = dict(self.git.fail)
         for name, (rc, out) in cases.items():
             with self.subTest(name):
+                self.git.fail = dict(base)  # CHAINSTACK1FIX2: each case sets only its own git answers
                 lanes = self.no_commit_first()
-                self.range_git(out, rc=rc)
+                key = self.range_git(out, rc=rc)
+                self.assertEqual(self.git(list(key)), (rc, out))  # this case's answer, not an earlier one
+                self.assertFalse(self.c.stack_proven(self.RB, [self.S1, self.S2], self.SHA))
                 why, ap = self.direct(lanes, **self.STACK)
                 self.assertEqual(why, f"no single report names stack commit {self.S1[:7]}")
                 self.assertNotIn("chain_slices", ap)
