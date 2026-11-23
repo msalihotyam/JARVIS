@@ -313,7 +313,7 @@ class Gen:
         for sid in sorted(picks):
             for f in picks[sid][1]:
                 o = owner.setdefault(f, sid)
-                if o != sid and not (sid.startswith(o) or o.startswith(sid)):
+                if o != sid and re.sub(r"(?:FIX\d*)+$", "", o) != re.sub(r"(?:FIX\d*)+$", "", sid):
                     raise Refuse(f"scopes not disjoint: {f} in {o} and {sid}")
         order = []  # ponytail: O(n^2) ancestry checks, fine for a handful of picks
         todo = list(picks)
@@ -580,15 +580,18 @@ DAILY_CAP = {"slice": 4, "fix": 6}  # ALLOWLIST T5: --write per UTC day (item 5 
 def daily_count(root, cmd, at, add=0):
     """Today's --write count for cmd from build/orch/gen_caps.json; a corrupt file fails closed."""
     path = Path(root) / "build" / "orch" / "gen_caps.json"
-    key = f"{cmd}:{time.strftime('%Y-%m-%d', time.gmtime(at))}"
     try:
         caps = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
         caps = {}
     except ValueError as e:
         raise Refuse(f"ALLOW-T5 cap file unreadable ({e}); escalate to the orchestrator")
-    if not isinstance(caps, dict) or not all(type(v) is int for v in caps.values()):
+    if not isinstance(caps, dict) or not all(type(v) is int and v >= 0 and re.fullmatch(r"(?:%s):\d{4}-\d\d-\d\d" % "|".join(DAILY_CAP), k)
+                                             for k, v in caps.items()):
         raise Refuse("ALLOW-T5 cap file malformed; escalate to the orchestrator")
+    day = max([time.strftime("%Y-%m-%d", time.gmtime(at))] +
+              [k[len(cmd) + 1:] for k in caps if k.startswith(cmd + ":")])  # a backward clock keeps the newest day
+    key = f"{cmd}:{day}"
     if add:
         caps = {k: v for k, v in caps.items() if k == key or not k.startswith(cmd + ":")}  # drop old days
         caps[key] = caps.get(key, 0) + add

@@ -64,8 +64,9 @@ WAKE = {"O5", "O10", "DRY", "CONVSAFE", "R7/O19", "STUCK", "EVTAUDIT1", "PAGER",
 T1_RE = re.compile(r"(^|/)(conftest[^/]*\.py|pytest\.ini|tox\.ini|setup\.cfg|pyproject\.toml|uv\.lock|pace\.json"
                    r"|route\.py|test\.ps1|test_parallel\.py)$|(^|/)(tests/)?fixtures?/|quarantine|test[_-]?ids?\b"
                    r"|allowlist")
-# a report flags test weakening: a TEST WEAKENING line (not ": none") or CHANGED ASSERTS naming a weakening
-WEAK_RE = re.compile(r"(?im)^[ \t>*-]*(?:test[- ]weakening\b(?![ \t]*:[ \t]*(?:none|no|0|-)?[ \t.]*$)"
+# a report flags test weakening: a TEST WEAKENING line (unless its value is exactly none/no/0/-; an empty
+# value is a heading with details below) or CHANGED ASSERTS naming a weakening
+WEAK_RE = re.compile(r"(?im)^[^\w\n]*(?:\d+[.)][ \t]*)?(?:test[-_ \t]*weakenings?\b(?![ \t]*:[ \t]*(?:none|no|0|-)[ \t.]*$)"
                      r"|CHANGED ASSERTS:.*\b(?:weaken|remov|delet|relax|loosen|skip|disabl))")
 REVIEWER_RE = re.compile(r"(?im)^[ \t]*(?:reviewer|worker):[ \t]*(.+)$")
 SEC_RE = re.compile(r"(?i)secur|critical|secret|credential|breach|leak|incident")  # T5: never auto-acked
@@ -341,8 +342,9 @@ SHAPES = {  # shadow.json keys; a present key of another shape resets the state 
     "history": lambda v: isinstance(v, list) and all(
         isinstance(h, list) and len(h) == 3 and num(h[0]) and isinstance(h[1], str) and isinstance(h[2], str)
         for h in v),
-    "fixes": lambda v: isinstance(v, dict) and all(type(x) is int for x in v.values()),
-    "daily": lambda v: isinstance(v, dict) and all(type(x) is int for x in v.values()),
+    "fixes": lambda v: isinstance(v, dict) and all(type(x) is int and x >= 0 for x in v.values()),
+    "daily": lambda v: isinstance(v, dict) and all(type(x) is int and x >= 0 and re.fullmatch(r"(?:%s):\d{4}-\d\d-\d\d" % "|".join(DAILY_CAP), k)
+                                                   for k, x in v.items()),
     "respawns": lambda v: isinstance(v, dict) and all(isinstance(x, list) and all(num(t) for t in x)
                                                      for x in v.values()),
     "head": lambda v: isinstance(v, str),
@@ -1783,8 +1785,10 @@ class Bot:
         d = self.st.setdefault("daily", {})
         if not isinstance(d, dict):
             d = self.st["daily"] = {}
-        k = f"{code}:{cv.iso(at)[:10]}"
-        for old in [x for x in d if not x.endswith(k[-10:])]:
+        mine = [x for x in d if x.startswith(code + ":")]
+        day = max([cv.iso(at)[:10]] + [x[-10:] for x in mine])  # a backward event time counts on code's newest day
+        k = f"{code}:{day}"
+        for old in [x for x in mine if x != k]:
             d.pop(old)
         if d.get(k, 0) >= DAILY_CAP[code]:
             return True

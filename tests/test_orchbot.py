@@ -2027,6 +2027,24 @@ class AllowlistT1T5Test(BotCase):
         self.put("build/reports/L1.md", "STATUS: PASS\nTEST WEAKENING: removed an assert in test_a\n")
         self.assertEqual(self.acts(self.run_bot()), [("ask_salih_key1", "ALLOW-T1", "L1")])
 
+    def test_t1_weak_re_flags_every_value_but_an_explicit_none(self):  # FIX3 F1: one line per variant
+        for text in ("TEST WEAKENING:\n  - removed an assert", "TEST WEAKENING:   ", "TEST WEAKENING:",
+                     "TEST_WEAKENING: x", "TEST  WEAKENING: x", "test-weakening: x", "## TEST WEAKENING",
+                     "**TEST WEAKENING**: x", "> TEST WEAKENING: x", "TEST WEAKENING: nоne",
+                     "TEST WEAKENING: none (why)", "TEST WEAKENING: nonexistent", "TEST WEAKENING: none, but x",
+                     "CHANGED ASSERTS: relaxed one bound", "1. TEST WEAKENING: removed an assert",
+                     "2) TEST WEAKENING: x", "+ TEST WEAKENING: x", "TEST WEAKENINGS: removed 3 asserts",
+                     "| TEST WEAKENING | removed |", "`TEST WEAKENING: removed`"):
+            self.assertTrue(orchbot.WEAK_RE.search(text), repr(text))
+        for text in ("TEST WEAKENING: none", "TEST WEAKENING: None.", "- TEST WEAKENING: 0", "1. TEST WEAKENING: none",
+                     "TEST WEAKENING: no", "TEST WEAKENING: -", "STATUS: PASS\nCHANGED ASSERTS: none"):
+            self.assertIsNone(orchbot.WEAK_RE.search(text), repr(text))
+
+    def test_t1_empty_weakening_heading_never_auto_key1(self):
+        self.key1_lane("L1", ["jarvis/a.py"])
+        self.put("build/reports/L1.md", "STATUS: PASS\nTEST WEAKENING:\n  - removed an assert in test_a\n")
+        self.assertEqual(self.acts(self.run_bot()), [("ask_salih_key1", "ALLOW-T1", "L1")])
+
     def test_t2_key1_check_fail_asks_salih(self):
         self.key1_lane("L1", ["jarvis/a.py"])
         ds = self.run_bot(key1_verify=lambda lane, sha: (False, "FAIL 2 patch-id mismatch"))
@@ -2060,6 +2078,25 @@ class AllowlistT1T5Test(BotCase):
         for code, cap in orchbot.DAILY_CAP.items():
             self.assertEqual([bot.capped(code, at) for _ in range(cap + 1)], [False] * cap + [True], code)
             self.assertFalse(bot.capped(code, at + 86400), code)  # a new day resets the cap
+
+    def test_t5_backward_event_time_keeps_the_newest_day(self):  # FIX3 F3
+        bot = orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append, from_start=True,
+                          wake_post=self.post, wake_topic=self.topic, key1_verify=lambda lane, sha: (True, "PASS"))
+        bot.run()
+        at = self.clock()
+        for code, cap in orchbot.DAILY_CAP.items():
+            self.assertEqual([bot.capped(code, at + 86400) for _ in range(cap)], [False] * cap, code)
+            self.assertTrue(bot.capped(code, at), code)  # an older event time still counts on the newest day
+            self.assertTrue(bot.capped(code, at + 86400), code)
+        self.assertFalse(bot.capped(code, at + 2 * 86400))  # a forward day still resets
+
+    def test_t5_negative_or_bad_counter_state_fails_closed(self):  # FIX3 F2
+        for bad in ({"fixes": {"L1": -1}}, {"daily": {"page_salih:2026-10-15": -100}},
+                    {"daily": {"page_salih:2026-10-15": True}}, {"daily": {"page_salih:9999-zz-zz": 0}},
+                    {"daily": {"page_salih": 0}}, {"daily": {"O26:2026-10-15": 0}},
+                    {"daily": {"page_salih:x:2026-10-15": 0}}):
+            self.put("build/bot/shadow.json", dict(bad, cursor=0))
+            self.assertEqual(self.acts(self.run_bot()), [("escalate_orchestrator", "FAILCLOSED", "shadow.json")], bad)
 
     T4_OK = {"ts": 1, "code": "ALLOW-T5", "action": "escalate_orchestrator", "target": "LANE-fix"}
 
