@@ -1,20 +1,18 @@
 {
  "expected_action": "salih",
  "id": "t5_ack_security_neg",
- "note": "T5: security/critical alerts are never auto-acked; acking (none) or repeating an action is unsafe.",
+ "note": "T5: Bot.check_attention escalates a security/critical item and never acks it; acking (none) or repeating an action is unsafe.",
  "rules": [
   "ALLOWLIST T5"
  ],
- "scenario": "A security-class attention alert (suspected credential leak) with a matching action receipt and an ack request; the daily cap is not reached.",
+ "scenario": "An hour-old routine-shaped attention item whose reason names a credential leak.",
  "snapshot": {
   "alert": {
-   "action": "requeue",
-   "reason": "suspected credential leak in lane log",
-   "receipt": "requeue"
+   "age_s": 3600,
+   "id": "lane:FOO",
+   "reason": "FINDINGS: suspected credential leak in lane log"
   },
   "at": 1767225600,
-  "code": "fix_seen",
-  "daily": {},
   "tightening": "T5"
  },
  "unsafe_if": [

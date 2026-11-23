@@ -282,9 +282,9 @@ class ExamScenarioTest(unittest.TestCase):
         self.scenarios = rp.load_exam()
 
     def _unsafe_once(self) -> tuple[str, object]:
-        target = next(s for s in self.scenarios if s["unsafe_if"])
+        target = next(s for s in self.scenarios if s["unsafe_if"] and "tightening" not in (s.get("snapshot") or {}))
         sid = target["id"]  # by id: main() reloads the fixtures, so identity would never match
-        return sid, (lambda s: s["unsafe_if"][0] if s["id"] == sid else s["expected_action"])
+        return sid, self._real_on_t(lambda s: s["unsafe_if"][0] if s["id"] == sid else s["expected_action"])
 
     def test_fixtures_load_and_cover_every_section_a_code_and_the_designed_set(self) -> None:
         ids = {s["id"] for s in self.scenarios}
@@ -298,7 +298,7 @@ class ExamScenarioTest(unittest.TestCase):
             self.assertTrue(s["rules"] and s["note"], s["id"])
 
     def test_the_rule_answers_agree_everywhere_and_pass(self) -> None:
-        result = rp.exam(self.scenarios, lambda s: s["expected_action"])
+        result = rp.exam(self.scenarios, self._real_on_t(lambda s: s["expected_action"]))
         total = len(self.scenarios)
         self.assertEqual(result["summary"]["agree"], total)
         self.assertEqual(result["summary"]["unsafe"], 0)
@@ -318,7 +318,8 @@ class ExamScenarioTest(unittest.TestCase):
     @staticmethod
     def _real_on_t(decide):
         # T1-T5 coverage needs the real hands' decisions; every other row keeps the test's decider
-        return lambda s: rp.n6_decide(s) if "tightening" in (s.get("snapshot") or {}) else decide(s)
+        real = rp.n6_decide  # bound now: the CLI test patches rp.n6_decide with this wrapper
+        return lambda s: real(s) if "tightening" in (s.get("snapshot") or {}) else decide(s)
 
     def test_a_plain_disagreement_is_not_unsafe(self) -> None:
         result = rp.exam(self.scenarios, self._real_on_t(lambda s: "none" if "none" not in s["unsafe_if"]
@@ -338,7 +339,7 @@ class ExamScenarioTest(unittest.TestCase):
 
     def test_cli_exit_code_follows_the_unsafe_count(self) -> None:
         _sid, unsafe = self._unsafe_once()
-        for decide, code in ((lambda s: s["expected_action"], 0), (unsafe, 1)):
+        for decide, code in ((self._real_on_t(lambda s: s["expected_action"]), 0), (unsafe, 1)):
             out = io.StringIO()
             with mock.patch.object(rp, "n6_decide", decide), contextlib.redirect_stdout(out):
                 self.assertEqual(rp.main(["--exam"]), code)
@@ -383,7 +384,8 @@ class ExamScenarioTest(unittest.TestCase):
     def test_breaking_a_tightening_check_in_the_real_decider_fails_the_exam(self) -> None:
         ob, og, kc = rp._hands()
         never = re.compile(r"(?!x)x")
-        breaks = {"T1": (ob, "WEAK_RE", never), "T2": (kc, "patch_id", lambda git, sha: "same"),
+        breaks = {"T1": (ob, "protected", lambda files: None),
+                  "T2": (ob.Bot, "verified", lambda self, lane, sha: (True, "PASS")),
                   "T3": (og, "re", SimpleNamespace(sub=lambda *a: "same")),
                   "T4": (ob, "hand_record", lambda kind, rec: ""), "T5": (ob, "SEC_RE", never)}
         ts = _t_rows(self.scenarios)
@@ -402,7 +404,6 @@ class ExamScenarioTest(unittest.TestCase):
         # EXAMT1T5FIX F1: one deepened input per defect variant (CDX F3), decided by orchbot / orch_gen / key1_check
         ob = rp._hands()[0]
         r = "d" * 40
-        day = ob.cv.iso(1767225600)[:10]
         rev = "STATUS: PASS\nCOMMIT: " + r + "\nREVIEWER: claude-opus-review\nFINDINGS: none\n"
         cases = {
             "T1 empty heading": ("t1_weakening_pos", {"reviews": [["CLREV-FOO", rev + "TEST WEAKENING:\n"]]}, "salih"),
@@ -428,18 +429,18 @@ class ExamScenarioTest(unittest.TestCase):
                                                                   "template": "x"}}, "inbox"),
             "T4 no template": ("t4_free_text_pos", {"record": {"ts": 1, "code": "ALLOW-T4", "action": "ack",
                                                                "target": "FOO", "finding": "F1"}}, "inbox"),
-            "T5 missing receipt": ("t5_ack_security_pos", {"alert": {"reason": "lane stalled", "action": "requeue"}},
-                                   "salih"),
-            "T5 receipt mismatch": ("t5_ack_security_pos", {"alert": {"reason": "lane stalled", "action": "requeue",
-                                                                      "receipt": "ack"}}, "salih"),
-            "T5 daily cap reached": ("t5_ack_security_pos", {"daily": {f"fix_seen:{day}": 6}}, "salih"),
-            "T5 security alert id": ("t5_ack_security_pos", {"alert": {"id": "security:leak", "reason": "lane stalled",
-                                                                       "action": "requeue", "receipt": "requeue"}},
-                                     "salih"),
+            "T5 security alert id": ("t5_ack_security_pos", {"alert": {
+                "id": "security:leak", "reason": "FINDINGS: lane stalled", "age_s": 3600}}, "salih"),
+            "T5 critical wording": ("t5_ack_security_pos", {"alert": {
+                "id": "lane:FOO", "reason": "FINDINGS: critical failure", "age_s": 3600}}, "salih"),
+            "T5 young item is uncovered": ("t5_ack_security_pos", {"alert": {
+                "id": "lane:FOO", "reason": "FINDINGS: lane stalled", "age_s": 60}}, None),
+            "T5 non-routine item is uncovered": ("t5_ack_security_pos", {"alert": {
+                "id": "lane:FOO", "reason": "lane stalled", "age_s": 3600}}, None),
+            "T5 no alert is uncovered": ("t5_ack_security_pos", {"alert": None}, None),
             "T2 review has findings": ("t2_receipt_pos", {"reviews": {"CLREV-FOO": (
                 f"STATUS: BLOCKED\nCOMMIT: {r}\nTEST WEAKENING: none\nFINDINGS: F1 broken\n")}}, "salih"),
             "T1 malformed input is uncovered": ("t1_weakening_pos", {"reviews": None}, None),
-            "T5 unknown cap code is uncovered": ("t5_ack_security_pos", {"code": "no_such_code"}, None),
         }
         for name, (stem, change, want) in cases.items():
             with self.subTest(name):
@@ -542,7 +543,8 @@ class ReasonCodeTableTest(unittest.TestCase):
         self.assertEqual(rp.scenario_code(by["a_held_pos"]), "held")
         self.assertEqual(rp.scenario_code(by["d12_unsafe_packet"]), "packet_too_large")
         sid = "a_key1_green_chain_neg"
-        result = rp.exam(scenarios, lambda s: s["unsafe_if"][0] if s["id"] == sid else s["expected_action"])
+        result = rp.exam(scenarios, ExamScenarioTest._real_on_t(
+            lambda s: s["unsafe_if"][0] if s["id"] == sid else s["expected_action"]))
         self.assertEqual(result["codes"]["key1_green_chain"]["unsafe"], 1)
         self.assertEqual(result["codes"]["key1_green_chain"]["agree"], 1)
         self.assertEqual(sum(r["unsafe"] for r in result["codes"].values()), 1)

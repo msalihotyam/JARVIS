@@ -425,7 +425,7 @@ def n6_decide(scenario: dict[str, Any]) -> str | None:
 
 # EXAMT1T5FIX: a T1-T5 snapshot is decided by the hands' own code (scripts/orchbot.py, orch_gen.py,
 # key1_check.py); the snapshot holds raw inputs only, the hands' action is mapped to the exam vocabulary
-HANDS_ACTION = {"ask_salih_key1": "salih", "write_key1": "approve_key1"}
+HANDS_ACTION = {"ask_salih_key1": "salih", "write_key1": "approve_key1", "escalate_orchestrator": "salih", "ack": "none"}
 
 
 class _PastScope(Exception):
@@ -465,15 +465,9 @@ def _key1_stub(snap: dict[str, Any], said: list[str], reviews: list[tuple[str, s
         decide=lambda _at, _saw, action, *_a, **_k: said.append(action))
 
 
-def _t2_verified(kc: Any, snap: dict[str, Any]) -> tuple[bool, str]:
-    """orchbot.Bot.verified's T2 part: key1_check.verify check 2 (pick patch-id == reviewed commit's) on a fake repo."""
-    import hashlib
-    import json
-    import tempfile
-    from pathlib import Path as _P
+def _git_fake(snap: dict[str, Any]) -> Callable[..., tuple[int, str]]:
+    """key1_check's git subprocess over the scenario's commits; key1_check itself does every check."""
     commits, base, sha = snap["commits"], snap["base"], snap["sha"]
-    if kc.field(snap["report"], "CANDIDATE SHA") != sha:
-        return False, f"report CANDIDATE SHA is not {sha[:7]}"
 
     def git(args: list[str], inp: str | None = None) -> tuple[int, str]:
         if args[0] == "diff-tree" and "-p" in args:
@@ -487,20 +481,18 @@ def _t2_verified(kc: Any, snap: dict[str, Any]) -> tuple[bool, str]:
         if args[:2] == ["merge-base", "--is-ancestor"]:
             return (0 if args[2:] == [base, sha] else 1), ""
         return 0, ""
+    return git
 
-    with tempfile.TemporaryDirectory() as tmp:
-        reports = _P(tmp) / "build" / "reports"
-        reports.mkdir(parents=True)
-        (_P(tmp) / "build" / "conveyor").mkdir()
-        (_P(tmp) / "build" / "conveyor" / "backlog.json").write_text(json.dumps(snap["backlog"]), encoding="utf-8")
-        for name, text in {snap["lane"]: snap["report"], **snap["reviews"]}.items():
-            (reports / f"{name}.md").write_text(text, encoding="utf-8")
-        out, _ = kc.verify(snap["lane"], tmp, git, lambda _args: (1, ""))
-    # every key1_check verdict as orchbot.Bot.verified reads it, except check 4 (CI): green CI is the premise
-    fails = [x for x in out if x.startswith("FAIL") and not x.startswith("FAIL 4 ")]
-    if not any(x.startswith("PASS 2") for x in out):
-        fails.append("FAIL 2 not reached")
-    return not fails, (fails or ["PASS"])[0]
+
+def _bot(ob: Any, tmp: str, at: int) -> Any:
+    """A real orchbot.Bot on a scratch root, shadow only (run() is never called, so nothing goes live)."""
+    bot = ob.Bot(Path(tmp), now=lambda: at)
+    bot.st, bot.new, bot.attn = bot.load_state(), [], None
+    return bot
+
+
+def _said(bot: Any) -> str | None:
+    return HANDS_ACTION.get(bot.new[-1]["would_do"], bot.new[-1]["would_do"]) if bot.new else None
 
 
 def hands_decide(snap: dict[str, Any]) -> str | None:
@@ -515,16 +507,28 @@ def hands_decide(snap: dict[str, Any]) -> str | None:
 def _hands_decide(snap: dict[str, Any]) -> str | None:
     ob, og, kc = _hands()
     t, said = snap["tightening"], []
-    if t in ("T1", "T2"):
-        reviews = [tuple(r) for r in snap["reviews"]] if t == "T1" else list(snap["reviews"].items())
-        stub = _key1_stub(snap, said, reviews)
-        if t == "T1":  # orchbot.Bot.key1: WEAK_RE on report/reviews, then protected(files), else the key-1 gate
-            stub.gate_key1 = lambda *_a: said.append("write_key1")
-            ob.Bot.key1(stub, 0, "exam", snap["lane"], {"ci": {"cand": True}}, snap["sha"])
-        else:  # orchbot.Bot.gate_key1 over key1_check's receipt check
-            stub.verified = lambda _lane, _sha: _t2_verified(kc, snap)
-            ob.Bot.gate_key1(stub, 0, "exam", snap["lane"], snap["sha"], "exam", None)
+    if t == "T1":  # orchbot.Bot.key1: WEAK_RE on report/reviews, then protected(files), else the key-1 gate
+        stub = _key1_stub(snap, said, [tuple(r) for r in snap["reviews"]])
+        stub.gate_key1 = lambda *_a: said.append("write_key1")
+        ob.Bot.key1(stub, 0, "exam", snap["lane"], {"ci": {"cand": True}}, snap["sha"])
         return HANDS_ACTION.get(said[-1], said[-1]) if said else None
+    if t == "T2":  # a real Bot.gate_key1 -> Bot.verified -> key1_check.verify; only git/gh are faked
+        from unittest import mock
+        assert sys.modules.get("key1_check") is kc  # the module Bot.verified imports
+        git = _git_fake(snap)
+        gh = lambda _a: (0, json.dumps([{"workflowName": "tests", "headSha": snap["sha"], "status": "completed",  # noqa: E731
+                                          "conclusion": "success", "url": "exam"}]))
+        with tempfile.TemporaryDirectory() as tmp:
+            reports = Path(tmp) / "build" / "reports"
+            reports.mkdir(parents=True)
+            (Path(tmp) / "build" / "conveyor").mkdir()
+            (Path(tmp) / "build" / "conveyor" / "backlog.json").write_text(json.dumps(snap["backlog"]), encoding="utf-8")
+            for name, text in {snap["lane"]: snap["report"], **snap["reviews"]}.items():
+                (reports / f"{name}.md").write_text(text, encoding="utf-8")
+            bot = _bot(ob, tmp, snap.get("at", 0))
+            with mock.patch.object(kc, "make_git", lambda _r: git), mock.patch.object(kc, "make_gh", lambda _r: gh):
+                bot.gate_key1(0, "exam", snap["lane"], snap["sha"], "exam", None)
+        return _said(bot)
     if t == "T3":  # orch_gen Gen.integration: batch INT scopes disjoint (a slice and its own FIX may share)
         try:
             og.Gen.integration(_IntStub(snap["picks"]), list(snap["rids"]))
@@ -538,15 +542,18 @@ def _hands_decide(snap: dict[str, Any]) -> str | None:
             ob.hand_record("inbox", snap["record"])
         except (ValueError, KeyError):
             return "inbox"
+        # no hands selector exists: hand_record is the real check, the hands_propose_fix label is this adapter's
         return "hands_propose_fix" if {"finding", "template"} <= set(snap["record"]) else "inbox"
-    if t == "T5":  # orchbot: a security alert is never acked; no matching receipt or a spent daily cap escalates
-        from types import SimpleNamespace
-        alert = snap["alert"]
-        sec = ob.SEC_RE.search(f"{alert.get('id', '')} {alert.get('reason') or ''}")  # as Bot.check_attention
-        if sec or alert.get("receipt") != alert.get("action"):
-            return "salih"
-        stub = SimpleNamespace(st={"daily": dict(snap.get("daily") or {})})
-        return "salih" if ob.Bot.capped(stub, snap["code"], snap["at"]) else "none"
+    if t == "T5":  # a real Bot.check_attention over a status.json holding the one alert
+        alert, at = snap["alert"], snap["at"]
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "build" / "conveyor").mkdir(parents=True)
+            item = {"id": alert["id"], "reason": alert["reason"], "since": ob.cv.iso(at - alert["age_s"])}
+            (Path(tmp) / "build" / "conveyor" / "status.json").write_text(json.dumps({"attention": [item]}),
+                                                                          encoding="utf-8")
+            bot = _bot(ob, tmp, at)
+            bot.check_attention()
+        return _said(bot)
     return None
 
 

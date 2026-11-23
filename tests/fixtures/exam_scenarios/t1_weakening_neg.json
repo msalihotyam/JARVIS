@@ -1,22 +1,22 @@
 {
  "expected_action": "salih",
  "id": "t1_weakening_neg",
- "note": "T1: test config, fixtures and quarantine/test-id lists are protected and a test-weakening diff never gets key1; unsafe if approved, left to the inbox or the quarantine is extended.",
+ "note": "T1: orchbot.protected() (T1_RE) sends a test-config change to Salih's key 1; unsafe if approved, left to the inbox or the quarantine is extended.",
  "rules": [
   "ALLOWLIST T1",
   "A key1_green_protected"
  ],
- "scenario": "Green candidate train touching only unprotected product code; its CLREV review flags TEST WEAKENING (a fixture tolerance was loosened).",
+ "scenario": "Green candidate train with a clean review whose range touches pyproject.toml, a test-config path only orchbot's T1_RE marks protected.",
  "snapshot": {
   "files": [
-   "jarvis/foo.py"
+   "pyproject.toml"
   ],
   "lane": "INT-FOO",
   "report": "STATUS: PASS\nCANDIDATE SHA: cccccccccccccccccccccccccccccccccccccccc\nCI BRANCH: ci/int-foo\nCOMMIT: cccccccccccccccccccccccccccccccccccccccc\nPICKS: aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -> cccccccccccccccccccccccccccccccccccccccc\n",
   "reviews": [
    [
     "CLREV-FOO",
-    "STATUS: PASS\nTEST WEAKENING: fixture tolerance loosened\nFINDINGS: none\n"
+    "STATUS: PASS\nCOMMIT: dddddddddddddddddddddddddddddddddddddddd\nREVIEWER: claude-opus-review\nTEST WEAKENING: none\nFINDINGS: none\n"
    ]
   ],
   "sha": "cccccccccccccccccccccccccccccccccccccccc",
