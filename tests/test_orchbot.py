@@ -1950,5 +1950,60 @@ class DigestTest(BotCase):
         self.assertNotIn("a1" * 18, text)
 
 
+class DecisionGateTest(LiveTest):
+    """DECISIONID1: decide() is the single gate before a live act; a named decision id must be active,
+    a non-routine action without one is refused and waits for Salih, routine needs none."""
+    DID = "D-20261123-0132-ACKRULE"
+
+    def bot(self, *live):
+        b = orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append)
+        b.new, b.st, b.live = [], b.load_state(), set(live)
+        return b
+
+    def registry(self):
+        return self.root / orchbot.od.REL
+
+    def test_every_action_has_a_decision_class(self):
+        self.assertEqual(set(orchbot.ACTION_CLASS), set(orchbot.ACTIONS))
+        self.assertEqual(orchbot.ACTION_CLASS["write_key1"], "authority")
+
+    def test_authority_action_without_id_is_refused_and_asks_salih(self):
+        b = self.bot("write_key1")
+        with mock.patch.object(b, "act_live") as act:
+            b.decide(ts("2026-10-15T12:00:00"), "saw", "write_key1", "R", "INT63")
+        act.assert_not_called()
+        self.assertIn("ask Salih", b.new[0]["refused"])
+        self.assertEqual(self.acts(b.new), [("write_key1", "R", "INT63"),
+                                            ("escalate_orchestrator", "DECISIONID", "INT63")])
+        self.assertEqual(b.live, {"write_key1"})  # refused, not demoted
+
+    def test_live_ack_naming_an_unknown_or_inactive_id_is_refused(self):
+        orchbot.od.add(self.DID, "routine", "KARARLAR 2026-11-23 01:32", "2026-11-23T01:32:00",
+                       path=self.registry())
+        orchbot.od.deactivate(self.DID, path=self.registry())
+        for did, why in ((self.DID, "inactive"), ("D-20261123-0133-NOPE", "unknown")):
+            with self.subTest(did):
+                b = self.bot("ack")
+                b.decide(ts("2026-10-15T12:00:00"), "saw", "ack", "O33", "L2", decision=did)
+                self.assertFalse(self.ack().exists())
+                self.assertIn(why, b.new[0]["refused"])
+                self.assertEqual(b.new[-1]["rule"], "DECISIONID")
+
+    def test_live_ack_naming_an_active_id_acts(self):
+        orchbot.od.add(self.DID, "routine", "KARARLAR 2026-11-23 01:32", "2026-11-23T01:32:00",
+                       path=self.registry())
+        b = self.bot("ack")
+        b.decide(ts("2026-10-15T12:00:00"), "saw", "ack", "O33", "L2", decision=self.DID)
+        self.assertTrue(self.ack().exists())
+        self.assertEqual((b.new[0]["decision"], "refused" in b.new[0]), (self.DID, False))
+
+    def test_routine_live_ack_needs_no_id_and_no_registry(self):
+        self.live(ack=True)
+        self.attention("2026-10-15T11:30:00")
+        self.run_bot()
+        self.assertTrue(self.ack().exists())
+        self.assertFalse(self.registry().exists())
+
+
 if __name__ == "__main__":
     unittest.main()
