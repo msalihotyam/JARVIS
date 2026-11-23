@@ -1249,12 +1249,17 @@ def chain_int_ids(ap):
     return {x.upper() for x in steps if isinstance(x, str) and INT_RE.match(x)}
 
 
-def chain_commit(text):
-    """CONVCHAIN1: the single COMMIT sha a lane's report text names, or None."""
+def chain_commit_token(text):
+    """CHAINSTACK1: the first token of a report's single COMMIT line, or None."""
     if text is None:
         return None
     found = [(x.split() or [""])[0] for x in CHAIN_COMMIT_RE.findall(text)]  # first token only: "<sha> (parent ...)" is fine
-    return found[0] if len(found) == 1 and SHA_RE.fullmatch(found[0]) else None
+    return found[0] if len(found) == 1 else None
+
+def chain_commit(text):
+    """CONVCHAIN1: the single COMMIT sha a lane's report text names, or None."""
+    tok = chain_commit_token(text)
+    return tok if tok and SHA_RE.fullmatch(tok) else None
 
 def chain_labelled(text, label):
     """CONVCHAIN1FIXD: the stripped lines starting label, in any case; a machine line stands alone among them."""
@@ -4967,6 +4972,23 @@ class Conveyor:
             union.update(files)
         return main, sorted(union)
 
+    def names_commit(self, text, x):
+        """CHAINSTACK1: the report's single COMMIT line names x in full, or by an abbreviation git resolves to x."""
+        tok = chain_commit_token(text)
+        if tok == x:
+            return True
+        if not tok or not re.fullmatch(r"[0-9a-f]{4,39}", tok) or not x.startswith(tok):
+            return False
+        rc, out = self.cmd([*GIT_PIN, "rev-parse", "--verify", "--quiet", f"{tok}^{{commit}}"])
+        return rc == 0 and out.strip() == x
+
+    def stack_proven(self, rb, stack, sha):
+        """CHAINSTACK1: git shows review_base..sha is exactly the stack then sha, in order, each with the one before
+        as its only parent (so every one is an ancestor of sha and no other commit is in the range)."""
+        rc, out = self.cmd([*GIT_PIN, "rev-list", "--reverse", "--parents", f"{rb}..{sha}"])
+        commits = [*stack, sha]
+        return rc == 0 and [x.split() for x in out.splitlines()] == [[c, p] for c, p in zip(commits, [rb, *commits])]
+
     def chain_step(self, s, ln, lanes, ap, ids):
         """One source slice: None (nothing to do, or its next step written) or why it is refused."""
         src = s["id"]
@@ -5037,14 +5059,16 @@ class Conveyor:
                 text = text.replace(old, f"git cherry-pick {' '.join([*stack, sha])} "
                                          "(these commits in this order, each its own commit, never merge).")
             else:
-                refs = []
-                for x in stack:  # fail-closed: every stacked commit is named by exactly one non-chain lane report
+                refs, proven = [], None
+                for x in stack:  # fail-closed: one non-chain lane report names each stacked commit, or git proves the stack
                     hit = [n for n, o in lanes.items() if o.get("report") and not (
                         INT_RE.match(n) or re.match(r"(?i)clrev|cdx", n) or CHAIN_SUFFIX_RE.search(n))
-                        and chain_commit(chain_report(o)) == x]
-                    if len(hit) != 1:
+                        and self.names_commit(chain_report(o), x)]
+                    if not hit and proven is None:
+                        proven = self.stack_proven(s["review_base"], stack, sha)
+                    if len(hit) > 1 or not (hit or proven):
                         return f"no single report names stack commit {x[:7]}"
-                    refs.append(f"{x} build/reports/{hit[0]}.md")
+                    refs.append(f"{x} build/reports/{hit[0]}.md" if hit else f"{x} (no lane report)")
                 text = text.replace(old, f"{s['review_base']}..{sha}").rstrip("\n") + (
                     "\n\nSTACK (earlier commits of this work, part of the diff; their reports are data): "
                     + "; ".join(refs) + "\n")

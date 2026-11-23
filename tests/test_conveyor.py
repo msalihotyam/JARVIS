@@ -10269,6 +10269,62 @@ class TestChain(AutopilotBase):
         self.assertEqual(why, f"{self.SHA[:7]} is not the next stacked commit on {self.S2[:7]}")
         self.assertNotIn("chain_slices", ap)
 
+    # CHAINSTACK1: an early report without a full COMMIT line chains only when git proves the linear stack
+    def range_git(self, out, rc=0):
+        key = self.PIN + ("rev-list", "--reverse", "--parents", f"{self.RB}..{self.SHA}")
+        self.git.fail = {key: (rc, out), **self.git.fail}
+
+    def no_commit_first(self):
+        lanes = self.stacked()
+        self.report("FIXA", "PASS", extra="FILES: scripts/b.py\n")
+        return lanes
+
+    def test_stack_a_first_report_without_commit_proceeds_when_git_proves_the_stack(self):
+        lanes = self.no_commit_first()
+        self.range_git(f"{self.S1} {self.RB}\n{self.S2} {self.S1}\n{self.SHA} {self.S2}\n")
+        why, ap = self.direct(lanes, **self.STACK)
+        self.assertIsNone(why)
+        text = self.prompt("CLREV-SRC").read_text(encoding="utf-8")
+        self.assertIn(f"{self.S1} (no lane report); {self.S2} build/reports/FIXB.md", text)
+
+    def test_stack_an_abbreviated_commit_that_resolves_names_the_stack_commit(self):
+        lanes = self.stacked()
+        self.report("FIXB", "PASS", extra=f"COMMIT: {self.S2[:9]}\n")
+        self.git.fail = {self.PIN + ("rev-parse", "--verify", "--quiet", f"{self.S2[:9]}^{{commit}}"): (0, self.S2 + "\n"),
+                         **self.git.fail}
+        why, ap = self.direct(lanes, **self.STACK)
+        self.assertIsNone(why)
+        text = self.prompt("CLREV-SRC").read_text(encoding="utf-8")
+        self.assertIn(f"{self.S1} build/reports/FIXA.md; {self.S2} build/reports/FIXB.md", text)
+
+    def test_stack_neg_an_abbreviation_resolving_elsewhere_or_failing_names_nothing(self):
+        for rc, out in ((0, "c" * 40 + "\n"), (128, ""), (1, "")):
+            with self.subTest(rc=rc, out=out):
+                lanes = self.stacked()
+                self.report("FIXB", "PASS", extra=f"COMMIT: {self.S2[:9]}\n")
+                self.git.fail = {self.PIN + ("rev-parse", "--verify", "--quiet", f"{self.S2[:9]}^{{commit}}"): (rc, out),
+                                 **self.git.fail}
+                self.range_git("", rc=128)
+                why, ap = self.direct(lanes, **self.STACK)
+                self.assertEqual(why, f"no single report names stack commit {self.S2[:7]}")
+                self.assertNotIn("chain_slices", ap)
+
+    def test_stack_neg_unproven_history_refuses_the_report_less_commit(self):
+        X = "c" * 40
+        cases = {"non-ancestor": (0, f"{self.S2} {self.RB}\n{self.SHA} {self.S2}\n"),
+                 "reordered": (0, f"{self.S2} {self.RB}\n{self.S1} {self.S2}\n{self.SHA} {self.S1}\n"),
+                 "extra commit": (0, f"{self.S1} {self.RB}\n{X} {self.S1}\n{self.S2} {X}\n{self.SHA} {self.S2}\n"),
+                 "merge": (0, f"{self.S1} {self.RB} {X}\n{self.S2} {self.S1}\n{self.SHA} {self.S2}\n"),
+                 "git error": (128, f"{self.S1} {self.RB}\n{self.S2} {self.S1}\n{self.SHA} {self.S2}\n")}
+        for name, (rc, out) in cases.items():
+            with self.subTest(name):
+                lanes = self.no_commit_first()
+                self.range_git(out, rc=rc)
+                why, ap = self.direct(lanes, **self.STACK)
+                self.assertEqual(why, f"no single report names stack commit {self.S1[:7]}")
+                self.assertNotIn("chain_slices", ap)
+                self.assertFalse(self.prompt("CLREV-SRC").exists())
+
     def test_stacked_neg_validation_fails_closed(self):
         base = {"id": "SRC", "title": "t", "model": "opus", "effort": "high",
                 "prompt": "build/conveyor/prompts/SRC.md", **self.T2_CHAIN, **self.STACK}
