@@ -235,6 +235,31 @@ class OrchGenTest(unittest.TestCase):
         self.assertEqual(rc, 2, out)
         self.assertIn("scopes not disjoint: jarvis/foo.py in PMA and QZ", out)
 
+    def test_int_refuses_a_prefix_id_that_is_not_its_fix(self):  # FIX3 F4: PMA2 is not PMA's FIX
+        self.report("PMA2", self.sha_b, "jarvis/foo.py")
+        self.assertEqual(self.run_gen("review", "PMA", "--write", "--focus", "x")[0], 0)
+        self.assertEqual(self.run_gen("review", "PMA2", "--write", "--focus", "x")[0], 0)
+        for rid in ("CDXINT1", "CLREV2"):
+            self.put(f"build/reports/{rid}.md", f"STATUS: PASS\nCOMMIT: reviewed {self.sha_a}\n")
+        rc, out = self.run_gen("int", "CLREV2", "CDXINT1")
+        self.assertEqual(rc, 2, out)
+        self.assertRegex(out, r"scopes not disjoint: jarvis/foo\.py in PMA2? and PMA2?\b")
+
+    def test_gen_caps_negative_or_bad_key_is_refused(self):  # FIX3 F2
+        for bad in ({"slice:2027-01-15": -100}, {"slice:2027-01-15": True}, {"slice:zzzz": 0}, {"slice": 0}, [],
+                    {"slice:2027-01-15": 4, "slice:zz:2027-01-15": 0}, {"other:2027-01-15": 0}):
+            self.put("build/orch/gen_caps.json", json.dumps(bad))
+            with self.assertRaisesRegex(orch_gen.Refuse, "ALLOW-T5 cap file malformed", msg=bad):
+                orch_gen.daily_count(self.root, "slice", 1_800_000_000.0, add=1)
+
+    def test_gen_caps_backward_clock_keeps_the_newest_day(self):  # FIX3 F3
+        t, cap = 1_800_000_000.0, orch_gen.DAILY_CAP["slice"]
+        for _ in range(cap):
+            orch_gen.daily_count(self.root, "slice", t + 86400, add=1)
+        self.assertEqual(orch_gen.daily_count(self.root, "slice", t), cap)  # an older clock reads the newest day
+        self.assertEqual(orch_gen.daily_count(self.root, "slice", t, add=1), cap + 1)
+        self.assertEqual(orch_gen.daily_count(self.root, "slice", t + 2 * 86400), 0)  # a forward day still resets
+
     def test_spec_without_tests_or_run_is_refused(self):
         for k in ("tests", "run"):
             rc, out = self.run_gen("slice", "--spec", self.spec(**{k: None}), "--write")
