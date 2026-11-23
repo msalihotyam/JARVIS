@@ -75,6 +75,48 @@ class DecisionsTest(unittest.TestCase):
                 self.assertIn("malformed", why)
                 self.assertFalse(od.require("cost", A, path=self.path)[0])
 
+    def assert_refused_no_crash(self):
+        self.assertIs(od.load(self.path), od.UNKNOWN)
+        self.assertIsNone(od.get(A, path=self.path))
+        ok, why = od.require_active(A, path=self.path)
+        self.assertFalse(ok)
+        self.assertIn("malformed", why)
+        self.assertFalse(od.require("cost", A, path=self.path)[0])
+        before = self.path.read_bytes()
+        for write in (lambda: self.add(C), lambda: od.deactivate(A, path=self.path),
+                      lambda: od.supersede(A, B, path=self.path)):
+            with self.assertRaises(od.Malformed):
+                write()
+        self.assertEqual(self.path.read_bytes(), before)
+        self.assertEqual([p.name for p in self.path.parent.iterdir()], ["decisions.json"])  # no lock left
+
+    def test_undecodable_bytes_refused_not_crash(self):  # DECISIONID1FIX F2
+        good = json.dumps([{"id": A, "class": "cost", "state": "active", "superseded_by": None,
+                            "source": SRC, "at": AT}]).encode()
+        cases = {"ff fe": b"\xff\xfe[]", "lone continuation": b"[\x80]", "truncated multibyte": b"[\xe2\x82",
+                 "bad byte inside a valid record": good.replace(b"KARARLAR", b"KARAR\xffLAR")}
+        for name, data in cases.items():
+            with self.subTest(name):
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self.path.write_bytes(data)
+                self.assert_refused_no_crash()
+
+    def test_non_id_superseded_by_refused_not_crash(self):  # DECISIONID1FIX F1
+        b = {"id": B, "class": "cost", "state": "active", "superseded_by": None, "source": SRC, "at": AT}
+        for state in ("superseded", "active", "inactive"):
+            for bad in ([], {}, [B], {B: B}, 5, True, 1.5):
+                with self.subTest(state=state, superseded_by=bad):
+                    self.raw(json.dumps([dict(b, id=A, state=state, superseded_by=bad), b]))
+                    self.assert_refused_no_crash()
+
+    def test_non_text_class_or_state_refused_not_crash(self):
+        good = {"id": A, "class": "cost", "state": "active", "superseded_by": None, "source": SRC, "at": AT}
+        for key in ("class", "state"):
+            for bad in ([], {}, ["cost"], {"active": 1}, None, 0):
+                with self.subTest(key=key, value=bad):
+                    self.raw(json.dumps([dict(good, **{key: bad})]))
+                    self.assert_refused_no_crash()
+
     def test_malformed_file_is_never_overwritten(self):
         self.raw("{")
         for write in (lambda: self.add(B), lambda: od.deactivate(A, path=self.path)):
