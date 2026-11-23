@@ -35,10 +35,7 @@ class ReplayTest(unittest.TestCase):
                {"ts": "2026-10-15T12:00:00", "event": "reader", "lane": "L2",
                 "reading": {"kind": "needs_orchestrator", "summary": "y"}}]
         self.put("build/conveyor/events.jsonl", "".join(json.dumps(e) + "\n" for e in evs), "2026-10-15T09:00:00")
-        self.put("build/reports/L1.md", f"STATUS: PASS
-CANDIDATE SHA: {SHA}
-FILES: jarvis/a.py
-",
+        self.put("build/reports/L1.md", f"STATUS: PASS\nCANDIDATE SHA: {SHA}\nFILES: jarvis/a.py\n",
                  "2026-10-15T10:30:00")
         # ALLOWT1T5FIX5: a verified receipt; the real verify shells out, so the replay gets a PASS verifier
         self.verify_calls = []
