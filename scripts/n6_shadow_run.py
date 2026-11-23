@@ -147,6 +147,8 @@ def judge(root: Path, *, clock: Callable[[], datetime],
     for number in snap.padded:
         print(f"n6_shadow: events.jsonl line {number}: dropped NUL fill from a crashed append",
               file=sys.stderr)
+    for lane, why in sorted(snap.unreadable.items()):
+        print(f"N6 {lane}: report unreadable: {why}", file=sys.stderr)
     usage_text = _read(n6, root / "build" / "ledger" / "usage.json")
     usage = json.loads(usage_text).get("by_lane", {}) if usage_text else {}
     notes = _read(n6, notes_path)

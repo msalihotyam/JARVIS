@@ -155,6 +155,36 @@ class N6ShadowTests(unittest.TestCase):
             with self.assertRaises(n6_shadow.TornSnapshot, msg=repr(bad)):
                 n6_shadow.load(self.root, read=guarded)
 
+    def test_neg_an_unreadable_report_makes_only_that_lane_unknown(self) -> None:
+        report = self.root / "build" / "reports" / "CDX-N6-01.md"
+        clean = self.by_lane()
+        variants = {"invalid utf-8": b"\xff\xfe bad", "utf-16": "STATUS: PASS\n".encode("utf-16"),
+                    "cp1252": "STATUS: BLOCKED caf\xe9\n".encode("cp1252")}
+        for name, data in variants.items():
+            report.write_bytes(data)
+            got = self.by_lane()
+            self.assertEqual(n6_shadow.load(self.root, read=guarded).unreadable.keys(), {"CDX-N6-01"}, name)
+            self.assertEqual((got["CDX-N6-01"]["verdict"], got["CDX-N6-01"]["n6"]["verdict"]),
+                             ("unknown", "unknown"), name)
+            self.assertTrue(str(got["CDX-N6-01"]["n6"]["reason"]).startswith("report unreadable: Unicode"), name)
+            self.assertEqual({k: v for k, v in got.items() if k != "CDX-N6-01"},
+                             {k: v for k, v in clean.items() if k != "CDX-N6-01"}, name)
+        report.unlink()
+        report.mkdir()  # a directory where the report should be: OSError, not the pass
+        self.assertEqual(self.by_lane()["CDX-N6-01"]["n6"]["verdict"], "unknown")
+        report.rmdir()
+
+        def refused(path: Path) -> str:
+            if path.name == "INT100B.md":
+                raise PermissionError("guard refused")
+            return guarded(path)
+        snap = n6_shadow.load(self.root, read=refused)
+        self.assertEqual(snap.unreadable, {"INT100B": "PermissionError: guard refused"})
+        # a UTF-8 BOM is not report text: the conveyor reads utf-8-sig, so N6 must too
+        fix = self.root / "build" / "reports" / "N6-01FIX.md"
+        fix.write_bytes(b"\xef\xbb\xbf" + fix.read_bytes())
+        self.assertEqual(self.by_lane()["N6-01FIX"]["n6"]["reason"], "no independent sha (git head)")
+
     def test_neg_report_text_alone_never_passes(self) -> None:
         lanes = json.loads((self.conveyor / "lanes.json").read_text(encoding="utf-8"))
         lanes["N6-02"]["status"] = "BLOCKED"

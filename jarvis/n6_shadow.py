@@ -28,7 +28,7 @@ import os
 import posixpath
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, cast
@@ -51,6 +51,7 @@ class Snapshot:
     events: tuple[dict[str, Any], ...]
     reports: dict[str, str | None]
     padded: tuple[int, ...] = ()  # events.jsonl line numbers whose leading NUL fill was dropped
+    unreadable: dict[str, str] = field(default_factory=dict)  # lane -> why its report did not read
 
 
 def _json(text: str, what: str) -> Any:
@@ -69,13 +70,18 @@ def load(root: str | os.PathLike[str], *, read: Callable[[Path], str]) -> Snapsh
         raise TornSnapshot("lanes.json is not a lane -> state mapping")
     lanes = cast(dict[str, dict[str, Any]], lanes)
     reports: dict[str, str | None] = {}
+    unreadable: dict[str, str] = {}
     for lane in lanes:  # lanes.json names the lanes, never the reports directory
         if not _LANE.fullmatch(lane):
             raise TornSnapshot(f"lanes.json names a malformed lane: {lane!r}")
         try:
-            reports[lane] = read(Path(root) / "build" / "reports" / f"{lane}.md")
+            # the conveyor reads reports as utf-8-sig, so a leading BOM is not report text
+            reports[lane] = read(Path(root) / "build" / "reports" / f"{lane}.md").removeprefix("﻿")
         except FileNotFoundError:
             reports[lane] = None
+        except (UnicodeDecodeError, OSError) as error:  # one lane's bad report, not the pass
+            reports[lane] = None
+            unreadable[lane] = f"{type(error).__name__}: {error}"
     # A writer that dies mid-append can leave NUL zero fill; the next append lands after it.
     # Only that fill is dropped (leading, or trailing at EOF); any other bad line stays fatal.
     raw = read(conveyor / "events.jsonl")
@@ -103,7 +109,8 @@ def load(root: str | os.PathLike[str], *, read: Callable[[Path], str]) -> Snapsh
     # append only adds evidence. Re-read it too if the ledger is ever rewritten in place.
     if read(conveyor / "lanes.json") != first:
         raise TornSnapshot("lanes.json changed while the snapshot was read")
-    return Snapshot(lanes, cast(tuple[dict[str, Any], ...], events), reports, tuple(padded))
+    return Snapshot(lanes, cast(tuple[dict[str, Any], ...], events), reports, tuple(padded),
+                    unreadable)
 
 
 def _blocked_child(snap: Snapshot, lane: str) -> str | None:
@@ -155,6 +162,8 @@ def n6_verdict(snap: Snapshot, lane: str,
     """(pass | block | unknown, reason): N6's own decision; PASS needs report, state and the
     git head to agree. The sha evidence is only ``head`` (never the ledger, whose chain/ci sha
     is copied from the report): missing or different is unknown, never pass."""
+    if lane in snap.unreadable:  # the report exists but is not text N6 can judge
+        return "unknown", f"report unreadable: {snap.unreadable[lane]}"[:200]
     report = snap.reports[lane]
     if report is None:
         return "block", "no report"

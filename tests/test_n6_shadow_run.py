@@ -202,6 +202,17 @@ class ShadowRunTest(unittest.TestCase):
         self.assertIn("events.jsonl line 2", err.getvalue())
         self.assertIn("N6 A: N6 head: refs/heads/worktree-A is not text", err.getvalue())
 
+    def test_a_report_that_is_not_utf8_makes_only_that_lane_unknown(self) -> None:
+        self.on()
+        (self.root / "build/reports/A.md").write_bytes(b"\xff\xfe STATUS: PASS\n")  # A malformed, B valid
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            written = self.judge()
+        self.assertEqual(written, 2)  # B judged; A unknown, so no rows
+        self.assertEqual({r.slice_id for r in rows(self.db)}, {"B"})
+        self.assertIn("N6 A: report unreadable: UnicodeDecodeError", err.getvalue())
+        self.assertNotIn("N6 B:", err.getvalue())
+
     def test_no_git_dir_fails_the_run_instead_of_writing_nothing(self) -> None:
         self.on()
         with self.assertRaises(RuntimeError):
