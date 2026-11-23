@@ -9452,13 +9452,14 @@ class TestChain(AutopilotBase):
         self.assertEqual((main, files), (ORIGIN, ["scripts/a.py"]))
         diff = [c for c in self.git.calls if "--name-only" in c]
         self.assertEqual([list(c)[-2:] for c in diff], [[f"{self.SHA}^", self.SHA]])
+        self.assertTrue(all("-z" in c for c in diff))  # U1RULE1FIX3: NUL-separated raw names, never a whitespace split
 
     # (c) a file name that is not plainly safe never reaches a prompt
     def test_unsafe_file_name_refused_even_under_a_glob_grant(self):
         self.git.fail[self.PIN + ("rev-list",)] = (0, f"{self.SHA} {MAIN}\n")
-        grant = {"files": ["scripts/*", "build/reports/*"]}
+        grant = {"files": ["scripts/*", "build/reports/*", "jarvis/*"]}
         for name in ("scripts/a b.py", "scripts/a..b.py", "scripts/ä.py", "scripts/a\nb.py",
-                     "scripts/{ID}.py", "build/reports/x y.md"):
+                     "scripts/{ID}.py", "build/reports/x y.md", "scripts/çonveyor.py", "jarvis/a b.py"):
             with self.subTest(name=name):
                 self.commit(files=(name,))
                 main, why = self.c.chain_verify(grant, {"base": MAIN}, self.SHA)

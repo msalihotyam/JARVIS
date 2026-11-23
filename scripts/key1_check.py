@@ -134,13 +134,17 @@ def verify(lane, root, git, gh, operator_tool=False, rep=None):
         put(2, "PASS", f"{len(pick_shas)} pick(s) patch-id equal to {len(rev)} review commit(s)")
 
     allowed = [f.replace("\\", "/") for s in srcs for f in slices.get(s, {}).get("files") or []]
-    touched = set(git(["diff", "--name-only", "--no-renames", f"{base}...{cand}"])[1].split())
+    # U1RULE1FIX3: raw NUL-separated names (never quoted, never whitespace-split), exactly as git stores them
+    qp = ["-c", "core.quotepath=false"]
+    touched = set(filter(None, git([*qp, "diff", "--name-only", "--no-renames", "-z", f"{base}...{cand}"])[1].split("\0")))
     for s in pick_shas:
-        touched |= set(git(["diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames", s])[1].split())
+        touched |= set(filter(None, git([*qp, "diff-tree", "--no-commit-id", "--name-only", "-r", "--no-renames", "-z", s])[1]
+                                    .split("\0")))
     # U1RULE1 (Salih 11-22): a T1 source whose diff and backlog files are product code sends MINOR/NIT to POLISH.md;
     # only a report build/reports/<NAME>.md is dropped, by the same conveyor.chain_report_file chain_verify uses;
     # anything else under build/reports/ is kept, so "build/" in GRANT_DENY keeps the chain strict
-    pf = sorted(p for p in touched | set(allowed) if not conveyor.chain_report_file(p))
+    # strip only for the strictness test: "keys/a.pem " stays protected as .split() used to make it (F2)
+    pf = sorted(p.strip() for p in touched | set(allowed) if not conveyor.chain_report_file(p))
     polish_ok = bool(srcs) and not any(conveyor.chain_strict(slices.get(s, {}).get("tier"), pf) for s in srcs)
 
     # 3: every review report passes the conveyor's own chain gate (STATUS PASS, exactly one "FINDINGS: none", no finding line);

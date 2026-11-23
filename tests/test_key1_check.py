@@ -215,6 +215,24 @@ class Key1CheckTests(unittest.TestCase):
                 self.assertFalse(ok, text)
                 self.assertIn("FAIL 3", text)
 
+    def test_u1rule1fix3_touched_names_reach_the_gates_unquoted_and_unsplit(self):
+        """U1RULE1FIX3: git quotes non-ASCII names and .split() cut names at a space; both read NUL-separated now."""
+        minor = "1\nF1 MINOR: a.txt:1 - nit - fix"
+        # a bare star grant: a quoted name used to hide a protected path from chain_strict (polish_ok True -> WARN)
+        for name in ("scripts/çonveyor.py", "data/a b.txt"):
+            with self.subTest(name=name):
+                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", src_file=name, files=("*",)))
+                self.assertFalse(ok, text)
+                self.assertIn("FAIL 3", text)
+                self.assertIn("PASS 5", text)
+        # an exact grant of a space or non-ASCII product name: no stray half-names, the chain warns
+        for name in ("jarvis/a b.py", "jarvis/ça va.py"):
+            with self.subTest(name=name):
+                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", src_file=name, files=("a.txt", name)))
+                self.assertTrue(ok, text)
+                self.assertIn("WARN 3", text)
+                self.assertIn("PASS 5", text)
+
     def test_ci_must_be_success_on_exactly_the_candidate(self):
         fx = self.fx()
         for gh in (ci(fx.cand, "failure"), ci(fx.cand, None, "in_progress"), ci("0" * 40),
