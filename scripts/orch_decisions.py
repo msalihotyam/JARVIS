@@ -66,6 +66,8 @@ def _check(recs):
             raise Malformed(f"{i}: source and at must be non-empty text")
         if (r["state"] == "superseded") != (r["superseded_by"] is not None):
             raise Malformed(f"{i}: superseded_by goes with state superseded only")
+        if r["superseded_by"] is not None and not isinstance(r["superseded_by"], str):
+            raise Malformed(f"{i}: superseded_by must be an id or null")
         out[i] = r
     for i, r in out.items():
         s = r["superseded_by"]
@@ -79,12 +81,12 @@ def _read(path):
     try:
         with open(path, encoding="utf-8") as f:
             text = f.read()
+        return _check(json.loads(text, object_pairs_hook=_no_dup_keys))
     except FileNotFoundError:
         return {}
-    try:
-        return _check(json.loads(text, object_pairs_hook=_no_dup_keys))
-    except (ValueError, RecursionError) as e:
-        raise Malformed(f"{e}") from e
+    # UnicodeDecodeError is a ValueError; TypeError = any type confusion _check missed: malformed, never a crash
+    except (ValueError, TypeError, RecursionError) as e:
+        raise Malformed(f"{e}"[:200]) from e
 
 
 def load(path=DEFAULT):
