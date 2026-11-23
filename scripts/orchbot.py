@@ -43,6 +43,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import conveyor as cv  # noqa: E402  constants, regexes and pure helpers only
+import orch_decisions as od  # noqa: E402  the decision-id registry
 
 ACTIONS = ("none", "ack", "rerun_ci_once", "write_key1", "ask_salih_key1", "queue_fix_slice",
            "hold_dispatch", "escalate_orchestrator", "page_salih")
@@ -82,6 +83,13 @@ STAGE_A, STAGE_PCT = {"ack": 30, "ask": 10}, 90  # stage A: ack + ask agree >= 9
 RECENT_N = 10
 GRAD_DAYS, GRAD_PUSHES = 7, 10  # stage 4 exit: >= 1 week, >= 10 key-1 decisions, 100% agree
 KEY1 = {"write_key1", "ask_salih_key1"}
+# DECISIONID1: acting live on a non-routine action needs an active Salih decision id (orch_decisions);
+# routine needs none. ack/hold_dispatch are reversible and logged with their undo; asking or paging Salih
+# is the waiting path itself. An action missing here has no class and is refused.
+ACTION_CLASS = {"none": "routine", "ack": "routine", "hold_dispatch": "routine", "ask_salih_key1": "routine",
+                "escalate_orchestrator": "routine", "page_salih": "routine", "write_key1": "authority",
+                "rerun_ci_once": "cost", "queue_fix_slice": "cost"}
+assert set(ACTION_CLASS) == set(ACTIONS), "every bot action needs a decision class"  # nosec B101
 STAMP_RE = re.compile(r"\.\d{8}-\d{6}$")  # approvals/done/<name>.<YYYYmmdd-HHMMSS> on a name clash
 PACE_KEYS = ("max_lanes", "min_lanes", "lanes_present", "lanes_away")  # a decrease = dispatch held
 FACTS_MAX = 6 * 1024
@@ -598,7 +606,7 @@ class Bot:
         self.st["seen"][key] = at
         return True
 
-    def decide(self, at, saw, action, rule, target, detail="", key=None):
+    def decide(self, at, saw, action, rule, target, detail="", key=None, decision=None):
         assert action in ACTIONS, action  # nosec B101 - a programming error, the closed enum
         orig = action
         hist = [h for h in self.st["history"] if at - h[0] < LOOP_S]
@@ -617,8 +625,15 @@ class Bot:
             self.st["agreement"]["pending"].append({"at": at, "action": action, "rule": rule, "target": target,
                                                     "key": key, "detail": rec["detail"]})
         # BOTLIVE: only the LIVE_OK file actions; every other action stays a log line whatever live.json says
+        if decision is not None:
+            rec["decision"] = decision
+        # DECISIONID1: the single gate before any live act; a refusal waits for Salih, it does not demote
+        ok, why = od.require(ACTION_CLASS[action], decision, self.root / od.REL) if action in self.live else (True, "")
         if orig in self.live and action != orig:  # the loop guard tripped: back to shadow until reset
             self.demote(orig, rec["detail"], "LOOP")
+        elif not ok:
+            rec["refused"] = why
+            self.decide(at, f"live {action} refused", "escalate_orchestrator", "DECISIONID", target, why)
         elif action in self.live and action in ("ack", "hold_dispatch"):
             try:
                 self.act_live(rec)
