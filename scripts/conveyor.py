@@ -371,10 +371,13 @@ KEY1_HEADER_RE = re.compile(
 # lanes run with --settings SETTINGS; dispatch refuses unless its deny list keeps lanes away from key 1:
 # the approvals paths and the writer itself (key1_check --write/--manual, write_key1). KEY1PATH1FIX: a
 # same-user lane can still forge a header via string-built paths/names; only OS separation closes that.
+# KEY1PATH1FIX2: the writer denies are anchored on how a (sub)command STARTS (an interpreter, a path, a
+# shell), so quoted text in git commit -m/-F, git diff -S/-G, grep/rg or echo never matches them.
+KEY1_RUNNERS = ("py", "uv", "scripts", "key1_check", ".", "/", "\\", "C:", "c:", '"', "'", "&",
+                "bash", "sh", "cmd", "pwsh", "powershell", "env", "exec", "start")
 REQUIRED_DENY = ("Write(build/approvals/**)", "Edit(build/approvals/**)",
-                 "Bash(*build/approvals*)", "Bash(*build\\approvals*)",
-                 # only the writing forms: lanes still test, diff, stage and commit key1_check itself
-                 "Bash(*key1_check*--write*)", "Bash(*key1_check*--manual*)", "Bash(*write_key1(*)")
+                 "Bash(*build/approvals*)", "Bash(*build\\approvals*)") + tuple(
+    f"Bash({r}*{w}*)" for r in KEY1_RUNNERS for w in ("key1_check*--write", "key1_check*--manual", "write_key1("))
 
 
 def key1_header(sha, ci, lane, by, checks, reason=None, now=None):
@@ -416,9 +419,10 @@ def write_key1(approvals, sha, ci, lane, by, checks, reason=None, now=None):
     return target
 
 
-def key1_refusal(path):
-    """-> None when the approval file at path is a valid key 1 for its own name, else the reason."""
-    m = APPROVAL_RE.fullmatch(Path(path).name)
+def key1_refusal(path, name=None):
+    """-> None when the approval file at path is a valid key 1 for its own name (or name: a done/ file's
+    unstamped name), else the reason."""
+    m = APPROVAL_RE.fullmatch(name or Path(path).name)
     if not m or len(m.group(1)) != 40 or not m.group(2):
         return "approval name is not push-<sha40>-<ci>"
     try:

@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from types import SimpleNamespace
 
 _SPEC = importlib.util.spec_from_file_location(
@@ -195,7 +196,11 @@ class Key1CheckTests(unittest.TestCase):
     def test_write_refused_on_warn_or_fail(self):
         minor = "1\nF1 MINOR: a.py:1 - nit - fix"
         fx = self.fx(findings=minor)
-        text, ok, p = self.write(fx, write=True, operator_tool=True)
+        real = k1.verify  # KEY1PATH1FIX2: run() never asks verify for WARN on --write; force a real WARN verdict
+        with mock.patch.object(k1, "verify", lambda lane, root, git, gh, operator_tool=False, rep=None:
+                               real(lane, root, git, gh, True, rep)):
+            text, ok, p = self.write(fx, write=True)
+        self.assertIn("WARN", text)
         self.assertFalse(ok, text)
         self.assertFalse(p.exists())
         fx = self.fx()
