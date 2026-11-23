@@ -8,10 +8,12 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
+import key1_check  # noqa: E402
 import orchbot  # noqa: E402
 import orchbot_replay  # noqa: E402
 
 SHA = "a" * 40
+REAL_VERIFIED = orchbot.Bot.verified
 
 
 def ts(s):
@@ -33,7 +35,14 @@ class ReplayTest(unittest.TestCase):
                {"ts": "2026-10-15T12:00:00", "event": "reader", "lane": "L2",
                 "reading": {"kind": "needs_orchestrator", "summary": "y"}}]
         self.put("build/conveyor/events.jsonl", "".join(json.dumps(e) + "\n" for e in evs), "2026-10-15T09:00:00")
-        self.put("build/reports/L1.md", "STATUS: PASS\nFILES: jarvis/a.py\n", "2026-10-15T10:30:00")
+        self.put("build/reports/L1.md", f"STATUS: PASS\nCANDIDATE SHA: {SHA}\nFILES: jarvis/a.py\n",
+                 "2026-10-15T10:30:00")
+        # ALLOWT1T5FIX5: a verified receipt; the real verify shells out, so the replay gets a PASS verifier
+        self.verify_calls = []
+        patch = mock.patch.object(orchbot.Bot, "verified",
+                                  lambda bot, lane, sha: self.verify_calls.append((lane, sha)) or (True, "PASS"))
+        patch.start()
+        self.addCleanup(patch.stop)
         self.put(f"build/approvals/done/push-{SHA}-l1", "approved by the orchestrator\n", "2026-10-15T11:10:00")
         self.put("build/conveyor/ack/L2", "", "2026-10-15T12:40:00")
         self.put("build/conveyor/hold/backlog.json.bak-1", {"slices": [{"id": "A1"}]}, "2026-10-15T09:00:00")
@@ -74,6 +83,7 @@ class ReplayTest(unittest.TestCase):
                                   "verdicts"})
         self.assertEqual(s["events"], 5)
         self.assertEqual(s["per_action"]["write_key1"]["agree"], 1)
+        self.assertIn(("L1", SHA), self.verify_calls)
         self.assertEqual(s["per_action"]["ack"]["agree"], 0)  # BOTFIX3C: no attention item -> excluded
         self.assertEqual(s["per_action"]["queue_fix_slice"], {"n": 1, "agree": 0, "disagree": 0, "unmatched": 0,
                                                               "missed": 1})
@@ -82,6 +92,17 @@ class ReplayTest(unittest.TestCase):
         md = (out / "report.md").read_text(encoding="utf-8")
         self.assertIn("## disagreements and misses", md)
         self.assertIn("L1FIX-1", md)
+
+    def test_without_a_verified_receipt_the_replay_asks_salih_not_key1(self):
+        self.put("build/reports/L1.md", "STATUS: PASS\nFILES: jarvis/a.py\n", "2026-10-15T10:30:00")
+        with mock.patch.object(orchbot.Bot, "verified", REAL_VERIFIED), \
+                mock.patch.object(key1_check, "verify", side_effect=AssertionError("verify ran")) as verify:
+            out, body = self.run_replay()
+        verify.assert_not_called()  # no CANDIDATE SHA line: refused before any verify/gh call
+        per = json.loads(body)["per_action"]
+        self.assertNotIn("write_key1", per)
+        self.assertEqual(per["ask_salih_key1"]["n"], 1)
+        self.assertIn("ALLOW-T2", (out / "decisions.jsonl").read_text(encoding="utf-8"))
 
     def test_odd_inputs_never_crash_the_replay(self):
         with open(self.root / "build/conveyor/events.jsonl", "a", encoding="utf-8") as f:
