@@ -2859,10 +2859,19 @@ class Conveyor:
         and run the full suite), whatever max_lanes allows."""
         return bool(INT_RE.match(name)) and any(INT_RE.match(n) for n in self.running(lanes))
 
+    def owner(self):
+        """LEASEGATE1FIX: the CONVLOCK2 OS lock is the single authority: without it nothing is
+        ours, whatever conveyor.lock says; with it, a missing, torn or foreign info file is not
+        ours either (fail closed; our next heartbeat rewrites it)."""
+        if self.instance_fd is None:
+            return False
+        cur = self.read_lock()
+        return isinstance(cur, dict) and cur.get("pid") == self.pid
+
     def not_owner(self, name):
-        """LEASEGATE1: right before any launch, conveyor.lock must not name another pid.
+        """LEASEGATE1: right before any launch this process must own the conveyor (owner()).
         True: refuse (fail closed, the lane is not failed; the next pass decides again)."""
-        if self.own_lock():
+        if self.owner():
             return False
         self.event("dispatch_not_owner", lane=name)
         return True
@@ -3711,6 +3720,9 @@ class Conveyor:
             self.event("priority", lane=name, presence=want, pids=len(pids), failed=failed[:5])
 
     def dispatch(self, lanes, agents):
+        if not self.owner():  # LEASEGATE1FIX F2: not a start failure; no inbox_stuck, no N6 refusal
+            self.event("dispatch_pass_not_owner")
+            return
         if self.disk_hold():
             if not self.pager_flag("disk_low"):
                 self.pager_flag("disk_low", self.now())  # the low-disk episode's attention since

@@ -191,7 +191,10 @@ class Base(unittest.TestCase):
                           cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
                           mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs,
                           net=lambda: self.net, popen=self.fake_popen)
-        env = mock.patch.dict(os.environ)  # PHONECMD: never the real command topic
+        self.assertTrue(self.c.acquire_lock())  # LEASEGATE1FIX: only the OS-lock holder dispatches
+        self.c.beats = 0  # the tests count heartbeats from the loop's first one, as before
+        self.first = self.c  # a test may swap self.c; tearDown still closes this handle
+        env =mock.patch.dict(os.environ)  # PHONECMD: never the real command topic
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("JARVIS_NTFY_CMD_TOPIC", None)
@@ -224,6 +227,7 @@ class Base(unittest.TestCase):
 
     def tearDown(self):
         self.c.release_lock()  # CONVLOCK2: Windows cannot delete the temp dir with the handle open
+        self.first.release_lock()
         self.tmp.cleanup()
 
     def drop(self, fname, text, age=0):
@@ -2751,6 +2755,7 @@ class TestReader(Base):
         return next(x for x in self.status()["lanes"] if x["name"] == "A")
 
     def all_files_text(self):
+        self.c.release_lock()  # the OS-locked byte of conveyor.instance is unreadable on Windows
         return {p: p.read_bytes().decode("utf-8", "replace") for p in self.root.rglob("*") if p.is_file()}
 
     def test_reader_system_pages_salih_only_for_human_only_decisions(self):
@@ -6100,6 +6105,38 @@ class TestN6Lease(Base):
         self.assertFalse((self.base / "lanes.json").exists())  # no lane recorded
         self.assertEqual(self.fake.bg_calls(), [])
 
+    def f2_setup(self):
+        self.backlog({"id": "A", "tier": "T1"})
+        self.n6_claim("A")
+        self.drop("b.md", HDR.format("B") + "y")
+
+    def test_leasegate1fix_neg_ownership_refusal_is_not_a_start_failure(self):
+        # F2: a non-owner pass is skipped with one event: no inbox_stuck, no N6 refusal
+        for lose in ("foreign info file", "no OS lock"):
+            with self.subTest(lose=lose):
+                self.f2_setup()
+                if lose == "no OS lock":
+                    self.c.release_lock()
+                else:
+                    (self.base / "conveyor.lock").write_text(json.dumps({"pid": -7, "heartbeat": self.t}))
+                n = len([e for e in self.events() if e["event"] == "dispatch_pass_not_owner"])
+                self.c.pass_once()
+                self.assertEqual(self.fake.bg_calls(), [])
+                self.assertFalse(self.c.pager_flag("inbox_stuck"))
+                self.assertFalse((self.root / "build" / "n6" / "claim_result.json").exists())
+                skips = [e for e in self.events() if e["event"] == "dispatch_pass_not_owner"]
+                self.assertEqual(len(skips), n + 1)
+                self.assertEqual([e for e in self.events() if e["event"] == "dispatch_not_owner"], [])
+                self.assertEqual(len(list(self.c.inbox.glob("*.md"))), 1)  # still queued
+
+    def test_leasegate1fix_real_start_failure_keeps_its_paths(self):
+        self.f2_setup()
+        self.c.start = lambda *a, **k: None  # the owner's launch fails
+        self.c.pass_once()
+        self.assertEqual(self.n6_result()["reason"], "start_failed")
+        self.assertIn("b.md", self.c.pager_flag("inbox_stuck"))
+        self.assertEqual([e for e in self.events() if e["event"] == "dispatch_pass_not_owner"], [])
+
     def test_neg_unreadable_claim_holds_it_and_the_queue_goes_on(self):
         n6 = self.root / "build" / "n6"
         n6.mkdir(parents=True)
@@ -7001,6 +7038,8 @@ class TestLock(Base):
 
     def setUp(self):
         super().setUp()
+        self.c.release_lock()  # these tests start before startup and take the lock themselves
+        (self.base / "conveyor.lock").unlink()
         self.others = []
 
     def tearDown(self):
@@ -7082,6 +7121,43 @@ class TestLock(Base):
         held = [e for e in self.events() if e["event"] == "dispatch_not_owner"]
         self.assertEqual(len(held), 3)
         self.c.heartbeat()  # ours again
+        self.assertIsNotNone(self.c.start("A", "opus", "high", "x"))
+
+    def test_leasegate1fix_neg_no_os_lock_never_launches_whatever_the_info_file_says(self):
+        # F1: the OS lock is the authority; a failed acquire never launches, for every info file
+        self.assertTrue(self.c.acquire_lock())
+        second = self.other()
+        second.cmd = self.git
+        self.assertFalse(second.acquire_lock())
+        self.assertIsNone(second.instance_fd)
+        lock = self.base / "conveyor.lock"
+        cases = {"missing": None, "malformed": "{torn", "foreign owner": json.dumps({"pid": self.c.pid, "heartbeat": self.t}),
+                 "forged own pid": json.dumps({"pid": -7, "heartbeat": self.t}), "not a dict": "[]"}
+        self.drop("a.md", HDR.format("A") + "do things")
+        for name, raw in cases.items():
+            with self.subTest(info=name):
+                lock.unlink(missing_ok=True)
+                if raw is not None:
+                    lock.write_text(raw)
+                self.assertFalse(second.owner())
+                self.assertIsNone(second.start("A", "opus", "high", "x"))
+                self.assertIsNone(second.start_codex("A", "main", "x"))
+                self.assertIsNone(second.start_jules("A", "main", "x", []))
+                second.pass_once()
+                self.assertEqual(self.fake.bg_calls(), [])
+        self.assertEqual(len(list((self.base / "inbox").glob("*.md"))), 1)  # still queued
+
+    def test_leasegate1fix_holder_with_a_missing_or_torn_info_file_waits_for_its_heartbeat(self):
+        self.assertTrue(self.c.acquire_lock())
+        for raw in (None, "{torn"):
+            with self.subTest(raw=raw):
+                (self.base / "conveyor.lock").unlink()
+                if raw is not None:
+                    (self.base / "conveyor.lock").write_text(raw)
+                self.assertIsNone(self.c.start("A", "opus", "high", "x"))  # never "ours" by default
+                self.assertEqual(self.fake.bg_calls(), [])
+                self.c.heartbeat()  # the holder rewrites it
+                self.assertTrue(self.c.owner())
         self.assertIsNotNone(self.c.start("A", "opus", "high", "x"))
 
     def test_a_lock_call_that_raises_means_exit(self):
@@ -10279,6 +10355,7 @@ class PhoneCmd(Base):
         self.tick()
         self.assertEqual([r["error"] for r in self.events("phone_poll_failed")],
                          ["OSError", "ZeroDivisionError", "bad_topic"])
+        self.c.release_lock()  # the OS-locked byte of conveyor.instance is unreadable on Windows
         for f in (self.root / "build").rglob("*"):
             if f.is_file():
                 self.assertNotIn(self.TOPIC, f.read_text(encoding="utf-8", errors="replace"), f)
@@ -11246,6 +11323,7 @@ class TestAuthWatch(Base):
                           cmd=self.git, disk=self.fake_disk, projects=self.root / "projects",
                           mem=lambda: self.memory, idle=lambda: self.idle, procs=self.procs,
                           net=lambda: self.net, popen=self.fake_popen)
+        self.assertTrue(self.c.acquire_lock())  # the new instance takes the OS lock at startup
         self.wrap()
 
     def lost(self):
