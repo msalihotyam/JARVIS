@@ -194,7 +194,7 @@ class Base(unittest.TestCase):
         self.assertTrue(self.c.acquire_lock())  # LEASEGATE1FIX: only the OS-lock holder dispatches
         self.c.beats = 0  # the tests count heartbeats from the loop's first one, as before
         self.first = self.c  # a test may swap self.c; tearDown still closes this handle
-        env =mock.patch.dict(os.environ)  # PHONECMD: never the real command topic
+        env = mock.patch.dict(os.environ)  # PHONECMD: never the real command topic
         env.start()
         self.addCleanup(env.stop)
         os.environ.pop("JARVIS_NTFY_CMD_TOPIC", None)
@@ -6137,6 +6137,24 @@ class TestN6Lease(Base):
         self.assertIn("b.md", self.c.pager_flag("inbox_stuck"))
         self.assertEqual([e for e in self.events() if e["event"] == "dispatch_pass_not_owner"], [])
 
+    def test_leasegate1fix2_neg_mid_pass_loss_is_not_a_start_failure(self):
+        # LEASEGATE1FIX2: ownership lost inside the launch (after the pass check) is still a refusal
+        for way in LG2_WAYS:
+            with self.subTest(way=way):
+                lg2_regain(self)
+                self.f2_setup()
+
+                def start(*a, **k):
+                    lg2_lose(self, way)
+                    return None
+                with mock.patch.object(self.c, "start", start), \
+                        mock.patch.object(conveyor, "LOCK_RETRY_S", 0):
+                    self.c.pass_once()
+                self.assertFalse(self.c.pager_flag("inbox_stuck"))
+                self.assertFalse((self.root / "build" / "n6" / "claim_result.json").exists())
+                self.assertEqual(len(list(self.c.inbox.glob("*.md"))), 1)  # still queued
+        lg2_regain(self)
+
     def test_neg_unreadable_claim_holds_it_and_the_queue_goes_on(self):
         n6 = self.root / "build" / "n6"
         n6.mkdir(parents=True)
@@ -11582,6 +11600,160 @@ class TestAuthWatch(Base):
         self.step()
         self.assertEqual(self.lanes()["A"]["state"], "AUTH_HOLD")
         self.assertEqual(len(self.ev("auth_lost")), 2)
+
+
+
+LG2_WAYS = ("acquire_lock failed", "missing", "malformed", "foreign")
+LG2_SESSION = ("stop", "rm", "respawn", "--bg")
+
+
+def lg2_lose(tc, way):
+    """LEASEGATE1FIX2: make tc.c a non-owner one way."""
+    if way == "acquire_lock failed":
+        tc.c.release_lock()
+    elif way == "missing":
+        tc.c.lock.unlink(missing_ok=True)
+    else:
+        tc.c.lock.write_text("{torn" if way == "malformed" else json.dumps({"pid": -7, "heartbeat": tc.t}))
+
+
+def lg2_regain(tc):
+    if tc.c.instance_fd is None:
+        tc.c.acquire_lock()
+    tc.c.lock.write_text(json.dumps({"pid": tc.c.pid, "heartbeat": tc.t}))
+    tc.assertTrue(tc.c.owner())
+
+
+class TestLeasegate1fix2NonOwner(Base):
+    """LEASEGATE1FIX2: every stop/resume/respawn/redispatch/launch path refuses at the point of
+    action when this process is not the OS-lock owner: no session call, no counter or once-flag,
+    exactly one dispatch_not_owner event."""
+
+    def setUp(self):
+        super().setUp()
+        self.enterContext(mock.patch.object(conveyor, "LOCK_RETRY_S", 0))  # the torn-lock retry, no sleep
+
+    def refused(self, act, check):
+        for way in LG2_WAYS:
+            with self.subTest(way=way):
+                lg2_regain(self)
+                calls = len(self.fake.calls)
+                n = len([e for e in self.events() if e["event"] == "dispatch_not_owner"])
+                lg2_lose(self, way)
+                check(act())
+                self.assertEqual([c for c in self.fake.calls[calls:] if c and c[0] in LG2_SESSION], [])
+                self.assertEqual(len([e for e in self.events() if e["event"] == "dispatch_not_owner"]), n + 1)
+        lg2_regain(self)
+
+    def patch(self, **kw):
+        for k, v in kw.items():
+            self.enterContext(mock.patch.object(self.c, k, v))
+
+    def test_nudge(self):
+        a = {"sessionId": "x", "status": "idle"}
+        ln = {"id": "x"}
+        self.refused(lambda: self.c.nudge("A", ln, a), lambda r: (self.assertFalse(r), self.assertEqual(ln, {"id": "x"})))
+
+    def test_unblock(self):
+        self.patch(net=lambda: True, context_full=lambda a: False)
+        ln = {"id": "x", "state": "blocked", "blocked_since": 0}
+        self.refused(lambda: self.c.unblock("A", ln, {"sessionId": "x", "status": "idle"}),
+                     lambda r: self.assertNotIn("nudges", ln))
+
+    def test_redispatch(self):
+        ln = {"id": "x"}
+        self.refused(lambda: self.c.redispatch("A", ln), lambda r: self.assertEqual(ln, {"id": "x"}))
+
+    def test_early_death(self):
+        self.patch(cmd=lambda *a, **k: (1, ""))
+        ln = {"id": "x", "worktree": str(self.root)}
+        self.refused(lambda: self.c.early_death("A", ln),
+                     lambda r: (self.assertTrue(r), self.assertNotIn("early_redispatch", ln)))
+
+    def test_budget(self):
+        self.patch(messages=lambda sid: 10 ** 9)
+        ln = {"id": "x"}
+
+        def act():
+            ln.pop("budget_ts", None)
+            return self.c.budget("A", ln, {"sessionId": "x"})
+        self.refused(act, lambda r: (self.assertTrue(r), self.assertNotIn("budget_nudged", ln)))
+
+    def test_watch_idle(self):
+        self.patch(active_since=lambda *a: False)
+        ln = {"id": "x", "idle_since": 0}
+        self.refused(lambda: self.c.watch_idle("A", ln, {"sessionId": "x", "status": "idle"}),
+                     lambda r: (self.assertTrue(r), self.assertNotIn("idle_nudged", ln)))
+
+    def test_resume_in_place(self):
+        rep = self.root / "lg2.md"
+        rep.write_text("STATUS: BLOCKED\nNEEDS FILES: docs/x.md\n", encoding="utf-8")
+        ln = {"id": "x"}
+        self.refused(lambda: self.c.resume_in_place("A", ln, rep, {"sessionId": "x"}, {"A": ln}),
+                     lambda r: (self.assertTrue(r), self.assertNotIn("resumed_in_place", ln)))
+
+    def test_track_respawn(self):
+        self.drop("a.md", HDR.format("A"))
+        self.c.pass_once()
+        del self.fake.agent("A")["pid"]  # stopped without a report: the respawn path
+        lanes = self.lanes()
+        self.refused(lambda: self.c.track(lanes, self.c.agents()),
+                     lambda r: self.assertNotIn("respawned", lanes["A"]))
+
+    def test_auth_clear(self):
+        probe = mock.Mock(return_value=True)
+        self.patch(auth_probe=probe)
+        lanes = {"A": {"id": "x", "auth_parked": True, "state": "AUTH_HOLD"}}
+
+        def act():
+            self.c.pager_flag("auth", {"since": 0, "paged": self.t, "probed": 0, "lanes": ["A"]})
+            return self.c.auth_watch(lanes, {})
+        self.refused(act, lambda r: (probe.assert_not_called(), self.assertTrue(self.c.pager_flag("auth")),
+                                     self.assertTrue(lanes["A"]["auth_parked"])))
+
+    def test_outage_clear(self):
+        lanes = {"A": {"id": "x"}}
+        self.c.pager_flag("outage", {"since": 0, "nudged": self.t, "lanes": ["A"]})
+        self.refused(lambda: self.c.outage(lanes, {}), lambda r: self.assertTrue(self.c.pager_flag("outage")))
+
+    def test_outage_periodic_nudge(self):
+        self.patch(active_since=lambda *a: False)
+        lanes = {"A": {"id": "x", "paused": True}}
+        self.c.pager_flag("outage", {"since": 0, "nudged": 0, "lanes": ["A"]})
+        self.refused(lambda: self.c.outage(lanes, {"x": {"sessionId": "x"}}),
+                     lambda r: self.assertNotIn("outage_nudged", lanes["A"]))
+
+    def test_stop_finished(self):
+        live = ([{"id": "x", "sessionId": "x", "pid": 1}], None)
+        self.patch(collected_ts=lambda ln: 0, lane_sessions=lambda *a, **k: live, agents=lambda: [])
+        lanes = {"A": {"id": "x", "finished": True, "status": "PASS"}}
+        self.refused(lambda: self.c.stop_finished(lanes, [], set()), lambda r: self.assertNotIn("stopped", lanes["A"]))
+
+    def test_cleanup(self):
+        live = ([{"id": "x", "sessionId": "x", "pid": 1}], None)
+        self.patch(collected_ts=lambda ln: 0, lane_sessions=lambda *a, **k: live, agents=lambda: [],
+                   ledger_has=lambda *a: True)
+        lanes = {"A": {"id": "x", "finished": True, "status": "PASS"}}
+        self.refused(lambda: self.c.cleanup(lanes, [], set()), lambda r: self.assertNotIn("cleanup", lanes["A"]))
+
+    def codex(self, status, ln, **kw):
+        m = mock.Mock(**kw)
+        m.status.return_value = status
+        self.patch(codex=m)
+        lanes = {"A": dict(ln, worker="codex", id="x")}
+        self.refused(lambda: self.c.codex_track(lanes),
+                     lambda r: (m.stop.assert_not_called(), self.assertNotIn("finished", lanes["A"])))
+
+    def test_codex_violation_stop(self):
+        self.codex("running", {}, **{"violation.return_value": "limit"})
+
+    def test_codex_pass_stop(self):
+        self.patch(find_report=lambda *a: (self.root / "r.md", "PASS"))
+        self.codex("running", {}, **{"violation.return_value": None})
+
+    def test_codex_restart_stop(self):
+        self.patch(find_report=lambda *a: None)
+        self.codex("unknown", {"codex": {"pid": 1}}, **{"attach.return_value": "unverified"})
 
 
 if __name__ == "__main__":

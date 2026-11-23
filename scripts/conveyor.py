@@ -2217,6 +2217,8 @@ class Conveyor:
                                              ln.get("worktree"))
                     found = found if found and found[1] != INTERIM else "stop"
                 if found == "stop":
+                    if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+                        continue
                     self.codex.stop(ln["id"])  # fail closed: stop it, then prove it is gone
                     pid = ln["codex"].get("pid")
                     if att(name, ln["id"], ln["codex"]) != "gone":  # held: slot, attention, retried
@@ -2234,6 +2236,8 @@ class Conveyor:
             if not ln.get("finished") and self.codex.status(ln["id"]) == "running":
                 why = self.codex.violation(name)
                 if why:  # limit reached or credits mid-run: stop it, credits are never spent
+                    if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+                        continue
                     self.codex.stop(ln["id"])
                     ln.update(state="stopped", finished=True, status="MISSING", finished_ts=self.now())
                     self.event("codex_stop", lane=name, id=ln["id"], reason=why)
@@ -2245,6 +2249,8 @@ class Conveyor:
                 found = None  # an interim from a gone session is no finish: MISSING below
             if found and found[1] in GOOD:  # CODEXCOMMIT: the lane never commits, the conveyor does
                 if self.codex.status(ln["id"]) == "running":
+                    if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+                        continue
                     self.codex.stop(ln["id"])  # a PASS report is final: no edits after the snapshot
                 why = self.codex_commit(name, ln, found[0])
                 if why:
@@ -2354,6 +2360,8 @@ class Conveyor:
                 continue  # no respawns during an outage hold
             elif a is not None and not ln.get("respawn_pending"):
                 # stopped without finishing or reporting (reboot/sleep): respawn, once per stop
+                if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+                    continue
                 ln.update(respawned=True, respawn_pending=True, respawned_ts=self.now())
                 try:
                     rc, out = self.run(["respawn", ln["id"]])
@@ -2415,6 +2423,8 @@ class Conveyor:
                 return False  # it committed: a finish, not an early death
         except Exception:  # unreadable: treat as no commit
             pass
+        if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+            return True
         ln["early_redispatch"] = True
         self.event("early_death", lane=name, id=ln["id"])
         self.redispatch(name, ln)
@@ -2475,6 +2485,8 @@ class Conveyor:
             return
         h["lanes"] = parked
         if now - h.get("probed", h["since"]) >= AUTH_PROBE_S:
+            if self.not_owner("auth"):  # LEASEGATE1FIX2: checked before the probe and its event
+                return
             h["probed"] = now
             ok = self.auth_probe()
             self.event("auth_probe", result="ok" if ok else "fail")
@@ -2523,6 +2535,8 @@ class Conveyor:
             if any(lanes[n].get("finished") or not lanes[n].get("paused")
                    or self.active_since(n, o["since"], cwd(n))
                    for n in set(o.get("lanes", [])) | set(paused) if n in lanes):
+                if self.not_owner("outage"):  # LEASEGATE1FIX2: checked at the point of action
+                    return
                 self.pager_flag("outage", {})
                 for n, ln in paused.items():
                     ln.pop("paused", None)
@@ -2535,6 +2549,8 @@ class Conveyor:
             if paused and now - o.get("nudged", o["since"]) >= OUTAGE_NUDGE_S:
                 n = min(paused, key=lambda k: paused[k].get("outage_nudged", 0))
                 a = by_id.get(paused[n]["id"])
+                if self.not_owner(n):  # LEASEGATE1FIX2: checked at the point of action
+                    return
                 paused[n]["outage_nudged"] = o["nudged"] = now
                 self.pager_flag("outage", o)
                 if a:
@@ -2564,6 +2580,8 @@ class Conveyor:
         ln["budget_ts"] = self.now()
         if self.messages(a.get("sessionId") or ln["id"]) < BUDGET_MSGS:
             return False
+        if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+            return True
         ln["budget_nudged"] = self.now()
         self.nudge(name, ln, a, BUDGET_NUDGE, "budget_nudge")
         return True
@@ -2628,6 +2646,8 @@ class Conveyor:
         if now - since < IDLE_NO_REPORT_S or self.active_since(name, now - IDLE_NO_REPORT_S, a.get("cwd")):
             return False
         if "idle_nudged" not in ln:
+            if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+                return True
             ln["idle_nudged"] = ln["idle_since"] = now  # the resumed turn gets its own 15 min
             self.nudge(name, ln, a, IDLE_NUDGE, "idle_nudge")
             return True
@@ -2653,6 +2673,8 @@ class Conveyor:
         needs = NEEDS_RE.findall(text)
         if not needs:
             return False  # an ordinary BLOCKED report
+        if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+            return True
         ln["resumed_in_place"] = self.now()
         why, paths = self.grant_check(name, needs, text, lanes)
         ok = why is None and self.nudge(name, ln, a, GRANT_NUDGE.format(paths=", ".join(paths)),
@@ -2717,6 +2739,8 @@ class Conveyor:
         <sessionId>` it with `text` in its own cwd, same model, effort and settings. One `kind`
         event with each step; a blocked-lane nudge (kind "nudge") is counted even when it fails
         (the idle watchdog and resume in place keep their own once-flags). True when both steps ran."""
+        if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+            return False
         if kind == "nudge":
             ln["nudges"] = ln.get("nudges", 0) + 1
             ln["nudged_ts"] = self.now()
@@ -2811,6 +2835,8 @@ class Conveyor:
     def redispatch(self, name, ln):
         """Stop the silent respawned session (its conversation is kept) and start the
         lane again from its saved prompt with a 'continue' preface."""
+        if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+            return
         ln["redispatches"] = ln.get("redispatches", 0) + 1
         ln.pop("respawned_ts", None)
         ln.pop("auth_seen", None)  # a new session: its errors are new
@@ -3060,6 +3086,8 @@ class Conveyor:
                     self.finish(name, ln, report, "BLOCKED")
                     continue
             elif st != "failed":
+                if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+                    continue
                 self.jules.stop(ln["id"])
             ln.update(state=st, finished=True, status="MISSING", finished_ts=self.now())
             self.event("finish", lane=name, id=ln["id"], state=st, status="MISSING")
@@ -3776,6 +3804,8 @@ class Conveyor:
                 sid = self.start(name, hdr["model"], hdr["effort"], text)
                 if not sid:  # CONVHEAL: a stuck prompt never blocks the backlog; attention item
                     held.add(f)
+                    if not self.owner():  # LEASEGATE1FIX2: an ownership refusal, not a stuck prompt
+                        return
                     stuck = self.pager_flag("inbox_stuck") or {}
                     if f.name not in stuck:
                         self.pager_flag("inbox_stuck", {**stuck, f.name: self.now()})
@@ -3929,6 +3959,8 @@ class Conveyor:
                 self.n6_answer(epoch, sid, "refused", f"start_error: {type(exc).__name__}")
                 return False
             if not lane_id:
+                if not self.owner():  # LEASEGATE1FIX2: an ownership refusal is not start_failed
+                    return False
                 self.n6_answer(epoch, sid, "refused", "start_failed")
                 return False
             dest = self.started_path(sid)
@@ -5855,6 +5887,8 @@ class Conveyor:
             live = [a for a in sess if "pid" in a]
             if doubt or not live:
                 continue
+            if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+                return
             done += 1
             steps = []
             for a in live:
@@ -5946,6 +5980,8 @@ class Conveyor:
                     ln["cleanup_skip"] = doubt
                     self.event("cleanup_skip", lane=name, reason=doubt)
                 continue
+            if self.not_owner(name):  # LEASEGATE1FIX2: checked at the point of action
+                return
             done += 1
             for a in sess:
                 self.beat()  # git per session
