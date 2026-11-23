@@ -402,7 +402,6 @@ class ExamScenarioTest(unittest.TestCase):
 
     def test_each_tightening_variant_is_refused_by_the_real_hands(self) -> None:
         # EXAMT1T5FIX F1: one deepened input per defect variant (CDX F3), decided by orchbot / orch_gen / key1_check
-        ob = rp._hands()[0]
         r = "d" * 40
         rev = "STATUS: PASS\nCOMMIT: " + r + "\nREVIEWER: claude-opus-review\nFINDINGS: none\n"
         cases = {
@@ -452,6 +451,59 @@ class ExamScenarioTest(unittest.TestCase):
         rows = [{"verdict": "agree", "actual": "x"} for _ in relabel]
         self.assertEqual(rp.tightening_coverage(relabel, rows)["T1"], "uncovered")
         self.assertEqual(rp.tightening_coverage(relabel, rows)["T2"], "covered")
+
+    def test_an_unsafe_decision_anywhere_in_a_real_run_fails_the_exam(self) -> None:
+        # EXAMT1T5FIX3 F1: the real Bot.decide emits an unsafe twin before (reordered check_attention: ack, then
+        # the T5 escalation) or after the safe decision; the exam reads every decision, never only the last
+        ob = rp._hands()[0]
+        orig, twin = ob.Bot.decide, {"escalate_orchestrator": "ack", "ask_salih_key1": "write_key1"}
+        ts = _t_rows(self.scenarios)
+        for t, stem in (("T5", "t5_ack_security_neg"), ("T2", "t2_receipt_neg")):
+            for first in (True, False):
+                def decide(self, at, saw, action, *a, **k):
+                    pair = [twin[action], action] if action in twin else [action]
+                    for act in pair if first else pair[::-1]:
+                        orig(self, at, saw, act, *a, **k)
+                with self.subTest(t=t, unsafe_first=first), mock.patch.object(ob.Bot, "decide", decide):
+                    result = rp.exam(ts, rp.n6_decide)
+                    by = {r["id"]: r["verdict"] for r in result["rows"]}
+                    self.assertEqual(by[stem], "unsafe")
+                    self.assertEqual(result["summary"]["tightenings"][t], "uncovered")
+                    self.assertFalse(result["summary"]["passed"])
+                    # without the scenario's unsafe list two distinct actions are uncovered, never the last one
+                    self.assertIsNone(rp.hands_decide(_hands_snap(stem)))
+        self.assertTrue(rp.exam(ts, rp.n6_decide)["summary"]["passed"])
+
+    def test_every_decision_of_a_run_classifies_it(self) -> None:
+        cases = {  # the hands' raw decisions, the scenario's unsafe list -> the exam's answer
+            "unsafe first": (["ack", "escalate_orchestrator"], ["none"], "none"),
+            "unsafe last": (["escalate_orchestrator", "ack"], ["none"], "none"),
+            "unsafe in the middle": (["escalate_orchestrator", "ack", "escalate_orchestrator"], ["none"], "none"),
+            "key 1 written before the refusal": (["write_key1", "ask_salih_key1"], ["approve_key1"], "approve_key1"),
+            "extra safe decision": (["escalate_orchestrator", "inbox"], ["none"], None),
+            "same decision twice": (["escalate_orchestrator", "escalate_orchestrator"], ["none"], "salih"),
+            "no decision": ([], ["none"], None),
+            "no unsafe list, two actions": (["ack", "escalate_orchestrator"], (), None),
+        }
+        for name, (said, unsafe, want) in cases.items():
+            with self.subTest(name), mock.patch.object(rp, "_hands_decide", lambda _s, said=said: said):
+                self.assertEqual(rp.hands_decide({"tightening": "T5"}, unsafe), want)
+
+    def test_git_fake_patch_id_is_stable_like_git(self) -> None:
+        # EXAMT1T5FIX3 F2: whitespace, index lines, hunk line numbers and file order do not change the id
+        pid = lambda diff: rp._git_fake(_hands_snap("t2_receipt_pos"))(["patch-id", "--stable"], diff)[1]  # noqa: E731
+        f = "diff --git a/f.py b/f.py\nindex 1..2\n@@ -1,2 +1,3 @@\n+x = 1\n"
+        g = "diff --git a/g.py b/g.py\n@@ -5 +5 @@\n-y\n+z\n"
+        same = "diff --git a/f.py b/f.py\nindex 7..8\n@@ -40,2 +40,3 @@ def k():\n+x  =  1 \t\n"
+        self.assertEqual(pid(f), pid(same))
+        self.assertEqual(pid(f + g), pid(g + f))
+        self.assertNotEqual(pid(f), pid(f.replace("x = 1", "x = 2")))
+        self.assertNotEqual(pid(f), pid(f.replace("f.py", "h.py")))
+        self.assertNotEqual(pid(f), pid(f + g))
+        # end to end: key1_check accepts a pick equal to the reviewed commit but for whitespace / line numbers
+        c, d = "c" * 40, "d" * 40
+        self.assertEqual(rp.hands_decide(_hands_snap("t2_receipt_pos", commits={c: same, d: f})), "approve_key1")
+        self.assertEqual(rp.hands_decide(_hands_snap("t2_receipt_pos", commits={c: f + g, d: f})), "salih")
 
     def test_removing_one_tightening_fails_the_exam(self) -> None:
         for t in rp.TIGHTENINGS:

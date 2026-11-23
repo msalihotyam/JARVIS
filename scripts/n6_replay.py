@@ -417,7 +417,7 @@ def n6_decide(scenario: dict[str, Any]) -> str | None:
     if snap is None:
         return None
     if "tightening" in snap:
-        return hands_decide(snap)
+        return hands_decide(snap, scenario.get("unsafe_if") or ())
     state = Snapshot(snap["lanes"], tuple(snap["events"]), snap["reports"])
     verdict, _ = n6_verdict(state, snap["lane"], lambda _lane: snap["head"])
     return "approve_key1" if verdict == "pass" else "inbox"
@@ -472,8 +472,13 @@ def _git_fake(snap: dict[str, Any]) -> Callable[..., tuple[int, str]]:
     def git(args: list[str], inp: str | None = None) -> tuple[int, str]:
         if args[0] == "diff-tree" and "-p" in args:
             return (0, commits[args[-1]]) if args[-1] in commits else (128, "")
-        if args[0] == "patch-id":  # git patch-id --stable: equal diffs give equal ids
-            return 0, hashlib.sha1((inp or "").encode(), usedforsecurity=False).hexdigest() + " x"
+        if args[0] == "patch-id":  # git patch-id --stable: whitespace, index and hunk line numbers ignored,
+            total = 0              # each file hashed alone and summed so file order does not matter
+            for block in ("\n" + (inp or "")).split("\ndiff --git ")[1:] or [inp or ""]:
+                kept = "\n".join("".join(ln.split()) for ln in block.splitlines()
+                                 if not ln.startswith(("index ", "@@")))
+                total += int(hashlib.sha1(kept.encode(), usedforsecurity=False).hexdigest(), 16)
+            return 0, f"{total % (1 << 160):040x} x"
         if args[0] == "cat-file":
             return (0 if args[-1].split("^")[0] in commits else 1), ""
         if args[:2] == ["rev-parse", "origin/main"]:
@@ -491,27 +496,30 @@ def _bot(ob: Any, tmp: str, at: int) -> Any:
     return bot
 
 
-def _said(bot: Any) -> str | None:
-    return HANDS_ACTION.get(bot.new[-1]["would_do"], bot.new[-1]["would_do"]) if bot.new else None
+def _said(bot: Any) -> list[str]:
+    return [rec["would_do"] for rec in bot.new]
 
 
-def hands_decide(snap: dict[str, Any]) -> str | None:
-    """The hands' own decision on one ALLOWLIST T1-T5 input; an unknown tightening or a malformed input
-    the hands cannot read is uncovered (None), never an action."""
+def hands_decide(snap: dict[str, Any], unsafe: Any = ()) -> str | None:
+    """The hands' own decision on one ALLOWLIST T1-T5 input, read over EVERY decision the run made
+    (EXAMT1T5FIX3): any decision in ``unsafe`` is the answer; more than one distinct action, no
+    decision, an unknown tightening or a malformed input is uncovered (None), never an action."""
     try:
-        return _hands_decide(snap)
+        said = [HANDS_ACTION.get(a, a) for a in _hands_decide(snap)]
     except (KeyError, TypeError, AttributeError):
         return None
+    hit = [a for a in said if a in unsafe]
+    return hit[0] if hit else said[0] if len(set(said)) == 1 else None
 
 
-def _hands_decide(snap: dict[str, Any]) -> str | None:
+def _hands_decide(snap: dict[str, Any]) -> list[str]:
     ob, og, kc = _hands()
     t, said = snap["tightening"], []
     if t == "T1":  # orchbot.Bot.key1: WEAK_RE on report/reviews, then protected(files), else the key-1 gate
         stub = _key1_stub(snap, said, [tuple(r) for r in snap["reviews"]])
         stub.gate_key1 = lambda *_a: said.append("write_key1")
         ob.Bot.key1(stub, 0, "exam", snap["lane"], {"ci": {"cand": True}}, snap["sha"])
-        return HANDS_ACTION.get(said[-1], said[-1]) if said else None
+        return said
     if t == "T2":  # a real Bot.gate_key1 -> Bot.verified -> key1_check.verify; only git/gh are faked
         from unittest import mock
         assert sys.modules.get("key1_check") is kc  # the module Bot.verified imports
@@ -533,17 +541,17 @@ def _hands_decide(snap: dict[str, Any]) -> str | None:
         try:
             og.Gen.integration(_IntStub(snap["picks"]), list(snap["rids"]))
         except og.Refuse:
-            return "inbox"
+            return ["inbox"]
         except _PastScope:
-            return "dispatch_packet"
-        return None
+            return ["dispatch_packet"]
+        return []
     if t == "T4":  # orchbot.hand_record: ids/enums only, <= HAND_MAX bytes
         try:
             ob.hand_record("inbox", snap["record"])
         except (ValueError, KeyError):
-            return "inbox"
+            return ["inbox"]
         # no hands selector exists: hand_record is the real check, the hands_propose_fix label is this adapter's
-        return "hands_propose_fix" if {"finding", "template"} <= set(snap["record"]) else "inbox"
+        return ["hands_propose_fix" if {"finding", "template"} <= set(snap["record"]) else "inbox"]
     if t == "T5":  # a real Bot.check_attention over a status.json holding the one alert
         alert, at = snap["alert"], snap["at"]
         with tempfile.TemporaryDirectory() as tmp:
@@ -554,7 +562,7 @@ def _hands_decide(snap: dict[str, Any]) -> str | None:
             bot = _bot(ob, tmp, at)
             bot.check_attention()
         return _said(bot)
-    return None
+    return []
 
 
 def scenario_code(scenario: dict[str, Any]) -> str:
