@@ -59,7 +59,17 @@ WAKE_TOPIC = Path.home() / ".jarvis" / "orch_wake.topic"
 WAKE_S = 120
 STUCK_S = 3 * 3600  # a working lane with no status update for 3 h
 WAKE = {"O5", "O10", "DRY", "CONVSAFE", "R7/O19", "STUCK", "EVTAUDIT1", "PAGER", "O23", "HOLD", "BREAKER",
-        "ATTN", "LOOP", "FAILCLOSED"}
+        "ATTN", "LOOP", "FAILCLOSED", "ALLOW-T1", "ALLOW-T2", "ALLOW-T5"}
+# ALLOWLIST v1 T1: test config, fixtures, quarantine/test-id lists, uv.lock and policy files are protected
+T1_RE = re.compile(r"(^|/)(conftest[^/]*\.py|pytest\.ini|tox\.ini|setup\.cfg|pyproject\.toml|uv\.lock|pace\.json"
+                   r"|route\.py|test\.ps1|test_parallel\.py)$|(^|/)(tests/)?fixtures?/|quarantine|test[_-]?ids?\b"
+                   r"|allowlist")
+# a report flags test weakening: a TEST WEAKENING line (not ": none") or CHANGED ASSERTS naming a weakening
+WEAK_RE = re.compile(r"(?im)^[ \t>*-]*(?:test[- ]weakening\b(?![ \t]*:[ \t]*(?:none|no|0|-)?[ \t.]*$)"
+                     r"|CHANGED ASSERTS:.*\b(?:weaken|remov|delet|relax|loosen|skip|disabl))")
+REVIEWER_RE = re.compile(r"(?im)^[ \t]*(?:reviewer|worker):[ \t]*(.+)$")
+SEC_RE = re.compile(r"(?i)secur|critical|secret|credential|breach|leak|incident")  # T5: never auto-acked
+DAILY_CAP = {"queue_fix_slice": 6, "page_salih": 3}  # T5: per-code daily caps (items 2 and 9)
 TOPIC_RE = re.compile(r"[A-Za-z0-9_-]{20,64}")  # unguessable: token_urlsafe(24) gives 32
 REPORT_MAX = 256 * 1024
 ROUTINE_RE = re.compile(r"^(reader needs_orchestrator|FINDINGS):")
@@ -304,6 +314,7 @@ SHAPES = {  # shadow.json keys; a present key of another shape resets the state 
         isinstance(h, list) and len(h) == 3 and num(h[0]) and isinstance(h[1], str) and isinstance(h[2], str)
         for h in v),
     "fixes": lambda v: isinstance(v, dict) and all(type(x) is int for x in v.values()),
+    "daily": lambda v: isinstance(v, dict) and all(type(x) is int for x in v.values()),
     "respawns": lambda v: isinstance(v, dict) and all(isinstance(x, list) and all(num(t) for t in x)
                                                      for x in v.values()),
     "head": lambda v: isinstance(v, str),
@@ -350,15 +361,16 @@ def protected(files):
             if any("/" + d in "/" + base for d in dirs) or any(r.startswith(base) for r in roots):
                 return f"the glob {p} may cover a protected path"
         elif any("/" + d in "/" + q for d in dirs) or any(("/" + q).endswith("/" + r) for r in pfiles) \
-                or cv.SKIPLIST_RE.search(q):
+                or cv.SKIPLIST_RE.search(q) or T1_RE.search(q):
             return f"the range touches {p}"
     return None
 
 
 class Bot:
     def __init__(self, root, now=time.time, sleep=time.sleep, quota_ceiling=90, from_start=False,
-                 started=proc_started, wake_post=None, wake_topic=None):
+                 started=proc_started, wake_post=None, wake_topic=None, key1_verify=None):
         self.root = Path(root)
+        self.key1_verify = key1_verify  # None: scripts/key1_check.py verify (T2); tests inject (lane, sha) -> (ok, why)
         self.wake_post, self.wake_topic = wake_post, wake_topic  # None: wake_http / WAKE_TOPIC at post time
         self.wakes = []  # the replay calls check_attention without run()
         self.started = started  # pid -> process start epoch (OSError when unreadable)
@@ -498,7 +510,7 @@ class Bot:
         blank = {"cursor": None, "decisions": [], "counters": {}, "seen": {}, "history": [],
                  "fixes": {}, "respawns": {}, "head": "", "agreement": agree_blank(),
                  "asks": {}, "conv_push": {}, "live": {}, "wake": {}, "hold_since": {},
-                 "blocked": {}, "items": {}, "auto": {}, "waiting": {}}
+                 "blocked": {}, "items": {}, "auto": {}, "waiting": {}, "daily": {}}
         path = self.out / "shadow.json"
         if not path.exists():
             return blank
@@ -1589,6 +1601,9 @@ class Bot:
         if self.approved(sha):
             return self.decide(at, saw, "none", "O26", lane, "key 1 already in build/approvals")
         files, key = self.changed(ln, rep), agree_key("write_key1", f"push-{sha}-{lane}")
+        if WEAK_RE.search(rep) or any(WEAK_RE.search(t) for _, t in self.reviews(lane)):  # ALLOWLIST T1
+            return self.decide(at, saw, "ask_salih_key1", "ALLOW-T1", lane,
+                               "a report flags test weakening: never an automatic key 1", key=key)
         if not files:  # BOTFIX3C: no file list - the conveyor's own auto_approve verdict decides, or wait
             self.st["waiting"][lane] = {"sha": sha, "at": at, "saw": saw, "key": key}
             return self.wait_key1(lane)
@@ -1596,7 +1611,48 @@ class Bot:
         if why:
             self.decide(at, saw, "ask_salih_key1", "CONVSAFE", lane, why, key=key)
         else:
-            self.decide(at, saw, "write_key1", "O26", lane, f"build/approvals/push-{sha}-{lane}", key=key)
+            self.gate_key1(at, saw, lane, sha, f"build/approvals/push-{sha}-{lane}", key)
+
+    def reviews(self, lane):
+        """[(review id, text)] of the CLREV/CDX reports the lane's backlog entry (or INT- source) names."""
+        bl = self.read_json(self.conv / "backlog.json", {})
+        sl = {s.get("id"): s for s in (bl.get("slices") or [] if isinstance(bl, dict) else []) if isinstance(s, dict)}
+        deps = [d for d in (sl.get(lane, {}).get("depends_on") or []) if str(d).startswith(("CLREV-", "CDX-"))]
+        src = lane[4:] if lane.startswith("INT-") else ""
+        names = list(dict.fromkeys(deps + ([f"CLREV-{src}", f"CDX-{src}"] if src else [])))
+        out = []
+        for n in names:
+            try:
+                out.append((n, (self.root / "build" / "reports" / f"{n}.md").read_text(encoding="utf-8")))
+            except OSError:
+                continue
+        return out
+
+    def verified(self, lane, sha):
+        """ALLOWLIST T2: (ok, why) from scripts/key1_check.py for exactly this sha (patch-id + FINDINGS)."""
+        if self.key1_verify:
+            return self.key1_verify(lane, sha)
+        try:
+            import key1_check as kc
+            if kc.field(kc.read(self.root, lane) or "", "CANDIDATE SHA") != sha:
+                return False, f"report CANDIDATE SHA is not {sha[:7]}"
+            out, ok = kc.verify(lane, self.root, kc.make_git(self.root), kc.make_gh(self.root))
+        except Exception as e:  # fail closed: an unverifiable receipt is no receipt
+            return False, f"key1_check error {type(e).__name__}"
+        return ok, next((x for x in out if x.startswith("FAIL")), "PASS")
+
+    def gate_key1(self, at, saw, lane, sha, detail, key):
+        ok, why = self.verified(lane, sha)
+        if not ok:
+            return self.decide(at, saw, "ask_salih_key1", "ALLOW-T2", lane,
+                               f"key1_check refused {sha[:7]}: {why}"[:300], key=key)
+        ids = []
+        for n, t in self.reviews(lane):
+            m = REVIEWER_RE.search(t)
+            who = re.sub(r"[^\w .,()=+-]", "", m.group(1))[:80].strip() if m else n
+            ids.append(f"{n}={who}")
+        self.decide(at, saw, "write_key1", "O26", lane,
+                    f"{detail}; reviewers: {', '.join(ids) or 'none found'}", key=key)
 
     def seen_auto(self, ev, at, lane):
         ok = ev.get("event") == "auto_approve"
@@ -1612,8 +1668,8 @@ class Bot:
             return
         del self.st["waiting"][lane]
         if auto["ok"]:
-            self.decide(auto["at"], w["saw"], "write_key1", "O26", lane,
-                        f"build/approvals/push-{w['sha']}-{lane} (conveyor auto_approve)", key=w["key"])
+            self.gate_key1(auto["at"], w["saw"], lane, w["sha"],
+                           f"build/approvals/push-{w['sha']}-{lane} (conveyor auto_approve)", w["key"])
         else:
             self.decide(auto["at"], w["saw"], "ask_salih_key1", "CONVSAFE", lane,
                         f"conveyor auto_approve_refused: {auto['why'] or 'no reason'}", key=w["key"])
@@ -1645,6 +1701,9 @@ class Bot:
         if n >= FIX_CAP:
             return self.decide(at, saw, "escalate_orchestrator", "O5", target,
                                f"{n} fixes already queued for {target}; {detail}")
+        if self.capped("queue_fix_slice", at):
+            return self.decide(at, saw, "escalate_orchestrator", "ALLOW-T5", target,
+                               f"daily FIX cap {DAILY_CAP['queue_fix_slice']} reached; {detail}")
         self.st["fixes"][target] = n + 1
         self.decide(at, saw, "queue_fix_slice", "O5", target, detail)
 
@@ -1677,7 +1736,23 @@ class Bot:
         state-change record, so one event may carry both)."""
         if self.fresh("outage", at):
             self.decide(at, saw, "hold_dispatch", "EVTAUDIT1", "dispatch", why)
+            if self.capped("page_salih", at):
+                return self.decide(at, "outage episode opened", "escalate_orchestrator", "ALLOW-T5", "salih",
+                                   f"daily page cap {DAILY_CAP['page_salih']} reached; {why}")
             self.decide(at, "outage episode opened", "page_salih", "EVTAUDIT1", "salih", why)
+
+    def capped(self, code, at):
+        """ALLOWLIST T5: True once `code` already ran DAILY_CAP[code] times this UTC day; else counts it."""
+        d = self.st.setdefault("daily", {})
+        if not isinstance(d, dict):
+            d = self.st["daily"] = {}
+        k = f"{code}:{cv.iso(at)[:10]}"
+        for old in [x for x in d if not x.endswith(k[-10:])]:
+            d.pop(old)
+        if d.get(k, 0) >= DAILY_CAP[code]:
+            return True
+        d[k] = d.get(k, 0) + 1
+        return False
 
     # ---- state rules -------------------------------------------------------------------------
     def check_pager(self):
@@ -1729,6 +1804,11 @@ class Bot:
             elif iid != cv.BREAKER_ID and not ok and since is not None and now - since > ACK_AGE_S:
                 wake(("ATTN", iid, "escalate_orchestrator"))
             if not ok or since is None or now - since <= ACK_AGE_S:
+                continue
+            if SEC_RE.search(f"{iid} {reason}"):  # ALLOWLIST T5: a security/critical alert is never auto-acked
+                if self.once(f"sec:{iid}:{cv.iso(now)[:10]}", now):
+                    self.decide(now, f"security/critical attention {iid}", "escalate_orchestrator", "ALLOW-T5",
+                                iid, "never acked automatically")
                 continue
             ack = self.conv / "ack" / cv.ack_name(iid)
             if ack.exists() and since <= ack.stat().st_mtime <= now:  # BOTREPLAY2: a future ack hides nothing

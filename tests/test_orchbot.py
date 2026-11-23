@@ -63,6 +63,7 @@ class BotCase(unittest.TestCase):
         kw.setdefault("from_start", True)
         kw.setdefault("wake_post", self.post)
         kw.setdefault("wake_topic", self.topic)
+        kw.setdefault("key1_verify", lambda lane, sha: (True, "PASS"))  # ALLOWLIST T2: key1_check stubbed
         return orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append, **kw).run()
 
     def acts(self, ds):
@@ -2003,6 +2004,62 @@ class DecisionGateTest(LiveTest):
         self.run_bot()
         self.assertTrue(self.ack().exists())
         self.assertFalse(self.registry().exists())
+
+
+class AllowlistT1T5Test(BotCase):
+    """build/orch/devir/ALLOWLIST_v1.md T1..T5 in the hands path."""
+
+    def key1_lane(self, lane, files):
+        self.put("build/conveyor/lanes.json", {lane: {"files": files, "ci": {"cand": True, "sha": SHA}}})
+        self.events({"ts": "2026-10-15T11:00:00", "event": "ci_result", "lane": lane, "sha": SHA,
+                     "result": "success"})
+
+    def test_t1_widened_protected_set(self):
+        for f in ("tests/conftest.py", "uv.lock", "build/conveyor/pace.json", "tests/quarantine.txt",
+                  "build/orch/devir/ALLOWLIST_v1.md", "tests/fixtures/a.json", "pytest.ini"):
+            self.assertTrue(orchbot.protected([f]), f)
+        self.assertFalse(orchbot.protected(["jarvis/a.py", "tests/test_a.py"]))
+        self.key1_lane("L1", ["jarvis/a.py", "tests/conftest.py"])
+        self.assertNotIn("write_key1", [a[0] for a in self.acts(self.run_bot())])
+
+    def test_t1_test_weakening_never_auto_key1(self):
+        self.key1_lane("L1", ["jarvis/a.py"])
+        self.put("build/reports/L1.md", "STATUS: PASS\nTEST WEAKENING: removed an assert in test_a\n")
+        self.assertEqual(self.acts(self.run_bot()), [("ask_salih_key1", "ALLOW-T1", "L1")])
+
+    def test_t2_key1_check_fail_asks_salih(self):
+        self.key1_lane("L1", ["jarvis/a.py"])
+        ds = self.run_bot(key1_verify=lambda lane, sha: (False, "FAIL 2 patch-id mismatch"))
+        self.assertEqual(self.acts(ds), [("ask_salih_key1", "ALLOW-T2", "L1")])
+        self.assertIn("patch-id mismatch", ds[0]["detail"])
+
+    def test_t2_default_verifier_refuses_another_sha(self):
+        self.key1_lane("L1", ["jarvis/a.py"])
+        self.put("build/reports/L1.md", f"STATUS: PASS\nCANDIDATE SHA: {'1' + SHA[1:]}\n")
+        self.assertEqual(self.acts(self.run_bot(key1_verify=None)), [("ask_salih_key1", "ALLOW-T2", "L1")])
+
+    def test_t2_reviewer_ids_recorded(self):
+        self.key1_lane("INT-X", ["jarvis/a.py"])
+        self.put("build/reports/CLREV-X.md", "STATUS: PASS\nREVIEWER: opus-a\nFINDINGS: none\n")
+        ds = self.run_bot()
+        self.assertEqual(self.acts(ds), [("write_key1", "O26", "INT-X")])
+        self.assertIn("CLREV-X=opus-a", ds[0]["detail"])
+
+    def test_t5_security_attention_is_never_acked(self):
+        self.put("build/conveyor/status.json", {"attention": [
+            {"id": "SEC1", "reason": "FINDINGS: credential leak", "since": "2026-10-15T11:00:00"}]})
+        acts = self.acts(self.run_bot())
+        self.assertIn(("escalate_orchestrator", "ALLOW-T5", "SEC1"), acts)
+        self.assertNotIn("O33", [a[1] for a in acts])
+
+    def test_t5_daily_caps(self):
+        bot = orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append, from_start=True,
+                          wake_post=self.post, wake_topic=self.topic, key1_verify=lambda lane, sha: (True, "PASS"))
+        bot.run()
+        at = self.clock()
+        for code, cap in orchbot.DAILY_CAP.items():
+            self.assertEqual([bot.capped(code, at) for _ in range(cap + 1)], [False] * cap + [True], code)
+            self.assertFalse(bot.capped(code, at + 86400), code)  # a new day resets the cap
 
 
 if __name__ == "__main__":
