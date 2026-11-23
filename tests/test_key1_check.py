@@ -222,6 +222,54 @@ class Key1CheckTests(unittest.TestCase):
                 self.assertFalse(ok, text)
                 self.assertFalse(p.exists())
 
+    # KEY1PATH1FIX negative tests (V7-V9)
+    def test_write_uses_the_verified_report_not_a_second_read(self):  # V7 / F2 TOCTOU
+        fx = self.fx()
+        rp = fx.root / "build" / "reports" / "INT-X.md"
+
+        def gh(args):  # the report changes while verify() waits on the network
+            rp.write_text(rp.read_text(encoding="utf-8").replace(fx.cand, fx.other), encoding="utf-8")
+            return ci(fx.cand)(args)
+        text, ok, p = self.write(fx, gh, write=True)
+        self.assertTrue(ok, text)
+        self.assertIn(f"sha={fx.cand} ", p.read_text(encoding="ascii"))
+        self.assertFalse((p.parent / f"push-{fx.other}-int-x").exists())
+
+    def test_writer_ignores_planted_temp_and_never_overwrites(self):  # V8 / F3
+        import os
+        import threading
+        from unittest import mock
+        d = Path(self.fx().root) / "build" / "approvals"
+        d.mkdir()
+        planted = d / f".key1-{os.getpid()}-{threading.get_ident()}.tmp"  # the old predictable name
+        planted.write_text("planted", encoding="ascii")
+        sha, ci_ = "a" * 40, "ci/int-x"
+        p = k1.conveyor.write_key1(d, sha, ci_, "INT-X", "key1_check", ("ci",))
+        self.assertEqual(planted.read_text(encoding="ascii"), "planted")
+        self.assertIsNone(k1.conveyor.key1_refusal(p))
+        before = p.read_bytes()
+        # a target appearing after the exists() check is still never replaced
+        with mock.patch.object(k1.conveyor.Path, "exists", return_value=False):
+            with self.assertRaises(FileExistsError):
+                k1.conveyor.write_key1(d, sha, ci_, "INT-X", "conveyor", ("approval-for",))
+        self.assertEqual(p.read_bytes(), before)
+        self.assertEqual(sorted(q.name for q in d.iterdir()), sorted([p.name, planted.name]))
+        # a locked temp (AV) after a successful link still reports the key that is on disk
+        with mock.patch.object(k1.conveyor.Path, "unlink", side_effect=PermissionError):
+            q = k1.conveyor.write_key1(d, "c" * 40, ci_, "INT-X", "key1_check", ("ci",))
+        self.assertIsNone(k1.conveyor.key1_refusal(q))
+
+    def test_refusal_checks_the_whole_first_line(self):  # V9 / F4
+        d = Path(self.fx().root) / "build" / "approvals"
+        p = k1.conveyor.write_key1(d, "b" * 40, "ci/int-x", "INT-X", "key1_check", ("ci",))
+        h = p.read_text(encoding="ascii").rstrip("\n")
+        for body in (h + " " + "x" * 600 + "\n", h + "x" * 2000, h + "x" * 2000 + "\n"):
+            with self.subTest(n=len(body)):
+                p.write_text(body, encoding="ascii", newline="\n")
+                self.assertIsNotNone(k1.conveyor.key1_refusal(p))
+        p.write_text(h, encoding="ascii")  # no trailing newline is still a whole line
+        self.assertIsNone(k1.conveyor.key1_refusal(p))
+
 
 if __name__ == "__main__":
     unittest.main()

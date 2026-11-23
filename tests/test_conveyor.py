@@ -5241,6 +5241,32 @@ class TestPushGate(Base):
                 self.assertEqual(self.fake.bg_calls(), [])
                 self.assertTrue([e for e in self.events() if e["event"] == "dispatch_refused"])
 
+    def test_every_required_deny_entry_is_needed_for_dispatch(self):  # KEY1PATH1FIX V6
+        for entry in conveyor.REQUIRED_DENY:
+            with self.subTest(missing=entry):
+                write_settings(self.root, tuple(d for d in conveyor.REQUIRED_DENY if d != entry))
+                self.assertIn(repr(entry), conveyor.settings_refusal(self.root) or "")
+        self.assertIn("Bash(*key1_check*--write*)", conveyor.REQUIRED_DENY)
+        self.assertIn("Bash(*write_key1(*)", conveyor.REQUIRED_DENY)
+
+    def test_lane_commands_that_reach_the_key1_writer_match_a_bash_deny(self):  # KEY1PATH1FIX V1-V5
+        import fnmatch
+        pats = [d[5:-1] for d in conveyor.REQUIRED_DENY if d.startswith("Bash(")]
+        for cmd in ("python scripts/key1_check.py INT-X --write",                      # V1
+                    'python scripts/key1_check.py INT-X --manual "ok"',                # V2
+                    "python -m key1_check INT-X --write", "cd scripts && py key1_check.py INT-X --write",
+                    r"python scripts\key1_check.py INT-X --write",                      # V3
+                    "python -c \"import conveyor; conveyor.write_key1('a', 1, 2, 3, 4, ())\"",  # V4
+                    "echo x > build/approvals/push-1", r"copy x build\approvals\push-1"):  # V5
+            with self.subTest(cmd=cmd):
+                self.assertTrue(any(fnmatch.fnmatchcase(cmd, p) for p in pats), cmd)
+        for cmd in ("python scripts/test_parallel.py tests.test_key1_check",  # lanes owning the writer still work
+                    "git add scripts/key1_check.py tests/test_key1_check.py", "git diff -- scripts/key1_check.py",
+                    'git commit -m "fix: make key1_check the only reachable writer"',
+                    "python -m unittest -k write_key1 tests.test_conveyor"):
+            with self.subTest(allowed=cmd):
+                self.assertFalse(any(fnmatch.fnmatchcase(cmd, p) for p in pats), cmd)
+
     def assert_blocked(self, name, why):
         self.c.pass_once()
         self.assertEqual(self.git.pushes(), [])
