@@ -161,10 +161,8 @@ class TestR7PushBlockedLocalMain(tc.Base):
         """
         self.t = T0
         want = "d" * 40  # the sha the lane pushed to ci/*; local main is still MAIN
-        d = self.root / "build" / "approvals"
-        d.mkdir(parents=True)
-        approval = d / f"push-{want}-p2b"
-        approval.write_text("integration report read, ok\n", encoding="utf-8")
+        # KEY1PATH1FIX5: a valid key 1 (the real writer), so the refusal under test is the local-main lag
+        approval = tc.key1(self.root / "build" / "approvals", want, "ci/p2b")
         self.c.pass_once()
         (ev,) = [e for e in self.events() if e["event"] == "push_blocked"]
         self.assertEqual(ev["approval"], approval.name)
