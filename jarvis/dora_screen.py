@@ -19,10 +19,13 @@ Deny = tuple[int, list[re.Pattern[str]], list[tuple[str, bool, bool]]]
 
 _TR = str.maketrans("çğıöşüâîû", "cgiosuaiu")
 # sk-ant keys, GitHub tokens and any key/token/secret/password = 32+ char value.
+# DORAGATE1FIX: linear time. The name branch starts only at the start of a [\w-] run,
+# checks the keyword by lookahead and takes the run possessively (same matches as before).
 _SECRET = re.compile(
     r"sk-ant-[\w-]{8,}"
     r"|(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,})"
-    r"|(?i:[\w-]*(?:key|token|secret|passw(?:or)?d|pwd)[\w-]*)[\"']?\s*[=:]\s*[\"']?[^\s\"',;]{32,}")
+    r"|(?<![\w-])(?i:(?=[\w-]*?(?:key|token|secret|passw(?:or)?d|pwd))[\w-]++)"
+    r"[\"']?\s*[=:]\s*[\"']?[^\s\"',;]{32,}")
 
 
 def load_deny(path: Path | None = None) -> Deny:
@@ -30,6 +33,10 @@ def load_deny(path: Path | None = None) -> Deny:
     in the JSON ask for a word boundary in the letters skeleton (see _skeleton).
     ``path`` None reads DENY_PATH at call time (tests patch it)."""
     d = json.loads((DENY_PATH if path is None else path).read_text(encoding="utf-8"))
+    if not (isinstance(d, dict) and type(d.get("shapes")) is list and type(d.get("words")) is list
+            and all(type(x) is str for x in d["shapes"] + d["words"])
+            and (d["shapes"] or d["words"])):  # an empty list would allow everything
+        raise ValueError("deny list needs lists of strings, not both empty")
     words = [(w.strip("^$"), w.startswith("^"), w.endswith("$")) for w in d["words"]]
     if not all(w and w.isalnum() for w, _, _ in words):
         raise ValueError("deny words must be letters/digits with optional ^ $")
@@ -131,6 +138,8 @@ def shape_hits(text: str, shapes, n=None, org=None) -> list:
 def _screen(text: str, deny) -> list:
     """(start, end) offsets in text of every shape and word hit."""
     _, shapes, words = deny
+    if not (shapes or words):
+        raise ValueError("empty deny list")  # fail closed: denied() drops, screen() doubts
     n, org = _norm(text)
     out = shape_hits(text, shapes, n, org)
     sk, so, sb = _skeleton(n)
@@ -158,6 +167,8 @@ def screen(text: object, deny: Deny | None = None) -> tuple[bool, str]:
         return False, "doubt:type"
     try:
         deny = load_deny() if deny is None else deny
+        if not (deny[1] or deny[2]):
+            raise ValueError("empty deny list")
     except Exception:  # fail closed: unreadable or malformed list
         return False, "doubt:list"
     try:

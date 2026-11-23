@@ -4,6 +4,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -73,13 +74,30 @@ class DoraScreenTests(unittest.TestCase):
 
     def test_neg_unreadable_or_malformed_list_refused(self):
         bad = [None, "not json", {"version": 1, "shapes": [], "words": ["two words"]},
-               {"version": 1, "shapes": ["("], "words": []}, {"shapes": [], "words": []}]
+               {"version": 1, "shapes": ["("], "words": []}, {"shapes": [], "words": []},
+               # DORAGATE1FIX: an empty or wrong-shape list refuses everything, never allows
+               {"version": 1, "shapes": [], "words": []}, [], {"version": 1},
+               {"version": 1, "shapes": {}, "words": [WORD]}, {"version": 1, "shapes": "x", "words": []},
+               {"version": 1, "shapes": [], "words": WORD}, {"version": 1, "shapes": [], "words": {WORD: 1}},
+               {"version": 1, "shapes": [None], "words": [WORD]}, {"version": 1, "shapes": [], "words": [3]}]
         for data in bad:
             if data is None:
                 self.path.unlink()
             else:
                 write_list(self.root, data)
             self.assertEqual(screen("harmless text"), (False, "doubt:list"), data)
+
+    def test_neg_empty_explicit_list_refused(self):  # CDX-DORAGATE1 F2
+        self.assertEqual(screen("harmless text", (1, [], [])), (False, "doubt:list"))
+
+    def test_secret_pattern_is_linear(self):  # CLREV-DORAGATE1 F1: was cubic on long runs
+        for text in ("key" * 16667, "key-" * 12500, "Token" * 10000, "a" * 50000, "-" * 50000,
+                     ("key=" + "x" * 31 + " ") * 1390, "pwd_" * 12500 + ":"):
+            start = time.perf_counter()
+            dora_screen._SECRET.search(text)
+            self.assertLess(time.perf_counter() - start, 0.1, text[:12])
+        self.assertTrue(dora_screen._SECRET.search("cfg." + GENERIC))  # mid-text still found
+        self.assertTrue(dora_screen._SECRET.search("my-api-token : " + "y" * 32))
 
     def test_neg_screen_error_refused(self):
         with mock.patch.object(dora_screen, "_screen", side_effect=RuntimeError("boom")):

@@ -140,6 +140,13 @@ class LessonExtractTests(unittest.TestCase):
         self.assert_never_sent(files, api, "yapi", "kredi")
         self.assertIn("Orkestrator kuyrugu", "\n".join(api.payloads))
 
+    def test_secret_in_lesson_text_is_never_sent(self):  # CLREV-DORAGATE1 F2
+        token = "API_" + "KEY=" + "x7" * 20  # built at run time
+        self.write("kayit/sohbet/S2.md", "## Sohbet\nanahtar " + token + "\n")
+        api, rep, files = self.run_once()
+        self.assertGreaterEqual(rep["dropped_dora"], 1)
+        self.assert_never_sent(files, api, token, "x7" * 20)
+
     def test_quote_not_verbatim_is_dropped(self):
         def answer(content):
             ok = json.loads(good_answer(content))

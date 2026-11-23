@@ -303,8 +303,21 @@ class N6ScreenTests(N6NotifyTests.__base__):
 
     flush = N6NotifyTests.flush
 
+    OLD_KEYS = {"version", "pending", "daily", "ask_day", "asks", "outbox", "outbox_asks"}
+
     def state(self):
         return json.loads(self.path.read_text("utf-8"))
+
+    @property
+    def sidecar(self):
+        return self.path.with_name(self.path.name + ".refused")
+
+    def counts(self):
+        return json.loads(self.sidecar.read_text("utf-8"))
+
+    def set_words(self, *words):
+        self.deny.write_text(json.dumps({"version": 1, "shapes": [], "words": list(words)}),
+                             encoding="utf-8")
 
     def test_neg_deny_hit_never_sent_and_counted(self):
         submit(self.path, Event("urgent", "a", f"kota {self.WORD.upper()} bitti"))
@@ -313,7 +326,8 @@ class N6ScreenTests(N6NotifyTests.__base__):
         self.assertEqual(self.sent, ["kota bitti"])
         self.assertEqual(len(self.ledger.events), 1)  # the refused item made no ledger point
         state = self.state()
-        self.assertEqual(state["refused"], {"deny": 1})
+        self.assertEqual(self.counts(), {"deny": 1})
+        self.assertEqual(set(state), self.OLD_KEYS)  # 00f3a20 reader needs exactly these keys
         self.assertEqual(state["pending"], [])  # dropped, not retried
         self.assertNotIn(self.WORD, self.path.read_text("utf-8").lower())
 
@@ -323,7 +337,7 @@ class N6ScreenTests(N6NotifyTests.__base__):
         self.assertIsNone(self.flush())
         self.assertEqual(self.sent, [])
         self.assertEqual(self.ledger.events, [])
-        self.assertEqual(self.state()["refused"], {"secret": 1})
+        self.assertEqual(self.counts(), {"secret": 1})
 
     def test_neg_unsent_outbox_hit_is_dropped(self):
         submit(self.path, Event("status", "a", "not"))  # a valid state with an empty outbox
@@ -332,7 +346,61 @@ class N6ScreenTests(N6NotifyTests.__base__):
         self.path.write_text(json.dumps(state), encoding="utf-8")
         self.assertIsNone(self.flush())
         self.assertEqual(self.sent, [])
-        self.assertEqual(self.state()["refused"], {"deny": 1})
+        self.assertEqual(self.counts(), {"deny": 1})
+
+    def test_neg_join_of_clean_lines_refused(self):  # CDX-DORAGATE1 F1: screen the sent text
+        self.set_words(self.WORD, "plimb")
+        submit(self.path, Event("urgent", "a", "Pli"))
+        submit(self.path, Event("urgent", "b", "mb"))
+        self.assertEqual(self.flush(), "Pli")  # the joined text would spell the deny word
+        self.assertEqual(self.flush(at=DAY2), "mb")  # deferred, sent on its own, never joined
+        submit(self.path, Event("urgent", "c", "API_" + "KEY="))
+        submit(self.path, Event("urgent", "d", "x" * 40))
+        self.assertEqual(self.flush(at=DAY2), "API_" + "KEY=")
+        self.assertEqual(self.sent, ["Pli", "mb", "API_" + "KEY=", "x" * 40][:3])
+        for text in self.sent:
+            self.assertTrue(n6_notify.dora_screen.screen(text)[0], text)
+
+    def test_neg_join_with_unsent_outbox_refused(self):
+        self.set_words(self.WORD, "plimb")
+        submit(self.path, Event("status", "a", "not"))
+        state = self.state()
+        state["outbox"] = "Pli"
+        self.path.write_text(json.dumps(state), encoding="utf-8")
+        submit(self.path, Event("urgent", "b", "mb"))
+        self.assertEqual(self.flush(), "Pli")
+        self.assertNotIn("mb", self.sent[0])
+
+    def test_neg_empty_list_sends_nothing(self):  # CDX-DORAGATE1 F2
+        submit(self.path, Event("urgent", "a", "kota bitti"))
+        before = self.path.read_text("utf-8")
+        self.set_words()
+        with self.assertRaises(ValueError):
+            self.flush()
+        self.assertEqual((self.sent, self.ledger.events), ([], []))
+        self.assertEqual(self.path.read_text("utf-8"), before)
+
+    def test_refused_outbox_frees_its_asks(self):  # CDX-DORAGATE1 F3
+        submit(self.path, Event("status", "a", "not"))
+        state = self.state()
+        state.update(ask_day="2026-11-08", asks=4, outbox_asks=4, outbox=f"kota {self.WORD}")
+        self.path.write_text(json.dumps(state), encoding="utf-8")
+        self.assertIsNone(self.flush())
+        state = self.state()
+        self.assertEqual((state["asks"], state["outbox_asks"], state["outbox"]), (0, 0, ""))
+
+    def test_old_reader_keys_kept_and_legacy_refused_moves_to_sidecar(self):  # CLREV F3
+        submit(self.path, Event("urgent", "a", f"kota {self.WORD}"))
+        state = self.state()
+        state["refused"] = {"deny": 2}  # written by DORAGATE1
+        self.path.write_text(json.dumps(state), encoding="utf-8")
+        self.assertIsNone(self.flush())
+        self.assertEqual(self.counts(), {"deny": 3})
+        self.assertEqual(set(self.state()), self.OLD_KEYS)
+        submit(self.path, Event("urgent", "b", f"yine {self.WORD}"))
+        self.flush()
+        self.assertEqual(self.counts(), {"deny": 4})  # counts grow across flushes
+        self.assertNotIn(self.WORD, self.sidecar.read_text("utf-8"))  # labels only
 
     def test_neg_unreadable_list_sends_nothing_and_keeps_pending(self):
         submit(self.path, Event("urgent", "a", "kota bitti"))
@@ -346,14 +414,22 @@ class N6ScreenTests(N6NotifyTests.__base__):
 
     def test_state_without_refused_still_loads_and_bad_refused_raises(self):
         submit(self.path, Event("urgent", "a", "kota bitti"))
-        self.assertNotIn("refused", self.state())  # written only after a refusal
+        self.assertNotIn("refused", self.state())  # never written to the state
         self.assertEqual(self.flush(), "kota bitti")
+        self.assertFalse(self.sidecar.exists())  # written only after a refusal
+        good = self.state()
         for bad in ([], {"deny": 0}, {"deny": "1"}, {"deny": True}):
-            state = self.state()
-            state["refused"] = bad
-            self.path.write_text(json.dumps(state), encoding="utf-8")
+            self.path.write_text(json.dumps({**good, "refused": bad}), encoding="utf-8")
             with self.assertRaises(StateError):
                 self.flush()
+            self.path.write_text(json.dumps(good), encoding="utf-8")
+            self.sidecar.write_text(json.dumps(bad), encoding="utf-8")
+            with self.assertRaises(StateError):
+                self.flush()
+            self.sidecar.unlink()
+        self.sidecar.write_text("not json", encoding="utf-8")
+        with self.assertRaises(StateError):
+            self.flush()
 
 
 if __name__ == "__main__":

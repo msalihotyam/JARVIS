@@ -21,7 +21,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from jarvis import dora_screen  # noqa: E402
-from jarvis.dora_screen import _screen, denied  # noqa: E402,F401  (public names kept)
+from jarvis.dora_screen import _screen, denied, screen  # noqa: E402,F401  (public names kept)
 
 HERE = Path(__file__).resolve().parent
 DENY_PATH = HERE / "lesson_deny_patterns.json"
@@ -202,7 +202,7 @@ def run(root: Path, out: Path, ceiling: float, api, deny_path: Path = DENY_PATH)
         purpose = f"ders lesson {Path(c['source']).name}:{c['start']}"[:80]
         st = seen.setdefault(c["source"], [0, 0])
         st[1] += 1
-        if (_hit(c, hits[c["source"]]) or any(denied(t, deny) for t in
+        if (_hit(c, hits[c["source"]]) or any(not screen(t, deny)[0] for t in  # + secrets
                                               (c["text"], c["source"], ptr, purpose))):
             rep["dropped_dora"] += 1
             st[0] += 1

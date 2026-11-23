@@ -183,8 +183,30 @@ def _save(path: Path, s: _State) -> None:
     data = {
         "version": 1, "pending": [asdict(e) for e in s.pending], "daily": s.daily,
         "ask_day": s.ask_day, "asks": s.asks, "outbox": s.outbox, "outbox_asks": s.outbox_asks,
-        **({"refused": s.refused} if s.refused else {}),
-    }
+    }  # exactly _KEYS: the 00f3a20 reader rejects any other key (refusal counts: sidecar)
+    _write(path, data)
+
+
+def _counts_path(path: Path) -> Path:
+    return path.with_name(path.name + ".refused")
+
+
+def _load_counts(path: Path) -> dict[str, int]:
+    """Refusal counts by reason label only, from the sidecar beside the state file."""
+    try:
+        data = cast(object, json.loads(_counts_path(path).read_text(encoding="utf-8")))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError) as exc:
+        raise _bad("refused") from exc
+    if not isinstance(data, dict) or not all(
+            isinstance(k, str) and type(v) is int and v > 0
+            for k, v in cast("dict[object, object]", data).items()):
+        raise _bad("refused")
+    return cast("dict[str, int]", data)
+
+
+def _write(path: Path, data: object) -> None:
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as fh:
@@ -235,22 +257,30 @@ def flush(
     """Send at most one phone message holding every due SALIH item; return it.
 
     DORAGATE1: every line is screened (jarvis.dora_screen) before it is sent; a refused
-    item is dropped, never sent, and counted in ``refused`` by reason label only. An
-    unreadable deny list raises before state is touched: nothing sent or consumed.
+    item is dropped, never sent, and counted by reason label only in the ``<state>.refused``
+    sidecar (the state keeps the keys the previous reader checks). An unreadable, empty or
+    malformed deny list raises before state is touched: nothing sent or consumed.
+    DORAGATE1FIX: the joined message is screened too; a line whose join is refused waits
+    for the next flush, so the text sent is always the text screened.
     """
     if at.utcoffset() is None:
         raise ValueError("at must be timezone-aware")
     deny = dora_screen.load_deny()  # fail closed: raises, nothing sent
     path = Path(state_path)
     s = _load(path)
+    counts = _load_counts(path)
+    for why, n in s.refused.items():  # a DORAGATE1 state kept its counts in the state file
+        counts[why] = counts.get(why, 0) + n
+    s.refused = {}
 
     def refuse(text: str) -> bool:
         ok, why = dora_screen.screen(text, deny)
         if not ok:
-            s.refused[why] = s.refused.get(why, 0) + 1
+            counts[why] = counts.get(why, 0) + 1
         return not ok
 
     if s.outbox and refuse(s.outbox):
+        s.asks -= s.outbox_asks  # its asks were never sent: free them for today
         s.outbox, s.outbox_asks = "", 0
     day = at.astimezone(ISTANBUL).date().isoformat()
     if day > s.ask_day:  # a clock going backwards never resets the cap
@@ -269,6 +299,8 @@ def flush(
                 continue
             if lines and len("\n".join([*lines, line])) > MAX_CHARS:
                 break  # does not fit: waits for the next flush, never clipped away
+            if lines and not dora_screen.screen("\n".join([*lines, line]), deny)[0]:
+                break  # the joined text is refused: this line waits and goes alone
             point = _SALIH_POINTS[ev.kind]
             if core.notify(run_id, point, f"{ev.kind}:{ev.key}", seq=next_seq(), at=at,
                            importance="high"):
@@ -280,6 +312,8 @@ def flush(
     finally:
         s.pending += queue
         s.outbox = "\n".join(lines)
+        if counts:
+            _write(_counts_path(path), counts)
         _save(path, s)
     if not s.outbox:
         return None
