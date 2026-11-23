@@ -17,8 +17,11 @@ import json
 import math
 import re
 import sys
-import unicodedata
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from jarvis import dora_screen  # noqa: E402
+from jarvis.dora_screen import _screen, denied  # noqa: E402,F401  (public names kept)
 
 HERE = Path(__file__).resolve().parent
 DENY_PATH = HERE / "lesson_deny_patterns.json"
@@ -31,7 +34,6 @@ CLASSES = ("enforced_in_code", "every_round", "topic", "historical")
 FIELDS = ("olay", "kok_neden", "kural", "zorlanma_yeri", "n6_davranisi", "tur", "alinti")
 RULE_RE = re.compile(r"^(?:#{1,6}\s+|-\s+)?O(\d+)[a-z]?(?![0-9A-Za-z])")
 HEAD_RE = re.compile(r"^#{1,6}\s")
-_TR = str.maketrans("çğıöşüâîû", "cgiosuaiu")
 
 SYSTEM = (
     "JARVIS orkestrasyon gecmisinden DERS ADAYI cikariyorsun. Yalniz verilen parcayi kullan, "
@@ -47,129 +49,8 @@ SYSTEM = (
 
 
 def load_deny(path: Path = DENY_PATH):
-    """(version, shapes, words). A word is (letters, needs_start, needs_end): '^' / '$'
-    in the JSON ask for a word boundary in the letters skeleton (see _skeleton)."""
-    d = json.loads(path.read_text(encoding="utf-8"))
-    words = [(w.strip("^$"), w.startswith("^"), w.endswith("$")) for w in d["words"]]
-    if not all(w and w.isalnum() for w, _, _ in words):
-        raise ValueError("deny words must be letters/digits with optional ^ $")
-    return int(d["version"]), [re.compile(p, re.I) for p in d["shapes"]], words
-
-
-_DATE = re.compile(r"(?<!\d)(?:19|20)\d\d-[01]\d-[0-3]\d(?!\d)")
-_GLUED = re.compile(r"(?<=[^\W\d_])\d{1,3}(?!\d)")  # O52, UIRED5: ids glued to letters
-_MARK = ("Mn", "Mc", "Me", "Cf")
-# Cyrillic / Greek lookalikes (after casefold) -> Latin, for the letters skeleton only.
-_HOMO = str.maketrans("аеорсухіјѕԁкмнтвοαειкνρτυχβημ", "aeopcyxijsdkmhtboaeiknptuxbhm")
-# LESSONS1FIX4: leet digits ('d0ra') and Unicode small capitals ('ᴅora'), skeleton only.
-_LEET = str.maketrans(  # LATIN LETTER SMALL CAPITAL A..Z (Unicode has no X)
-    "013457ᴀʙᴄᴅᴇꜰɢʜɪᴊᴋʟᴍ"
-    "ɴᴏᴘꞯʀꜱᴛᴜᴠᴡʏᴢ",
-    "oieastabcdefghijklmnopqrstuvwyz")
-
-
-def _norm(text: str):
-    """Whole-string NFKC (each base char composed with its combining marks, so decomposed
-    mü / ş compose), Cf (zero-width, soft hyphen) dropped, any script's digits -> ASCII.
-    Returns (normalized, origin index in text per char)."""
-    out, org, i, n = [], [], 0, len(text)
-    while i < n:
-        j = i + 1
-        while j < n and unicodedata.category(text[j]) in _MARK:
-            j += 1
-        unit = "".join(c for c in text[i:j] if unicodedata.category(c) != "Cf")
-        for c in unicodedata.normalize("NFKC", unit):
-            out.append(str(unicodedata.decimal(c)) if c.isdecimal() else c)
-            org.append(i)
-        i = j
-    return "".join(out), org
-
-
-def _skeleton(n: str):
-    """Letters/digits only, casefolded, accents and Turkish letters folded, lookalikes
-    mapped: 'Garanti-BBVA', 'YapıKredi', 'dora_notes', 'D.O.R.A', 'yapi\\nkredi' all read
-    as joined letters. Returns (skeleton, index in n per char, boundary-before per char);
-    a boundary is a removed separator, a lower->Upper step or a letter<->digit step."""
-    sk, so, sb, gap, prev = [], [], [], True, ""
-    # hex ids (commit shas) skip leet folding, else 'a7eb1f0c' reads as 'teb'
-    hexrun = {i for m in re.finditer(r"(?<![^\W_])[0-9a-fA-F]{7,}(?![^\W_])", n)
-              for i in range(*m.span())}
-    for i, ch in enumerate(n):
-        if unicodedata.category(ch) in _MARK:
-            continue
-        if not ch.isalnum():
-            gap = True
-            continue
-        b = gap or (prev.islower() and ch.isupper()) or prev.isdigit() != ch.isdigit()
-        for c in unicodedata.normalize("NFD", ch.casefold()):
-            if c.isalnum():
-                c = c.translate(_TR).translate(_HOMO)
-                sk.append(c if i in hexrun else c.translate(_LEET))
-                so.append(i)
-                sb.append(b)
-                b = False
-        gap, prev = False, ch
-    sb.append(True)
-    return "".join(sk), so, sb
-
-
-def _at_collapse(n: str):
-    """n with every non-letter/digit run on either side of each '@' removed
-    ('salih @example.com', 'salih@ example.com'). Returns (text, index in n per char)."""
-    drop = set()
-    for i, ch in enumerate(n):
-        if ch == "@":
-            for step in (-1, 1):
-                j = i + step
-                while 0 <= j < len(n) and j not in drop and n[j] != "@" and not n[j].isalnum():
-                    drop.add(j)
-                    j += step
-    keep = [i for i in range(len(n)) if i not in drop]
-    return "".join(n[i] for i in keep), keep
-
-
-def shape_hits(text: str, shapes, n=None, org=None) -> list:
-    """(start, end) offsets in text of every shape hit. Views: raw, normalized and the
-    '@'-collapsed normalized text; each seen unmasked, with ISO dates blanked and with
-    letter-glued 1-3 digit ids hidden (LESSONS1FIX3: the unmasked pass catches
-    'Tel53 2026-11-14')."""
-    if n is None:
-        n, org = _norm(text)
-    a, ao = _at_collapse(n)
-    views = [(n, org)] + [(text, None)] * (text != n) + [(a, [org[k] for k in ao])] * (a != n)
-    out = []
-    for t, o in views:  # identical views skipped: same hits, a third of the time
-        for v in (t, _DATE.sub(lambda m: " " * len(m.group()), t),
-                  _GLUED.sub(lambda m: "#" * len(m.group()), t)):
-            for p in shapes:
-                for m in p.finditer(v):
-                    s, e = m.span()
-                    out.append((s, e) if o is None else (o[s], o[max(e - 1, s)] + 1))
-    return out
-
-
-def _screen(text: str, deny) -> list:
-    """(start, end) offsets in text of every shape and word hit."""
-    _, shapes, words = deny
-    n, org = _norm(text)
-    out = shape_hits(text, shapes, n, org)
-    sk, so, sb = _skeleton(n)
-    for w, st, en in words:
-        i = sk.find(w)
-        while i >= 0:
-            e = i + len(w)
-            if (not st or sb[i]) and (not en or sb[e]):
-                out.append((org[so[i]], org[so[e - 1]] + 1))
-            i = sk.find(w, i + 1)
-    return out
-
-
-def denied(text: str, deny) -> bool:
-    """True = drop. Any doubt (error, non-text) also drops."""
-    try:
-        return bool(_screen(text, deny))
-    except Exception:  # fail closed
-        return True
+    """DORAGATE1: the shared jarvis.dora_screen list loader, same file and errors."""
+    return dora_screen.load_deny(path)
 
 
 def hit_lines(path: Path, deny):

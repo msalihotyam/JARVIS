@@ -36,7 +36,7 @@ from tests.helpers import safe_cleanup
 from tests.test_work_driver import FakePorts, result, run_drive
 
 # ASCII, no dot/slash (n6_notify strips links), not credential-shaped.
-CANARY = "KANARYA-DORA-7F3A9C"
+CANARY = "KANARYA-PRIV-7F3A9C"
 AT = datetime(2026, 11, 15, 9, 0, tzinfo=timezone.utc)
 RUN = "run-canary"
 MAIN = "c" * 40
@@ -245,7 +245,11 @@ class PrivacyCanaryTests(unittest.TestCase):
         def leaky(kind, key, text, recommendation=""):
             return real(kind, key, f"{text} {record.text}", recommendation)
 
-        with mock.patch.object(n6_notify, "Event", leaky):
+        # DORAGATE1: the real Dora screen refuses this record before the phone, so the
+        # screen is opened here to prove the scan itself still catches a phone leak.
+        self.assertFalse(n6_notify.dora_screen.screen(record.text)[0])
+        with mock.patch.object(n6_notify, "Event", leaky), mock.patch.object(
+                n6_notify.dora_screen, "screen", lambda text, deny=None: (True, "")):
             sinks = self._drive()
         with self.assertRaisesRegex(AssertionError, "n6 phone send, n6 stored events"):
             assert_no_canary(sinks)

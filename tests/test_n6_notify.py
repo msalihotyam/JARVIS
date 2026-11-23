@@ -287,5 +287,74 @@ class N6NotifyTests(unittest.TestCase):
         self.assertEqual(self.sent, [])
 
 
+class N6ScreenTests(N6NotifyTests.__base__):
+    """DORAGATE1 / GAP 5: flush screens every line; synthetic deny list, no real words."""
+
+    WORD = "zqxvkmark"  # synthetic, not a real deny word
+
+    def setUp(self):
+        N6NotifyTests.setUp(self)
+        self.deny = self.path.parent / "deny.json"
+        self.deny.write_text(json.dumps({"version": 1, "shapes": [], "words": [self.WORD]}),
+                             encoding="utf-8")
+        patcher = mock.patch.object(n6_notify.dora_screen, "DENY_PATH", self.deny)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    flush = N6NotifyTests.flush
+
+    def state(self):
+        return json.loads(self.path.read_text("utf-8"))
+
+    def test_neg_deny_hit_never_sent_and_counted(self):
+        submit(self.path, Event("urgent", "a", f"kota {self.WORD.upper()} bitti"))
+        submit(self.path, Event("urgent", "b", "kota bitti"))
+        self.assertEqual(self.flush(), "kota bitti")
+        self.assertEqual(self.sent, ["kota bitti"])
+        self.assertEqual(len(self.ledger.events), 1)  # the refused item made no ledger point
+        state = self.state()
+        self.assertEqual(state["refused"], {"deny": 1})
+        self.assertEqual(state["pending"], [])  # dropped, not retried
+        self.assertNotIn(self.WORD, self.path.read_text("utf-8").lower())
+
+    def test_neg_secret_never_sent(self):
+        token = "gh" + "p_" + "Z9y8" * 9
+        submit(self.path, Event("urgent", "a", f"token {token}"))
+        self.assertIsNone(self.flush())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.ledger.events, [])
+        self.assertEqual(self.state()["refused"], {"secret": 1})
+
+    def test_neg_unsent_outbox_hit_is_dropped(self):
+        submit(self.path, Event("status", "a", "not"))  # a valid state with an empty outbox
+        state = self.state()
+        state["outbox"] = f"kota {self.WORD}"
+        self.path.write_text(json.dumps(state), encoding="utf-8")
+        self.assertIsNone(self.flush())
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.state()["refused"], {"deny": 1})
+
+    def test_neg_unreadable_list_sends_nothing_and_keeps_pending(self):
+        submit(self.path, Event("urgent", "a", "kota bitti"))
+        before = self.path.read_text("utf-8")
+        self.deny.unlink()
+        with self.assertRaises(OSError):
+            self.flush()
+        self.assertEqual(self.sent, [])
+        self.assertEqual(self.ledger.events, [])
+        self.assertEqual(self.path.read_text("utf-8"), before)
+
+    def test_state_without_refused_still_loads_and_bad_refused_raises(self):
+        submit(self.path, Event("urgent", "a", "kota bitti"))
+        self.assertNotIn("refused", self.state())  # written only after a refusal
+        self.assertEqual(self.flush(), "kota bitti")
+        for bad in ([], {"deny": 0}, {"deny": "1"}, {"deny": True}):
+            state = self.state()
+            state["refused"] = bad
+            self.path.write_text(json.dumps(state), encoding="utf-8")
+            with self.assertRaises(StateError):
+                self.flush()
+
+
 if __name__ == "__main__":
     unittest.main()

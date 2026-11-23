@@ -26,11 +26,12 @@ import re
 import tempfile
 import unicodedata
 from collections.abc import Callable
-from dataclasses import asdict, astuple, dataclass
+from dataclasses import asdict, astuple, dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import cast
 
+from jarvis import dora_screen
 from jarvis.notify import NotificationCore
 from jarvis.work_controls import ISTANBUL
 
@@ -48,6 +49,7 @@ _LINK = re.compile(
 _DOTS = {0x3002: ".", 0xFF61: "."}
 _KEYS = {"version", "pending", "daily", "ask_day", "asks", "outbox", "outbox_asks"}
 _ITEM_KEYS = ("kind", "key", "text", "recommendation")
+_OPT_KEYS = {"refused"}  # DORAGATE1: optional, written only when non-empty
 
 
 class Route(enum.Enum):
@@ -80,6 +82,7 @@ class _State:
     asks: int
     outbox: str
     outbox_asks: int = 0
+    refused: dict[str, int] = field(default_factory=lambda: {})
 
 
 def classify(kind: str) -> Route:
@@ -138,8 +141,8 @@ def _load(path: Path) -> _State:
     d = cast("dict[str, object]", data)
     version, pending_raw, daily_raw = d.get("version"), d.get("pending"), d.get("daily")
     day, asks, outbox = d.get("ask_day"), d.get("asks"), d.get("outbox")
-    oasks = d.get("outbox_asks")
-    if set(d) != _KEYS or type(version) is not int or version != 1:
+    oasks, refused_raw = d.get("outbox_asks"), d.get("refused", {})
+    if not _KEYS <= set(d) <= _KEYS | _OPT_KEYS or type(version) is not int or version != 1:
         raise _bad("keys or version")
     if not isinstance(pending_raw, list) or not isinstance(daily_raw, list):
         raise _bad("pending/daily")
@@ -152,6 +155,11 @@ def _load(path: Path) -> _State:
     lines_ok = all(x and x == clean(x) for x in outbox.split("\n")) if outbox else not oasks
     if len(outbox) > MAX_CHARS or not lines_ok:
         raise _bad("outbox")
+    if not isinstance(refused_raw, dict):
+        raise _bad("refused")
+    refused = cast("dict[object, object]", refused_raw)
+    if not all(isinstance(k, str) and type(v) is int and v > 0 for k, v in refused.items()):
+        raise _bad("refused")
     daily = cast("list[object]", daily_raw)
     if not all(isinstance(x, str) and x and x == clean(x) for x in daily):
         raise _bad("daily item")
@@ -167,13 +175,15 @@ def _load(path: Path) -> _State:
         if classify(ev.kind) is not Route.SALIH or not _valid(ev):
             raise _bad(f"pending item {ev.kind!r}")
         pending.append(ev)
-    return _State(pending, cast("list[str]", daily), day, asks, outbox, oasks)
+    return _State(pending, cast("list[str]", daily), day, asks, outbox, oasks,
+                  cast("dict[str, int]", refused))
 
 
 def _save(path: Path, s: _State) -> None:
     data = {
         "version": 1, "pending": [asdict(e) for e in s.pending], "daily": s.daily,
         "ask_day": s.ask_day, "asks": s.asks, "outbox": s.outbox, "outbox_asks": s.outbox_asks,
+        **({"refused": s.refused} if s.refused else {}),
     }
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
     try:
@@ -222,11 +232,26 @@ def flush(
     at: datetime,
     send: Callable[[str], None],
 ) -> str | None:
-    """Send at most one phone message holding every due SALIH item; return it."""
+    """Send at most one phone message holding every due SALIH item; return it.
+
+    DORAGATE1: every line is screened (jarvis.dora_screen) before it is sent; a refused
+    item is dropped, never sent, and counted in ``refused`` by reason label only. An
+    unreadable deny list raises before state is touched: nothing sent or consumed.
+    """
     if at.utcoffset() is None:
         raise ValueError("at must be timezone-aware")
+    deny = dora_screen.load_deny()  # fail closed: raises, nothing sent
     path = Path(state_path)
     s = _load(path)
+
+    def refuse(text: str) -> bool:
+        ok, why = dora_screen.screen(text, deny)
+        if not ok:
+            s.refused[why] = s.refused.get(why, 0) + 1
+        return not ok
+
+    if s.outbox and refuse(s.outbox):
+        s.outbox, s.outbox_asks = "", 0
     day = at.astimezone(ISTANBUL).date().isoformat()
     if day > s.ask_day:  # a clock going backwards never resets the cap
         s.ask_day, s.asks = day, s.outbox_asks  # unsent asks count against the send day
@@ -239,6 +264,9 @@ def flush(
                 s.pending.append(queue.pop(0))
                 continue
             line = _line(ev)
+            if refuse(line):
+                _ = queue.pop(0)
+                continue
             if lines and len("\n".join([*lines, line])) > MAX_CHARS:
                 break  # does not fit: waits for the next flush, never clipped away
             point = _SALIH_POINTS[ev.kind]
