@@ -175,6 +175,53 @@ class Key1CheckTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("FAIL 6", text)
 
+    # KEY1PATH1: --write / --manual are the only key-1 writers
+    def write(self, fx, gh=None, **kw):
+        out, ok = k1.run("INT-X", fx.root, k1.make_git(fx.root), gh or ci(fx.cand), **kw)
+        return "\n".join(out), ok, fx.root / "build" / "approvals" / f"push-{fx.cand}-int-x"
+
+    def test_write_on_pass_writes_header_the_conveyor_accepts(self):
+        fx = self.fx()
+        text, ok, p = self.write(fx, write=True)
+        self.assertTrue(ok, text)
+        self.assertIsNone(k1.conveyor.key1_refusal(p))
+        self.assertTrue(p.read_text(encoding="ascii").startswith(
+            f"KEY1 v1 sha={fx.cand} ci=ci/int-x lane=INT-X by=key1_check "
+            "checks=ci,ff,files,name,patch-id,reviews at="))
+        self.assertEqual([q.name for q in p.parent.iterdir()], [p.name])  # no temp left behind
+        text, ok, _ = self.write(fx, write=True)  # never overwrites
+        self.assertFalse(ok, text)
+
+    def test_write_refused_on_warn_or_fail(self):
+        minor = "1\nF1 MINOR: a.py:1 - nit - fix"
+        fx = self.fx(findings=minor)
+        text, ok, p = self.write(fx, write=True, operator_tool=True)
+        self.assertFalse(ok, text)
+        self.assertFalse(p.exists())
+        fx = self.fx()
+        text, ok, p = self.write(fx, ci(fx.cand, "failure"), write=True)
+        self.assertFalse(ok, text)
+        self.assertFalse(p.exists())
+
+    def test_manual_skips_reviews_but_not_ci(self):
+        fx = self.fx(findings="1\nF1 MINOR: a.py:1 - nit - fix")
+        text, ok, p = self.write(fx, manual="stack review ok")
+        self.assertTrue(ok, text)
+        self.assertIsNone(k1.conveyor.key1_refusal(p))
+        self.assertIn("by=manual reason=stack review ok checks=ci,ff,files,name,patch-id at=", p.read_text())
+        fx = self.fx()
+        text, ok, p = self.write(fx, ci(fx.cand, "failure"), manual="stack review ok")
+        self.assertFalse(ok, text)
+        self.assertFalse(p.exists())
+
+    def test_manual_bad_reason_refused(self):
+        fx = self.fx()
+        for reason in ("", "a=b", "x" * 121, " lead", "trail ", "ünï", "a\nb"):
+            with self.subTest(reason=reason):
+                text, ok, p = self.write(fx, manual=reason)
+                self.assertFalse(ok, text)
+                self.assertFalse(p.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

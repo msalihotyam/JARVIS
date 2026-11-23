@@ -910,7 +910,7 @@ class Bot:
                 f"{lane} CI {status}; aralık korunan yola dokunuyor: {why}",
                 [f"Aralığı oku: build/reports/{lane}.md", "Uygunsa aşağıdaki komutla onay dosyasını oluştur",
                  "Push'u konveyör kendi kapısından yapar"],
-                [("Anahtar 1", f"New-Item -ItemType File build\\approvals\\push-{sha}-{lane}")],
+                [("Anahtar 1", f"python scripts/key1_check.py {lane} --write")],  # KEY1PATH1: the only key-1 writer
                 "Konveyör kontrolleri geçerse main'e push eder; bu istek kapanır."))
         return out
 

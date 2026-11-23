@@ -1157,7 +1157,7 @@ class AsksTest(BotCase):
         self.assertEqual(a["id"], "key1:INT63")
         self.assertEqual(set(a), self.KEYS)
         self.assertEqual(a["source"]["rule"], "CONVSAFE")
-        self.assertEqual(a["cmds"][0]["text"], f"New-Item -ItemType File build\\approvals\\push-{SHA}-INT63")
+        self.assertEqual(a["cmds"][0]["text"], "python scripts/key1_check.py INT63 --write")
         self.run_bot()  # still open: logged once, since kept
         self.assertEqual(self.asks()[0]["since"], a["since"])
         self.assertEqual(self.shadow()["asks_open"], 1)
