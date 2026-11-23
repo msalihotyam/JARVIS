@@ -74,8 +74,9 @@ def patch_id(git, sha):
     return out.split()[0] if rc == 0 and out.split() else None
 
 
-def verify(lane, root, git, gh, operator_tool=False):
-    """-> (output lines, ok). git(args, stdin=None) and gh(args) return (rc, output)."""
+def verify(lane, root, git, gh, operator_tool=False, rep=None):
+    """-> (output lines, ok). git(args, stdin=None) and gh(args) return (rc, output). rep: the report
+    text already read by run() so key 1 is written from exactly what was verified."""
     out, ok = [], True
 
     def put(n, st, msg):
@@ -83,7 +84,7 @@ def verify(lane, root, git, gh, operator_tool=False):
         ok = ok and st != "FAIL"
         out.append(f"{st} {n} {msg}")
 
-    rep = read(root, lane)
+    rep = read(root, lane) if rep is None else rep
     if rep is None:
         return [f"FAIL 1 no report build/reports/{lane}.md"], False
     cand, branch = field(rep, "CANDIDATE SHA"), field(rep, "CI BRANCH")
@@ -194,15 +195,17 @@ def run(lane, root, git, gh, operator_tool=False, write=False, manual=None):
     """verify, then (write or manual) write key 1 only when the required checks PASS -> (lines, ok)."""
     if manual is not None and not re.fullmatch(conveyor._KEY1_REASON, manual):
         return ["FAIL write --manual reason must be 1-120 printable ASCII chars, no '=', no edge spaces"], False
-    out, ok = verify(lane, root, git, gh, operator_tool and manual is None and not write)
+    rep = read(root, lane)  # KEY1PATH1FIX: read once; verify and write_key1 both use this text
+    if rep is None:
+        return [f"FAIL 1 no report build/reports/{lane}.md"], False
+    out, ok = verify(lane, root, git, gh, operator_tool and manual is None and not write, rep)
     if not (write or manual is not None):
         return out, ok
     need = ("1", "2", "4", "5", "6") if manual is not None else ("1", "2", "3", "4", "5", "6")
     got = {x.split()[1]: x.split()[0] for x in out if len(x.split()) > 1}
     if any(got.get(n) != "PASS" for n in need):
         return out + [f"FAIL write refused: checks {', '.join(n for n in need if got.get(n) != 'PASS')} not PASS"], False
-    rep = read(root, lane) or ""
-    checks = ("ci", "ff", "files", "name", "patch-id") + (() if manual is not None else ("reviews",))
+    checks =("ci", "ff", "files", "name", "patch-id") + (() if manual is not None else ("reviews",))
     try:
         p = conveyor.write_key1(Path(root) / "build" / "approvals", field(rep, "CANDIDATE SHA"),
                                 field(rep, "CI BRANCH"), lane, "key1_check" if manual is None else "manual",

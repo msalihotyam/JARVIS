@@ -368,9 +368,13 @@ KEY1_HEADER_RE = re.compile(
     r"KEY1 v1 sha=(?P<sha>[0-9a-f]{40}) ci=(?P<ci>ci/[A-Za-z0-9._-]+) lane=(?P<lane>[A-Za-z0-9._-]+) "
     rf"by=(?:(?P<by>key1_check|conveyor)|(?P<manual>manual) reason=(?P<reason>{_KEY1_REASON})) "
     r"checks=(?P<checks>[a-z0-9-]+(?:,[a-z0-9-]+)*) at=(?P<at>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
-# lanes run with --settings SETTINGS; dispatch refuses unless its deny list keeps lanes away from key 1
+# lanes run with --settings SETTINGS; dispatch refuses unless its deny list keeps lanes away from key 1:
+# the approvals paths and the writer itself (key1_check --write/--manual, write_key1). KEY1PATH1FIX: a
+# same-user lane can still forge a header via string-built paths/names; only OS separation closes that.
 REQUIRED_DENY = ("Write(build/approvals/**)", "Edit(build/approvals/**)",
-                 "Bash(*build/approvals*)", "Bash(*build\\approvals*)")
+                 "Bash(*build/approvals*)", "Bash(*build\\approvals*)",
+                 # only the writing forms: lanes still test, diff, stage and commit key1_check itself
+                 "Bash(*key1_check*--write*)", "Bash(*key1_check*--manual*)", "Bash(*write_key1(*)")
 
 
 def key1_header(sha, ci, lane, by, checks, reason=None, now=None):
@@ -384,8 +388,9 @@ def key1_header(sha, ci, lane, by, checks, reason=None, now=None):
 
 
 def write_key1(approvals, sha, ci, lane, by, checks, reason=None, now=None):
-    """KEY1PATH1: the one writer of build/approvals/push-<sha40>-<ci>; atomic (temp + replace), never
-    overwrites. The temp name must not start with "push-" (APPROVAL_RE would match it)."""
+    """KEY1PATH1: the one writer of build/approvals/push-<sha40>-<ci>; atomic, never overwrites.
+    KEY1PATH1FIX: random temp created O_EXCL (no pre-created file or link is followed), published with
+    os.link (FileExistsError if the target exists). The temp name must not start with "push-"."""
     h = key1_header(sha, ci, lane, by, checks, reason, now)
     name = f"push-{sha}-{ci[3:]}"
     if not APPROVAL_RE.fullmatch(name):
@@ -395,12 +400,19 @@ def write_key1(approvals, sha, ci, lane, by, checks, reason=None, now=None):
     target = approvals / name
     if target.exists():
         raise FileExistsError(str(target))
-    tmp = approvals / f".key1-{os.getpid()}-{threading.get_ident()}.tmp"
-    with open(tmp, "w", encoding="ascii", newline="\n") as f:
-        f.write(h + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-    os.replace(tmp, target)
+    tmp = approvals / f".key1-{os.urandom(16).hex()}.tmp"
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_BINARY", 0), 0o600)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write((h + "\n").encode("ascii"))
+            f.flush()
+            os.fsync(f.fileno())
+        os.link(tmp, target)
+    finally:
+        try:  # a locked temp (AV) must not report failure for a key already on disk; it never matches push-*
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
     return target
 
 
@@ -411,9 +423,13 @@ def key1_refusal(path):
         return "approval name is not push-<sha40>-<ci>"
     try:
         with open(path, "rb") as f:
-            first = f.read(512).decode("ascii").split("\n", 1)[0].rstrip("\r")
+            raw = f.read(1024)
+        first, nl, _ = raw.partition(b"\n")
+        first = first.decode("ascii").rstrip("\r")
     except (OSError, UnicodeDecodeError) as e:
         return f"approval unreadable or not ascii: {type(e).__name__}"
+    if not nl and len(raw) == 1024:  # the whole first line is validated, never a prefix of it
+        return "first line too long for a KEY1 v1 header"
     h = KEY1_HEADER_RE.fullmatch(first)
     if not h:
         return "first line is not a KEY1 v1 header (only key1_check --write makes key 1)"
