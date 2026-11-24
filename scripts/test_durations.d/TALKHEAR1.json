@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "classes": {
+    "tests.test_talk_hear.TalkHearTests": 0.005
+  }
+}
