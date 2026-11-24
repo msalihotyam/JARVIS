@@ -229,6 +229,30 @@ class DigestTests(unittest.TestCase):
         self.assertEqual(got["OV2"], ("held", "status.json backlog state overlap + breaker_open"))
         self.assertEqual([i for i in d["items"] if i["reason"] == "overlap"], [])
 
+    def test_int_busy_run_set_mirrors_conveyor_running(self):  # POLISHDG1FIX
+        cases = {"PAUSED": "held", "AUTH_HOLD": "held", "stopped": "held", "working": "held", None: "held",
+                 "missing": "overlap"}
+        for state, want in cases.items():
+            for finished in (False, True):
+                with self.subTest(state=state, finished=finished):
+                    ln = {} if state is None else {"state": state}
+                    if finished:
+                        ln["finished"] = True
+                    view = [{"id": s["id"], "state": "ready"} for s in slices()] + [{"id": "INT9", "state": "overlap"}]
+                    with tempfile.TemporaryDirectory() as t:
+                        tree(t, view=view, lanes={"INT8": ln})
+                        _, d = run(t)
+                    got = {i["id"]: i["reason"] for i in d["items"]}["INT9"]
+                    self.assertEqual(got, "overlap" if finished else want)
+
+    def test_same_name_busy_skips_idle_lane_like_busy_names(self):  # POLISHDG1FIX F2 probe
+        view = [{"id": s["id"], "state": "ready"} for s in slices()] + [{"id": "X1", "state": "overlap"}]
+        for idle, want in ((True, "overlap"), (False, "held")):
+            with self.subTest(idle=idle), tempfile.TemporaryDirectory() as t:
+                tree(t, view=view, lanes={"X1": {"state": "PAUSED", "idle": idle}})
+                _, d = run(t)
+                self.assertEqual({i["id"]: i["reason"] for i in d["items"]}["X1"], want)
+
     def test_error_only_view_is_unknown_not_queue_empty(self):  # POLISHDG1 F2
         for view in ([{"error": "backlog.json: bad json"}], [{"error": "x"}, {"id": "A", "state": "PASS"}]):
             with tempfile.TemporaryDirectory() as t:

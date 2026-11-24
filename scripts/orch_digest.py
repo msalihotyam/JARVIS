@@ -130,7 +130,9 @@ def build(root, now, since):
         view = []
     title = {str(s.get("id")): str(s.get("title", "")) for s in backlog if isinstance(s, dict)}
     ready = {"n6": 0, "improve": 0, "other": 0}
-    run_names = {str(n) for n, v in lanes.items() if isinstance(v, dict) and v.get("state") in RUNNING}
+    # mirrors conveyor running(): every lane not finished and not missing (PAUSED, AUTH_HOLD, stopped still block)
+    run_names = {str(n) for n, v in lanes.items()
+                 if isinstance(v, dict) and not v.get("finished") and v.get("state") != "missing"}
     int_re = re.compile(r"(?i)^int(?![a-z])")  # conveyor INT_RE
     bad = 0
     for b in view:
@@ -144,7 +146,7 @@ def build(root, now, since):
             add(i, "needs_t2_approval", "status.json backlog state needs_t2_approval", None)
         elif st == "overlap":  # conveyor slice_hold: file set conflicts with a running lane, every earlier gate passed
             # slice_hold stops at overlap; the later gates the digest can see are checked here (slice_lint is not visible)
-            later = [w for w, on in (("same_name_busy", i in run_names),
+            later = [w for w, on in (("same_name_busy", i in run_names and not lanes[i].get("idle")),  # busy_names
                                      ("int_busy", bool(int_re.match(i)) and any(int_re.match(n) for n in run_names)),
                                      ("breaker_open", status.get("breaker") == "open" and not int_re.match(i))) if on]
             if later:
