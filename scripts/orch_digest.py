@@ -130,8 +130,12 @@ def build(root, now, since):
         view = []
     title = {str(s.get("id")): str(s.get("title", "")) for s in backlog if isinstance(s, dict)}
     ready = {"n6": 0, "improve": 0, "other": 0}
+    run_names = {str(n) for n, v in lanes.items() if isinstance(v, dict) and v.get("state") in RUNNING}
+    int_re = re.compile(r"(?i)^int(?![a-z])")  # conveyor INT_RE
+    bad = 0
     for b in view:
         if not isinstance(b, dict) or b.get("id") in (None, ""):
+            bad += 1  # e.g. {"error": ...}: an unreadable entry is never proof of an empty queue
             continue
         i, st = str(b["id"]), str(b.get("state", ""))
         if st.startswith("held:"):
@@ -139,7 +143,14 @@ def build(root, now, since):
         elif st == "needs_t2_approval":
             add(i, "needs_t2_approval", "status.json backlog state needs_t2_approval", None)
         elif st == "overlap":  # conveyor slice_hold: file set conflicts with a running lane, every earlier gate passed
-            add(i, "overlap", "status.json backlog state overlap", None)
+            # slice_hold stops at overlap; the later gates the digest can see are checked here (slice_lint is not visible)
+            later = [w for w, on in (("same_name_busy", i in run_names),
+                                     ("int_busy", bool(int_re.match(i)) and any(int_re.match(n) for n in run_names)),
+                                     ("breaker_open", status.get("breaker") == "open" and not int_re.match(i))) if on]
+            if later:
+                add(i, "held", "status.json backlog state overlap + " + ", ".join(later), None)
+            else:
+                add(i, "overlap", "status.json backlog state overlap (no later visible hold)", None)
         elif st == "n6":
             ready["n6"] += 1
         elif st == "ready":
@@ -148,7 +159,9 @@ def build(root, now, since):
     for track in ("n6", "improve"):
         if ready[track] < LOW:
             add(f"queue:{track}", f"queue_low_{track}", f"{ready[track]} ready < {LOW}", None)
-    if isinstance(status.get("backlog"), list) and not any(ready.values()):  # an unreadable view is not "empty"
+    if bad:
+        unk.append(("input:status.backlog", f"status.json: {bad} unreadable backlog view entries"))
+    elif isinstance(status.get("backlog"), list) and not any(ready.values()):  # an unreadable view is not "empty"
         add("queue:all", "queue_empty", "0 ready slices", None)
     for i, why in unk:
         add(i, "unknown", why, None)

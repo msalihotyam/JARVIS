@@ -213,6 +213,31 @@ class DigestTests(unittest.TestCase):
             _, d = run(t)
         self.assertEqual([i for i in d["items"] if i["reason"] == "overlap"], [])
 
+    def test_overlap_with_later_holds_reports_every_reason(self):  # POLISHDG1 F1
+        view = [{"id": s["id"], "state": "ready"} for s in slices()] + [
+            {"id": "RUN1", "state": "overlap"}, {"id": "INT9", "state": "overlap"}, {"id": "OV2", "state": "overlap"}]
+        lanes = {"RUN1": {"state": "working"}, "INT8": {"state": "waiting"}}
+        with tempfile.TemporaryDirectory() as t:
+            tree(t, view=view, lanes=lanes)
+            c = Path(t) / "build" / "conveyor"
+            st = json.loads((c / "status.json").read_text(encoding="utf-8"))
+            (c / "status.json").write_text(json.dumps(dict(st, breaker="open")), encoding="utf-8")
+            _, d = run(t)
+        got = {i["id"]: (i["reason"], i["evidence"]) for i in d["items"] if i["id"] in ("RUN1", "INT9", "OV2")}
+        self.assertEqual(got["RUN1"], ("held", "status.json backlog state overlap + same_name_busy, breaker_open"))
+        self.assertEqual(got["INT9"], ("held", "status.json backlog state overlap + int_busy"))
+        self.assertEqual(got["OV2"], ("held", "status.json backlog state overlap + breaker_open"))
+        self.assertEqual([i for i in d["items"] if i["reason"] == "overlap"], [])
+
+    def test_error_only_view_is_unknown_not_queue_empty(self):  # POLISHDG1 F2
+        for view in ([{"error": "backlog.json: bad json"}], [{"error": "x"}, {"id": "A", "state": "PASS"}]):
+            with tempfile.TemporaryDirectory() as t:
+                tree(t, view=view)
+                _, d = run(t)
+            self.assertEqual([i for i in d["items"] if i["reason"] == "queue_empty"], [])
+            self.assertEqual({i["id"]: i["evidence"] for i in d["items"] if i["reason"] == "unknown"},
+                             {"input:status.backlog": "status.json: 1 unreadable backlog view entries"})
+
     def test_section_b_closed_list(self):
         self.assertEqual(orch_digest.REASONS[-3:], ("queue_empty", "overlap", "unknown"))
         self.assertIn("UNKNOWN_OUTCOME", orch_digest.REASONS)  # OUTCOME1 (B2a)
