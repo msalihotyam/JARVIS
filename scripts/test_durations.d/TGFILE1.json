@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "classes": {
+    "tests.test_telegram_files.TelegramFileTests": 0.5
+  }
+}
