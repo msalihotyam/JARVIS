@@ -1791,9 +1791,15 @@ class Bot:
             if kc.field(kc.read(self.root, lane) or "", "CANDIDATE SHA") != sha:
                 return False, f"report CANDIDATE SHA is not {sha[:7]}"
             out, ok = kc.verify(lane, self.root, kc.make_git(self.root), kc.make_gh(self.root))
+            # KEY1LIVE1FIX2: same rule as key1_check --write: checks 1-6 each exactly once and all PASS (a WARN is a no);
+            # one single-line "PASS <n>[ msg]" per item, so nothing rides inside or beside a PASS line
+            got = [re.fullmatch(r"PASS ([1-6])(?: [^\r\n]*)?", x) for x in out]
+            nums = sorted(m.group(1) for m in got if m)
         except Exception as e:  # fail closed: an unverifiable receipt is no receipt
             return False, f"key1_check error {type(e).__name__}"
-        return ok, next((x for x in out if x.startswith("FAIL")), "PASS")
+        if ok is not True or not all(got) or nums != list("123456"):
+            return False, str(next((x for x, m in zip(out, got) if not m), f"checks {nums} are not exactly 1-6 PASS"))[:200]
+        return True, "PASS"
 
     def gate_key1(self, at, saw, lane, sha, detail, key, files=None):
         base = git_ref(self.root, "refs/remotes/origin/main") if "write_key1" in self.live else None
