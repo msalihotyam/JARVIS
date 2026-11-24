@@ -88,6 +88,7 @@ class EntryTests(Base):  # R2
         self.assertEqual(out["signature"], q.signature(UI, "AssertionError", MSG))
         self.assertEqual(out["signature_text"], "AssertionError: timeout after <n>ms at <tmp> (<ts>, id <hex>)")
         self.assertEqual(out["entry_rate"], 0.5)
+        self.assertEqual(out["entry_counts"], [2, 4])
 
     def test_r2_intermittent_failure_without_same_sha_flip_is_not_evidence(self):
         ev = {"test_id": UI, "results": [row("a", "1", "fail"), row("b", "2", "fail"),
@@ -120,6 +121,11 @@ class EntryTests(Base):  # R2
         self.assertNotEqual(q.signature(UI, "AssertionError", MSG),
                             q.signature("tests.test_ui.UiTests.test_other", "AssertionError", MSG))
 
+    def test_r2_temp_directly_under_drive_root_is_normalized(self):
+        for path in (r"C:\Temp\abc\f.txt", "c:/tmp/x", r"D:\TEMP\x", r"C:\Users\x\AppData\Local\Temp\y"):
+            self.assertEqual(q.normalize_message(f"at {path} end"), "at <tmp> end", path)
+        self.assertEqual(q.normalize_message(r"at C:\TempFolder\x end"), r"at C:\TempFolder\x end")
+
     def test_r2_malformed_evidence_is_refused(self):
         for bad in ([], {"test_id": UI}, {"test_id": UI, "results": [{"sha": "a", "run": "1", "outcome": "maybe",
                                                                      "at": NOW.isoformat()}]},
@@ -127,6 +133,22 @@ class EntryTests(Base):  # R2
                     {"test_id": UI, "results": [row("", "1", "fail")]}):
             with self.assertRaises(ValueError):
                 q.evaluate(bad, NOW)
+
+    def test_r2_fail_row_without_exception_type_is_refused(self):
+        for exc in (None, "", "  ", 123, []):
+            ev = flaky()
+            ev["results"][0]["exception"] = exc
+            with self.assertRaises(ValueError, msg=repr(exc)):
+                q.evaluate(ev, NOW)
+        ev = flaky()
+        del ev["results"][2]["exception"]
+        with self.assertRaises(ValueError):
+            q.evaluate(ev, NOW)
+        ev = flaky()
+        for r in ev["results"]:
+            if r["outcome"] == "pass":
+                del r["exception"]
+        self.assertTrue(q.evaluate(ev, NOW)["ok"])  # pass rows need no exception
 
 
 SIG = q.signature(UI, "AssertionError", MSG)
@@ -211,6 +233,16 @@ class CancelTests(Base):  # R5
         self.assertEqual(len(self.reg.load()["entries"][UI]["runs"]), 10)
         self.assertTrue(q.check(self.reg.load(), UI, SIG, NOW)["covered"])
 
+    def test_r5_compare_uses_exact_counts_not_the_rounded_rate(self):
+        extra = ([row(f"f{i}", f"y{i}", "fail") for i in range(199)]
+                 + [row(f"p{i}", f"x{i}", "pass") for i in range(1806)])  # 201/2009 rounds to 0.1
+        self.enter(extra=extra)
+        entry = self.reg.load()["entries"][UI]
+        self.assertEqual((entry["entry_rate"], entry["entry_counts"]), (0.1, [201, 2009]))
+        out = self.runs(["fail", "pass", "pass", "pass", "fail", "pass", "pass", "pass", "pass", "pass"])
+        self.assertEqual({o["reason"] for o in out}, {"recorded"})  # 2/10 < 2*201/2009
+        self.assertTrue(q.check(self.reg.load(), UI, SIG, NOW)["covered"])
+
 
 class MaxActiveTests(Base):  # R6
     def test_r6_sixth_entry_is_refused_with_lane_growth_stop(self):
@@ -228,6 +260,33 @@ class MaxActiveTests(Base):  # R6
         self.now = NOW + q.MAX_DAYS
         self.enter("tests.test_ui.UiTests.test_5")
 
+    def expired_plus(self, others):
+        self.enter()
+        self.now = NOW + q.MAX_DAYS  # UI expired, stored status still "active"
+        for i in range(others):
+            self.enter(f"tests.test_ui.UiTests.test_{i}")
+
+    def test_r6_extending_an_expired_entry_into_a_sixth_slot_is_refused(self):
+        self.expired_plus(5)
+        out = self.reg.extend(self.reg.load(), UI, {"approver": "salih"})
+        self.assertEqual((out["ok"], out["reason"], out["lane_growth_stop"]), (False, "max_active", True))
+        self.assertEqual(self.reg.load()["generation"], 6)
+        self.assertEqual(len(q.active_ids(self.reg.load(), self.now)), 5)
+        self.assertNotIn(UI, q.active_ids(self.reg.load(), self.now))
+        self.assertTrue(self.journal()[-1]["lane_growth_stop"])
+
+    def test_r6_extending_an_expired_entry_with_a_free_slot_succeeds(self):
+        self.expired_plus(4)
+        out = self.reg.extend(self.reg.load(), UI, {"approver": "salih"})
+        self.assertEqual((out["ok"], out["reason"]), (True, "extended"))
+        self.assertEqual(len(q.active_ids(self.reg.load(), self.now)), 5)
+
+    def test_r6_extending_a_still_active_entry_at_five_active_is_allowed(self):
+        for i in range(5):
+            self.enter(f"tests.test_ui.UiTests.test_{i}")
+        out = self.reg.extend(self.reg.load(), "tests.test_ui.UiTests.test_0", {"approver": "salih"})
+        self.assertEqual((out["ok"], out["reason"]), (True, "extended"))  # no growth, no refusal
+
 
 class StateTests(Base):  # R7
     def test_r7_write_is_atomic_with_generation_and_journal(self):
@@ -241,6 +300,20 @@ class StateTests(Base):  # R7
         with mock.patch.object(q.os, "replace", side_effect=OSError("disk")), self.assertRaises(OSError):
             self.reg.propose(self.reg.load(), flaky())
         self.assertFalse(self.path.exists())
+        self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
+        self.assertFalse(self.reg.lock.exists())
+        self.assertEqual([(j["reason"], j["generation"]) for j in self.journal()],
+                         [("entered", 1), ("write_failed", 0)])
+        self.assertEqual(self.journal()[-1]["aborted_generation"], 1)
+
+    def test_r7_journal_failure_leaves_state_unchanged(self):
+        self.enter()
+        self.reg.journal = self.dir / "missing" / "j.jsonl"
+        with self.assertRaises(OSError):
+            self.reg.propose(self.reg.load(), flaky("tests.test_ui.UiTests.test_other"))
+        state = self.reg.load()
+        self.assertEqual(state["generation"], 1)
+        self.assertNotIn("tests.test_ui.UiTests.test_other", state["entries"])
         self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
         self.assertFalse(self.reg.lock.exists())
 

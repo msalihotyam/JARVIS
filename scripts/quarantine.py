@@ -112,7 +112,7 @@ ALLOWED_PREFIXES = {
 ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$")
 
 _NORMALIZE = (  # order matters: paths, then timestamps, then hex ids, then bare numbers
-    (re.compile(r"[A-Za-z]:[\\/][^\s'\"]*?[\\/](?:temp|tmp)[\\/][^\s'\"]*", re.I), "<tmp>"),
+    (re.compile(r"[A-Za-z]:(?:[\\/][^\s'\"]*?)?[\\/](?:temp|tmp)[\\/][^\s'\"]*", re.I), "<tmp>"),
     (re.compile(r"(?<![\w.])/(?:var/folders|private/var|tmp|var/tmp)/[^\s'\"]*", re.I), "<tmp>"),
     (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"), "<ts>"),
     (re.compile(r"\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\b"), "<ts>"),
@@ -227,8 +227,11 @@ def _rows(evidence) -> tuple:
         for key in ("sha", "run"):
             if not isinstance(row.get(key), (str, int)) or str(row.get(key)).strip() == "":
                 raise ValueError(f"results[{i}]: {key} is required")
+        exc = row.get("exception")
+        if row["outcome"] == "fail" and (not isinstance(exc, str) or not exc.strip()):
+            raise ValueError(f"results[{i}]: a fail row needs an exception type")
         rows.append({"sha": str(row["sha"]), "run": str(row["run"]), "outcome": row["outcome"],
-                     "at": parse_at(row.get("at")), "exception": str(row.get("exception") or ""),
+                     "at": parse_at(row.get("at")), "exception": str(exc or ""),
                      "message": str(row.get("message") or "")})
     return test_id, rows
 
@@ -255,7 +258,8 @@ def evaluate(evidence, now: datetime) -> dict:
                 "flips": len(flips[best])}
     fails = sum(1 for r in window if r["outcome"] == "fail")
     return {"ok": True, "test_id": test_id, "class": elig["class"], "signature": best,
-            "signature_text": texts[best], "entry_rate": round(fails / len(window), 4),
+            "signature_text": texts[best], "entry_rate": round(fails / len(window), 4),  # display only
+            "entry_counts": [fails, len(window)],  # R5 compares these exactly
             "cause": {"kind": "same_sha_flip", "flips": [list(f) for f in sorted(flips[best])]}}
 
 
@@ -272,7 +276,7 @@ def decide_entry(state: dict, evidence, now: datetime) -> tuple:
         return {**decision, "ok": False, "reason": "max_active", "lane_growth_stop": True}, None
     entry = {"test_id": test_id, "class": verdict["class"], "signature": verdict["signature"],
              "signature_text": verdict["signature_text"], "cause": verdict["cause"],
-             "entry_rate": verdict["entry_rate"], "entered_at": iso(now), "expires_at": iso(now + MAX_DAYS),
+             "entry_rate": verdict["entry_rate"], "entry_counts": verdict["entry_counts"], "entered_at": iso(now), "expires_at": iso(now + MAX_DAYS),
              "status": "active", "runs": [], "extensions": []}
     new = json.loads(json.dumps(state))
     new["entries"][test_id] = entry
@@ -295,9 +299,10 @@ def decide_run(state: dict, test_id: str, outcome: str, now: datetime) -> tuple:
     entry["runs"] = (entry["runs"] + [{"outcome": outcome, "at": iso(now)}])[-RATE_RUNS:]
     outcomes = [r["outcome"] for r in entry["runs"]]
     rate = outcomes.count("fail") / len(outcomes)
+    entry_fails, entry_total = entry["entry_counts"]
     if outcomes[-CANCEL_STREAK:] == ["fail"] * CANCEL_STREAK:
         why = "fail_streak"
-    elif len(outcomes) >= RATE_RUNS and rate >= 2 * entry["entry_rate"]:
+    elif len(outcomes) >= RATE_RUNS and outcomes.count("fail") * entry_total >= 2 * entry_fails * len(outcomes):
         why = "rate_doubled"
     else:
         return {**decision, "ok": True, "reason": "recorded", "rate": round(rate, 4)}, new
@@ -313,6 +318,9 @@ def decide_extension(state: dict, test_id: str, approval, now: datetime) -> tupl
     entry = state["entries"].get(test_id)
     if not entry or entry.get("status") != "active":
         return {**decision, "reason": "not_extendable"}, None
+    # R6: extending an expired (stored-active) entry reactivates it, so it needs a free slot like an entry does
+    if len([t for t in active_ids(state, now) if t != test_id]) >= MAX_ACTIVE:
+        return {**decision, "reason": "max_active", "lane_growth_stop": True}, None
     new = json.loads(json.dumps(state))
     entry = new["entries"][test_id]
     entry["expires_at"] = iso(now + MAX_DAYS)
@@ -360,21 +368,32 @@ class Registry:
             elif new is not None:
                 new["generation"] = disk + 1
                 fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp")
+                decision = {**decision, "generation": new["generation"]}
+                journaled = False
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
                         json.dump(new, fh, indent=2, sort_keys=True)
                         fh.write("\n")
+                    self._journal(decision)  # journal before state: no committed decision without its line
+                    journaled = True
                     os.replace(tmp, self.path)
                 except BaseException:
                     with contextlib.suppress(OSError):
                         os.unlink(tmp)
+                    if journaled:  # the line above names a generation that never landed; mark it
+                        with contextlib.suppress(OSError):
+                            self._journal({**decision, "ok": False, "reason": "write_failed",
+                                           "generation": disk, "aborted_generation": new["generation"]})
                     raise
-                decision = {**decision, "generation": new["generation"]}
+                return decision
             else:
                 decision = {**decision, "generation": disk}
-            with open(self.journal, "a", encoding="utf-8") as fh:
-                fh.write(json.dumps(decision, sort_keys=True) + "\n")
+            self._journal(decision)
         return decision
+
+    def _journal(self, decision: dict) -> None:
+        with open(self.journal, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(decision, sort_keys=True) + "\n")
 
     def propose(self, state: dict, evidence) -> dict:
         return self._apply(state, *decide_entry(state, evidence, self.clock()))
