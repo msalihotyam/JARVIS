@@ -1,0 +1,1 @@
+{"version": 1, "about": "TALKPACK1: CI duration record for tests.test_talk_packet (seconds, same schema as scripts/test_durations.json).", "classes": {"tests.test_talk_packet.StaticPurityTests": 1.0, "tests.test_talk_packet.AcceptanceTests": 1.0, "tests.test_talk_packet.NegativeTests": 1.0}, "tests": {}}
