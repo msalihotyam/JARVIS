@@ -273,9 +273,12 @@ from jarvis.work_ledger import (
     EventKind,
     RunSize,
     RunState,
+    StepState,
     WorkLedgerError,
     WorkRun,
+    WorkStep,
     advance_run,
+    step_key,
 )
 from jarvis.work_plan import Plan as WorkPlan, validate as validate_work_plan
 from jarvis import clarify
@@ -1478,6 +1481,9 @@ class AgentCore:
         # snapshot allows, and it is re-read at every stage boundary - which is
         # what lets a freeze stop running work at its next safe point.
         self.execution_gate: Callable[[], bool] = lambda: True
+        # PM26B: (run_id, step) -> build_ports deps plus resume inputs
+        # (boot_id, now, lease, granted_targets, usage, ...); None fails closed.
+        self.project_drive = None
         # The closed (connector, capability, destination) authorization table
         # this build runs under. It is COMPOSITION state, fixed here and never
         # touched again: no connector, task, chain declaration or model answer
@@ -1822,6 +1828,102 @@ class AgentCore:
         except ValueError:
             self._release_project_leases(tuple(claimed), run_id, boot_id, now)
             raise
+
+    def create_project_slice_tasks(self, session_id: str, run_id: str, *, at: datetime) -> list[Task]:
+        """PM26B: one chain Task per plan slice, each with a PENDING ledger
+        step; a slice advances only through resume()."""
+        first, _ = self._project_run_payloads(run_id)
+        plan = WorkPlan.from_dict(first["plan"])
+        tasks = []
+        for ordinal, piece in enumerate(plan.slices, start=1):
+            slug = piece.slice_id.lower()
+            self.memory.append_work_step(WorkStep(
+                run_id, step_key(run_id, ordinal, slug), ordinal, slug, StepState.PENDING, at,
+            ))
+            task = Task(
+                objective=piece.goal, capability="project_slice",
+                scope=ActionScope(action="project_slice", target=run_id),
+                preferences={"project_run": run_id, "project_step": ordinal},
+            )
+            self.memory.save_task(session_id, task)
+            tasks.append(task)
+        return tasks
+
+    def drive_project_step(self, session: SessionState, task: Task) -> AgentRun:
+        """PM26B: advance one project slice as a chain step. resume_project_run
+        revalidates policy, scope, plan hash, PM10, leases and the D3 budget
+        before every step; a refusal returns before any port exists, so no
+        worker starts and nothing applies. drive runs exactly once per call
+        and apply/undo are the work_ports ones; a completed task is reported
+        by _terminal_run and never driven again."""
+        from jarvis import work_driver, work_ports
+
+        run_id = task.preferences["project_run"]
+        ordinal = task.preferences.get("project_step")
+        if self.project_drive is None:
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, "refused: project drive is not configured", session,
+            )
+        run = self.memory.latest_work_run(run_id)
+        steps = {item.key: item for item in self.memory.work_steps(run_id)}
+        step = next((item for item in steps.values() if item.ordinal == ordinal), None)
+        if run is None or step is None or run.state not in (RunState.BUILDING, RunState.INTERRUPTED):
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, f"refused: not_resumable ({run_id})", session,
+            )
+        deps = dict(self.project_drive(run_id, step))
+        boot_id, now, lease = deps.pop("boot_id"), deps.pop("now"), deps.pop("lease")
+        boot = {name: deps.pop(name) for name in ("boot_scan", "boot_record", "boot_resume") if name in deps}
+        resume_args = {
+            name: deps.pop(name)
+            for name in ("granted_targets", "usage", "quota_available", "large_budget") if name in deps
+        }
+        if run.state is RunState.BUILDING:
+            self.advance_project_run(run_id, RunState.INTERRUPTED, boot_id=boot_id, at=now)
+        resumed = self.resume_project_run(run_id, boot_id=boot_id, now=now, lease=lease, **resume_args)
+        if isinstance(resumed, ResumeRefused):
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, f"refused: {resumed.code}: {resumed.detail}", session,
+            )
+        first, _ = self._project_run_payloads(run_id)
+        plan = WorkPlan.from_dict(first["plan"])
+        targets = tuple(_plan_targets(plan))
+        # The revalidation claims are proof only; the step's port claims its own lease.
+        self._release_project_leases(tuple(_lease_targets(targets)), run_id, boot_id, now)
+        if resumed.state is not RunState.BUILDING:
+            resumed = self.advance_project_run(run_id, RunState.BUILDING, boot_id=boot_id, at=now)
+        piece = plan.slices[step.ordinal - 1]
+        ports = work_ports.build_ports(
+            store=self.memory, run_id=run_id, boot_id=boot_id, lease=lease,
+            # shortcut: one lease per step on the slice's first target; widen when slices span disjoint trees.
+            lease_target=tuple(_lease_targets(piece.targets))[0],
+            targets={target: "subtree" if target.endswith("/") else "file" for target in targets},
+            jarvis_repo=first.get("jarvis_repo") is True, plan_hash=first.get("plan_hash"),
+            **deps,
+        )
+        for name, port in boot.items():
+            setattr(ports, name, port)
+        done = [
+            item for item in steps.values()
+            if item.state is StepState.ACCEPTED and item.ordinal < step.ordinal
+        ]
+        moved, driven = work_driver.drive(resumed, sorted([*done, step], key=lambda item: item.ordinal), ports)
+        after = next(item for item in driven if item.key == step.key)
+        if after != step:
+            self.memory.append_work_step(after)
+        if moved != resumed:
+            self.memory.append_work_run(moved, prior=resumed)
+        if after.state is StepState.ACCEPTED:
+            task = replace(task, status=TaskStatus.COMPLETED, result_snapshot=None)
+            # shortcut: direct save_task write; route through the loop's guarded writer when slices join the chain loop.
+            self.memory.save_task(session.id, task)
+            return AgentRun(RunStatus.COMPLETED, session, task)
+        failed = self._input_failure(
+            task, ErrorCode.VERIFICATION_FAILED, f"step {step.key} ended {after.state.value}", session,
+        )
+        task = replace(task, status=TaskStatus.FAILED, result_snapshot=self._result_to_dict(failed.result))
+        self.memory.save_task(session.id, task)
+        return AgentRun(RunStatus.FAILED, session, task, result=failed.result, error=failed.error)
 
     # PM07: the clarify dialog in chat. A project-looking turn earns only a
     # confirm question; an explicit "evet" creates the run in clarifying. The
@@ -2250,6 +2352,8 @@ class AgentCore:
         terminal = self._terminal_run(session, task)
         if terminal is not None:
             return terminal
+        if "project_run" in task.preferences:
+            return self.drive_project_step(session, task)
         return self._advance(session, task, grant)
 
     def provide_clarification(
