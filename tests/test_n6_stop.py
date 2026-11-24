@@ -167,6 +167,49 @@ class LyingInt(int):
     __gt__ = __le__ = __ge__ = __lt__
 
 
+class EqualToEveryType(type):
+    """A metaclass equal to every type: its classes pass `type(x) in (int, float)` style gates."""
+
+    def __eq__(cls, other: object) -> bool:
+        return True
+
+    __hash__ = type.__hash__
+
+
+class MetaLieInt(int, metaclass=EqualToEveryType):
+    """Every comparison True and float() 0.0: a real 99% reads as a safe 0% if the gate lets it in."""
+
+    def __ge__(self, other: object) -> bool:
+        return True
+
+    __le__ = __lt__ = __gt__ = __ge__
+
+    def __float__(self) -> float:
+        return 0.0
+
+
+class MetaLieFloat(float, metaclass=EqualToEveryType):
+    def __ge__(self, other: object) -> bool:
+        return True
+
+    __le__ = __lt__ = __gt__ = __ge__
+
+    def __float__(self) -> float:
+        return 0.0
+
+
+class MetaLieList(list[object], metaclass=EqualToEveryType):
+    """Hides its items from iteration: a real incident inside reads as no rows/events."""
+
+    def __iter__(self):  # type: ignore[override]
+        return iter(())
+
+
+class MetaLieTuple(tuple[object, ...], metaclass=EqualToEveryType):
+    def __iter__(self):  # type: ignore[override]
+        return iter(())
+
+
 def forged(item: object, **fields: object) -> object:
     for name, value in fields.items():
         object.__setattr__(item, name, value)
@@ -201,6 +244,24 @@ class ExactTypeTests(unittest.TestCase):
                 run(usage=value)
             with self.subTest(share=value), self.assertRaises(StopInputError):
                 run(share=value)
+
+    def test_metaclass_eq_number_reading_refused(self) -> None:
+        """N6STOP1FIX2: the gate is identity; a metaclass __eq__ -> True does not pass it."""
+        self.assertTrue(MetaLieInt in (int, float))  # the gate the fix replaced would have let it in
+        for value in (MetaLieInt(99), MetaLieInt(-5), MetaLieInt(500), MetaLieFloat(99.0), MetaLieFloat(-5.0)):
+            with self.subTest(usage=value), self.assertRaises(StopInputError):
+                run(usage=value)
+        for value in (MetaLieInt(80), MetaLieInt(-5), MetaLieFloat(80.0)):
+            with self.subTest(share=value), self.assertRaises(StopInputError):
+                run(share=value)
+
+    def test_metaclass_eq_container_refused(self) -> None:
+        self.assertTrue(MetaLieList in (list, tuple))
+        for container in (MetaLieList, MetaLieTuple):
+            with self.subTest(rows=container.__name__), self.assertRaises(StopInputError):
+                run(rows=container([row(security=1)]))
+            with self.subTest(events=container.__name__), self.assertRaises(StopInputError):
+                run(events=container([Event("false_pass", "n6")]))
 
     def test_lying_row_field_refused(self) -> None:
         for fields in ({"security_incidents": LyingInt(1)}, {"post_accept_defects": LyingInt(-1)},

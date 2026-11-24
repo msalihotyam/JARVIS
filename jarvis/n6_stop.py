@@ -84,9 +84,11 @@ _EVENT_FIELDS = (("kind", str), ("source", str))
 def _pct(name: str, value: object) -> float | None:
     if value is None:
         return None
-    # Exact int/float (bool excluded too): a subclass can lie in its comparisons. Bounds before
+    # Exact int/float (bool excluded too): a subclass can lie in its comparisons. Identity, never
+    # `in`/==: a metaclass __eq__ -> True passes a tuple membership test. Bounds before
     # isfinite: math.isfinite(10**400) raises OverflowError.
-    if type(value) not in (int, float) or not 0 <= value <= 100 or not math.isfinite(value):  # pyright: ignore[reportOperatorIssue, reportArgumentType]
+    exact = type(value) is int or type(value) is float
+    if not exact or not 0 <= value <= 100 or not math.isfinite(value):  # pyright: ignore[reportOperatorIssue, reportArgumentType]
         raise StopInputError(f"{name} must be a number 0..100 or None, got {type(value).__name__}"[:120])
     return float(value)  # pyright: ignore[reportArgumentType]
 
@@ -99,8 +101,9 @@ def _items(name: str, value: object, kind: type, fields: tuple[tuple[str, type],
     """
     if value is None:
         return None
-    # Exact list/tuple: a Sequence subclass's __iter__ is foreign code, bytearray/memoryview are not item lists.
-    if type(value) not in (list, tuple):
+    # Exact list/tuple (identity, as in _pct): a Sequence subclass's __iter__ is foreign code,
+    # bytearray/memoryview are not item lists.
+    if type(value) is not list and type(value) is not tuple:
         raise StopInputError(f"{name} must be a list, a tuple or None")
     copies: list[tuple[object, ...]] = []
     try:
