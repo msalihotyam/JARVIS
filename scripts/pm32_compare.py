@@ -2,7 +2,8 @@
 
 It runs no model; it only reads two JSON files and writes build/v24/PM32.md.
 
-Task list (--tasks): a JSON list of task id strings, e.g. ["PM32-01", ...].
+Task list (--tasks): a JSON list of task id strings, e.g. ["PM32-01", ...];
+an id is 1-80 ASCII letters, digits, ".", "_" or "-", starting with a letter or digit.
 Run records (--runs): {"runs": [record, ...]}, one record per task and arm:
     {"task_id": "PM32-01",            # must be in the task list
      "arm": "project" | "single",
@@ -19,6 +20,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
+import re
 import sys
 from fractions import Fraction
 from pathlib import Path
@@ -28,6 +31,8 @@ ARM_TITLES = {"project": "project mode", "single": "single agent"}
 MIN_TASKS = 20
 DEFAULT_OUT = Path(__file__).resolve().parents[1] / "build" / "v24" / "PM32.md"
 MISSING = "missing"
+# Ids are written raw into the report: an allowlist keeps line breaks, separators and look-alikes out.
+TASK_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,79}")
 
 
 class Refused(ValueError):
@@ -41,12 +46,14 @@ def _reject_constant(name):
 def _load_json(path):
     try:
         text = Path(path).read_text(encoding="utf-8")
-    except OSError as exc:
+    except (OSError, UnicodeDecodeError) as exc:
         raise Refused(f"cannot read {path}: {exc}") from exc
     try:
         return json.loads(text, parse_constant=_reject_constant)
-    except json.JSONDecodeError as exc:
-        raise Refused(f"{path}: invalid JSON: {exc}") from exc
+    except Refused:
+        raise
+    except (ValueError, RecursionError) as exc:  # ValueError covers JSONDecodeError and int digit limits
+        raise Refused(f"{path}: invalid JSON: {str(exc)[:80]}") from exc
 
 
 def load_tasks(data):
@@ -54,8 +61,8 @@ def load_tasks(data):
         raise Refused("task list must be a non-empty JSON list")
     seen = set()
     for task_id in data:
-        if not isinstance(task_id, str) or not task_id.strip() or task_id != task_id.strip():
-            raise Refused(f"bad task id {task_id!r}")
+        if not isinstance(task_id, str) or not TASK_ID.fullmatch(task_id):
+            raise Refused(f"bad task id {task_id!r:.80}")
         if task_id in seen:
             raise Refused(f"duplicate task id {task_id!r}")
         seen.add(task_id)
@@ -66,8 +73,15 @@ def _amount(record, key):
     value = record.get(key)
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or value < 0:
-        raise Refused(f"{record.get('task_id')}/{record.get('arm')}: bad {key} {value!r}")
+    bad = Refused(f"{record.get('task_id')}/{record.get('arm')}: bad {key} {value!r:.80}")
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise bad
+    try:
+        value = float(value)  # same report text: the totals are formatted as floats anyway
+    except OverflowError:
+        raise bad from None
+    if not math.isfinite(value) or value < 0:
+        raise bad
     return value
 
 
@@ -130,6 +144,8 @@ def score_arm(tasks, runs, arm):
             duration_missing = True
         else:
             duration += run["duration"]
+    if not (math.isfinite(quota) and math.isfinite(duration)):
+        raise Refused(f"{arm}: quota or duration total overflows")
     if quota_missing:
         per_accepted = MISSING
     elif accepted == 0:

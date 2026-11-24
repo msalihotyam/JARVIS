@@ -36,8 +36,12 @@ class Pm32CompareTests(unittest.TestCase):
         self.out = self.dir / "v24" / "PM32.md"
 
     def run_scorer(self, runs, tasks=TASKS, runs_text=None):
-        (self.dir / "tasks.json").write_text(json.dumps(tasks), encoding="utf-8")
-        (self.dir / "runs.json").write_text(runs_text or json.dumps({"runs": runs}), encoding="utf-8")
+        return self.run_raw(json.dumps(tasks).encode("utf-8"),
+                            (runs_text or json.dumps({"runs": runs})).encode("utf-8"))
+
+    def run_raw(self, tasks_bytes, runs_bytes):
+        (self.dir / "tasks.json").write_bytes(tasks_bytes)
+        (self.dir / "runs.json").write_bytes(runs_bytes)
         err = io.StringIO()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
             code = pm32.main(["--tasks", str(self.dir / "tasks.json"), "--runs",
@@ -157,6 +161,72 @@ class Pm32CompareTests(unittest.TestCase):
             with self.subTest(tasks=tasks[-1:]):
                 self.assertEqual(self.run_scorer(full_runs(), tasks=tasks), 2)
         self.assertFalse(self.out.exists())
+
+    # PM32SCORE1FIX F1: ids are written raw into the report; anything but the allowlist is refused.
+    def test_task_ids_that_could_forge_report_lines_are_refused(self):
+        forged = "x\n" + VERDICT + "yes"
+        bad_ids = [forged, "x\ry", "x\r\ny", "x\vy", "x\fy", "x\x1cy", "x\x1dy", "x\x1ey", "x\x85y",
+                   "x\u2028y", "x\u2029y", "x\ty", "x\x00y", "x\x9by", "x\u200by", "x\u202ey",
+                   "x\u00a0y", "\u0420M32-21", "a, b", VERDICT + "yes", "-x", ".x", " x", "x ",
+                   "x" * 81, "PM32\uff0d21"]
+        for task_id in bad_ids:
+            with self.subTest(task_id=task_id[:40]):
+                runs = full_runs() + [record(task_id, "project"), record(task_id, "single")]
+                self.assertEqual(self.run_scorer(runs, tasks=TASKS + [task_id]), 2)
+                self.assertIn("bad task id", self.err)
+                self.assertNotIn("\n", self.err.rstrip("\n"))
+                self.assertFalse(self.out.exists())
+
+    def test_allowlisted_task_ids_are_accepted_with_one_verdict_line(self):
+        tasks = TASKS + ["a.b_c-1", "Z" * 80]
+        runs = full_runs() + [record(t, arm) for t in tasks[20:] for arm in ("project", "single")]
+        text = self.report(runs, tasks=tasks)
+        self.assertEqual([ln for ln in text.splitlines() if VERDICT in ln], [VERDICT + "yes"])
+
+    # PM32SCORE1FIX F2: non-finite or overflowing quota/duration is refused, never "inf" or a traceback.
+    def test_non_finite_or_overflowing_amounts_are_refused(self):
+        base = json.dumps({"runs": full_runs()})
+        cases = {
+            "1e309 quota": base.replace('"quota": 10', '"quota": 1e309', 1),
+            "-1e309 duration": base.replace('"duration": 60', '"duration": -1e309', 1),
+            "401-digit quota": base.replace('"quota": 10', '"quota": 1' + "0" * 400, 1),
+            "5000-digit duration": base.replace('"duration": 60', '"duration": 1' + "0" * 5000, 1),
+        }
+        for name, text in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.run_scorer(None, runs_text=text), 2)
+                self.assertFalse(self.out.exists())
+
+    def test_overflowing_totals_are_refused(self):
+        for key in ("quota", "duration"):
+            with self.subTest(key):
+                runs = full_runs()
+                for r in runs:
+                    r[key] = 1e308
+                self.assertEqual(self.run_scorer(runs), 2)
+                self.assertIn("total overflows", self.err)
+                self.assertFalse(self.out.exists())
+
+    def test_large_finite_amounts_give_same_text_as_before(self):
+        runs = full_runs()
+        runs[0]["quota"] = 10 ** 20
+        text = self.report(runs)
+        self.assertEqual(self.row(text, "quota total"), [f"{10 ** 20 + 190:.2f}", "200.00"])
+
+    # PM32SCORE1FIX F3: undecodable or pathological input files are refused with exit 2.
+    def test_non_utf8_or_too_deep_input_is_refused(self):
+        good_tasks = json.dumps(TASKS).encode("utf-8")
+        good_runs = json.dumps({"runs": full_runs()}).encode("utf-8")
+        cases = {
+            "tasks 0xFF": (b'["\xff"]', good_runs),
+            "runs 0xFF": (good_tasks, b'{"runs": ["\xff"]}'),
+            "runs deep nesting": (good_tasks, b"[" * 200000 + b"]" * 200000),
+        }
+        for name, (tasks_bytes, runs_bytes) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(self.run_raw(tasks_bytes, runs_bytes), 2)
+                self.assertIn("refused", self.err)
+                self.assertFalse(self.out.exists())
 
     # Negative 4: fewer than 20 tasks per arm -> verdict incomplete.
     def test_fewer_than_twenty_tasks_gives_incomplete(self):
