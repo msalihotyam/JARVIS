@@ -25,6 +25,28 @@ class TalkGlossaryTests(unittest.TestCase):
         glossary = Glossary.load()
         self.assertEqual(glossary.correct("ben altın ve en altın"), ("ben altın ve en altın", []))
 
+    def test_alias_followed_by_any_mark_or_joiner_inside_word_is_preserved(self):
+        glossary = Glossary.load()
+        # Mn outside U+0300-036F, Mn, Mc, Me, Cf ZWNJ, Cf ZWJ, Cf soft hyphen
+        marks = ("᪰", "⃐", "ः", "⃝", "‌", "‍", "­", "＿", "‿", "⁀", "\U0001f3fb")
+        for mark in marks:
+            for text in (f"en altı{mark}nın", f"x{mark}en altı"):
+                with self.subTest(mark=hex(ord(mark)), text=text):
+                    self.assertEqual(glossary.correct(text), (text, []))
+        self.assertEqual(glossary.correct("en altı᪰"), ("en altı᪰", []))
+
+    def test_decomposed_transcript_matches_precomposed_alias(self):
+        glossary = self.load_rows([{"canonical": "N6", "aliases": ["í"]}])
+        self.assertEqual(glossary.correct("İ́"), ("N6", [Replacement("İ́", "N6")]))
+        self.assertEqual(glossary.correct("í"), ("N6", [Replacement("í", "N6")]))
+
+    def test_aliases_equal_after_fold_and_nfc_are_refused_at_load(self):
+        with self.assertRaisesRegex(ValueError, "ambiguous"):
+            self.load_rows([
+                {"canonical": "A", "aliases": ["í"]},
+                {"canonical": "B", "aliases": ["İ́"]},
+            ])
+
     def test_turkish_case_folding(self):
         glossary = self.load_rows([
             {"canonical": "N6", "aliases": ["ılık", "ileri"]},

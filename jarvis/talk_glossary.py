@@ -2,12 +2,21 @@
 
 import json
 import re
+import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 
 DEFAULT_GLOSSARY_PATH = Path(__file__).resolve().parents[1] / "dev" / "talk" / "glossary_tr.json"
-_WORD = r"\w[\w\u0300-\u036f]*"
+# Every combining mark (Mn/Mc/Me), format joiner (Cf, e.g. ZWNJ), connector (Pc, e.g. U+203F)
+# and emoji skin-tone modifier (Word_Break=Extend) stays inside a word,
+# so an alias never matches the start of a longer word. Python re has no \p{M}; scan once.
+_JOINERS = "".join(
+    re.escape(chr(code))
+    for code in range(sys.maxunicode + 1)
+    if unicodedata.category(chr(code)) in {"Mn", "Mc", "Me", "Cf", "Pc"} or 0x1F3FB <= code <= 0x1F3FF
+)
+_WORD = rf"\w[\w{_JOINERS}]*"
 _TOKEN = re.compile(rf"{_WORD}|\s+|[^\w\s]")
 _TURKISH_I = str.maketrans({"I": "ı", "İ": "i"})
 
@@ -15,7 +24,8 @@ _TURKISH_I = str.maketrans({"I": "ı", "İ": "i"})
 def _fold(token: str) -> str:
     if token.isspace():
         return " "
-    return unicodedata.normalize("NFC", token).translate(_TURKISH_I).casefold()
+    folded = unicodedata.normalize("NFC", token).translate(_TURKISH_I).casefold()
+    return unicodedata.normalize("NFC", folded)
 
 
 def _term_key(term: str) -> tuple[str, ...]:
