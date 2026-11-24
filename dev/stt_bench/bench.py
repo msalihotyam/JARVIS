@@ -38,12 +38,21 @@ def load_phrases() -> list[Phrase]:
     return [Phrase(entry["id"], entry["reference"], tuple(entry["terms"])) for entry in entries]
 
 
-_TURKISH_CASE = str.maketrans({"I": "ı", "İ": "i"})
+# Uppercase "I" is ı in Turkish but i in Latin-script terms (JARVIS, API), so it stays a wildcard.
+_ANY_I = ""
+_TURKISH_CASE = str.maketrans({"I": _ANY_I, "İ": "i"})
 
 
 def _words(text: str) -> list[str]:
-    normalized = unicodedata.normalize("NFC", text).translate(_TURKISH_CASE).lower()
-    return re.findall(r"[^\W_]+", normalized)
+    normalized = unicodedata.normalize("NFC", text).replace("i̇", "i")
+    return [word.translate(_TURKISH_CASE).lower() for word in re.findall(r"[^\W_]+", normalized)]
+
+
+def _same(expected: str, actual: str) -> bool:
+    return len(expected) == len(actual) and all(
+        left == right or (_ANY_I in (left, right) and {left, right} <= {_ANY_I, "i", "ı"})
+        for left, right in zip(expected, actual)
+    )
 
 
 def word_error_rate(reference: str, transcript: str) -> float:
@@ -56,7 +65,7 @@ def word_error_rate(reference: str, transcript: str) -> float:
             current.append(min(
                 previous[position] + 1,
                 current[-1] + 1,
-                previous[position - 1] + (expected_word != actual_word),
+                previous[position - 1] + (not _same(expected_word, actual_word)),
             ))
         previous = current
     return previous[-1] / max(len(expected), 1)
@@ -71,7 +80,7 @@ def term_hit_rate(transcript: str, terms: Sequence[str]) -> float | None:
     for term in terms:
         tokens = _words(term)
         if tokens and any(
-            words[start:start + len(tokens)] == tokens
+            all(map(_same, tokens, words[start:start + len(tokens)]))
             for start in range(len(words) - len(tokens) + 1)
         ):
             hits += 1
