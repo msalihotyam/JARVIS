@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "about": "TGPOLL1: CI duration record for tests.test_telegram_offset (seconds, same schema as scripts/test_durations.json).",
+  "classes": {
+    "tests.test_telegram_offset.TelegramOffsetTests": 1.0
+  },
+  "tests": {}
+}
