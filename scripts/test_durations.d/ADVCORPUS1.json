@@ -1,0 +1,8 @@
+{
+ "version": 1,
+ "classes": {
+  "tests.test_adversarial.CorpusShapeTests": 0.2,
+  "tests.test_adversarial.HelperTests": 0.1,
+  "tests.test_adversarial.IsolationTests": 2.0
+ }
+}
