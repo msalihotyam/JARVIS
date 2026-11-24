@@ -42,6 +42,7 @@ class HookConnector(DummyConnector):
 
 class SkillCancelTests(unittest.TestCase):
     # SKCORE's fixtures, borrowed (not subclassed, so its tests run once).
+    setUpClass = base.SkillCoreTests.__dict__["setUpClass"]
     setUp = base.SkillCoreTests.setUp
     core = base.SkillCoreTests.core
     events_of = base.SkillCoreTests.events_of
