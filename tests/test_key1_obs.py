@@ -151,6 +151,32 @@ class Key1ObsTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("bot-stricter 1, unmatched 0", out)
 
+    def test_header_sha_differs_from_name_fails_closed(self):
+        # push-A file with a header for B is a key 1 for neither: never AGREE for A or B, counted, exit 2
+        for name in (f"push-{A}-int-x", f"push-{A}-int-x.refused"):
+            with self.subTest(name=name):
+                for p in self.done.iterdir():
+                    p.unlink()
+                self.write([bot("2026-11-24T08:00:00Z", "write_key1", "INT-X", A),
+                            bot("2026-11-24T08:00:00Z", "write_key1", "INT-X", B)],
+                           {name: key1(B, "INT-X", "key1_check", "2026-11-24T08:30:00Z")})
+                code, out, err = self.run_obs()
+                self.assertEqual(code, 2, out)
+                self.assertIn("inconsistent 1", out)
+                self.assertIn(f"{name} header sha={B} differs from its file name INCONSISTENT", out)
+                self.assertNotIn("AGREE", out)
+                self.assertIn("K2: 0/10 matching, unsafe 2", out)  # neither A nor B has a real key 1
+                self.assertIn("inconsistent approval", err)
+
+    def test_k4_lane_compare_ignores_case(self):
+        # a sha-less live write names the lane; the hands file's lane differs only in case: no mismatch
+        self.write([bot("2026-11-24T08:00:00Z", "write_key1", "int-x", live=True)],
+                   {f"push-{A}-int-x": key1(A, "INT-X", "hands", "2026-11-24T08:00:05Z"),
+                    f"push-{B}-int-y": key1(B, "Int-Y", "hands", "2026-11-24T09:00:00Z")})  # no live write: mismatch
+        code, out, _ = self.run_obs()
+        self.assertEqual(code, 0, out)
+        self.assertIn("K4: 2 hands key1 audited, mismatches 1", out)
+
     def test_nothing_written(self):
         self.write([bot("2026-11-24T08:00:00Z", "write_key1", "INT-X", A)],
                    {f"push-{A}-int-x": key1(A, "INT-X", "key1_check", "2026-11-24T08:30:00Z")})

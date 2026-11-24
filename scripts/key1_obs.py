@@ -3,7 +3,8 @@ with the real key 1 files in build/approvals/done/ since a given time and prints
 
   python scripts/key1_obs.py [--root R] [--since 2026-11-24T00:00:00Z] [--now ISO]
 
-Exit 0 for readable input, 2 for an unreadable or malformed one (fail closed). Writes nothing."""
+Exit 0 for readable input, 2 for an unreadable or malformed one or an inconsistent approval (header sha differs
+from the file name sha; fail closed). Writes nothing."""
 import argparse
 import json
 import re
@@ -50,7 +51,7 @@ def load_decisions(path, since):
 
 
 def load_approvals(done):
-    """[{sha, lane, by, at, refused, name}] of every approval in done/; ValueError on a malformed one."""
+    """[{sha, lane, by, at, refused, name, bad}] of every approval in done/; ValueError on a malformed one."""
     out = []
     for p in sorted(Path(done).iterdir()):
         m = NAME_RE.fullmatch(p.name)
@@ -61,13 +62,14 @@ def load_approvals(done):
         h = HEAD_RE.fullmatch(first)
         if not h:
             if m.group(2):  # a refused file may carry any text: its name is the record
-                out.append({"sha": m.group(1), "lane": "", "by": "?", "at": None, "refused": True, "name": p.name})
+                out.append({"sha": m.group(1), "lane": "", "by": "?", "at": None, "refused": True, "name": p.name,
+                            "bad": False})
                 continue
             if V1_RE.match(first):  # a KEY1 v1 header attempt that does not parse fails closed
                 raise ValueError(f"approval {p.name}: malformed KEY1 v1 header")
             continue  # legacy free-text approval (pre KEY1 v1): not a key 1 record
         out.append({"sha": h["sha"], "lane": h["lane"], "by": h["by"], "at": ts(h["at"]),
-                    "refused": bool(m.group(2)), "name": p.name})
+                    "refused": bool(m.group(2)), "name": p.name, "bad": h["sha"] != m.group(1)})
     return out
 
 
@@ -77,6 +79,9 @@ def same(bot_lane, bot_sha, a):
 
 def report(decisions, approvals, since, now):
     lines, c = [], {"agree": 0, "unsafe": 0, "stricter": 0, "unmatched": 0, "pending": 0}
+    bad = [a for a in approvals if a["bad"]]  # header sha != name sha: a key 1 for neither sha
+    approvals = [a for a in approvals if not a["bad"]]
+    lines += [f"{a['name']} header sha={a['sha']} differs from its file name INCONSISTENT" for a in bad]
     real = [a for a in approvals if a["by"] != "hands"]
     used = set()
     for t, act, mode, lane, sha in decisions:
@@ -105,12 +110,12 @@ def report(decisions, approvals, since, now):
         if a["name"] not in used and not a["refused"] and a["at"] is not None and a["at"] >= since:
             c["unmatched"] += 1
             lines.append(f"{iso(a['at'])} real key1 by={a['by']} {a['lane']} {a['sha']} | no bot decision UNMATCHED")
-    live = {(d[4] or d[3]) for d in decisions if d[1] == "write_key1" and d[2] == "live"}
+    live = {(d[4] or d[3].casefold()) for d in decisions if d[1] == "write_key1" and d[2] == "live"}
     hands = [a for a in approvals if a["by"] == "hands" and a["at"] is not None and a["at"] >= since]
     # DECISION TAKEN: a hands key 1 mismatches when refused or no live bot write names its sha (alt: a verdict line)
-    mism = sum(a["refused"] or (a["sha"] not in live and a["lane"] not in live) for a in hands)
+    mism = sum(a["refused"] or (a["sha"] not in live and a["lane"].casefold() not in live) for a in hands)
     lines.append(f"agree {c['agree']}, unsafe {c['unsafe']}, bot-stricter {c['stricter']}, "
-                 f"unmatched {c['unmatched']}, pending {c['pending']}")
+                 f"unmatched {c['unmatched']}, pending {c['pending']}, inconsistent {len(bad)}")
     lines.append(f"K2: {c['agree']}/10 matching, unsafe {c['unsafe']}")
     lines.append(f"K4: {len(hands)} hands key1 audited, mismatches {mism}")
     return lines
@@ -136,6 +141,9 @@ def main(argv=None):
         print(f"key1_obs: unreadable or malformed input: {e}"[:300], file=sys.stderr)
         return 2
     print("\n".join(report(decisions, approvals, since, now)))
+    if any(a["bad"] for a in approvals):
+        print("key1_obs: inconsistent approval (header sha differs from file name sha)", file=sys.stderr)
+        return 2
     return 0
 
 
