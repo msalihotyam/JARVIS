@@ -1,6 +1,7 @@
 import contextlib
 import io
 import json
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -29,12 +30,47 @@ class LessonCoverageTests(unittest.TestCase):
         (self.root / "tests").mkdir()
         # ZZ2 named as a word; ZZ10 only inside a longer token, so it is not guarded.
         (self.root / "tests" / "test_x.py").write_text("# guards ZZ2\nX = 'ZZ100'\n", encoding="utf-8")
+        self.git("init", "-q")
+        self.git("add", "tests/test_x.py")
         self.rules = self.root / "rules.jsonl"
         lines = [json.dumps(r) for r in RULES] + ["{not json", "", '{"rule": "ZZ9"}']
         self.rules.write_text("\n".join(lines) + "\n", encoding="utf-8")
         self.cands = self.root / "cands.jsonl"
         cands = [{"dogrulama_durumu": "aday"}] * 3 + [{"dogrulama_durumu": "dogrulandi"}, {}]
         self.cands.write_text("\n".join(json.dumps(c) for c in cands) + "\n", encoding="utf-8")
+
+    def git(self, *args):
+        subprocess.run(["git", *args], cwd=self.root, check=True, capture_output=True)
+
+    def guarded(self):
+        _, out, _ = self.run_cli("--json")
+        return json.loads(out)["guarded"]
+
+    def test_invalid_utf8_line_counted_unreadable(self):
+        good = json.dumps(RULES[1]).encode()
+        self.rules.write_bytes(good + b"\n" + b'{"rule": "\xff\xfe", "class": "topic"}\n' + b"\xff\xfe\n" + good + b"\n")
+        code, out, _ = self.run_cli("--json")
+        self.assertEqual(code, 0)
+        rep = json.loads(out)
+        self.assertEqual(rep["unreadable"]["rules"], [2, 3])
+        self.assertEqual(rep["classes"], {"enforced_in_code": 2})
+
+    def test_untracked_binary_and_ignored_files_do_not_guard(self):
+        cache = self.root / "tests" / "__pycache__"
+        cache.mkdir()
+        (cache / "old.cpython-312.pyc").write_bytes(b"\x00\x01ZZ10\x00")
+        (self.root / "tests" / "test_untracked.py").write_text("# ZZ10\n", encoding="utf-8")
+        (self.root / "tests" / "notes.txt").write_text("ZZ10\n", encoding="utf-8")
+        self.git("add", "tests/notes.txt")
+        self.assertEqual(self.guarded(), ["ZZ2"])
+        # tracked binary .py is skipped by -I; a tracked text .py in a subfolder counts
+        (self.root / "tests" / "bin.py").write_bytes(b"\x00ZZ10\x00")
+        self.git("add", "-f", "tests/bin.py")
+        self.assertEqual(self.guarded(), ["ZZ2"])
+        (self.root / "tests" / "sub").mkdir()
+        (self.root / "tests" / "sub" / "test_y.py").write_text("# ZZ10\n", encoding="utf-8")
+        self.git("add", "tests/sub/test_y.py")
+        self.assertEqual(self.guarded(), ["ZZ2", "ZZ10"])
 
     def run_cli(self, *extra):
         out, err = io.StringIO(), io.StringIO()

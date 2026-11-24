@@ -25,12 +25,12 @@ def natural_key(text):
 def read_jsonl(path, required):
     """Return (rows, unreadable line numbers); a missing file raises FileNotFoundError."""
     rows, bad = [], []
-    with open(path, encoding="utf-8") as fh:
-        for number, line in enumerate(fh, 1):
-            if not line.strip():
+    with open(path, "rb") as fh:
+        for number, raw in enumerate(fh, 1):
+            if not raw.strip():
                 continue
-            try:
-                row = json.loads(line)
+            try:  # decode per line: invalid UTF-8 (UnicodeDecodeError is a ValueError) marks only that line
+                row = json.loads(raw.decode("utf-8"))
             except ValueError:
                 bad.append(number)
                 continue
@@ -42,9 +42,10 @@ def read_jsonl(path, required):
 
 
 def named_in_tests(rule, root):
-    """True when a file under <root>/tests names the rule id as a whole word."""
+    """True when a tracked text .py file under <root>/tests names the rule id as a whole word."""
+    # tracked only (no --no-index) and -I: ignored __pycache__/*.pyc or binaries never count
     done = subprocess.run(
-        ["git", "grep", "--no-index", "-q", "-w", "-F", "-e", rule, "--", "tests"],
+        ["git", "grep", "-I", "-q", "-w", "-F", "-e", rule, "--", "tests/*.py"],
         cwd=root, capture_output=True, text=True,
     )
     if done.returncode not in (0, 1):
