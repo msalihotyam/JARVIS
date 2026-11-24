@@ -1564,6 +1564,7 @@
   "tests.test_work_ledger.KeyTests": 0.0,
   "tests.test_work_ledger.RunTransitionTests": 0.003,
   "tests.test_work_ledger.StepTransitionTests": 0.007,
+  "tests.test_work_lessons.LessonTests": 1.0,
   "tests.test_work_plan.PlanTests": 0.007,
   "tests.test_work_planner.PlannerTests": 18.655,
   "tests.test_work_ports.ApplyFixTests": 63.754,
