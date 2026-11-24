@@ -2236,6 +2236,58 @@ class Key1LiveTest(BotCase):
         self.assertFalse(self.key().exists())
         self.assertIn(("escalate_orchestrator", "REVERIFY", "INT-X"), self.shadow_acts(ds))
 
+    # KEY1LIVE1FIX2 (CLREV F1): the real verified() over key1_check.verify output; a WARN or any non-PASS is a no
+    ALL_PASS = [f"PASS {n} ok" for n in range(1, 7)]
+
+    def real_verify(self, *outs):
+        """Run live with key1_check.verify returning outs in order (last repeats); -> (decisions, verify calls)."""
+        import key1_check
+        self.live(write_key1=True)
+        self.put("build/reports/INT-X.md", f"STATUS: PASS\nCANDIDATE SHA: {SHA}\nCI BRANCH: ci/int-x\n")
+        for f in ("shadow.json", "decisions.jsonl"):  # each subTest decides from scratch
+            (self.root / "build" / "bot" / f).unlink(missing_ok=True)
+        calls = []
+
+        def fake(lane, root, git, gh, *a, **k):
+            calls.append(lane)
+            return outs[min(len(calls), len(outs)) - 1]
+        with mock.patch.object(key1_check, "verify", side_effect=fake), \
+                mock.patch.object(key1_check, "make_git"), mock.patch.object(key1_check, "make_gh"):
+            self.bot = orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append, from_start=True,
+                                   wake_post=self.post, wake_topic=self.topic, key1_verify=None)
+            return self.bot.run(), calls
+
+    def test_real_verify_all_pass_writes(self):
+        ds, calls = self.real_verify((self.ALL_PASS, True))
+        self.assertEqual(calls, ["INT-X", "INT-X"])
+        self.assertTrue(self.key().exists())
+        self.assertIn(("write_key1", "O26", "INT-X"), self.shadow_acts(ds))
+
+    def test_real_verify_not_all_pass_asks_no_file(self):
+        warn3 = self.ALL_PASS[:2] + ["WARN 3 MINOR to POLISH.md (U1RULE1, T1 product chain)"] + self.ALL_PASS[3:]
+        cases = {"warn3": (warn3, True), "warn6": (self.ALL_PASS[:5] + ["WARN 6 x"], True),
+                 "skip": (self.ALL_PASS[:3] + ["SKIP 4 x"] + self.ALL_PASS[4:], True),
+                 "lower": (self.ALL_PASS[:3] + ["pass 4 x"] + self.ALL_PASS[4:], True),
+                 "missing": (self.ALL_PASS[:5], True), "dup": (self.ALL_PASS + ["WARN 3 x"], True),
+                 "dup_pass": (self.ALL_PASS[:5] + ["PASS 5 again"], True), "bare": (self.ALL_PASS + ["PASS"], True),
+                 "extra": (self.ALL_PASS + ["note"], True), "ok_false": (self.ALL_PASS, False), "empty": ([], True),
+                 "newline": (self.ALL_PASS[:2] + ["PASS 3 x\nWARN 3 y"] + self.ALL_PASS[3:], True),
+                 "pass_space": (self.ALL_PASS + ["PASS "], True), "tab": (["PASS\t1 x"] + self.ALL_PASS[1:], True),
+                 "ok_truthy": (self.ALL_PASS, "yes"), "non_str": (self.ALL_PASS + [1], True), "none": (None, True)}
+        for name, out in cases.items():
+            with self.subTest(name):
+                ds, _ = self.real_verify(out)
+                self.assertFalse(self.key().exists())
+                self.assertIn(("ask_salih_key1", "ALLOW-T2", "INT-X"), self.shadow_acts(ds))
+                self.assertNotIn(("write_key1", "O26", "INT-X"), self.shadow_acts(ds))
+
+    def test_real_reverify_warn_escalates_no_file(self):
+        warn3 = self.ALL_PASS[:2] + ["WARN 3 MINOR x"] + self.ALL_PASS[3:]
+        ds, calls = self.real_verify((self.ALL_PASS, True), (warn3, True))
+        self.assertEqual(calls, ["INT-X", "INT-X"])
+        self.assertFalse(self.key().exists())
+        self.assertIn(("escalate_orchestrator", "REVERIFY", "INT-X"), self.shadow_acts(ds))
+
     def test_refused_written_file_demotes_and_escalates(self):
         self.live(write_key1=True)
         with mock.patch.object(orchbot.cv, "key1_refusal", return_value="bad header"):
