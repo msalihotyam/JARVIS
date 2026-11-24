@@ -1903,11 +1903,11 @@ class AgentCore:
         )
         for name, port in boot.items():
             setattr(ports, name, port)
-        done = [
-            item for item in steps.values()
-            if item.state is StepState.ACCEPTED and item.ordinal < step.ordinal
-        ]
-        moved, driven = work_driver.drive(resumed, sorted([*done, step], key=lambda item: item.ordinal), ports)
+        # Every slice is passed so drive sees failed ones (pause) and later ones (no early ACCEPTING);
+        # only= drives this step alone and keeps the run BUILDING while another slice can move.
+        moved, driven = work_driver.drive(
+            resumed, sorted(steps.values(), key=lambda item: item.ordinal), ports, only=step.key,
+        )
         after = next(item for item in driven if item.key == step.key)
         if after != step:
             self.memory.append_work_step(after)

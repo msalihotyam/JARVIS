@@ -18,6 +18,7 @@ from jarvis.registry import ToolRegistry
 from jarvis.work_controls import Budget, Usage
 from jarvis.work_ledger import EventKind, RunSize, RunState, StepState, advance_run
 from jarvis.work_plan import Plan, PlanBudget, PlanCheck, PlanSlice
+from tests.test_work_driver import FAIL, FakePorts, result
 
 NOW = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
 LEASE = timedelta(minutes=10)
@@ -54,13 +55,15 @@ class CoreProjectDriveTests(unittest.TestCase):
         mock.patch("jarvis.work_driver.drive", side_effect=self.fake_drive).start()
         self.addCleanup(mock.patch.stopall)
 
-    def fake_drive(self, run, steps, ports):
-        self.drive_calls.append([step.key for step in steps])
-        current = steps[-1]
-        self.worker.start(current.key)
+    def fake_drive(self, run, steps, ports, *, only):
+        self.drive_calls.append(only)
+        self.worker.start(only)
         if self.outcome is StepState.ACCEPTED:
-            self.applied.append(current.key)
-        return run, (*steps[:-1], replace(current, state=self.outcome, updated_at=NOW + timedelta(minutes=3)))
+            self.applied.append(only)
+        return run, tuple(
+            replace(s, state=self.outcome, updated_at=NOW + timedelta(minutes=3)) if s.key == only else s
+            for s in steps
+        )
 
     def ready(self, *, approve=True, recover=True):
         self.core.create_project_run(
@@ -153,6 +156,74 @@ class CoreProjectDriveTests(unittest.TestCase):
         self.assertIn("blocked", str(saved.result_snapshot))
         last = [step for step in self.memory.work_steps("r") if step.ordinal == 1][-1]
         self.assertIs(last.state, StepState.BLOCKED_BY_GATE)
+
+
+class RealDriverTests(CoreProjectDriveTests):
+    """PM26W1FIX: the real work_driver.drive behind a FakePorts, so run moves are exercised."""
+
+    def setUp(self):
+        super().setUp()
+        mock.patch.stopall()
+        self.ports = None
+        self.scripts = {"s1": [result()], "s2": [result()]}
+        self.port_kw = {}
+        mock.patch("jarvis.work_ports.build_ports", side_effect=self.build_fake).start()
+
+    def build_fake(self, **_):
+        script = dict(self.port_kw)
+        no_root_cause = script.pop("root_cause", True) is None
+        self.ports = FakePorts(self.scripts, **script)
+        self.ports.now = NOW + timedelta(minutes=2)
+        if no_root_cause:
+            self.ports.root_cause = None  # like production build_ports: no root_cause port
+        return self.ports
+
+    def run_state(self):
+        return self.memory.latest_work_run("r").state
+
+    def step_states(self):
+        latest = {}
+        for step in self.memory.work_steps("r"):
+            latest[step.ordinal] = step.state
+        return [latest[n] for n in sorted(latest)]
+
+    def test_two_slices_driven_in_turn_run_accepting_only_after_last(self):
+        first, second = self.ready()
+        self.assertIs(self.resume(first).status, RunStatus.COMPLETED)
+        self.assertEqual([len(w.tasks) for w in self.ports.workers.values()], [1, 0])  # once per step
+        self.assertIs(self.run_state(), RunState.BUILDING)
+        self.assertEqual(self.step_states(), [StepState.ACCEPTED, StepState.PENDING])
+        self.assertIs(self.resume(second).status, RunStatus.COMPLETED)
+        self.assertEqual([len(w.tasks) for w in self.ports.workers.values()], [0, 1])
+        self.assertIs(self.run_state(), RunState.ACCEPTING)
+        self.assertEqual(self.step_states(), [StepState.ACCEPTED, StepState.ACCEPTED])
+
+    def test_held_non_final_slice_still_pauses_the_run(self):
+        # F2: a held slice (gate fail, no valid root cause) is an N6-13 attention item even
+        # while slice 2 could move; the per-step guard must not hide that pause.
+        first, second = self.ready()
+        self.port_kw = {"regress": [FAIL], "root_cause": None}
+        self.assertIs(self.resume(first).status, RunStatus.FAILED)
+        self.assertIs(self.run_state(), RunState.PAUSED)
+        self.assertEqual(len(self.ports.workers["s2"].tasks), 0)
+        self.assertIn("refused: not_resumable", self.resume(second).result.summary)
+
+    def test_last_slice_reached_out_of_order_still_waits_for_the_first(self):
+        first, second = self.ready()
+        self.assertIs(self.resume(second).status, RunStatus.COMPLETED)
+        self.assertIs(self.run_state(), RunState.BUILDING)
+        self.assertIs(self.resume(first).status, RunStatus.COMPLETED)
+        self.assertIs(self.run_state(), RunState.ACCEPTING)
+
+    # The fake-drive wiring tests do not apply to the real driver.
+    test_a1_each_slice_is_one_chain_task_driven_once_per_resume = None
+    test_a2_gates_rechecked_before_every_step = None
+    test_a3_n5_applied_step_is_not_applied_again = None
+    test_a4_not_resumable_run_starts_no_worker = None
+    test_n1_frozen_policy = None
+    test_n2_narrowed_scope = None
+    test_n3_plan_hash_mismatch = None
+    test_n4_failed_check_means_no_apply_and_failed_with_evidence = None
 
 
 if __name__ == "__main__":

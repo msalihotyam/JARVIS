@@ -232,21 +232,27 @@ def _booted(ports: object) -> bool:
         cast("Callable[[n6_boot.Item], object]", resume))
 
 
-def drive(run: WorkRun, steps: Iterable[WorkStep], ports: Ports) -> tuple[WorkRun, tuple[WorkStep, ...]]:
+def drive(
+    run: WorkRun, steps: Iterable[WorkStep], ports: Ports, *, only: str | None = None,
+) -> tuple[WorkRun, tuple[WorkStep, ...]]:
     """Drive a BUILDING run until it waits, pauses or every slice is done.
 
+    ``only`` (PM26W1FIX, one chain step per call): drive just that step key and
+    leave the run BUILDING while any other slice can still move.
     Returns ``(run, steps)`` with the final ledger values.
     """
     by_key = {step.key: step for step in steps}
     if not _booted(ports):
         return run, tuple(sorted(by_key.values(), key=lambda s: s.ordinal))
+    held = False
     while run.state == RunState.BUILDING:
         # Checked first: a resumed run may already hold three failed slices.
         if run_should_pause(by_key.values()):
             run = _run_to(run, RunState.PAUSED, ports)
             break
-        # Revisions cut short (budget) resume before fresh slices start.
-        ready = [s for s in by_key.values() if s.state in _REVISABLE] + list(runnable_steps(by_key.values()))
+        ready = _ready(by_key.values())
+        if only is not None:
+            ready = [s for s in ready if s.key == only]
         if not ready:
             break
         step, outcome = _drive_slice(ready[0], ports)
@@ -255,10 +261,13 @@ def drive(run: WorkRun, steps: Iterable[WorkStep], ports: Ports) -> tuple[WorkRu
             run = _run_to(run, RunState.BLOCKED_BUDGET, ports)
             _notify(ports, "blocked:budget", f"budget:{step.key}:{step.attempt}", step.key)
         elif outcome == "held":
+            held = True
             break  # N6-13: an attention item; the run pauses below
     if run.state == RunState.BUILDING:
         values = tuple(by_key.values())
-        if run_waits_for_input(values):
+        if only is not None and not held and _ready(values):
+            pass  # another slice can still move: the run stays BUILDING for its own step
+        elif run_waits_for_input(values):
             run = _run_to(run, RunState.NEEDS_INPUT, ports)
         elif values and all(step.state == StepState.ACCEPTED for step in values):
             # The acceptance phase owns awaiting_acceptance/done eligibility.
@@ -303,6 +312,12 @@ class _FencedPorts:
             return box[0] if box else None
 
         return write
+
+
+def _ready(steps: Iterable[WorkStep]) -> list[WorkStep]:
+    # Revisions cut short (budget) resume before fresh slices start.
+    steps = tuple(steps)
+    return [s for s in steps if s.state in _REVISABLE] + list(runnable_steps(steps))
 
 
 def _drive_slice(step: WorkStep, ports: Ports) -> tuple[WorkStep, str]:
