@@ -94,12 +94,25 @@ class TalkHearTests(unittest.TestCase):
     def test_unsafe_candidates_dropped(self):
         base = "lütfen şunu aç sonra bana haber ver"
         for bad in ("C:\\notes", "src/app.py", "https://x.com", "www.x.com", "/deploy", "~home",
-                    "a\x07b", "a\u202eb", "a\u200fb", "a\u2066b", "a\u200bb"):
+                    "a\x07b", "a\u202eb", "a\u200fb", "a\u2066b", "a\u200bb",
+                    # scheme-only URIs, case, later word, edge punctuation, NFKC, homoglyph
+                    "mailto:a@b.c", "javascript:alert(1", "tel:123", "data:text", "ms-settings:x",
+                    "JavaScript:x", "MAILTO:a", "a\u00e7 www.x.com", "a\u00e7 mailto:a", "(javascript:alert(1)",
+                    "javascript\uff1ax", "a\uff0fb", "x\uff0ecom", "x\u3002com", "\u0458avascript:x",
+                    "java\u200bscript:x", "14:30", "javascript\u2236x", "javascript\ua789x",
+                    "a\u2044b", "a\u2215b", "a\u29f8b", "x\ufe52com", "x\u2024com", "a\uff20b",
+                    # DECISION TAKEN: bare domains and emails count as URLs
+                    "x.com", "github.com", "a@b"):
             with self.subTest(bad=repr(bad)):
                 got = correction_candidates(base.replace("şunu", "dosya"), base.replace("şunu", bad))
                 self.assertEqual(got["candidates"], [])
                 got = correction_candidates(base.replace("şunu", bad), base.replace("şunu", "dosya"))
                 self.assertEqual(got["candidates"], [])
+        # normal words, a trailing colon and a decimal number stay candidates
+        for good, meant in (("saat:", "saat"), ("İzmir", "İzmir"), ("3.5", "3.5")):
+            with self.subTest(good=good):
+                got = correction_candidates(base.replace("şunu", "dosya"), base.replace("şunu", good))
+                self.assertEqual(got["candidates"], [{"heard": "dosya", "meant": meant}])
 
     # N3 raw empty or too long
     def test_raw_empty_or_too_long_refused(self):

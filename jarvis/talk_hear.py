@@ -6,6 +6,7 @@ function returns {"ok": True, ...} or a typed refusal {"ok": False, "reason": <A
 """
 
 import difflib
+import re
 import unicodedata
 from collections.abc import Mapping
 
@@ -14,6 +15,7 @@ MAX_TEXT = 4000
 MAX_CANDIDATES = 5
 MAX_SIDE_WORDS = 4
 _EDGE_PUNCT = ".,;:!?\"'()[]{}«»“”‘’…"
+_DOMAIN = re.compile(r"[^\W_]\.[^\W\d_]{2,}")  # x.com, app.py: a bare domain counts as a URL
 
 
 def _refuse(reason):
@@ -128,9 +130,13 @@ def _words(text):
 def _unsafe(phrase):
     if any(unicodedata.category(ch).startswith("C") for ch in phrase):
         return True  # control, format (bidi, zero-width), private, unassigned
-    low = phrase.lower()
-    return ("/" in phrase or "\\" in phrase or "://" in phrase or phrase.startswith("~")
-            or low.startswith("www.") or (len(phrase) > 1 and phrase[1] == ":"))
+    # Per word, after NFKC (fullwidth : / . fold to ASCII). Any inner ":" covers every URI
+    # scheme (mailto:, javascript:, tel:), drives and times; "@" emails; dotted words bare domains.
+    for word in unicodedata.normalize("NFKC", phrase).replace("。", ".").lower().split():
+        if (any(ch in word for ch in "/\\:@∶꞉⁄∕⧸") or word.startswith(("~", "www."))
+                or _DOMAIN.search(word)):
+            return True
+    return False
 
 
 @_guard
