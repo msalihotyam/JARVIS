@@ -118,8 +118,32 @@ class FallbackDrillTests(unittest.TestCase):
     def test_protected_paths(self):
         for p in ("scripts/conveyor.py", ".claude/x", "data\\jarvis.db", "a/.env.local", "k.pem", "./uv.lock"):
             self.assertTrue(drill._protected(p), p)
-        for p in ("scripts/n6_fallback_drill.py", "jarvis/n6_lease.py", "dev/notes.md"):
+        for p in ("scripts/n6_fallback_drill.py", "jarvis/n6_lease.py", "dev/notes.md", "jarvis/tariot.md",
+                  "docs/jarvis/x.md", "tests/test_env.py", "dev/data/x.md"):
             self.assertFalse(drill._protected(p), p)
+
+    def test_protected_paths_match_conveyor_class(self):  # N6ROLLDRILL1FIX: CDX F1 variants
+        cases = {
+            "case": ("Scripts/Conveyor.py", ".Claude/x", "DATA/x", "K.PEM", "Dev/Dashboard/a.js", "UV.LOCK"),
+            "separators": ("scripts\\ci.ps1", ".github\\workflows/ci.yml", ".\\./scripts/quality.ps1"),
+            "folding": ("a/../data/x", "./././.claude/x", "jarvis/../scripts/test_parallel.py"),
+            "win32 trailing": ("scripts./conveyor.py", ".claude ./x", "scripts/conveyor.py. ", "uv.lock."),
+            ".jarvis": (".jarvis/config", "a/.jarvis/x", ".JARVIS/k"),
+            "riot": ("riot/vgk.sys", "Riot Vanguard/x", "a/riotx/y"),
+            "uv.lock anywhere": ("sub/uv.lock", "a/b/uv.lock"),
+            ".env": (".env", "cfg/.env.prod", ".ENV.local"),
+            "ext": ("certs/client.crt", "c.cer", "k.p12", "x.sqlite3", "a.key", "b.pfx", "c.sqlite", "d.db"),
+            "fail closed": ("", " ", ".", "..", "../x", "/etc/x", "C:/x", "scripts/conveyor.py:s", "data:x"),
+            "8.3 and glob": ("scr~1/conveyor.py", "scripts/CONVEY~1.PY", "scripts/*", "data/[a]", "dat?/x"),
+            "dir or ancestor": ("data", ".claude", ".github/workflows", ".github", "dev/dashboard", "scripts", "scripts/"),
+            "trailing slash": ("data/", ".claude/", ".github/workflows/", "dev/dashboard/", "data/ ", "data/.", "data/x/../"),
+            "dot segments": ("a/.. /data/x", "x/.. ./data/x", ".. /data/x", "x/. /data/y", "a/.../b"),
+            "unicode": ("R\u0130OT/x", "\uff24\uff21\uff34\uff21/x", "\u212a.pem", "k.pem\u200b", "uv\u00adlock".replace("\u00ad", ".")
+                        + "\u200d"),
+        }
+        for variant, paths in cases.items():
+            for p in paths:
+                self.assertTrue(drill._protected(p), f"{variant}: {p!r}")
 
 
 if __name__ == "__main__":

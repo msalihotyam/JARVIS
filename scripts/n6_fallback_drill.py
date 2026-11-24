@@ -17,6 +17,7 @@ import secrets
 import shutil
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,9 +36,10 @@ lr = sys.modules["n6_limited_run"]
 
 MARKER = ".n6drill"
 T0, TTL = 1_800_000_000.0, 600.0  # synthetic clock: the drill never reads the wall clock
-# The conveyor's protected_path prefixes (scripts/conveyor.py), not imported: a lane there is protected-range.
-PROTECTED = (".github/workflows/", ".claude/", "data/", "dev/dashboard/", "scripts/conveyor.py",
-             "scripts/test_parallel.py", "scripts/ci.ps1", "scripts/quality.ps1", "uv.lock")
+# The conveyor's protected_path + PROTECTED_FILES (scripts/conveyor.py), not imported: a lane there is protected-range.
+PROTECTED = (".github/workflows/", ".claude/", "data/", "dev/dashboard/")
+PROTECTED_FILES = {"scripts/conveyor.py", "scripts/test_parallel.py", "scripts/ci.ps1", "scripts/quality.ps1"}
+PROTECTED_EXT = (".pem", ".key", ".p12", ".pfx", ".crt", ".cer", ".db", ".sqlite", ".sqlite3")
 SIT = Situation.from_dict({"operator_pause": False, "policy": DEFAULT_POLICY,
                            "memory": {"free_gb": 8.0, "held": False},
                            "quota": {"used_pct": 10, "line_pct": 10, "hour": 12}})
@@ -291,10 +293,23 @@ class Drill:
 
 
 def _protected(path: str) -> bool:
-    p = path.replace("\\", "/")
-    p = p[2:] if p.startswith("./") else p
-    return any(p == x or (x.endswith("/") and p.startswith(x)) for x in PROTECTED) \
-        or p.rsplit("/", 1)[-1].startswith(".env") or p.lower().endswith((".db", ".sqlite", ".key", ".pem", ".pfx"))
+    """conveyor protected_path or PROTECTED_FILES, fail closed: case-insensitive, either separator, "." segments
+    dropped, Win32 trailing dots/spaces dropped per segment, unicode compatibility forms, marks and format chars folded;
+    empty, absolute, ".."-like, drive/stream (":"), glob or 8.3 ("~") paths and ancestors of a protected path count."""
+    p = "".join(ch for ch in unicodedata.normalize("NFKD", path.casefold())
+                if not unicodedata.combining(ch) and unicodedata.category(ch) != "Cf")
+    raw = p.replace("\\", "/").strip().split("/")
+    # any "..", "...", ".. " or ". " segment may climb or alias once Win32 trims dots/spaces: fail closed
+    if raw[0] == "" or any(s not in ("", ".") and not s.rstrip(". ") for s in raw) or any(ch in p for ch in ":*?[~"):
+        return True
+    segs = [t for t in (s.rstrip(". ") for s in raw) if t]
+    if not segs:
+        return True
+    p, base = "/".join(segs), segs[-1]
+    known = PROTECTED + tuple(PROTECTED_FILES)
+    return (p in PROTECTED_FILES or (p + "/").startswith(PROTECTED) or any(x.startswith(p + "/") for x in known)
+            or base == "uv.lock" or base.startswith(".env")
+            or ".jarvis" in segs or any(s.startswith("riot") for s in segs) or base.endswith(PROTECTED_EXT))
 
 
 def _expect(got: object, want: object) -> None:
