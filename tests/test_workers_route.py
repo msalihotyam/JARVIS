@@ -177,9 +177,36 @@ class TestRouteVetoParity(unittest.TestCase):
             ".cer", ".crt", ".db", ".env", ".key", ".p12", ".pem", ".pfx", ".sqlite",
             ".sqlite3", "/", "/.jarvis/", "\\", "data/", "dev/dashboard/", "riot",
             "uv.lock", "", " ", "*?[~", ".", "..", "../", ":", "agents.md", "claude.md"})
+        # AUDROUTE1FIX2: a known literal reused in a new position (base.startswith(" "))
+        # must show too: probe every segment position (alone, leading, trailing, middle,
+        # leading with suffix) at depth 0/1/2, as basename and as a directory segment.
+        segs = lambda lit: (lit, lit + "x", "x" + lit, "x" + lit + "y", lit + "x.py")  # noqa: E731
         for lit in sorted(found | set("".join(found))):  # char-set rules ("*?[~") per char
-            for path in (lit, lit + "x", "a/" + lit, "a/b" + lit, lit + "/x.py",
-                         "a/" + lit + "x/b.py", "a/" + lit + "/b.py"):
+            for path in {d + s + t for d in ("", "a/", "a/b/") for s in segs(lit)
+                         for t in ("", "/b.py")}:
                 for variant in (path, path.upper(), path.replace("/", "\\")):
                     with self.subTest(literal=lit, path=variant):
                         self.assertEqual(_veto(variant), self.conveyor.codex_veto(variant))
+
+    def test_conveyor_rules_unchanged(self):
+        """AUDROUTE1FIX2: any edit to conveyor.protected_path/codex_veto bodies (a rule
+        that reuses a pinned literal, a reordered strip/lower) fails here. Re-check
+        route._veto against the new rule, then update the digest."""
+        import ast
+        import hashlib
+        from pathlib import Path
+        tree = ast.parse(Path(self.conveyor.__file__).read_text(encoding="utf-8"))
+        digests = {}
+        for f in tree.body:
+            if isinstance(f, ast.FunctionDef) and f.name in ("protected_path", "codex_veto"):
+                if ast.get_docstring(f):
+                    f.body = f.body[1:]  # docstring edits do not change the rule
+                # shortcut: ast.dump text can shift across Python minors (CI and local are
+                # 3.13), re-pin the digest when the CI Python moves.
+                digests[f.name] = hashlib.sha256(ast.dump(f).encode()).hexdigest()
+                # A later rebinding (wrapper, second def) would run unpinned code.
+                self.assertEqual(getattr(self.conveyor, f.name).__code__.co_firstlineno,
+                                 f.lineno - len(f.decorator_list), f.name)
+        self.assertEqual(digests, {
+            "protected_path": "1670b45d134b96ed608d0c6ebee328324af48637eb3b9506714069c024336295",
+            "codex_veto": "576ae0cf855cd850638861cbd8cac74a726e464708e054700b9bfbf1fc35b215"})
