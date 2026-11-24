@@ -2,6 +2,7 @@
 
 import itertools
 import os
+import shutil
 import subprocess
 import stat
 import sys
@@ -9,6 +10,7 @@ import tempfile
 import unittest
 import zlib
 from dataclasses import replace
+from functools import cached_property
 from pathlib import Path
 from unittest.mock import patch
 
@@ -16,13 +18,25 @@ from jarvis.write_stage import GIT_PIN, StageError, StageManager
 
 
 class StageTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        tmp = tempfile.TemporaryDirectory(dir=os.environ["TEMP"])
+        cls.addClassCleanup(tmp.cleanup)
+        home = Path(tmp.name).resolve()
+        manager = StageManager(home / "stages")
+        cls.repo_template = manager.create_repo(home / "project")
+
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory(dir=os.environ["TEMP"])
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name).resolve()
         self.manager = StageManager(self.home / "stages")
-        self.repo = self.manager.create_repo(self.home / "project")
         self.clock = itertools.count(1_000_000_000, 1000)
+
+    @cached_property
+    def repo(self):
+        # Each test owns its refs, config and objects, even when it corrupts them.
+        return shutil.copytree(self.repo_template, self.home / "project")
 
     def dirty(self, file):
         # A new mtime makes the index entry stat-dirty, so status must re-read
@@ -75,7 +89,7 @@ class StageTests(unittest.TestCase):
         marker.unlink()
 
     def tracked_repo(self, name):
-        repo = self.manager.create_repo(self.home / name)
+        repo = shutil.copytree(self.repo_template, self.home / name)
         (repo / "base.txt").write_text("base\n")
         self.commit(repo)
         return repo
@@ -213,6 +227,7 @@ class StageTests(unittest.TestCase):
                     self.manager._claim(stage)
 
     def test_new_repo_has_empty_baseline(self):
+        self.repo = self.manager.create_repo(self.home / "project")
         self.assertEqual(self.manager._git(self.repo, "ls-tree", "HEAD"), b"")
         with self.assertRaises(StageError):
             self.manager.create_repo(self.repo)
