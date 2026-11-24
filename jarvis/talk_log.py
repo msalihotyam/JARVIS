@@ -41,20 +41,30 @@ def _seal(record, previous):
     return _encode({"hash": digest, "record": record}) + b"\n", digest
 
 
+def _lock_byte_zero(file, mode):
+    # msvcrt.locking acts at the OS fd offset, which a buffered seek may not
+    # move; set it explicitly, then restore it so the buffer stays in sync.
+    fd = file.fileno()
+    position = os.lseek(fd, 0, os.SEEK_CUR)
+    os.lseek(fd, 0, os.SEEK_SET)
+    try:
+        msvcrt.locking(fd, mode, 1)
+    finally:
+        os.lseek(fd, position, os.SEEK_SET)
+
+
 @contextmanager
 def _locked(file):
     # Windows permits a byte-range lock past EOF, including on an empty log.
     if os.name == "nt":
-        file.seek(0)
-        msvcrt.locking(file.fileno(), msvcrt.LK_LOCK, 1)
+        _lock_byte_zero(file, msvcrt.LK_LOCK)
     else:
         fcntl.flock(file, fcntl.LOCK_EX)
     try:
         yield
     finally:
         if os.name == "nt":
-            file.seek(0)
-            msvcrt.locking(file.fileno(), msvcrt.LK_UNLCK, 1)
+            _lock_byte_zero(file, msvcrt.LK_UNLCK)
         else:
             fcntl.flock(file, fcntl.LOCK_UN)
 

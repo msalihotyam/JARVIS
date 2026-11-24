@@ -93,6 +93,44 @@ class TalkLogTests(unittest.TestCase):
         with self.assertRaises(TalkLogError):
             self.open_log().read()
 
+    def test_mid_file_corruption_raises_talk_log_error_and_releases_lock(self):
+        for _ in range(3):
+            self.append()
+        good = self.path.read_bytes()
+        lines = good.splitlines(keepends=True)
+
+        def resealed(index, change):
+            record = json.loads(lines[index])["record"]
+            change(record)
+            previous = json.loads(lines[index - 1])["hash"] if index else "0" * 64
+            return talk_log._seal(record, previous)[0]
+
+        def set_text(record):
+            record["entry"]["text"] = "Changed"
+
+        def add_field(record):
+            record["entry"]["extra"] = True
+
+        variants = {
+            "edit record 1 of 3": (0, resealed(0, set_text)),
+            "edit record 2 of 3": (1, resealed(1, set_text)),
+            "invalid json record 1": (0, b"{not json}\n"),
+            "unknown field record 1": (0, resealed(0, add_field)),
+            "oversized record 1": (0, b"x" * (MAX_RECORD_BYTES + 1) + b"\n"),
+        }
+        for name, (index, line) in variants.items():
+            with self.subTest(name):
+                corrupt = b"".join(lines[:index] + [line] + lines[index + 1:])
+                self.path.write_bytes(corrupt)
+                with self.assertRaises(TalkLogError):
+                    self.open_log().read()
+                with self.assertRaises(TalkLogError):
+                    self.append()
+                self.assertEqual(self.path.read_bytes(), corrupt)
+                self.path.write_bytes(good)
+                self.assertEqual(self.append()["id"], 4)
+                self.path.write_bytes(good)
+
     def test_unknown_fields_and_oversized_entries_are_refused(self):
         with self.assertRaises(TypeError):
             self.append(extra=True)
