@@ -13,6 +13,7 @@ from tests.test_ui import _APP  # noqa: F401 - the offscreen platform and the ap
 from PySide6.QtCore import Signal  # noqa: E402
 from PySide6.QtWidgets import QSystemTrayIcon  # noqa: E402
 
+from jarvis import notify_sink  # noqa: E402
 from jarvis.notify_sink import NotifySink  # noqa: E402
 from jarvis.ui import tray  # noqa: E402
 from tests.test_dftray import FakeBridge, FakeMenu, FakeTray  # noqa: E402
@@ -144,6 +145,54 @@ class TrayHookTests(unittest.TestCase):
         self.assertEqual([], fetch(0))
         self.assertEqual([], tray.outbox_fetch(SimpleNamespace(backend=SimpleNamespace(conversations=lambda: None)))(0))
         self.assertIsNone(tray.outbox_fetch(SimpleNamespace()))
+
+
+class SinkProtocolTests(unittest.TestCase):
+    """AUDNOTIFY1: the tray as a Sink makes exactly the calls tray.deliver makes."""
+
+    class Icon:
+        def __init__(self) -> None:
+            self.messages = []
+
+        def showMessage(self, *args) -> None:
+            self.messages.append(args)
+
+    def run_both(self, rows_per_poll):
+        via_tray, via_sink = self.Icon(), self.Icon()
+        outbox_a, outbox_b = Outbox(), Outbox()
+        a, b = sink(outbox_a), sink(outbox_b)
+        for rows in rows_per_poll:
+            outbox_a.rows += rows
+            outbox_b.rows += rows
+            a._last_toast = b._last_toast = None
+            tray.deliver(via_tray, a)
+            notify_sink.deliver(b, notify_sink.TraySink(via_sink, tray._TOAST_MS))
+        return via_tray.messages, via_sink.messages
+
+    def test_tray_sink_matches_tray_deliver(self) -> None:
+        old, new = self.run_both([[row(1, "plan_ready", "high")], [row(2, "done")], [row(3, "progress", "low")],
+                                  [row(4), row(5, "needs_input", "high")]])
+        self.assertEqual(old, new)
+        self.assertEqual([QSystemTrayIcon.MessageIcon.Warning, QSystemTrayIcon.MessageIcon.Information,
+                          QSystemTrayIcon.MessageIcon.Warning], [m[2] for m in new])
+        self.assertEqual(("JARVIS", "2 yeni bildirim"), new[2][:2])
+        self.assertTrue(all(m[3] == tray._TOAST_MS for m in new))
+
+    def test_a_new_channel_is_one_class(self) -> None:
+        class Recorder:
+            def __init__(self) -> None:
+                self.shown = []
+
+            def show(self, title, text, importance) -> None:
+                self.shown.append((title, text, importance))
+
+        outbox, out = Outbox(), Recorder()
+        s = sink(outbox)
+        notify_sink.deliver(s, out)
+        self.assertEqual([], out.shown)                     # nothing new: no call
+        outbox.rows.append(row(1, "plan_ready", "high"))
+        notify_sink.deliver(s, out)
+        self.assertEqual([("Plan hazır", "Proje planını onaylayın.", "high")], out.shown)
 
 
 if __name__ == "__main__":
