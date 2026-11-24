@@ -22,6 +22,8 @@ temp database, never data/jarvis.db, no model or network call):
 
 from __future__ import annotations
 
+import shutil
+import sqlite3
 import tempfile
 import unittest
 from dataclasses import replace
@@ -141,10 +143,24 @@ class TypedCore(AgentCore):
 
 
 class SkillCoreTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.addClassCleanup(safe_cleanup, temp)
+        cls.database_template = Path(temp.name) / "template.db"
+        SkillStore(cls.database_template)
+
     def setUp(self) -> None:
         temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(safe_cleanup, temp)
         self.database = Path(temp.name) / "jarvis.db"
+        # The template has no open connections or test data. Each test writes
+        # only to its own copy and still uses the real store and transactions.
+        shutil.copyfile(self.database_template, self.database)
+        # Keep SQLite from recreating the WAL sidecars between store calls.
+        connection = sqlite3.connect(self.database)
+        self.addCleanup(connection.close)
+        connection.execute("PRAGMA schema_version").fetchone()
         self.store = SkillStore(self.database)
         patcher = mock.patch.dict(
             intent.NL_CAPABILITIES,
