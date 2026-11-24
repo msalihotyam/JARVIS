@@ -26,6 +26,7 @@ import sqlite3
 import stat
 import sys
 import tempfile
+import unicodedata
 from pathlib import Path
 from typing import cast
 
@@ -64,7 +65,23 @@ class PackError(ValueError):
 
 
 def _parts(path: Path) -> tuple[str, ...]:
-    return tuple(p.casefold() for p in path.resolve().parts)
+    """Resolved casefolded parts; a ':' after the drive (an NTFS alternate data stream such as
+    jarvis.db:kpi, raw or resolved) is refused."""
+    for each in (path, path.absolute()):
+        if ":" in str(each)[len(each.drive):]:
+            raise PackError(f"refused: {path.name} names an alternate data stream (':' after the drive)")
+    resolved = path.resolve()
+    if ":" in str(resolved)[len(resolved.drive):]:
+        raise PackError(f"refused: {path.name} names an alternate data stream (':' after the drive)")
+    return tuple(p.casefold() for p in resolved.parts)
+
+
+def _v(value: object) -> str:
+    """An input value as a markdown code span (no emphasis, image or entity renders inside it)."""
+    text = str(value)
+    if "`" in text:  # would close the span early
+        raise PackError("refused: a backtick inside an input value")
+    return f"`{text}`"
 
 
 def _under(path: Path, folder: Path) -> bool:
@@ -74,8 +91,8 @@ def _under(path: Path, folder: Path) -> bool:
 
 def _not_operator(path: Path, root: Path) -> Path:
     """Resolved (symlinks followed); any data/ or .jarvis/ folder, jarvis.db or hardlink refused."""
+    parts = _parts(path)  # first: refuses an alternate data stream before resolving
     resolved = path.resolve()
-    parts = _parts(path)
     if ("jarvis.db" in (path.name.casefold(), parts[-1]) or _under(path, root / "data")
             or {"data", ".jarvis"} & set(parts[:-1])
             or (resolved.is_file() and resolved.stat().st_nlink > 1)):
@@ -123,8 +140,15 @@ def _kpi(db: Path, root: Path) -> tuple[tuple[KpiRow, ...], tuple[LimitedEvent, 
         copy.write_bytes(source.read_bytes())
         for suffix in ("-wal", "-shm", "-journal"):
             sidecar = source.with_name(source.name + suffix)
-            # -wal and a hot -journal carry rows/rollback; -shm is an index sqlite rebuilds.
-            if _plain_sidecar(sidecar, root) and suffix != "-shm":
+            if not _plain_sidecar(sidecar, root):
+                continue
+            # A non-empty rollback journal is never replayed: its super-journal record names a
+            # file that sqlite's recovery of the copy opens and can delete (pager_delsuper).
+            if suffix == "-journal" and sidecar.stat().st_size > 0:
+                raise PackError(f"refused: {sidecar.name} is a non-empty rollback journal,"
+                                " never replayed (its recovery can delete a file it names)")
+            # -wal carries rows; -shm is an index sqlite rebuilds; an empty -journal is no journal.
+            if suffix == "-wal":
                 Path(tmp, "kpi.db" + suffix).write_bytes(sidecar.read_bytes())
         return read_rows(copy), limited_events(copy)
 
@@ -145,7 +169,7 @@ def _baseline(path: Path, root: Path) -> tuple[dict[str, dict[str, object]] | No
         raise PackError(f"refused: baseline hash mismatch, {sums.name} does not pin {actual}")
     try:
         doc: object = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as error:
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:  # deep nesting recurses
         raise PackError(f"refused: malformed baseline: {error}") from error
     groups = cast(dict[str, object], doc).get("groups") if isinstance(doc, dict) else None
     if not isinstance(groups, dict) or not all(
@@ -176,7 +200,7 @@ def _row(row: KpiRow | None) -> str:
     return (f"passed={'yes' if row.passed else 'no'} post_accept_defects={row.post_accept_defects}"
             f" salih_interventions={row.salih_interventions} quota_tokens={row.quota_tokens}"
             f" finish_seconds={row.finish_seconds:.4g} security_incidents={row.security_incidents}"
-            f" origin={row.origin}")
+            f" origin={_v(row.origin)}")
 
 
 def build(acceptance_set: Path, kpi_db: Path, baseline: Path, root: Path) -> str:
@@ -203,36 +227,38 @@ def build(acceptance_set: Path, kpi_db: Path, baseline: Path, root: Path) -> str
              "## Acceptance set", f"FILE: {e8.SET_NAME}",
              f"PINNED SHA256: {pinned} (verified against {e8.SUMS_NAME})",
              "LIMITS: " + " ".join(f"{k}={v}" for k, v in e8.LIMITS.items()),
-             f"CASES: {len(slice_ids)}", f"KPI DATABASE: {kpi_db.name} (read-only copy)",
-             f"BASELINE: {baseline.name} sha256 {base_sha}", "",
+             f"CASES: {len(slice_ids)}", f"KPI DATABASE: {_v(kpi_db.name)} (read-only copy)",
+             f"BASELINE: {_v(baseline.name)} sha256 {base_sha}", "",
              "## Per-case inputs and observed verdicts"]
     if not slice_ids:
         lines.append("none: the pinned set lists no slice")
     for slice_id in slice_ids:
         n6_row = by.get((slice_id, "n6"))
-        lines += [f"CASE {slice_id}", f"  n6: {_row(n6_row)}",
+        lines += [f"CASE {_v(slice_id)}", f"  n6: {_row(n6_row)}",
                   f"  conveyor: {_row(by.get((slice_id, 'conveyor')))}",
                   "  n6 limited runs: " + ("; ".join(
-                      f"{e.run_id} verdict={e.verdict} receipt={e.receipt_id}"
+                      f"{_v(e.run_id)} verdict={_v(e.verdict)} receipt={_v(e.receipt_id)}"
                       for e in runs.get(slice_id, [])) or "none")]
         for event in runs.get(slice_id, []):
             if n6_row is not None and (event.verdict == "PASS") != n6_row.passed:
-                notes.append(f"{slice_id}: limited run {event.run_id} verdict {event.verdict} but"
+                notes.append(f"{_v(slice_id)}: limited run {_v(event.run_id)} verdict {_v(event.verdict)} but"
                              f" the n6 KPI row says passed={'yes' if n6_row.passed else 'no'}")
     lines += ["", "## E8 report (output of scripts/n6_e8_report.py, verbatim)",
               f"E8 EXIT CODE: {code} (0 ADVANCE, 1 DO-NOT-ADVANCE, as that report computes it)", ""]
     lines += [f"    {line}" for line in e8_text.splitlines()]
     lines += _table(slice_ids, by, groups, notes)
     reasons = [line[len("REASON: "):] for line in e8_text.splitlines() if line.startswith("REASON: ")]
-    disagreements = ([f"E8 reason: {r}" for r in reasons] + notes + [DEFINITION_NOTE])
+    disagreements = ([f"E8 reason: {_v(r)}" for r in reasons] + notes + [DEFINITION_NOTE])
     lines += ["", "## Open disagreements (for the judges; none is resolved by code)"]
     lines += [f"{i}. {d}" for i, d in enumerate(disagreements, 1)]
     lines += ["", "## Verdicts (blank: filled by the judges and Salih, never by N6)"]
     lines += [f"- {v}" for v in VERDICT_LINES]
     # A line break inside a data value (run id, verdict, group name) could forge a verdict line,
-    # and inline HTML (<br>) could render one; no constant text here holds < or >.
-    if any(ch in line for line in lines for ch in "\r\n\v\f\x1c\x1d\x1e\x85  <>"):
-        raise PackError("refused: a line break or < > inside an input value")
+    # inline HTML (<br>) could render one, and a bidi/zero-width/format character can reorder or
+    # hide text; no constant text here holds < >, a control (Cc/Cf/Cs/Co/Cn) or Zl/Zp.
+    if any(ch in "<>" or unicodedata.category(ch)[0] == "C" or unicodedata.category(ch) in ("Zl", "Zp")
+           for line in lines for ch in line):
+        raise PackError("refused: a line break, control or format character, or < > inside an input value")
     text = "\n".join(lines) + "\n"
     ok, label = screen(text)
     if not ok:
@@ -254,7 +280,7 @@ def _table(slice_ids: tuple[str, ...], by: dict[tuple[str, str], KpiRow],
         notes.append("no paired set slice: the n6 and conveyor columns read missing")
     # One labeled line per measure, not a grid: a row of bare numbers joined by " | " reads as a
     # phone number to the deny screen, and a column label between values keeps that from happening.
-    columns = ["n6 (set)", "conveyor (set)", *names]
+    columns = ["n6 (set)", "conveyor (set)", *(names if groups is None else [_v(n) for n in names])]
     lines = ["", "## E8 measures vs N6BASE1 (shown side by side, not compared by code)", "",
              "COLUMNS: " + "; ".join(columns)]
     for measure, key in BASE_KEYS.items():
@@ -262,16 +288,16 @@ def _table(slice_ids: tuple[str, ...], by: dict[tuple[str, str], KpiRow],
         for name in names:
             value = _num(None if groups is None else groups[name].get(key))
             if value == MISSING and groups is not None:
-                notes.append(f"N6BASE1 {name} {key} is missing")
+                notes.append(f"N6BASE1 {_v(name)} {key} is missing")
             cells.append(value)
         lines.append(f"- {measure}: " + "; ".join(f"{c}={v}" for c, v in zip(columns, cells)))
     for extra in ("n", "small_sample"):
         cells = [str(len(paired)) if extra == "n" else "-"] * 2
         for name in names:
             value = None if groups is None else groups[name].get(extra)
-            cells.append(MISSING if value is None else str(value))
+            cells.append(MISSING if value is None else _v(value))
             if extra == "small_sample" and value is True:
-                notes.append(f"N6BASE1 {name} is a small sample (n under 10)")
+                notes.append(f"N6BASE1 {_v(name)} is a small sample (n under 10)")
         lines.append(f"- {extra}: " + "; ".join(f"{c}={v}" for c, v in zip(columns, cells)))
     return lines
 
@@ -295,6 +321,11 @@ def write(text: str, out: Path, root: Path) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def _say(text: str) -> None:
+    """Print ASCII only (non-ASCII as backslash escapes): a narrow stdout encoding cannot raise."""
+    print(text.encode("ascii", "backslashreplace").decode("ascii"))
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="N6 Phase 3 judge packet (decides nothing)")
     parser.add_argument("--root", type=Path, default=ROOT)
@@ -311,10 +342,10 @@ def main(argv: list[str] | None = None) -> int:
     try:
         _guard(out, root)  # refuse a bad target before reading anything
         digest = write(build(acceptance_set, kpi, baseline, root), out, root)
-    except (PackError, ValueError, OSError, sqlite3.Error) as error:  # KpiError is a ValueError
-        print(f"REFUSED: {error}")
+    except (PackError, ValueError, OSError, sqlite3.Error, RecursionError) as error:  # KpiError is a ValueError
+        _say(f"REFUSED: {error}")
         return 2
-    print(f"WROTE {out.name} sha256 {digest}")
+    _say(f"WROTE {out.name} sha256 {digest}")
     return 0
 
 

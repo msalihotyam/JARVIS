@@ -13,6 +13,7 @@ import io
 import json
 import os
 import sqlite3
+import struct
 import sys
 import tempfile
 import unittest
@@ -95,15 +96,15 @@ class JudgePackTest(unittest.TestCase):
                        "## E8 report", "## E8 measures vs N6BASE1", "## Open disagreements",
                        "## Verdicts"):
             self.assertIn(header, text)
-        self.assertIn("CASE CASEB1\n  n6: passed=no post_accept_defects=0", text)
-        self.assertIn("  n6 limited runs: run1 verdict=PASS receipt=0123abcd", text)
+        self.assertIn("CASE `CASEB1`\n  n6: passed=no post_accept_defects=0", text)
+        self.assertIn("  n6 limited runs: `run1` verdict=`PASS` receipt=`0123abcd`", text)
         self.assertIn("    VERDICT: DO-NOT-ADVANCE", text)  # E8's own output, indented
-        self.assertIn("E8 reason: pass_rate is worse", text)
-        self.assertIn("CASEB1: limited run run1 verdict PASS but the n6 KPI row says passed=no", text)
-        self.assertIn("COLUMNS: n6 (set); conveyor (set); code/writer-a; docs/writer-b", text)
+        self.assertIn("E8 reason: `pass_rate is worse", text)
+        self.assertIn("`CASEB1`: limited run `run1` verdict `PASS` but the n6 KPI row says passed=no", text)
+        self.assertIn("COLUMNS: n6 (set); conveyor (set); `code/writer-a`; `docs/writer-b`", text)
         self.assertIn("- quota_tokens_per_accepted: n6 (set)=2000; conveyor (set)=1000;"
-                      " code/writer-a=1200; docs/writer-b=800", text)
-        self.assertIn("N6BASE1 docs/writer-b is a small sample (n under 10)", text)
+                      " `code/writer-a`=1200; `docs/writer-b`=800", text)
+        self.assertIn("N6BASE1 `docs/writer-b` is a small sample (n under 10)", text)
         for line in pack.VERDICT_LINES:
             self.assertIn(f"- {line}", text)
         # N6 code states no verdict of its own: only the indented E8 copy says VERDICT.
@@ -134,16 +135,16 @@ class JudgePackTest(unittest.TestCase):
         _fixture(self.root)
         self.assertEqual(_main(self.root)[0], 0)
         text = _packet(self.root).read_text(encoding="utf-8")
-        self.assertIn("CASE CASEC1\n  n6: passed=yes", text)
+        self.assertIn("CASE `CASEC1`\n  n6: passed=yes", text)
         self.assertIn("  conveyor: missing", text)  # unpaired case: no conveyor row
-        self.assertIn("- finish_seconds: n6 (set)=120; conveyor (set)=120; code/writer-a=missing;", text)
-        self.assertIn("N6BASE1 code/writer-a finish_seconds_median is missing", text)
+        self.assertIn("- finish_seconds: n6 (set)=120; conveyor (set)=120; `code/writer-a`=missing;", text)
+        self.assertIn("N6BASE1 `code/writer-a` finish_seconds_median is missing", text)
 
     def test_absent_baseline_and_no_pairs_read_missing(self) -> None:
         _fixture(self.root, ids=("CASEC1",), baseline=False)
         self.assertEqual(_main(self.root)[0], 0)
         text = _packet(self.root).read_text(encoding="utf-8")
-        self.assertIn("BASELINE: baseline.json sha256 missing", text)
+        self.assertIn("BASELINE: `baseline.json` sha256 missing", text)
         self.assertIn("baseline.json is absent: every N6BASE1 column reads missing", text)
         self.assertIn("no paired set slice: the n6 and conveyor columns read missing", text)
         self.assertIn("- pass_rate: n6 (set)=missing; conveyor (set)=missing; N6BASE1=missing", text)
@@ -327,7 +328,7 @@ class JudgePackTest(unittest.TestCase):
             code, said = _main(self.root)
             self.assertEqual(code, 0, said)
             self.assertEqual(self._listing(), before)
-        self.assertIn("run2 verdict=PASS receipt=4567abcd", _packet(self.root).read_text(encoding="utf-8"))
+        self.assertIn("`run2` verdict=`PASS` receipt=`4567abcd`", _packet(self.root).read_text(encoding="utf-8"))
 
     def test_reports_folder_linked_outside_is_refused(self) -> None:
         _fixture(self.root)
@@ -374,6 +375,100 @@ class JudgePackTest(unittest.TestCase):
         self.assertEqual(code, 2, said)
         self.assertIn("out of range", said)
         self.assertFalse(_packet(self.root).exists())
+
+    def _journal(self, body: bytes) -> None:
+        (self.root / "build" / "n6" / "kpi.db-journal").write_bytes(body)
+
+    def test_non_empty_rollback_journal_refuses_and_an_outside_file_survives(self) -> None:
+        with tempfile.TemporaryDirectory() as away:
+            canary = Path(away).resolve() / "canary.json"  # outside every fixture root
+            name = str(canary).encode("utf-8")
+            # A hot journal (first byte non-zero) ending in a super-journal record: sqlite's
+            # recovery opens the named file and deletes it when its child journals are absent.
+            super_record = (b"X" * 512 + struct.pack(">I", 1) + name + struct.pack(">I", len(name))
+                            + struct.pack(">I", sum(name)) + bytes.fromhex("d9d505f920a163d7"))
+            for variant, body in (("super record", super_record), ("junk", b"X" * 600)):
+                with self.subTest(variant=variant), tempfile.TemporaryDirectory() as tmp:
+                    self.root = Path(tmp).resolve()
+                    _fixture(self.root)
+                    canary.write_bytes(b"hello world")
+                    self._journal(body)
+                    code, said = _main(self.root)
+                    self.assertEqual(code, 2, said)
+                    self.assertIn("rollback journal", said)
+                    self.assertEqual(canary.read_bytes(), b"hello world")
+                    self.assertFalse(_packet(self.root).exists())
+
+    def test_empty_rollback_journal_is_ignored(self) -> None:
+        _fixture(self.root)
+        self._journal(b"")
+        code, said = _main(self.root)
+        self.assertEqual(code, 0, said)
+
+    def test_alternate_data_stream_names_refuse(self) -> None:
+        _fixture(self.root)
+        n6 = self.root / "build" / "n6"
+        for flag, path in (("--kpi", n6 / "jarvis.db:kpi"), ("--kpi", n6 / "kpi.db::$DATA"),
+                           ("--baseline", n6 / "baseline.json:s"),
+                           ("--set", self.root / "dev" / "n6" / "acceptance" / "acceptance_set.json:s"),
+                           ("--out", self.root / "build" / "reports" / "p.md:s")):
+            with self.subTest(flag=flag, name=path.name):
+                code, said = _main(self.root, flag, str(path))
+                self.assertEqual(code, 2, said)
+                self.assertIn("alternate data stream", said)
+        self.assertFalse((self.root / "build" / "reports").exists())
+
+    def test_markdown_in_a_value_stays_inside_a_code_span(self) -> None:
+        _fixture(self.root)
+        record_limited(self.root / "build" / "n6" / "kpi.db",
+                       LimitedEvent("CASEA1", "![x](y.png)", AT, AT, "**&#65;**", "0123abcd"))
+        self._pin_baseline({"_g_": GROUPS["docs/writer-b"]})  # receipt_id is hex-checked by n6_kpi
+        code, said = _main(self.root)
+        self.assertEqual(code, 0, said)
+        text = _packet(self.root).read_text(encoding="utf-8")
+        self.assertIn("`![x](y.png)` verdict=`**&#65;**` receipt=`0123abcd`", text)
+        self.assertIn("COLUMNS: n6 (set); conveyor (set); `_g_`", text)
+
+    def test_backtick_bidi_and_zero_width_in_a_value_refuse(self) -> None:
+        for run_id, said_part in (("a`b", "backtick"), ("a\u202eb", "control"), ("a\u2066b", "control"),
+                                  ("a\u200bb", "control"), ("a\x1bb", "control")):
+            with self.subTest(run_id=ascii(run_id)), tempfile.TemporaryDirectory() as tmp:
+                self.root = Path(tmp).resolve()
+                _fixture(self.root)
+                record_limited(self.root / "build" / "n6" / "kpi.db",
+                               LimitedEvent("CASEA1", run_id, AT, AT, "PASS", "0123abcd"))
+                code, said = _main(self.root)
+                self.assertEqual(code, 2, said)
+                self.assertIn(said_part, said)
+                self.assertFalse(_packet(self.root).exists())
+
+    def test_deeply_nested_baseline_refuses_with_exit_2(self) -> None:
+        _fixture(self.root)
+        n6 = self.root / "build" / "n6"
+        base = b'{"groups": {"g": {"n": ' + b"[" * 5000 + b"]" * 5000 + b"}}}"
+        (n6 / "baseline.json").write_bytes(base)
+        (n6 / "baseline.json.sha256").write_bytes(f"{_sha(base)}  baseline.json\n".encode("ascii"))
+        code, said = _main(self.root)
+        self.assertEqual(code, 2, said)
+        self.assertIn("malformed baseline", said)
+        self.assertFalse(_packet(self.root).exists())
+
+    def _narrow_main(self, *extra: str) -> tuple[int, str]:
+        raw = io.BytesIO()
+        out = io.TextIOWrapper(raw, encoding="cp1252", errors="strict")
+        with contextlib.redirect_stdout(out):
+            code = pack.main(["--root", str(self.root), *extra])
+        out.flush()
+        return code, raw.getvalue().decode("ascii")
+
+    def test_non_ascii_names_print_under_a_narrow_stdout_encoding(self) -> None:
+        _fixture(self.root)
+        code, said = self._narrow_main("--out", str(self.root / "build" / "reports" / "p\u0446.md"))
+        self.assertEqual(code, 0, said)
+        self.assertIn("WROTE p\\u0446.md sha256 ", said)
+        code, said = self._narrow_main("--kpi", str(self.root / "build" / "n6" / "n\u0446.db"))
+        self.assertEqual(code, 2, said)
+        self.assertIn("REFUSED: refused: no KPI database n\\u0446.db", said)
 
     def test_real_pinned_set_builds(self) -> None:
         _fixture(self.root, baseline=False)
