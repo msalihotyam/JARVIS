@@ -60,11 +60,13 @@ def commit_values(text: str) -> list[str]:
     return [m.group(1).strip(" \t*`") for m in found if m]
 
 
-def read_notes(path: Path) -> tuple[dict[str, int], dict[str, dict[str, Any]], datetime | None,
-                                    list[tuple[str, dict[str, Any], datetime]]]:
+def read_notes(path: Path, until: datetime | None = None) -> tuple[
+        dict[str, int], dict[str, dict[str, Any]], datetime | None,
+        list[tuple[str, dict[str, Any], datetime]]]:
     """(counts, newest verdict note per lane, first note time, EVERY live verdict note as
     (lane, note, at));
-    bad lines are counted. Only a note marked ``[origin=live]`` is live: older notes are unknown."""
+    bad lines are counted. Only a note marked ``[origin=live]`` is live: older notes are unknown.
+    N6DAILY1: with an aware ``until``, a note at or after it does not exist (past-day rebuilds)."""
     counts = {"lines": 0, "malformed": 0, "other": 0, "agree": 0, "disagree": 0, "false_pass": 0}
     newest: dict[str, dict[str, Any]] = {}
     first: datetime | None = None
@@ -83,6 +85,9 @@ def read_notes(path: Path) -> tuple[dict[str, int], dict[str, dict[str, Any]], d
             counts["malformed"] += 1
             continue
         at = at if at.tzinfo else at.replace(tzinfo=timezone.utc)
+        if until is not None and at >= until:
+            counts["lines"] -= 1
+            continue
         first = at if first is None or at < first else first
         m = _NOTE.fullmatch(body)
         if not m:
@@ -220,13 +225,15 @@ def classify(lane: str, note: dict[str, Any], snap: Snapshot, heals: dict[str, i
             "kpi": kpi.get(lane, {}), "evidence": evidence}
 
 
-def build(root: Path, day: date, since: date | None = None) -> dict[str, Any]:
+def build(root: Path, day: date, since: date | None = None,
+          until: datetime | None = None) -> dict[str, Any]:
     """The whole daily diff as data; reads only, never the wall clock.
 
     ``live_*`` (Gate B B4c) counts only notes the runner marked ``[origin=live]`` dated on or
-    after ``since``; unsafe = false_pass + n6_wrong exactly as ``classify`` reports them."""
+    after ``since``; unsafe = false_pass + n6_wrong exactly as ``classify`` reports them.
+    ``until`` (exclusive, aware) drops later notes; lanes/events/reports are read as they are now."""
     n6 = root / "build" / "n6"
-    counts, newest, first, live_notes = read_notes(n6 / "notes.jsonl")
+    counts, newest, first, live_notes = read_notes(n6 / "notes.jsonl", until)
     live_in = [(lane, note) for lane, note, at in live_notes if since is None or at.date() >= since]
     if first is None and (n6 / "SHADOW_ON").is_file():
         first = datetime.fromtimestamp((n6 / "SHADOW_ON").stat().st_mtime, timezone.utc)
@@ -283,9 +290,10 @@ def render_md(rep: dict[str, Any]) -> str:
     return "\n".join(out) + "\n"
 
 
-def write(root: Path, day: date, since: date | None = None) -> tuple[Path, Path]:
+def write(root: Path, day: date, since: date | None = None,
+          until: datetime | None = None) -> tuple[Path, Path]:
     """Write build/n6/daily/<date>.json and .md; nothing else is written."""
-    rep = build(root, day, since)
+    rep = build(root, day, since, until)
     out = root / "build" / "n6" / "daily"
     out.mkdir(parents=True, exist_ok=True)
     js, md = out / f"{day.isoformat()}.json", out / f"{day.isoformat()}.md"
@@ -293,6 +301,20 @@ def write(root: Path, day: date, since: date | None = None) -> tuple[Path, Path]
                    .encode("utf-8"))
     md.write_bytes(render_md(rep).encode("utf-8"))
     return js, md
+
+
+def backfill(root: Path, start: date, end: date, since: date | None = None) -> list[Path]:
+    """N6DAILY1: (re)write one report per day start..end (inclusive), each from the notes before
+    the next local midnight; existing reports in the range are overwritten."""
+    if end < start:
+        raise ValueError(f"backfill end {end} is before start {start}")
+    paths: list[Path] = []
+    for n in range((end - start).days + 1):
+        day = start + timedelta(days=n)
+        # naive -> aware in this machine's local zone; no wall-clock read
+        until = datetime.combine(day + timedelta(days=1), datetime.min.time()).astimezone()
+        paths += write(root, day, since, until)
+    return paths
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -303,16 +325,21 @@ def main(argv: list[str] | None = None) -> int:
                         help="count live rounds from this date (inclusive)")
     parser.add_argument("--summary", action="store_true",
                         help="print only the live round / unsafe counts; writes nothing")
+    parser.add_argument("--backfill", nargs=2, type=date.fromisoformat, metavar=("START", "END"),
+                        help="one-shot: (re)build one report per day START..END (inclusive)")
     args = parser.parse_args(argv)
     try:
-        if args.summary:
+        if args.backfill:
+            paths = backfill(args.root, *args.backfill, since=args.since)
+        elif args.summary:
             rep = build(args.root, args.date or date.today(), args.since)
             print(f"SINCE: {rep['since'] or 'start'}\nLIVE ROUNDS: {rep['live_rounds']}\n"
                   f"LIVE UNSAFE: {rep['live_unsafe']} (false_pass {rep['live_false_pass']}, "
                   f"n6_wrong {rep['live_n6_wrong']})")
             return 0
-        paths = write(args.root, args.date or date.today(), args.since)
-    except RuntimeError as err:
+        else:
+            paths = list(write(args.root, args.date or date.today(), args.since))
+    except (RuntimeError, ValueError) as err:
         print(err, file=sys.stderr)
         return 2
     for path in paths:

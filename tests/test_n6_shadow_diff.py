@@ -230,6 +230,40 @@ class ShadowDiffTest(unittest.TestCase):
         self.assertEqual((rep["notes"]["lines"], rep["notes"]["malformed"]), (5, 2))
         self.assertEqual(len(rep["records"]), 3)
 
+    # N6DAILY1: date-range backfill from the existing notes; each day sees only notes before it ends.
+    def _files(self) -> dict[str, bytes]:
+        return {p.relative_to(self.root).as_posix(): p.read_bytes()
+                for p in self.root.rglob("*") if p.is_file()}
+
+    def test_until_drops_later_notes_entirely(self) -> None:
+        rep = diff.build(self.root, DAY, until=SHADOW + timedelta(days=1))
+        self.assertEqual(sorted(r["lane"] for r in rep["records"]), ["HEALED", "OLD"])
+        self.assertEqual(rep["notes"]["lines"], 4)  # GOOD's note is gone, malformed lines stay
+
+    def test_backfill_writes_one_report_per_day_and_nothing_else(self) -> None:
+        before = self._files()
+        out = self.root / "build/n6/daily"
+        code = diff.main(["--root", str(self.root), "--backfill", "2026-11-01", "2026-11-07"])
+        self.assertEqual(code, 0)
+        after = self._files()
+        self.assertEqual({k: v for k, v in after.items() if k in before}, before)  # inputs unchanged
+        days = [f"2026-11-0{n}" for n in range(1, 8)]
+        self.assertEqual(set(after) - set(before),
+                         {f"build/n6/daily/{d}{e}" for d in days for e in (".json", ".md")})
+        first = json.loads((out / "2026-11-01.json").read_text(encoding="utf-8"))
+        last = json.loads((out / "2026-11-07.json").read_text(encoding="utf-8"))
+        self.assertEqual((first["date"], len(first["records"])), ("2026-11-01", 2))
+        self.assertEqual((last["date"], len(last["records"])), ("2026-11-07", 3))
+
+    def test_backfill_end_before_start_is_refused(self) -> None:
+        import contextlib
+        import io
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            code = diff.main(["--root", str(self.root), "--backfill", "2026-11-03", "2026-11-01"])
+        self.assertEqual(code, 2)
+        self.assertIn("before start", err.getvalue())
+        self.assertFalse((self.root / "build/n6/daily").exists())
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -23,13 +23,14 @@ Row fields (B1), per source:
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import math
 import re
 import sys
 import time
 from collections.abc import Callable
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
@@ -246,6 +247,45 @@ def live(root: Path, window: int) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _diff_write(root: Path, day: Any, until: datetime) -> Any:
+    """scripts/n6_shadow_diff.write, loaded from this file's folder (scripts/ is no package)."""
+    spec = importlib.util.spec_from_file_location("n6_shadow_diff", Path(__file__).with_name("n6_shadow_diff.py"))
+    if spec is None or spec.loader is None:
+        raise ImportError("scripts/n6_shadow_diff.py not found")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module.write(root, day, until=until)
+
+
+def daily(root: Path, *, clock: Callable[[], datetime], writer: Callable[..., Any] = _diff_write) -> bool:
+    """N6DAILY1: after a completed shadow pass, write the daily diff of the previous local day
+    (``clock``'s own zone) once: skipped when its .json and .md exist or the switch is off.
+    It never raises; a failure is appended to build/n6/daily/errors.log (stderr is DEVNULL
+    under the conveyor) and the pass result stands. True when a report was written."""
+    out = root / "build" / "n6" / "daily"
+    if not (root / "build" / "n6" / "SHADOW_ON").is_file():
+        return False
+    day = now = None
+    try:
+        now = clock()
+        midnight = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        day = midnight.date() - timedelta(days=1)
+        if all((out / f"{day.isoformat()}{ext}").is_file() for ext in (".json", ".md")):
+            return False
+        writer(root, day, until=midnight)  # notes from today stay out of yesterday's report
+        return True
+    except Exception as error:  # a diff failure must never fail the shadow pass
+        line = f"{now.isoformat() if now else '?'} day={day} {error!r}"
+        print(f"N6 daily: {line}", file=sys.stderr)
+        try:
+            out.mkdir(parents=True, exist_ok=True)
+            with (out / "errors.log").open("a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except OSError:
+            pass
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="N6 shadow runner (Phase 1)")
     parser.add_argument("--live", type=int, metavar="N", help="print the last N judged slices")
@@ -261,6 +301,7 @@ def main(argv: list[str] | None = None) -> int:
         args.origin = "live"
         print("origin=live (default)", file=sys.stderr)  # a manual run is visible; conveyor path stays live
     judge(root, clock=lambda: datetime.now(timezone.utc), origin=cast(str, args.origin))
+    daily(root, clock=lambda: datetime.now().astimezone())  # local day; never fails the pass
     return 0
 
 

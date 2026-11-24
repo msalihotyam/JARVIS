@@ -9,7 +9,7 @@ import json
 import subprocess
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -246,6 +246,56 @@ class ShadowRunTest(unittest.TestCase):
         self.assertIn("AGREEMENT: 100.0%", out)
         self.assertIn("FALSE PASS: 0\n", out)
         self.assertIn("OVERHEAD QUOTA: 0.0%", out)
+
+    # N6DAILY1: the daily diff after a shadow pass, once per local day, never failing the pass.
+    NOW = datetime(2026, 11, 12, 9, 0, tzinfo=timezone(timedelta(hours=3)))
+
+    def files(self) -> set[Path]:
+        return {p.relative_to(self.root) for p in self.root.rglob("*") if p.is_file()}
+
+    def test_missing_yesterday_runs_the_real_diff_once_and_writes_only_daily(self) -> None:
+        self.on()
+        self.judge()  # kpi.db + notes from this pass, read by the real diff below
+        before = self.files()
+        self.assertTrue(run.daily(self.root, clock=lambda: self.NOW))
+        daily = Path("build/n6/daily")
+        self.assertEqual(self.files() - before, {daily / "2026-11-11.json", daily / "2026-11-11.md"})
+        rep = json.loads((self.root / daily / "2026-11-11.json").read_text(encoding="utf-8"))
+        self.assertEqual((rep["date"], rep["notes"]["agree"]), ("2026-11-11", 2))
+        self.assertFalse(run.daily(self.root, clock=lambda: self.NOW))  # never twice for one day
+        self.assertEqual(self.files() - before, {daily / "2026-11-11.json", daily / "2026-11-11.md"})
+
+    def test_present_report_is_not_rebuilt_and_switch_off_does_nothing(self) -> None:
+        calls: list[object] = []
+        self.assertFalse(run.daily(self.root, clock=lambda: self.NOW, writer=lambda *a, **k: calls.append(a)))
+        self.on()
+        self.write("build/n6/daily/2026-11-11.json", "{}")
+        self.write("build/n6/daily/2026-11-11.md", "x")
+        self.assertFalse(run.daily(self.root, clock=lambda: self.NOW, writer=lambda *a, **k: calls.append(a)))
+        self.assertEqual(calls, [])
+
+    def test_until_is_local_midnight_of_the_clock_zone(self) -> None:
+        self.on()
+        seen: list[tuple] = []
+        run.daily(self.root, clock=lambda: self.NOW, writer=lambda root, day, until: seen.append((day, until)))
+        self.assertEqual(seen, [(self.NOW.date() - timedelta(days=1), self.NOW.replace(hour=0))])
+
+    def test_diff_error_is_logged_and_the_pass_stands(self) -> None:
+        self.on()
+        self.judge()
+        notes = self.notes.read_text(encoding="utf-8")
+
+        def boom(*a: object, **k: object) -> None:
+            raise RuntimeError("kpi.db is in WAL mode")
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            self.assertFalse(run.daily(self.root, clock=lambda: self.NOW, writer=boom))
+        self.assertIn("kpi.db is in WAL mode", err.getvalue())
+        log = (self.root / "build/n6/daily/errors.log").read_text(encoding="utf-8")
+        self.assertIn("day=2026-11-11 RuntimeError('kpi.db is in WAL mode')", log)
+        self.assertEqual(self.notes.read_text(encoding="utf-8"), notes)
+        self.assertEqual(len(rows(self.db)), 4)
+        self.assertFalse((self.root / "build/n6/daily/2026-11-11.json").exists())
 
 
 if __name__ == "__main__":
