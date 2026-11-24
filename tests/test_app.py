@@ -921,6 +921,58 @@ class CompositionRootTests(unittest.TestCase):
         self.assertEqual("claude-sonnet-4-5", connector.model)
         self.assertEqual("high", connector.effort)
 
+    def test_default_app_gives_every_claude_adapter_the_same_values(self) -> None:
+        # AUDAPPKW1: the kwargs are built once; each adapter still receives
+        # exactly the values it got before, for a fixed config.
+        settings = replace(
+            self.settings,
+            claude_model="claude-sonnet-4-5",
+            claude_effort="high",
+            claude_call_budget_usd=0.75,
+        )
+        names = (
+            "ClaudeCodeConnector",
+            "ClaudeIntentAdapter",
+            "ClaudeResearchAdapter",
+            "ClaudeClarifyAdapter",
+        )
+        spies = {
+            name: mock.patch.object(
+                app_module, name, wraps=getattr(app_module, name)
+            )
+            for name in names
+        }
+        started = {name: patcher.start() for name, patcher in spies.items()}
+        try:
+            with mock.patch.object(
+                claude_code.subprocess, "run", side_effect=AssertionError("no subprocess")
+            ), mock.patch.object(
+                claude_code.subprocess, "Popen", side_effect=AssertionError("no subprocess")
+            ), mock.patch.object(
+                claude_code, "resolve_trusted_executable", side_effect=AssertionError("no probe")
+            ):
+                build_default_app(settings)
+        finally:
+            for patcher in spies.values():
+                patcher.stop()
+        startup_directory = Path.cwd().resolve()
+        expected = {
+            "allowed_roots": (startup_directory,),
+            "default_working_directory": startup_directory,
+            "protected_roots": (settings.memory_database.parent,),
+            "max_budget_usd": 0.75,
+            "model": "claude-sonnet-4-5",
+            "effort": "high",
+        }
+        for name, spy in started.items():
+            spy.assert_called_once()
+            call = spy.call_args
+            self.assertEqual((), call.args, name)
+            want = dict(expected)
+            if name == "ClaudeIntentAdapter":
+                want["warm_sessions"] = app_module.WARM_SESSIONS
+            self.assertEqual(want, call.kwargs, name)
+
     def test_default_app_binds_the_local_reader_to_the_same_startup_root(self) -> None:
         # M3: the local reader and the Claude connector share exactly one
         # boundary, and constructing it touches no filesystem and no process.

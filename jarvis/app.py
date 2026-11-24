@@ -6546,7 +6546,8 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
     # working directory, even inside the startup root. A tuple: a bare Path
     # would be iterated as its parts.
     protected_roots = (settings.memory_database.parent,)
-    connector = ClaudeCodeConnector(
+    # One boundary, model, effort and budget for every Claude adapter below.
+    claude_kwargs = dict(
         allowed_roots=(startup_directory,),
         default_working_directory=startup_directory,
         protected_roots=protected_roots,
@@ -6554,18 +6555,11 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
         model=settings.claude_model,
         effort=settings.claude_effort,
     )
+    connector = ClaudeCodeConnector(**claude_kwargs)
     # The natural-language understanding call: the same hardened CLI seam
     # and the same operator model/effort/budget, held by the app and NOT
     # registered - it interprets a request, it never executes one.
-    intent_model = ClaudeIntentAdapter(
-        allowed_roots=(startup_directory,),
-        default_working_directory=startup_directory,
-        protected_roots=protected_roots,
-        max_budget_usd=settings.claude_call_budget_usd,
-        model=settings.claude_model,
-        effort=settings.claude_effort,
-        warm_sessions=WARM_SESSIONS,
-    )
+    intent_model = ClaudeIntentAdapter(**claude_kwargs, warm_sessions=WARM_SESSIONS)
     # WARMON: the warm session follows the setting (default on); turned off,
     # the warm processes still alive are killed, and each turn spawns anew.
     intent_model.warm_claude = settings.warm_claude
@@ -6573,24 +6567,10 @@ def build_default_app(settings: Settings | None = None) -> JarvisApp:
         intent_model.close_warm()
     # Web Research: the same seam, the same operator model/effort, one tool
     # (WebSearch). Held by the app and NOT registered, like the understanding call.
-    research_model = ClaudeResearchAdapter(
-        allowed_roots=(startup_directory,),
-        default_working_directory=startup_directory,
-        protected_roots=protected_roots,
-        max_budget_usd=settings.claude_call_budget_usd,
-        model=settings.claude_model,
-        effort=settings.claude_effort,
-    )
+    research_model = ClaudeResearchAdapter(**claude_kwargs)
     # PM07C: the clarify proposal call - the same seam, its own system prompt,
     # never the warm intent session. Held by the app and NOT registered.
-    clarify_model = ClaudeClarifyAdapter(
-        allowed_roots=(startup_directory,),
-        default_working_directory=startup_directory,
-        protected_roots=protected_roots,
-        max_budget_usd=settings.claude_call_budget_usd,
-        model=settings.claude_model,
-        effort=settings.claude_effort,
-    )
+    clarify_model = ClaudeClarifyAdapter(**claude_kwargs)
     # M3: the same startup root, so a local read and a Claude plan are bound
     # to exactly one boundary. Constructing it touches no filesystem.
     local_reader = LocalFileReadConnector(
