@@ -107,7 +107,7 @@ def check(shadow: Sequence[Mapping[str, Any]], e8: Mapping[str, Any],
             raise GateError(f"shadow row event_id is missing or malformed: {event!r}")
         # str only: JSON true == 1 would hide a disagreement
         if any(not isinstance(row[k], str) or not row[k] for k in ("n6_decision", "conveyor_decision")):
-            raise GateError(f"shadow row {event} has an empty or non-text decision")
+            raise GateError(f"shadow row {event!r} has an empty or non-text decision")
         if row.get("origin") == REAL_ORIGIN:
             real[g].add(event)
         if row["n6_decision"] != row["conveyor_decision"] and row["safe"] is not True:
@@ -129,8 +129,8 @@ def check(shadow: Sequence[Mapping[str, Any]], e8: Mapping[str, Any],
 def render(result: Mapping[str, tuple[str, list[str]]]) -> str:
     lines: list[str] = []
     for g, (verdict, reasons) in result.items():
-        lines.append(f"{g}: {verdict}")
-        lines += [f"  REASON: {r}" for r in reasons]
+        lines.append(_escape(f"{g}: {verdict}"))
+        lines += [_escape(f"  REASON: {r}") for r in reasons]
     return "\n".join(lines) + "\n"
 
 
@@ -146,10 +146,16 @@ def main(argv: list[str] | None = None) -> int:
         result = check(data.get("shadow", []), data.get("e8", {}),  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]
                        data.get("drills", []), data.get("taken_over", []))  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]
     except (OSError, ValueError, AttributeError, TypeError, RecursionError) as error:
-        print(_ascii(f"REFUSED: {error}"))
+        print(_ascii(_escape(f"REFUSED: {error}")))
         return 2
     print(_ascii(render(result)), end="")
     return 0
+
+
+def _escape(text: str) -> str:
+    # one output line per call: an id holding newline, CR, U+2028, ESC... would forge a "<group>: READY" line;
+    # the backslash is escaped too so a literal backslash-n id stays distinct from a real newline
+    return "".join(c if c.isprintable() and c != "\\" else repr(c)[1:-1] for c in text)
 
 
 def _ascii(text: str) -> str:

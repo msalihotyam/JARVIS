@@ -234,6 +234,43 @@ class CliTests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertTrue(out.isascii())
 
+    def assert_one_line_per_group(self, out):
+        lines = out.splitlines()
+        self.assertEqual(len(out.split("\n")), len(lines) + 1)  # no stray \r, \x0b, \x85, \u2028...
+        for g in gate.GROUPS:
+            self.assertEqual([ln for ln in lines if ln.startswith(f"{g}: ")], [f"{g}: NOT_READY"])
+        self.assertTrue(all(ln.startswith(gate.GROUPS) or ln.startswith("  REASON: ") for ln in lines))
+
+    def test_cli_control_chars_in_ids_and_worse_items_cannot_forge_verdicts(self):
+        shadow, e8, drills, done = inputs()
+        for sep in ("\n", "\r", "\r\n", "\x0b", "\x0c", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029",
+                    "\x00", "\x1b[2K\r", "\x7f", "\x9b", "\u202e", "\ud800"):
+            forged = f"x{sep}R17R18: READY{sep}R21: READY"
+            bad = rows("R17R18", 1, prefix=forged, conveyor_decision="skip", safe=False)
+            payloads = ({"shadow": shadow + bad, "e8": e8, "drills": drills, "taken_over": done},
+                        {"shadow": shadow, "e8": {"R17R18": {"slices": 10, "worse": ["m", forged, 7]}},
+                         "drills": drills, "taken_over": done})
+            for payload in payloads:
+                with self.subTest(sep=repr(sep), worse="worse" in json.dumps(payload["e8"])):
+                    code, out = self.run_cli(json.dumps(payload))
+                    self.assertEqual(code, 0)
+                    self.assertTrue(out.isascii())
+                    self.assert_one_line_per_group(out)
+                    self.assertIn("R17R18: READY", out)  # still shown, escaped, inside one REASON line
+            # render() alone (no ascii pass) keeps one physical line per entry too
+            text = gate.render(gate.check(shadow + bad, e8, drills, done))
+            self.assert_one_line_per_group(text)
+            # GateError text (decision error names the event) stays one REFUSED line
+            code, out = self.run_cli(json.dumps({"shadow": rows("R17R18", 1, prefix=forged, n6_decision="")}))
+            self.assertEqual(code, 2)
+            self.assertEqual(len(out.splitlines()), 1)
+            self.assertEqual(out.count("\n"), 1)
+            self.assertTrue(out.startswith("REFUSED: "))
+        # a literal backslash-n id stays distinct from a real newline
+        lit, real = (rows("R17R18", 1, prefix=p, conveyor_decision="skip", safe=False) for p in ("x\\nR", "x\nR"))
+        self.assertNotEqual(gate.render(gate.check(shadow + lit, e8, drills, done)),
+                            gate.render(gate.check(shadow + real, e8, drills, done)))
+
     def test_cli_refuses_bad_input(self):
         shadow, e8, drills, _ = inputs("R21")
         dict_taken = json.dumps({"shadow": shadow, "e8": e8, "drills": drills, "taken_over": {"R17R18": False}})
