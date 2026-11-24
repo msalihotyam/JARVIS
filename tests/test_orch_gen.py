@@ -9,6 +9,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import conveyor  # noqa: E402
+import orch_decisions  # noqa: E402
 import orch_gen  # noqa: E402
 
 GIT = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false"]
@@ -514,6 +515,139 @@ class OrchGenTest(unittest.TestCase):
         self.assertEqual(g.test_groups(["jarvis/ui/qml/Main.qml", "jarvis/foo.py"]),
                          [["tests.test_foo"], ["tests.test_ui"]])
         self.assertEqual(g.test_groups(["jarvis/nothing.py", "README.md"]), [])
+
+    # QUEUEFILL1: fill = an approved READY spec -> a slice when a track runs low
+    T = 1_800_000_000.0
+    DEC = "D-20261124-0000-FILL"
+
+    def fill_state(self, n6_ready=0, lanes=None):
+        view = [{"id": f"X{i}", "state": "n6"} for i in range(n6_ready)]
+        self.put("build/conveyor/status.json", json.dumps({"backlog": view}))
+        self.put("build/conveyor/lanes.json", json.dumps(lanes or {}))
+        if not (self.root / orch_decisions.REL).exists():
+            orch_decisions.add(self.DEC, "authority", "test", "2026-11-24", path=self.root / orch_decisions.REL)
+
+    def ready(self, track, seq, sid, **over):
+        sp = {"id": sid, "title": ("[N6] " if track == "n6" else "[IYILESTIRME] ") + sid, "tier": "T2",
+              "model": "opus", "effort": "high", "size": "MEDIUM", "goal": "g", "tests": "a test",
+              "run": ["tests.test_foo"], "owned": ["jarvis/foo.py"], "commit": f"feat: {sid} x",
+              "track": track, "priority": 1, "approved_by": "orchestrator", "decision": self.DEC}
+        sp.update(over)
+        rel = f"build/orch/ready/{track}/{seq:03d}-{sid}.json"
+        self.put(rel, json.dumps({k: v for k, v in sp.items() if v is not None}))
+        return self.root / rel
+
+    def fill(self, *argv):
+        out = []
+        rc = orch_gen.main(["--root", str(self.root), "fill", *argv], out=out.append, now=lambda: self.T)
+        return rc, "\n".join(out)
+
+    def fill_log(self):
+        return [json.loads(x) for x in (self.root / "build/orch/ready/fill.jsonl").read_text("utf-8").splitlines()]
+
+    def test_fill_low_n6_is_picked_before_improve(self):
+        self.fill_state()
+        self.ready("improve", 1, "IM1", priority=9)
+        self.ready("n6", 2, "NB1")
+        self.ready("n6", 1, "NA1")  # same priority, older seq wins
+        rc, out = self.fill()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("picked n6/001-NA1.json", out)
+        self.assertEqual(self.fill_log()[-1]["result"], "dry_run")
+        self.assertEqual(self.fill_log()[-1]["reason"], "queue_low_n6")
+
+    def test_fill_improve_only_when_n6_is_not_low(self):
+        self.fill_state(n6_ready=2)
+        self.ready("n6", 1, "NA1")
+        self.ready("improve", 1, "IM1")
+        rc, out = self.fill("--track", "n6")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.fill_log()[-1]["result"], "no_track_low")
+        rc, out = self.fill()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("picked improve/001-IM1.json", out)
+
+    def test_fill_skips_unapproved_inactive_and_malformed(self):
+        self.fill_state()
+        orch_decisions.add("D-20261124-0001-OLD", "authority", "test", "x", path=self.root / orch_decisions.REL)
+        orch_decisions.deactivate("D-20261124-0001-OLD", path=self.root / orch_decisions.REL)
+        self.ready("n6", 1, "NU1", priority=9, approved_by="somebody")
+        self.ready("n6", 2, "NI1", priority=9, decision="D-20261124-0001-OLD")
+        self.ready("n6", 3, "NM1", priority="9")
+        self.ready("n6", 4, "NT1", priority=9, title="no prefix")
+        self.ready("n6", 5, "NS1", priority=9, size=None)  # lacks a slice spec field
+        self.put("build/orch/ready/n6/bad name.json", "{}")
+        self.ready("n6", 6, "NG1")
+        rc, out = self.fill()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("picked n6/006-NG1.json", out)
+        self.assertEqual(sorted(self.fill_log()[-1]["skipped"]),
+                         ["001-NU1.json:unapproved", "002-NI1.json:inactive_decision", "003-NM1.json:malformed",
+                          "004-NT1.json:malformed", "005-NS1.json:malformed", "<bad-name>:malformed"])
+
+    def test_fill_skips_a_spec_overlapping_a_running_lane_or_a_queued_slice(self):
+        self.fill_state(lanes={"L1": {"id": "L1", "state": "working", "files": ["jarvis/foo.py"]}})
+        self.ready("n6", 1, "NA1", priority=5)
+        self.ready("n6", 2, "NB1", owned=["jarvis/other.py"])
+        self.ready("n6", 3, "NC1", owned=["jarvis/other.py"])
+        rc, out = self.fill("--write")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.fill_log()[-1]["skipped"], ["001-NA1.json:overlap"])
+        rc, out = self.fill()  # NB1 is now queued (no lane, no report): NC1 overlaps it
+        self.assertEqual(rc, 1, out)
+        self.assertEqual(self.fill_log()[-1]["skipped"], ["001-NA1.json:overlap", "003-NC1.json:overlap"])
+        self.assertEqual(self.fill_log()[-1]["result"], "queue_empty")
+
+    def test_fill_daily_cap_refuses(self):
+        self.fill_state()
+        p = self.ready("n6", 1, "NA1")
+        day = orch_gen.time.strftime("%Y-%m-%d", orch_gen.time.gmtime(self.T))
+        self.put("build/orch/gen_caps.json", json.dumps({f"slice:{day}": orch_gen.DAILY_CAP["slice"]}))
+        rc, out = self.fill("--write")
+        self.assertEqual(rc, 2, out)
+        self.assertIn("daily slice cap", out)
+        self.assertTrue(p.exists())
+        self.assertEqual(self.backlog()["slices"], [])
+        self.assertEqual(self.fill_log()[-1]["reason"], "cap_reached")
+
+    def test_fill_write_moves_the_spec_and_adds_one_slice(self):
+        self.fill_state()
+        p = self.ready("n6", 1, "NA1")
+        rc, out = self.fill("--write")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual([s["id"] for s in self.backlog()["slices"]], ["NA1"])
+        self.assertEqual(sorted(x.name for x in (self.root / "build/conveyor/prompts").iterdir()), ["NA1.md"])
+        self.assert_lints("NA1")
+        self.assertFalse(p.exists())
+        day = orch_gen.time.strftime("%Y-%m-%d", orch_gen.time.gmtime(self.T))
+        self.assertTrue((self.root / f"build/orch/ready/used/{day}/001-NA1.json").is_file())
+        log = self.fill_log()
+        self.assertEqual(len(log), 1)
+        self.assertEqual({k: log[0][k] for k in ("track", "spec", "result", "reason")},
+                         {"track": "n6", "spec": "001-NA1.json", "result": "written", "reason": "queue_low_n6"})
+        self.assertEqual(orch_gen.daily_count(self.root, "slice", self.T), 1)
+
+    def test_fill_dry_run_changes_nothing(self):
+        self.fill_state()
+        p = self.ready("n6", 1, "NA1")
+        before = (self.root / "build/conveyor/backlog.json").read_bytes()
+        rc, out = self.fill()
+        self.assertEqual(rc, 0, out)
+        self.assertIn("dry-run", out)
+        self.assertEqual((self.root / "build/conveyor/backlog.json").read_bytes(), before)
+        self.assertEqual(list((self.root / "build/conveyor/prompts").iterdir()), [])
+        self.assertTrue(p.exists())
+        self.assertFalse((self.root / "build/orch/ready/used").exists())
+        self.assertFalse((self.root / "build/orch/gen_caps.json").exists())
+        self.assertEqual(len(self.fill_log()), 1)
+
+    def test_fill_nothing_ready_is_queue_empty(self):
+        self.fill_state()
+        rc, out = self.fill("--write")
+        self.assertEqual(rc, 1, out)
+        self.assertIn("queue_empty", out)
+        self.assertEqual(self.fill_log()[-1]["result"], "queue_empty")
+        self.assertEqual(self.backlog()["slices"], [])
 
 
 if __name__ == "__main__":
