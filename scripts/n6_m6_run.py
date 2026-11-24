@@ -42,7 +42,7 @@ IDS = ("A", "B", "C")
 WRITER, REVIEWER = "claude", "codex"
 SESSION_CAP = 4
 PINNED_SHA = "a9531bcaaa23fcc04ee5c0c1e28b3e9dcc904ac560d5f427d32dd606ca1afc2a"
-GIT_SUBCOMMANDS = frozenset({"init", "add", "commit", "rev-parse", "diff"})
+GIT_SUBCOMMANDS = frozenset({"init", "add", "commit", "rev-parse", "diff", "status"})
 _DATE = "2026-11-24T23:30:00+00:00"  # fixed commit dates: deterministic SHAs, no clock read
 _NAME = re.compile(r"[a-z_][a-z0-9_]*\.py")
 
@@ -107,6 +107,19 @@ def _write(repo: Path, files: dict) -> list[str]:
     return sorted(files)
 
 
+def _dirty(repo: Path, env: dict, owned: set[str]) -> list[str] | None:
+    """M2: the owned paths left uncommitted, staged or untracked after the writer's commit.
+
+    None when git status cannot be read: receipt_verdict turns that into INVALID (fail closed).
+    """
+    try:
+        out = _git(repo, env, "status", "--porcelain", "--untracked-files=all")
+        # "XY path"; fixture names match _NAME, so git never quotes them and no rename arrow appears.
+        return sorted({line[3:] for line in out.splitlines() if len(line) > 3} & owned)
+    except Exception:  # any failure is an unknown tree, never a clean one
+        return None
+
+
 def _check(repo: Path, env: dict, argv: list[str]) -> CheckResult:
     argv = [sys.executable if a == "python" else a for a in argv]
     proc = subprocess.run(argv, cwd=repo, env=env, capture_output=True, text=True,  # nosec B603
@@ -159,6 +172,7 @@ def run_scenario(sc: dict, work: Path, env: dict, key: bytes) -> dict:
            "planted_file": sc.get("planted_file")}
     last: tuple[str, str] | None = None
     revisions = 0
+    owned = {name for files in sc["attempts"] for name in files}  # the writer's slice
     for n, files in enumerate(sc["attempts"], 1):
         if last is not None:
             if n > RETRY_CAP:
@@ -195,7 +209,8 @@ def run_scenario(sc: dict, work: Path, env: dict, key: bytes) -> dict:
         record = InvocationRecord("check", check.argv, sha, check.exit_code).sign(key)
         commit_files = _git(repo, env, "diff", "--name-only", base, sha).split()
         res["receipt"] = receipt_verdict({"check": check.argv}, [record], sha, key=key,
-                                         changed_files=changed, commit_files=commit_files).verdict
+                                         changed_files=changed, commit_files=commit_files,
+                                         dirty_paths=_dirty(repo, env, owned)).verdict
         _write(repo, sc["hidden"]["files"])
         hidden = _check(repo, env, sc["hidden"]["argv"])
         res.update(outcome="accepted", blocked_by=None, post_accept_failed=hidden.exit_code != 0)

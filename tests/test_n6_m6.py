@@ -106,8 +106,52 @@ class M6RunTests(unittest.TestCase):
         self.assertEqual((r["blocked_by"], r["attempts"]), ("retry_cap", m6.RETRY_CAP))
         self.assertEqual(m6.judge("C", r), "FAIL")
 
+    def test_owned_file_dirty_after_commit_is_a_partial_receipt(self):
+        name, real = sorted(self.scenarios["A"]["attempts"][0])[0], m6._check
+
+        def check(repo, env, argv):  # the visible check leaves an owned file changed after the commit
+            res = real(repo, env, argv)
+            with open(repo / name, "a", encoding="utf-8") as fh:
+                fh.write("# left after the commit\n")
+            return res
+        with mock.patch.object(m6, "_check", check):
+            r = self._variant("A")
+        self.assertEqual(r["receipt"], "PARTIAL")
+        self.assertEqual(m6.judge("A", r), "FAIL")
+
+    def test_unreadable_git_status_fails_closed(self):
+        real = m6._git
+
+        def git(repo, env, *args):
+            if args[0] == "status":
+                raise m6.subprocess.CalledProcessError(128, "git status")
+            return real(repo, env, *args)
+        with mock.patch.object(m6, "_git", git):
+            r = self._variant("A")
+        self.assertEqual(r["receipt"], "INVALID")
+        self.assertEqual(m6.judge("A", r), "FAIL")
+
 
 class M6PinAndScoreTests(unittest.TestCase):
+    def test_owned_paths_dirty_in_every_way_and_nothing_else(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, gitconfig = Path(tmp) / "r", Path(tmp) / "gitconfig"
+            repo.mkdir()
+            gitconfig.write_text("", encoding="utf-8")
+            env = m6._env(gitconfig)
+            m6._git(repo, env, "init", "-q")
+            owned = {"mod.py", "gone.py", "new.py", "staged.py", "clean.py"}
+            m6._write(repo, {"mod.py": "a\n", "gone.py": "b\n", "clean.py": "c\n", "base.py": "d\n"})
+            m6._git(repo, env, "add", "-A")
+            m6._git(repo, env, "commit", "-q", "-m", "base")
+            self.assertEqual(m6._dirty(repo, env, owned), [])
+            m6._write(repo, {"mod.py": "a2\n", "new.py": "n\n", "staged.py": "s\n", "base.py": "d2\n",
+                             "stray.py": "x\n"})
+            (repo / "gone.py").unlink()
+            m6._git(repo, env, "add", "staged.py")
+            self.assertEqual(m6._dirty(repo, env, owned), ["gone.py", "mod.py", "new.py", "staged.py"])
+            self.assertIsNone(m6._dirty(Path(tmp) / "missing", env, owned))  # git cannot run: unknown
+
     def _copy(self, tmp, edit):
         doc = json.loads(m6.SCENARIOS.read_text(encoding="utf-8"))
         edit(doc)
