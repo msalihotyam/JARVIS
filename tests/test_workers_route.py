@@ -147,3 +147,39 @@ class TestRouteVetoParity(unittest.TestCase):
                 self.assertEqual(_veto(path), self.conveyor.codex_veto(path))
         for path in _ALLOWED:
             self.assertFalse(_veto(path), path)
+
+    def test_inline_literals_match_conveyor(self):
+        """AUDROUTE1FIX: every inline string in conveyor.protected_path/codex_veto
+        (suffix, prefix, basename, segment rule) is known here and probed for parity."""
+        import ast
+        from pathlib import Path
+        from jarvis.workers.route import _veto
+        tree = ast.parse((Path(self.conveyor.__file__)).read_text(encoding="utf-8"))
+        found, names, other = set(), set(), set()
+        for f in tree.body:
+            if isinstance(f, ast.FunctionDef) and f.name in ("protected_path", "codex_veto"):
+                body = f.body[1:] if ast.get_docstring(f) else f.body
+                consts = [n.value for s in body for n in ast.walk(s) if isinstance(n, ast.Constant)]
+                found |= {v for v in consts if isinstance(v, str)}
+                other |= {repr(v) for v in consts if not isinstance(v, str)}
+                names |= {n.id for n in ast.walk(f) if isinstance(n, ast.Name)}
+                names |= {"." + n.attr for n in ast.walk(f) if isinstance(n, ast.Attribute)}
+        # Non-str constants (bytes, slice/count ints) and methods (.isascii, .casefold) pinned too.
+        self.assertEqual(other, {"1"})  # rsplit("/", 1)
+        # A new constant or helper the rules call (a .kdbx tuple, a regex) fails here too:
+        # PROTECTED_DIRS/CODEX_VETO/PROTECTED_FILES are probed by corpus() already.
+        self.assertEqual(names, {"PROTECTED_DIRS", "CODEX_VETO", "any", "isinstance", "str",
+                                 "posixpath", "protected_path", "base", "p", "q", "s", "c",
+                                 ".endswith", ".lower", ".replace", ".rsplit", ".split",
+                                 ".startswith", ".normpath", ".strip"})
+        # A new conveyor literal fails here: add it to this set and make route._veto match.
+        self.assertEqual(found, {
+            ".cer", ".crt", ".db", ".env", ".key", ".p12", ".pem", ".pfx", ".sqlite",
+            ".sqlite3", "/", "/.jarvis/", "\\", "data/", "dev/dashboard/", "riot",
+            "uv.lock", "", " ", "*?[~", ".", "..", "../", ":", "agents.md", "claude.md"})
+        for lit in sorted(found | set("".join(found))):  # char-set rules ("*?[~") per char
+            for path in (lit, lit + "x", "a/" + lit, "a/b" + lit, lit + "/x.py",
+                         "a/" + lit + "x/b.py", "a/" + lit + "/b.py"):
+                for variant in (path, path.upper(), path.replace("/", "\\")):
+                    with self.subTest(literal=lit, path=variant):
+                        self.assertEqual(_veto(variant), self.conveyor.codex_veto(variant))
