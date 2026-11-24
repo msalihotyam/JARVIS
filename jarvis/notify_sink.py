@@ -14,6 +14,7 @@ replays earlier runs' toasts.
 from collections import deque
 from collections.abc import Callable, Iterable
 import time
+from typing import Protocol
 
 from jarvis.notify import _POINTS
 
@@ -81,6 +82,34 @@ class NotifySink:
         if len(pending) == 1:
             return pending[0]["title"], pending[0]["text"], importance
         return "JARVIS", f"{len(pending)} yeni bildirim", importance
+
+
+class Sink(Protocol):
+    """A notification channel: shows one ``toast()`` tuple. A new channel is one class."""
+
+    def show(self, title: str, text: str, importance: str) -> None: ...
+
+
+class TraySink:
+    """The tray channel: a ``QSystemTrayIcon`` balloon, Warning icon for high."""
+
+    def __init__(self, icon, duration_ms: int) -> None:
+        self._icon = icon
+        self._duration_ms = duration_ms
+
+    def show(self, title: str, text: str, importance: str) -> None:
+        from PySide6.QtWidgets import QSystemTrayIcon   # local: this module stays Qt-free on import
+
+        kind = QSystemTrayIcon.MessageIcon.Warning if importance == "high" else QSystemTrayIcon.MessageIcon.Information
+        self._icon.showMessage(title, text, kind, self._duration_ms)
+
+
+def deliver(notify: NotifySink, sink: Sink) -> None:
+    """One poll: new rows in, at most one toast out to ``sink``."""
+    notify.poll()
+    toast = notify.toast()
+    if toast is not None:
+        sink.show(*toast)
 
 
 def _id(row: dict) -> int:
