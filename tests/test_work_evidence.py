@@ -101,6 +101,51 @@ class EvidenceReceiptTests(unittest.TestCase):
         self.assertIn("başarılı", receipt.canonical_json())
         self.assertEqual(EvidenceReceipt.from_json(receipt.to_json()), receipt)
 
+    def test_legacy_receipts_verify_byte_for_byte(self):
+        # Written by the code at a083d6d, before N6NOTRUN1; must keep loading unchanged.
+        legacy = (
+            '{"receipt":{"base_result":{"count":4,"failures":["old_failure"]},"check_argv":'
+            '["python","-m","unittest","tests.example"],"diff_sha":"' + "b" * 40 + '",'
+            '"exit_code":0,"output_sha":"' + "c" * 64 + '","plan_hash":"' + "a" * 64 + '",'
+            '"verdict":"pass"},'
+            '"sha256":"7d3380ddf3c184894223d7712c8de6dec9739e0fdb016fa23197b7d372ccf6d5"}',
+            '{"receipt":{"base_result":{"failed_ids":[],"total":3},"check_argv":'
+            '["python -m unittest tests.x"],"diff_sha":"' + "b" * 40 + '","exit_code":0,'
+            '"output_sha":"' + "c" * 64 + '","plan_hash":"' + "a" * 64 + '","verdict":"passed"},'
+            '"sha256":"b34a6b30288a2e3b3c988f4a234ce94e631431bccf36293a2b8d7afeb2123cc4"}',
+        )
+        for serialized in legacy:
+            with self.subTest(serialized[-20:]):
+                loaded = EvidenceReceipt.from_json(serialized)
+                self.assertTrue(loaded.verify())
+                self.assertEqual(loaded.to_json(), serialized)
+        self.assertEqual(self.receipt().to_json(), legacy[0])
+
+    def test_not_run_and_partial_commit_are_covered_by_the_digest(self):
+        # Acceptance 4 / negatives 4-5 (N6NOTRUN1): the verdict and reasons sit in the payload.
+        receipt = self.receipt(verdict="NOT_RUN", base_result={
+            "checks": {"tests": "PASS", "lint": "NOT_RUN"},
+            "reasons": ["lint: no record", "partial_commit: ['jarvis/x.py']"]})
+        self.assertIn('"verdict":"NOT_RUN"', receipt.canonical_json())
+        self.assertIn("partial_commit", receipt.canonical_json())
+        loaded = EvidenceReceipt.from_json(receipt.to_json())
+        for _ in range(3):  # verify() is a check, never a promotion
+            self.assertTrue(loaded.verify())
+        self.assertEqual(loaded.verdict, "NOT_RUN")
+        serialized = receipt.to_json()
+        edits = {
+            "NOT_RUN to PASS": serialized.replace('"verdict":"NOT_RUN"', '"verdict":"PASS"'),
+            "one byte": serialized.replace('"verdict":"NOT_RUN"', '"verdict":"NOT_RUX"'),
+            "partial dropped": serialized.replace("partial_commit", "partial_commiT"),
+            "check flipped": serialized.replace('"lint":"NOT_RUN"', '"lint":"PASS"'),
+        }
+        for name, edited in edits.items():
+            with self.subTest(name):
+                self.assertNotEqual(edited, serialized)
+                with self.assertRaises(ValueError):
+                    EvidenceReceipt.from_json(edited)
+        self.assertFalse(replace(receipt, verdict="PASS").verify())
+
     def test_null_digest_cannot_be_recomputed_on_load(self):
         envelope = json.loads(self.receipt().to_json())
         envelope["sha256"] = None

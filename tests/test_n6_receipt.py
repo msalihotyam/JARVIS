@@ -31,9 +31,10 @@ def both(**changes):
     return [signed("tests", TESTS, **changes), signed("lint", LINT, **changes)]
 
 
-def judge(records, *, required=REQUIRED, sha=SHA, changed=FILES, committed=FILES, key=KEY):
-    return receipt_verdict(required, records, sha, key=key,
-                           changed_files=changed, commit_files=committed)
+def judge(records, *, required=REQUIRED, sha=SHA, changed=FILES, committed=FILES, key=KEY,
+          dirty=()):
+    return receipt_verdict(required, records, sha, key=key, changed_files=changed,
+                           commit_files=committed, dirty_paths=dirty)
 
 
 def resign(record_json, **payload_changes):
@@ -198,6 +199,54 @@ class N6ReceiptTests(unittest.TestCase):
             invocation_record("tests", TESTS, {"argv": resolved}, SHA, key=KEY)
         timed_out = invocation_record("tests", TESTS, result(resolved, 0, True), SHA, key=KEY)
         self.assertEqual(judge([timed_out, signed("lint", LINT)]).verdict, FAIL)
+
+    def test_neg_dirty_owned_file_after_commit_is_partial_commit(self):
+        # M2 (N6NOTRUN1): a commit exists and every check passed, but an owned file is still dirty.
+        for dirty in (["jarvis/x.py"], ("tests/new_untracked.py",), {"jarvis/x.py", "jarvis/y.py"}):
+            with self.subTest(dirty=dirty):
+                result = judge(both(), dirty=dirty)
+                self.assertEqual(result.verdict, PARTIAL)
+                self.assertEqual(result.checks, {"tests": PASS, "lint": PASS})
+                self.assertTrue(any(r.startswith("partial_commit: ") and sorted(dirty)[0] in r
+                                    for r in result.reasons))
+        # Worse states are never lowered to PARTIAL by a dirty file.
+        self.assertEqual(judge([signed(exit_code=1), signed("lint", LINT)],
+                               dirty=["jarvis/x.py"]).verdict, PARTIAL)
+        self.assertEqual(judge(["{", *both()], dirty=["jarvis/x.py"]).verdict, INVALID)
+        for bad in ("jarvis/x.py", None, 3, [None], [""], ["a", 1], [["a"]]):
+            with self.subTest(bad=bad):
+                result = judge(both(), dirty=bad)
+                self.assertEqual(result.verdict, INVALID)
+                self.assertIn("dirty path list is malformed", result.reasons)
+        with self.assertRaises(TypeError):  # no default: a caller cannot forget the input
+            receipt_verdict(REQUIRED, both(), SHA, key=KEY, changed_files=FILES,
+                            commit_files=FILES)
+
+    def test_neg_exit_zero_claim_without_invocation_is_not_run(self):
+        # Acceptance 1 / negative 1: a result that claims exit 0 with no signed invocation.
+        claims = ({"check_id": "lint", "exit_code": 0},
+                  CheckResult(argv=LINT, runner="ruff", exit_code=0, duration_s=0.0,
+                              stdout="", stderr="", truncated=False, timed_out=False),
+                  json.dumps({"check_id": "lint", "exit_code": 0}))
+        for claim in claims:
+            with self.subTest(claim=type(claim).__name__):
+                result = judge([signed("tests"), claim])
+                self.assertNotEqual(result.verdict, PASS)
+                self.assertEqual(result.checks["lint"], NOT_RUN)
+                self.assertIn("lint: no record", result.reasons)
+        # argv missing: the runner refuses to sign, so no record can exist and the check stays NOT_RUN.
+        with self.assertRaises(CheckRefused):
+            invocation_record("tests", TESTS, CheckResult(
+                argv=(), runner="python", exit_code=0, duration_s=0.0, stdout="", stderr="",
+                truncated=False, timed_out=False), SHA, key=KEY)
+        self.assertEqual(judge([signed("lint", LINT)]).checks["tests"], NOT_RUN)
+
+    def test_neg_report_pass_with_one_not_run_is_not_pass(self):
+        # Negative 2 / acceptance 2: one NOT_RUN blocks and the reason names the check.
+        result = judge(["STATUS: PASS", signed("lint", LINT)])
+        self.assertNotEqual(result.verdict, PASS)
+        self.assertEqual(result.checks["tests"], NOT_RUN)
+        self.assertIn("tests: no record", result.reasons)
 
     def test_ok_all_required_checks_recorded_on_final_sha(self):
         resolved = CheckResult(argv=("C:/Python/python.exe", *TESTS[1:]), runner="python",

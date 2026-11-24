@@ -228,12 +228,16 @@ def _claimed_check(raw: object) -> object:
 
 def receipt_verdict(required: object, records: object, final_sha: object, *,
                     key: bytes, changed_files: Iterable[str],
-                    commit_files: Iterable[str]) -> ReceiptVerdict:
+                    commit_files: Iterable[str],
+                    dirty_paths: Iterable[str]) -> ReceiptVerdict:
     """Judge a slice from runner-signed records only.
 
     ``required`` maps check id -> argv. Raises ``ValueError`` for an empty or
     malformed check list, a bad ``final_sha`` or key; anything wrong with a
-    record is a non-PASS verdict, never an exception.
+    record is a non-PASS verdict, never an exception. ``dirty_paths`` are the
+    caller's uncommitted or untracked owned paths after the worker's commit
+    (M2); any one makes the verdict at least PARTIAL ("partial_commit"). It
+    has no default so a caller cannot forget it and get PASS.
     """
     key = _key(key)
     if not _is_sha(final_sha):
@@ -291,6 +295,19 @@ def receipt_verdict(required: object, records: object, final_sha: object, *,
         reasons.append("changed/commit file sets are malformed")
     if outside:
         reasons.append(f"files outside the commit: {outside[:5]}")
+        if _RANK[verdict] < _RANK[PARTIAL]:
+            verdict = PARTIAL
+    try:
+        if isinstance(dirty_paths, str):
+            raise TypeError
+        dirty = sorted(set(dirty_paths))
+        if any(type(p) is not str or not p for p in dirty):
+            raise TypeError
+    except TypeError:
+        dirty, verdict = [], INVALID
+        reasons.append("dirty path list is malformed")
+    if dirty:
+        reasons.append(f"partial_commit: {dirty[:5]}")
         if _RANK[verdict] < _RANK[PARTIAL]:
             verdict = PARTIAL
     return ReceiptVerdict(verdict, checks, tuple(reasons))
