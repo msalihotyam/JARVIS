@@ -604,6 +604,8 @@
   "tests.test_intent.TokenUsageFoundationTests": 2.212,
   "tests.test_intent.WebResearchTests": 4.099,
   "tests.test_key1_check.Key1CheckTests": 145.173,
+  "tests.test_key1_obs.Key1ObsTests": 0.8,
+  "tests.test_lesson_coverage.LessonCoverageTests": 0.4,
   "tests.test_lesson_extract.LessonExtractTests": 0.5,
   "tests.test_lesson_extract.PhoneShapeTests": 0.05,
   "tests.test_live_stop.AtMostOnceTests": 6.749,
