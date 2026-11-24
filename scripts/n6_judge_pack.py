@@ -100,6 +100,8 @@ def _kpi(db: Path, root: Path) -> tuple[tuple[KpiRow, ...], tuple[LimitedEvent, 
     source = _not_operator(db, root)
     if not source.is_file():  # sqlite3.connect would create an empty database
         raise PackError(f"refused: no KPI database {db.name}")
+    for suffix in ("-wal", "-shm", "-journal"):  # sqlite opens these beside the db
+        _not_operator(source.with_name(source.name + suffix), root)
     with tempfile.TemporaryDirectory() as tmp:
         copy = Path(tmp) / "kpi.db"
         with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as src, \
@@ -113,8 +115,8 @@ def _baseline(path: Path, root: Path) -> tuple[dict[str, dict[str, object]] | No
     source = _not_operator(path, root)
     if not source.is_file():
         return None, MISSING
+    sums = _not_operator(source.with_name(source.name + ".sha256"), root)
     data = source.read_bytes()
-    sums = source.with_name(source.name + ".sha256")
     try:
         pinned = sums.read_text(encoding="ascii").split()
     except (OSError, UnicodeDecodeError) as error:
@@ -156,13 +158,15 @@ def _row(row: KpiRow | None) -> str:
 
 def build(acceptance_set: Path, kpi_db: Path, baseline: Path, root: Path) -> str:
     """The packet text; raises PackError (nothing written) on any refused input."""
+    set_path = _not_operator(acceptance_set, root)
+    _not_operator(set_path.parent / e8.SUMS_NAME, root)  # load_set reads it too
     try:
-        pinned, slice_ids = e8.load_set(_not_operator(acceptance_set, root))
+        pinned, slice_ids = e8.load_set(set_path)
     except e8.SetError as error:
         raise PackError(f"refused: acceptance set: {error}") from error
     rows, limited = _kpi(kpi_db, root)
     groups, base_sha = _baseline(baseline, root)
-    code, e8_text = e8.report(rows, acceptance_set, limited)
+    code, e8_text = e8.report(rows, set_path, limited)
     if code == 2:
         raise PackError(f"refused: the E8 report refused: {e8_text.splitlines()[0]}")
     by = {(r.slice_id, r.source): r for r in rows}
@@ -253,10 +257,17 @@ def write(text: str, out: Path, root: Path) -> str:
     target = _guard(out, root)
     data = text.encode("utf-8")
     target.parent.mkdir(parents=True, exist_ok=True)
-    # Write beside, then replace the name: a hardlinked old packet's other name is never written.
-    part = target.with_name(target.name + ".part")
-    part.write_bytes(data)
-    os.replace(part, target)
+    # A fresh exclusive (O_EXCL) temp name, then replace the name: no planted link at a fixed
+    # name is followed, and a hardlinked old packet's other name is never written.
+    fd, name = tempfile.mkstemp(prefix=target.name + ".", suffix=".part", dir=target.parent)
+    part = Path(name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+        os.replace(part, target)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
     return hashlib.sha256(data).hexdigest()
 
 

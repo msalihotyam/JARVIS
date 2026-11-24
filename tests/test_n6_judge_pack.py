@@ -11,6 +11,7 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -226,6 +227,61 @@ class JudgePackTest(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("no KPI database", said)
         self.assertFalse((self.root / "build" / "n6" / "none.db").exists())
+
+    def _operator_db(self) -> Path:
+        db = self.root / "data" / "jarvis.db"
+        db.parent.mkdir()
+        db.write_bytes(b"operator")
+        return db
+
+    def _link(self, name: Path, to: Path) -> None:
+        name.unlink(missing_ok=True)
+        os.link(to, name)
+
+    def test_planted_hardlinked_part_is_never_written(self) -> None:
+        _fixture(self.root)
+        canary = self.root / "canary.txt"  # an input as link target would be refused as nlink 2
+        canary.write_bytes(b"keep")
+        reports = self.root / "build" / "reports"
+        reports.mkdir()
+        self._link(reports / (pack.OUT_NAME + ".part"), canary)
+        self.assertEqual(_main(self.root)[0], 0)
+        self.assertEqual(canary.read_bytes(), b"keep")
+        self.assertEqual(sorted(p.name for p in reports.iterdir()),
+                         sorted([pack.OUT_NAME, pack.OUT_NAME + ".part"]))
+
+    def test_hardlinked_old_packet_name_is_replaced_not_written_through(self) -> None:
+        _fixture(self.root)
+        canary = self.root / "canary.txt"
+        canary.write_bytes(b"keep")
+        _packet(self.root).parent.mkdir(parents=True)
+        self._link(_packet(self.root), canary)
+        self.assertEqual(_main(self.root)[0], 0)
+        self.assertEqual(canary.read_bytes(), b"keep")
+        self.assertIn("# N6 Phase 3 judge packet", _packet(self.root).read_text(encoding="utf-8"))
+
+    def test_failed_replace_leaves_no_temp_file(self) -> None:
+        _fixture(self.root)
+        _packet(self.root).mkdir(parents=True)  # a folder at the target name: os.replace fails
+        self.assertEqual(_main(self.root)[0], 2)
+        self.assertEqual([p.name for p in _packet(self.root).parent.iterdir()], [pack.OUT_NAME])
+
+    def test_hardlinked_sidecars_are_refused_before_open(self) -> None:
+        n6 = Path("build") / "n6"
+        for sidecar in (n6 / "baseline.json.sha256", Path("dev") / "n6" / "acceptance" / "SHA256SUMS",
+                        n6 / "kpi.db-wal", n6 / "kpi.db-shm", n6 / "kpi.db-journal"):
+            with self.subTest(sidecar=str(sidecar)), tempfile.TemporaryDirectory() as tmp:
+                self.root = Path(tmp).resolve()
+                _fixture(self.root)
+                db = self._operator_db()
+                self._link(self.root / sidecar, db)
+                code, said = _main(self.root)
+                self.assertEqual(code, 2, said)
+                # Before the fix the sidecar was read first and refused later as a hash/format
+                # mismatch; "operator data" is only said before any read.
+                self.assertIn("operator data", said)
+                self.assertEqual(db.read_bytes(), b"operator")
+                self.assertFalse(_packet(self.root).exists())
 
     def test_real_pinned_set_builds(self) -> None:
         _fixture(self.root, baseline=False)
