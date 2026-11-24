@@ -1,0 +1,7 @@
+{
+  "version": 1,
+  "about": "Local unittest timing estimate for TALKGLOSS1.",
+  "classes": {
+    "tests.test_talk_glossary.TalkGlossaryTests": 0.01
+  }
+}
