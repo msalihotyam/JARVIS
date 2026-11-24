@@ -8404,6 +8404,51 @@ class TestAdvisorTrial(Base):  # CONVADVISOR
         self.assertFalse({"advisor", "subagent_model"} & set(ev))
         self.assertFalse({"advisor", "subagent_model"} & set(self.lanes()["A"]))
 
+    def codex_dispatch(self, info):  # CODEXMODEL1FIX: one auto slice routed to codex, its dispatch event
+        self.backlog({"id": "A", "worker": "auto", "model": "opus", "effort": "max"})
+
+        def start_codex(n, b, t):
+            if info is not None:
+                self.c.codex.info["cx-" + n] = info
+            return "cx-" + n
+        with (mock.patch.object(self.c, "route", lambda s: ("codex", "test")),
+              mock.patch.object(self.c, "start_codex", start_codex),
+              mock.patch.object(self.c, "start", side_effect=AssertionError)):
+            self.c.pass_once()
+        (ev,) = self.dispatches()
+        return ev["model"], ev["effort"]
+
+    def test_codex_dispatch_event_names_codex_model_and_effort_not_the_slice(self):
+        info = {"pid": 1, "model": "gpt-6.2-sol", "effort": "high"}
+        self.assertEqual(self.codex_dispatch(info), ("gpt-6.2-sol", "high"))
+        self.assertEqual(self.lanes()["A"]["codex"], info)
+
+    def test_codex_dispatch_event_without_codex_info_never_names_the_slice_model(self):
+        self.assertEqual(self.codex_dispatch(None), (None, None))
+
+    def test_codex_dispatch_event_with_non_dict_codex_info_names_none(self):
+        self.assertEqual(self.codex_dispatch("corrupt"), (None, None))
+
+    def test_claude_dispatch_event_keeps_the_slice_model_and_effort(self):
+        self.backlog({"id": "B", "model": "opus", "effort": "high"})
+        self.c.pass_once()
+        (ev,) = self.dispatches()
+        self.assertEqual((ev["model"], ev["effort"]), ("opus", "high"))
+
+    def test_route_time_pace_refusal_writes_one_codex_hold_event(self):  # CODEXMODEL1FIX
+        s = {"id": "RT1", "worker": "auto", "tier": "T1", "class": "C", "files": ["docs/x.md"]}
+        self.c.usage = 80
+        for why, held in (("pace: effort xhigh is not low/medium/high", True),
+                          ("pace: model gpt-x not in the catalogue", True),
+                          ("stale reading", False), ("limit reached", False), ("paceful", False)):
+            with self.subTest(why=why):
+                before = len(self.events())
+                with mock.patch.object(self.c.codex, "admit", return_value=(50, why)):
+                    self.assertEqual(self.c.route(s), ("claude", f"codex {why}"))
+                new = self.events()[before:]
+                self.assertEqual(new, [{"ts": new[0]["ts"], "event": "codex_hold", "lane": "RT1",
+                                        "headroom": 50, "reason": why}] if held else [])
+
     def test_subagent_model_is_env_for_that_lane_only_with_a_note_after_the_header(self):
         self.backlog({"id": "A", "subagent_model": "haiku"}, {"id": "B"})
         self.c.pass_once()

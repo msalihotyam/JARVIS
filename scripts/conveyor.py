@@ -3160,6 +3160,8 @@ class Conveyor:
         except Exception as e:
             return "claude", f"codex admit {type(e).__name__}"
         if why:
+            if str(why).startswith("pace: "):  # CODEXMODEL1FIX: a bad pace.json is visible, not only a claude route
+                self.event("codex_hold", lane=s.get("id"), headroom=h, reason=why)
             return "claude", f"codex {why}"
         if isinstance(h, bool) or not isinstance(h, (int, float)):
             return "claude", "codex headroom unknown"
@@ -4462,7 +4464,12 @@ class Conveyor:
             started = True
             if old not in ("main", base):  # BASEAUTO1: a stale base of an unstarted slice followed main
                 self.event("base_refreshed", slice=name, old=old, new=base)
-            self.event("dispatch", lane=name, id=sid, model=s["model"], effort=s["effort"],
+            model, effort = s["model"], s["effort"]
+            if codex:  # CODEXMODEL1FIX: what CodexWorker started with, never the slice's Claude model
+                info = lanes[name].get("codex")
+                info = info if isinstance(info, dict) else {}
+                model, effort = info.get("model"), info.get("effort")
+            self.event("dispatch", lane=name, id=sid, model=model, effort=effort,
                        file=dest.name, backlog=True, tier=s["tier"],
                        route=s.get("route") if isinstance(s.get("route"), str) else "slice model", **trial)
 
