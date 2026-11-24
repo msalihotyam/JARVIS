@@ -56,7 +56,7 @@ def _commit(manager, path, name, text):
 
 
 class Base(unittest.TestCase):
-    BASED = False  # True: the template repo already holds keep.txt and sub/x.txt (see based_stage)
+    BASE_FILES = ()
 
     @classmethod
     def setUpClass(cls):
@@ -66,9 +66,8 @@ class Base(unittest.TestCase):
         cls.addClassCleanup(template.cleanup)
         manager = StageManager(Path(template.name) / "stages")
         cls._template = manager.create_repo(Path(template.name) / "project")
-        if cls.BASED:
-            _commit(manager, cls._template, "keep.txt", "keep\n")
-            _commit(manager, cls._template, "sub/x.txt", "x\n")
+        for name, text in cls.BASE_FILES:
+            _commit(manager, cls._template, name, text)
 
     def setUp(self):
         temp = tempfile.TemporaryDirectory(dir=os.environ.get("TEMP"),
@@ -130,7 +129,7 @@ class Base(unittest.TestCase):
         return _commit(self.manager, path, name, text)
 
     def based_stage(self):
-        if not self.BASED:
+        if not self.BASE_FILES:
             self.commit_in(self.repo, "keep.txt", "keep\n")
             self.commit_in(self.repo, "sub/x.txt", "x\n")
         return self.ports.stage_create(self.step)
@@ -466,15 +465,39 @@ def _put(path, text):
 
 
 class ApplyBase(Base):
-    BASED = True
+    BASE_FILES = (("keep.txt", "keep\n"), ("sub/x.txt", "x\n"))
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        fixture = cls()
+        cls.addClassCleanup(fixture.doCleanups)
+        Base.setUp(fixture)
+        stage = fixture.based_stage()
+        fixture.commit_in(stage.path, "allowed.txt", "allowed\n")
+        cls._scope_result = fixture.ports.scope_check(stage)
+        cls._base, cls._judged = stage.base, fixture.pinned(stage)
+        cls._head = fixture.commit_in(fixture.repo, "z.txt", "z\n")
+        # These repositories are independent. Copy their objects, refs and index
+        # so each test can mutate them freely, including deliberately corrupting refs.
+        cls._template = fixture.repo
+        cls._stage_template = stage.path
+        cls._run_template = fixture.jarvis_repo(stage)
+        cls._stage_relative = stage.path.relative_to(fixture.manager.root)
+        cls._branch = stage.branch
 
     def setUp(self):
         super().setUp()
-        self.stage = self.based_stage()
-        self.commit_in(self.stage.path, "allowed.txt", "allowed\n")
-        self.assertEqual(self.ports.scope_check(self.stage), [])
-        self.B, self.C = self.stage.base, self.pinned(self.stage)
-        self.X = self.commit_in(self.repo, "z.txt", "z\n")
+        path = self.manager.root / self._stage_relative
+        shutil.copytree(self._stage_template, path)
+        self.stage = Stage(self.repo, path, self._branch, self._base)
+        shutil.copytree(self._run_template, self.jarvis_repo(self.stage))
+        # Record the stage with this test's paths and clock in its own ledger.
+        self.ports.append_event(EventKind.PROGRESS, self.step.key, {
+            "gate": "stage", "target": str(self.stage.target), "path": str(self.stage.path),
+            "branch": self.stage.branch, "base": self.stage.base})
+        self.assertEqual(self._scope_result, [])
+        self.B, self.C, self.X = self._base, self._judged, self._head
         self.intent()
 
     def intent(self, key="k"):
@@ -968,8 +991,10 @@ class BrokenRefTests(ApplyBase):
 
 
 class SliceChainTests(Base):
+    BASE_FILES = (("keep.txt", "keep\n"),)
+
     def rig(self, count, after_first=None):
-        head = self.commit_in(self.repo, "keep.txt", "keep\n")
+        head = self.git(self.repo, "rev-parse", "HEAD").strip()
         self.check_outputs *= count
         ports = self.build(targets={f"s{n}.txt": "file" for n in range(1, count + 1)})
         tips, stages = [], []
@@ -1074,7 +1099,7 @@ class SliceChainTests(Base):
         self.assert_move_between_slices_fails_closed(move)
 
     def test_first_slice_refuses_a_ref_the_ledger_never_recorded(self):
-        head = self.commit_in(self.repo, "keep.txt", "keep\n")
+        head = self.git(self.repo, "rev-parse", "HEAD").strip()
         self.git(self.repo, "update-ref", REF, head)
         before = self.git(self.repo, "for-each-ref")
         with self.assertRaisesRegex(StageError, "does not match the ledger"):
@@ -1082,7 +1107,7 @@ class SliceChainTests(Base):
         self.assertEqual(self.git(self.repo, "for-each-ref"), before)
 
     def test_without_a_receipt_the_ref_must_stay_at_the_recorded_start(self):
-        head = self.commit_in(self.repo, "keep.txt", "keep\n")
+        head = self.git(self.repo, "rev-parse", "HEAD").strip()
         self.ports.stage_create(self.step)
         # A failed apply gate is not a receipt.
         self.ports.append_event(EventKind.PROGRESS, self.step.key,
@@ -1096,7 +1121,7 @@ class SliceChainTests(Base):
         self.assertEqual(self.git(self.repo, "for-each-ref", REF), "")
 
     def test_broken_or_symbolic_integration_ref_stops_stage_create(self):
-        head = self.commit_in(self.repo, "keep.txt", "keep\n")
+        head = self.git(self.repo, "rev-parse", "HEAD").strip()
         path = Path(self.repo) / ".git" / REF
         path.parent.mkdir(parents=True, exist_ok=True)
         for shape, text in BROKEN.items():
