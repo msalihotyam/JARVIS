@@ -23,7 +23,8 @@ _TR = str.maketrans("çğıöşüâîû", "cgiosuaiu")
 # checks the keyword by lookahead and takes the run possessively (same matches as before).
 _SECRET = re.compile(
     r"sk-ant-[\w-]{8,}"
-    r"|(?<![A-Za-z0-9])(?:gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,})"
+    # DORAGATE1FIX4: no left boundary, a token glued to a letter/digit ('xghp_...') is refused
+    r"|gh[pousr]_[A-Za-z0-9]{20,}|github_pat_\w{20,}"
     r"|(?<![\w-])(?i:(?=[\w-]*?(?:key|token|secret|passw(?:or)?d|pwd))[\w-]++)"
     r"[\"']?\s*[=:]\s*[\"']?[^\s\"',;]{32,}")
 

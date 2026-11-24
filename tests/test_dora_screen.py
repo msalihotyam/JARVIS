@@ -61,8 +61,17 @@ class DoraScreenTests(unittest.TestCase):
         self.assertEqual(screen("token=short"), (True, ""))
         self.assertEqual(screen("commit " + "a1" * 20), (True, ""))  # bare 40-hex is no secret
 
+    def test_neg_github_token_refused_with_glued_prefix(self):  # CDX-DORAGATE1FIX3 F1
+        body, pat = "A" * 36, "github" + "_pat_" + "B" * 30
+        tokens = [f"gh{c}_{body}" for c in "pousr"] + [pat]
+        for tok in tokens:
+            for pre in ("", " ", "x", "7", "token", "_", "é", "a "):
+                self.assertEqual(screen(pre + tok), (False, "secret"), (pre + tok)[:20])
+        self.assertEqual(screen("x" + GH), (False, "secret"))
+        self.assertEqual(screen("x" + GH[:2] + "​" + GH[2:]), (False, "secret"))  # zero-width
+
     def test_reason_never_holds_matched_text(self):
-        for text in (WORD, SK, GH, GENERIC):
+        for text in (WORD, SK, GH, GENERIC, "x" + GH, "xgithub" + "_pat_" + "B" * 30):
             ok, why = screen(text)
             self.assertFalse(ok)
             self.assertIn(why, {"deny", "secret"})
@@ -92,7 +101,8 @@ class DoraScreenTests(unittest.TestCase):
 
     def test_secret_pattern_is_linear(self):  # CLREV-DORAGATE1 F1: was cubic on long runs
         for text in ("key" * 16667, "key-" * 12500, "Token" * 10000, "a" * 50000, "-" * 50000,
-                     ("key=" + "x" * 31 + " ") * 1390, "pwd_" * 12500 + ":"):
+                     ("key=" + "x" * 31 + " ") * 1390, "pwd_" * 12500 + ":",
+                     "xghp_" * 10000, "github" + "_pat_" * 4500, "gh" * 25000):
             start = time.perf_counter()
             dora_screen._SECRET.search(text)
             self.assertLess(time.perf_counter() - start, 0.1, text[:12])
