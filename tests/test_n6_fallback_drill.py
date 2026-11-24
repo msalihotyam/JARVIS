@@ -101,6 +101,27 @@ class FallbackDrillTests(unittest.TestCase):
             self.d.run()
         self.assertFalse((self.d.n6 / "LIMITED_ON").exists())  # refused before any switch
 
+    def test_c_refuses_an_unreadable_files_value(self):  # N6ROLLDRILL1FIX2: CDX F2 class
+        backlog = {"id": "S1", "tier": "T1", "n6": True, "depends_on": []}
+        bad = ("riotx", "", {"data/x": 1}, 5, ["ok.md", ["data/x"]], ["ok.md", 7], ["ok.md", None], True)
+        for where in ("lane", "backlog"):
+            for files in bad:
+                with self.subTest(where=where, files=files):
+                    lane = {"status": None, "finished": False}
+                    (lane if where == "lane" else backlog)["files"] = files
+                    lr._put(self.d.conv / "backlog.json", {"slices": [backlog]})
+                    lr._put(self.d.conv / "lanes.json", {"S1": lane})
+                    with self.assertRaisesRegex(drill.DrillRefused, "unreadable files"):
+                        self.d.preflight()
+                    backlog.pop("files", None)
+        lr._put(self.d.conv / "backlog.json", {"slices": [backlog]})
+        lr._put(self.d.conv / "lanes.json", {"S1": "running"})
+        with self.assertRaisesRegex(drill.DrillRefused, "unreadable lane"):
+            self.d.preflight()
+        lr._put(self.d.conv / "lanes.json", {"S1": {"finished": False, "files": None}})
+        self.d.preflight()  # absent/None files: no paths, not refused
+        self.assertFalse((self.d.n6 / "LIMITED_ON").exists())
+
     def test_d_refuses_a_path_it_did_not_create(self):
         with self.assertRaises(drill.DrillRefused):
             drill.Drill(ROOT, self.token)
@@ -144,6 +165,20 @@ class FallbackDrillTests(unittest.TestCase):
         for variant, paths in cases.items():
             for p in paths:
                 self.assertTrue(drill._protected(p), f"{variant}: {p!r}")
+
+    def test_protected_covers_conveyor_raw_view(self):  # N6ROLLDRILL1FIX2: CDX F1, folding must not split
+        cases = {
+            "fullwidth solidus": (".env／x", "a/.env／x", ".ENV／x"),
+            "fullwidth reverse solidus": (".env＼x", "a\\.env＼x"),
+            "small reverse solidus": (".env﹨x",),
+            "fullwidth colon/dot": (".env：x", ".env．"),
+            "casefold vs lower": (".envß", "uv.lock", "x.DB"),
+        }
+        for variant, paths in cases.items():
+            for p in paths:
+                self.assertTrue(drill._conveyor_protected(p), f"{variant}: {p!r}")
+                self.assertTrue(drill._protected(p), f"{variant}: {p!r}")
+        self.assertFalse(drill._conveyor_protected("jarvis/n6_lease.py"))
 
 
 if __name__ == "__main__":

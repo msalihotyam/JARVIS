@@ -236,8 +236,10 @@ class Drill:
             entry = backlog.get(sid, {})
             if entry.get("tier") != "T1":
                 raise DrillRefused(f"{sid}: a {entry.get('tier') or 'non-T1'} lane is in flight")
-            files = [*(ln.get("files") or [] if isinstance(ln, dict) else []), *(entry.get("files") or [])]
-            hit = [f for f in files if _protected(str(f))]
+            if not isinstance(ln, dict):
+                raise DrillRefused(f"{sid}: unreadable lane record")
+            files = [*_files(sid, ln), *_files(sid, entry)]
+            hit = [f for f in files if _protected(f)]
             if hit:
                 raise DrillRefused(f"{sid}: a protected-range lane is in flight ({hit[0]})")
 
@@ -292,10 +294,33 @@ class Drill:
         return receipt
 
 
+def _files(sid: str, rec: dict) -> list:
+    """A record's "files" as a list of str; any other shape refuses (a str "riotx" would spread into letters)."""
+    files = rec.get("files")
+    if files is None:
+        return []
+    if not isinstance(files, list) or not all(isinstance(f, str) for f in files):
+        raise DrillRefused(f"{sid}: unreadable files value {files!r:.80}")
+    return files
+
+
+def _conveyor_protected(path: str) -> bool:
+    """scripts/conveyor.py protected_path + PROTECTED_FILES, copied exactly (not imported: keeps the drill out of it)."""
+    p = path.replace("\\", "/").lower()
+    base = p.rsplit("/", 1)[-1]
+    return (p in PROTECTED_FILES or base == "uv.lock" or base.startswith(".env")
+            or p.startswith(("data/", "dev/dashboard/")) or p.startswith((".github/workflows/", ".claude/"))
+            or "/.jarvis/" in "/" + p or any(s.startswith("riot") for s in p.split("/"))
+            or base.endswith(PROTECTED_EXT))
+
+
 def _protected(path: str) -> bool:
-    """conveyor protected_path or PROTECTED_FILES, fail closed: case-insensitive, either separator, "." segments
+    """_conveyor_protected on the raw path (a superset by construction: folding below can split ".env／x"), or,
+    fail closed: case-insensitive, either separator, "." segments
     dropped, Win32 trailing dots/spaces dropped per segment, unicode compatibility forms, marks and format chars folded;
     empty, absolute, ".."-like, drive/stream (":"), glob or 8.3 ("~") paths and ancestors of a protected path count."""
+    if _conveyor_protected(path):
+        return True
     p = "".join(ch for ch in unicodedata.normalize("NFKD", path.casefold())
                 if not unicodedata.combining(ch) and unicodedata.category(ch) != "Cf")
     raw = p.replace("\\", "/").strip().split("/")
