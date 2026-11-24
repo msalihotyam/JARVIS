@@ -904,6 +904,7 @@
   "tests.test_motion_6g.TravelTests": 0.034,
   "tests.test_mutate.MutateTests": 9.5,
   "tests.test_mutgen.MutgenTests": 0.2,
+  "tests.test_n6_cleanup.N6CleanupTests": 0.3,
   "tests.test_n6_deps.N6DepsTests": 0.3,
   "tests.test_n6_e8.N6E8ReportTests": 0.3,
   "tests.test_n6_intseq.N6IntSeqShadowTests": 0.1,
