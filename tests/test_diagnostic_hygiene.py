@@ -12,6 +12,7 @@ live connector, auth probe, model subprocess, MCP or network call.
 from __future__ import annotations
 
 import json
+import shutil
 import sqlite3
 import tempfile
 import time
@@ -234,13 +235,33 @@ class TalkativeConnector(DummyConnector):
 
 
 class DiagnosticHygieneTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        template_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.addClassCleanup(safe_cleanup, template_dir)
+        cls.database_template = Path(template_dir.name) / "jarvis.db"
+        # Store initialization closes its SQLite connections, checkpointing
+        # the schema into the database file before any test copies it.
+        SQLiteMemoryStore(cls.database_template)
+
     def setUp(self) -> None:
+        if hasattr(self, "database_connection"):
+            self.database_connection.close()
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(safe_cleanup, self.temp)
         self.database = Path(self.temp.name) / "jarvis.db"
+        # Tests and subtests can mutate their own database, including through SQL.
+        shutil.copyfile(self.database_template, self.database)
         self.memory = SQLiteMemoryStore(self.database)
+        # Keep SQLite's WAL files open between the store's short connections.
+        # This connection never starts a transaction or performs test writes.
+        self.database_connection = sqlite3.connect(self.database)
+        self.addCleanup(self.database_connection.close)
+        self.database_connection.execute("PRAGMA journal_mode").close()
 
     def store(self) -> SQLiteMemoryStore:
+        self.database_connection.close()
         return SQLiteMemoryStore(self.database)
 
     def core(
