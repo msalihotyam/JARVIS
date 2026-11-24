@@ -2127,6 +2127,133 @@ class DecisionGateTest(LiveTest):
         self.assertFalse(self.registry().exists())
 
 
+class Key1LiveTest(BotCase):
+    """KEY1LIVE1FIX: live write_key1 (cv.write_key1 by=hands), off by default; any doubt asks Salih,
+    a failed re-verify escalates, a refused written file demotes and escalates; nothing else writes."""
+    live, recs, shadow_acts = LiveTest.live, LiveTest.recs, LiveTest.shadow_acts
+    DEC = "D-20261124-1200-HANDS-KEY1"
+    NAME = f"push-{SHA}-int-x"
+
+    def setUp(self):
+        super().setUp()
+        self.put("build/conveyor/lanes.json", {"INT-X": {"files": ["jarvis/a.py"], "ci": {"cand": True, "sha": SHA}}})
+        self.events({"ts": "2026-10-15T11:00:00", "event": "ci_result", "lane": "INT-X", "sha": SHA,
+                     "result": "success"})
+        self.backlog()
+        self.put("build/reports/INT-X.md", "STATUS: PASS\nCI BRANCH: ci/int-x\n")
+        self.put("build/reports/CLREV-X.md", "STATUS: PASS\nREVIEWER: opus-a\nFINDINGS: none\n")
+        orchbot.od.add(self.DEC, "authority", "test", "2026-10-15T12:00:00", path=self.root / orchbot.od.REL)
+        for p in (mock.patch.object(orchbot, "KEY1_DECISION", self.DEC),
+                  mock.patch.object(orchbot, "git_ref", return_value="b" * 40)):
+            p.start()
+            self.addCleanup(p.stop)
+
+    def backlog(self, tier="T1", files=("jarvis/a.py",)):
+        self.put("build/conveyor/backlog.json", {"slices": [
+            {"id": "INT-X", "tier": "T1", "depends_on": ["CLREV-X"]},
+            {"id": "X", "tier": tier, "files": list(files), "chain": ["CLREV"]}]})
+
+    def go(self, verify=None):
+        self.bot = orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append, from_start=True,
+                               wake_post=self.post, wake_topic=self.topic,
+                               key1_verify=verify or (lambda lane, sha: (True, "PASS")))
+        return self.bot.run()
+
+    def key(self):
+        return self.root / "build" / "approvals" / self.NAME
+
+    def assert_shadow(self, ds):
+        self.assertFalse(self.key().exists())
+        self.assertEqual(self.recs(ds), [])
+        self.assertIn(("write_key1", "O26", "INT-X"), self.shadow_acts(ds))
+
+    def assert_ask(self, rule):
+        self.live(write_key1=True)
+        ds = self.go()
+        self.assertFalse(self.key().exists())
+        self.assertIn(("ask_salih_key1", rule, "INT-X"), self.shadow_acts(ds))
+        self.assertEqual([r for r in self.recs(ds) if r["did"] == "write_key1"], [])
+
+    def test_canonical_live_write(self):
+        self.live(write_key1=True)
+        ds = self.go()
+        self.assertIsNone(orchbot.cv.key1_refusal(self.key(), self.NAME))
+        self.assertEqual(orchbot.key1_side(self.key(), self.NAME)[:2], ("write_key1", "hands"))
+        [r] = self.recs(ds)
+        rel = f"build/approvals/{self.NAME}"
+        self.assertEqual((r["did"], r["file"], r["before"], r["undo"]),
+                         ("write_key1", rel, "absent", f"move {rel} to hold/"))
+        self.assertIn(("write_key1", "O26", "INT-X"), self.shadow_acts(ds))
+        self.assertIn("write_key1", self.bot.live)
+
+    def test_shadow_when_live_json_lacks_key(self):
+        self.live(ack=True)
+        self.assert_shadow(self.go())
+
+    def test_shadow_when_off(self):
+        self.live(write_key1=True)
+        self.put("build/bot/OFF", "")
+        self.assert_shadow(self.go())
+
+    def test_shadow_when_live_json_malformed(self):
+        self.put("build/bot/live.json", "{not json")
+        self.assert_shadow(self.go())
+
+    def test_protected_range_asks_no_file(self):
+        self.backlog(files=("jarvis/a.py", ".github/workflows/ci.yml"))
+        self.assert_ask("CONVSAFE")
+
+    def test_t2_range_asks_no_file(self):
+        self.backlog(tier="T2")
+        self.assert_ask("CONVSAFE")
+
+    def test_pending_chain_review_asks_no_file(self):  # exam d05
+        self.put("build/reports/CLREV-X.md", "STATUS: RUNNING\n")
+        self.assert_ask("CONVSAFE")
+
+    def test_no_review_asks_no_file(self):  # exam d10
+        (self.root / "build" / "reports" / "CLREV-X.md").unlink()
+        self.assert_ask("CONVSAFE")
+
+    def test_no_ci_branch_asks_no_file(self):
+        self.put("build/reports/INT-X.md", "STATUS: PASS\n")
+        self.assert_ask("CONVSAFE")
+
+    def test_daily_cap_asks_no_file(self):
+        self.assertEqual(orchbot.DAILY_CAP["write_key1"], 30)
+        with mock.patch.object(orchbot.Bot, "capped", side_effect=lambda code, at: code == "write_key1"):
+            self.assert_ask("ALLOW-T5")
+
+    def test_reverify_fail_escalates_no_file(self):
+        self.live(write_key1=True)
+        calls = []
+
+        def verify(lane, sha):
+            calls.append(sha)
+            return (True, "PASS") if len(calls) == 1 else (False, "FAIL patch-id moved")
+        ds = self.go(verify)
+        self.assertEqual(calls, [SHA, SHA])
+        self.assertFalse(self.key().exists())
+        self.assertIn(("escalate_orchestrator", "REVERIFY", "INT-X"), self.shadow_acts(ds))
+
+    def test_refused_written_file_demotes_and_escalates(self):
+        self.live(write_key1=True)
+        with mock.patch.object(orchbot.cv, "key1_refusal", return_value="bad header"):
+            ds = self.go()
+        self.assertTrue(self.key().exists())  # remove nothing: the orchestrator looks at it
+        self.assertNotIn("write_key1", self.bot.live)
+        self.assertIn("demote", [r["did"] for r in self.recs(ds)])
+        self.assertIn(("escalate_orchestrator", "FAILCLOSED", "INT-X"), self.shadow_acts(ds))
+
+    def test_od_refusal_no_file(self):
+        self.live(write_key1=True)
+        with mock.patch.object(orchbot, "KEY1_DECISION", None):
+            ds = self.go()
+        self.assertFalse(self.key().exists())
+        self.assertIn(("escalate_orchestrator", "DECISIONID", "INT-X"), self.shadow_acts(ds))
+        self.assertIn("write_key1", self.bot.live)  # a refusal waits for Salih, it does not demote
+
+
 class AllowlistT1T5Test(BotCase):
     """build/orch/devir/ALLOWLIST_v1.md T1..T5 in the hands path."""
 
