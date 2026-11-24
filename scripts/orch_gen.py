@@ -42,7 +42,9 @@ import hashlib
 import json
 import math
 import os
+import posixpath
 import re
+import secrets
 import subprocess
 import sys
 import time
@@ -731,7 +733,9 @@ LOW, TARGET, PER_ROUND = 2, 3, 2  # P2: trigger below LOW ready, fill toward TAR
 DEPOT_CAP = {"n6": 2, "improve": 2}  # N8: depot slices per class per UTC day (reviewed code, no data file)
 AT_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
 OWNED_RE = re.compile(r"([A-Za-z0-9_][A-Za-z0-9_./-]*)( \(new\))?")
-INBOX_RE = re.compile(r"spec_needed:(n6|improve)|queue_empty|unknown_outcome:[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+INBOX_RE = re.compile(r"spec_needed:(n6|improve)|queue_empty|stale_fill_lock"
+                      r"|unknown_outcome:[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+ATTEMPT_RE = re.compile(r"[0-9a-f]{16}")  # N9: one id per intent, repeated in its own receipt
 
 
 def _no_dupes(pairs):
@@ -769,16 +773,33 @@ def parse_spec(raw, stem=None):
           and all(isinstance(d, str) and conveyor.LANE_RE.fullmatch(d) for d in sp["depends_on"]))
     if not ok:
         raise Refuse(f"N13 spec {stem or '?'}: a field breaks the schema")
+    odd = [p for p in owned_paths(sp) if not canonical(p)]
+    if odd:
+        raise Refuse(f"N13 spec {stem or '?'}: owned path not canonical: {', '.join(odd)}")
     return sp, hashlib.sha256(raw).hexdigest()
+
+
+def canonical(p):
+    """N12/N13: one spelling per file, so the protected check sees the path git and Windows would write."""
+    return (p == posixpath.normpath(p) and not p.startswith("/") and "\\" not in p and ":" not in p
+            and all(s not in ("", ".", "..") and s == s.rstrip(". ") for s in p.split("/")))
 
 
 def owned_paths(sp):
     return [OWNED_RE.fullmatch(p).group(1) for p in sp["owned_files"]]
 
 
+def is_protected(p):
+    """conveyor's protected check plus a case-insensitive match (Windows paths) on its files and dirs."""
+    q = p.casefold()
+    return conveyor.protected_path(p) or conveyor.protected_path(p + "/") or any(
+        q == e or q.startswith(e + "/")
+        for e in (x.casefold().rstrip("/") for x in (*conveyor.PROTECTED_FILES, *conveyor.PROTECTED_DIRS)))
+
+
 def spec_tier(sp):
     """The tier from owned_files: any protected file needs T2; a lower declared tier is refused (N12)."""
-    hot = [p for p in owned_paths(sp) if conveyor.protected_path(p) or p in conveyor.PROTECTED_FILES]
+    hot = [p for p in owned_paths(sp) if is_protected(p)]
     if hot and sp["tier"] != "T2":
         raise Refuse(f"N12 {sp['id']}: declared {sp['tier']} but owns protected {', '.join(hot)}")
     return sp["tier"]
@@ -897,11 +918,11 @@ def origin_main(g):
     return o.strip()
 
 
-LOCK_STALE_S = 1800  # a fill.lock older than this whose owner pid is gone is reclaimed (one journal line)
+LOCK_STALE_S = 1800  # a fill.lock older than this whose owner pid is gone raises one inbox item; never reclaimed
 
 
 def pid_alive(pid):
-    """True unless the OS says pid is gone; any doubt counts as alive (a live lock is never reclaimed)."""
+    """True unless the OS says pid is gone; any doubt counts as alive (a live lock is never reported stale)."""
     if os.name == "nt":  # os.kill(pid, 0) on Windows sends CTRL_C_EVENT: never use it
         import ctypes
         k = ctypes.WinDLL("kernel32", use_last_error=True)
@@ -926,16 +947,17 @@ def pid_alive(pid):
 
 
 def take_lock(lock, t):
-    """O_EXCL create that records the owner; False if the lock already exists."""
+    """O_EXCL create that records the owner and a random token; the bytes written, or None if the lock exists."""
+    raw = json.dumps({"pid": os.getpid(), "at": t, "token": secrets.token_hex(16)}).encode("ascii")
     try:
-        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
     except FileExistsError:
-        return False
+        return None
     try:
-        os.write(fd, json.dumps({"pid": os.getpid(), "at": t}).encode("ascii"))
+        os.write(fd, raw)
     finally:
         os.close(fd)
-    return True
+    return raw
 
 
 def stale_lock(lock, t):
@@ -959,29 +981,31 @@ def depot_fill(g, cls, propose, write, t):
     """QUEUEFILL2: approved READY depot specs -> slices for a low class. Dry-run unless write; one fill at a time."""
     run = g.root / DEPOT / "_run"
     lock = run / "fill.lock"
+    mine, at = None, datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     if write:
         run.mkdir(parents=True, exist_ok=True)
-        if not take_lock(lock, t):  # N10: a second concurrent fill refuses
-            stale = stale_lock(lock, t)
-            if stale is None:
-                raise Refuse(f"N10 another depot fill holds {lock.relative_to(g.root).as_posix()}")
-            pid, raw = stale
-            try:  # re-read right before unlinking: only the lock judged stale is removed
-                same = lock.read_bytes() == raw
-            except OSError:
-                same = False
-            if not same:
-                raise Refuse(f"N10 another depot fill holds {lock.relative_to(g.root).as_posix()}")
-            journal(run, {"kind": "lock_reclaimed", "pid": pid,
-                          "at": datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
-            lock.unlink()
-            if not take_lock(lock, t):  # one retry; losing it to another fill is N10
-                raise Refuse(f"N10 another depot fill holds {lock.relative_to(g.root).as_posix()}")
+        mine = take_lock(lock, t)
+        if mine is None:  # N10: an existing lock always refuses; it is never reclaimed (no atomic reclaim on NTFS)
+            where = lock.relative_to(g.root).as_posix()
+            if stale_lock(lock, t) is None:
+                raise Refuse(f"N10 another depot fill holds {where}")
+            try:  # one item per outage; a human checks the dead owner's work and removes the lock
+                inbox_set(run, "stale_fill_lock", True, at, write, g.out)
+            except (Refuse, OSError) as e:
+                g.out(f"depot: could not raise inbox stale_fill_lock: {e}")
+            raise Refuse(f"N10 {where} is older than {LOCK_STALE_S}s and its pid is gone; a human removes it")
     try:
+        if write:
+            inbox_set(run, "stale_fill_lock", False, at, write, g.out)
         return _depot_fill(g, run, cls, propose, write, t)
     finally:
         if write:
-            lock.unlink()
+            try:  # unlink only our own lock (the token written at O_EXCL create)
+                ours = lock.read_bytes() == mine
+            except OSError:
+                ours = False
+            if ours:
+                lock.unlink()
 
 
 def _depot_fill(g, run, cls, propose, write, t):
@@ -999,22 +1023,54 @@ def _depot_fill(g, run, cls, propose, write, t):
         if write:
             _jsave(run / "state.json", state)
 
-    # N9: an intent without a receipt is UNKNOWN_OUTCOME: adopt the slice if it landed, else reject; never retry
-    recs = [json.loads(x) for x in (run / "journal.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()] \
-        if (run / "journal.jsonl").is_file() else []
-    done = {r.get("id") for r in recs if r.get("kind") == "receipt"}
-    for sid in dict.fromkeys(r.get("id") for r in recs if r.get("kind") == "intent" and r.get("id") not in done):
-        if not isinstance(sid, str) or not conveyor.LANE_RE.fullmatch(sid):
+    def n7(sid):  # N7: one more failed check; the second one rejects the spec for good
+        st = state.setdefault(sid, {"state": "READY", "attempts": 0})
+        st["attempts"] = st.get("attempts", 0) + 1
+        if st["attempts"] >= 2:
+            st.update(state="REJECTED", reason="N7 check failed twice")
+        save()
+
+    # N9: an intent without its own receipt (same id and attempt, later in the journal) is UNKNOWN_OUTCOME:
+    # adopt the slice if it landed (and restore its N8 charge), else reject; never retry
+    try:
+        recs = [json.loads(x) for x in (run / "journal.jsonl").read_text(encoding="utf-8").splitlines()
+                if x.strip()] if (run / "journal.jsonl").is_file() else []
+    except (OSError, ValueError, RecursionError) as e:
+        raise Refuse(f"journal.jsonl unreadable ({type(e).__name__}); fail closed") from None
+    if not all(isinstance(r, dict) for r in recs):
+        raise Refuse("journal.jsonl holds a non-object line; fail closed")
+    handled = set()
+    for i, r in enumerate(recs):
+        if r.get("kind") != "intent":
+            continue
+        sid, a = r.get("id"), r.get("attempt")
+        if not isinstance(sid, str) or not conveyor.LANE_RE.fullmatch(sid) \
+                or not (a is None or isinstance(a, str) and ATTEMPT_RE.fullmatch(a)):
             raise Refuse("journal.jsonl holds a malformed intent; fail closed")
+        if sid in handled or any(x.get("kind") == "receipt" and x.get("id") == sid and x.get("attempt") == a
+                                 for x in recs[i + 1:]):
+            continue
+        handled.add(sid)
         landed = sid in ids
         st = state.setdefault(sid, {"state": "READY", "attempts": 0})
         st.update(state="CONSUMED", slice=sid) if landed else st.update(state="REJECTED", reason="UNKNOWN_OUTCOME")
         g.out(f"depot: N9 intent {sid} had no receipt: {'adopted the landed slice' if landed else 'UNKNOWN_OUTCOME'}")
-        if write:
-            journal(run, {"kind": "receipt", "id": sid, "result": "reconciled", "at": at})
+        if landed:  # F4: the crashed run charged nothing; the landed slice still counts against today's N8 cap
+            title = next(str(s.get("title", "")) for s in b["slices"] if s.get("id") == sid)
+            c = next((k for k in CLASSES if title.startswith(TITLE[k].strip())), None)
+            if c is None:
+                raise Refuse(f"N9 landed {sid} has no depot class title; fail closed")
+            iat = r.get("at")
+            if (iat[:10] if isinstance(iat, str) and AT_RE.fullmatch(iat) else day) == day:
+                caps[f"{c}:{day}"] = caps.get(f"{c}:{day}", 0) + 1
+                if write:
+                    _jsave(run / "caps.json", {k: v for k, v in caps.items() if k.endswith(day)})
+        save()  # the receipt is the last write: a crash or inbox Refuse before it leaves the intent to reconcile again
         if not landed:
             inbox_set(run, f"unknown_outcome:{sid}", True, at, write, g.out)
-        save()
+        if write:
+            journal(run, {"kind": "receipt", "id": sid, "result": "reconciled", "at": at,
+                          **({"attempt": a} if a is not None else {})})
     now = datetime.fromtimestamp(t).replace(microsecond=0)
     d = orch_digest.build(g.root, now, now - timedelta(hours=24))
     if any(i["reason"] == "unknown" and i["id"] in STATE_INPUTS for i in d["items"]):
@@ -1025,6 +1081,10 @@ def _depot_fill(g, run, cls, propose, write, t):
     specs, approvals, bad = load_depot(g.root)
     for k, why in sorted(bad.items()):
         g.out(f"depot: skipped {k}: {why}")
+        if write and "owned path not canonical" in why and conveyor.LANE_RE.fullmatch(k) \
+                and state.get(k, {}).get("state", "READY") == "READY":  # N12/N13: rejected for good
+            state.setdefault(k, {"state": "READY", "attempts": 0}).update(state="REJECTED", reason="N13")
+            save()
     deps = {x for sp, _ in specs.values() for x in sp["depends_on"]}
     on_main = {x for x in deps if (lambda r: r[0] == 0 and r[1].strip())(g.git_fn(
         g.root, "log", "-1", "--format=%H", "-E", f"--grep=(^|[ :(]){re.escape(x)}([ ):]|$)", "refs/remotes/origin/main"))}
@@ -1033,7 +1093,24 @@ def _depot_fill(g, run, cls, propose, write, t):
             raise Refuse(f"N4 proposed {propose} is not a {cls} depot spec")
         cls = specs[propose][0]["class"]
     total_ready = sum(d["ready"].values())
-    made = 0
+    written, refused = [], []  # F6: per-slice results; rc 2 (a raised Refuse) only when nothing was written
+    try:
+        _fill_classes(g, run, cls, propose, write, at, day, state, caps, b, ids, seen, d, specs, approvals,
+                      on_main, blocked, total_ready, save, n7, written, refused)
+    except (Refuse, OSError) as e:
+        if not written:
+            raise
+        refused.append(("-", str(e)))
+    for sid in written:
+        g.out(f"depot: written {sid}")
+    for sid, why in refused:
+        g.out(f"depot: refused {sid}: {why}")
+    g.out(f"depot: {len(written)} slice(s) written" if write else "depot: dry-run; nothing written (use --write)")
+    return 1 if refused else 0
+
+
+def _fill_classes(g, run, cls, propose, write, at, day, state, caps, b, ids, seen, d, specs, approvals,
+                  on_main, blocked, total_ready, save, n7, written, refused):
     for c in [cls] if cls in CLASSES else CLASSES:
         pending = [s for s in b["slices"] if str(s.get("title", "")).startswith(TITLE[c].strip())
                    and s.get("id") not in seen and not (g.reports / f"{s.get('id')}.md").is_file()]
@@ -1068,33 +1145,38 @@ def _depot_fill(g, run, cls, propose, write, t):
             bb, entry, body = g.from_spec(as_gen_spec(sp), False)
             head, rest = body.split("\n", 1)
             body = head.replace(" base=main", f" base={base}") + "\n" + rest
-            g.lint(bb, entry, body)
+            try:
+                g.lint(bb, entry, body)
+            except Refuse as e:  # F5: a lint refusal is an N7 failed check, so a bad spec cannot wedge its class
+                if not write:
+                    raise
+                n7(sid)
+                refused.append((sid, f"N7 lint: {e}"))
+                return
             if not write:
                 g.emit(bb, entry, body, False)
                 continue
             if origin_main(g) != base or g.backlog_path.read_bytes() != raw:  # N16 / N10 CAS right before emit
-                raise Refuse("N10/N16 origin/main or backlog.json moved during the fill; nothing written")
-            journal(run, {"kind": "intent", "id": sid, "sha256": sha, "base": base, "at": at})
+                raise Refuse(f"N10/N16 origin/main or backlog.json moved during the fill; {sid} not written")
+            att = secrets.token_hex(8)  # N9: the receipt names this attempt, so it never answers a later intent
+            journal(run, {"kind": "intent", "id": sid, "attempt": att, "sha256": sha, "base": base, "at": at})
             rc = g.emit(bb, entry, body, True, strict=True)
-            st = state.setdefault(sid, {"state": "READY", "attempts": 0})
             if rc:  # N7: emit restored backlog + prompt; drop its backup so a retry can run
                 (g.root / "build" / "conveyor" / "hold" / f"backlog.json.bak-{sid}").unlink(missing_ok=True)
-                st["attempts"] = st.get("attempts", 0) + 1
-                if st["attempts"] >= 2:
-                    st.update(state="REJECTED", reason="N7 check failed twice")
             else:
-                st.update(state="CONSUMED", slice=sid)
+                state.setdefault(sid, {"state": "READY", "attempts": 0}).update(state="CONSUMED", slice=sid)
                 caps[f"{c}:{day}"] = caps.get(f"{c}:{day}", 0) + 1
                 _jsave(run / "caps.json", {k: v for k, v in caps.items() if k.endswith(day)})
-                made += 1
-            journal(run, {"kind": "receipt", "id": sid, "result": "failed" if rc else "written", "at": at})
-            save()
+            journal(run, {"kind": "receipt", "id": sid, "attempt": att, "result": "failed" if rc else "written",
+                          "at": at})
             if rc:
-                return 1
+                n7(sid)
+                refused.append((sid, f"N7 check failed (rc {rc})"))
+                return
+            save()
+            written.append(sid)
             b = g.backlog()
             ids.add(sid)
-    g.out(f"depot: {made} slice(s) written" if write else "depot: dry-run; nothing written (use --write)")
-    return 0
 
 
 def main(argv=None, git=real_git, out=print, now=time.time):

@@ -5,6 +5,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -820,16 +821,94 @@ class DepotFillTest(unittest.TestCase):
         self.run_dir.mkdir(parents=True, exist_ok=True)
         (self.run_dir / "fill.lock").write_text(json.dumps({"pid": pid, "at": self.T - age}), encoding="utf-8")
 
-    def test_stale_lock_of_a_dead_pid_is_reclaimed_once(self):  # QUEUEFILL2FIX
+    def test_stale_lock_is_never_reclaimed_one_inbox_item(self):  # F1
+        self.spec("DQA")
         self.old_lock(3600)
+        lock = (self.run_dir / "fill.lock").read_bytes()
+        before = self.bl.read_bytes()
+        res = []
         with mock.patch.object(orch_gen, "pid_alive", return_value=False):
-            rc, out = self.fill("--write", "--class", "improve")
-        self.assertEqual(rc, 0, out)
-        self.assertNotIn("N10", out)
-        lines = [json.loads(x) for x in (self.run_dir / "journal.jsonl").read_text("utf-8").splitlines()]
-        self.assertEqual([x for x in lines if x["kind"] == "lock_reclaimed"],
-                         [{"kind": "lock_reclaimed", "pid": 4242, "at": "2027-01-15T08:00:00Z"}])
-        self.assertFalse((self.run_dir / "fill.lock").exists())
+            ts = [threading.Thread(target=lambda: res.append(self.fill("--write", "--class", "improve")))
+                  for _ in range(2)]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+            res.append(self.fill("--write", "--class", "improve"))
+        self.assertEqual([r for r, _ in res], [2, 2, 2], res)
+        self.assertTrue(all("N10" in o for _, o in res), res)
+        self.assertEqual(self.inbox(), ["stale_fill_lock"])  # one item per outage
+        self.assertEqual(((self.run_dir / "fill.lock").read_bytes(), self.bl.read_bytes()), (lock, before))
+        self.assertFalse((self.run_dir / "journal.jsonl").exists())
+
+    def test_lock_token_guards_unlink(self):  # F1: never unlink a lock this process did not create
+        def foreign(*a, **k):
+            (self.run_dir / "fill.lock").write_bytes(b"foreign")
+            return 0
+        with mock.patch.object(orch_gen, "_depot_fill", side_effect=foreign):
+            self.fill("--write")
+        self.assertEqual((self.run_dir / "fill.lock").read_bytes(), b"foreign")
+
+    def test_noncanonical_owned_paths_rejected(self):  # F2 N12 N13
+        before = self.bl.read_bytes()
+        probes = ("tests/../scripts/conveyor.py", "docs/../.claude/settings.json", "scripts/./conveyor.py",
+                  "scripts//conveyor.py", "scripts/conveyor.py.", "jarvis/../scripts/conveyor.py")
+        for i, p in enumerate(probes + ("/scripts/conveyor.py", "C:/x.py", "a\\b.py", "scripts/conveyor.py ")):
+            sid = f"DQZ{chr(65 + i)}"
+            with self.subTest(p=p):
+                sp = self.spec(sid, tier="T1", owned_files=[p])
+                with self.assertRaises(orch_gen.Refuse):
+                    orch_gen.parse_spec(json.dumps(sp).encode(), sid)
+                self.fill("--write", "--class", "improve")
+                self.assertEqual((self.bl.read_bytes(), self.ids()), (before, []))
+                if p in probes:
+                    self.assertEqual((self.state()[sid]["state"], self.state()[sid]["reason"]), ("REJECTED", "N13"))
+        for p in ("Scripts/Conveyor.py", "SCRIPTS/conveyor.PY", ".Claude/Settings.json", "data", "Data",
+                  "dev/dashboard", "Dev/Dashboard"):
+            self.assertTrue(orch_gen.is_protected(p), p)
+        self.spec("DQY", tier="T1", owned_files=["Scripts/Conveyor.py"])
+        self.assertIn("DQY: N12", self.assert_untouched("--write", "--class", "improve"))
+        self.assertEqual(self.state()["DQY"]["state"], "REJECTED")
+
+    def test_receipt_matches_its_own_attempt(self):  # F3 N9
+        self.spec("DQA")
+        self.run_dir.mkdir(parents=True)
+        a, b = "a" * 16, "b" * 16
+        (self.run_dir / "journal.jsonl").write_text(
+            f'{{"kind": "intent", "id": "DQA", "attempt": "{a}"}}\n'
+            f'{{"kind": "receipt", "id": "DQA", "attempt": "{a}", "result": "failed"}}\n'
+            f'{{"kind": "intent", "id": "DQA", "attempt": "{b}"}}\n', encoding="utf-8")
+        self.assert_untouched("--write", "--class", "improve")
+        self.assertEqual((self.state()["DQA"]["state"], self.state()["DQA"]["reason"]), ("REJECTED", "UNKNOWN_OUTCOME"))
+        self.assertIn("unknown_outcome:DQA", self.inbox())
+
+    def test_adopted_landed_slice_restores_cap(self):  # F4 N8 N9
+        self.run_dir.mkdir(parents=True)
+        (self.run_dir / "journal.jsonl").write_text(
+            f'{{"kind": "intent", "id": "PMX", "attempt": "{"c" * 16}", "at": "{self.day}T00:00:00Z"}}\n',
+            encoding="utf-8")
+        self.bl.write_text('{"slices": [{"id": "PMX", "title": "[N6] x"}]}', encoding="utf-8")
+        self.fill("--write", "--class", "n6")
+        self.assertEqual(self.state()["PMX"]["state"], "CONSUMED")
+        caps = json.loads((self.run_dir / "caps.json").read_text(encoding="utf-8"))
+        self.assertEqual(caps[f"n6:{self.day}"], 1)
+
+    def test_lint_refuse_goes_through_n7(self):  # F5
+        self.spec("DQL")
+        with mock.patch.object(orch_gen.Gen, "lint", side_effect=orch_gen.Refuse("bad lint")):
+            for n, st in ((1, "READY"), (2, "REJECTED")):
+                self.assertIn("N7 lint", self.assert_untouched("--write", "--class", "improve", rc=1))
+                self.assertEqual((self.state()["DQL"]["attempts"], self.state()["DQL"]["state"]), (n, st))
+
+    def test_partial_run_lists_written_and_refused(self):  # F6
+        self.spec("DQI1", order=1)
+        self.spec("DQI2", order=2)
+        self.put("build/orch/preflight.py", "import sys, pathlib\nsys.exit(int('DQI2' in (pathlib.Path(__file__)"
+                 ".resolve().parents[1] / 'conveyor' / 'backlog.json').read_text(encoding='utf-8')))\n")
+        rc, out = self.fill("--write", "--class", "improve")
+        self.assertEqual((rc, self.ids()), (1, ["DQI1"]), out)
+        self.assertIn("depot: written DQI1", out)
+        self.assertIn("depot: refused DQI2: N7 check failed", out)
 
     def test_live_young_or_malformed_lock_still_refuses(self):  # QUEUEFILL2FIX
         self.spec("DQA")
@@ -843,6 +922,7 @@ class DepotFillTest(unittest.TestCase):
                     self.assertIn("N10", self.assert_untouched("--write", rc=2))
                 self.assertTrue((self.run_dir / "fill.lock").exists())
                 self.assertFalse((self.run_dir / "journal.jsonl").exists())
+                self.assertNotIn("stale_fill_lock", self.inbox())
 
     def test_pid_alive_sees_this_process(self):  # a ctypes slip would make every lock look dead
         self.assertTrue(orch_gen.pid_alive(os.getpid()))
