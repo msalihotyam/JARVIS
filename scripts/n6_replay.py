@@ -418,6 +418,8 @@ def n6_decide(scenario: dict[str, Any]) -> str | None:
         return None
     if "tightening" in snap:
         return hands_decide(snap, scenario.get("unsafe_if") or ())
+    if "fill" in snap:
+        return fill_decide(snap["fill"], scenario.get("unsafe_if") or ())
     state = Snapshot(snap["lanes"], tuple(snap["events"]), snap["reports"])
     lane = snap["lane"]
     verdict, reason = n6_verdict(state, lane, lambda _lane: snap["head"])
@@ -431,6 +433,77 @@ def n6_decide(scenario: dict[str, Any]) -> str | None:
     done = all(state.lanes.get(c, {}).get("finished") is True and state.lanes[c].get("status") == "PASS"
                for c in children)
     return "approve_key1" if children and done else "inbox"
+
+
+# QUEUEFILL2FIX: a "fill" snapshot is decided by orch_gen.depot_fill itself (dry-run, fake git, temp root);
+# each case is the positive inputs with one change; a proposal (emit) or any backlog write is hands_propose_slice
+FILL_AT = 1_800_000_000  # the exam's fixed clock
+FILL_OWNED = ["jarvis/foo.py", "tests/test_foo.py"]
+
+
+def _fill_git(_root: Path, *args: str) -> tuple[int, str]:
+    """origin/main is a fixed sha; no owned file is on main; no depends_on has landed."""
+    if args[:2] == ("rev-parse", "--verify"):
+        return 0, "1" * 40
+    return (0, "") if args[:1] == ("log",) else (1, "")
+
+
+def fill_decide(fill: Any, unsafe: Any = ()) -> str | None:
+    """One action for every case of a queue-fill snapshot: any unsafe action wins; a crash or a split is None."""
+    try:
+        cls, cases = fill["class"], fill["cases"]
+        if not isinstance(cases, list) or not cases:
+            return None
+        said = [_fill_case(cls, case) for case in cases]
+    except (KeyError, TypeError, AttributeError, OSError, ValueError, IndexError):
+        return None
+    hit = [a for a in said if a is not None and a in (unsafe or ())]
+    if hit:
+        return hit[0]
+    return said[0] if None not in said and len(set(said)) == 1 else None
+
+
+def _fill_case(cls: Any, case: Any) -> str | None:
+    og = _hands()[1]
+    if cls not in og.CLASSES or not isinstance(case, dict) or case.get("approval", "ok") not in ("ok", "bad_sha", "none"):
+        return None  # an unknown approval word is never read as approved
+    if type(case.get("ready", 0)) is not int or not 0 <= case.get("ready", 0) <= 50:
+        return None
+    with tempfile.TemporaryDirectory(prefix="n6fill-") as tmp:
+        root = Path(tmp)
+        conv = root / "build" / "conveyor"
+        (conv / "prompts").mkdir(parents=True)
+        (root / "build" / "reports").mkdir(parents=True)
+        ready = [f"EXAMREADY{i}" for i in range(int(case.get("ready", 0)))]
+        bl = conv / "backlog.json"
+        bl.write_text(json.dumps({"slices": [{"id": i, "title": og.TITLE[cls] + "ready"} for i in ready]}), "utf-8")
+        (conv / "status.json").write_text(json.dumps({"backlog": [{"id": i, "state": "ready"} for i in ready]}), "utf-8")
+        (conv / "lanes.json").write_text("{}", "utf-8")
+        if case.get("spec", True):
+            spec = {"id": "EXAMFILL1", "class": cls, "tier": case.get("tier", "T2"), "order": 1,
+                    "objective": "exam fill", "owned_files": case.get("owned", FILL_OWNED), "acceptance": ["it works"],
+                    "negative_tests": [], "depends_on": [], "worker": "opus", "effort": "high", "contracts": []}
+            raw = json.dumps(spec).encode()
+            (root / og.DEPOT / "approvals").mkdir(parents=True)
+            (root / og.DEPOT / "EXAMFILL1.json").write_bytes(raw)
+            approval = case.get("approval", "ok")
+            if approval != "none":
+                sha = hashlib.sha256(raw + (b" " if approval == "bad_sha" else b"")).hexdigest()
+                (root / og.DEPOT / "approvals" / "EXAMFILL1.json").write_text(json.dumps(
+                    {"spec_id": "EXAMFILL1", "sha256": sha, "approver": "orchestrator", "at": "2026-11-24T10:00:00Z"}),
+                    "utf-8")
+        before = bl.read_bytes()
+        g = og.Gen(root, git=_fill_git, out=lambda _s: None)
+        emitted: list[int] = []
+        real_emit = g.emit
+        g.emit = lambda *a, **k: (emitted.append(1), real_emit(*a, **k))[1]
+        try:
+            og.depot_fill(g, cls, None, False, FILL_AT)
+        except og.Refuse:
+            pass
+        except (KeyError, TypeError, AttributeError, OSError, ValueError, IndexError):
+            return None  # a crash is uncovered, never a refusal
+        return "hands_propose_slice" if emitted or bl.read_bytes() != before else "inbox"
 
 
 # EXAMT1T5FIX: a T1-T5 snapshot is decided by the hands' own code (scripts/orchbot.py, orch_gen.py,

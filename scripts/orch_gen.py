@@ -40,6 +40,7 @@ import argparse
 import ast
 import hashlib
 import json
+import math
 import os
 import re
 import subprocess
@@ -896,16 +897,86 @@ def origin_main(g):
     return o.strip()
 
 
+LOCK_STALE_S = 1800  # a fill.lock older than this whose owner pid is gone is reclaimed (one journal line)
+
+
+def pid_alive(pid):
+    """True unless the OS says pid is gone; any doubt counts as alive (a live lock is never reclaimed)."""
+    if os.name == "nt":  # os.kill(pid, 0) on Windows sends CTRL_C_EVENT: never use it
+        import ctypes
+        k = ctypes.WinDLL("kernel32", use_last_error=True)
+        k.OpenProcess.restype = ctypes.c_void_p
+        k.GetExitCodeProcess.argtypes = (ctypes.c_void_p, ctypes.POINTER(ctypes.c_ulong))
+        k.CloseHandle.argtypes = (ctypes.c_void_p,)
+        h = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return ctypes.get_last_error() != 87  # ERROR_INVALID_PARAMETER = no such pid; access denied = alive
+        try:
+            code = ctypes.c_ulong()
+            return not k.GetExitCodeProcess(h, ctypes.byref(code)) or code.value == 259  # STILL_ACTIVE
+        finally:
+            k.CloseHandle(h)
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def take_lock(lock, t):
+    """O_EXCL create that records the owner; False if the lock already exists."""
+    try:
+        fd = os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        return False
+    try:
+        os.write(fd, json.dumps({"pid": os.getpid(), "at": t}).encode("ascii"))
+    finally:
+        os.close(fd)
+    return True
+
+
+def stale_lock(lock, t):
+    """(pid, raw bytes) when the lock is well formed, older than LOCK_STALE_S and its pid is gone; else None."""
+    try:
+        raw = lock.read_bytes()
+        rec = json.loads(raw)
+    except (OSError, ValueError, RecursionError):
+        return None  # empty / unreadable lock: a human decides (fail closed)
+    if not isinstance(rec, dict):
+        return None
+    pid, at = rec.get("pid"), rec.get("at")
+    if type(pid) is not int or not 0 < pid < 2 ** 31 or type(at) not in (int, float) or not math.isfinite(at):
+        return None
+    if not t - at > LOCK_STALE_S or pid_alive(pid):
+        return None
+    return pid, raw
+
+
 def depot_fill(g, cls, propose, write, t):
     """QUEUEFILL2: approved READY depot specs -> slices for a low class. Dry-run unless write; one fill at a time."""
     run = g.root / DEPOT / "_run"
     lock = run / "fill.lock"
     if write:
         run.mkdir(parents=True, exist_ok=True)
-        try:  # N10: O_EXCL makes the second concurrent fill refuse; a stale lock needs a human (fail closed)
-            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
-        except FileExistsError:
-            raise Refuse(f"N10 another depot fill holds {lock.relative_to(g.root).as_posix()}") from None
+        if not take_lock(lock, t):  # N10: a second concurrent fill refuses
+            stale = stale_lock(lock, t)
+            if stale is None:
+                raise Refuse(f"N10 another depot fill holds {lock.relative_to(g.root).as_posix()}")
+            pid, raw = stale
+            try:  # re-read right before unlinking: only the lock judged stale is removed
+                same = lock.read_bytes() == raw
+            except OSError:
+                same = False
+            if not same:
+                raise Refuse(f"N10 another depot fill holds {lock.relative_to(g.root).as_posix()}")
+            journal(run, {"kind": "lock_reclaimed", "pid": pid,
+                          "at": datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")})
+            lock.unlink()
+            if not take_lock(lock, t):  # one retry; losing it to another fill is N10
+                raise Refuse(f"N10 another depot fill holds {lock.relative_to(g.root).as_posix()}")
     try:
         return _depot_fill(g, run, cls, propose, write, t)
     finally:

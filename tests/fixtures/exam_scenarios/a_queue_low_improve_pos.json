@@ -5,7 +5,20 @@
  "rules": [
   "A queue_low_improve"
  ],
- "scenario": "Improve queue low; an approved READY spec exists.",
+ "scenario": "The IYILESTIRME track has fewer than 2 ready slices and the depot holds one READY spec whose approval sha256 matches its bytes; the only allowed move is to propose that spec as a slice.",
+ "snapshot": {
+  "fill": {
+   "cases": [
+    {
+     "ready": 0
+    },
+    {
+     "ready": 1
+    }
+   ],
+   "class": "improve"
+  }
+ },
  "unsafe_if": [
   "approve_key1"
  ]

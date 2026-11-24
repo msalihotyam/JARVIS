@@ -1,11 +1,13 @@
 """ORCHGEN: scripts/orch_gen.py on a temp repo with fake reports (never the real backlog)."""
 import json
+import os
 import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import conveyor  # noqa: E402
@@ -813,6 +815,37 @@ class DepotFillTest(unittest.TestCase):
                             else orch_gen.real_git(root, *a))
         self.assertEqual((rc, self.bl.read_bytes()), (2, before), out)
         self.assertIn("N16", out)
+
+    def old_lock(self, age, pid=4242):
+        self.run_dir.mkdir(parents=True, exist_ok=True)
+        (self.run_dir / "fill.lock").write_text(json.dumps({"pid": pid, "at": self.T - age}), encoding="utf-8")
+
+    def test_stale_lock_of_a_dead_pid_is_reclaimed_once(self):  # QUEUEFILL2FIX
+        self.old_lock(3600)
+        with mock.patch.object(orch_gen, "pid_alive", return_value=False):
+            rc, out = self.fill("--write", "--class", "improve")
+        self.assertEqual(rc, 0, out)
+        self.assertNotIn("N10", out)
+        lines = [json.loads(x) for x in (self.run_dir / "journal.jsonl").read_text("utf-8").splitlines()]
+        self.assertEqual([x for x in lines if x["kind"] == "lock_reclaimed"],
+                         [{"kind": "lock_reclaimed", "pid": 4242, "at": "2027-01-15T08:00:00Z"}])
+        self.assertFalse((self.run_dir / "fill.lock").exists())
+
+    def test_live_young_or_malformed_lock_still_refuses(self):  # QUEUEFILL2FIX
+        self.spec("DQA")
+        for alive, body in ((True, {"pid": 4242, "at": self.T - 3600}), (False, {"pid": 4242, "at": self.T - 60}),
+                            (False, {"pid": True, "at": self.T - 3600}), (False, {"pid": 4242, "at": "-inf"}),
+                            (False, {"pid": 4242, "at": float("-inf")}), (False, [4242, 0]), (False, {"pid": -1, "at": 0})):
+            with self.subTest(alive=alive, body=body):
+                self.run_dir.mkdir(parents=True, exist_ok=True)
+                (self.run_dir / "fill.lock").write_text(json.dumps(body), encoding="utf-8")
+                with mock.patch.object(orch_gen, "pid_alive", return_value=alive):
+                    self.assertIn("N10", self.assert_untouched("--write", rc=2))
+                self.assertTrue((self.run_dir / "fill.lock").exists())
+                self.assertFalse((self.run_dir / "journal.jsonl").exists())
+
+    def test_pid_alive_sees_this_process(self):  # a ctypes slip would make every lock look dead
+        self.assertTrue(orch_gen.pid_alive(os.getpid()))
 
     def test_strict_schema_rejects_free_text(self):  # N13
         good = json.loads(json.dumps(self.spec("DQA", approve=False)))
