@@ -35,6 +35,8 @@ _TOTALS = re.compile(r"FAILED \(([^)]*)\)")
 # one item of unittest's FAILED (...) totals; ASCII digits, at most 9 (int() refuses > 4300)
 _TOTAL_ITEM = re.compile(r"(failures|errors|skipped|expected failures)=([0-9]{1,9})")
 _RAN = re.compile(r"Ran [0-9]+ tests? in [0-9.]+s")
+# the only lines unittest prints outside a FAIL/ERROR block: progress, rules, Ran, FAILED totals
+_OUTSIDE = re.compile(r"[.EFsxu]+|={10,}|-{10,}|Ran [0-9]+ tests? in [0-9.]+s|FAILED \([^)]*\)")
 # json.loads raises ValueError (JSONDecodeError, int digit limit) or RecursionError (deep nesting)
 _PARSE_ERRORS = (ValueError, RecursionError)
 
@@ -108,9 +110,16 @@ def failures(text: str) -> tuple[tuple[str, str], ...]:
     is cut off, gets the empty signature (never KNOWN-RED): the rule may be inside the message."""
     if not isinstance(cast(object, text), str):
         raise MalformedInput("failure output is not text")
+    return _scan(text)[0]
+
+
+def _scan(text: str) -> tuple[tuple[tuple[str, str], ...], bool]:
+    """(failures(text), stray): stray is True when a non-blank line outside every FAIL/ERROR
+    block is not unittest's own output (progress, rule, Ran, FAILED totals), e.g. lint text."""
     found: list[tuple[str, str]] = []
     current: str | None = None
     last = ""
+    stray = False
     started = False  # the "-----" right under a header opens the traceback, it does not end it
     lines = [line.strip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
     for index, line in enumerate(lines):
@@ -128,9 +137,11 @@ def failures(text: str) -> tuple[tuple[str, str], ...]:
             started = True
         elif current is not None and line:
             last = line
+        elif current is None and line and not _OUTSIDE.fullmatch(line):
+            stray = True
     if current is not None:  # cut off before its closing rule: the last line may be mid-message
         found.append((current, ""))
-    return tuple(found)
+    return tuple(found), stray
 
 
 def _accounted(text: str, found: tuple[tuple[str, str], ...]) -> bool:
@@ -242,9 +253,10 @@ def _checks(sha: str, required: Sequence[str], text: str,
             if not all(p is None or isinstance(p, str) for p in parts):
                 return _unknown(sha, f"check run {name!r} output text is not text")
             body = "\n".join(cast(str, p) for p in parts if p)
-            found = failures(body)
-            # only a plain test failure can be known-red; timed_out, cancelled, etc. stay red
-            unparsed = (unparsed or run.get("conclusion") != "failure" or not found
+            found, stray = _scan(body)
+            # only a plain test failure in pure unittest output can be known-red; timed_out,
+            # cancelled, etc. or any other text (lint, npm, the summary) stays red
+            unparsed = (unparsed or run.get("conclusion") != "failure" or not found or stray
                         or not _accounted(body, found))
             pairs.extend(found)
     missing = [name for name in required if name not in seen]
@@ -274,11 +286,12 @@ def _known(entries: Iterable[KnownRed]) -> frozenset[tuple[str, str]] | None:
     if not isinstance(entries, (list, tuple, set, frozenset)):
         return None
     for entry in cast(Iterable[object], entries):
-        if not (isinstance(entry, KnownRed) and isinstance(cast(object, entry.test_id), str)
-                and entry.test_id and isinstance(cast(object, entry.signature), str)
-                and entry.signature):
+        # getattr: KnownRed.__new__(KnownRed) has no fields set
+        test_id, signature = getattr(entry, "test_id", None), getattr(entry, "signature", None)
+        if not (isinstance(entry, KnownRed) and isinstance(test_id, str) and test_id
+                and isinstance(signature, str) and signature):
             return None
-        pairs.add((entry.test_id, entry.signature))
+        pairs.add((test_id, signature))
     return frozenset(pairs)
 
 
@@ -343,7 +356,7 @@ def compare_finish(verdict: CiVerdict, finish: Mapping[str, Any], *,
     def text(value: object) -> str:
         try:
             return str(value)
-        except (ValueError, RecursionError):  # str() of a 5000-digit int or a very deep list
+        except Exception:  # a 5000-digit int, a very deep list, a raising __str__
             return ""
 
     def record(agreement: str, reason: str) -> ShadowRecord:

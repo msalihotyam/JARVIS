@@ -47,7 +47,7 @@ def run(name: str, *, sha: str = SHA, status: str = "completed",
     out: dict[str, Any] = {"name": name, "head_sha": sha, "status": status,
                            "conclusion": conclusion}
     if text is not None:
-        out["output"] = {"summary": "tests failed", "text": text}
+        out["output"] = {"summary": None, "text": text}  # a summary is non-unittest text
     return out
 
 
@@ -223,6 +223,49 @@ class KnownRedTests(unittest.TestCase):
                                               text=FAIL_TEXT)})
         self.assertEqual(verdict(checks=mixed, known_red=[X, Y]).verdict, "red")
 
+    def test_non_unittest_text_outside_the_blocks_is_red(self) -> None:
+        rule = "=" * 70
+        between = FAIL_TEXT.replace(rule + "\nERROR:", rule + "\nlint: 2 errors\n" + rule
+                                    + "\nERROR:")
+        cases = {
+            "before": "lint: 2 errors\n" + FAIL_TEXT,
+            "after": FAIL_TEXT + "\nnpm ERR! lint failed\n",
+            "between_blocks": FAIL_TEXT.replace("\n\n" + rule + "\nERROR:",
+                                                "\n\n" + rule + "\nnpm ERR! x\n" + rule
+                                                + "\nERROR:"),
+            "between_rules": between,
+            "before_ran": FAIL_TEXT.replace("\nRan 2", "\nlint: 2 errors\nRan 2"),
+            "crlf_before": ("lint: 2 errors\n" + FAIL_TEXT).replace("\n", "\r\n"),
+            "cr_after": (FAIL_TEXT + "npm ERR! lint failed\n").replace("\n", "\r"),
+            "homoglyph_header": "ＦAIL: test_z (tests.test_c.C.test_z)\n" + FAIL_TEXT,
+            "ok_word": FAIL_TEXT + "OK\n",
+        }
+        for name, text in cases.items():
+            with self.subTest(variant=name):
+                checks = green_doc(**{"shard 1/2": run("shard 1/2", conclusion="failure",
+                                                       text=text)})
+                self.assertEqual(verdict(checks=checks, known_red=[X, Y]).verdict, "red")
+        shard = run("shard 1/2", conclusion="failure", text=FAIL_TEXT)
+        shard["output"]["summary"] = "npm ERR! lint failed"
+        self.assertEqual(verdict(checks=green_doc(**{"shard 1/2": shard}),
+                                 known_red=[X, Y]).verdict, "red")
+
+    def test_unittest_progress_and_blank_lines_stay_known_red(self) -> None:
+        text = ("..F.E.s\n  \n" + FAIL_TEXT.replace("(tests.test_a.A.test_x)\n",
+                                                   "(tests.test_a.A.test_x)\nDocstring line.\n")
+                + "\n\t\n")
+        checks = green_doc(**{"shard 1/2": run("shard 1/2", conclusion="failure", text=text)})
+        self.assertEqual(verdict(checks=checks, known_red=[X, Y]).verdict, "known-red-only")
+
+    def test_known_red_entry_without_fields_is_unknown(self) -> None:
+        bare = KnownRed.__new__(KnownRed)
+        half = KnownRed.__new__(KnownRed)
+        object.__setattr__(half, "test_id", X.test_id)
+        for known in ([bare], [X, half], [KnownRed(1, "sig")], [KnownRed(X.test_id, b"s")]):  # type: ignore[arg-type]
+            with self.subTest(known=len(known)):
+                self.assertEqual(verdict(checks=self.failing(), known_red=known).verdict,
+                                 "unknown")
+
     def test_malformed_known_red_entry_is_unknown(self) -> None:
         for known in ([("tests.test_a.A.test_x", "sig")], [KnownRed("", "sig")], "XY"):
             with self.subTest(known=known):
@@ -386,6 +429,16 @@ class CompareFinishTests(unittest.TestCase):
                 self.assertEqual((got.agreement, got.reason), ("disagree", "n6_malformed"))
                 self.assertEqual(compare_finish(n6, None,  # type: ignore[arg-type]
                                                 events=self.EVENTS).reason, "finish_malformed")
+
+    def test_raising_str_is_malformed_not_a_crash(self) -> None:
+        class Bad:
+            def __str__(self) -> str:
+                raise RuntimeError("boom")
+        for row in ({"event": "finish", "lane": Bad(), "status": "GREEN"},
+                    {"event": "finish", "lane": "L1", "status": Bad()}):
+            with self.subTest(row=sorted(row)):
+                got = compare_finish(CiVerdict(SHA, "green", "r"), row, events=self.EVENTS)
+                self.assertEqual(got.agreement, "disagree")
 
 
 if __name__ == "__main__":
