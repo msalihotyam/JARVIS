@@ -92,3 +92,58 @@ class TestWorkersRoute(unittest.TestCase):
         self.assertEqual(route(facts(headroom={})), ("claude", "headroom_unknown"))
         self.assertEqual(route(facts(headroom={"codex": 101, "jules": 5})),
                          ("claude", "headroom_unknown"))
+
+
+# Every path the route veto refused before AUDROUTE1; it must never be narrowed.
+_VETOED_BEFORE = (
+    "", ".", "..", "a*.py", "a?.py", "a[1].py", "progra~1/x.py", "c:/x.py",
+    "x.py:s", "/abs.py", "../up.py", "scripts./x.py", "jarvis /x.py",
+    "scripts/x.py", "Scripts\conveyor.py", ".claude/settings.json",
+    ".github/workflows/ci.yml", "data/jarvis.db", "data", "CLAUDE.md",
+    "docs/AGENTS.md", "uv.lock", "sub/uv.lock", ".env", ".env.local",
+    "dev/dashboard/app.py", "home/.jarvis/x", ".jarvis/x", "certs/a.pem",
+    "a.key", "a.p12", "a.pfx", "a.crt", "a.cer", "a.db", "a.sqlite",
+    "a.sqlite3",
+)
+_ALLOWED = ("jarvis/example.py", "tests/test_x.py", "docs/notes.md",
+            "jarvis/workers/route.py", "build/reports/x.md")
+
+
+def _conveyor():
+    import importlib.util
+    from pathlib import Path
+    spec = importlib.util.spec_from_file_location(
+        "conveyor", Path(__file__).resolve().parents[1] / "scripts" / "conveyor.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+class TestRouteVetoParity(unittest.TestCase):
+    """AUDROUTE1: route._veto stays in step with conveyor.codex_veto."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.conveyor = _conveyor()
+
+    def corpus(self):
+        c = self.conveyor
+        derived = [d + "x.py" for d in (*c.CODEX_VETO, *c.PROTECTED_DIRS)]
+        derived += sorted(c.PROTECTED_FILES)
+        return (*_VETOED_BEFORE, *_ALLOWED, *derived, "riot/x.py",
+                "games/RiotClient/x.exe", "jarvis/riot.py")
+
+    def test_never_narrowed(self):
+        from jarvis.workers.route import _veto
+        for path in _VETOED_BEFORE:
+            with self.subTest(path=path):
+                self.assertTrue(_veto(path))
+                self.assertEqual(route(facts(files=[path])), ("claude", "veto"))
+
+    def test_matches_conveyor(self):
+        from jarvis.workers.route import _veto
+        for path in self.corpus():
+            with self.subTest(path=path):
+                self.assertEqual(_veto(path), self.conveyor.codex_veto(path))
+        for path in _ALLOWED:
+            self.assertFalse(_veto(path), path)

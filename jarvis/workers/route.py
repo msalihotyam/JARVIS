@@ -11,7 +11,10 @@ def _number(value, maximum=None):
 
 
 def _veto(path):
-    """Conveyor codex_veto/protected_path rules, with no filesystem access."""
+    """Conveyor codex_veto/protected_path rules, with no filesystem access.
+
+    jarvis/ never imports scripts/; tests.test_workers_route fails if this drifts.
+    """
     q = posixpath.normpath(path.replace("\\", "/").strip()).lower()
     base = q.rsplit("/", 1)[-1]
     return (q in ("", ".", "..") or any(c in q for c in "*?[~")
@@ -21,6 +24,7 @@ def _veto(path):
             or base in ("claude.md", "agents.md", "uv.lock")
             or base.startswith(".env") or q.startswith("dev/dashboard/")
             or "/.jarvis/" in "/" + q
+            or any(s.startswith("riot") for s in q.split("/"))
             or base.endswith((".pem", ".key", ".p12", ".pfx", ".crt", ".cer",
                               ".db", ".sqlite", ".sqlite3")))
 
