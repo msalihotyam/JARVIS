@@ -103,13 +103,42 @@ class GroupGateTests(unittest.TestCase):
         shadow, e8, drills, done = inputs()
         with self.assertRaises(gate.GateError):
             gate.check([{"group": "R17R18", "event_id": "e"}], e8, drills, done)
-        broken = dict(shadow[0], event_id="")
-        with self.assertRaises(gate.GateError):
-            gate.check([broken], e8, drills, done)
+        for blank in ("", " ", "\t", "\n", " "):
+            with self.subTest(event_id=blank), self.assertRaises(gate.GateError):
+                gate.check([dict(shadow[0], event_id=blank)], e8, drills, done)
         for key in ("n6_decision", "conveyor_decision"):
             for empty in (None, ""):
                 with self.subTest(key=key, empty=empty), self.assertRaises(gate.GateError):
                     gate.check([dict(shadow[0], **{key: empty})], e8, drills, done)
+
+    def test_non_text_decision_raises(self):
+        shadow, e8, drills, done = inputs()
+        # JSON true == 1 in Python: a mixed bool/int pair must not read as agreement
+        for n6, conveyor in ((True, 1), (False, 0), (1.0, 1), (["fix"], ["fix"]), ({}, {}), ("fix", 1)):
+            with self.subTest(n6=n6, conveyor=conveyor), self.assertRaises(gate.GateError):
+                gate.check([dict(shadow[0], n6_decision=n6, conveyor_decision=conveyor, safe=False)],
+                           e8, drills, done)
+
+    def test_non_mapping_rows_and_receipts_raise(self):
+        shadow, e8, drills, done = inputs()
+        for bad in ("row", ["group", "R17R18"], 1, None):
+            with self.subTest(bad=bad):
+                with self.assertRaises(gate.GateError):
+                    gate.check(shadow + [bad], e8, drills, done)
+                with self.assertRaises(gate.GateError):
+                    gate.check(shadow, e8, drills + [bad], done)
+
+    def test_non_list_containers_raise(self):
+        shadow, e8, drills, done = inputs()
+        for bad in ({"R17R18": shadow[0]}, "R17R18", None, 5):
+            with self.subTest(bad=bad):
+                with self.assertRaises(gate.GateError):
+                    gate.check(bad, e8, drills, done)
+                with self.assertRaises(gate.GateError):
+                    gate.check(shadow, e8, bad, done)
+        for bad in (["R17R18"], "R17R18", None, 5):
+            with self.subTest(e8=bad), self.assertRaises(gate.GateError):
+                gate.check(shadow, bad, drills, done)
 
     def test_failed_drill_receipt_outweighs_pass(self):
         shadow, e8, drills, done = inputs()
@@ -168,6 +197,14 @@ class OrderTests(unittest.TestCase):
         with self.assertRaises(gate.GateError):
             gate.check(shadow, e8, drills, ["R21"])
 
+    def test_taken_over_must_be_list_of_group_ids(self):
+        # {"R17R18": false} iterated by key once made R21 READY although nothing had taken over
+        shadow, e8, drills, _ = inputs("R21")
+        for bad in ({"R17R18": False}, {"R17R18": True}, "R17R18", None, 1, ["R17R18", 1], [["R17R18"]]):
+            with self.subTest(taken_over=bad), self.assertRaises(gate.GateError):
+                gate.check(shadow, e8, drills, bad)
+        self.assertEqual(gate.check(shadow, e8, drills, ("R17R18",))["R21"], (gate.READY, []))
+
 
 class CliTests(unittest.TestCase):
     def run_cli(self, payload):
@@ -186,9 +223,24 @@ class CliTests(unittest.TestCase):
         self.assertIn("R17R18: READY\n", out)
         self.assertIn("R21: NOT_READY\n", out)
 
+    def test_cli_output_is_ascii_for_any_id(self):
+        shadow, e8, drills, done = inputs()
+        bad = rows("R17R18", 1, prefix="\ud800✓", conveyor_decision="skip", safe=False)
+        code, out = self.run_cli(json.dumps({"shadow": shadow + bad, "e8": e8, "drills": drills, "taken_over": done}))
+        self.assertEqual(code, 0)
+        self.assertIn("\\ud800\\u2713", out)
+        self.assertTrue(out.isascii())
+        code, out = self.run_cli(json.dumps({"taken_over": ["\ud800"]}))
+        self.assertEqual(code, 2)
+        self.assertTrue(out.isascii())
+
     def test_cli_refuses_bad_input(self):
-        for payload in ("[]", "{not json", json.dumps({"shadow": rows("R99", 1)})):
-            with self.subTest(payload=payload):
+        shadow, e8, drills, _ = inputs("R21")
+        dict_taken = json.dumps({"shadow": shadow, "e8": e8, "drills": drills, "taken_over": {"R17R18": False}})
+        deep = '{"shadow": ' + "[" * 100000 + "]" * 100000 + "}"
+        for payload in ("[]", "{not json", json.dumps({"shadow": rows("R99", 1)}), dict_taken, deep,
+                        json.dumps({"taken_over": None}), json.dumps({"e8": None}), json.dumps({"drills": ["x"]})):
+            with self.subTest(payload=payload[:80]):
                 code, out = self.run_cli(payload)
                 self.assertEqual(code, 2)
                 self.assertTrue(out.startswith("REFUSED: "))

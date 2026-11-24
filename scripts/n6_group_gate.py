@@ -15,7 +15,8 @@ Input shapes (the shadow helpers n6_ci_watch / n6_cleanup / n6_intseq are not on
 are defined here): a shadow row is {group, event_id, n6_decision, conveyor_decision, safe, origin};
 an E8 reading is {"slices": int, "worse": [measure, ...]} per group; a drill receipt is
 {group, passed}. An unknown group id anywhere raises ``GateError``; so does a malformed row or
-a later group marked taken over before an earlier one. Read-only: stdlib only, no DB, no network,
+a later group marked taken over before an earlier one; shadow, drills and taken_over must be lists
+(of objects / of group ids), e8 an object, and both decisions non-empty strings. Read-only: stdlib only, no DB, no network,
 nothing acts on the conveyor. CLI exit: 0 printed, 2 refused.
 """
 
@@ -24,7 +25,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
-from collections.abc import Collection, Iterable, Mapping
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -63,33 +64,50 @@ def _e8_reasons(reading: object) -> list[str]:
     return reasons
 
 
-def check(shadow: Iterable[Mapping[str, Any]], e8: Mapping[str, Any],
-          drills: Iterable[Mapping[str, Any]],
-          taken_over: Collection[str] = ()) -> dict[str, tuple[str, list[str]]]:
+def _list(value: object, where: str) -> Sequence[Any]:
+    # a dict/str would iterate by key/char: {"R17R18": false} once read as "taken over"
+    if not isinstance(value, (list, tuple)):
+        raise GateError(f"{where} is not a list: {type(value).__name__}")
+    return value  # pyright: ignore[reportUnknownVariableType]
+
+
+def _mappings(value: object, where: str) -> list[Mapping[str, Any]]:
+    items = _list(value, where)
+    if not all(isinstance(item, Mapping) for item in items):
+        raise GateError(f"{where} holds an entry that is not an object")
+    return list(items)
+
+
+def check(shadow: Sequence[Mapping[str, Any]], e8: Mapping[str, Any],
+          drills: Sequence[Mapping[str, Any]],
+          taken_over: Sequence[str] = ()) -> dict[str, tuple[str, list[str]]]:
     """{group: (READY | NOT_READY, reasons)} for every group, in takeover order."""
-    done = {_group(g, "taken_over") for g in taken_over}
+    done = {_group(g, "taken_over") for g in _list(taken_over, "taken_over")}
     for i, g in enumerate(GROUPS):
         if g in done and any(earlier not in done for earlier in GROUPS[:i]):
             raise GateError(f"{g} is marked taken over before an earlier group")
+    if not isinstance(e8, Mapping):
+        raise GateError(f"e8 is not an object: {type(e8).__name__}")
     for g in e8:
         _group(g, "e8")
     drilled: set[str] = set()
     failed_drill: set[str] = set()  # any failing receipt outweighs a pass (fail closed)
-    for receipt in drills:
+    for receipt in _mappings(drills, "drills"):
         g = _group(receipt.get("group"), "drill receipt")
         (drilled if receipt.get("passed") is True else failed_drill).add(g)
     drilled -= failed_drill
     real: dict[str, set[str]] = {g: set() for g in GROUPS}
     unsafe: dict[str, list[str]] = {g: [] for g in GROUPS}
-    for row in shadow:
+    for row in _mappings(shadow, "shadow"):
         missing = [k for k in _ROW_KEYS if k not in row]
         if missing:
             raise GateError(f"shadow row lacks {' '.join(missing)}")
         g, event = _group(row["group"], "shadow row"), row["event_id"]
-        if not isinstance(event, str) or not event:
+        if not isinstance(event, str) or not event.strip():
             raise GateError(f"shadow row event_id is missing or malformed: {event!r}")
-        if any(row[k] is None or row[k] == "" for k in ("n6_decision", "conveyor_decision")):
-            raise GateError(f"shadow row {event} has an empty decision")
+        # str only: JSON true == 1 would hide a disagreement
+        if any(not isinstance(row[k], str) or not row[k] for k in ("n6_decision", "conveyor_decision")):
+            raise GateError(f"shadow row {event} has an empty or non-text decision")
         if row.get("origin") == REAL_ORIGIN:
             real[g].add(event)
         if row["n6_decision"] != row["conveyor_decision"] and row["safe"] is not True:
@@ -127,11 +145,16 @@ def main(argv: list[str] | None = None) -> int:
             raise GateError("input is not a JSON object")
         result = check(data.get("shadow", []), data.get("e8", {}),  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]
                        data.get("drills", []), data.get("taken_over", []))  # pyright: ignore[reportUnknownArgumentType, reportUnknownMemberType]
-    except (OSError, ValueError, AttributeError, TypeError) as error:
-        print(f"REFUSED: {error}")
+    except (OSError, ValueError, AttributeError, TypeError, RecursionError) as error:
+        print(_ascii(f"REFUSED: {error}"))
         return 2
-    print(render(result), end="")
+    print(_ascii(render(result)), end="")
     return 0
+
+
+def _ascii(text: str) -> str:
+    # untrusted ids may hold lone surrogates or chars a cp1254 console cannot encode
+    return text.encode("ascii", "backslashreplace").decode("ascii")
 
 
 if __name__ == "__main__":
