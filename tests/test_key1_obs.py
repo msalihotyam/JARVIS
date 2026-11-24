@@ -6,6 +6,7 @@ import os
 import sys
 import tempfile
 import unittest
+from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
@@ -101,11 +102,54 @@ class Key1ObsTests(unittest.TestCase):
         self.assertIn("line 2", err)
 
     def test_malformed_approval_and_missing_input_exit_2(self):
-        self.write([], {f"push-{A}-int-x": "garbage\n"})
-        self.assertEqual(self.run_obs()[0], 2)
+        for bad in ("KEY1 v1 garbage\n", "key1 V1 sha=x\n", "﻿KEY1 v1 sha=zz\n", f" KEY1 v1 sha={A} lane=X\n",
+                    "KEY1v1 sha=x\n", "KEY1  v1 sha=x\n", "KEY1 v1\n"):
+            with self.subTest(bad=bad):
+                (self.done / f"push-{A}-int-x").write_text(bad, encoding="utf-8")
+                self.write([], {})
+                self.assertEqual(self.run_obs()[0], 2)
         os.remove(self.root / "build" / "bot" / "decisions.jsonl")
         os.remove(self.done / f"push-{A}-int-x")
         self.assertEqual(self.run_obs()[0], 2)
+
+    def test_legacy_free_text_approval_skipped(self):
+        files = {f"push-{A}-int-x": key1(A, "INT-X", "key1_check", "2026-11-24T08:30:00Z")}
+        self.write([bot("2026-11-24T08:00:00Z", "write_key1", "INT-X", A)], files)
+        code, base, _ = self.run_obs()
+        self.assertEqual(code, 0, base)
+        for i, text in enumerate(("key 1 by the orchestrator (O26, CONVSAFE) ok\n", "garbage\n", "", "\n",
+                                  "key1 INT-X (protected: conveyor.py): ff from c450cc2\n", "KEY1 v10 x\n")):
+            (self.done / f"push-{B}-int{i}").write_text(text, encoding="ascii")
+        code, out, err = self.run_obs()
+        self.assertEqual((code, err), (0, ""))
+        self.assertEqual(out, base)  # legacy files neither match nor count
+
+    def test_naive_local_decision_ts_matches_z_approval(self):
+        # decisions.jsonl ts is naive local time (conveyor.iso); the approval at= is UTC Z: same instant must agree
+        utc = key1_obs.ts("2026-11-24T08:00:00Z")
+        local = datetime.fromtimestamp(utc).strftime("%Y-%m-%dT%H:%M:%S")
+        self.assertEqual(key1_obs.ts(local), utc)
+        self.assertEqual(key1_obs.ts(local + ".5"), utc + 0.5)
+        self.assertEqual(key1_obs.ts("2026-11-24T11:00:00+03:00"), utc)
+        self.assertEqual(key1_obs.ts(" 2026-11-24t08:00:00z "), utc)
+        self.assertEqual(key1_obs.load_approvals(self.done), [])
+        (self.done / f"push-{B}-int-b").write_text("﻿" + key1(B, "INT-B", "key1_check", "2026-11-24T08:00:00Z"),
+                                                   encoding="utf-8")
+        self.assertEqual([a["sha"] for a in key1_obs.load_approvals(self.done)], [B])  # BOM before a valid header
+        os.remove(self.done / f"push-{B}-int-b")
+        self.write([bot(local, "write_key1", "INT-X", A)],
+                   {f"push-{A}-int-x": key1(A, "INT-X", "key1_check", "2026-11-24T08:00:05Z")})
+        code, out, _ = self.run_obs()
+        self.assertEqual(code, 0, out)
+        self.assertIn("K2: 1/10 matching, unsafe 0", out)
+        self.assertIn("unmatched 0", out)
+
+    def test_lane_match_ignores_case(self):
+        self.write([bot("2026-11-24T08:00:00Z", "ask_salih_key1", "int-w")],
+                   {f"push-{D}-int-w": key1(D, "INT-W", "key1_check", "2026-11-24T08:20:00Z")})
+        code, out, _ = self.run_obs()
+        self.assertEqual(code, 0, out)
+        self.assertIn("bot-stricter 1, unmatched 0", out)
 
     def test_nothing_written(self):
         self.write([bot("2026-11-24T08:00:00Z", "write_key1", "INT-X", A)],

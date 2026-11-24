@@ -9,7 +9,7 @@ import json
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 
 WINDOW_S = 2 * 3600  # a bot write with no real key 1 within 2 h is unsafe
@@ -18,10 +18,12 @@ NAME_RE = re.compile(r"push-([0-9a-f]{40})-[A-Za-z0-9._-]+?(?:\.\d{8}-\d{6})?(\.
 HEAD_RE = re.compile(r"KEY1 v1 sha=(?P<sha>[0-9a-f]{40}) ci=\S+ lane=(?P<lane>\S+) by=(?P<by>[A-Za-z0-9_]+) .*"
                      r"at=(?P<at>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
 SHA_RE = re.compile(r"push-([0-9a-f]{40})")
+V1_RE = re.compile(r"\s*KEY\s*1\s*V\s*1(?!\d)", re.I)  # legacy free text ("key1 INT-X ...") is not a v1 attempt
 
 
 def ts(s):
-    return datetime.fromisoformat(str(s).replace("Z", "+00:00")).replace(tzinfo=timezone.utc).timestamp()
+    """Epoch seconds; Z/offset values keep their zone, a naive value (decisions.jsonl, conveyor.iso) is local time."""
+    return datetime.fromisoformat(str(s).strip().upper()).timestamp()
 
 
 def load_decisions(path, since):
@@ -55,20 +57,22 @@ def load_approvals(done):
         if not m:
             continue
         with open(p, "rb") as f:
-            first = f.read(1024).partition(b"\n")[0].decode("ascii", "replace").rstrip("\r")
+            first = f.read(1024).partition(b"\n")[0].decode("utf-8", "replace").rstrip("\r").lstrip("﻿")
         h = HEAD_RE.fullmatch(first)
         if not h:
             if m.group(2):  # a refused file may carry any text: its name is the record
                 out.append({"sha": m.group(1), "lane": "", "by": "?", "at": None, "refused": True, "name": p.name})
                 continue
-            raise ValueError(f"approval {p.name}: first line is no KEY1 v1 header")
+            if V1_RE.match(first):  # a KEY1 v1 header attempt that does not parse fails closed
+                raise ValueError(f"approval {p.name}: malformed KEY1 v1 header")
+            continue  # legacy free-text approval (pre KEY1 v1): not a key 1 record
         out.append({"sha": h["sha"], "lane": h["lane"], "by": h["by"], "at": ts(h["at"]),
                     "refused": bool(m.group(2)), "name": p.name})
     return out
 
 
 def same(bot_lane, bot_sha, a):
-    return a["sha"] == bot_sha if bot_sha else bool(bot_lane) and a["lane"] == bot_lane
+    return a["sha"] == bot_sha if bot_sha else bool(bot_lane) and a["lane"].casefold() == bot_lane.casefold()
 
 
 def report(decisions, approvals, since, now):
