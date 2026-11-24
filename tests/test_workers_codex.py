@@ -83,6 +83,8 @@ class ParityTests(Base):
         self.assertEqual(conveyor.check_argv(ours, worktree=self.stage), ours)
         self.assertEqual(wc.check_argv(ours, self.exe, self.stage), ours)
         self.assertEqual(wc.CONFIGS, conveyor.CONFIGS)
+        for name in ("CODEX_MODEL_DEFAULT", "CODEX_EFFORT_DEFAULT", "CODEX_EFFORTS", "EFFORT_KEY"):
+            self.assertEqual(getattr(wc, name), getattr(conveyor, name), name)
         self.assertEqual(wc.PROHIBITED_ENV, conveyor.PROHIBITED_ENV)
         self.assertEqual(wc.SANDBOX_DIRS, conveyor.SANDBOX_DIRS)
 
@@ -126,7 +128,8 @@ class ArgvTests(Base):
 
     def test_unknown_attached_and_equals_forms_refused(self):
         good, insert = self.variants()
-        for extra in (["--search"], ["-m", "o3"], ["--model=o3"], ["--sandbox=workspace-write"],
+        for extra in (["--search"], ["--model=o3"], ["--model", "o3"], ["-mo3"], ["-m=o3"],
+                      ["--sandbox=workspace-write"],
                       ["-cforced_login_method=chatgpt"], ["-C" + str(self.stage)], ["--json=1"],
                       ["--mcp-server", "x"], ["--skip-git-repo-check"], ["-s", "danger-full-access"],
                       ["-i", "img.png"], ["--output-last-message", "o.txt"], ["prompt text"], ["-"],
@@ -136,9 +139,10 @@ class ArgvTests(Base):
 
     def test_values_repeats_missing_and_shape(self):
         good, insert = self.variants()
-        bad_value = [good[:9] + ["C:\\other"] + good[10:],  # -C elsewhere
-                     good[:11] + ["danger-full-access"] + good[12:],
-                     good[:11] + ["read-only"] + good[12:],
+        cd, sb = good.index("-C") + 1, good.index("--sandbox") + 1
+        bad_value = [good[:cd] + ["C:\\other"] + good[cd + 1:],  # -C elsewhere
+                     good[:sb] + ["danger-full-access"] + good[sb + 1:],
+                     good[:sb] + ["read-only"] + good[sb + 1:],
                      insert("-c", "model_provider=x"), insert("-c")]
         for argv in bad_value:
             with self.subTest(argv=argv):
@@ -151,6 +155,44 @@ class ArgvTests(Base):
         self.refused("argv_command", wc.check_argv, ["other.exe"] + good[1:], self.exe, self.stage)
         self.refused("argv_command", wc.check_argv, [self.exe, "review"] + good[2:], self.exe, self.stage)
         self.refused("argv_command", wc.check_argv, good[:-1] + ["do it"], self.exe, self.stage)
+
+    def test_model_and_effort_each_at_most_once_with_strict_values(self):
+        good, insert = self.variants()
+        stage = str(self.stage)
+        check = lambda argv: wc.check_argv(argv, self.exe, self.stage)  # noqa: E731
+        for model in ("a" * 64, "gpt-6.2-sol", "o3"):
+            with self.subTest(model=model):
+                argv = wc.build_argv(self.exe, stage, model=model)
+                self.assertEqual(check(argv), argv)
+        for effort in wc.CODEX_EFFORTS:
+            with self.subTest(effort=effort):
+                argv = wc.build_argv(self.exe, stage, effort=effort)
+                self.assertEqual(check(argv), argv)
+        m, e = good.index("-m"), good.index(wc.EFFORT_KEY + wc.CODEX_EFFORT_DEFAULT)
+        for argv in (good[:m] + good[m + 2:], good[:e - 1] + good[e + 1:], good[:m] + good[e + 1:]):
+            with self.subTest(omitted=argv):  # optional: absent is allowed
+                self.assertEqual(check(argv), argv)
+        for model in ("gpt 6", "gpt;x", "gpt&x", "gpt|x", "$(x)", "`x`", "%PATH%", "a^b", "a!b", '"gpt"',
+                      "'gpt'", "a<b", "a>b", "gpt\n", "gpt\r", "gpt\t", "gpt/x", "gpt\\x", "gpt=x",
+                      "gpt-6.2-ѕol", "gpt-６", "-yolo", ".gpt", "", "a" * 65, "gpt\x00"):
+            with self.subTest(model=model):
+                self.refused("flag_value_refused", check, wc.build_argv(self.exe, stage, model=model))
+        self.refused("flag_value_refused", check, insert("-m"))  # trailing -m with no value
+        for effort in ("xhigh", "HIGH", "High", "high ", " high", "minimal", "none", "", "high;x", "high\n",
+                       "hіgh", "medium,high"):
+            with self.subTest(effort=effort):
+                self.refused("flag_value_refused", check, wc.build_argv(self.exe, stage, effort=effort))
+        for value in ("model_reasoning_effort =high", "Model_reasoning_effort=high", "model_reasoning_effort:high",
+                      " model_reasoning_effort=high", "model_reasoning_summary=detailed", "model=gpt-6.2-sol"):
+            with self.subTest(config=value):
+                self.refused("flag_value_refused", check, good[:e] + [value] + good[e + 1:])
+        for extra in (["-m", wc.CODEX_MODEL_DEFAULT], ["-m", "o3"],
+                      ["-c", wc.EFFORT_KEY + wc.CODEX_EFFORT_DEFAULT], ["-c", wc.EFFORT_KEY + "low"]):
+            with self.subTest(repeat=extra):
+                self.refused("flag_repeated", check, insert(*extra))
+        odd = wc.EFFORT_KEY + "low"  # a stage path that looks like an effort is still only -C
+        argv = wc.build_argv(self.exe, odd)
+        self.assertEqual(wc.check_argv(argv, self.exe, odd), argv)
 
 
 class EnvTests(Base):
