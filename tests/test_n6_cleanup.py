@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import unittest
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from pathlib import Path
 from typing import Any
 
@@ -13,6 +13,7 @@ NOW = datetime(2026, 11, 24, 12, 0, tzinfo=UTC)
 HOUR = timedelta(hours=1)
 A, B, C, D, E = ("a" * 40, "b" * 40, "c" * 40, "d" * 40, "e" * 40)
 OLD = (NOW - timedelta(hours=2)).isoformat()
+ROOT = "C:\\dev\\JARVIS"  # the injected checkout that owns .claude/worktrees
 
 
 def lane(**kw: Any) -> dict[str, Any]:
@@ -31,9 +32,9 @@ def ev(**kw: Any) -> dict[str, Any]:
 
 
 def run(rec: Any, main: Any = frozenset({A}), evidence: Any = None, *, clock: Any = NOW,
-        timeout: Any = HOUR) -> c.Plan:
+        timeout: Any = HOUR, root: Any = ROOT) -> c.Plan:
     evs = {"L1": ev()} if evidence is None else evidence
-    out = c.plan([rec], main, evs, clock=lambda: clock, timeout=timeout)
+    out = c.plan([rec], main, evs, clock=lambda: clock, timeout=timeout, root=root)
     return next(iter(out.values()))
 
 
@@ -74,6 +75,26 @@ class N6CleanupTests(unittest.TestCase):
         self.assertIn("tip moved", p.reason)
         self.assertEqual(p.verdict, "preserve")
 
+    def test_supplied_list_must_end_at_the_head_even_with_the_head_on_main(self) -> None:
+        for commits in ([B], [], [A, B]):
+            p = run(lane(head=A, commits=commits), frozenset({A, B}))
+            self.assertEqual(p.verdict, "preserve", commits)
+            self.assertIn("tip moved", p.reason)
+        p = run(lane(head=A, commits=[B, A]), frozenset({A}))  # listed B never reached main
+        self.assertEqual(p.verdict, "preserve")
+        self.assertTrue(p.reason.startswith("commits not on main: bbbbbbbbbbbb"))
+        self.assertEqual(run(lane(head=A, commits=[B, A]), frozenset({A, B})).verdict, "remove")
+
+    def test_malformed_branch_name_is_unknown(self) -> None:
+        for branch in ("-D", "--force", "topic..old", "a b", " x y ", "x\x01", "x\x7f", "x~1",
+                       "x^", "x:y", "x?", "x*", "x[", "x\\y", "x.lock", "x.lock/y", "@{u}",
+                       "x@{1}", " x", "x​", "a//b", "x/", "x.", ".x", "a/.b", "@"):
+            p = run(lane(branch=branch))
+            self.assertEqual(p.verdict, "unknown", repr(branch))
+            self.assertIn("branch", p.reason)
+        for branch in ("feature/x-1", "worktree-L1", "a.b", "x@y", "lock.x"):
+            self.assertEqual(run(lane(branch=branch)).verdict, "remove", branch)
+
     def test_too_young_and_future_are_preserved(self) -> None:
         exact = run(lane(finished_ts=(NOW - HOUR).isoformat()))
         self.assertEqual(exact.verdict, "preserve")  # strictly older than the timeout
@@ -103,11 +124,36 @@ class N6CleanupTests(unittest.TestCase):
         self.assertEqual(run(lane(worktree="c:/DEV/jarvis/.claude/worktrees/l1/")).verdict,
                          "remove")
 
+    def test_worktree_outside_the_injected_root_is_preserved(self) -> None:
+        for path in ("../.claude/worktrees/L1", "..\\.claude\\worktrees\\L1",
+                     ".claude/worktrees/L1", "C:/foreign/.claude/worktrees/L1",
+                     "D:/dev/JARVIS/.claude/worktrees/L1", "/.claude/worktrees/L1",
+                     "C:/dev/JARVIS/./.claude/worktrees/L1", "C:/dev/JARVIS/.claude/worktrees/L1/.",
+                     "C:/dev/JARVIS/x/../.claude/worktrees/L1", "C:/dev/JARVIS/.claude/worktrees/L1/..",
+                     "C:/dev/JARVIS/.claude/worktrees/L1/sub", "C:/dev/JARVIS /.claude/worktrees/L1",
+                     "C:/dev/JARVIS/.claude/worktrees/L1.", "C:/dev/JARVIS/.claude/worktrees/L1 x",
+                     "\\\\server\\share\\.claude\\worktrees\\L1", "C:/dev/JARVIS//.claude/worktrees/L1"):
+            p = run(lane(worktree=path))
+            self.assertEqual(p.verdict, "preserve", path)
+            self.assertIn("not a lane worktree", p.reason)
+        # Windows drops a trailing dot: lane "L1." would own L1's directory
+        self.assertEqual(run(lane(lane="L1.", worktree=f"{ROOT}\\.claude\\worktrees\\L1")).verdict,
+                         "unknown")
+
+    def test_malformed_root_makes_every_lane_unknown(self) -> None:
+        for root in (None, "", "  ", 5, "dev/JARVIS", "C:dev\\JARVIS", "../JARVIS", ".",
+                     "C:/dev/../JARVIS", "C:/dev/./JARVIS", "C:\\dev\\JARVIS\\.."):
+            p = run(lane(), root=root)
+            self.assertEqual(p.verdict, "unknown", root)
+            self.assertIn("root", p.reason)
+        self.assertEqual(run(lane(), root="/dev/JARVIS").verdict, "preserve")  # not ours
+
     def test_two_lanes_claiming_one_target_are_unknown(self) -> None:
-        for shared in ({"worktree": lane()["worktree"].upper()}, {"branch": "WORKTREE-L1"}):
+        for shared in ({"worktree": lane()["worktree"].upper()}, {"branch": "WORKTREE-L1"},
+                       {"branch": "refs/heads/worktree-L1"}, {"branch": "heads/Worktree-L1"}):
             other = lane(lane="L2", status="RUNNING", head=B, **shared)
             out = c.plan([lane(), other], frozenset({A}), {"L1": ev()}, clock=lambda: NOW,
-                         timeout=HOUR)
+                         timeout=HOUR, root=ROOT)
             self.assertEqual({p.verdict for p in out.values()}, {"unknown"}, shared)
             self.assertIn("claimed by more than one lane", out["L1"].reason)
 
@@ -130,12 +176,94 @@ class N6CleanupTests(unittest.TestCase):
                    {"clock": naive}, {"clock": NOW.isoformat()}, {"timeout": timedelta(0)},
                    {"timeout": 3600}):
             self.assertEqual(run(lane(), **kw).verdict, "unknown", kw)
-        self.assertEqual(c.plan("L1", frozenset(), {}, clock=lambda: NOW, timeout=HOUR),
+        self.assertEqual(c.plan("L1", frozenset(), {}, clock=lambda: NOW, timeout=HOUR, root=ROOT),
                          {"#lanes": c.Plan("unknown", "malformed: lanes is not a list")})
+
+    def test_unicode_or_spaced_worktree_spelling_is_not_ours(self) -> None:
+        base = "C:\\dev\\JARVIS\\.claude\\"
+        for wt in (base + "wor\u212atrees\\L1", base + "worktree\u017f\\L1",
+                   base + "worktrees\\L1\u00a0", base + "worktrees\\L1\u3000",
+                   " " + base + "worktrees\\L1", "\u00a0" + base + "worktrees\\L1"):
+            got = run(lane(worktree=wt))
+            self.assertEqual(got.verdict, "preserve", repr(wt))
+            self.assertIn("not a lane worktree", got.reason)
+        got = run(lane(worktree="C:\\Users\\stra\u00dfe\\J\\.claude\\worktrees\\L1"),
+                  root="C:\\Users\\strasse\\J")
+        self.assertEqual(got.verdict, "preserve")
+
+    def test_unc_spaced_bare_or_non_ascii_root_makes_every_lane_unknown(self) -> None:
+        for root in ("//", "\\\\", "/", "C:\\", "  C:\\dev\\JARVIS", "C:\\dev\\JARVIS ",
+                     "\\\\.\\C:\\dev\\JARVIS", "\\\\server\\share\\JARVIS", "C:\\dev\\JARV\u0130S"):
+            self.assertEqual(run(lane(), root=root).verdict, "unknown", repr(root))
+
+    def test_any_spelling_of_one_worktree_directory_collides(self) -> None:
+        base = "C:\\dev\\JARVIS\\.claude\\worktrees\\"
+        for wt in (base + ".\\L1", "\\\\?\\" + base + "L1", base + "L1.", base + "x\\..\\L1",
+                   base + "L1\\.", base + "l1 "):
+            other = lane(lane="L2", status="RUNNING", head=B, worktree=wt)
+            out = c.plan([lane(), other], frozenset({A}), {"L1": ev()}, clock=lambda: NOW,
+                         timeout=HOUR, root=ROOT)
+            self.assertEqual(out["L1"].verdict, "unknown", repr(wt))
+            self.assertIn("worktree claimed by more than one lane", out["L1"].reason)
+
+    def test_nested_or_prefixed_branch_spellings_are_judged_canonically(self) -> None:
+        for branch in ("refs/heads/-x", "heads/-x", "heads/@", "refs/heads/"):
+            self.assertEqual(run(lane(branch=branch)).verdict, "unknown", branch)
+        for branch in ("refs/heads/heads/ci/x", "refs/heads/heads/main", "refs/tags/v1",
+                       "refs/heads/heads/remotes/o/x", "refs/remotes/origin/x"):
+            got = run(lane(branch=branch))
+            self.assertEqual(got.verdict, "preserve", branch)
+            self.assertIn("protected branch", got.reason)
+
+    def test_hostile_input_is_unknown_not_an_exception(self) -> None:
+        class Raising(tzinfo):
+            def utcoffset(self, dt: datetime | None) -> timedelta | None:
+                raise RuntimeError("tz")
+
+        class Far(tzinfo):
+            def utcoffset(self, dt: datetime | None) -> timedelta | None:
+                return timedelta(hours=30)
+
+        class Boom(dict[str, Any]):
+            def get(self, *args: Any) -> Any:
+                raise RuntimeError("get")
+
+        class Odd(datetime):
+            def isoformat(self, *args: Any, **kw: Any) -> str:
+                raise RuntimeError("iso")
+
+        for tz in (Raising(), Far()):
+            self.assertEqual(run(lane(), clock=datetime(2026, 11, 24, 12, tzinfo=tz)).verdict,
+                             "unknown")
+            self.assertEqual(run(lane(finished_ts=datetime(2026, 11, 1, tzinfo=tz))).verdict,
+                             "unknown")
+        out = c.plan([Boom(lane())], frozenset({A}), {}, clock=lambda: NOW, timeout=HOUR, root=ROOT)
+        self.assertEqual(list(out), ["#plan"])
+        self.assertEqual(out["#plan"].verdict, "unknown")
+        res = c.compare([lane()], frozenset({A}), {"L1": ev()}, [],
+                        clock=lambda: Odd(2026, 11, 24, 12, tzinfo=UTC), timeout=HOUR, root=ROOT)
+        self.assertEqual((res["records"], res["agreement"]), ([], None))
+        self.assertIn("input raised RuntimeError", res["error"])
+
+    def test_non_callable_or_raising_clock_is_unknown_not_an_exception(self) -> None:
+        def boom() -> datetime:
+            raise RuntimeError("clock down")
+
+        for clock in (None, NOW, 5, boom):
+            out = c.plan([lane()], frozenset({A}), {"L1": ev()}, clock=clock, timeout=HOUR,
+                         root=ROOT)
+            self.assertEqual(out["L1"].verdict, "unknown", clock)
+            self.assertIn("clock", out["L1"].reason)
+            shadow = c.compare([lane()], frozenset({A}), {"L1": ev()},
+                               [{"event": "cleanup", "lane": "L1", "result": "removed"}],
+                               clock=clock, timeout=HOUR, root=ROOT)
+            self.assertEqual(shadow["records"][0]["verdict"], "unknown", clock)
+            self.assertIsNone(shadow["ts"])
+            self.assertIsNone(shadow["agreement"])
 
     def test_duplicate_lane_ids_are_unknown(self) -> None:
         out = c.plan([lane(), lane()], frozenset({A}), {"L1": ev()}, clock=lambda: NOW,
-                     timeout=HOUR)
+                     timeout=HOUR, root=ROOT)
         self.assertEqual(out["L1"].verdict, "unknown")
         self.assertIn("duplicate", out["L1"].reason)
 
@@ -146,7 +274,7 @@ class N6CleanupTests(unittest.TestCase):
             calls.append(1)
             return NOW
 
-        c.compare([lane()], frozenset({A}), {"L1": ev()}, [], clock=clock, timeout=HOUR)
+        c.compare([lane()], frozenset({A}), {"L1": ev()}, [], clock=clock, timeout=HOUR, root=ROOT)
         self.assertEqual(len(calls), 1)
 
     # shadow compare against the conveyor's cleanup / cleanup_refused / preserved events
@@ -154,7 +282,8 @@ class N6CleanupTests(unittest.TestCase):
     def shadow(self, events: Any, recs: Any = None, evidence: Any = None) -> dict[str, Any]:
         recs = [lane()] if recs is None else recs
         evs = {"L1": ev()} if evidence is None else evidence
-        return c.compare(recs, frozenset({A}), evs, events, clock=lambda: NOW, timeout=HOUR)
+        return c.compare(recs, frozenset({A}), evs, events, clock=lambda: NOW, timeout=HOUR,
+                         root=ROOT)
 
     def verdict(self, events: Any, **kw: Any) -> str:
         return self.shadow(events, **kw)["records"][0]["verdict"]
@@ -191,6 +320,19 @@ class N6CleanupTests(unittest.TestCase):
     def test_cleanup_error_is_preserve(self) -> None:
         events = [{"event": "cleanup", "lane": "L1", "result": "error"}]
         self.assertEqual(c.conveyor_verdicts(events), {"L1": ("preserve", "cleanup error")})
+
+    def test_cleanup_without_a_known_result_is_unknown_not_agree(self) -> None:
+        running = [lane(status="RUNNING")]  # N6 preserves: a guessed "preserve" would agree
+        for extra in ({}, {"result": "weird"}, {"result": None}, {"result": 5},
+                      {"result": "Removed"}, {"result": " removed"}):
+            events = [{"event": "cleanup", "lane": "L1", **extra}]
+            self.assertEqual(c.conveyor_verdicts(events)["L1"][0], "unknown", extra)
+            out = self.shadow(events, recs=running)
+            self.assertEqual(out["records"][0]["verdict"], "unknown", extra)
+            self.assertIsNone(out["agreement"])
+        events = [{"event": "cleanup", "lane": "L1"},
+                  {"event": "cleanup_refused", "lane": "L1", "step": "worktree", "reason": "x"}]
+        self.assertEqual(self.verdict(events, recs=running), "agree")  # a later known event decides
 
     def test_preserved_released_clears_the_lane(self) -> None:
         events = [{"event": "preserved", "lane": "L1", "reason": "r"},
