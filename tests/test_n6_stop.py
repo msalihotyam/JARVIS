@@ -314,5 +314,107 @@ class ExactTypeTests(unittest.TestCase):
             Event("pass", BadRepr())  # type: ignore[arg-type]
 
 
+class RaisingName(type):
+    @property
+    def __name__(self) -> str:  # type: ignore[override]
+        raise RuntimeError("no name")
+
+
+def rewriting_at(effect: object) -> datetime:
+    """A recorded_at whose tzinfo (read by KpiRow.__post_init__) runs ``effect``."""
+    class Rewriting(datetime):
+        @property
+        def tzinfo(self) -> timezone:  # type: ignore[override]
+            effect()  # type: ignore[operator]
+            return timezone.utc
+    return Rewriting(2026, 11, 24)
+
+
+def keyed(kind: type, name: str, effect: object, fields: dict[str, object]) -> object:
+    """An item whose instance dict holds, first, a str-subclass key hashing like ``name``: reading
+    ``name`` through getattr calls its __eq__, which runs ``effect`` once armed."""
+    armed: list[bool] = []
+
+    class Key(str):
+        def __hash__(self) -> int:
+            return hash(name)
+
+        def __eq__(self, other: object) -> bool:
+            if armed:
+                effect()  # type: ignore[operator]
+            return False
+
+    item = object.__new__(kind)
+    object.__setattr__(item, Key("x" + name), 0)
+    for field, value in fields.items():
+        object.__setattr__(item, field, value)
+    armed.append(True)
+    return item
+
+
+class SnapshotTests(unittest.TestCase):
+    """N6STOP1FIX3: every row and event is copied before any check runs foreign code."""
+
+    def test_earlier_row_check_cannot_rewrite_a_later_row(self) -> None:
+        incident = row(security=1)
+        later = forged(row("S2"), recorded_at=rewriting_at(
+            lambda: object.__setattr__(incident, "security_incidents", 0)))
+        self.assertEqual(run(rows=[later, incident]), Verdict(STOP, n6_stop.SECURITY_INCIDENT))
+
+    def test_row_check_cannot_rewrite_an_event(self) -> None:
+        false_pass = Event("false_pass", "n6")
+        later = forged(row(), recorded_at=rewriting_at(lambda: object.__setattr__(false_pass, "kind", "pass")))
+        self.assertEqual(run(rows=[later], events=[false_pass]), Verdict(STOP, n6_stop.FALSE_PASS))
+
+    def test_colliding_dict_key_refused(self) -> None:
+        """getattr on such an item runs foreign code; the snapshot refuses the item instead."""
+        incident = row(security=1)
+        krow = keyed(KpiRow, "source", lambda: object.__setattr__(incident, "security_incidents", 0),
+                     dict(vars(row("S2"))))
+        with self.assertRaises(StopInputError):
+            run(rows=[krow, incident])
+        false_pass = Event("false_pass", "n6")
+        kevent = keyed(Event, "kind", lambda: object.__setattr__(false_pass, "kind", "pass"),
+                       {"kind": "pass", "source": "n6"})
+        with self.assertRaises(StopInputError):
+            run(events=[kevent, false_pass])
+
+    def test_dict_subclass_instance_dict_refused(self) -> None:
+        class Lying(dict[str, object]):
+            def get(self, key: str, default: object = None) -> object:  # type: ignore[override]
+                return 0 if key == "security_incidents" else super().get(key, default)
+
+        incident = row(security=1)
+        object.__setattr__(incident, "__dict__", Lying(vars(incident)))
+        with self.assertRaises(StopInputError):
+            run(rows=[incident])
+
+    def test_raising_type_name_gives_stop_input_error(self) -> None:
+        class Num(float, metaclass=RaisingName):
+            pass
+
+        class Text(str, metaclass=RaisingName):
+            pass
+
+        class Thing(metaclass=RaisingName):
+            pass
+
+        class Boom(Exception, metaclass=RaisingName):
+            pass
+
+        def boom() -> None:
+            raise Boom
+
+        for usage, share in ((Num(50.0), 5.0), (50.0, Num(5.0))):
+            with self.assertRaises(StopInputError):
+                run(usage=usage, share=share)
+        with self.assertRaises(StopInputError):
+            Event("pass", Text("n6"))
+        with self.assertRaises(StopInputError):
+            run(rows=[Thing()])
+        with self.assertRaises(StopInputError):
+            run(rows=[forged(row(), recorded_at=rewriting_at(boom))])
+
+
 if __name__ == "__main__":
     unittest.main()

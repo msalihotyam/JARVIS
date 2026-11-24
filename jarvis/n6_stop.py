@@ -65,7 +65,7 @@ class Event:
             value: object = getattr(self, field)
             # Exact str: a subclass can lie in __eq__/__ne__/__hash__ (or __repr__) and turn a STOP into CONTINUE.
             if type(value) is not str:
-                raise StopInputError(f"event {field} must be a str, got {type(value).__name__}"[:120])
+                raise StopInputError(f"event {field} must be a str")  # fixed text: a metaclass __name__ can raise
             if value not in allowed:
                 raise StopInputError(f"unknown event {field} {value!r}"[:120])
 
@@ -89,15 +89,17 @@ def _pct(name: str, value: object) -> float | None:
     # isfinite: math.isfinite(10**400) raises OverflowError.
     exact = type(value) is int or type(value) is float
     if not exact or not 0 <= value <= 100 or not math.isfinite(value):  # pyright: ignore[reportOperatorIssue, reportArgumentType]
-        raise StopInputError(f"{name} must be a number 0..100 or None, got {type(value).__name__}"[:120])
+        # Fixed text: never read the foreign type's metadata (a metaclass __name__ can raise).
+        raise StopInputError(f"{name} must be a number 0..100 or None")
     return float(value)  # pyright: ignore[reportArgumentType]
 
 
-def _items(name: str, value: object, kind: type, fields: tuple[tuple[str, type], ...]) -> list[tuple[object, ...]] | None:
-    """Plain copies of the read fields, taken before any check runs foreign code.
+def _snapshot(name: str, value: object, kind: type,
+              fields: tuple[tuple[str, type], ...]) -> tuple[tuple[object, ...], list[tuple[object, ...]]] | None:
+    """The items and plain copies of their read fields. Runs no foreign code at all.
 
-    Evaluating copies, not the items, means a later item's check (or anything else) cannot rewrite a
-    row already checked. Any failure while checking, of whatever type, is a StopInputError.
+    evaluate snapshots rows AND events before any item's check runs, so no check (KpiRow.__post_init__
+    reads recorded_at.tzinfo) can rewrite any item, earlier or later, before its copy is taken.
     """
     if value is None:
         return None
@@ -105,23 +107,33 @@ def _items(name: str, value: object, kind: type, fields: tuple[tuple[str, type],
     # bytearray/memoryview are not item lists.
     if type(value) is not list and type(value) is not tuple:
         raise StopInputError(f"{name} must be a list, a tuple or None")
+    items = tuple(value)  # pyright: ignore[reportUnknownArgumentType, reportUnknownVariableType]
     copies: list[tuple[object, ...]] = []
+    for item in items:  # pyright: ignore[reportUnknownVariableType]
+        if type(item) is not kind:  # pyright: ignore[reportUnknownArgumentType]
+            raise StopInputError(f"malformed {name} item")
+        # Not getattr: an instance-dict key that is a str subclass with a colliding hash runs its __eq__.
+        attrs: object = vars(item)  # pyright: ignore[reportUnknownArgumentType]
+        if type(attrs) is not dict or any(type(k) is not str for k in attrs):  # pyright: ignore[reportUnknownVariableType]
+            raise StopInputError(f"malformed {name} item")
+        copy = tuple(attrs.get(f) for f, _ in fields)  # pyright: ignore[reportUnknownMemberType]
+        if any(type(v) is not t for v, (_, t) in zip(copy, fields)):
+            raise StopInputError(f"malformed {name} item: a field has the wrong type")
+        copies.append(copy)
+    return items, copies
+
+
+def _check(name: str, snapshot: tuple[tuple[object, ...], list[tuple[object, ...]]] | None, kind: type) -> None:
+    """Re-run the dataclass checks: a frozen instance can still be forged with object.__setattr__."""
     try:
-        for item in tuple(value):  # pyright: ignore[reportUnknownArgumentType, reportUnknownVariableType]
-            # Re-run the dataclass checks: a frozen instance can still be forged with object.__setattr__.
-            if type(item) is not kind:  # pyright: ignore[reportUnknownArgumentType]
-                raise StopInputError(f"malformed {name} item: {type(item).__name__}")  # pyright: ignore[reportUnknownArgumentType]
-            copy = tuple(getattr(item, f) for f, _ in fields)  # pyright: ignore[reportUnknownArgumentType]
-            if any(type(v) is not t for v, (_, t) in zip(copy, fields)):
-                raise StopInputError(f"malformed {name} item: a field has the wrong type")
+        for item in snapshot[0] if snapshot else ():
             # Through the class: an instance attribute can shadow __post_init__ with a no-op.
             kind.__post_init__(item)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
-            copies.append(copy)
     except StopInputError:
         raise
     except Exception as error:  # KpiError, or anything foreign code raised: no verdict either way
-        raise StopInputError(f"malformed {name} item: {type(error).__name__}") from error
-    return copies
+        # Fixed text: the error's type is foreign and may raise on __name__.
+        raise StopInputError(f"malformed {name} item: its check raised") from error
 
 
 def evaluate(
@@ -129,8 +141,13 @@ def evaluate(
     usage_pct: float | None, n6_share_pct: float | None,
 ) -> Verdict:
     """The stop-rule verdict. ``None`` = missing / unreadable / unknown. ``events`` is oldest first."""
-    checked_rows = _items("rows", rows, KpiRow, _ROW_FIELDS)
-    checked_events = _items("events", events, Event, _EVENT_FIELDS)
+    # Every item of both lists is copied before any check runs foreign code; the checks come after.
+    row_snap = _snapshot("rows", rows, KpiRow, _ROW_FIELDS)
+    event_snap = _snapshot("events", events, Event, _EVENT_FIELDS)
+    _check("rows", row_snap, KpiRow)
+    _check("events", event_snap, Event)
+    checked_rows = row_snap[1] if row_snap else None
+    checked_events = event_snap[1] if event_snap else None
     usage = _pct("usage_pct", usage_pct)
     share = _pct("n6_share_pct", n6_share_pct)
     kpi = [(str(s), bool(p), int(d), int(i)) for s, p, d, i in checked_rows or ()]  # pyright: ignore[reportArgumentType]
