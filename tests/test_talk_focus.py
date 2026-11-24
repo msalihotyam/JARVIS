@@ -49,6 +49,19 @@ class TalkFocusTests(unittest.TestCase):
                 self.assertIsNone(result.notice)
                 self.assertIsNone(result.question)
 
+    def test_current_project_with_same_topic_stays_silently(self):
+        for intent in (Intent.WRITE, Intent.ACTION, Intent.READ, Intent.CHAT):
+            for explicit in (False, True):
+                with self.subTest(intent=intent, explicit=explicit):
+                    state = FocusState(self.focus)
+                    proposal = Proposal(intent, "planning", ("Atlas",), explicit=explicit)
+                    result = state.apply(proposal, self.projects)
+                    self.assertEqual(result.action, Action.SWITCH)
+                    self.assertEqual(result.focus, self.focus)
+                    self.assertIsNone(result.notice)
+                    self.assertIsNone(result.question)
+                    self.assertEqual(state.focus, self.focus)
+
     def test_start_project_opens_listed_project_and_moves_focus(self):
         result = self.decide(Intent.START_PROJECT)
         self.assertEqual(result.action, Action.OPEN_PROJECT)

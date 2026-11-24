@@ -59,7 +59,7 @@ def decide(current: Focus, proposal: Proposal, projects: Collection[str]) -> Dec
     target = Focus(candidates[0], proposal.topic)
     if opening:
         return Decision(Action.OPEN_PROJECT, target)
-    if target.project == current.project and target.topic != current.topic:
+    if target.project == current.project:
         return Decision(Action.SWITCH, target)
     if proposal.explicit or proposal.intent in (Intent.READ, Intent.CHAT):
         return Decision(Action.SWITCH, target, notice="Switched")
