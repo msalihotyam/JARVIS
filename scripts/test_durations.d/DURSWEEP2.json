@@ -1,0 +1,14 @@
+{
+  "classes": {
+    "tests.test_n6_stop.StopTests": 1.0,
+    "tests.test_n6_stop.PauseTests": 1.0,
+    "tests.test_n6_stop.NegativeTests": 1.0,
+    "tests.test_n6_stop.ExactTypeTests": 1.0,
+    "tests.test_n6_stop.SnapshotTests": 1.0,
+    "tests.test_n6_baseline.Fixture": 1.0,
+    "tests.test_n6_baseline.AcceptanceTests": 1.0,
+    "tests.test_n6_baseline.NegativeTests": 1.0,
+    "tests.test_n6_judge_pack.JudgePackTest": 3.0,
+    "tests.test_n6_ffrehearse.FfRehearseTests": 131.7
+  }
+}
