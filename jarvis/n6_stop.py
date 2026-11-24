@@ -19,7 +19,7 @@ import math
 from collections.abc import Sequence
 from dataclasses import dataclass
 
-from jarvis.n6_kpi import SOURCES, KpiError, KpiRow
+from jarvis.n6_kpi import SOURCES, KpiRow
 
 QUOTA_LINE_PCT = 95  # kit 5: "95 until X1 is decided"
 RESERVE_PCT = 5  # N6-04 reserve: pause once usage is inside the last 5%
@@ -61,10 +61,13 @@ class Event:
     source: str
 
     def __post_init__(self) -> None:
-        if not isinstance(self.kind, str) or self.kind not in KINDS:  # pyright: ignore[reportUnnecessaryIsInstance]
-            raise StopInputError(f"unknown event kind {self.kind!r}")
-        if not isinstance(self.source, str) or self.source not in SOURCES:  # pyright: ignore[reportUnnecessaryIsInstance]
-            raise StopInputError(f"event source must be one of {SOURCES}, got {self.source!r}")
+        for field, allowed in (("kind", KINDS), ("source", SOURCES)):
+            value: object = getattr(self, field)
+            # Exact str: a subclass can lie in __eq__/__ne__/__hash__ (or __repr__) and turn a STOP into CONTINUE.
+            if type(value) is not str:
+                raise StopInputError(f"event {field} must be a str, got {type(value).__name__}"[:120])
+            if value not in allowed:
+                raise StopInputError(f"unknown event {field} {value!r}"[:120])
 
 
 @dataclass(frozen=True)
@@ -73,27 +76,49 @@ class Verdict:
     reason: str
 
 
+# The fields evaluate reads, with their exact types; n6_kpi checks with isinstance, which a lying subclass passes.
+_ROW_FIELDS = (("source", str), ("passed", bool), ("post_accept_defects", int), ("security_incidents", int))
+_EVENT_FIELDS = (("kind", str), ("source", str))
+
+
 def _pct(name: str, value: object) -> float | None:
     if value is None:
         return None
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) \
-            or not 0 <= value <= 100:
-        raise StopInputError(f"{name} must be a number 0..100 or None, got {value!r}"[:120])
-    return float(value)
+    # Exact int/float (bool excluded too): a subclass can lie in its comparisons. Bounds before
+    # isfinite: math.isfinite(10**400) raises OverflowError.
+    if type(value) not in (int, float) or not 0 <= value <= 100 or not math.isfinite(value):  # pyright: ignore[reportOperatorIssue, reportArgumentType]
+        raise StopInputError(f"{name} must be a number 0..100 or None, got {type(value).__name__}"[:120])
+    return float(value)  # pyright: ignore[reportArgumentType]
 
 
-def _items(name: str, value: object, kind: type) -> tuple[object, ...] | None:
+def _items(name: str, value: object, kind: type, fields: tuple[tuple[str, type], ...]) -> list[tuple[object, ...]] | None:
+    """Plain copies of the read fields, taken before any check runs foreign code.
+
+    Evaluating copies, not the items, means a later item's check (or anything else) cannot rewrite a
+    row already checked. Any failure while checking, of whatever type, is a StopInputError.
+    """
     if value is None:
         return None
-    if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise StopInputError(f"{name} must be a sequence or None")
-    items = tuple(value)  # pyright: ignore[reportUnknownArgumentType]
-    for item in items:
-        # Re-run the dataclass checks: a frozen instance can still be forged with object.__setattr__.
-        if type(item) is not kind:
-            raise StopInputError(f"malformed {name} item: {item!r}"[:120])
-        item.__post_init__()  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
-    return items
+    # Exact list/tuple: a Sequence subclass's __iter__ is foreign code, bytearray/memoryview are not item lists.
+    if type(value) not in (list, tuple):
+        raise StopInputError(f"{name} must be a list, a tuple or None")
+    copies: list[tuple[object, ...]] = []
+    try:
+        for item in tuple(value):  # pyright: ignore[reportUnknownArgumentType, reportUnknownVariableType]
+            # Re-run the dataclass checks: a frozen instance can still be forged with object.__setattr__.
+            if type(item) is not kind:  # pyright: ignore[reportUnknownArgumentType]
+                raise StopInputError(f"malformed {name} item: {type(item).__name__}")  # pyright: ignore[reportUnknownArgumentType]
+            copy = tuple(getattr(item, f) for f, _ in fields)  # pyright: ignore[reportUnknownArgumentType]
+            if any(type(v) is not t for v, (_, t) in zip(copy, fields)):
+                raise StopInputError(f"malformed {name} item: a field has the wrong type")
+            # Through the class: an instance attribute can shadow __post_init__ with a no-op.
+            kind.__post_init__(item)  # pyright: ignore[reportAttributeAccessIssue, reportUnknownMemberType]
+            copies.append(copy)
+    except StopInputError:
+        raise
+    except Exception as error:  # KpiError, or anything foreign code raised: no verdict either way
+        raise StopInputError(f"malformed {name} item: {type(error).__name__}") from error
+    return copies
 
 
 def evaluate(
@@ -101,26 +126,27 @@ def evaluate(
     usage_pct: float | None, n6_share_pct: float | None,
 ) -> Verdict:
     """The stop-rule verdict. ``None`` = missing / unreadable / unknown. ``events`` is oldest first."""
-    try:
-        checked_rows = _items("rows", rows, KpiRow)
-        checked_events = _items("events", events, Event)
-    except KpiError as error:  # a forged row that fails its own checks
-        raise StopInputError(str(error)[:120]) from error
+    checked_rows = _items("rows", rows, KpiRow, _ROW_FIELDS)
+    checked_events = _items("events", events, Event, _EVENT_FIELDS)
     usage = _pct("usage_pct", usage_pct)
     share = _pct("n6_share_pct", n6_share_pct)
-    kpi = [r for r in checked_rows or () if isinstance(r, KpiRow)]
-    seen = [e for e in checked_events or () if isinstance(e, Event)]
+    kpi = [(str(s), bool(p), int(d), int(i)) for s, p, d, i in checked_rows or ()]  # pyright: ignore[reportArgumentType]
+    seen = [(str(k), str(s)) for k, s in checked_events or ()]
+    # The copies were taken before __post_init__ ran foreign code that could reset the item: check them too.
+    if any(s not in SOURCES or d < 0 or i < 0 for s, _, d, i in kpi) or any(
+            k not in KINDS or s not in SOURCES for k, s in seen):
+        raise StopInputError("malformed rows or events item")
 
     hits: set[str] = set()
-    for r in kpi:
-        if r.security_incidents > 0:  # any source: stopping N6 is the safe side
+    for source, passed, defects, security in kpi:
+        if security > 0:  # any source: stopping N6 is the safe side
             hits.add(SECURITY_INCIDENT)
         # Mirrors scripts/n6_e8_report.py false_pass: an N6 PASS later shown wrong.
-        if r.source == "n6" and r.passed and r.post_accept_defects > 0:
+        if source == "n6" and passed and defects > 0:
             hits.add(FALSE_PASS)
-    for e in seen:
-        if e.kind in STOP_KINDS and not (e.kind == FALSE_PASS and e.source != "n6"):
-            hits.add(e.kind)
+    for kind, source in seen:
+        if kind in STOP_KINDS and not (kind == FALSE_PASS and source != "n6"):
+            hits.add(kind)
     for reason in STOP_KINDS:
         if reason in hits:
             return Verdict(STOP, reason)
@@ -132,9 +158,9 @@ def evaluate(
     if usage >= min(QUOTA_LINE_PCT, 100 - RESERVE_PCT):
         return Verdict(PAUSE, QUOTA_LINE)
     streak = 0
-    for e in seen:
-        if e.source == "n6" and e.kind in RESULT_KINDS:  # conveyor results neither count nor reset
-            streak = streak + 1 if e.kind == "blocked" else 0
+    for kind, source in seen:
+        if source == "n6" and kind in RESULT_KINDS:  # conveyor results neither count nor reset
+            streak = streak + 1 if kind == "blocked" else 0
     if streak >= BLOCKED_STREAK:
         return Verdict(PAUSE, BLOCKED_RUN)
     if share is None:

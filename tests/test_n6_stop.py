@@ -31,7 +31,7 @@ def results(*spec: str) -> list[Event]:
 class StopTests(unittest.TestCase):
     def test_security_incident_stops(self) -> None:
         self.assertEqual(run(rows=[row(security=1)]), Verdict(STOP, n6_stop.SECURITY_INCIDENT))
-        self.assertEqual(run(events=[Event("security_incident", "n6")]).reason, n6_stop.SECURITY_INCIDENT)
+        self.assertEqual(run(events=[Event("security_incident", "n6")]), Verdict(STOP, n6_stop.SECURITY_INCIDENT))
 
     def test_false_pass_stops(self) -> None:
         self.assertEqual(run(rows=[row(defects=1)]), Verdict(STOP, n6_stop.FALSE_PASS))
@@ -135,6 +135,122 @@ class NegativeTests(unittest.TestCase):
             Event("paused", "n6")
         with self.assertRaises(StopInputError):
             Event("blocked", "codex")
+
+
+class LyingStr(str):
+    """Equal to everything, unequal to everything: defeats == / != / in checks."""
+
+    def __eq__(self, other: object) -> bool:
+        return True
+
+    def __ne__(self, other: object) -> bool:
+        return True
+
+    __hash__ = str.__hash__
+
+
+class LyingFloat(float):
+    """Every comparison True: passes 0 <= x <= 100 whatever its value."""
+
+    def __ge__(self, other: object) -> bool:
+        return True
+
+    __le__ = __lt__ = __gt__ = __ge__
+
+
+class LyingInt(int):
+    """Every comparison False: a negative count passes ``< 0`` and a real incident fails ``> 0``."""
+
+    def __lt__(self, other: object) -> bool:
+        return False
+
+    __gt__ = __le__ = __ge__ = __lt__
+
+
+def forged(item: object, **fields: object) -> object:
+    for name, value in fields.items():
+        object.__setattr__(item, name, value)
+    return item
+
+
+class ExactTypeTests(unittest.TestCase):
+    """N6STOP1FIX: lying subclasses and shadowed __post_init__ raise, never CONTINUE."""
+
+    def test_lying_str_event_kind_or_source_refused(self) -> None:
+        for kind, source in ((LyingStr("false_pass"), "n6"), ("false_pass", LyingStr("n6")),
+                             (LyingStr("maybe"), "n6"), ("pass", LyingStr("codex"))):
+            with self.subTest(kind=kind, source=source), self.assertRaises(StopInputError):
+                Event(kind, source)
+
+    def test_forged_lying_str_event_raises(self) -> None:
+        for fields in ({"kind": LyingStr("false_pass")}, {"source": LyingStr("n6")}):
+            with self.subTest(fields=fields), self.assertRaises(StopInputError):
+                run(events=[forged(Event("false_pass", "n6"), **fields)])
+
+    def test_shadowed_post_init_still_checked(self) -> None:
+        noop = {"__post_init__": lambda: None}
+        event = forged(Event("pass", "n6"), kind="maybe", **noop)
+        kpi = forged(row(), security_incidents=-1, **noop)
+        for rows, events in (([], [event]), ([kpi], [])):
+            with self.subTest(rows=rows, events=events), self.assertRaises(StopInputError):
+                run(rows=rows, events=events)
+
+    def test_lying_number_reading_refused(self) -> None:
+        for value in (LyingFloat(-5.0), LyingFloat(500.0), LyingFloat(99.0), LyingInt(-1), LyingInt(50)):
+            with self.subTest(usage=value), self.assertRaises(StopInputError):
+                run(usage=value)
+            with self.subTest(share=value), self.assertRaises(StopInputError):
+                run(share=value)
+
+    def test_lying_row_field_refused(self) -> None:
+        for fields in ({"security_incidents": LyingInt(1)}, {"post_accept_defects": LyingInt(-1)},
+                       {"source": LyingStr("n6")}):
+            with self.subTest(fields=fields), self.assertRaises(StopInputError):
+                run(rows=[forged(row(), **fields)])
+        with self.assertRaises(StopInputError):  # built directly: n6_kpi's isinstance check lets it in
+            run(rows=[KpiRow("S1", "n6", True, 0, 0, 1000, 60.0, LyingInt(1), AT)])
+
+    def test_later_check_cannot_rewrite_a_checked_row(self) -> None:
+        incident = row(security=1)
+
+        class Rewriting(datetime):  # tzinfo runs inside the next row's __post_init__
+            @property
+            def tzinfo(self) -> timezone:  # type: ignore[override]
+                object.__setattr__(incident, "security_incidents", 0)
+                return timezone.utc
+
+        later = forged(row("S2"), recorded_at=Rewriting(2026, 11, 24))
+        self.assertEqual(run(rows=[incident, later]), Verdict(STOP, n6_stop.SECURITY_INCIDENT))
+
+        class Resetting(int):  # runs inside the same row's __post_init__, after the copy was taken
+            def __lt__(self, other: object) -> bool:
+                object.__setattr__(negative, "security_incidents", 0)
+                return False
+
+        negative = forged(row(), security_incidents=-1, quota_tokens=Resetting(5))
+        with self.assertRaises(StopInputError):
+            run(rows=[negative])
+
+    def test_hostile_input_raises_stop_input_error_only(self) -> None:
+        class Seq(list[KpiRow]):
+            def __iter__(self):  # type: ignore[override]
+                raise ZeroDivisionError
+
+        class BadRepr:
+            def __repr__(self) -> str:
+                raise RuntimeError
+
+        for rows in (Seq([row()]), bytearray(), memoryview(b""), range(0), [BadRepr()],
+                     [object.__new__(KpiRow)], [forged(row(), origin=BadRepr())]):
+            with self.subTest(rows=type(rows).__name__), self.assertRaises(StopInputError):
+                run(rows=rows)
+        for value in (10**400, -(10**400)):
+            with self.subTest(value="huge"), self.assertRaises(StopInputError):
+                run(usage=value)
+            with self.subTest(share="huge"), self.assertRaises(StopInputError):
+                run(share=value)
+        with self.assertRaises(StopInputError):
+            Event("pass", BadRepr())  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":
