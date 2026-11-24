@@ -48,6 +48,10 @@ class FallbackDrillTests(unittest.TestCase):
         r = self._accept()
         self.assertEqual(r["after"]["deps"]["S1"], "done")
         self.assertIn("n6: S1: PASS", r["steps"])
+        # N6EVT1: the finish lands one n6_limited record under the conveyor's receipt id
+        events = lr.n6_kpi.limited_events(self.d.n6 / "kpi.db")
+        self.assertEqual([(e.slice_id, e.verdict, e.receipt_id) for e in events],
+                         [("S1", "PASS", drill.receipt_id("S1"))])
 
     def test_a_flip_between_intent_and_receipt_is_unknown_outcome(self):
         d = self.d

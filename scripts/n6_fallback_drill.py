@@ -10,6 +10,7 @@ The live build/n6/LIMITED_ON, build/conveyor and every real lane are never touch
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import os
@@ -93,6 +94,12 @@ def _get(path: Path) -> object:
         return None
 
 
+def receipt_id(sid: str) -> str:
+    """The fake conveyor's fixed lane id per slice (8 hex, like lanes.json "id"): N6EVT1 records
+    the finished slice under it, so the drill exercises the receipt path production takes."""
+    return hashlib.sha256(sid.encode("utf-8")).hexdigest()[:8]
+
+
 class Drill:
     def __init__(self, root: Path | str, token: str, slices=(("S1", "T1"), ("S2", "T1"))):
         self.root = guard(root, token)
@@ -135,7 +142,7 @@ class Drill:
     def ports(self):
         return lr.Ports(now=lambda: self.clock, verify=lambda sha: True, tier=self.tiers().get,
                         situation=lambda sid: SIT, run=lambda sid, lease: lr.write_claim(self.n6, lease),
-                        ttl_s=TTL)
+                        ttl_s=TTL, receipt=receipt_id)
 
     def tick(self) -> list[str]:
         notes = lr.tick(self.root, self.ports())  # the real N6 LIMITED caller
@@ -157,7 +164,7 @@ class Drill:
     # -- the fake conveyor -------------------------------------------------------------------
     def _start(self, sid: str) -> None:
         lanes = self.lanes()
-        lanes[sid] = {"status": None, "finished": False}
+        lanes[sid] = {"id": receipt_id(sid), "status": None, "finished": False}
         lr._put(self.conv / "lanes.json", lanes)
         (self.started_dir / f"{int(self.clock):015d}-{sid}.md").write_text(sid, encoding="utf-8")
         self.starts[sid] = self.starts.get(sid, 0) + 1
@@ -222,7 +229,8 @@ class Drill:
 
     def finish(self, sid: str, status: str = "PASS") -> None:
         lanes = self.lanes()
-        lanes[sid] = {"status": status, "finished": True}
+        old = lanes.get(sid)
+        lanes[sid] = {**(old if isinstance(old, dict) else {}), "status": status, "finished": True}  # keeps the receipt id
         lr._put(self.conv / "lanes.json", lanes)
         self.log("conveyor", f"{sid}: lane finished {status}")
 
