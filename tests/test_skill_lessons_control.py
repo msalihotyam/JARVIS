@@ -60,6 +60,7 @@ def raw(database: Path, sql: str) -> list[tuple]:
 
 class LessonCoreTests(unittest.TestCase):
     # The SKCORE harness, borrowed without collecting its tests here.
+    setUpClass = test_skill_core.SkillCoreTests.__dict__["setUpClass"]
     setUp = test_skill_core.SkillCoreTests.setUp
     core = test_skill_core.SkillCoreTests.core
     save_skill = test_skill_core.SkillCoreTests.save_skill

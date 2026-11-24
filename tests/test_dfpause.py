@@ -39,6 +39,7 @@ class _SimulatedCrash(BaseException):
 
 class PauseCoreTests(unittest.TestCase):
     # SKCORE's fixtures, borrowed (not subclassed, so its tests run once).
+    setUpClass = base.SkillCoreTests.__dict__["setUpClass"]
     setUp = base.SkillCoreTests.setUp
     core = base.SkillCoreTests.core
     feed = base.SkillCoreTests.feed
