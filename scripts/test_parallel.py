@@ -94,6 +94,7 @@ ROOT = Path(__file__).resolve().parents[1]
 TESTS = ROOT / "tests"
 STATE = ROOT / "JARVIS_ACTIVE_STATE.md"
 DURATIONS = Path(__file__).resolve().with_name("test_durations.json")
+DURATIONS_D = DURATIONS.with_name("test_durations.d")  # DURD1: per-slice records, scripts/test_durations.d/<SLICEID>.json
 
 #: A module recorded above this many seconds is split into chunks of about this size.
 CHUNK_SECONDS = 60.0
@@ -257,11 +258,50 @@ class Unit:
         return self.seconds if self.seconds is not None else 0.0
 
 
-def load_durations(path: Path = DURATIONS, key: str = "classes") -> dict[str, float]:
+def load_durations(path: Path | None = None, key: str = "classes") -> dict[str, float]:
+    """The main file's ``key`` map united with every per-slice ``DURATIONS_D/*.json`` (DURD1), by
+    file name: the main file wins a duplicate key; between two .d files the first wins (WARN
+    line). A malformed .d file exits naming it (fail closed); a missing directory is no records."""
     try:
-        return {k: float(v) for k, v in json.loads(path.read_text(encoding="utf-8")).get(key, {}).items()}
+        merged = {k: float(v) for k, v in json.loads((path or DURATIONS).read_text(encoding="utf-8")).get(key, {}).items()}
     except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        return {}
+        merged = {}
+    main_keys, owner = set(merged), {}
+    for file in sorted(DURATIONS_D.glob("*.json"), key=lambda p: p.name):
+        for k, v in _read_slice_durations(file)[key].items():
+            if k in main_keys:
+                continue
+            if k in owner:
+                print(f"WARN: duration record {k} in {file.name} ignored, {owner[k]} has it", flush=True)
+                continue
+            owner[k], merged[k] = file.name, v
+    return merged
+
+
+def _read_slice_durations(file: Path) -> dict[str, dict[str, float]]:
+    """One scripts/test_durations.d file, both maps validated, or SystemExit naming the file."""
+    def bad(why: str) -> SystemExit:
+        return SystemExit(f"malformed duration record file {file}: {why}")
+    try:
+        data = json.loads(file.read_text(encoding="utf-8-sig"))  # utf-8-sig: PowerShell 5.1 writes a BOM
+    except (OSError, ValueError) as exc:
+        raise bad(str(exc)) from None
+    if not isinstance(data, dict):
+        raise bad("top level is not an object")
+    maps = {}
+    for name in ("classes", "tests"):
+        records = data.get(name, {})
+        if not isinstance(records, dict):
+            raise bad(f'"{name}" is not an object')
+        for k, v in records.items():
+            try:  # float(): a huge JSON int overflows here, not later without the file name
+                ok = not isinstance(v, bool) and isinstance(v, (int, float)) and 0 <= float(v) < float("inf")
+            except OverflowError:
+                ok = False
+            if not ok:
+                raise bad(f'"{name}" {k}: {str(v)[:40]} is not a non-negative number of seconds')
+        maps[name] = {k: float(v) for k, v in records.items()}
+    return maps
 
 
 def build_units(discovery: dict, ui: set[str], durations: dict[str, float], tests: dict[str, float] | None = None) -> list[Unit]:
@@ -318,6 +358,7 @@ def missing_records_message(units: list[Unit]) -> str:
     if not missing:
         return ""
     return ("no duration record for these test modules, add it to scripts/test_durations.json "
+            "or scripts/test_durations.d/<SLICEID>.json "
             "(without one a module runs as a single unit on the flat 600 s timeout):\n  " + "\n  ".join(missing))
 
 

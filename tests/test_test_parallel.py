@@ -2,11 +2,14 @@
 count, so the UI set no longer sets the suite's critical path; ``--ui-split share`` keeps the old cut.
 The plan is replayed on scripts/test_durations.json (recorded seconds, no clock); no test module runs."""
 import argparse
+import contextlib
 import importlib.util
+import io
 import json
 import os
 import shutil
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -128,6 +131,82 @@ class RollbackTest(unittest.TestCase):
     def test_ci_keeps_the_requested_counts(self):
         with mock.patch.dict(os.environ, {"CI": "true"}):
             self.assertEqual(tp.pool_for(4, 6, True), (None, 4, 6))
+
+
+class SliceDurationsTest(unittest.TestCase):
+    """DURD1: records also live in scripts/test_durations.d/<SLICEID>.json, united with the main file."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        self.main = Path(tmp.name) / "test_durations.json"
+        self.d = Path(tmp.name) / "test_durations.d"
+        self.d.mkdir()
+        patch = mock.patch.object(tp, "DURATIONS_D", self.d)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.main.write_text(json.dumps({"classes": {"tests.m.A": 1.0, "tests.m.B": 2.0}, "tests": {"tests.m.A.t": 1.0}}),
+                             encoding="utf-8")
+
+    def write(self, name: str, data) -> None:
+        (self.d / name).write_text(data if isinstance(data, str) else json.dumps(data), encoding="utf-8")
+
+    def load(self, key: str = "classes") -> tuple[dict, str]:
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            got = tp.load_durations(self.main, key)
+        return got, out.getvalue()
+
+    def test_union_of_main_and_slice_files(self):
+        self.write("S1.json", {"classes": {"tests.n.C": 3.0}, "tests": {"tests.n.C.t": 3}, "note": "ignored"})
+        self.assertEqual(self.load(), ({"tests.m.A": 1.0, "tests.m.B": 2.0, "tests.n.C": 3.0}, ""))
+        self.assertEqual(self.load("tests"), ({"tests.m.A.t": 1.0, "tests.n.C.t": 3.0}, ""))
+
+    def test_main_file_wins_silently(self):
+        self.write("S1.json", {"classes": {"tests.m.A": 9.0}})
+        self.assertEqual(self.load(), ({"tests.m.A": 1.0, "tests.m.B": 2.0}, ""))  # THIZ refresh: no WARN
+
+    def test_first_slice_file_by_name_wins_with_one_warn_line(self):
+        self.write("Z9.json", {"classes": {"tests.n.C": 7.0}})
+        self.write("A1.json", {"classes": {"tests.n.C": 3.0}})
+        got, out = self.load()
+        self.assertEqual(got["tests.n.C"], 3.0)
+        self.assertEqual(out.splitlines(), ["WARN: duration record tests.n.C in Z9.json ignored, A1.json has it"])
+        self.assertEqual(self.load("tests")[1], "")  # the other map's call prints nothing
+
+    def test_malformed_slice_file_fails_naming_it(self):
+        for bad in ("{not json", "[]", {"classes": []}, {"classes": {"tests.n.C": "3"}}, {"tests": {"tests.n.C.t": -1}},
+                    {"classes": {"tests.n.C": True}}, '{"classes": {"tests.n.C": NaN}}',
+                    '{"classes": {"tests.n.C": Infinity}}', '{"classes": {"tests.n.C": 1%s}}' % ("0" * 400)):
+            with self.subTest(bad=str(bad)[:80]):
+                self.write("BAD1.json", bad)
+                with self.assertRaises(SystemExit) as caught:
+                    self.load()
+                self.assertIn("BAD1.json", str(caught.exception.code))
+                self.assertIn("malformed duration record file", str(caught.exception.code))
+
+    def test_missing_or_empty_directory_is_fine(self):
+        self.assertEqual(self.load()[0], {"tests.m.A": 1.0, "tests.m.B": 2.0})  # empty
+        self.d.rmdir()
+        self.assertEqual(self.load()[0], {"tests.m.A": 1.0, "tests.m.B": 2.0})  # missing
+
+    def test_bom_slice_file_is_read(self):
+        (self.d / "S1.json").write_text(json.dumps({"classes": {"tests.n.C": 3.0}}), encoding="utf-8-sig")
+        self.assertEqual(self.load()[0]["tests.n.C"], 3.0)
+
+    def test_missing_record_message_names_both_places(self):
+        units = [tp.Unit("n", [""], ["tests.n.C.t"], None, False)]
+        self.assertIn("add it to scripts/test_durations.json or scripts/test_durations.d/<SLICEID>.json",
+                      tp.missing_records_message(units))
+
+    def test_module_recorded_only_in_a_slice_file_is_planned_with_it(self):
+        discovery = {"modules": {"n": {"split": True, "classes": {"C": ["tests.n.C.t"]}}}}
+        self.assertEqual(tp.build_units(discovery, set(), self.load()[0], self.load("tests")[0])[0].seconds, None)
+        self.write("S1.json", {"classes": {"tests.n.C": 42.5}})
+        units = tp.build_units(discovery, set(), self.load()[0], self.load("tests")[0])
+        self.assertEqual([u.seconds for u in units], [42.5])
+        self.assertEqual(tp.missing_records_message(units), "")
+        self.assertEqual([u.seconds for shard in tp.shard_plan(units, 2) for u in shard], [42.5])
 
 
 if __name__ == "__main__":
