@@ -72,8 +72,8 @@ def sense(ram=read_ram, disk=read_disk) -> Reading:
 
 def margin_ok(reading: Reading, policy=DEFAULT_POLICY) -> bool:
     """True only when RAM is at low + margin AND commit and disk are within limits.
-    The caller restarts its ok_for_s timer on every reading where this is False,
-    so a commit or disk dip also restarts the full MEM_OK_S release wait."""
+    A False reading clears the release timer (see release_timer), so a commit or
+    disk dip also restarts the full MEM_OK_S release wait."""
     if type(reading) is not Reading:
         raise ValueError("reading must be a Reading")
     return memory_hold(policy, reading.free_ram_gb, True, MEM_OK_S,
@@ -81,9 +81,24 @@ def margin_ok(reading: Reading, policy=DEFAULT_POLICY) -> bool:
                        disk_free_gb=reading.free_disk_gb).action == "dispatch"
 
 
+def release_timer(ok_since, reading: Reading, now, policy=DEFAULT_POLICY):
+    """(ok_since, ok_for_s) after one reading taken at `now` (caller's clock).
+    ok_since is the time of the FIRST margin_ok() reading since the last one that
+    was not ok (None while not ok), so the unobserved gap before the first healthy
+    sample never counts toward MEM_OK_S (same as conveyor mem_ok_since)."""
+    t, start = _num(now), ok_since if ok_since is None else _num(ok_since)
+    if t is None or (ok_since is not None and start is None):
+        raise ValueError("now and ok_since must be finite numbers")
+    if not margin_ok(reading, policy):
+        return None, 0
+    start = t if start is None else start
+    return start, t - start   # a clock that went back gives < 0: still held
+
+
 def memory_situation(reading: Reading, held: bool, ok_for_s=0) -> dict:
     """Situation.memory for supervise(): always carries all three readings.
-    ok_for_s = time since margin_ok() was last False."""
+    ok_for_s = now - first healthy sample since the last unhealthy one (release_timer);
+    never the time since the last unhealthy sample."""
     if type(reading) is not Reading:
         raise ValueError("reading must be a Reading")
     return {"free_gb": reading.free_ram_gb, "held": held, "ok_for_s": ok_for_s,

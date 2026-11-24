@@ -10,7 +10,7 @@ from pathlib import Path
 from unittest import mock
 
 from jarvis import n6_sensors, work_supervisor
-from jarvis.n6_sensors import Reading, margin_ok, memory_situation, sense
+from jarvis.n6_sensors import Reading, margin_ok, memory_situation, release_timer, sense
 from jarvis.work_supervisor import Policy, Situation, supervise
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +27,18 @@ def _decide(reading, held=False, ok_for_s=0):
         "operator_pause": False, "policy": THEN,
         "memory": memory_situation(reading, held, ok_for_s),
         "quota": {"used_pct": 10, "line_pct": 10, "hour": 12}}))
+
+
+def _run(samples, held=True):
+    """Drive the hold over (t, ram, disk) samples with release_timer; returns [(t, rule)]."""
+    ok_since, out = None, []
+    for t, ram, disk in samples:
+        r = sense(ram=lambda: ram, disk=lambda: disk)
+        ok_since, ok_for_s = release_timer(ok_since, r, t, THEN)
+        d = _decide(r, held, ok_for_s)
+        held = d.action != "dispatch"
+        out.append((t, d.rule_id if held else "dispatch"))
+    return out
 
 
 class Port:
@@ -119,21 +131,50 @@ class SensorHoldTests(unittest.TestCase):
         self.assertEqual(_decide(sense(ram=lambda: GOOD, disk=lambda: 50.0)).action, "dispatch")
 
     def test_commit_dip_restarts_the_release_timer(self):
-        # Ticks every 10 s (injected, no clock); ok_since restarts when margin_ok is False.
-        ok_since, held, out = 0, True, []
-        for t in range(0, 900, 10):
-            commit = 95.0 if t < 300 else 85.0      # RAM stays at 8 GB throughout
-            r = sense(ram=lambda: (8.0, commit), disk=lambda: 50.0)
-            if not margin_ok(r, THEN):
-                ok_since = t
-            d = _decide(r, held, t - ok_since)
-            held = d.action != "dispatch"
-            out.append((t, d.rule_id if held else "dispatch"))
+        # Ticks every 10 s (injected, no clock); the timer starts at the first healthy sample (300).
+        out = _run([(t, (8.0, 95.0 if t < 300 else 85.0), 50.0) for t in range(0, 900, 10)])
         self.assertTrue(all(rule == "mem.commit" for t, rule in out if t < 300))
-        self.assertTrue(all(rule == "mem.hysteresis" for t, rule in out if 300 <= t < 590))
-        self.assertEqual(dict(out)[590], "dispatch")
+        self.assertTrue(all(rule == "mem.hysteresis" for t, rule in out if 300 <= t < 600))
+        self.assertEqual(dict(out)[590], "mem.hysteresis")
+        self.assertEqual(dict(out)[600], "dispatch")
         with self.assertRaises(ValueError):
             margin_ok({"free_ram_gb": 8.0})
+
+    def test_coarse_tick_never_counts_the_unobserved_gap(self):
+        # Sample interval 400 s >= MEM_OK_S: one healthy reading after a hold must not release.
+        out = dict(_run([(0, (8.0, 95.0), 50.0), (400, GOOD, 50.0), (800, GOOD, 50.0)]))
+        self.assertEqual(out, {0: "mem.commit", 400: "mem.hysteresis", 800: "dispatch"})
+
+    def test_first_healthy_sample_after_hold_has_zero_ok_time(self):
+        self.assertEqual(release_timer(None, sense(ram=lambda: GOOD, disk=lambda: 50.0), 1e6, THEN),
+                         (1e6, 0))
+        self.assertEqual(dict(_run([(5000, GOOD, 50.0)]))[5000], "mem.hysteresis")
+
+    def test_any_unhealthy_reading_mid_wait_restarts(self):
+        # commit dip, disk dip, RAM between low and low+margin, unknown RAM, unreadable disk
+        for dip in (((8.0, 95.0), 50.0), (GOOD, 9.0), ((4.4, 10.0), 50.0),
+                    (None, 50.0), (GOOD, None)):
+            out = dict(_run([(0, GOOD, 50.0), (200, *dip), (300, GOOD, 50.0),
+                             (599, GOOD, 50.0), (600, GOOD, 50.0)]))
+            self.assertEqual(out[300], "mem.hysteresis", dip)
+            self.assertEqual(out[599], "mem.hysteresis", dip)
+            self.assertEqual(out[600], "dispatch", dip)
+
+    def test_clock_going_back_stays_held(self):
+        r = sense(ram=lambda: GOOD, disk=lambda: 50.0)
+        self.assertEqual(release_timer(1000, r, 400, THEN), (1000, -600))
+        self.assertEqual(_decide(r, True, -600).rule_id, "mem.hysteresis")
+
+    def test_junk_time_fails_closed(self):
+        r = sense(ram=lambda: GOOD, disk=lambda: 50.0)
+        for bad in (None, float("nan"), float("inf"), True, "5"):
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                release_timer(None, r, bad, THEN)
+            if bad is not None:
+                with self.assertRaises(ValueError, msg=repr(bad)):
+                    release_timer(bad, r, 10, THEN)
+        with self.assertRaises(ValueError):
+            release_timer(None, {"free_ram_gb": 8.0}, 10, THEN)
 
     def test_no_hold_path_kills_or_terminates(self):
         # sense() is handed only the read side of the port; the recorder proves
