@@ -472,11 +472,20 @@ def _git_fake(snap: dict[str, Any]) -> Callable[..., tuple[int, str]]:
     def git(args: list[str], inp: str | None = None) -> tuple[int, str]:
         if args[0] == "diff-tree" and "-p" in args:
             return (0, commits[args[-1]]) if args[-1] in commits else (128, "")
-        if args[0] == "patch-id":  # git patch-id --stable: whitespace, index and hunk line numbers ignored,
-            total = 0              # each file hashed alone and summed so file order does not matter
-            for block in ("\n" + (inp or "")).split("\ndiff --git ")[1:] or [inp or ""]:
-                kept = "\n".join("".join(ln.split()) for ln in block.splitlines()
-                                 if not ln.startswith(("index ", "@@")))
+        if args[0] == "patch-id":  # Each file is hashed independently so file order does not matter.
+            total = 0
+            patch = (inp or "").removesuffix("\n")
+            for block in ("\n" + patch).split("\ndiff --git ")[1:] or [patch]:
+                lines = block.split("\n")
+                binary = any(
+                    ln.rstrip("\r") == "GIT binary patch"
+                    or (ln.startswith("Binary files ") and ln.rstrip("\r").endswith(" differ"))
+                    for ln in lines
+                )
+                kept = "\n".join(
+                    re.sub(r"[ \t\n\r\v\f]", "", ln) for ln in lines
+                    if not ln.startswith("@@") and (binary or not ln.startswith("index "))
+                )
                 total += int(hashlib.sha1(kept.encode(), usedforsecurity=False).hexdigest(), 16)
             return 0, f"{total % (1 << 160):040x} x"
         if args[0] == "cat-file":
@@ -506,9 +515,9 @@ def hands_decide(snap: dict[str, Any], unsafe: Any = ()) -> str | None:
     decision, an unknown tightening or a malformed input is uncovered (None), never an action."""
     try:
         said = [HANDS_ACTION.get(a, a) for a in _hands_decide(snap)]
-    except (KeyError, TypeError, AttributeError):
+        hit = [a for a in said if a in (() if unsafe is None else unsafe)]
+    except (KeyError, TypeError, AttributeError, OSError, ValueError):
         return None
-    hit = [a for a in said if a in unsafe]
     return hit[0] if hit else said[0] if len(set(said)) == 1 else None
 
 
