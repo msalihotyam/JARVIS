@@ -1,0 +1,9 @@
+{
+  "classes": {
+    "tests.test_n6_fallback_drill.FallbackDrillTests": 1.0,
+    "tests.test_n6_group_gate.CliTests": 1.0,
+    "tests.test_n6_group_gate.GroupGateTests": 1.0,
+    "tests.test_n6_group_gate.OrderTests": 1.0,
+    "tests.test_n6_phase_exit.PhaseExitTests": 4.7
+  }
+}
