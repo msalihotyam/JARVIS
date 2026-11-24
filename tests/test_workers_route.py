@@ -218,3 +218,164 @@ class TestRouteVetoParity(unittest.TestCase):
         self.assertEqual(digests, {
             "protected_path": "e0f696cd251aef7e68bec4f41014c476ebf2486e2db6d69bece35552f869c583",
             "codex_veto": "0847911af6b29661c245fae96ddf01331c752f49176bbfdd0989024f357cee35"})
+
+
+# AUD3TABLE1 oracle: _number() and route() verbatim from base a083d6d, before the table.
+def _old_number(value, maximum=None):
+    import math
+    return (type(value) in (int, float) and 0 <= value
+            and (maximum is None or value <= maximum)
+            and (type(value) is int or math.isfinite(value)))
+
+
+def _old_route(facts):
+    import posixpath
+    from jarvis.workers.route import _veto
+    _number = _old_number
+    default = ("claude", "invalid_input")
+    if type(facts) is not dict:
+        return default
+    required = {"tier", "class", "files", "veto", "linux_ok", "new_project",
+                "worker", "usage", "headroom", "subscription_only", "admitted"}
+    if not required <= facts.keys():
+        return default
+    for key in ("tier", "class", "worker"):
+        if type(facts[key]) is not str:
+            return default
+    if (facts["tier"] not in ("T0", "T1", "T2")
+            or facts["class"] not in ("A", "B", "C")
+            or facts["worker"] not in ("auto", "claude", "codex", "jules")):
+        return default
+    for key in ("linux_ok", "new_project", "subscription_only"):
+        if type(facts[key]) is not bool:
+            return default
+    for key in ("files", "veto"):
+        if type(facts[key]) is not list or any(type(p) is not str for p in facts[key]):
+            return default
+    if not _number(facts["usage"], 100):
+        return "claude", "usage_unknown"
+    h, admitted = facts["headroom"], facts["admitted"]
+    if type(h) is not dict or type(admitted) is not dict:
+        return default
+    for worker in ("codex", "jules"):
+        if not _number(h.get(worker), 100 if worker == "codex" else None):
+            return "claude", "headroom_unknown"
+        if type(admitted.get(worker)) is not bool:
+            return default
+    if not facts["subscription_only"]:
+        return "claude", "subscription_required"
+    w = facts["worker"]
+    if w == "claude":
+        return "claude", "explicit"
+    if facts["tier"] not in ("T0", "T1"):
+        return "claude", "tier"
+    if facts["class"] not in ("B", "C"):
+        return "claude", "class"
+    if not facts["files"]:
+        return "claude", "no_files"
+    veto = {posixpath.normpath(p.replace("\\", "/")).lower() for p in facts["veto"]}
+    if any(_veto(p) or posixpath.normpath(p.replace("\\", "/")).lower() in veto
+           for p in facts["files"]):
+        return "claude", "veto"
+    candidate = "codex" if w == "auto" else w
+    if candidate == "jules":
+        if facts["new_project"]:
+            return "claude", "new_project"
+        if not facts["linux_ok"]:
+            return "claude", "linux_required"
+    if not admitted[candidate]:
+        return "claude", "admission_refused"
+    if h[candidate] < (10 if candidate == "codex" else 1):
+        return "claude", "low_headroom"
+    if w != "auto":
+        return w, "explicit"
+    return (("codex", "more_headroom") if 100 - facts["usage"] < h["codex"]
+            else ("claude", "claude_headroom"))
+
+
+class TestWorkerTable(unittest.TestCase):
+    """AUD3TABLE1: one worker table drives route names and reviewer pairing."""
+
+    def test_route_matches_old_route_on_grid(self):
+        import itertools
+        files_veto = (([], []), (["jarvis/x.py"], []), (["jarvis/x.py"], ["JARVIS\\x.py"]),
+                      (["scripts/x.py"], []))
+        workers = ("auto", "claude", "codex", "jules", "paid")
+        lin_new = ((True, False), (False, True), (False, False))
+        # Headroom edges (codex max 100, min 10; jules unbounded, min 1) x admitted flags.
+        valid = [({"codex": c, "jules": j}, {"codex": a, "jules": b})
+                 for c in (9, 10, 100) for j in (0, 1, 1000)
+                 for a in (True, False) for b in (True, False)]
+        headrooms = [{"codex": c, "jules": j} for c in (9, 10, 100, 101, -1, None, float("nan"))
+                     for j in (0, 1, 1000, None, True)]
+        headrooms += [{}, {"codex": 50}, {"jules": 5}, []]
+        admitteds = [{"codex": a, "jules": b} for a in (True, False, None)
+                     for b in (True, False, None)]
+        admitteds += [{}, {"codex": True}, None]
+        decisions = itertools.product(  # every tier x class x worker x veto/files state
+            ("T0", "T1", "T2", "T3"), ("A", "B", "C", "D"), workers, valid,
+            (True, False), files_veto, (50, 95, None), lin_new)
+        checks = itertools.product(  # every headroom/admitted shape, valid and not
+            ("T1",), ("B",), workers, itertools.product(headrooms, admitteds),
+            (True, False), files_veto[1:2], (50, 95, None), lin_new[:1])
+        mismatches, reasons, n = [], set(), 0
+        for tier, cls, worker, (h, a), sub, (files, veto), usage, (lin, new) in \
+                itertools.chain(decisions, checks):
+            f = {"tier": tier, "class": cls, "worker": worker, "headroom": h, "admitted": a,
+                 "files": files, "veto": veto, "usage": usage, "subscription_only": sub,
+                 "linux_ok": lin, "new_project": new}
+            n += 1
+            old = _old_route(f)
+            reasons.add(old[1])
+            if route(f) != old:
+                mismatches.append((f, route(f), old))
+        self.assertGreater(n, 100000)
+        self.assertEqual(mismatches[:5], [])
+        # The grid reaches every reason key, so every branch of the oracle is compared.
+        self.assertEqual(reasons, {
+            "invalid_input", "usage_unknown", "headroom_unknown", "subscription_required",
+            "explicit", "tier", "class", "no_files", "veto", "new_project", "linux_required",
+            "admission_refused", "low_headroom", "more_headroom", "claude_headroom"})
+        # Auto tie: 100 - usage == codex headroom stays with Claude.
+        self.assertEqual(route(facts(usage=50, headroom={"codex": 50, "jules": 5})),
+                         ("claude", "claude_headroom"))
+
+    def test_reviewer_for_unchanged(self):
+        from jarvis.work_review import REVIEWER_FOR
+        self.assertEqual(REVIEWER_FOR, {"claude": "codex", "codex": "claude", "jules": "claude"})
+        self.assertEqual((REVIEWER_FOR.get("codex"), REVIEWER_FOR["jules"],
+                          "claude" in REVIEWER_FOR, "paid" in REVIEWER_FOR,
+                          REVIEWER_FOR.get("paid")),
+                         ("claude", "claude", True, False, None))
+
+    def test_unknown_worker_is_invalid(self):
+        for name in ("paid", "Codex", "", "auto ", "gemini"):
+            self.assertEqual(route(facts(worker=name)), ("claude", "invalid_input"), name)
+
+    def test_table_is_read_only(self):
+        from jarvis.work_review import REVIEWER_FOR
+        from jarvis.workers.route import WORKERS
+        with self.assertRaises(TypeError):
+            WORKERS["gemini"] = WORKERS["codex"]
+        with self.assertRaises(TypeError):
+            del WORKERS["jules"]
+        with self.assertRaises(AttributeError):
+            WORKERS["codex"].auto = False
+        with self.assertRaises(AttributeError):
+            WORKERS["codex"].headroom.minimum = 0
+        with self.assertRaises(TypeError):
+            REVIEWER_FOR["codex"] = "codex"
+
+    def test_route_does_not_import_work_review(self):
+        import ast
+        from pathlib import Path
+        import jarvis.workers.route as module
+        tree = ast.parse(Path(module.__file__).read_text(encoding="utf-8"))
+        names = set()
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                names |= {a.name for a in node.names}
+            elif isinstance(node, ast.ImportFrom):
+                names.add(node.module or "")
+                names |= {a.name for a in node.names}
+        self.assertEqual([n for n in names if "work_review" in n], [], names)

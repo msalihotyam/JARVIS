@@ -2,6 +2,33 @@
 
 import math
 import posixpath
+from types import MappingProxyType
+from typing import NamedTuple
+
+
+class Headroom(NamedTuple):
+    maximum: int | None  # valid headroom range is 0..maximum (None = unbounded)
+    minimum: int         # below this the worker is low_headroom
+
+
+class WorkerSpec(NamedTuple):
+    explicit: bool               # facts["worker"] may name it
+    auto: bool                   # the one worker "auto" weighs against Claude
+    headroom: Headroom | None    # None = no headroom/admission facts (Claude)
+    reviewer: str                # cross-provider reviewer (work_review.REVIEWER_FOR)
+
+
+# One row per worker; read-only (proxy over records that cannot be reassigned).
+WORKERS = MappingProxyType({
+    "claude": WorkerSpec(explicit=True, auto=False, headroom=None, reviewer="codex"),
+    "codex": WorkerSpec(explicit=True, auto=True, headroom=Headroom(100, 10),
+                        reviewer="claude"),
+    "jules": WorkerSpec(explicit=True, auto=False, headroom=Headroom(None, 1),
+                        reviewer="claude"),
+})
+_EXPLICIT = tuple(n for n, w in WORKERS.items() if w.explicit)
+_TRACKED = tuple((n, w.headroom) for n, w in WORKERS.items() if w.headroom)
+(_AUTO,) = (n for n, w in WORKERS.items() if w.auto)  # exactly one, checked at import
 
 
 def _number(value, maximum=None):
@@ -52,7 +79,7 @@ def route(facts):
             return default
     if (facts["tier"] not in ("T0", "T1", "T2")
             or facts["class"] not in ("A", "B", "C")
-            or facts["worker"] not in ("auto", "claude", "codex", "jules")):
+            or facts["worker"] not in ("auto", *_EXPLICIT)):
         return default
     for key in ("linux_ok", "new_project", "subscription_only"):
         if type(facts[key]) is not bool:
@@ -65,8 +92,8 @@ def route(facts):
     h, admitted = facts["headroom"], facts["admitted"]
     if type(h) is not dict or type(admitted) is not dict:
         return default
-    for worker in ("codex", "jules"):
-        if not _number(h.get(worker), 100 if worker == "codex" else None):
+    for worker, limits in _TRACKED:
+        if not _number(h.get(worker), limits.maximum):
             return "claude", "headroom_unknown"
         if type(admitted.get(worker)) is not bool:
             return default
@@ -85,7 +112,7 @@ def route(facts):
     if any(_veto(p) or posixpath.normpath(p.replace("\\", "/")).lower() in veto
            for p in facts["files"]):
         return "claude", "veto"
-    candidate = "codex" if w == "auto" else w
+    candidate = _AUTO if w == "auto" else w
     if candidate == "jules":
         if facts["new_project"]:
             return "claude", "new_project"
@@ -93,9 +120,9 @@ def route(facts):
             return "claude", "linux_required"
     if not admitted[candidate]:
         return "claude", "admission_refused"
-    if h[candidate] < (10 if candidate == "codex" else 1):
+    if h[candidate] < WORKERS[candidate].headroom.minimum:
         return "claude", "low_headroom"
     if w != "auto":
         return w, "explicit"
-    return (("codex", "more_headroom") if 100 - facts["usage"] < h["codex"]
+    return ((_AUTO, "more_headroom") if 100 - facts["usage"] < h[_AUTO]
             else ("claude", "claude_headroom"))

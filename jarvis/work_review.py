@@ -28,14 +28,16 @@ import secrets
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
+from types import MappingProxyType
 
 from jarvis.work_checks import CheckResult
 from jarvis.work_regress import RegressionVerdict
 from jarvis.workers.base import AgentProfile, Worker, WorkerResult
-from jarvis.workers.route import _veto
+from jarvis.workers.route import WORKERS, _veto
 
-#: Writer provider -> the only provider allowed to review it.
-REVIEWER_FOR = {"claude": "codex", "codex": "claude", "jules": "claude"}
+#: Writer provider -> the only provider allowed to review it. Read-only view of
+#: route.WORKERS: {"claude": "codex", "codex": "claude", "jules": "claude"}.
+REVIEWER_FOR = MappingProxyType({n: w.reviewer for n, w in WORKERS.items()})
 SEVERITIES = ("BLOCKER", "MAJOR", "MINOR", "NIT")
 BLOCKING = frozenset({"BLOCKER", "MAJOR"})
 VERDICTS = ("PASS", "CHANGES_REQUIRED")
