@@ -37,19 +37,21 @@ import json
 import math
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from jarvis import n6_deps, n6_lease  # noqa: E402
+from jarvis import n6_deps, n6_kpi, n6_lease  # noqa: E402
 from jarvis.n6_breaker import BAD, GOOD  # noqa: E402
 from jarvis.work_planner import n6_next  # noqa: E402
 from jarvis.work_supervisor import DEFAULT_POLICY, Situation, n6_record_finish, supervise  # noqa: E402
@@ -67,6 +69,23 @@ class Ports:
     run: Callable[[str, n6_lease.Lease], object]  # the lane's final status, e.g. "PASS"
     ttl_s: float  # >= the runner's wall cap; the lease is never renewed here
     page: Callable[[Path], object] | None = None  # e.g. n6_notify.flush over notify.json
+    receipt: Callable[[str], object] | None = None  # N6EVT1: the finished run's receipt id (8 hex)
+
+
+def _emit(n6: Path, sid: str, run_id: str, start: float, end: float, verdict: str,
+          receipt: object) -> list[str]:
+    """N6EVT1: the one durable n6_limited record of a slice N6 ran end to end, in the kpi
+    store the E8 report reads. No receipt, a malformed one or a repeat (same slice + run)
+    writes nothing and says so."""
+    if receipt is None:
+        return [f"{sid}: no receipt, no n6_limited record"]
+    try:
+        utc = [datetime.fromtimestamp(x, timezone.utc) for x in (min(start, end), end)]
+        n6_kpi.record_limited(n6 / "kpi.db", n6_kpi.LimitedEvent(
+            sid, run_id, utc[0], utc[1], verdict, receipt))  # pyright: ignore[reportArgumentType]
+    except (n6_kpi.KpiError, sqlite3.Error, OSError, ValueError, TypeError, OverflowError) as exc:
+        return [f"{sid}: n6_limited record refused ({str(exc)[:80]})"]
+    return []
 
 
 def switch_on(root: Path | str) -> bool:
@@ -231,6 +250,11 @@ def _step(root: Path | str, n6: Path, ports: Ports) -> list[str]:
                 notes.append(f"{sid}: breaker not written")
             n6_deps.record(n6 / "deps.json", sid, "done" if verdict in GOOD else "blocked")
             notes.append(f"{sid}: {verdict}")
+            try:
+                receipt = ports.receipt(sid) if ports.receipt is not None else None
+            except Exception:
+                receipt = None
+            notes += _emit(n6, sid, str(lease.epoch), t1, now, verdict, receipt)
         else:
             notes.append(f"{sid}: no verdict ({str(status)[:40]})")
     except Exception as exc:
@@ -328,6 +352,8 @@ def _settle(root: Path | str, n6: Path, ports: Ports) -> list[str]:
         except ValueError:
             pass  # already final: a second settle never rewrites it
         notes.append(f"{sid}: {verdict}")
+        receipt = ln.get("id") if isinstance(ln, dict) else None
+        notes += _emit(n6, sid, str(lease.epoch), lease.expires - ports.ttl_s, now, verdict, receipt)
     else:
         notes.append(f"{sid}: no verdict ({str(status)[:40]})")
     _drop(claim_path, res_path)
@@ -390,7 +416,70 @@ def _situation(sid: str, root: Path | str = ROOT) -> Situation:
                      memory={"free_gb": free, "held": False})
 
 
-def main() -> int:
+def _read_json(path: Path) -> object:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+
+
+def backfill(root: Path | str = ROOT) -> list[str]:
+    """N6EVT1, read-only: every past N6 slice (deps.json done/blocked) marked "evidenced <receipt>"
+    only when an N6 dispatch event, its finished lanes.json entry and the recorded state all
+    agree on one well-formed receipt. Never invents a record, never opens the kpi store."""
+    root = Path(root)
+    deps, conv = _read_json(root / "build" / "n6" / "deps.json"), root / "build" / "conveyor"
+    entries = deps.get("backlog") if isinstance(deps, dict) else None
+    lanes = _read_json(conv / "lanes.json")
+    lanes = lanes if isinstance(lanes, dict) else {}
+    dispatched: dict[str, object] = {}
+    try:
+        with open(conv / "events.jsonl", encoding="utf-8") as f:
+            for line in f:
+                with contextlib.suppress(ValueError):
+                    ev = json.loads(line)
+                    if isinstance(ev, dict) and ev.get("event") == "dispatch" and ev.get("n6") is True:
+                        dispatched[str(ev.get("lane"))] = ev.get("id")  # the latest dispatch wins
+    except OSError:
+        pass
+    out: list[str] = []
+    done = [e for e in entries or [] if isinstance(e, dict) and e.get("state") in ("done", "blocked")]
+    good = 0
+    for e in done:
+        sid, rid = str(e.get("id")), dispatched.get(str(e.get("id")))
+        ln = lanes.get(sid)
+        status = ln.get("status") if isinstance(ln, dict) else None
+        want = GOOD if e.get("state") == "done" else BAD
+        if sid not in dispatched:
+            why = "no N6 dispatch event"
+        elif not isinstance(rid, str) or not n6_kpi.RECEIPT_ID.fullmatch(rid):
+            why = "malformed receipt"
+        elif not isinstance(ln, dict):
+            why = "no lanes entry"
+        elif ln.get("id") != rid:
+            why = "receipt mismatch"
+        elif not ln.get("finished"):
+            why = "not finished"
+        elif not isinstance(status, str) or status.strip().upper() not in want:
+            why = "verdict mismatch"
+        else:
+            good += 1
+            out.append(f"{sid}: evidenced {rid}")
+            continue
+        out.append(f"{sid}: not evidenced ({why})")
+    return [*out, f"EVIDENCED: {good} of {len(done)}"]
+
+
+def main(argv: list[str] | None = None) -> int:
+    import argparse
+    parser = argparse.ArgumentParser(description="N6 LIMITED tick, or the read-only evidence backfill")
+    parser.add_argument("--backfill", action="store_true", help="list past N6 slices, evidenced or not")
+    parser.add_argument("--root", type=Path, default=ROOT)
+    args = parser.parse_args(argv if argv is not None else [])
+    if args.backfill:
+        for line in backfill(args.root):
+            print(line)
+        return 0
     n6 = ROOT / "build" / "n6"
     if not switch_on(ROOT) and not (n6 / "claim.json").exists():
         print("N6 LIMITED is off (build/n6/LIMITED_ON absent): nothing done")
@@ -404,4 +493,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

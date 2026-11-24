@@ -1,6 +1,9 @@
 """N6-WIRE2: the LIMITED-phase caller behind build/n6/LIMITED_ON (fakes only, injected clock)."""
 
+import contextlib
+import hashlib
 import importlib.util
+import io
 import json
 import sys
 import tempfile
@@ -8,8 +11,9 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from jarvis import n6_deps, n6_lease, n6_notify
+from jarvis import n6_deps, n6_kpi, n6_lease, n6_notify
 from jarvis.notify import NotificationCore
+from tests.test_n6_e8 import GOOD_SET, e8
 from tests.test_n6_notify import Ledger
 from tests.test_work_supervisor import _sit
 
@@ -355,7 +359,7 @@ class ClaimFlow(unittest.TestCase):
         self.lanes({"A-1": {"status": "running"}})
         self.assertEqual(lr.tick(self.root, self.claim_ports()), ["A-1: running"])
         self.assertEqual(self.state(), "started")
-        self.lanes({"A-1": {"finished": True, "status": "PASS"}})
+        self.lanes({"A-1": {"finished": True, "status": "PASS", "id": "abcd1234"}})
         self.assertEqual(lr.tick(self.root, self.claim_ports()), ["A-1: PASS"])
         self.assertEqual(self.state(), "done")
         self.assertFalse((self.n6 / "claim.json").exists())
@@ -427,6 +431,138 @@ class ClaimFlow(unittest.TestCase):
         self.addCleanup(setattr, lr, "ROOT", old)
         self.assertEqual(lr.main(), 0)
         self.assertEqual(sorted(p.name for p in self.n6.iterdir()), [])
+
+
+class LimitedEvidence(unittest.TestCase):
+    """N6EVT1: one durable n6_limited record per slice N6 ran end to end; read-only backfill."""
+
+    setUp, on, backlog, ports, live, run_port = (
+        LimitedRun.setUp, LimitedRun.on, LimitedRun.backlog, LimitedRun.ports, LimitedRun.live,
+        LimitedRun.run_port)
+    claim_ports, claimed, answer, lanes = (
+        ClaimFlow.claim_ports, ClaimFlow.claimed, ClaimFlow.answer, ClaimFlow.lanes)
+
+    def events(self):
+        db = self.n6 / "kpi.db"  # guard: sqlite3.connect would create the file
+        return n6_kpi.limited_events(db) if db.exists() else ()
+
+    def fake_run(self, sid, lease):
+        self.clock = 1060.0
+        return self.status
+
+    def test_acc1_one_n6_run_t1_slice_leaves_one_record_and_e8_counts_it(self):
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        notes = lr.tick(self.root, self.ports(run=self.fake_run, receipt=lambda sid: "abcd1234"))
+        self.assertIn("A-1: PASS", notes)
+        (ev,) = self.events()
+        self.assertEqual((ev.slice_id, ev.verdict, ev.receipt_id), ("A-1", "PASS", "abcd1234"))
+        self.assertEqual(ev.started_at, datetime.fromtimestamp(1000.0, timezone.utc))
+        self.assertEqual(ev.ended_at, datetime.fromtimestamp(1060.0, timezone.utc))
+        acc = self.root / e8.SET_NAME
+        acc.write_text(json.dumps(GOOD_SET), encoding="utf-8")
+        (self.root / e8.SUMS_NAME).write_text(
+            f"{hashlib.sha256(acc.read_bytes()).hexdigest()}  {e8.SET_NAME}\n", encoding="ascii")
+        _, text = e8.report(n6_kpi.rows(self.n6 / "kpi.db"), acc, self.events())
+        self.assertIn("\nN6 LIMITED SLICES: 1 A-1\n", text)
+
+    def test_acc1_settled_claim_records_the_lanes_receipt(self):
+        claim = self.claimed()
+        self.answer(claim, "started")
+        self.lanes({"A-1": {"finished": True, "status": "PASS", "id": "0badf00d"}})
+        self.assertEqual(lr.tick(self.root, self.claim_ports()), ["A-1: PASS"])
+        (ev,) = self.events()
+        self.assertEqual((ev.slice_id, ev.run_id, ev.receipt_id), ("A-1", str(claim["epoch"]), "0badf00d"))
+
+    def test_neg_a_conveyor_run_slice_emits_none(self):
+        # the conveyor never calls tick; with the switch off N6 runs nothing and records nothing
+        self.backlog(n6_deps.Item("A-1"))
+        self.assertEqual(lr.tick(self.root, self.ports(receipt=lambda sid: "abcd1234")), [])
+        self.assertFalse((self.n6 / "kpi.db").exists())
+
+    def test_neg_b_crash_mid_run_leaves_no_record(self):
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        self.status = RuntimeError("runner died")
+        lr.tick(self.root, self.ports(receipt=lambda sid: "abcd1234"))
+        self.assertEqual(self.events(), ())
+
+    def test_neg_b_pass_without_a_receipt_is_not_recorded(self):
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        notes = lr.tick(self.root, self.ports())
+        self.assertIn("A-1: no receipt, no n6_limited record", notes)
+        self.assertEqual(self.events(), ())
+
+    def test_neg_b_lanes_entry_gone_records_nothing(self):
+        claim = self.claimed()
+        self.answer(claim, "started")
+        self.lanes({"OTHER": {"status": "running"}})
+        self.assertIn("A-1: no receipt, no n6_limited record", lr.tick(self.root, self.claim_ports()))
+        self.assertEqual(self.events(), ())
+
+    def test_neg_c_restart_re_emitting_the_same_slice_and_run_is_refused(self):
+        self.assertEqual(lr._emit(self.n6, "A-1", "7", 1000.0, 1060.0, "PASS", "abcd1234"), [])
+        again = lr._emit(self.n6, "A-1", "7", 1000.0, 1070.0, "PASS", "abcd1234")
+        self.assertEqual(len(again), 1)
+        self.assertTrue(again[0].startswith("A-1: n6_limited record refused"))
+        self.assertEqual(len(self.events()), 1)
+        self.assertEqual(lr._emit(self.n6, "A-1", "8", 2000.0, 2060.0, "PASS", "abcd1235"), [])
+        self.assertEqual(len(self.events()), 2)  # a later real run is its own record ...
+        self.assertEqual({e.slice_id for e in self.events()}, {"A-1"})  # ... E8 counts slices
+
+    def test_neg_d_malformed_receipt_is_never_recorded(self):
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        notes = lr.tick(self.root, self.ports(receipt=lambda sid: "NOT-HEX!"))
+        self.assertTrue(any(n.startswith("A-1: n6_limited record refused") for n in notes))
+        self.assertEqual(self.events(), ())
+
+    def write_evidence(self):
+        conv = self.root / "build" / "conveyor"
+        conv.mkdir(parents=True, exist_ok=True)
+        states = {"A-1": "done", "B-2": "done", "C-3": "blocked", "D-4": "done", "E-5": "done",
+                  "F-6": "pending", "G-7": "blocked", "H-8": "done", "I-9": "done"}
+        (self.n6 / "deps.json").write_text(json.dumps(
+            {"backlog": [{"id": k, "state": v} for k, v in states.items()]}), encoding="utf-8")
+        dispatch = [("A-1", "aaaa0001", True), ("B-2", "bbbb0002", None), ("C-3", "XYZ", True),
+                    ("D-4", "dddd0004", True), ("E-5", "eeee0005", True), ("G-7", "aaaa0007", True),
+                    ("H-8", "aaaa0008", True), ("I-9", "aaaa0009", True)]
+        (conv / "events.jsonl").write_text("".join(
+            json.dumps({"event": "dispatch", "lane": s, "id": i, **({"n6": True} if n else {})}) + "\n"
+            for s, i, n in dispatch) + "{broken\n", encoding="utf-8")
+        self.lanes({
+            "A-1": {"id": "aaaa0001", "finished": True, "status": "PASS"},
+            "B-2": {"id": "bbbb0002", "finished": True, "status": "PASS"},
+            "C-3": {"id": "XYZ", "finished": True, "status": "BLOCKED"},
+            "E-5": {"id": "eeee9999", "finished": True, "status": "PASS"},
+            "G-7": {"id": "aaaa0007", "finished": True, "status": "BLOCKED"},
+            "H-8": {"id": "aaaa0008", "status": "running"},
+            "I-9": {"id": "aaaa0009", "finished": True, "status": "BLOCKED"},
+        })
+
+    def test_acc2_backfill_matches_the_fixture_evidence_and_writes_nothing(self):
+        self.write_evidence()
+        snap = {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
+        want = ["A-1: evidenced aaaa0001",
+                "B-2: not evidenced (no N6 dispatch event)",
+                "C-3: not evidenced (malformed receipt)",
+                "D-4: not evidenced (no lanes entry)",
+                "E-5: not evidenced (receipt mismatch)",
+                "G-7: evidenced aaaa0007",
+                "H-8: not evidenced (not finished)",
+                "I-9: not evidenced (verdict mismatch)",
+                "EVIDENCED: 2 of 8"]
+        self.assertEqual(lr.backfill(self.root), want)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(lr.main(["--backfill", "--root", str(self.root)]), 0)
+        self.assertEqual(out.getvalue().splitlines(), want)
+        self.assertEqual({p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}, snap)
+        self.assertFalse((self.n6 / "kpi.db").exists())
+
+    def test_backfill_with_no_evidence_files_is_zero_of_zero(self):
+        self.assertEqual(lr.backfill(self.root), ["EVIDENCED: 0 of 0"])
 
 
 class LimitedInputs(unittest.TestCase):

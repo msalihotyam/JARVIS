@@ -70,6 +70,25 @@ class N6E8ReportTests(unittest.TestCase):
         for opened in self.opened:
             self.assertNotEqual(Path(opened).resolve(), LIVE_DB)
 
+    def test_limited_slices_are_counted_by_distinct_slice_and_never_move_the_verdict(self):
+        ev = [n6_kpi.LimitedEvent("S9", r, T0, T0, "PASS", "abcd1234") for r in ("1", "2")]
+        ev.append(n6_kpi.LimitedEvent("S1", "1", T0, T0, "PASS", "abcd1235"))
+        code, text = e8.report(_pairs(), self.set_path, ev)
+        plain_code, plain = e8.report(_pairs(), self.set_path)
+        self.assertIn("\nN6 LIMITED SLICES: 2 S1 S9\n", text)
+        self.assertNotIn("N6 LIMITED", plain)
+        self.assertEqual((code, text.replace("N6 LIMITED SLICES: 2 S1 S9\n", "")), (plain_code, plain))
+
+    def test_main_counts_limited_events_from_the_db(self):
+        db = self.dir / "kpi.db"
+        for row in _pairs():
+            n6_kpi.record(db, row)
+        n6_kpi.record_limited(db, n6_kpi.LimitedEvent("S1", "1", T0, T0, "PASS", "abcd1234"))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            e8.main(["--db", str(db), "--set", str(self.set_path)])
+        self.assertIn("\nN6 LIMITED SLICES: 1 S1\n", out.getvalue())
+
     def _write_set(self, doc, *, raw=None, pin=None):
         data = raw if raw is not None else json.dumps(doc, separators=(",", ":")).encode()
         path = self.dir / e8.SET_NAME

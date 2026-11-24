@@ -124,6 +124,78 @@ def record(database_path: str | Path, row: KpiRow) -> None:
             raise KpiError(f"KPI row refused for {row.slice_id}/{row.source}: {error}") from error
 
 
+RECEIPT_ID = re.compile(r"[0-9a-f]{8}")  # the conveyor's lane id (lanes.json "id", dispatch "id")
+# N6EVT1: one durable record per slice N6 ran end to end under LIMITED_ON (N6_KIT Phase 2
+# exit evidence). Its own additive table (no ALTER, schema stays 10), created only on write.
+_LIMITED_SQL = """
+CREATE TABLE IF NOT EXISTS n6_limited_event (
+    slice_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    ended_at TEXT NOT NULL,
+    verdict TEXT NOT NULL,
+    receipt_id TEXT NOT NULL,
+    PRIMARY KEY (slice_id, run_id)
+)
+"""
+
+
+@dataclass(frozen=True)
+class LimitedEvent:
+    slice_id: str
+    run_id: str
+    started_at: datetime
+    ended_at: datetime
+    verdict: str
+    receipt_id: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.slice_id, str) or not _SLICE_ID.fullmatch(self.slice_id):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise KpiError(f"slice_id is missing or malformed: {self.slice_id!r}")
+        if not isinstance(self.run_id, str) or not self.run_id:  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise KpiError(f"run_id must be a non-empty string, got {self.run_id!r}")
+        for at in (self.started_at, self.ended_at):
+            if not isinstance(at, datetime) or at.tzinfo is None:  # pyright: ignore[reportUnnecessaryIsInstance]
+                raise KpiError("started_at / ended_at must be timezone-aware datetimes")
+        if self.started_at > self.ended_at:
+            raise KpiError("started_at is after ended_at")
+        if not isinstance(self.verdict, str) or not self.verdict or self.verdict != self.verdict.upper():  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise KpiError(f"verdict must be a non-empty upper-case string, got {self.verdict!r}")
+        if not isinstance(self.receipt_id, str) or not RECEIPT_ID.fullmatch(self.receipt_id):  # pyright: ignore[reportUnnecessaryIsInstance]
+            raise KpiError(f"receipt_id is missing or malformed: {self.receipt_id!r}")
+
+
+def record_limited(database_path: str | Path, event: LimitedEvent) -> None:
+    """Insert one event; the same (slice, run) a second time is refused, never overwritten."""
+    with closing(sqlite3.connect(database_path)) as connection:
+        connection.execute(_LIMITED_SQL)
+        try:
+            with connection:
+                connection.execute(
+                    "INSERT INTO n6_limited_event (slice_id, run_id, started_at, ended_at, verdict,"
+                    " receipt_id) VALUES (?,?,?,?,?,?)",
+                    (event.slice_id, event.run_id, event.started_at.isoformat(),
+                     event.ended_at.isoformat(), event.verdict, event.receipt_id))
+        except sqlite3.IntegrityError as error:
+            raise KpiError(f"n6_limited record refused for {event.slice_id}/{event.run_id}: {error}") from error
+
+
+def limited_events(database_path: str | Path) -> tuple[LimitedEvent, ...]:
+    """All n6_limited events in slice order; () when the table does not exist yet."""
+    with closing(sqlite3.connect(database_path)) as connection:
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type = 'table'"
+                              " AND name = 'n6_limited_event'").fetchone() is None:
+            return ()
+        fetched = connection.execute(
+            "SELECT slice_id, run_id, started_at, ended_at, verdict, receipt_id"
+            " FROM n6_limited_event ORDER BY slice_id, run_id").fetchall()
+    return tuple(
+        LimitedEvent(str(r[0]), str(r[1]), datetime.fromisoformat(str(r[2])),
+                     datetime.fromisoformat(str(r[3])), str(r[4]), str(r[5]))
+        for r in fetched  # pyright: ignore[reportAny]
+    )
+
+
 def rows(database_path: str | Path, *, source: str | None = None) -> tuple[KpiRow, ...]:
     """All rows (optionally one source) in slice order; [] when the table does not exist yet."""
     with closing(sqlite3.connect(database_path)) as connection:

@@ -24,7 +24,7 @@ from pathlib import Path
 from typing import cast
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # CLI: make ``jarvis`` importable
-from jarvis.n6_kpi import KpiRow, rows as read_rows  # noqa: E402
+from jarvis.n6_kpi import KpiRow, LimitedEvent, limited_events, rows as read_rows  # noqa: E402
 
 SET_NAME = "acceptance_set.json"
 SUMS_NAME = "SHA256SUMS"
@@ -98,8 +98,10 @@ def _measures(side: list[KpiRow]) -> dict[str, float]:
     }
 
 
-def report(rows: Iterable[KpiRow], acceptance_set: Path) -> tuple[int, str]:
-    """(exit code, report text) for the rows over the pinned set at ``acceptance_set``."""
+def report(rows: Iterable[KpiRow], acceptance_set: Path,
+           limited: Iterable[LimitedEvent] | None = None) -> tuple[int, str]:
+    """(exit code, report text) for the rows over the pinned set at ``acceptance_set``.
+    ``limited`` (N6EVT1) is counted as Phase 2 exit evidence only; it never moves the verdict."""
     try:
         pinned, slice_ids = load_set(acceptance_set)
     except SetError as error:
@@ -143,6 +145,9 @@ def report(rows: Iterable[KpiRow], acceptance_set: Path) -> tuple[int, str]:
             reasons.append(f"false PASS {len(false_pass)}: {' '.join(false_pass)}")
         if security:
             reasons.append(f"n6 security incidents {security}")
+    if limited is not None:
+        ids = sorted({e.slice_id for e in limited})
+        lines.append(f"N6 LIMITED SLICES: {len(ids)} {' '.join(ids)}".rstrip())
     lines.append("ROLLBACK DRILL: required by M9, confirmed by the judges, not by this report")
     lines += [f"REASON: {r}" for r in reasons]
     lines.append(NO_ADVANCE if reasons else ADVANCE)
@@ -159,7 +164,7 @@ def main(argv: list[str] | None = None) -> int:
     if not db.is_file():  # sqlite3.connect would create an empty database
         print(f"REFUSED: no database at {db}\n{NO_ADVANCE}")
         return 2
-    code, text = report(read_rows(db), cast(Path, args.acceptance_set))
+    code, text = report(read_rows(db), cast(Path, args.acceptance_set), limited_events(db))
     print(text, end="")
     return code
 

@@ -152,6 +152,28 @@ class N6KpiTests(unittest.TestCase):
             n6_kpi.record(self.db, _row(passed=False, quota_tokens=1))
         self.assertEqual(n6_kpi.rows(self.db), (_row(),))
 
+    def _limited(self, **over):
+        base = dict(slice_id="S1", run_id="7", started_at=T0, ended_at=T0, verdict="PASS",
+                    receipt_id="abcd1234")
+        base.update(over)
+        return n6_kpi.LimitedEvent(**base)
+
+    def test_limited_event_round_trips_and_duplicate_slice_run_is_refused(self):
+        n6_kpi.record_limited(self.db, self._limited())
+        with self.assertRaises(n6_kpi.KpiError):
+            n6_kpi.record_limited(self.db, self._limited(verdict="BLOCKED"))
+        self.assertEqual(n6_kpi.limited_events(self.db), (self._limited(),))
+
+    def test_limited_events_without_the_table_is_empty(self):
+        self.assertEqual(n6_kpi.limited_events(self.db), ())
+
+    def test_neg_malformed_limited_event_is_refused(self):
+        for over in ({"receipt_id": "NOT-HEX!"}, {"receipt_id": ""}, {"run_id": ""},
+                     {"verdict": "pass"}, {"started_at": datetime(2026, 1, 1)},
+                     {"started_at": T0.replace(hour=10)}):
+            with self.subTest(over=over), self.assertRaises(n6_kpi.KpiError):
+                self._limited(**over)
+
     def test_zero_is_a_real_reading_when_given(self):
         n6_kpi.record(self.db, _row(quota_tokens=0, finish_seconds=0, salih_interventions=0))
         stored = n6_kpi.rows(self.db)[0]
