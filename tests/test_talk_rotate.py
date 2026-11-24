@@ -109,7 +109,7 @@ class BundleTests(unittest.TestCase):
         self.assertEqual([t["id"] for t in b.turns], list(range(30, 80)))
 
     def test_oldest_trimmed_first_exact_boundary(self):
-        turns = [turn(i, text="x" * 10) for i in range(5)]
+        turns = [turn(i, text="x" * 10, topic="a") for i in range(5)]
         fixed = len("st") + len("a") + len("sum")
         b = tr.build_bundle("st", {"a": "sum"}, turns, fixed + 50)
         self.assertEqual((len(b.turns), b.dropped, b.chars), (5, (), fixed + 50))
@@ -129,9 +129,69 @@ class BundleTests(unittest.TestCase):
         self.assertEqual(tr.build_bundle("", {}, turns, 3), tr._refuse("BUDGET_TOO_SMALL"))
 
     def test_summaries_over_budget_refused_not_truncated(self):
-        got = tr.build_bundle("s", {"a": "x" * 100}, [turn(1)], 50)
+        got = tr.build_bundle("s", {"a": "x" * 100}, [turn(1, topic="a")], 50)
         self.assertEqual(got, tr._refuse("BUDGET_TOO_SMALL"))
         self.assertNotIsInstance(got, tr.Bundle)
+
+    def test_untouched_summary_left_out(self):
+        b = tr.build_bundle("s", {"a": "sa", "zz": "z" * 10}, [turn(1, topic="a")], 500)
+        self.assertEqual((b.summaries, b.chars), ((("a", "sa"),), 1 + 3 + 2))
+        b = tr.build_bundle("s", {"zz": "z"}, [turn(1)], 500)
+        self.assertEqual((b.summaries, b.chars), ((), 1 + 2))
+        self.assertEqual(tr.build_bundle("s", {"a": "sa"}, [], 500).summaries, ())
+
+    def test_untouched_summary_not_counted_against_budget(self):
+        b = tr.build_bundle("s", {"a": "sa", "zz": "z" * 100}, [turn(1, topic="a")], 50)
+        self.assertEqual((b.summaries, b.chars, b.dropped), ((("a", "sa"),), 6, ()))
+
+    def test_summary_kept_for_any_touching_turn(self):
+        # outside the 50-turn window, trimmed for budget, or only an open card
+        old = [turn(0, topic="old")] + [turn(i, text="x") for i in range(1, 60)]
+        self.assertEqual(tr.build_bundle("", {"old": "o"}, old, 500).summaries, (("old", "o"),))
+        trim = [turn(0, text="x" * 10, topic="t"), turn(1, text="y")]
+        b = tr.build_bundle("", {"t": "s"}, trim, 3)
+        self.assertEqual((b.summaries, b.dropped), ((("t", "s"),), (0,)))
+        card = [turn(0, text="C", topic="c", approval_open=True)]
+        self.assertEqual(tr.build_bundle("", {"c": "s", "d": "s"}, card, 3).summaries,
+                         (("c", "s"),))
+
+    def test_topic_match_exact(self):
+        sums = {"A": "up", "a": "lo", "": "empty"}
+        b = tr.build_bundle("", sums, [turn(1, topic="a"), turn(2, topic="")], 500)
+        self.assertEqual(b.summaries, (("", "empty"), ("a", "lo")))
+        got = tr.build_bundle("", {"A": "up"}, [turn(1, topic="a")], 500)
+        self.assertEqual(got, tr._refuse("SUMMARY_MISSING"))
+        self.assertEqual(tr.build_bundle("", {"a ": "x"}, [turn(1, topic="a")], 500),
+                         tr._refuse("SUMMARY_MISSING"))
+
+    def test_lying_mapping_views_refused(self):
+        class Lying(Mapping):  # keys()/in say "a", items() disagrees
+            def __init__(self, items):
+                self._items = items
+
+            def __getitem__(self, key):
+                return "x"
+
+            def __iter__(self):
+                return iter(["a"])
+
+            def __len__(self):
+                return 1
+
+            def __contains__(self, key):
+                return True
+
+            def items(self):
+                return list(self._items)
+
+        one = [turn(1, topic="a")]
+        self.assertEqual(tr.build_bundle("", Lying([]), one, 500), tr._refuse("SUMMARY_MISSING"))
+        self.assertEqual(tr.build_bundle("", Lying([("a", "1"), ("a", "22")]), one, 500),
+                         tr._refuse("SUMMARIES_INVALID"))
+
+    def test_untouched_bad_summary_still_refused(self):
+        got = tr.build_bundle("s", {"a": "sa", "zz": None}, [turn(1, topic="a")], 500)
+        self.assertEqual(got, tr._refuse("SUMMARIES_INVALID"))
 
     def test_bad_input_refused(self):
         cases = [

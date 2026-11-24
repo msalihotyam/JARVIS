@@ -147,7 +147,9 @@ def build_bundle(style, summaries, turns, budget):
     """Handoff bundle for the next brain session, or a Refusal.
 
     Size in characters = len(style) + len(topic) + len(summary) per summary +
-    len(text) per turn. Style, every summary and every open approval card are
+    len(text) per turn. Only summaries of topics some turn touches (any turn,
+    also outside the window) are handed over; untouched ones are left out and
+    not counted. Style, those summaries and every open approval card are
     never cut (over budget -> refused); of the last MAX_TURNS turns the oldest
     are trimmed first until the bundle fits.
     """
@@ -158,14 +160,19 @@ def build_bundle(style, summaries, turns, budget):
     pairs = list(summaries.items())
     if not all(isinstance(k, str) and isinstance(v, str) for k, v in pairs):
         return _refuse("SUMMARIES_INVALID")
+    known = dict(pairs)  # one view of summaries: a Mapping's keys() may disagree with items()
+    if len(known) != len(pairs):
+        return _refuse("SUMMARIES_INVALID")
     pairs.sort()
     if not isinstance(budget, int) or isinstance(budget, bool) or budget <= 0:
         return _refuse("BUDGET_INVALID")
     norm = _turns(turns)
     if isinstance(norm, Refusal):
         return norm
-    if any(t["topic"] is not None and t["topic"] not in summaries for t in norm):
+    touched = {t["topic"] for t in norm if t["topic"] is not None}
+    if not touched <= known.keys():
         return _refuse("SUMMARY_MISSING")
+    pairs = [(k, v) for k, v in pairs if k in touched]  # one summary per touched topic
 
     window = norm[-MAX_TURNS:]
     window_ids = {t["id"] for t in window}
