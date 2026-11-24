@@ -650,5 +650,187 @@ class OrchGenTest(unittest.TestCase):
         self.assertEqual(self.backlog()["slices"], [])
 
 
+class DepotFillTest(unittest.TestCase):
+    """QUEUEFILL2 depot-fill: sha-bound approvals, deterministic head, lock, intent/receipt (injected clock)."""
+    T = 1_800_000_000.0
+    setUp_repo = OrchGenTest.setUp
+    git, put, commit, report = OrchGenTest.git, OrchGenTest.put, OrchGenTest.commit, OrchGenTest.report
+
+    def setUp(self):
+        self.setUp_repo()
+        self.put("build/conveyor/status.json", '{"backlog": []}')
+        self.put("build/conveyor/lanes.json", "{}")
+        self.bl = self.root / "build/conveyor/backlog.json"
+        self.run_dir = self.root / "build/orch/specs/_run"
+        self.day = orch_gen.datetime.fromtimestamp(self.T, orch_gen.timezone.utc).strftime("%Y-%m-%d")
+
+    def spec(self, sid, cls="improve", order=1, approve=True, **kw):
+        sp = {"id": sid, "class": cls, "tier": "T2", "order": order, "objective": f"do {sid}",
+              "owned_files": ["jarvis/foo.py", "tests/test_foo.py"], "acceptance": ["it works"],
+              "negative_tests": [], "depends_on": [], "worker": "opus", "effort": "high", "contracts": []}
+        sp.update(kw)
+        raw = json.dumps(sp).encode()
+        self.put(f"build/orch/specs/{sid}.json", raw.decode())
+        if approve:
+            self.put(f"build/orch/specs/approvals/{sid}.json", json.dumps({
+                "spec_id": sid, "sha256": orch_gen.hashlib.sha256(raw).hexdigest(), "approver": "orchestrator",
+                "at": f"2026-11-24T10:00:0{order % 10}Z"}))
+        return sp
+
+    def fill(self, *argv, git=orch_gen.real_git):
+        out = []
+        rc = orch_gen.main(["--root", str(self.root), "depot-fill", *argv], git=git, out=out.append, now=lambda: self.T)
+        return rc, "\n".join(out)
+
+    def ids(self):
+        return [s["id"] for s in json.loads(self.bl.read_text(encoding="utf-8"))["slices"]]
+
+    def inbox(self):
+        p = self.run_dir / "inbox.json"
+        return [i["code"] for i in json.loads(p.read_text(encoding="utf-8"))["items"]] if p.is_file() else []
+
+    def state(self):
+        return json.loads((self.run_dir / "state.json").read_text(encoding="utf-8"))
+
+    def assert_untouched(self, *argv, rc=0, has=""):
+        before = self.bl.read_bytes()
+        r, out = self.fill(*argv)
+        self.assertEqual((r, self.bl.read_bytes()), (rc, before), out)
+        self.assertIn(has, out)
+        return out
+
+    def test_dry_run_is_default_and_writes_nothing(self):  # P5
+        self.spec("DQA")
+        out = self.assert_untouched(has="dry-run; nothing written")
+        self.assertFalse(self.run_dir.exists())
+        self.assertIn("@jarvis lane=DQA", out)
+
+    def test_write_orders_n6_first_and_binds_origin_sha(self):  # P1 N5 N16 P2 P4
+        self.spec("DQI2", order=2)
+        self.spec("DQI1", order=1)
+        self.spec("DQI3", order=3)
+        self.spec("DQN", cls="n6", order=9)
+        rc, out = self.fill("--write")
+        self.assertEqual(rc, 0, out)
+        self.assertEqual(self.ids(), ["DQN", "DQI1", "DQI2"])  # N6 first, then order; at most 2 per round
+        head = (self.root / "build/conveyor/prompts/DQI1.md").read_text(encoding="utf-8").splitlines()[0]
+        self.assertTrue(head.endswith(f"base={self.base}"), head)
+        st = self.state()
+        self.assertEqual((st["DQI1"]["state"], st["DQI1"]["slice"], st.get("DQI3")), ("CONSUMED", "DQI1", None))
+        self.assertFalse(list((self.root / "build/conveyor/hold").glob("backlog.json.bak-DQI3")))
+        self.assert_untouched("--write", has="improve has 2 ready")  # P4 re-run: written slices count as ready
+
+    def test_negative_cases_leave_backlog_identical(self):
+        w = ("--write", "--class", "improve")
+        self.spec("DQS")
+        self.spec("DQS", approve=False, objective="edited after approval")
+        self.assertIn("DQS: N1", self.assert_untouched(*w))  # N1 approval sha256 no longer matches
+        self.spec("DQU", approve=False)
+        self.assertIn("DQU: N2 no approval", self.assert_untouched(*w))
+        self.spec("DQD", depends_on=["NOTMERGED"])
+        self.assertIn("DQD: N6", self.assert_untouched(*w))
+        self.assertEqual(self.inbox(), ["spec_needed:improve"])  # N6: one item per outage
+        self.assert_untouched(*w)
+        self.assertEqual(self.inbox(), ["spec_needed:improve"])
+        self.assertIn("scripts/conveyor.py", conveyor.PROTECTED_FILES)
+        self.spec("DQP", tier="T1", owned_files=["scripts/conveyor.py"])
+        self.assertIn("DQP: N12", self.assert_untouched(*w))  # P3: T1 + protected file refused
+        self.assertEqual(self.state()["DQP"]["state"], "REJECTED")
+
+    def test_n11_consumed_and_taken_ids_are_skipped(self):
+        self.spec("DQC")
+        self.run_dir.mkdir(parents=True)
+        (self.run_dir / "state.json").write_text('{"DQC": {"state": "CONSUMED", "slice": "DQC"}}', encoding="utf-8")
+        self.assertIn("DQC: N11 CONSUMED", self.assert_untouched("--write"))
+        self.spec("PMA")  # an id already in the backlog is a duplicate
+        self.bl.write_text('{"slices": [{"id": "PMA", "title": "x"}]}', encoding="utf-8")
+        self.assertIn("PMA: N11 already in the backlog", self.assert_untouched("--write"))
+
+    def test_stale_trigger_is_noop_without_inbox(self):  # N3
+        self.spec("DQA")
+        self.bl.write_text(json.dumps({"slices": [{"id": i, "title": f"[IYILESTIRME] {i}"} for i in ("R1", "R2")]}),
+                           encoding="utf-8")
+        self.put("build/conveyor/status.json", json.dumps({"backlog": [{"id": "R1", "state": "ready"},
+                                                                        {"id": "R2", "state": "ready"}]}))
+        self.assert_untouched("--write", "--class", "improve", has="nothing to fill")
+        self.assertEqual(self.inbox(), [])
+
+    def test_propose_must_be_the_class_head(self):  # N4
+        self.spec("DQ1", order=1)
+        self.spec("DQ2", order=2)
+        self.assertIn("N4", self.assert_untouched("--write", "--propose", "DQ2", rc=2))
+        self.assertIn("N4", self.assert_untouched("--write", "--class", "n6", "--propose", "DQ1", rc=2))
+
+    def test_check_failure_rolls_back_then_rejects(self):  # N7
+        self.spec("DQF")
+        self.put("build/orch/preflight.py", "import sys\nsys.exit(1)\n")
+        for n, st in ((1, "READY"), (2, "REJECTED")):
+            self.assert_untouched("--write", "--class", "improve", rc=1)
+            self.assertEqual((self.state()["DQF"]["attempts"], self.state()["DQF"]["state"]), (n, st))
+            self.assertFalse((self.root / "build/conveyor/prompts/DQF.md").exists())
+            self.assertFalse(list((self.root / "build/conveyor/hold").glob("backlog.json.bak-DQF")))
+
+    def test_daily_cap(self):  # N8
+        self.spec("DQA")
+        self.run_dir.mkdir(parents=True)
+        (self.run_dir / "caps.json").write_text(json.dumps({f"improve:{self.day}": 2}), encoding="utf-8")
+        self.assert_untouched("--write", "--class", "improve", has="N8 daily cap")
+
+    def test_intent_without_receipt_reconciles_never_retries(self):  # N9
+        self.spec("DQA")
+        self.spec("DQB", order=2)
+        self.run_dir.mkdir(parents=True)
+        (self.run_dir / "journal.jsonl").write_text(
+            '{"kind": "intent", "id": "DQA"}\n{"kind": "intent", "id": "PMX"}\n', encoding="utf-8")
+        self.bl.write_text('{"slices": [{"id": "PMX", "title": "[N6] x"}]}', encoding="utf-8")
+        rc, out = self.fill("--write", "--class", "improve")
+        self.assertEqual(rc, 0, out)
+        st = self.state()
+        self.assertEqual((st["DQA"]["state"], st["DQA"]["reason"], st["PMX"]["state"]),
+                         ("REJECTED", "UNKNOWN_OUTCOME", "CONSUMED"))
+        self.assertIn("unknown_outcome:DQA", self.inbox())
+        self.assertEqual(self.ids(), ["PMX", "DQB"])  # exactly one new slice; DQA is never retried
+
+    def test_lock_and_moved_base_refuse(self):  # N10 N16
+        self.spec("DQA")
+        self.run_dir.mkdir(parents=True)
+        (self.run_dir / "fill.lock").write_text("", encoding="utf-8")
+        self.assertIn("N10", self.assert_untouched("--write", rc=2))
+        (self.run_dir / "fill.lock").unlink()
+        calls = []
+
+        def moving(root, *args):
+            if args[:1] == ("rev-parse",) and "refs/remotes/origin/main" in args:
+                calls.append(1)
+                return 0, ("a" if len(calls) == 1 else "b") * 40 + "\n"
+            return orch_gen.real_git(root, *args)
+        before = self.bl.read_bytes()
+        rc, out = self.fill("--write", git=moving)
+        self.assertEqual((rc, self.bl.read_bytes()), (2, before), out)
+        self.assertIn("N10/N16", out)
+        self.assertFalse((self.run_dir / "fill.lock").exists())
+        rc, out = self.fill("--write", git=lambda root, *a: (0, "main\n") if a[:1] == ("rev-parse",)
+                            else orch_gen.real_git(root, *a))
+        self.assertEqual((rc, self.bl.read_bytes()), (2, before), out)
+        self.assertIn("N16", out)
+
+    def test_strict_schema_rejects_free_text(self):  # N13
+        good = json.loads(json.dumps(self.spec("DQA", approve=False)))
+        for bad in ({**good, "note": "x"}, {**good, "objective": "a\nb"}, {**good, "order": "1"},
+                    {**good, "owned_files": ["../x; rm"]}, {**good, "objective": "x" * 400},
+                    {**good, "acceptance": []}):
+            with self.assertRaises(orch_gen.Refuse):
+                orch_gen.parse_spec(json.dumps(bad).encode(), "DQA")
+        with self.assertRaises(orch_gen.Refuse):
+            orch_gen.parse_spec(b"{" + b" " * orch_gen.SPEC_MAX + b"}", "DQA")
+        with self.assertRaises(orch_gen.Refuse):
+            orch_gen.parse_spec(b'{"id": "DQA", "id": "DQA"}', "DQA")
+
+    def test_empty_depot_raises_queue_empty_once(self):  # N15
+        self.assert_untouched("--write")
+        self.assert_untouched("--write")
+        self.assertEqual(self.inbox(), ["queue_empty"])
+
+
 if __name__ == "__main__":
     unittest.main()

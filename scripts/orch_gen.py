@@ -27,6 +27,10 @@ build/orch/preflight.py and roll back the backlog and prompt on any error.
 the highest-priority, oldest approved READY spec build/orch/ready/<track>/<seq>-<id>.json (a slice
 spec + track, priority, approved_by, decision) into a slice the slice way (preflight, T5 cap);
 --write moves the spec to ready/used/<UTC date>/; every fill appends a line to ready/fill.jsonl.
+"depot-fill [--class n6|improve|auto] [--propose ID]" (QUEUEFILL2, never run unless invoked):
+strict depot specs build/orch/specs/<id>.json, each approved by a build/orch/specs/approvals/<id>.json
+bound to its sha256; a low class gets the deterministic head(s) at base = origin/main (40 hex) under
+a lock with an intent/receipt journal and state in build/orch/specs/_run/.
 Anything unclear refuses (exit 2) with the reason. Never edits conveyor.py, never pushes, never
 writes approvals (the entry carries no "approved" key).
 """
@@ -34,6 +38,7 @@ from __future__ import annotations
 
 import argparse
 import ast
+import hashlib
 import json
 import os
 import re
@@ -441,8 +446,8 @@ class Gen:
 
     def spec(self, path, fix):
         """A slice/fix spec (JSON object); refuses on any missing or bad field."""
-        try:
-            sp = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+        try:  # a dict is a spec the depot already parsed and vetted (depot_slice)
+            sp = dict(path) if isinstance(path, dict) else json.loads(Path(path).read_text(encoding="utf-8-sig"))
         except (OSError, ValueError) as e:
             raise Refuse(f"spec unreadable: {e}") from None
         if not isinstance(sp, dict):
@@ -713,17 +718,328 @@ def fill_log(root, t, rec):
         f.write(json.dumps({"at": at, **rec}, sort_keys=True) + "\n")
 
 
+# QUEUEFILL2: the spec depot build/orch/specs/<id>.json. Off by default: only `depot-fill --write` writes,
+# and only under build/orch/specs/_run/ plus the one emitted slice (backlog.json + its prompt).
+DEPOT = Path("build") / "orch" / "specs"
+SPEC_KEYS = {"id", "class", "tier", "order", "objective", "owned_files", "acceptance", "negative_tests",
+             "depends_on", "worker", "effort", "contracts"}
+SPEC_MAX, APPROVAL_MAX, INBOX_MAX = 16384, 1024, 16  # bytes per spec / approval record, items in the inbox
+CLASSES = ("n6", "improve")  # N5: n6 before improve
+TITLE = {"n6": "[N6] ", "improve": "[IYILESTIRME] "}  # orch_digest counts ready by these prefixes
+LOW, TARGET, PER_ROUND = 2, 3, 2  # P2: trigger below LOW ready, fill toward TARGET, at most PER_ROUND a round
+DEPOT_CAP = {"n6": 2, "improve": 2}  # N8: depot slices per class per UTC day (reviewed code, no data file)
+AT_RE = re.compile(r"\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ")
+OWNED_RE = re.compile(r"([A-Za-z0-9_][A-Za-z0-9_./-]*)( \(new\))?")
+INBOX_RE = re.compile(r"spec_needed:(n6|improve)|queue_empty|unknown_outcome:[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+
+
+def _no_dupes(pairs):
+    d = {}
+    for k, v in pairs:
+        if k in d:
+            raise ValueError(f"duplicate key {k!r}")
+        d[k] = v
+    return d
+
+
+def parse_spec(raw, stem=None):
+    """(spec, sha256 of these exact bytes); N13: exact key set, typed fields, one line each, <= SPEC_MAX."""
+    if len(raw) > SPEC_MAX:
+        raise Refuse(f"N13 spec over {SPEC_MAX} bytes")
+    try:
+        sp = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_dupes)
+    except (ValueError, RecursionError) as e:  # UnicodeDecodeError is a ValueError
+        raise Refuse(f"N13 spec unreadable: {e}") from None
+    if not isinstance(sp, dict) or set(sp) != SPEC_KEYS:
+        raise Refuse(f"N13 spec fields must be exactly {', '.join(sorted(SPEC_KEYS))}")
+
+    def one(x):
+        return isinstance(x, str) and 0 < len(x) <= 300 and x.isprintable()
+
+    def lines(x, need=False):
+        return isinstance(x, list) and len(x) <= 20 and (x or not need) and all(one(y) for y in x)
+
+    ok = (isinstance(sp["id"], str) and conveyor.LANE_RE.fullmatch(sp["id"]) and stem in (None, sp["id"])
+          and sp["class"] in CLASSES and sp["tier"] in ("T0", "T1", "T2") and type(sp["order"]) is int
+          and one(sp["objective"]) and sp["worker"] in ("opus", "codex") and sp["effort"] in conveyor.EFFORTS
+          and lines(sp["acceptance"], True) and lines(sp["negative_tests"]) and lines(sp["contracts"])
+          and lines(sp["owned_files"], True) and all(OWNED_RE.fullmatch(p) for p in sp["owned_files"])
+          and isinstance(sp["depends_on"], list) and len(sp["depends_on"]) <= 20
+          and all(isinstance(d, str) and conveyor.LANE_RE.fullmatch(d) for d in sp["depends_on"]))
+    if not ok:
+        raise Refuse(f"N13 spec {stem or '?'}: a field breaks the schema")
+    return sp, hashlib.sha256(raw).hexdigest()
+
+
+def owned_paths(sp):
+    return [OWNED_RE.fullmatch(p).group(1) for p in sp["owned_files"]]
+
+
+def spec_tier(sp):
+    """The tier from owned_files: any protected file needs T2; a lower declared tier is refused (N12)."""
+    hot = [p for p in owned_paths(sp) if conveyor.protected_path(p) or p in conveyor.PROTECTED_FILES]
+    if hot and sp["tier"] != "T2":
+        raise Refuse(f"N12 {sp['id']}: declared {sp['tier']} but owns protected {', '.join(hot)}")
+    return sp["tier"]
+
+
+def pick(specs, approvals, state, cls, on_main=(), blocked=(), taken=()):
+    """Pure, model-free choice: (eligible ids head first, {id: why skipped}); order N6, order, approval time."""
+    ok, why = [], {}
+    for sid, (sp, sha) in specs.items():
+        if cls in CLASSES and sp["class"] != cls:
+            continue
+        st, ap = (state.get(sid) or {}).get("state", "READY"), approvals.get(sid)
+        if st != "READY" or sid in taken:
+            why[sid] = f"N11 {st if st != 'READY' else 'already in the backlog'}"
+        elif not isinstance(ap, dict):
+            why[sid] = "N2 no approval"
+        elif ap.get("sha256") != sha:
+            why[sid] = "N1 approval sha256 does not match the spec bytes"
+        elif (set(ap) != {"spec_id", "sha256", "approver", "at"} or ap["spec_id"] != sid
+              or ap["approver"] not in APPROVERS or not isinstance(ap["at"], str) or not AT_RE.fullmatch(ap["at"])):
+            why[sid] = "N2 approval record malformed"
+        elif any(d not in on_main or d in blocked for d in sp["depends_on"]) or sid in blocked:
+            why[sid] = "N6 depends_on not on main, or blocked"
+        else:
+            try:
+                spec_tier(sp)
+                ok.append(sid)
+            except Refuse as e:
+                why[sid] = str(e)
+    ok.sort(key=lambda s: (CLASSES.index(specs[s][0]["class"]), specs[s][0]["order"], approvals[s]["at"], s))
+    return ok, why
+
+
+def load_depot(root):
+    """({id: (spec, sha)}, {id: approval}, {id: why unreadable}); a bad record is skipped, never guessed."""
+    d = Path(root) / DEPOT
+    specs, approvals, bad = {}, {}, {}
+    for p in sorted(d.glob("*.json")) if d.is_dir() else []:
+        try:
+            specs[p.stem] = parse_spec(p.read_bytes(), p.stem)
+        except (Refuse, OSError) as e:
+            bad[p.stem] = str(e)
+    ad = d / "approvals"
+    for p in sorted(ad.glob("*.json")) if ad.is_dir() else []:
+        try:
+            raw = p.read_bytes()
+            if len(raw) <= APPROVAL_MAX:
+                approvals[p.stem] = json.loads(raw.decode("utf-8"), object_pairs_hook=_no_dupes)
+        except (OSError, ValueError, RecursionError):
+            bad[f"approvals/{p.stem}"] = "unreadable approval"
+    return specs, approvals, bad
+
+
+def _jload(p, default):
+    try:
+        v = json.loads(p.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return default
+    except (OSError, ValueError, RecursionError) as e:
+        raise Refuse(f"{p.name} unreadable ({type(e).__name__}); fail closed") from None
+    if not isinstance(v, type(default)):
+        raise Refuse(f"{p.name} is not a {type(default).__name__}; fail closed")
+    return v
+
+
+def _jsave(p, v):
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(p.name + ".tmp")
+    tmp.write_text(json.dumps(v, indent=1, sort_keys=True), encoding="utf-8", newline="\n")
+    os.replace(tmp, p)
+
+
+def journal(run, rec):
+    run.mkdir(parents=True, exist_ok=True)
+    with open(run / "journal.jsonl", "a", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps(rec, sort_keys=True) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+
+
+def inbox_set(run, code, on, at, write, out):
+    """One schema-bound {code, at} item per outage: raised once while it lasts, cleared when it ends."""
+    p = run / "inbox.json"
+    items = _jload(p, {"items": []}).get("items")
+    if not isinstance(items, list) or not all(isinstance(i, dict) and set(i) == {"code", "at"}
+                                              and INBOX_RE.fullmatch(str(i["code"])) for i in items):
+        raise Refuse("inbox.json breaks its schema; fail closed")
+    if not INBOX_RE.fullmatch(code) or on == any(i["code"] == code for i in items):
+        return
+    new = items + [{"code": code, "at": at}] if on else [i for i in items if i["code"] != code]
+    if len(new) > INBOX_MAX:
+        raise Refuse(f"inbox holds {INBOX_MAX} items; not adding {code}")
+    out(f"{'' if write else 'dry-run: would '}{'raise' if on else 'clear'} inbox {code}")
+    if write:
+        _jsave(p, {"items": new})
+
+
+def as_gen_spec(sp):
+    """A vetted depot spec -> the Gen.spec dict; every text field comes from the sha-approved spec bytes."""
+    owned = owned_paths(sp)
+    run = [f"tests.{Path(p).stem}" for p in owned if p.startswith("tests/test_") and p.endswith(".py")]
+    out = {"id": sp["id"], "title": TITLE[sp["class"]] + sp["objective"], "tier": sp["tier"], "model": sp["worker"],
+           "effort": sp["effort"], "size": "MEDIUM", "goal": sp["objective"],
+           "tests": sp["acceptance"] + sp["negative_tests"], "run": run or ["tests"], "owned": owned,
+           "commit": f"feat: {sp['id']} {sp['objective']}", "depends_on": sp["depends_on"]}
+    if sp["contracts"]:
+        out["decisions"] = "; ".join(sp["contracts"])
+    return out
+
+
+def origin_main(g):
+    """N16: the slice base is origin/main as a full 40-hex sha, never a branch name."""
+    rc, o = g.git_fn(g.root, "rev-parse", "--verify", "refs/remotes/origin/main")
+    if rc != 0 or not SHA40.fullmatch(o.strip()):
+        raise Refuse("N16 origin/main is not a 40-hex sha; fail closed")
+    return o.strip()
+
+
+def depot_fill(g, cls, propose, write, t):
+    """QUEUEFILL2: approved READY depot specs -> slices for a low class. Dry-run unless write; one fill at a time."""
+    run = g.root / DEPOT / "_run"
+    lock = run / "fill.lock"
+    if write:
+        run.mkdir(parents=True, exist_ok=True)
+        try:  # N10: O_EXCL makes the second concurrent fill refuse; a stale lock needs a human (fail closed)
+            os.close(os.open(lock, os.O_CREAT | os.O_EXCL | os.O_WRONLY))
+        except FileExistsError:
+            raise Refuse(f"N10 another depot fill holds {lock.relative_to(g.root).as_posix()}") from None
+    try:
+        return _depot_fill(g, run, cls, propose, write, t)
+    finally:
+        if write:
+            lock.unlink()
+
+
+def _depot_fill(g, run, cls, propose, write, t):
+    at = datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    day = at[:10]
+    state = _jload(run / "state.json", {})
+    caps = _jload(run / "caps.json", {})
+    if not all(isinstance(v, dict) and v.get("state") in ("READY", "CONSUMED", "REJECTED") for v in state.values()) \
+            or not all(type(v) is int and v >= 0 for v in caps.values()):
+        raise Refuse("depot state.json/caps.json breaks its schema; fail closed")
+    b = g.backlog()
+    ids = {s.get("id") for s in b["slices"]}
+
+    def save():
+        if write:
+            _jsave(run / "state.json", state)
+
+    # N9: an intent without a receipt is UNKNOWN_OUTCOME: adopt the slice if it landed, else reject; never retry
+    recs = [json.loads(x) for x in (run / "journal.jsonl").read_text(encoding="utf-8").splitlines() if x.strip()] \
+        if (run / "journal.jsonl").is_file() else []
+    done = {r.get("id") for r in recs if r.get("kind") == "receipt"}
+    for sid in dict.fromkeys(r.get("id") for r in recs if r.get("kind") == "intent" and r.get("id") not in done):
+        if not isinstance(sid, str) or not conveyor.LANE_RE.fullmatch(sid):
+            raise Refuse("journal.jsonl holds a malformed intent; fail closed")
+        landed = sid in ids
+        st = state.setdefault(sid, {"state": "READY", "attempts": 0})
+        st.update(state="CONSUMED", slice=sid) if landed else st.update(state="REJECTED", reason="UNKNOWN_OUTCOME")
+        g.out(f"depot: N9 intent {sid} had no receipt: {'adopted the landed slice' if landed else 'UNKNOWN_OUTCOME'}")
+        if write:
+            journal(run, {"kind": "receipt", "id": sid, "result": "reconciled", "at": at})
+        if not landed:
+            inbox_set(run, f"unknown_outcome:{sid}", True, at, write, g.out)
+        save()
+    now = datetime.fromtimestamp(t).replace(microsecond=0)
+    d = orch_digest.build(g.root, now, now - timedelta(hours=24))
+    if any(i["reason"] == "unknown" and i["id"] in STATE_INPUTS for i in d["items"]):
+        raise Refuse("conveyor state unreadable; cannot count ready slices")
+    view = orch_digest.load(g.root / "build" / "conveyor" / "status.json", [], {}).get("backlog") or []
+    seen = {str(v.get("id")) for v in view if isinstance(v, dict)}
+    blocked = {i["id"] for i in d["items"] if i["reason"] in ("blocked", "held")}
+    specs, approvals, bad = load_depot(g.root)
+    for k, why in sorted(bad.items()):
+        g.out(f"depot: skipped {k}: {why}")
+    deps = {x for sp, _ in specs.values() for x in sp["depends_on"]}
+    on_main = {x for x in deps if (lambda r: r[0] == 0 and r[1].strip())(g.git_fn(
+        g.root, "log", "-1", "--format=%H", "-E", f"--grep=(^|[ :(]){re.escape(x)}([ ):]|$)", "refs/remotes/origin/main"))}
+    if propose:  # N4: a proposed id must be this class's head, never just any spec
+        if propose not in specs or (cls in CLASSES and specs[propose][0]["class"] != cls):
+            raise Refuse(f"N4 proposed {propose} is not a {cls} depot spec")
+        cls = specs[propose][0]["class"]
+    total_ready = sum(d["ready"].values())
+    made = 0
+    for c in [cls] if cls in CLASSES else CLASSES:
+        pending = [s for s in b["slices"] if str(s.get("title", "")).startswith(TITLE[c].strip())
+                   and s.get("id") not in seen and not (g.reports / f"{s.get('id')}.md").is_file()]
+        ready = d["ready"][c] + len(pending)  # P4: a slice written but not yet in status.json counts as ready
+        if ready >= LOW:  # N3: a stale trigger is a no-op; the outage (if any) is over
+            g.out(f"depot: {c} has {ready} ready >= {LOW}; nothing to fill")
+            inbox_set(run, f"spec_needed:{c}", False, at, write, g.out)
+            continue
+        ok, why = pick(specs, approvals, state, c, on_main, blocked, ids)
+        for sid, w in sorted(why.items()):
+            g.out(f"depot: skipped {sid}: {w}")
+            if w.startswith("N12") and write:  # a T1/T0 spec owning protected files is rejected for good
+                state.setdefault(sid, {"state": "READY", "attempts": 0}).update(state="REJECTED", reason="N12")
+                save()
+        if propose and (not ok or ok[0] != propose):
+            raise Refuse(f"N4 proposed {propose} is not the {c} head ({ok[0] if ok else 'none eligible'})")
+        if not ok:
+            empty = not specs and total_ready == 0
+            code = "queue_empty" if empty else f"spec_needed:{c}"  # N15 / N6: once per outage
+            inbox_set(run, code, True, at, write, g.out)
+            continue
+        inbox_set(run, f"spec_needed:{c}", False, at, write, g.out)
+        inbox_set(run, "queue_empty", False, at, write, g.out)
+        want = min(TARGET - ready, PER_ROUND, DEPOT_CAP[c] - caps.get(f"{c}:{day}", 0))
+        if want <= 0:
+            g.out(f"depot: N8 daily cap {DEPOT_CAP[c]} for {c} reached")
+            continue
+        base = origin_main(g)
+        for sid in ok[:want]:
+            sp, sha = specs[sid]
+            raw = g.backlog_path.read_bytes()
+            bb, entry, body = g.from_spec(as_gen_spec(sp), False)
+            head, rest = body.split("\n", 1)
+            body = head.replace(" base=main", f" base={base}") + "\n" + rest
+            g.lint(bb, entry, body)
+            if not write:
+                g.emit(bb, entry, body, False)
+                continue
+            if origin_main(g) != base or g.backlog_path.read_bytes() != raw:  # N16 / N10 CAS right before emit
+                raise Refuse("N10/N16 origin/main or backlog.json moved during the fill; nothing written")
+            journal(run, {"kind": "intent", "id": sid, "sha256": sha, "base": base, "at": at})
+            rc = g.emit(bb, entry, body, True, strict=True)
+            st = state.setdefault(sid, {"state": "READY", "attempts": 0})
+            if rc:  # N7: emit restored backlog + prompt; drop its backup so a retry can run
+                (g.root / "build" / "conveyor" / "hold" / f"backlog.json.bak-{sid}").unlink(missing_ok=True)
+                st["attempts"] = st.get("attempts", 0) + 1
+                if st["attempts"] >= 2:
+                    st.update(state="REJECTED", reason="N7 check failed twice")
+            else:
+                st.update(state="CONSUMED", slice=sid)
+                caps[f"{c}:{day}"] = caps.get(f"{c}:{day}", 0) + 1
+                _jsave(run / "caps.json", {k: v for k, v in caps.items() if k.endswith(day)})
+                made += 1
+            journal(run, {"kind": "receipt", "id": sid, "result": "failed" if rc else "written", "at": at})
+            save()
+            if rc:
+                return 1
+            b = g.backlog()
+            ids.add(sid)
+    g.out(f"depot: {made} slice(s) written" if write else "depot: dry-run; nothing written (use --write)")
+    return 0
+
+
 def main(argv=None, git=real_git, out=print, now=time.time):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--root", default=str(Path(__file__).resolve().parents[1]),
                     help="main checkout (holds build/)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("review", "int", "slice", "fix", "fill"):
+    for name in ("review", "int", "slice", "fix", "fill", "depot-fill"):
         p = sub.add_parser(name)
         if name in ("slice", "fix"):
             p.add_argument("--spec", required=True, metavar="JSON", help="the slice/fix spec file")
         elif name == "fill":
             p.add_argument("--track", choices=[n for n, _ in TRACKS] + ["auto"], default="auto")
+        elif name == "depot-fill":
+            p.add_argument("--class", dest="cls", choices=CLASSES + ("auto",), default="auto")
+            p.add_argument("--propose", metavar="ID", help="the spec id the caller expects at the head")
         else:
             p.add_argument("ids", nargs="+")
         if name == "review":
@@ -743,6 +1059,8 @@ def main(argv=None, git=real_git, out=print, now=time.time):
         out(f"warning: no --focus; the prompt carries the placeholder {FOCUS_PLACEHOLDER}")
         focus = None
     try:
+        if a.cmd == "depot-fill":
+            return depot_fill(g, a.cls, a.propose, a.write, now())
         if a.cmd == "fill":
             t = now()
             rec = {"track": None, "spec": None, "result": "refused", "reason": "error", "skipped": []}
