@@ -13,6 +13,7 @@ from jarvis.model_retirement import (
     claude_migration,
     codex_migration,
     codex_retirement,
+    newest_per_name,
 )
 
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
@@ -84,6 +85,53 @@ NOW = datetime(2026, 9, 24, tzinfo=timezone.utc)
 def offered(*ids: str, specialty: dict | None = None) -> list[dict]:
     return [{"id": i, "efforts": ["low", "medium", "high"], "default_effort": "medium", "specialty": (specialty or {}).get(i, "")}
             for i in ids]
+
+
+class ProviderRuleOutputTests(unittest.TestCase):
+    def test_claude_alias_migration(self) -> None:
+        models = claude_catalog(opus="claude-opus-6[1m]", sonnet="claude-sonnet-6")
+        cases = (
+            ("opus[1m]", "claude-opus-5-5[1m]", ("claude-opus-6[1m]", "high")),
+            ("opus[1m]", "claude-opus-5-5", None),
+            ("sonnet", "claude-sonnet-5", ("claude-sonnet-6", "high")),
+            ("haiku", "claude-haiku-4-5-20250901", ("claude-haiku-4-5-20251001", "")),
+            ("default", "claude-opus-5-5[1m]", None),
+        )
+        for lane, model, expected in cases:
+            with self.subTest(lane=lane, model=model):
+                self.assertEqual(expected, claude_migration(models, lane, model, "high"))
+
+    def test_codex_retirement_and_migration(self) -> None:
+        source, successor, specialized = "gpt-5.6-sol", "gpt-6-sol", "gpt-daybreak-blue-latest"
+        models = offered(source, successor, specialized, specialty={specialized: "cyber"})
+        cases = (
+            (successor, "", [successor, specialized], {source: successor}, (successor, "medium")),
+            (specialized, "", [source, successor, specialized], {}, None),
+            ("", "2026-09-01T00:00:00Z", [successor, specialized], {}, None),
+        )
+        for target, retirement_at, ids, mapping, migration in cases:
+            with self.subTest(target=target, retirement_at=retirement_at):
+                kept, retired = codex_retirement(models, {
+                    source: {"model": target, "retirement_at": retirement_at},
+                }, NOW)
+                self.assertEqual((ids, mapping), ([row["id"] for row in kept], retired))
+                self.assertEqual(migration, codex_migration(source, "max", kept, retired))
+
+    def test_display_keepers_by_provider(self) -> None:
+        models = claude_catalog(sonnet="claude-sonnet-6") + offered(
+            "claude-sonnet-5", "gpt-5.6-sol", "gpt-6-sol",
+        )
+        cases = (
+            ("claude", {"claude-sonnet-5": "sonnet"}),
+            ("codex", {"gpt-5.6-sol": "gpt-6-sol"}),
+            ("unknown", {}),
+        )
+        for provider, hidden in cases:
+            with self.subTest(provider=provider):
+                self.assertEqual(
+                    ([row for row in models if row["id"] not in hidden], hidden),
+                    newest_per_name(models, provider=provider),
+                )
 
 
 class CodexRetirementTests(unittest.TestCase):

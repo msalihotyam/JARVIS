@@ -24,11 +24,39 @@ where it is.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-_FAMILY = re.compile(r"\Aclaude-([a-z]+)-")
-_VARIANT = re.compile(r"(\[[a-z0-9]+\])\Z")
+
+@dataclass(frozen=True)
+class _ProviderRule:
+    version: re.Pattern[str]
+    family: re.Pattern[str] | None = None
+    variant: re.Pattern[str] | None = None
+    alias_exclusion: re.Pattern[str] | None = None
+    successor_lane_field: str = ""
+
+    def is_alias(self, model_id: str) -> bool:
+        return bool(model_id and self.alias_exclusion and not self.alias_exclusion.match(model_id))
+
+
+_PROVIDER_RULES = {
+    "claude": _ProviderRule(
+        version=re.compile(
+            r"\Aclaude-(?P<name>[a-z]+(?:-[a-z]+)*)-(?P<major>\d+)"
+            r"(?:-(?P<minor>\d{1,2}))?(?:-\d{8})?\Z"
+        ),
+        family=re.compile(r"\Aclaude-([a-z]+)-"),
+        variant=re.compile(r"(\[[a-z0-9]+\])\Z"),
+        alias_exclusion=re.compile(r"\A(?:default\Z|claude-)"),
+    ),
+    "codex": _ProviderRule(
+        version=re.compile(r"\Agpt-(?P<major>\d+)(?:\.(?P<minor>\d+))?-(?P<name>[a-z]+(?:-[a-z]+)*)\Z"),
+        successor_lane_field="specialty",
+    ),
+}
+
 _MAX_HOPS = 5
 
 
@@ -40,7 +68,7 @@ def _rows(models: Any) -> dict[str, dict[str, Any]]:
 
 def is_claude_alias(row_id: str) -> bool:
     """A CLI alias (a lane), not ``default`` and not a full model id."""
-    return bool(row_id) and row_id != "default" and not row_id.startswith("claude-")
+    return _PROVIDER_RULES["claude"].is_alias(row_id)
 
 
 def claude_lane(models: Any, row_id: str, model: str) -> str:
@@ -59,10 +87,13 @@ def adopt_claude_lane(models: Any, model: str) -> str:
     return matches[0] if len(matches) == 1 else ""
 
 
-def _same_lane(old: str, new: str) -> bool:
+def _same_lane(rule: _ProviderRule, old: str, new: str) -> bool:
     """Same model family and same context variant; never a version comparison."""
-    old_family, new_family = _FAMILY.match(old), _FAMILY.match(new)
-    old_variant, new_variant = _VARIANT.search(old), _VARIANT.search(new)
+    if rule.family is None:
+        return False
+    old_family, new_family = rule.family.match(old), rule.family.match(new)
+    old_variant = rule.variant.search(old) if rule.variant else None
+    new_variant = rule.variant.search(new) if rule.variant else None
     return (bool(old_family) and bool(new_family) and old_family.group(1) == new_family.group(1)
             and (old_variant.group(1) if old_variant else "") == (new_variant.group(1) if new_variant else ""))
 
@@ -74,7 +105,9 @@ def claude_migration(models: Any, lane: str, model: str, effort: str) -> tuple[s
     if not model or not row or not is_claude_alias(lane):
         return None
     target = row.get("resolved")
-    if not isinstance(target, str) or not target or target == model or not _same_lane(model, target):
+    if not isinstance(target, str) or not target or target == model:
+        return None
+    if not _same_lane(_PROVIDER_RULES["claude"], model, target):
         return None
     efforts = row.get("efforts") if isinstance(row.get("efforts"), list) else []
     return target, effort if not effort or effort in efforts else ""
@@ -104,10 +137,12 @@ def codex_retirement(models: list[dict[str, Any]], upgrades: dict[str, dict[str,
     """
     now = now or datetime.now(timezone.utc)
     offered = _rows(models)
+    lane_field = _PROVIDER_RULES["codex"].successor_lane_field
 
-    def specialty(model_id: str) -> str:
+    def lane(model_id: str) -> str:
         source = offered.get(model_id) or upgrades.get(model_id) or {}
-        return source.get("specialty") if isinstance(source.get("specialty"), str) else ""
+        value = source.get(lane_field)
+        return value if isinstance(value, str) else ""
 
     def expired(model_id: str) -> bool:
         return _passed((upgrades.get(model_id) or {}).get("retirement_at"), now)
@@ -124,7 +159,7 @@ def codex_retirement(models: list[dict[str, Any]], upgrades: dict[str, dict[str,
     retired = {}
     for model_id in set(upgrades) | set(offered):
         target = successor(model_id, frozenset({model_id}))
-        if target and specialty(target) == specialty(model_id):
+        if target and lane(target) == lane(model_id):
             retired[model_id] = target
     kept = [m for m in models if m.get("id") not in retired and not expired(m.get("id"))]
     return kept, retired
@@ -147,29 +182,22 @@ def codex_migration(selected: str, effort: str, offered: list[dict[str, Any]],
 
 # -- The newest version per model name (display only) -------------------------
 
-_CLAUDE_FULL = re.compile(r"\Aclaude-([a-z]+(?:-[a-z]+)*)-(\d+)(?:-(\d{1,2}))?(?:-(\d{8}))?\Z")
-_CODEX_FULL = re.compile(r"\Agpt-(\d+)(?:\.(\d+))?-([a-z]+(?:-[a-z]+)*)\Z")
-
-
 def _bypass(model_id: str) -> bool:
     """An id the rule never touches: a preview, a context variant, -latest."""
     lowered = model_id.lower()
     return "preview" in lowered or "[" in model_id or lowered.endswith("-latest")
 
 
-def _parse_version(provider: str, model_id: Any) -> tuple[str, tuple[int, int]] | None:
+def _parse_version(rule: _ProviderRule, model_id: Any) -> tuple[str, tuple[int, int]] | None:
     """``(name key, (major, minor))`` of a full model id, or ``None`` when it
     is not one (an alias, unversioned, a variant, a preview, unparseable). A
     date suffix is a snapshot of the same version and never part of it."""
     if not isinstance(model_id, str) or not model_id or _bypass(model_id):
         return None
-    if provider == "claude":
-        match = _CLAUDE_FULL.match(model_id)
-        return (match.group(1), (int(match.group(2)), int(match.group(3) or 0))) if match else None
-    if provider == "codex":
-        match = _CODEX_FULL.match(model_id)
-        return (match.group(3), (int(match.group(1)), int(match.group(2) or 0))) if match else None
-    return None
+    match = rule.version.match(model_id)
+    if match is None:
+        return None
+    return match["name"], (int(match["major"]), int(match["minor"] or 0))
 
 
 def newest_per_name(models: Any, *, provider: str,
@@ -187,18 +215,19 @@ def newest_per_name(models: Any, *, provider: str,
     keeper is still named). Codex's declared upgrades apply BEFORE this.
     """
     rows = [m for m in models or [] if isinstance(m, dict) and isinstance(m.get("id"), str)]
+    rule = _PROVIDER_RULES.get(provider)
+    if rule is None:
+        return rows, {}
     full: dict[str, list[tuple[tuple[int, int], str]]] = {}
+    aliases: dict[str, list[tuple[tuple[int, int], str]]] = {}
     for row in rows:
-        parsed = _parse_version(provider, row["id"])
+        parsed = _parse_version(rule, row["id"])
         if parsed:
             full.setdefault(parsed[0], []).append((parsed[1], row["id"]))
-    aliases: dict[str, list[tuple[tuple[int, int], str]]] = {}
-    if provider == "claude":
-        for row in rows:
-            if is_claude_alias(row["id"]):
-                parsed = _parse_version(provider, row.get("resolved"))
-                if parsed:
-                    aliases.setdefault(parsed[0], []).append((parsed[1], row["id"]))
+        if rule.is_alias(row["id"]):
+            resolved = _parse_version(rule, row.get("resolved"))
+            if resolved:
+                aliases.setdefault(resolved[0], []).append((resolved[1], row["id"]))
     hidden: dict[str, str] = {}
     for key, entries in full.items():
         top_full = max(version for version, _ in entries)
