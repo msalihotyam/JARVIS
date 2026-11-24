@@ -28,12 +28,22 @@ class _Recorder:
     """Real sandbox git that records every call."""
 
     def __init__(self, root: Path) -> None:
+        self.root = root
         self.inner = m.sandbox_git(root)
-        self.calls: list[tuple[str, ...]] = []
+        self.calls: list[tuple[Path, tuple[str, ...]]] = []
 
     def __call__(self, cwd: Path, *args: str) -> tuple[int, str]:
-        self.calls.append(args)
+        self.calls.append((cwd, args))
         return self.inner(cwd, *args)
+
+
+def _junction(target: Path, link: Path) -> None:
+    if os.name == "nt":
+        import _winapi  # junction: no symlink privilege needed
+
+        _winapi.CreateJunction(str(target), str(link))  # type: ignore[attr-defined]
+    else:
+        os.symlink(target, link)
 
 
 def _no_git(_root: Path) -> m.Git:
@@ -244,8 +254,110 @@ class FfRehearseTests(unittest.TestCase):
 
         result = m.rehearse(self.base, clock=_clock, git_factory=factory)
         self.assertEqual("pass", result.status, result.receipts)
-        verbs = {call[0] for call in recorder[0].calls}
+        rec = recorder[0]
+        self.assertTrue(rec.calls)
+        root = m._real(rec.root)  # pyright: ignore[reportPrivateUsage]
+        for cwd, args in rec.calls:
+            self.assertTrue(m._inside(m._real(cwd), root), (cwd, args))  # pyright: ignore[reportPrivateUsage]
+        verbs = {args[0] for _cwd, args in rec.calls}
         self.assertFalse(verbs & {"push", "fetch", "pull", "reset", "clean", "stash", "remote"})
+
+    def test_ff_failure_after_checks_passed_is_unknown(self) -> None:
+        def factory(root: Path) -> m.Git:
+            inner = m.sandbox_git(root)
+            return lambda cwd, *args: (1, "") if args[0] == "merge" else inner(cwd, *args)
+
+        box, v1, v2 = self._sandbox(git_factory=factory)
+        self.assertEqual("unknown", box.fast_forward(box.repo, v2))
+        self.assertIn("after checks passed", self._last(box).detail)
+        self.assertEqual(v1, self._main(box))
+        self.assertIsNone(box.previous)
+
+    # -- links inside the sandbox are never followed (F1) ---------------------
+
+    def _plant(self, link: Path, as_dir: bool) -> tuple[Path, object]:
+        """Swap ``link`` (any existing entry moved aside) for a link to a fresh foreign target."""
+        if os.path.lexists(link):
+            link.rename(link.with_name(link.name + "-aside"))
+        foreign = Path(tempfile.mkdtemp(dir=self.base))
+        if as_dir:
+            _junction(foreign, link)
+            return foreign, []
+        target = foreign / "foreign.txt"
+        target.write_bytes(b"foreign\n")
+        os.link(target, link)
+        return target, b"foreign\n"
+
+    def _untouched(self, target: Path, before: object) -> None:
+        self.assertEqual(before, sorted(os.listdir(target)) if target.is_dir() else target.read_bytes())
+
+    def test_seed_never_follows_a_link(self) -> None:
+        box = m.open_sandbox(self.base, clock=_clock)
+        assert isinstance(box, m.Sandbox)
+        box.repo.rename(box.root / "repo-moved")
+        target, before = self._plant(box.repo, as_dir=True)  # the repo dir itself
+        self.assertIsNone(box.seed())
+        self.assertEqual("refused", self._last(box).status)
+        self._untouched(target, before)
+        box = m.open_sandbox(self.base, clock=_clock)
+        assert isinstance(box, m.Sandbox)
+        target, before = self._plant(box.repo / "a.txt", as_dir=False)  # hard link to a foreign file
+        self.assertIsNone(box.seed())
+        self.assertEqual("refused", self._last(box).status)
+        self._untouched(target, before)
+        target, before = self._plant(box.repo / "sub", as_dir=True)  # link in an intermediate dir
+        with self.assertRaises(m.LinkRefused):
+            # a.txt kept in the dict: the planted untracked file is not git rm'd first
+            box._write_version({"sub/new.bin": b"x", "a.txt": b"x"})  # pyright: ignore[reportPrivateUsage]
+        self._untouched(target, before)
+
+    def test_deploy_rollback_and_verify_never_follow_a_link(self) -> None:
+        cases = [("deploy", "VERSION", False), ("deploy", "PREVIOUS_VERSION", False),
+                 ("deploy", "incoming", True), ("deploy", "app", True), ("deploy", "previous", True),
+                 ("rollback", "VERSION", False), ("rollback", "PREVIOUS_VERSION", False),
+                 ("rollback", "app", True), ("rollback", "previous", True),
+                 ("verify_rollback", "VERSION", False), ("verify_rollback", "app", True)]
+        for step, name, as_dir in cases:
+            with self.subTest(step=step, name=name):
+                box, v1, v2 = self._sandbox()
+                self.assertEqual("pass", box.deploy(box.install, v1))
+                self.assertEqual("pass", box.fast_forward(box.repo, v2))
+                if step != "deploy":
+                    self.assertEqual("pass", box.deploy(box.install, v2))
+                if step == "verify_rollback":
+                    self.assertEqual("pass", box.rollback(box.install))
+                child = f"incoming-{v2}" if name == "incoming" else name
+                target, before = self._plant(box.install / child, as_dir)
+                calls = {"deploy": lambda: box.deploy(box.install, v2),
+                         "rollback": lambda: box.rollback(box.install),
+                         "verify_rollback": lambda: box.verify_rollback(box.install, v1)}
+                self.assertEqual("refused", calls[step]())
+                self.assertIn("link", self._last(box).detail)
+                self._untouched(target, before)
+                self.assertFalse(any(p.name.startswith("failed-") for p in box.install.iterdir())
+                                 and step == "rollback")
+
+    def test_manifest_never_follows_a_link(self) -> None:
+        tree = self.base / "tree"
+        (tree / "d").mkdir(parents=True)
+        (tree / "d" / "f").write_bytes(b"x")
+        plain = m.manifest(tree)
+        self.assertEqual(["d/f"], list(plain or {}))
+        os.link(tree / "d" / "f", self.base / "twin")  # hard link
+        self.assertIsNone(m.manifest(tree))
+        os.unlink(self.base / "twin")
+        self.assertEqual(plain, m.manifest(tree))
+        foreign = Path(tempfile.mkdtemp(dir=self.base))
+        _junction(foreign, tree / "d" / "j")  # dir link inside
+        self.assertIsNone(m.manifest(tree))
+        os.rmdir(tree / "d" / "j")
+        _junction(tree, self.base / "root-link")  # the tree root is a link
+        self.assertIsNone(m.manifest(self.base / "root-link"))
+        try:  # a file symlink needs privilege on Windows: checked only where it can be made
+            os.symlink(foreign / "x", tree / "s")
+        except OSError:
+            return
+        self.assertIsNone(m.manifest(tree))
 
     # -- deploy, rollback, byte-equal -----------------------------------------
 

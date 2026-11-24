@@ -24,6 +24,7 @@ from __future__ import annotations
 import hashlib
 import os
 import re
+import stat
 import subprocess
 import tempfile
 from collections.abc import Callable
@@ -126,11 +127,44 @@ def sandbox_git(root: Path) -> Git:
     return run
 
 
+class LinkRefused(OSError):
+    """A sandbox child is a symlink, junction/reparse point or extra hard link: never followed."""
+
+
+def _linked(path: Path) -> bool:
+    """True for a symlink, junction/reparse point or a non-dir with another hard link; False when absent."""
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    reparse = getattr(st, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    return stat.S_ISLNK(st.st_mode) or bool(reparse) or (not stat.S_ISDIR(st.st_mode) and st.st_nlink > 1)
+
+
+def _plain(own: Path, rel: str) -> Path:
+    """``own/rel`` with no link anywhere below ``own``; raises ``LinkRefused`` otherwise.
+
+    shortcut: check-then-act, a racing same-user writer can still swap between the
+    check and the open; upgrade to handle-relative opens if the sandbox ever leaves mkdtemp.
+    """
+    path = own
+    for part in Path(rel).parts:
+        path = path / part
+        if _linked(path):
+            raise LinkRefused(f"{rel} is a link")
+    return path
+
+
 def manifest(tree: Path) -> dict[str, str] | None:
-    """Relative path -> sha256 of every file under ``tree``; ``None`` when unreadable."""
+    """Relative path -> sha256 of every file under ``tree``; ``None`` when unreadable or any entry is a link."""
     files: dict[str, str] = {}
     try:
-        for folder, _dirs, names in os.walk(tree, onerror=_raise):
+        if _linked(tree):
+            return None
+        for folder, dirs, names in os.walk(tree, onerror=_raise):
+            for name in [*dirs, *names]:
+                if _linked(Path(folder, name)):
+                    return None
             for name in names:
                 path = Path(folder, name)
                 files[path.relative_to(tree).as_posix()] = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -172,8 +206,19 @@ class Sandbox:
         real = _real(path)
         if _overlaps(real, self._running):
             return self._note(step, "refused", "target overlaps the repo JARVIS runs from")
-        if real != self._pinned[own] or os.path.islink(own):
+        if real != self._pinned[own] or _linked(own):
             return self._note(step, "refused", "target was not created by this rehearsal")
+        return None
+
+    def _no_links(self, step: str, *names: str) -> Status | None:
+        """``None`` when no named install child is a link; otherwise the refusal, recorded."""
+        try:
+            for name in names:
+                _plain(self.install, name)
+        except LinkRefused:
+            return self._note(step, "refused", "a link inside the install dir is never followed")
+        except OSError as exc:
+            return self._note(step, "unknown", f"install dir unreadable: {type(exc).__name__}")
         return None
 
     def _sha(self, step: str, sha: object) -> Status | None:
@@ -187,6 +232,9 @@ class Sandbox:
 
     def seed(self) -> tuple[str, str] | None:
         """Two commits: v1 on ``main``, v2 (one file changed, one added, one gone) on ``candidate``."""
+        if _real(self.repo) != self._pinned[self.repo] or _linked(self.repo):
+            self._note("seed", "refused", "repo dir was swapped after creation")
+            return None
         try:
             steps: list[tuple[str, ...] | dict[str, bytes]] = [
                 ("init", "-q", "--template=", "-b", "main"), _V1, ("add", "-A"),
@@ -199,6 +247,9 @@ class Sandbox:
                 elif self.git(self.repo, *item)[0]:
                     return self._seed_failed(f"git {item[0]} failed")
             base, candidate = self._head(_MAIN), self._head("refs/heads/candidate")
+        except LinkRefused as exc:
+            self._note("seed", "refused", f"never followed: {exc}")
+            return None
         except (GitUnavailable, OSError) as exc:
             return self._seed_failed(str(exc) or type(exc).__name__)
         if base is None or candidate is None:
@@ -211,8 +262,8 @@ class Sandbox:
             if old.is_file() and old.name not in files and self.git(self.repo, "rm", "-q", "--", old.name)[0]:
                 raise OSError(f"git rm {old.name} failed")
         for name, data in files.items():
-            (self.repo / name).parent.mkdir(exist_ok=True)
-            (self.repo / name).write_bytes(data)
+            _plain(self.repo, name).parent.mkdir(exist_ok=True)
+            _plain(self.repo, name).write_bytes(data)  # re-checked: the parent may be new
 
     def _seed_failed(self, why: str) -> None:
         self._note("seed", "unknown", why)
@@ -246,7 +297,8 @@ class Sandbox:
             if code:
                 return self._note(step, "unknown", "ancestry check failed")
             if self.git(self.repo, "merge", "--ff-only", "-q", sha)[0]:
-                return self._note(step, "refused", "merge --ff-only refused: main not moved")
+                # Every policy check already passed: what is left is operational (e.g. index.lock).
+                return self._note(step, "unknown", "merge --ff-only failed after checks passed")
             if self._head(_MAIN) != sha:
                 return self._note(step, "unknown", "main is not at the candidate after merge")
         except GitUnavailable as exc:
@@ -276,7 +328,8 @@ class Sandbox:
     def deploy(self, install: object, sha: object) -> Status:
         """Export ``sha`` into ``install/app`` with a ``VERSION`` marker; the old app becomes ``previous``."""
         step = "deploy"
-        refusal = self._target(step, install, self.install) or self._sha(step, sha)
+        refusal = self._target(step, install, self.install) or self._sha(step, sha) or self._no_links(
+            step, "app", "previous", "VERSION", "PREVIOUS_VERSION", f"incoming-{sha}")
         if refusal is not None:
             return refusal
         app, previous, marker = self.install / "app", self.install / "previous", self.install / "VERSION"
@@ -296,7 +349,8 @@ class Sandbox:
 
     def rollback(self, install: object) -> Status:
         """Rename ``app`` to ``failed-<sha>`` and ``previous`` back to ``app``; nothing is deleted."""
-        refusal = self._target("rollback", install, self.install)
+        refusal = self._target("rollback", install, self.install) or self._no_links(
+            "rollback", "app", "previous", "VERSION", "PREVIOUS_VERSION")
         if refusal is not None:
             return refusal
         app, previous = self.install / "app", self.install / "previous"
@@ -317,7 +371,8 @@ class Sandbox:
     def verify_rollback(self, install: object, sha: object) -> Status:
         """``install/app`` is byte-equal to a fresh export of ``sha`` and ``VERSION`` names it."""
         step = "verify_rollback"
-        refusal = self._target(step, install, self.install) or self._sha(step, sha)
+        refusal = self._target(step, install, self.install) or self._sha(step, sha) or self._no_links(
+            step, "VERSION", "app")
         if refusal is not None:
             return refusal
         self._exports += 1
