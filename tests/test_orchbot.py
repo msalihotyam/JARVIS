@@ -1704,6 +1704,58 @@ class WakeTest(BotCase):
                                        "FAILCLOSED facts.md escalate_orchestrator"])
 
 
+class DoraWakeTest(BotCase):
+    """DORAGATE2 (A13): the ntfy wake text passes the shared Dora/secret screen; synthetic list, fake HTTP."""
+
+    WORD, SECRET = "zorblax", "sk-ant-" + "a" * 20
+
+    def setUp(self):
+        super().setUp()
+        deny = self.root / "deny.json"
+        deny.write_text(json.dumps({"version": 1, "shapes": [], "words": [self.WORD]}), encoding="utf-8")
+        p = mock.patch("jarvis.dora_screen.DENY_PATH", deny)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def wake(self, target):
+        b = orchbot.Bot(self.root, now=self.clock, sleep=self.sleeps.append, wake_post=self.post,
+                        wake_topic=self.topic)
+        b.out.mkdir(parents=True, exist_ok=True)
+        b.st, b.wakes = {}, []
+        b.new = [{"rule": sorted(orchbot.WAKE)[0], "target": target, "would_do": "escalate_orchestrator"}]
+        with mock.patch("sys.stderr", new_callable=io.StringIO) as err:
+            b.wake()
+        return b, err.getvalue()
+
+    def assert_withheld(self, target, why, leak):
+        b, err = self.wake(target)
+        self.assertEqual(self.posts, [(self.topic.read_text(encoding="utf-8").strip(), orchbot.WITHHELD)])
+        self.assertEqual(b.st["wake"]["withheld"], why)
+        self.assertEqual(b.st["wake"].get("queue", []), [])  # dropped after the notice went out
+        # the withhold record (stderr line + "withheld" field) is the reason code only; "sent" is the pre-existing dedup
+        self.assertEqual(err.strip(), f"orchbot: orch-wake message withheld: {why}")
+        self.assertNotIn(leak, err)
+
+    def test_deny_hit_is_withheld_and_never_recorded(self):
+        self.assert_withheld(self.WORD, "deny", self.WORD)
+
+    def test_secret_is_withheld_and_never_recorded(self):
+        self.assert_withheld(self.SECRET, "secret", self.SECRET)
+
+    def test_unreadable_deny_list_withholds(self):
+        with mock.patch("jarvis.dora_screen.DENY_PATH", self.root / "missing.json"):
+            self.assert_withheld(self.WORD, "doubt:list", self.WORD)
+
+    def test_screen_error_withholds(self):
+        with mock.patch("jarvis.dora_screen.screen", side_effect=RuntimeError("boom")):
+            self.assertEqual(orchbot.screened("x"), (orchbot.WITHHELD, "doubt:import"))
+
+    def test_clean_text_is_sent_unchanged(self):
+        b, _ = self.wake("T")
+        self.assertEqual([t for _, t in self.posts], [f"{sorted(orchbot.WAKE)[0]} T escalate_orchestrator"])
+        self.assertNotIn("withheld", b.st["wake"])
+
+
 class LiveTest(BotCase):
     """BOTLIVE: each live action vs shadow, OFF wins, malformed or never-live config is shadow, PAUSE
     ownership, the loop guard demotes."""

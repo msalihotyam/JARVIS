@@ -42,6 +42,7 @@ from datetime import datetime
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(1, str(Path(__file__).resolve().parents[1]))  # DORAGATE2: jarvis.dora_screen
 import conveyor as cv  # noqa: E402  constants, regexes and pure helpers only
 import orch_decisions as od  # noqa: E402  the decision-id registry
 
@@ -57,6 +58,8 @@ SEEN_S = 7 * 86400
 # BOTFIX3 orchestrator wake: one coalesced ntfy message per WAKE_S on these rules; never the human paging topic
 WAKE_TOPIC = Path.home() / ".jarvis" / "orch_wake.topic"
 WAKE_S = 120
+# DORAGATE2: what is sent instead of a wake text the Dora/secret screen refuses (content-free)
+WITHHELD = "JARVIS: message withheld by the Dora screen"
 STUCK_S = 3 * 3600  # a working lane with no status update for 3 h
 WAKE = {"O5", "O10", "DRY", "CONVSAFE", "R7/O19", "STUCK", "EVTAUDIT1", "PAGER", "O23", "HOLD", "BREAKER",
         "ATTN", "LOOP", "FAILCLOSED", "ALLOW-T1", "ALLOW-T2", "ALLOW-T5"}
@@ -245,6 +248,17 @@ def git_ref(root, name):
     except (OSError, UnicodeDecodeError):
         return None
     return None
+
+
+def screened(text):
+    """DORAGATE2 (A13): (text, "") when the shared Dora/secret screen passes it, else (WITHHELD, reason code).
+    Fail closed: a deny hit, a secret, an unreadable list or any screen/import error withholds."""
+    try:
+        from jarvis import dora_screen  # lazy: an import failure withholds, never breaks the tick
+        ok, why = dora_screen.screen(text)
+    except Exception:
+        ok, why = False, "doubt:import"
+    return (text, "") if ok else (WITHHELD, why or "doubt:screen")
 
 
 def wake_http(topic, text):
@@ -560,7 +574,13 @@ class Bot:
             topic = path.read_text(encoding="utf-8-sig").strip()
             if not TOPIC_RE.fullmatch(topic) or topic == os.environ.get("JARVIS_NTFY_TOPIC", "").strip():
                 raise ValueError("bad topic")  # never the human paging topic
-            (self.wake_post or wake_http)(topic, "\n".join(queue[:20]))
+            # DORAGATE2: the only off-machine text; whole batch screened (a hit can span lines)
+            text, why = screened("\n".join(queue[:20]))
+            w.pop("withheld", None)
+            if why:
+                w["withheld"] = why  # the reason code only, never the text
+                print(f"orchbot: orch-wake message withheld: {why}", file=sys.stderr)
+            (self.wake_post or wake_http)(topic, text)
         except Exception as e:  # the queue stays for the next window
             print(f"orchbot: orch-wake topic post failed: {type(e).__name__}", file=sys.stderr)
             return
