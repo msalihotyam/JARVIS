@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import atexit
 import json
 import math
 import os
@@ -200,6 +201,53 @@ _SUBSCRIPTION_TYPES = frozenset({"max", "pro", "team", "enterprise"})
 #: against it instead of parsing prose.
 TIMEOUT_MESSAGE = "Claude Code did not finish before the timeout."
 
+#: E1-WARMTASK. A run's warm task process is reaped after this many idle
+#: seconds, and recycled once its cumulative cost reaches this fraction of the
+#: per-call ``--max-budget-usd`` (the CLI's cap is per process, not per turn).
+WARM_TASK_IDLE_SECONDS = 600.0
+WARM_TASK_CAP_FRACTION = 0.8
+#: Every live warm task process, so app exit reaps them (``atexit`` below).
+_WARM_TASK_PROCESSES: set[Any] = set()
+_WARM_TASK_LOCK = threading.Lock()
+
+
+class _WarmTask:
+    """One run's long-lived stream-json CLI and what it may be reused for."""
+
+    __slots__ = ("process", "key", "last_used", "cost")
+
+    def __init__(self, process: Any, key: tuple[Any, ...], last_used: float) -> None:
+        self.process, self.key, self.last_used, self.cost = process, key, last_used, 0.0
+
+
+def _reap_warm_task(process: Any) -> None:
+    """Kill and wait a warm task process; never raises."""
+    with _WARM_TASK_LOCK:
+        _WARM_TASK_PROCESSES.discard(process)
+    try:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    for stream in (process.stdin, process.stdout):
+        try:
+            if stream is not None:
+                stream.close()
+        except (OSError, ValueError):
+            pass
+
+
+def close_warm_task_processes() -> None:
+    """App exit: reap every warm task process still alive."""
+    with _WARM_TASK_LOCK:
+        processes = list(_WARM_TASK_PROCESSES)
+    for process in processes:
+        _reap_warm_task(process)
+
+
+atexit.register(close_warm_task_processes)
+
 
 def _reported_usd(value: Any) -> float | None:
     """Provider-reported USD, or ``None`` when it is not a usable amount.
@@ -325,6 +373,10 @@ class ClaudeCodeConnector(BaseConnector):
     billing_route_reuse_seconds = 300.0
     #: Monotonic clock for that reuse window; tests inject a fake one.
     _clock = staticmethod(time.monotonic)
+    #: E1-WARMTASK opt-in: the current run's key. Set per run by the caller,
+    #: steps of that run reuse one live stream-json CLI on an unchanged argv,
+    #: project and working directory; ``None`` (default) spawns per step.
+    warm_run: str | None = None
 
     def __init__(
         self,
@@ -385,6 +437,12 @@ class ClaudeCodeConnector(BaseConnector):
         self._process_lock = threading.Lock()
         #: Task ids cancelled before their CLI spawned; ``complete`` refuses them.
         self._cancelled: set[str] = set()
+        #: E1-WARMTASK: run key -> that run's warm task process (idle only;
+        #: a step in flight holds its session outside the map).
+        self._warm_tasks: dict[str, _WarmTask] = {}
+        self._warm_lock = threading.Lock()
+        #: Bumped by every run end / close: a step in flight then never puts its process back.
+        self._warm_generation = 0
         #: The located CLI, resolved on first use and then reused (DB-001).
         self._executable: TrustedExecutable | None = None
         #: (verified_at, auth-config fingerprint, route) of the last positive
@@ -505,9 +563,30 @@ class ClaudeCodeConnector(BaseConnector):
         return tuple(prints)
 
     def forget_billing_route(self) -> None:
-        """Drop the reused route; the next ``billing_route`` re-verifies."""
+        """Drop the reused route; the next ``billing_route`` re-verifies.
+        Every warm task process goes with it (fail closed: an auth/billing
+        doubt never leaves a live CLI to be reused)."""
         with self._route_lock:
             self._verified_route = None
+        self.close_warm()
+
+    def end_warm_run(self, run: str) -> None:
+        """Run end (or a run-level cancel between steps): reap that run's
+        warm process. The run engine calls this; not wired yet."""
+        with self._warm_lock:
+            self._warm_generation += 1
+            session = self._warm_tasks.pop(run, None)
+        if session is not None:
+            _reap_warm_task(session.process)
+
+    def close_warm(self) -> None:
+        """Reap every warm task process this connector holds."""
+        with self._warm_lock:
+            self._warm_generation += 1
+            sessions = list(self._warm_tasks.values())
+            self._warm_tasks.clear()
+        for session in sessions:
+            _reap_warm_task(session.process)
 
     def _verify_billing_route(self) -> tuple[BillingClass, str]:
         """One ``auth status`` probe, classified; ``billing_route`` gates it."""
@@ -674,6 +753,8 @@ class ClaudeCodeConnector(BaseConnector):
         # model command on a metered or unestablished route.
         billing_class, evidence = self.billing_route()
         if billing_class is BillingClass.UNKNOWN:
+            # E1-WARMTASK: no warm process outlives an unproven route.
+            self.forget_billing_route()
             return self._error_result(
                 task,
                 ErrorCode.BILLING_ROUTE_UNKNOWN,
@@ -941,6 +1022,10 @@ class ClaudeCodeConnector(BaseConnector):
         ``command`` is the complete, provenance-checked argv and ``stdin_text``
         the exact bytes for its stdin; an override may deliver them another
         way (a long-lived process) but never changes either."""
+        run = self.warm_run
+        warm = self._warm_command(command) if run is not None and stdin_text is None else None
+        if warm is not None:
+            return self._run_warm(task, run, warm, working_directory, billing_class, evidence)
         # Spawn and registration share the lock with ``cancel``: a cancel
         # either finds the process or lands first and the CLI is never started.
         with self._process_lock:
@@ -1008,6 +1093,176 @@ class ClaudeCodeConnector(BaseConnector):
                 # leaves one uuid in _cancelled; ids are never reused, so no false refusal.
                 self._cancelled.discard(task.id)
         return process.returncode, stdout, stderr
+
+    @staticmethod
+    def _warm_command(command: list[str]) -> tuple[list[str], str] | None:
+        """``(stream-json argv without the prompt, prompt)`` for a one-shot
+        ``-p <prompt> --output-format json`` argv, else ``None`` (no warm).
+        Every other flag is kept verbatim, so the argv is the reuse key."""
+        try:
+            at, fmt = command.index("-p"), command.index("--output-format")
+        except ValueError:
+            return None
+        if at + 1 >= len(command) or fmt != at + 2 or command[fmt + 1] != "json":
+            return None
+        argv = [*command[:at + 1], "--input-format", "stream-json",
+                "--output-format", "stream-json", "--verbose", *command[fmt + 2:]]
+        return argv, command[at + 1]
+
+    def _take_warm(self, run: str, key: tuple[Any, ...]) -> _WarmTask | None:
+        """This run's live session on the same key, else ``None``. Stale ones
+        (other key, exited, idle) and other runs' idle ones are reaped."""
+        now, stale = self._clock(), []
+        with self._warm_lock:
+            for other, held in list(self._warm_tasks.items()):
+                if not 0 <= now - held.last_used < WARM_TASK_IDLE_SECONDS:
+                    stale.append(self._warm_tasks.pop(other).process)
+            session = self._warm_tasks.pop(run, None)
+        if session is not None and (session.key != key or session.process.poll() is not None):
+            stale.append(session.process)
+            session = None
+        for process in stale:
+            _reap_warm_task(process)
+        return session
+
+    def _warm_refusal(self, argv: list[str], event: dict[str, Any]) -> str:
+        """What in a turn event breaks the hardened argv, or ''."""
+        kind = event.get("type")
+        if kind == "control_request":
+            return "control request"
+        if kind != "system" or event.get("subtype") != "init":
+            return ""
+        if event.get("apiKeySource") != "none":
+            return "credential source"
+        granted = set(filter(None, argv[argv.index("--tools") + 1].split(","))) if "--tools" in argv else set()
+        tools = event.get("tools")
+        if not isinstance(tools, list) or not all(isinstance(t, str) for t in tools) or not set(tools) <= granted:
+            return "tools"
+        if event.get("mcp_servers") != []:
+            return "MCP servers"
+        if event.get("permissionMode") != "plan":
+            return "permission mode"
+        # ponytail: the CLI may report a resolved id (alias -> dated id); substring match.
+        if "--model" in argv and argv[argv.index("--model") + 1] not in str(event.get("model", "")):
+            return "model"
+        return ""
+
+    def _run_warm(
+        self,
+        task: Task,
+        run: str,
+        warm: tuple[list[str], str],
+        working_directory: str,
+        billing_class: BillingClass,
+        evidence: str,
+    ) -> ToolResult | tuple[int, str, str]:
+        """One execute step on this run's warm stream-json CLI (E1-WARMTASK).
+        Same contract as the one-shot path: the returned stdout ends in the
+        step's ``result`` line, its ``total_cost_usd`` is this step's share."""
+        argv, prompt = warm
+        # The auth-config fingerprint is in the key: a re-login or settings change respawns.
+        key = (str(working_directory), tuple(argv), self._auth_config_fingerprint())
+        with self._warm_lock:
+            generation = self._warm_generation
+        session = self._take_warm(run, key)
+
+        def refused(code: ErrorCode, message: str, retryable: bool) -> ToolResult:
+            return self._error_result(task, code, message, retryable=retryable, billing_class=billing_class,
+                                      billing_evidence=evidence, call_count=1)
+
+        with self._process_lock:
+            if task.id in self._cancelled:
+                self._cancelled.discard(task.id)
+                if session is not None:
+                    _reap_warm_task(session.process)
+                return self._error_result(
+                    task, ErrorCode.CANCELLED,
+                    "The call was cancelled before Claude Code started; nothing was sent.",
+                    retryable=False, billing_class=billing_class, billing_evidence=evidence)
+            if session is None:
+                try:
+                    process = subprocess.Popen(
+                        argv, cwd=working_directory, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                        stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace",
+                        shell=False, env=self._sanitized_environment(), creationflags=NO_CONSOLE_WINDOW)
+                except FileNotFoundError:
+                    self.forget_billing_route()
+                    return self._error_result(
+                        task, ErrorCode.CONNECTOR_UNAVAILABLE,
+                        "Claude Code CLI is not installed or is not on PATH.",
+                        retryable=True, billing_class=billing_class, billing_evidence=evidence)
+                with _WARM_TASK_LOCK:
+                    _WARM_TASK_PROCESSES.add(process)
+                session = _WarmTask(process, key, self._clock())
+            self._processes[task.id] = session.process
+        process, lines, result = session.process, [], None
+        timed_out = threading.Event()
+
+        def expire() -> None:
+            timed_out.set()
+            process.kill()
+
+        timer = threading.Timer(self.timeout_seconds, expire)
+        timer.daemon = True
+        timer.start()
+        try:
+            message = {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": prompt}]}}
+            process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+            process.stdin.flush()
+            for line in iter(process.stdout.readline, ""):
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    event = None
+                event = event if isinstance(event, dict) else {}
+                drift = self._warm_refusal(argv, event)
+                if drift:
+                    _reap_warm_task(process)
+                    self.forget_billing_route()
+                    return refused(ErrorCode.EGRESS_REFUSED,
+                                   f"The warm Claude process drifted from the hardened call ({drift}); "
+                                   "it was stopped and the step was refused.", False)
+                if event.get("type") == "result":
+                    result = event
+                    break
+                lines.append(line)
+        except (OSError, ValueError):
+            result = None       # the CLI exited or its pipe closed mid-turn
+        except BaseException:
+            _reap_warm_task(process)
+            raise
+        finally:
+            timer.cancel()
+            with self._process_lock:
+                self._processes.pop(task.id, None)
+                self._cancelled.discard(task.id)
+        if result is None:
+            _reap_warm_task(process)
+            if timed_out.is_set():
+                return refused(ErrorCode.CONNECTOR_FAILED, TIMEOUT_MESSAGE, True)
+            return 1, "".join(lines), ""
+        total = result.get("total_cost_usd")
+        keep = not result.get("is_error")
+        if type(total) in (int, float) and math.isfinite(total) and total >= session.cost:
+            # The CLI reports the process's running total; the step is billed its share.
+            result["total_cost_usd"], session.cost = total - session.cost, float(total)
+            keep = keep and total < WARM_TASK_CAP_FRACTION * self.max_budget_usd
+        else:
+            keep = False        # unreadable or decreasing total: never carried forward
+        displaced = None
+        if keep:
+            session.last_used = self._clock()
+            with self._warm_lock:
+                keep = self._warm_generation == generation   # run ended / closed mid-step: drop it
+                if keep:
+                    displaced = self._warm_tasks.pop(run, None)
+                    self._warm_tasks[run] = session
+        if displaced is not None:
+            _reap_warm_task(displaced.process)
+        if not keep:
+            _reap_warm_task(process)
+        lines.append(json.dumps(result, ensure_ascii=False) + "\n")
+        return 0, "".join(lines), ""
 
     def _stdin_payload(self, prompt: str) -> str | None:
         """Text to write to the CLI's stdin, or ``None`` when the prompt travels
