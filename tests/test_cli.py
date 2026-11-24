@@ -127,7 +127,9 @@ def _must_not_build(settings: Settings):
     raise AssertionError("The application must not be built for this invocation.")
 
 
-class CliTestCase(unittest.TestCase):
+class CliFixture(unittest.TestCase):
+    """setUp and helpers only, so subclasses do not rerun CliTestCase's tests."""
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(safe_cleanup, self.temp)
@@ -201,6 +203,8 @@ class CliTestCase(unittest.TestCase):
         payload = json.loads(output)
         return payload, payload["session"]["id"], payload["task"]["id"]
 
+
+class CliTestCase(CliFixture):
     # -- status ------------------------------------------------------------
 
     def test_status_output_is_backward_compatible(self) -> None:
@@ -1066,7 +1070,7 @@ class CliTestCase(unittest.TestCase):
             self.assertFalse(process_mock.called)
 
 
-class ShownAttemptIdCommandTests(CliTestCase):
+class ShownAttemptIdCommandTests(CliFixture):
     """P2-1 at the command surface: the operator never opens SQLite.
 
     The whole point of the fix is that these two commands compose. ``show``
