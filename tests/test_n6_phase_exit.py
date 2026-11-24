@@ -208,6 +208,77 @@ class PhaseExitTests(unittest.TestCase):
                 self.assertFalse(db.parent.exists())
         self.assertFalse((self.root / px.REPORT).exists())
 
+    def test_neg_live_drill_receipt_without_slice_id_is_not_yet(self):
+        full(self.root)
+        base = {"kind": "live", "root": str(self.root), "lost": 0, "doubled": 0}
+        for name, extra in (("absent", {}), ("null", {"slice_id": None}), ("empty", {"slice_id": ""}),
+                            ("blank", {"slice_id": "   "}), ("int", {"slice_id": 0}), ("list", {"slice_id": ["S00"]}),
+                            ("zero-width", {"slice_id": "​"}), ("lone surrogate", {"slice_id": "\ud800"})):
+            with self.subTest(name):
+                write_json(n6dir(self.root) / "fallback_drill.json", dict(base, **extra))
+                code, text, lines = run(self.root)
+                self.assertEqual((code, status(lines, "FALLBACK_DRILL"), lines["OVERALL"]),
+                                 (1, "NOT_YET", "NOT_YET"), text)
+                self.assertIn("no slice_id", lines["FALLBACK_DRILL"])
+
+    def test_neg_malformed_input_is_refused_exit_2_and_writes_nothing(self):
+        def ci(**fields):
+            return lambda root: write_json(n6dir(root) / "ci-report.json", dict(CI, **fields))
+
+        def base(**fields):
+            return lambda root: write_baseline(root, dict(GROUP, **fields))
+
+        def raw_baseline(text):  # JSON json.dumps cannot write (a huge int)
+            def knock(root):
+                data = text.encode()
+                (n6dir(root) / "baseline.json").write_bytes(data)
+                (n6dir(root) / "baseline.json.sha256").write_text(
+                    f"{hashlib.sha256(data).hexdigest()}  baseline.json\n", encoding="ascii")
+            return knock
+
+        group = json.dumps(GROUP)[:-1]
+        cases = {
+            "dispatched=1": ci(dispatched=1), "dispatched str": ci(dispatched="x"), "dispatched dict": ci(dispatched={}),
+            "dispatched [1]": ci(dispatched=[1]), "skips [[[]]]": ci(skips=[[[]]]), "skips 1": ci(skips=1),
+            "skips [[]]": ci(skips=[[]]), "durations [[1, []]]": ci(durations=[[1, []]]),
+            "durations [1]": ci(durations=[1]), "durations str seconds": ci(durations=[["x", TEST_ID]]),
+            "durations NaN seconds": ci(durations=[[float("nan"), TEST_ID]]),
+            "ci deep nesting": lambda root: (n6dir(root) / "ci-report.json").write_text(
+                "[" * 200000 + "]" * 200000, encoding="utf-8"),
+            "pass_rate 10**400": raw_baseline(
+                '{"version": 1, "groups": {"code/claude": ' + group + ', "pass_rate": 1' + "0" * 400 + "}}}"),
+            "pass_rate NaN": base(pass_rate=float("nan")), "finish Infinity": base(finish_seconds_median=float("inf")),
+            "pass_rate -1": base(pass_rate=-1), "pass_rate 1.5": base(pass_rate=1.5),
+            "interventions -1": base(interventions=-1), "finish 1.7e308 x 1.10": base(finish_seconds_median=1.7e308),
+            "ratio 1e300/1e-300": base(post_accept_failures=1e300, kpi_rows_measured=1e-300),
+        }
+        for name, knock in cases.items():
+            with self.subTest(name), tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp)
+                full(root)
+                knock(root)
+                before = snapshot(root)
+                code, text, _ = run(root)
+                self.assertEqual(code, 2, text)
+                self.assertTrue(text.startswith("REFUSED: "), text)
+                self.assertNotIn("OVERALL", text)
+                self.assertEqual(snapshot(root), before)
+
+    def test_two_manager_pass_states_the_ci_record_has_no_tree_identity(self):
+        full(self.root)
+        code, text, lines = run(self.root)
+        self.assertEqual(code, 0, text)
+        self.assertIn("no commit/tree identity", lines["TWO_MANAGER"])
+
+    def test_non_ascii_evidence_is_escaped_so_no_stdout_encoding_crashes(self):
+        full(self.root)
+        write_json(n6dir(self.root) / "fallback_drill.json",
+                   {"kind": "live", "root": str(self.root), "slice_id": "日本", "lost": 0, "doubled": 0})
+        code, text, lines = run(self.root)
+        self.assertEqual(code, 0, text)
+        self.assertTrue(text.isascii(), text)
+        self.assertIn("\\u65e5", lines["FALLBACK_DRILL"])
+
 
 if __name__ == "__main__":
     unittest.main()

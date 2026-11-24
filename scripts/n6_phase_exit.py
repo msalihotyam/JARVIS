@@ -21,6 +21,7 @@ import re
 import sqlite3
 import statistics
 import sys
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 
@@ -50,19 +51,31 @@ class Refused(ValueError):
 def _json(path: Path) -> Any:
     try:
         return json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError) as error:
+    except (OSError, UnicodeDecodeError, ValueError, RecursionError) as error:  # RecursionError: deep nesting
         raise Refused(f"cannot read {path}: {error}") from error
 
 
-def _num(value: object) -> float | None:
+def _ascii(text: str) -> str:
+    """Input-derived text escaped to ASCII, so no stdout encoding or lone surrogate can crash the print/write."""
+    return text.encode("ascii", "backslashreplace").decode("ascii")
+
+
+def _num(value: object, name: str) -> float | None:
+    """A baseline number: a non-number is a missing reading, an out-of-range number is refused."""
     # bool is an int subclass and "missing" is a reading: neither is a number here.
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None
-    return float(value)
+    try:
+        number = float(value)
+    except OverflowError:  # a huge JSON int
+        raise Refused(f"baseline {name} is out of range (too large)") from None
+    if not math.isfinite(number) or number < 0:
+        raise Refused(f"baseline {name} is out of range: {number!r}")
+    return number
 
 
-def _ratio(top: object, bottom: object) -> float | None:
-    a, b = _num(top), _num(bottom)
+def _ratio(top: object, bottom: object, names: str) -> float | None:
+    a, b = _num(top, names), _num(bottom, names)
     return a / b if a is not None and b else None
 
 
@@ -82,7 +95,7 @@ def load_baseline(path: Path, group: str) -> dict[str, Any] | None:
         raise Refused(f"baseline hash mismatch: pinned {sums[0]}, actual {actual}")
     try:
         doc: object = json.loads(data.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as error:
+    except (UnicodeDecodeError, ValueError, RecursionError) as error:
         raise Refused(f"malformed baseline: {error}") from error
     groups = cast(dict[str, Any], doc).get("groups") if isinstance(doc, dict) else None
     if not isinstance(groups, dict) or not isinstance(cast(dict[str, Any], groups).get(group), dict):
@@ -96,12 +109,20 @@ def baseline_rates(group: dict[str, Any] | None) -> tuple[dict[str, float | None
         return {}, "no baseline.json"
     if group.get("small_sample") is not False:
         return {}, f"baseline small_sample (n={group.get('n')!r})"
-    finish = _num(group.get("finish_seconds_median"))
-    return {"a": _num(group.get("pass_rate")),
-            "b": _ratio(group.get("post_accept_failures"), group.get("kpi_rows_measured")),
-            "c": _ratio(group.get("interventions"), group.get("interventions_n")),
-            "d": _num(group.get("quota_per_accepted")),
-            "e": None if finish is None else finish * 1.10}, ""
+    finish = _num(group.get("finish_seconds_median"), "finish_seconds_median")
+    rates = {"a": _num(group.get("pass_rate"), "pass_rate"),
+             "b": _ratio(group.get("post_accept_failures"), group.get("kpi_rows_measured"),
+                         "post_accept_failures/kpi_rows_measured"),
+             "c": _ratio(group.get("interventions"), group.get("interventions_n"),
+                         "interventions/interventions_n"),
+             "d": _num(group.get("quota_per_accepted"), "quota_per_accepted"),
+             "e": None if finish is None else finish * 1.10}
+    if (rates["a"] or 0.0) > 1:
+        raise Refused(f"baseline pass_rate is out of range: {rates['a']!r}")
+    for key, rate in rates.items():  # a ratio or the 1.10 tolerance can overflow to inf
+        if rate is not None and not math.isfinite(rate):
+            raise Refused(f"baseline rate E8{key} is out of range: {rate!r}")
+    return rates, ""
 
 
 def n6_rates(side: list[KpiRow]) -> dict[str, float]:
@@ -132,12 +153,24 @@ def two_manager(path: Path) -> tuple[str, str]:
     if not isinstance(rec, dict):
         raise Refused(f"CI record {path} is not a test_parallel report object")
     rec = cast(dict[str, Any], rec)
+
+    def entries(key: str, ok: Callable[[Any], bool]) -> list[Any]:
+        value = rec.get(key)
+        if value is None:
+            return []
+        if not isinstance(value, list) or not all(ok(e) for e in cast(list[Any], value)):
+            raise Refused(f"CI record {path} has a malformed {key!r} (test_parallel report format)")
+        return cast(list[Any], value)
+
     # "dispatched" may hold class-level units; "durations" ([seconds, test id]) is per test.
-    ids = [*(rec.get("dispatched") or []),
-           *(d[1] for d in rec.get("durations") or [] if isinstance(d, list) and len(d) == 2)]
-    ran = sorted({t for t in ids if isinstance(t, str)
-                  and t.startswith(TWO_MANAGER[0]) and t.endswith(TWO_MANAGER[1])})
-    skipped = {s[0] for s in rec.get("skips") or [] if isinstance(s, list) and s}
+    ids = [*entries("dispatched", lambda e: isinstance(e, str)),
+           *(d[1] for d in entries("durations", lambda e: isinstance(e, list) and len(cast(list[Any], e)) == 2
+                                  and type(cast(list[Any], e)[0]) in (int, float)
+                                  and 0 <= cast(list[Any], e)[0] < math.inf
+                                  and isinstance(cast(list[Any], e)[1], str)))]
+    ran = sorted({t for t in ids if t.startswith(TWO_MANAGER[0]) and t.endswith(TWO_MANAGER[1])})
+    skipped = {s[0] for s in entries("skips", lambda e: isinstance(e, list) and bool(e)
+                                     and isinstance(cast(list[Any], e)[0], str))}
     if not ran:
         return NOT_YET, f"two-manager test not in the CI record {path.name}"
     if any(t in skipped for t in ran):
@@ -148,7 +181,9 @@ def two_manager(path: Path) -> tuple[str, str]:
     if not green:
         return NOT_YET, (f"CI record not green (green={rec.get('green')!r}, failures="
                          f"{rec.get('failures')!r}, errors={rec.get('errors')!r})")
-    return PASS, f"{ran[0]} ran in a green CI record ({path.name})"
+    # shortcut: test_parallel reports carry no commit/tree, so the run tree is not proven; check it once a writer stamps it.
+    return PASS, (f"{ran[0]} ran in a green CI record ({path.name}); the record carries no"
+                  " commit/tree identity, so it is not tied to the run tree")
 
 
 def drill(path: Path, root: Path) -> tuple[str, str]:
@@ -160,15 +195,22 @@ def drill(path: Path, root: Path) -> tuple[str, str]:
         raise Refused(f"drill receipt {path} is not an object")
     rec = cast(dict[str, Any], rec)
     where = rec.get("root")
-    live = (rec.get("kind") == "live" and isinstance(where, str) and bool(where)
-            and Path(where).resolve() == root.resolve())
+    try:
+        live = (rec.get("kind") == "live" and isinstance(where, str) and bool(where)
+                and Path(where).resolve() == root.resolve())
+    except (OSError, ValueError) as error:
+        raise Refused(f"drill receipt {path} has a malformed root: {error}") from error
     if not live:
-        return NOT_YET, (f"rehearsal receipt (kind={rec.get('kind')!r}, root={where!r}),"
+        return NOT_YET, (f"rehearsal receipt (kind={rec.get('kind')!r}, root={str(where)[:80]!r}),"
                          " not counted as the live drill")
+    slice_id = rec.get("slice_id")
+    if not (isinstance(slice_id, str) and slice_id.strip() and slice_id.isprintable()):  # missing never passes
+        return NOT_YET, f"live drill receipt has no slice_id ({str(slice_id)[:40]!r}), not counted"
     lost, doubled = rec.get("lost"), rec.get("doubled")
     if not (type(lost) is int and lost == 0 and type(doubled) is int and doubled == 0):
-        return NOT_YET, f"live drill lost={lost!r} doubled={doubled!r}, need exactly 0 and 0"
-    return PASS, f"live drill on {root} (slice {rec.get('slice_id')!r}): lost 0, doubled 0"
+        return NOT_YET, (f"live drill lost={str(lost)[:40]!r} doubled={str(doubled)[:40]!r},"
+                         " need exactly 0 and 0")
+    return PASS, f"live drill on {root} (slice {slice_id[:80]!r}): lost 0, doubled 0"
 
 
 def evaluate(root: Path, db: Path, baseline: Path, group: str, backlog: Path,
@@ -239,10 +281,10 @@ def main(argv: list[str] | None = None, root: Path = ROOT) -> int:
         lines = evaluate(root, cast(Path, args.db), cast(Path, args.baseline), cast(str, args.group),
                          cast(Path, args.backlog), cast(Path, args.ci_record), cast(Path, args.drill))
     except Refused as error:
-        print(f"REFUSED: {error}")
+        print(_ascii(f"REFUSED: {error}"))
         return 2
     verdict = overall(lines)
-    text = "".join(f"{n}: {s} | {e}\n" for n, s, e in lines) + f"OVERALL: {verdict}\n"
+    text = _ascii("".join(f"{n}: {s} | {e}\n" for n, s, e in lines) + f"OVERALL: {verdict}\n")
     print(text, end="")
     out = root / REPORT
     out.parent.mkdir(parents=True, exist_ok=True)
