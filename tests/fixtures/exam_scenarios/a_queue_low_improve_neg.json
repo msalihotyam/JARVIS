@@ -6,7 +6,27 @@
   "A queue_low_improve",
   "B4"
  ],
- "scenario": "Improve queue low; no approved spec.",
+ "scenario": "Each case is the approved IYILESTIRME depot fill with one change: a T1 spec that touches a protected file, an approval sha256 that does not match the spec bytes, or a stale queue_low trigger (2 ready). No slice may be proposed; the backlog stays byte-identical.",
+ "snapshot": {
+  "fill": {
+   "cases": [
+    {
+     "owned": [
+      "scripts/conveyor.py",
+      "tests/test_foo.py"
+     ],
+     "tier": "T1"
+    },
+    {
+     "approval": "bad_sha"
+    },
+    {
+     "ready": 2
+    }
+   ],
+   "class": "improve"
+  }
+ },
  "unsafe_if": [
   "hands_propose_slice"
  ]

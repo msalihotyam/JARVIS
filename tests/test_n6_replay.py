@@ -351,10 +351,31 @@ class ExamScenarioTest(unittest.TestCase):
             if "tightening" in s.get("snapshot", {}):  # decided by the real hands code
                 self.assertEqual(got, s["expected_action"], s["id"])
             elif "snapshot" in s:  # EXAMSAFE1: every snapshot scenario now gets the rule's answer
-                self.assertIn(got, ("approve_key1", "inbox", "wait"), s["id"])
+                self.assertIn(got, ("approve_key1", "inbox", "wait", "hands_propose_slice"), s["id"])
                 self.assertEqual(got, s["expected_action"], s["id"])
             else:
                 self.assertIsNone(got, s["id"])
+
+    def test_queue_fill_rows_are_judged_by_the_real_depot_fill(self) -> None:
+        # QUEUEFILL2FIX: the four queue_low rows agree through orch_gen.depot_fill (dry-run), not a stub
+        rows = {r["id"]: r["verdict"] for r in rp.exam(self.scenarios, rp.n6_decide)["rows"]}
+        for code in ("queue_low_n6", "queue_low_improve"):
+            for side in ("pos", "neg"):
+                self.assertEqual(rows[f"a_{code}_{side}"], "agree", f"a_{code}_{side}")
+        ok = {"class": "n6", "cases": [{}]}
+        self.assertEqual(rp.fill_decide(ok), "hands_propose_slice")
+        for one_change in ({"approval": "none"}, {"approval": "bad_sha"}, {"ready": 2}, {"spec": False},
+                           {"tier": "T1", "owned": ["scripts/conveyor.py"]}):
+            with self.subTest(one_change):
+                self.assertEqual(rp.fill_decide({"class": "improve", "cases": [one_change]}), "inbox")
+        mixed = {"class": "n6", "cases": [{}, {"approval": "bad_sha"}]}
+        self.assertIsNone(rp.fill_decide(mixed))  # a split answer is uncovered
+        self.assertEqual(rp.fill_decide(mixed, ("hands_propose_slice",)), "hands_propose_slice")  # unsafe wins
+        for bad in ({}, {"class": "n6", "cases": []}, {"class": "x", "cases": [{}]}, {"class": "n6", "cases": "ab"},
+                    {"class": "n6", "cases": [{"ready": "x"}]}, {"class": "n6", "cases": [{"ready": -1}]},
+                    {"class": "n6", "cases": [{"approval": "weird"}]}, None):
+            with self.subTest(bad=bad):
+                self.assertIsNone(rp.fill_decide(bad))
 
     @staticmethod
     def _decide(lanes: dict, chain: tuple = (), head: str = "1" * 40) -> object:

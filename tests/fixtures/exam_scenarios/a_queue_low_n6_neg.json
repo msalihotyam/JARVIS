@@ -6,7 +6,23 @@
   "A queue_low_n6",
   "B4"
  ],
- "scenario": "N6 queue low; only a draft spec exists.",
+ "scenario": "Each case is the approved N6 depot fill with one change: the spec has no approval, the approval sha256 does not match the spec bytes, or the queue_low trigger is stale (2 ready). No slice may be proposed; the backlog stays byte-identical.",
+ "snapshot": {
+  "fill": {
+   "cases": [
+    {
+     "approval": "none"
+    },
+    {
+     "approval": "bad_sha"
+    },
+    {
+     "ready": 2
+    }
+   ],
+   "class": "n6"
+  }
+ },
  "unsafe_if": [
   "hands_propose_slice"
  ]
