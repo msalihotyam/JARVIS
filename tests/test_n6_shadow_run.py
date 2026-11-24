@@ -9,6 +9,7 @@ import json
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -296,6 +297,50 @@ class ShadowRunTest(unittest.TestCase):
         self.assertEqual(self.notes.read_text(encoding="utf-8"), notes)
         self.assertEqual(len(rows(self.db)), 4)
         self.assertFalse((self.root / "build/n6/daily/2026-11-11.json").exists())
+
+    def main_at(self, local: datetime) -> int:
+        """main() with its wall clock frozen: naive now() is local time, so .astimezone() keeps the day."""
+        class Frozen(datetime):
+            @classmethod
+            def now(cls, tz=None):  # type: ignore[override]
+                return local if tz is None else local.astimezone(tz)
+        err = io.StringIO()
+        with mock.patch.object(run, "datetime", Frozen), contextlib.redirect_stderr(err):
+            return run.main(["--root", str(self.root)])
+
+    def test_main_writes_the_previous_day_once_after_a_shadow_pass(self) -> None:
+        self.real_repo()  # judge needs a .git to read branch tips
+        self.on()
+        local = datetime(2026, 11, 12, 0, 30)  # just past local midnight: a UTC clock east of UTC names the wrong day
+        self.assertEqual(self.main_at(local), 0)
+        daily = self.root / "build/n6/daily"
+        got = {p.name for p in daily.iterdir()}
+        self.assertEqual(got, {"2026-11-11.json", "2026-11-11.md"})
+        rep = json.loads((daily / "2026-11-11.json").read_text(encoding="utf-8"))
+        self.assertEqual(rep["date"], "2026-11-11")
+        stamp = {p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in daily.iterdir()}
+        self.assertEqual(self.main_at(local.replace(hour=23)), 0)  # same local day, second pass
+        self.assertEqual({p.name: (p.read_bytes(), p.stat().st_mtime_ns) for p in daily.iterdir()}, stamp)
+        self.assertEqual(self.main_at(local + timedelta(days=1)), 0)  # next day adds only its own report
+        self.assertEqual({p.name for p in daily.iterdir()} - got, {"2026-11-12.json", "2026-11-12.md"})
+
+    def test_main_calls_the_writer_once_after_judge_and_a_failure_keeps_rc_0(self) -> None:
+        self.real_repo()
+        self.on()
+        calls: list[tuple] = []
+
+        def boom(root: Path, day: object, until: object) -> None:
+            calls.append((day, self.db.exists()))  # judge already wrote its KPI rows
+            raise RuntimeError("diff failed")
+        with mock.patch.dict(run.daily.__kwdefaults__, {"writer": boom}):
+            self.assertEqual(self.main_at(datetime(2026, 11, 12, 9, 0)), 0)
+        self.assertEqual(calls, [(datetime(2026, 11, 11).date(), True)])
+        log = (self.root / "build/n6/daily/errors.log").read_text(encoding="utf-8")
+        self.assertIn("day=2026-11-11 RuntimeError('diff failed')", log)
+
+    def test_main_without_the_switch_writes_no_daily_report(self) -> None:
+        self.assertEqual(self.main_at(datetime(2026, 11, 12, 9, 0)), 0)
+        self.assertFalse((self.root / "build/n6/daily").exists())
 
 
 if __name__ == "__main__":
