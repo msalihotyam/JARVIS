@@ -29,7 +29,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterable, Mapping
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
 from typing import Any, NamedTuple, cast
 
 # ponytail: STUCK / MISSING / RUNNING and any new status are "unknown state", so preserved.
@@ -39,8 +39,8 @@ VERDICTS = ("agree", "disagree", "false_remove", "excluded", "unknown")
 # no trailing ".": Windows drops it, so lane "L1." would name L1's worktree directory
 _LANE = re.compile(r"[A-Za-z0-9](?:[A-Za-z0-9_.-]{0,62}[A-Za-z0-9_-])?")
 _SHA = re.compile(r"[0-9a-f]{40}")
-# git check-ref-format plus a leading "-" (it would become an option to git branch -D)
-_BAD_REF = re.compile(r"^-|\.\.|[\x00-\x20\x7f~^:?*\[\\]|@\{|\.lock(?:/|$)|(?:^|/)\.|//|[/.]$|^@$")
+# git check-ref-format --branch (no leading "/") plus a leading "-" (an option to git branch -D)
+_BAD_REF = re.compile(r"^[-/]|\.\.|[\x00-\x20\x7f~^:?*\[\\]|@\{|\.lock(?:/|$)|(?:^|/)\.|//|[/.]$|^@$")
 # normalised absolute root: "x:/a/b" or "/a/b", no empty segment (so no "//", UNC or bare "/")
 _ROOT = re.compile(r"(?:[a-z]:)?(?:/[^/]+)+")
 # the conveyor logs cleanup result "removed" or "error"; anything else is not evidence
@@ -69,7 +69,8 @@ def _text(value: object) -> bool:
 
 
 def _aware(value: object) -> datetime | None:
-    """An aware datetime, or an ISO string that parses to one; anything else is None."""
+    """An aware datetime, or an ISO string that parses to one, as UTC; anything else is None.
+    UTC because two datetimes sharing one DST tzinfo subtract in wall clock, not real time."""
     if type(value) is str:
         try:
             value = datetime.fromisoformat(value)
@@ -78,17 +79,17 @@ def _aware(value: object) -> datetime | None:
     if not isinstance(value, datetime) or value.tzinfo is None:
         return None
     try:
-        offset = value.utcoffset()
+        return None if value.utcoffset() is None else value.astimezone(UTC)
     except Exception:  # noqa: BLE001 - a broken tzinfo is malformed input, never a guess
         return None
-    return None if offset is None else value
 
 
 def _branch(name: str) -> str:
     """Canonical local branch name: "refs/heads/x", "heads/x", nested spellings of them and "X"
     all name x (Windows refs ignore case, so "Main" can still name refs/heads/main)."""
     name = name.strip().casefold()
-    while (short := name.removeprefix("refs/heads/").removeprefix("heads/")) != name:
+    # a leading "/" is stripped too, so "/x" collides with "x" in the one-owner check
+    while (short := name.lstrip("/").removeprefix("refs/heads/").removeprefix("heads/")) != name:
         name = short
     return name
 

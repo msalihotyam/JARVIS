@@ -16,6 +16,23 @@ OLD = (NOW - timedelta(hours=2)).isoformat()
 ROOT = "C:\\dev\\JARVIS"  # the injected checkout that owns .claude/worktrees
 
 
+class Berlin(tzinfo):
+    """CET/CEST for 2026 only (Windows has no tzdata): CEST from 03-29 02:00 to 10-25 03:00 wall."""
+
+    def utcoffset(self, dt: datetime | None) -> timedelta:
+        assert dt is not None
+        wall = dt.replace(tzinfo=None, fold=0)
+        start, end = datetime(2026, 3, 29, 2), datetime(2026, 10, 25, 2)
+        summer = start <= wall < end or (end <= wall < end + HOUR and not dt.fold)
+        return timedelta(hours=2 if summer else 1)
+
+    def dst(self, dt: datetime | None) -> timedelta:
+        return self.utcoffset(dt) - HOUR
+
+    def tzname(self, dt: datetime | None) -> str:
+        return "CEST" if self.dst(dt) else "CET"
+
+
 def lane(**kw: Any) -> dict[str, Any]:
     name = kw.get("lane", "L1")
     rec: dict[str, Any] = {"lane": name, "worktree": f"C:\\dev\\JARVIS\\.claude\\worktrees\\{name}",
@@ -88,7 +105,8 @@ class N6CleanupTests(unittest.TestCase):
     def test_malformed_branch_name_is_unknown(self) -> None:
         for branch in ("-D", "--force", "topic..old", "a b", " x y ", "x\x01", "x\x7f", "x~1",
                        "x^", "x:y", "x?", "x*", "x[", "x\\y", "x.lock", "x.lock/y", "@{u}",
-                       "x@{1}", " x", "x​", "a//b", "x/", "x.", ".x", "a/.b", "@"):
+                       "x@{1}", " x", "x​", "a//b", "x/", "x.", ".x", "a/.b", "@",
+                       "/topic", "/a/b", "/", "//x", "refs/heads//x", "heads//x"):
             p = run(lane(branch=branch))
             self.assertEqual(p.verdict, "unknown", repr(branch))
             self.assertIn("branch", p.reason)
@@ -101,6 +119,25 @@ class N6CleanupTests(unittest.TestCase):
         self.assertTrue(exact.reason.startswith("too young"))
         future = run(lane(finished_ts=(NOW + HOUR).isoformat()))
         self.assertEqual(future.verdict, "preserve")
+
+    def test_age_is_real_elapsed_time_across_dst(self) -> None:
+        tz, t90 = Berlin(), timedelta(minutes=90)
+        # spring forward: 01:30 CET -> 03:30 CEST is 1h real, 2h on the wall clock
+        start = datetime(2026, 3, 29, 1, 30, tzinfo=tz)
+        young = run(lane(finished_ts=start), clock=datetime(2026, 3, 29, 3, 30, tzinfo=tz), timeout=t90)
+        self.assertEqual(young, c.Plan("preserve", "too young: 3600s <= 5400s"))
+        self.assertEqual(run(lane(finished_ts=start), clock=datetime(2026, 3, 29, 4, 30, tzinfo=tz),
+                             timeout=t90).verdict, "remove")
+        # fall back: 02:30 CEST (fold 0) -> 02:30 CET (fold 1) is 1h real, 0 on the wall clock
+        back = datetime(2026, 10, 25, 2, 30, tzinfo=tz)
+        self.assertEqual(run(lane(finished_ts=back), clock=back.replace(fold=1),
+                             timeout=timedelta(minutes=30)).verdict, "remove")
+        self.assertEqual(run(lane(finished_ts=back), clock=back.replace(fold=1), timeout=HOUR),
+                         c.Plan("preserve", "too young: 3600s <= 3600s"))
+        # mixed: an ISO fixed-offset finish against a DST-zone clock
+        self.assertEqual(run(lane(finished_ts="2026-03-29T01:30:00+01:00"),
+                             clock=datetime(2026, 3, 29, 3, 30, tzinfo=tz), timeout=t90).verdict,
+                         "preserve")
 
     def test_unfinished_or_unknown_status_is_preserved(self) -> None:
         for status in ("RUNNING", "STUCK", "MISSING", "NEWSTATUS", ""):
@@ -150,7 +187,8 @@ class N6CleanupTests(unittest.TestCase):
 
     def test_two_lanes_claiming_one_target_are_unknown(self) -> None:
         for shared in ({"worktree": lane()["worktree"].upper()}, {"branch": "WORKTREE-L1"},
-                       {"branch": "refs/heads/worktree-L1"}, {"branch": "heads/Worktree-L1"}):
+                       {"branch": "refs/heads/worktree-L1"}, {"branch": "heads/Worktree-L1"},
+                       {"branch": "/worktree-L1"}, {"branch": "/refs/heads/worktree-L1"}):
             other = lane(lane="L2", status="RUNNING", head=B, **shared)
             out = c.plan([lane(), other], frozenset({A}), {"L1": ev()}, clock=lambda: NOW,
                          timeout=HOUR, root=ROOT)
