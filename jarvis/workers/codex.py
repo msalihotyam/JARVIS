@@ -30,6 +30,12 @@ SANDBOX = "workspace-write"  # never danger-full-access; network stays off in it
 FORCED_LOGIN = "forced_login_method=chatgpt"
 WINDOWS_SANDBOX = "windows.sandbox=mxc"
 CONFIGS = (FORCED_LOGIN, WINDOWS_SANDBOX)
+# CODEXMODEL1: the conveyor's explicit model and effort (scripts/conveyor_workers.py; parity-tested).
+CODEX_MODEL_DEFAULT = "gpt-6.2-sol"
+CODEX_EFFORT_DEFAULT = "medium"
+CODEX_EFFORTS = ("low", "medium", "high")
+EFFORT_KEY = "model_reasoning_effort="
+EFFORT_CONFIGS = tuple(EFFORT_KEY + e for e in CODEX_EFFORTS)
 PROHIBITED_ENV = ("OPENAI_API_KEY", "CODEX_API_KEY", "OPENAI_BASE_URL", "OPENAI_ORG_ID",
                   "OPENAI_ORGANIZATION", "OPENAI_PROJECT_ID", "AZURE_OPENAI_API_KEY")
 # Native binary: a Node hook is never needed and could load code into every child.
@@ -61,35 +67,45 @@ class ProcessRunner(Protocol):
     def output(self, handle: Any) -> str: ...
 
 
-def build_argv(exe: str, stage: Any) -> list[str]:
+def build_argv(exe: str, stage: Any, model: str = CODEX_MODEL_DEFAULT,
+               effort: str = CODEX_EFFORT_DEFAULT) -> list[str]:
     """Same argv as the conveyor's CodexWorker.argv(worktree)."""
     return [exe, "exec", "--json", "--ignore-user-config", "-c", FORCED_LOGIN,
-            "-c", WINDOWS_SANDBOX, "-C", str(stage), "--sandbox", SANDBOX, "-"]
+            "-c", WINDOWS_SANDBOX, "-m", model, "-c", EFFORT_KEY + effort,
+            "-C", str(stage), "--sandbox", SANDBOX, "-"]
 
 
 def check_argv(argv: list[str], exe: str, stage: Any) -> list[str]:
     """Closed allowlist: every token is a known flag with an allowed value, each once,
-    all present; the task comes on stdin (``-``). Anything else refuses."""
+    all present except ``-m <model>`` (jarvis/codex.py CODEX_MODEL_PATTERN) and
+    ``-c model_reasoning_effort=<CODEX_EFFORTS>``, which are optional; the task comes
+    on stdin (``-``). Anything else refuses."""
     argv = list(argv)
     if argv[:2] != [exe, "exec"] or argv[-1:] != ["-"]:
         raise WorkerRefused("argv_command")
-    values = {"-c": CONFIGS, "-C": (str(stage),), "--sandbox": (SANDBOX,)}
+    values = {"-c": CONFIGS + EFFORT_CONFIGS, "-C": (str(stage),), "--sandbox": (SANDBOX,)}
     required = {"--json", "--ignore-user-config", ("-c", FORCED_LOGIN), ("-c", WINDOWS_SANDBOX),
                 ("-C", str(stage)), ("--sandbox", SANDBOX)}
+    optional = {("-m",), ("-c", EFFORT_KEY)}  # keyed by flag: a second value is a repeat
     seen = []
     tokens = iter(argv[2:-1])
     for token in tokens:
-        if token in values:
+        if token == "-m":
+            value = next(tokens, None)
+            if type(value) is not str or not jarvis_codex.CODEX_MODEL_PATTERN.match(value):
+                raise WorkerRefused("flag_value_refused")
+            token = ("-m",)
+        elif token in values:
             value = next(tokens, None)
             if value not in values[token]:
                 raise WorkerRefused("flag_value_refused")
-            token = (token, value)
+            token = ("-c", EFFORT_KEY) if token == "-c" and value in EFFORT_CONFIGS else (token, value)
         elif token not in ("--json", "--ignore-user-config"):
             raise WorkerRefused("flag_not_allowed")
         if token in seen:
             raise WorkerRefused("flag_repeated")
         seen.append(token)
-    if set(seen) != required:
+    if set(seen) - optional != required:
         raise WorkerRefused("flag_missing")
     return argv
 
