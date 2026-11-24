@@ -9,6 +9,7 @@ subprocess, MCP or network call; the Claude-facing cases additionally patch
 from __future__ import annotations
 
 import contextlib
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -263,11 +264,36 @@ class PausedClaimStore(SQLiteMemoryStore):
 # --------------------------------------------------------------------------
 
 
+_TEMPLATE: Path | None = None
+
+
+def _template_database() -> Path:
+    """One freshly initialised, still-empty store per module run.
+
+    Building the schema from nothing is the costly part of opening a store;
+    the result is identical for every test (schema bookkeeping only, no
+    rows), so each test gets a byte copy and then opens it through the
+    normal ``SQLiteMemoryStore`` path. Nothing ever writes to the template.
+    """
+    global _TEMPLATE
+    if _TEMPLATE is None:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        unittest.addModuleCleanup(safe_cleanup, temp)
+        path = Path(temp.name) / "template.db"
+        SQLiteMemoryStore(path)
+        # Every write checkpoints with TRUNCATE, so the main file is complete.
+        wal = Path(f"{path}-wal")
+        assert not wal.exists() or wal.stat().st_size == 0, "template WAL not empty"
+        _TEMPLATE = path
+    return _TEMPLATE
+
+
 class BillingIntegrityTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(safe_cleanup, self.temp)
         self.database = Path(self.temp.name) / "jarvis.db"
+        shutil.copyfile(_template_database(), self.database)
         self.memory = SQLiteMemoryStore(self.database)
 
     def store(self) -> SQLiteMemoryStore:
