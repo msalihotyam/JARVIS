@@ -23,6 +23,10 @@ keeps a backup of the backlog in build/conveyor/hold/ and runs build/orch/check_
 SKELETONS 2 FIX (stack = source stack + source COMMIT, review base = parent(stack[0]),
 stack-only grant = every stack file) from a short JSON spec; they also run
 build/orch/preflight.py and roll back the backlog and prompt on any error.
+"fill [--track n6|improve|auto]" (ALLOWLIST 5): when orch_digest says a track is queue_low, turns
+the highest-priority, oldest approved READY spec build/orch/ready/<track>/<seq>-<id>.json (a slice
+spec + track, priority, approved_by, decision) into a slice the slice way (preflight, T5 cap);
+--write moves the spec to ready/used/<UTC date>/; every fill appends a line to ready/fill.jsonl.
 Anything unclear refuses (exit 2) with the reason. Never edits conveyor.py, never pushes, never
 writes approvals (the entry carries no "approved" key).
 """
@@ -36,10 +40,13 @@ import re
 import subprocess
 import sys
 import time
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import conveyor  # noqa: E402  (read-only: the conveyor's own validators)
+import orch_decisions  # noqa: E402  (read-only: fill's decision check)
+import orch_digest  # noqa: E402  (read-only: fill's queue_low view)
 
 SHA40 = re.compile(r"[0-9a-f]{40}")
 COMMIT_RE = re.compile(r"(?m)^[\s>#*`-]*COMMIT:[\s`]*([0-9a-fA-F]{7,40})\b")
@@ -602,15 +609,121 @@ def daily_count(root, cmd, at, add=0):
     return caps.get(key, 0)
 
 
+TRACKS = (("n6", "[N6]"), ("improve", "[IYILESTIRME"))  # (track, title prefix); fill order N6 > improvement
+APPROVERS = ("orchestrator", "brain", "salih")
+READY_NAME = re.compile(r"(\d{1,9})-([A-Za-z0-9][A-Za-z0-9._-]{0,63})\.json")  # <seq>-<slice id>.json
+STATE_INPUTS = {"input:status.json", "input:status.backlog", "input:lanes.json", "input:backlog.json"}
+
+
+def ready_skip(g, p, sp, ids, taken):
+    """Why the READY spec p (parsed: sp) cannot become a slice now, or None."""
+    if sp.get("approved_by") not in APPROVERS:
+        return "unapproved"
+    if not orch_decisions.require("authority", sp.get("decision"), g.root / orch_decisions.REL)[0]:
+        return "inactive_decision"
+    if sp["id"] in ids or (g.prompts / f"{sp['id']}.md").exists():
+        return "id_exists"
+    try:
+        b, entry, body = g.from_spec(p, False)
+        g.lint(b, entry, body)
+    except (Refuse, OSError, ValueError, TypeError, KeyError):
+        return "malformed"
+    if any(conveyor.files_overlap(entry["files"], f) for f in taken):
+        return "overlap"
+    return None
+
+
+def fill(g, track, write, t, rec):
+    """ALLOWLIST 5: the best usable READY spec of the first low track -> a slice. rec = the fill.jsonl line."""
+    now = datetime.fromtimestamp(t).replace(microsecond=0)
+    d = orch_digest.build(g.root, now, now - timedelta(hours=24))
+    if any(i["reason"] == "unknown" and i["id"] in STATE_INPUTS for i in d["items"]):
+        rec["reason"] = "state_unknown"  # a missing status.json reads as "0 ready": never fill on it
+        raise Refuse("conveyor state unreadable; cannot tell which track is low")
+    low = [n for n, _ in TRACKS if any(i["reason"] == f"queue_low_{n}" for i in d["items"])]
+    tr = low[0] if low and track == "auto" else track if track in low else None
+    if tr is None:
+        rec.update(result="no_track_low", reason="not_low")
+        g.out(f"fill: track {track}: not queue_low; nothing to fill")
+        return 0
+    rec.update(track=tr, reason=f"queue_low_{tr}")
+    lanes = orch_digest.load(g.root / "build" / "conveyor" / "lanes.json", [], None)
+    if not isinstance(lanes, dict):
+        rec["reason"] = "state_unknown"
+        raise Refuse("lanes.json is not an object")
+    b = g.backlog()
+    ids = {s.get("id") for s in b["slices"]}
+    # running lanes + slices not started yet (no lane, no report: conveyor slice_hold's own test)
+    live = [v for v in lanes.values() if isinstance(v, dict) and not v.get("finished") and v.get("state") != "missing"]
+    queued = [s for s in b["slices"] if s.get("id") not in lanes and not (g.reports / f"{s.get('id')}.md").is_file()]
+    taken = [x.get("files") or [] for x in live + queued]
+    specs, skipped = [], []
+    for p in sorted((g.root / "build" / "orch" / "ready" / tr).glob("*.json")):
+        m = READY_NAME.fullmatch(p.name)
+        sp = orch_digest.load(p, [], None) if m else None
+        if (isinstance(sp, dict) and sp.get("id") == m.group(2) and sp.get("track") == tr
+                and str(sp.get("title", "")).startswith(dict(TRACKS)[tr]) and type(sp.get("priority")) is int):
+            specs.append((-sp["priority"], int(m.group(1)), p.name, p, sp))
+        else:
+            skipped.append((p.name if m else "<bad-name>", "malformed"))
+    pick = None
+    for _, _, name, p, sp in sorted(specs, key=lambda x: x[:3]):  # highest priority, then oldest seq
+        why = ready_skip(g, p, sp, ids, taken)
+        if why is None:
+            pick = (name, p)
+            break
+        skipped.append((name, why))
+    rec["skipped"] = [f"{n}:{w}" for n, w in skipped]
+    for n, w in skipped:
+        g.out(f"fill: skipped {n}: {w}")
+    if pick is None:
+        rec["result"] = "queue_empty"
+        g.out(f"fill: {tr} is queue_low but no READY spec is usable: queue_empty")
+        return 1
+    name, p = pick
+    rec["spec"] = name
+    g.out(f"fill: {tr} is queue_low ({d['ready'].get(tr)} ready); picked {tr}/{name}")
+    if not write:
+        rec["result"] = "dry_run"
+        return g.emit(*g.from_spec(p, False), False)
+    if daily_count(g.root, "slice", t) >= DAILY_CAP["slice"]:  # shares the slice counter (ALLOWLIST T5 item 5)
+        rec["reason"] = "cap_reached"
+        raise Refuse(f"ALLOW-T5 daily slice cap {DAILY_CAP['slice']} reached; escalate to the orchestrator")
+    dest = g.root / "build" / "orch" / "ready" / "used" / time.strftime("%Y-%m-%d", time.gmtime(t)) / name
+    if dest.exists():
+        rec["reason"] = "used_exists"
+        raise Refuse(f"{dest} already exists")
+    if g.emit(*g.from_spec(p, False), True, strict=True):
+        rec["reason"] = "preflight_failed"
+        return 1
+    daily_count(g.root, "slice", t, add=1)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    os.rename(p, dest)  # kept, never deleted
+    rec["result"] = "written"
+    g.out(f"fill: moved {tr}/{name} to {dest.relative_to(g.root).as_posix()}")
+    return 0
+
+
+def fill_log(root, t, rec):
+    """One build/orch/ready/fill.jsonl line: fixed codes and file names only, never free text."""
+    path = Path(root) / "build" / "orch" / "ready" / "fill.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    at = datetime.fromtimestamp(t, timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    with open(path, "a", encoding="utf-8", newline="\n") as f:
+        f.write(json.dumps({"at": at, **rec}, sort_keys=True) + "\n")
+
+
 def main(argv=None, git=real_git, out=print, now=time.time):
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("--root", default=str(Path(__file__).resolve().parents[1]),
                     help="main checkout (holds build/)")
     sub = ap.add_subparsers(dest="cmd", required=True)
-    for name in ("review", "int", "slice", "fix"):
+    for name in ("review", "int", "slice", "fix", "fill"):
         p = sub.add_parser(name)
         if name in ("slice", "fix"):
             p.add_argument("--spec", required=True, metavar="JSON", help="the slice/fix spec file")
+        elif name == "fill":
+            p.add_argument("--track", choices=[n for n, _ in TRACKS] + ["auto"], default="auto")
         else:
             p.add_argument("ids", nargs="+")
         if name == "review":
@@ -630,6 +743,13 @@ def main(argv=None, git=real_git, out=print, now=time.time):
         out(f"warning: no --focus; the prompt carries the placeholder {FOCUS_PLACEHOLDER}")
         focus = None
     try:
+        if a.cmd == "fill":
+            t = now()
+            rec = {"track": None, "spec": None, "result": "refused", "reason": "error", "skipped": []}
+            try:
+                return fill(g, a.track, a.write, t, rec)
+            finally:
+                fill_log(g.root, t, rec)
         if a.cmd in ("slice", "fix"):
             cap = DAILY_CAP[a.cmd]
             if a.write and daily_count(a.root, a.cmd, now()) >= cap:  # ALLOWLIST T5 items 2 and 5
