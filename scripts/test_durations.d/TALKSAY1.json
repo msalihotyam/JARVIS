@@ -1,0 +1,1 @@
+{"version": 1, "classes": {"tests.test_talk_say.SpokenTextTests": 1.0, "tests.test_talk_say.CapTests": 1.0, "tests.test_talk_say.NegativeTests": 1.0, "tests.test_talk_say.RefusalTests": 1.0, "tests.test_talk_say.PurityTests": 1.0}}
