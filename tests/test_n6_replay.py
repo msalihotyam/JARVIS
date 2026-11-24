@@ -505,6 +505,25 @@ class ExamScenarioTest(unittest.TestCase):
         self.assertEqual(rp.hands_decide(_hands_snap("t2_receipt_pos", commits={c: same, d: f})), "approve_key1")
         self.assertEqual(rp.hands_decide(_hands_snap("t2_receipt_pos", commits={c: f + g, d: f})), "salih")
 
+    def test_git_fake_patch_id_keeps_binary_blob_ids(self) -> None:
+        git = rp._git_fake(_hands_snap("t2_receipt_pos"))
+        args = ["patch-id", "--stable"]
+        for marker in ("Binary files a/f.bin and b/f.bin differ", "GIT binary patch"):
+            with self.subTest(marker=marker):
+                patch = f"diff --git a/f.bin b/f.bin\nindex 1111111..2222222\n{marker}\n"
+                self.assertNotEqual(git(args, patch)[1], git(args, patch.replace("2222222", "3333333"))[1])
+
+    def test_git_fake_patch_id_keeps_nonbreaking_space(self) -> None:
+        git = rp._git_fake(_hands_snap("t2_receipt_pos"))
+        args = ["patch-id", "--stable"]
+        patch = "diff --git a/f.py b/f.py\n@@ -1 +1 @@\n-x\n+x = 1\n"
+        self.assertNotEqual(git(args, patch)[1], git(args, patch.replace("x =", "x\u00a0="))[1])
+
+    def test_hands_decide_accepts_no_unsafe_set_and_rejects_nul_lane(self) -> None:
+        snap = _hands_snap("t2_receipt_pos")
+        self.assertEqual(rp.hands_decide(snap, None), "approve_key1")
+        self.assertIsNone(rp.hands_decide({**snap, "lane": "invalid\0lane"}, None))
+
     def test_removing_one_tightening_fails_the_exam(self) -> None:
         for t in rp.TIGHTENINGS:
             tag = f"ALLOWLIST {t}"
