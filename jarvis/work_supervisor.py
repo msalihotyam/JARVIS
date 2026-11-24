@@ -39,6 +39,9 @@ NIGHT = (2, 8)              # local hours [start, end)
 MEM_LOW_GB = 3.0            # conveyor min_free_mem_gb
 MEM_MARGIN_GB = 1.5         # release at low + margin ...
 MEM_OK_S = 300              # ... held continuously this long
+MAX_COMMIT_PCT = 90.0       # conveyor max_commit_pct: commit charge above this holds
+MIN_FREE_GB = 10.0          # conveyor MIN_FREE_GB: free disk below this holds
+_UNSET = object()           # an optional reading the caller did not pass
 RATE_SLACK = 1.2            # burn rate over target * this counts as ahead
 INT_WAIT_S = 3600           # O11: a PASS waiting this long gets a small INT
 INT_MIN_BATCH = 3
@@ -228,9 +231,12 @@ def quota_pacing(policy: Policy, used_pct, line_pct, hour, rate_pct_h=None,
     return Decision("dispatch", "pace.on_line", f"quota {used:g}% vs line {line:g}%")
 
 
-def memory_hold(policy: Policy, free_gb, held: bool, ok_for_s=0) -> Decision:
+def memory_hold(policy: Policy, free_gb, held: bool, ok_for_s=0, *,
+                commit_pct=_UNSET, disk_free_gb=_UNSET) -> Decision:
     """No new worker below policy.mem_low_gb; a hold releases at low+margin held
-    MEM_OK_S. The caller's next `held` is `decision.action == "wait"`."""
+    MEM_OK_S. The caller's next `held` is `decision.action == "wait"`.
+    commit_pct / disk_free_gb are optional readings: absent = not checked;
+    passed but unusable (None, bool, NaN, inf, negative) = wait."""
     policy = _policy(policy)
     free, low = _num(free_gb), _num(policy.mem_low_gb)
     release = low + _num(policy.mem_margin_gb)
@@ -238,6 +244,18 @@ def memory_hold(policy: Policy, free_gb, held: bool, ok_for_s=0) -> Decision:
         return Decision("wait", "mem.unknown", "free memory unknown")
     if free < low:
         return Decision("wait", "mem.hold", f"free {free:g} GB < {low:g} GB")
+    if commit_pct is not _UNSET:
+        commit = _num(commit_pct)
+        if commit is None or not 0 <= commit <= 100:
+            return Decision("wait", "mem.commit_unknown", "commit charge unknown")
+        if commit > MAX_COMMIT_PCT:
+            return Decision("wait", "mem.commit", f"commit {commit:g}% > {MAX_COMMIT_PCT:g}%")
+    if disk_free_gb is not _UNSET:
+        disk = _num(disk_free_gb)
+        if disk is None or disk < 0:
+            return Decision("wait", "disk.unknown", "free disk unknown")
+        if disk < MIN_FREE_GB:
+            return Decision("wait", "disk.hold", f"disk {disk:g} GB < {MIN_FREE_GB:g} GB")
     ok = _num(ok_for_s)
     if held is not False and (free < release or ok is None or ok < MEM_OK_S):
         return Decision("wait", "mem.hysteresis", f"free {free:g} GB, release at "

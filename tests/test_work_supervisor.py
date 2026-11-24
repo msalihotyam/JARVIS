@@ -183,6 +183,55 @@ class MemoryTests(unittest.TestCase):
         self.assertEqual(memory_hold(THEN, 4.0, None, 600).action, "wait")
 
 
+class CommitDiskTests(unittest.TestCase):
+    """N6SENSE1: optional commit-charge and disk readings in the memory gate."""
+
+    def test_commit_over_limit_waits_with_plenty_of_ram(self):
+        self.assertEqual(memory_hold(THEN, 64.0, False, 600, commit_pct=90.5).rule_id,
+                         "mem.commit")
+        self.assertEqual(memory_hold(THEN, 64.0, False, commit_pct=90).rule_id, "mem.ok")
+
+    def test_release_after_commit_hold_needs_margin_for_ok_time(self):
+        # held came from a commit hold; commit is back under the limit
+        self.assertEqual(memory_hold(THEN, 8.0, True, 0, commit_pct=85).rule_id,
+                         "mem.hysteresis")
+        self.assertEqual(memory_hold(THEN, 4.4, True, 600, commit_pct=85).rule_id,
+                         "mem.hysteresis")
+        self.assertEqual(memory_hold(THEN, 4.5, True, 299, commit_pct=85).rule_id,
+                         "mem.hysteresis")
+        self.assertEqual(memory_hold(THEN, 4.5, True, 300, commit_pct=85).rule_id, "mem.ok")
+        self.assertEqual(memory_hold(THEN, 8.0, True, 600, commit_pct=91).rule_id,
+                         "mem.commit")
+
+    def test_free_ram_just_over_minimum_after_hold_stays_held(self):
+        for ok in (0, 299, 600):
+            self.assertEqual(memory_hold(THEN, 3.01, True, ok, commit_pct=10,
+                                         disk_free_gb=100).action, "wait")
+
+    def test_low_disk_holds(self):
+        self.assertEqual(memory_hold(THEN, 8.0, False, disk_free_gb=9.99).rule_id, "disk.hold")
+        self.assertEqual(memory_hold(THEN, 8.0, False, disk_free_gb=10).rule_id, "mem.ok")
+
+    def test_unusable_readings_wait(self):
+        for bad in (None, True, False, float("nan"), float("inf"), -1, 101, "50"):
+            self.assertEqual(memory_hold(THEN, 8.0, False, commit_pct=bad).rule_id,
+                             "mem.commit_unknown", bad)
+        for bad in (None, True, float("nan"), float("-inf"), -0.5, "50"):
+            self.assertEqual(memory_hold(THEN, 8.0, False, disk_free_gb=bad).rule_id,
+                             "disk.unknown", bad)
+
+    def test_absent_readings_keep_old_behaviour(self):
+        self.assertEqual(memory_hold(THEN, 8.0, False).rule_id, "mem.ok")
+
+    def test_situation_memory_gate_carries_new_readings(self):
+        for mem, rule in (({"free_gb": 64.0, "held": False, "commit_pct": 95}, "mem.commit"),
+                          ({"free_gb": 64.0, "held": False, "disk_free_gb": 2}, "disk.hold"),
+                          ({"free_gb": 64.0, "held": False, "disk_free_gb": None},
+                           "disk.unknown")):
+            d = supervise(_sit(memory=mem))
+            self.assertEqual((d.action, d.rule_id, d.constraint), ("wait", rule, "none"))
+
+
 class ProposalTests(unittest.TestCase):
     def test_allowlisted_proposals_pass(self):
         for action in ALLOWED_PROPOSALS:
