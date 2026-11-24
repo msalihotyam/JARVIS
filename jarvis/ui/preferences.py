@@ -24,6 +24,7 @@ from pathlib import Path
 from typing import Any
 
 from jarvis.codex import CODEX_EFFORT_VALUES, CODEX_MODEL_PATTERN
+from jarvis.providers import CHAT_PROVIDERS
 from jarvis.settings import CLAUDE_MODEL_PATTERN
 
 PREFERENCES_VERSION = 5
@@ -51,8 +52,7 @@ RAIL_IDS = ("tasks", "updates", "focus", "plan", "skills", "memory")
 RAIL_MAX_SHOWN = 4   # the 2x2 tile grid; "updates" has no tile and does not count
 #: Interface languages, as stable locale ids (never the visible option name).
 LANGUAGES = ("en-US", "tr-TR")
-#: The chat / understanding providers a person can choose.
-CHAT_PROVIDERS = ("claude", "codex")
+#: The chat / understanding providers a person can choose: ``CHAT_PROVIDERS``, from ``jarvis.providers``.
 
 #: Bounds, in fractions of the content area. The stack's height shares are
 #: normalized on render, so a share is a proportion, not a pixel count.
