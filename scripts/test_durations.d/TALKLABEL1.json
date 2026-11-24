@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "classes": {
+    "tests.test_talk_label.TalkLabelTests": 0.05
+  }
+}
