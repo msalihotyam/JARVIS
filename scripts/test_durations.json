@@ -912,6 +912,7 @@
   "tests.test_n6_outage.N6OutageTests": 0.1,
   "tests.test_n6_pause.N6PauseTests": 0.1,
   "tests.test_n6_preflight.N6PreflightTests": 0.3,
+  "tests.test_n6_presence.PresenceTests": 0.1,
   "tests.test_n6_quota.QuotaWindowTests": 0.1,
   "tests.test_n6_receipt.N6ReceiptTests": 0.1,
   "tests.test_n6_refcheck.N6RefcheckTests": 0.1,
