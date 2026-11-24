@@ -4,7 +4,9 @@ from __future__ import annotations
 import importlib.util
 import json
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -29,9 +31,10 @@ def shard(index: int, ids: list[str], green: bool = True, wall: float = 10.0) ->
 class Fake(shadow.Shadow):
     """The real git; the suite and gh stubbed."""
 
-    def __init__(self, *args, report=None, rc=0, gh=None, **kwargs):
+    def __init__(self, *args, report=None, rc=0, gh=None, dirty=False, **kwargs):
         super().__init__(*args, clock=lambda: NOW, python="py", **kwargs)
         self.report, self.rc, self.gh = report, rc, gh or (lambda argv: (1, "gh: offline"))
+        self.dirty = dirty
         self.suite_calls: list = []
         self.gh_calls: list = []
 
@@ -43,6 +46,8 @@ class Fake(shadow.Shadow):
 
     def suite(self, argv, cwd):
         self.suite_calls.append((argv, Path(cwd), (Path(cwd) / "f.txt").read_text(encoding="utf-8")))
+        if self.dirty:
+            (Path(cwd) / "untracked.txt").write_text("left by the suite", encoding="utf-8")
         if isinstance(self.report, Exception):
             raise self.report
         if self.report is not None:
@@ -193,6 +198,57 @@ class TestLocalRun(Base):
         self.assertTrue(rec["errors"][0].startswith("commit not found"))
         self.assertEqual(fake.suite_calls, [])
 
+    def test_a_dirtied_tree_is_cleaned_without_force(self):  # POLISHLCI1 F3
+        _, rec = self.run_one(report=self.REPORT, dirty=True)
+        self.assertEqual(rec["verdict"], "green")
+        self.assertIn("modified or untracked", rec["cleanup_error"])
+        self.assertNotIn("registration left", rec["cleanup_error"])
+        self.assertEqual(self.worktrees(), 1)
+        self.assertEqual(list(self.scratch.iterdir()), [])
+
+    def test_only_our_own_scratch_dir_is_deleted(self):  # POLISHLCI1 F3
+        fake, sha = self.make(), self.shas[0]
+        foreign = [self.tmp / f"localci-{sha[:12]}-x", self.scratch / "other-dir", self.scratch / "localci-000000000000-x"]
+        for path in foreign:
+            path.mkdir()
+            left = fake._drop_scratch(path, sha, path / "wt")
+            self.assertTrue(left.startswith("not our scratch dir"), left)
+            self.assertTrue(path.exists())
+
+    def test_a_failed_add_leaves_no_registration(self):  # POLISHLCI1 F4
+        hooks = self.tmp / "hooks"
+        hooks.mkdir()
+        (hooks / "post-checkout").write_bytes(b"#!/bin/sh\nexit 3\n")  # add registers the tree, then fails
+        (hooks / "post-checkout").chmod(0o755)
+        git(self.repo, "config", "core.hooksPath", hooks.as_posix())
+        fake, rec = self.run_one(report=self.REPORT)
+        self.assertEqual(rec["verdict"], "error")
+        self.assertTrue(rec["errors"][0].startswith("worktree add failed"), rec["errors"])
+        self.assertEqual(fake.suite_calls, [])
+        self.assertEqual(self.worktrees(), 1)
+        self.assertEqual(list(self.scratch.iterdir()), [])
+        self.assertFalse((self.repo / ".git" / "worktrees").exists() and any((self.repo / ".git" / "worktrees").iterdir()))
+
+
+class TestTimeout(Base):
+    RUNNER = ("import pathlib, subprocess, sys, time\n"
+              "beat = pathlib.Path(sys.argv[1])\n"
+              "subprocess.Popen([sys.executable, '-c', \"import sys, time\\n"
+              "while True:\\n open(sys.argv[1], 'ab').write(b'.'); time.sleep(0.1)\", str(beat)])\n"
+              "while not beat.exists():\n    time.sleep(0.05)\n"
+              "time.sleep(600)\n")
+
+    def test_a_timeout_kills_the_whole_process_tree(self):  # POLISHLCI1 F2
+        runner, beat = self.tmp / "runner.py", self.tmp / "beat"
+        runner.write_text(self.RUNNER, encoding="utf-8")
+        code, out = self.make().cmd([sys.executable, str(runner), str(beat)], timeout=8)
+        self.assertEqual(code, -1)
+        self.assertTrue(out.startswith("TimeoutExpired"), out[:80])
+        self.assertTrue(beat.exists())  # the grandchild was running before the kill
+        size = beat.stat().st_size
+        time.sleep(1.5)
+        self.assertEqual(beat.stat().st_size, size)  # and no longer writes: it died with the tree
+
 
 class TestGithubCompare(Base):
     def record(self, ids: list[str], verdict: str = "green") -> dict:
@@ -235,6 +291,13 @@ class TestGithubCompare(Base):
         self.compare(rec, gh_complete([shard(i, ["t.a"], green=i != 3) for i in (1, 2, 3, 4)]))
         self.assertEqual(rec["github"]["verdict"], "red")
 
+    def test_a_failed_aggregate_job_makes_github_red(self):  # POLISHLCI1 F1
+        rec = self.record(["t.a"])
+        self.compare(rec, gh_complete([shard(i, ["t.a"]) for i in (1, 2, 3, 4)], conclusion="failure"))
+        g = rec["github"]
+        self.assertEqual((g["status"], g["conclusion"], g["verdict"], g["verdict_equal"]),
+                         ("complete", "failure", "red", False))
+
     def test_pending_until_the_run_completes_then_compared_on_a_later_run(self):
         sha = self.shas[0]
         self.pend(sha)
@@ -243,7 +306,8 @@ class TestGithubCompare(Base):
         def gh(argv):
             if argv[1:3] == ["run", "list"]:
                 return 0, json.dumps([{"databaseId": 9, "headSha": sha, "status": state["status"],
-                                       "conclusion": "", "workflowName": "tests"}])
+                                       "conclusion": "success" if state["status"] == "completed" else "",
+                                       "workflowName": "tests"}])
             return gh_complete([shard(i, ["t.a"]) for i in (1, 2, 3, 4)])(argv)
         fake = self.make(report={"green": True, "dispatched": ["t.a"], "wall": 3.0}, gh=gh)
         fake.run_once()

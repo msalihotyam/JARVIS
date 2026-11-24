@@ -98,6 +98,21 @@ def file_lock(path: Path):
         os.close(fd)
 
 
+def kill_tree(proc: subprocess.Popen) -> None:
+    """Kills the process and every descendant (Windows: taskkill /T; POSIX: its own session's group)."""
+    try:
+        if os.name == "nt":
+            subprocess.run(["taskkill", "/F", "/T", "/PID", str(proc.pid)], capture_output=True, timeout=60,
+                           creationflags=subprocess.CREATE_NO_WINDOW)
+        else:
+            import signal
+            os.killpg(proc.pid, signal.SIGKILL)
+    except (OSError, subprocess.SubprocessError):
+        pass
+    with contextlib.suppress(OSError):
+        proc.kill()  # the direct child at least, whatever the tree kill did
+
+
 def _count(value) -> int:
     return value if isinstance(value, int) else len(value or [])
 
@@ -114,15 +129,21 @@ class Shadow:
 
     def cmd(self, argv: list[str], cwd: Path | None = None, timeout: float = 600) -> tuple[int, str]:
         """(returncode, stdout; plus stderr when it failed). Never raises; -1 when it could not run."""
-        flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+        flags = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {"start_new_session": True}
         try:
-            done = subprocess.run(argv, cwd=cwd or self.root, capture_output=True, text=True, encoding="utf-8",
-                                  errors="replace", timeout=timeout, stdin=subprocess.DEVNULL,
-                                  env={**os.environ, "PYTHONUTF8": "1"}, **flags)
+            proc = subprocess.Popen(argv, cwd=cwd or self.root, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                    text=True, encoding="utf-8", errors="replace", stdin=subprocess.DEVNULL,
+                                    env={**os.environ, "PYTHONUTF8": "1"}, **flags)
         except (OSError, subprocess.SubprocessError) as exc:
-            # shortcut: a timeout kills test_parallel, not its workers; they end on their own unit timeouts.
             return -1, f"{type(exc).__name__}: {exc}"
-        return done.returncode, done.stdout if done.returncode == 0 else done.stdout + done.stderr
+        try:
+            stdout, stderr = proc.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired as exc:
+            kill_tree(proc)  # test_parallel's workers too, not only the direct child
+            with contextlib.suppress(subprocess.SubprocessError):
+                proc.communicate(timeout=60)
+            return -1, f"{type(exc).__name__}: {exc}"
+        return proc.returncode, stdout if proc.returncode == 0 else stdout + stderr
 
     def suite(self, argv: list[str], cwd: Path) -> tuple[int, str]:
         return self.cmd(argv, cwd=cwd, timeout=SUITE_TIMEOUT)
@@ -170,7 +191,7 @@ class Shadow:
         code, out = self.cmd([*git, "worktree", "add", "--detach", str(tree), sha])
         if code:
             record["errors"].append(f"worktree add failed: {out.strip()[:300]}")
-            shutil.rmtree(scratch, ignore_errors=True)
+            self._drop_scratch(scratch, sha, tree)  # add can fail after registering the tree
             return
         try:
             # CI's command (.github/workflows/tests.yml "Run this shard"), unsharded, the sha's own runner.
@@ -192,10 +213,26 @@ class Shadow:
                 record["tail"] = out[-TAIL:]
         finally:
             code, out = self.cmd([*git, "worktree", "remove", str(tree)])
-            if code:
-                record["cleanup_error"] = out.strip()[:500]  # left in place for a look; never --force
+            if code:  # a dirtied tree: never --force; delete our own scratch dir, then drop the registration
+                record["cleanup_error"] = out.strip()[:500]
+                left = self._drop_scratch(scratch, sha, tree)
+                if left:
+                    record["cleanup_error"] += f"; {left}"
             else:
                 shutil.rmtree(scratch, ignore_errors=True)
+
+    def _drop_scratch(self, scratch: Path, sha: str, tree: Path) -> str:
+        """Deletes a scratch dir this tool made (realpath-checked: a localci-<sha12>- child of self.temp),
+        then runs a non-forced ``git worktree remove`` that only drops the now dirless registration (never
+        prune). Returns "" when nothing is left, else why."""
+        real = Path(os.path.realpath(scratch))
+        if real.parent != Path(os.path.realpath(self.temp)) or not real.name.startswith(f"localci-{sha[:12]}-"):
+            return f"not our scratch dir, kept: {real}"
+        shutil.rmtree(real, ignore_errors=True)
+        if real.exists():
+            return f"scratch dir not deleted: {real}"
+        code, out = self.cmd(["git", "-C", str(self.root), "worktree", "remove", str(tree)])
+        return f"registration left: {out.strip()[:200]}" if code else ""
 
     # ---- the GitHub side (read-only) -----------------------------------------------------------------
     def compare(self, record: dict) -> None:
@@ -243,7 +280,9 @@ class Shadow:
         indices = {tuple(s["shard"]) for s in shards if isinstance(s.get("shard"), list) and len(s["shard"]) == 2}
         total = max((n for _, n in indices), default=0)
         whole = total > 0 and indices == {(i, total) for i in range(1, total + 1)}
-        verdict = "green" if whole and all(s.get("green") is True for s in shards) else "red"
+        # the run's conclusion carries the aggregate job: a red aggregate is a red run even with green shards
+        green = whole and all(s.get("green") is True for s in shards) and run.get("conclusion") == "success"
+        verdict = "green" if green else "red"
         cloud = {t for s in shards for t in (s.get("dispatched") or [])}
         local = set(record.get("ids") or [])
         only_local = sorted(local - cloud)[:MAX_DIFF]
