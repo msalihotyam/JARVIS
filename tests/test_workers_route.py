@@ -98,7 +98,7 @@ class TestWorkersRoute(unittest.TestCase):
 _VETOED_BEFORE = (
     "", ".", "..", "a*.py", "a?.py", "a[1].py", "progra~1/x.py", "c:/x.py",
     "x.py:s", "/abs.py", "../up.py", "scripts./x.py", "jarvis /x.py",
-    "scripts/x.py", "Scripts\conveyor.py", ".claude/settings.json",
+    "scripts/x.py", r"Scripts\conveyor.py",".claude/settings.json",
     ".github/workflows/ci.yml", "data/jarvis.db", "data", "CLAUDE.md",
     "docs/AGENTS.md", "uv.lock", "sub/uv.lock", ".env", ".env.local",
     "dev/dashboard/app.py", "home/.jarvis/x", ".jarvis/x", "certs/a.pem",
@@ -128,7 +128,9 @@ class TestRouteVetoParity(unittest.TestCase):
 
     def corpus(self):
         c = self.conveyor
-        derived = [d + "x.py" for d in (*c.CODEX_VETO, *c.PROTECTED_DIRS)]
+        # d + "/x.py" covers entries without a trailing slash ("private/.env").
+        derived = [d + t for d in (*c.CODEX_VETO, *c.PROTECTED_DIRS)
+                   for t in ("x.py", "/x.py")]
         derived += sorted(c.PROTECTED_FILES)
         return (*_VETOED_BEFORE, *_ALLOWED, *derived, "riot/x.py",
                 "games/RiotClient/x.exe", "jarvis/riot.py")
@@ -195,18 +197,24 @@ class TestRouteVetoParity(unittest.TestCase):
         import ast
         import hashlib
         from pathlib import Path
+
+        def norm(n):  # ast.dump without the empty/None fields newer minors add (type_params)
+            if isinstance(n, ast.AST):
+                return [type(n).__name__] + [[k, norm(v)] for k, v in ast.iter_fields(n)
+                                             if v is not None and v != []]
+            if isinstance(n, list):
+                return [norm(x) for x in n]
+            return repr(n)
         tree = ast.parse(Path(self.conveyor.__file__).read_text(encoding="utf-8"))
         digests = {}
         for f in tree.body:
             if isinstance(f, ast.FunctionDef) and f.name in ("protected_path", "codex_veto"):
                 if ast.get_docstring(f):
                     f.body = f.body[1:]  # docstring edits do not change the rule
-                # shortcut: ast.dump text can shift across Python minors (CI and local are
-                # 3.13), re-pin the digest when the CI Python moves.
-                digests[f.name] = hashlib.sha256(ast.dump(f).encode()).hexdigest()
+                digests[f.name] = hashlib.sha256(repr(norm(f)).encode()).hexdigest()
                 # A later rebinding (wrapper, second def) would run unpinned code.
                 self.assertEqual(getattr(self.conveyor, f.name).__code__.co_firstlineno,
                                  f.lineno - len(f.decorator_list), f.name)
         self.assertEqual(digests, {
-            "protected_path": "1670b45d134b96ed608d0c6ebee328324af48637eb3b9506714069c024336295",
-            "codex_veto": "576ae0cf855cd850638861cbd8cac74a726e464708e054700b9bfbf1fc35b215"})
+            "protected_path": "e0f696cd251aef7e68bec4f41014c476ebf2486e2db6d69bece35552f869c583",
+            "codex_veto": "0847911af6b29661c245fae96ddf01331c752f49176bbfdd0989024f357cee35"})
