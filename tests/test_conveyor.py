@@ -10023,7 +10023,10 @@ class TestChain(AutopilotBase):
                       ("jarvis/x.py", ".claude/settings.json"), ("jarvis/x.py", "data/x.db")):
             with self.subTest(files=files):
                 why, ap = self.u1(files, self.MINOR)
-                self.assertEqual(why, "CLREV-SRC report has a finding line")
+                # SEEDGUARD1 A18 refuses .claude/ files before the polish rule is reached: still a stop
+                a18 = any(f.startswith(".claude/") for f in files)
+                self.assertEqual(why, "touches build/conveyor/notes/ or .claude/: refused before INT" if a18
+                                 else "CLREV-SRC report has a finding line")
                 self.assertNotIn("chain_slices", ap)
                 self.assertEqual(self.polish(), [])
 
