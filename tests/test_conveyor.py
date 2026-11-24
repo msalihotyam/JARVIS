@@ -10264,6 +10264,17 @@ class TestChain(AutopilotBase):
         self.assertNotIn("chain_slices", ap)
         self.assertFalse(self.prompt("CLREV-SRC").exists())
 
+    def test_stacked_neg_two_reports_naming_one_stack_commit_are_refused(self):
+        # CHAINSTACK1FIX3: two non-chain lane reports for S1 are ambiguous; the first must never be picked
+        lanes = self.stacked()
+        self.report("FIXC", "PASS", extra=f"COMMIT: {self.S1}\n")
+        lanes["FIXC"] = {"finished": True, "status": "PASS",
+                         "report": str(self.root / ".claude/worktrees/wt/build/reports/FIXC.md")}
+        why, ap = self.direct(lanes, **self.STACK)
+        self.assertEqual(why, f"no single report names stack commit {self.S1[:7]}")
+        self.assertNotIn("chain_slices", ap)
+        self.assertFalse(self.prompt("CLREV-SRC").exists())
+
     def test_stacked_neg_a_broken_parent_chain_is_refused(self):
         why, ap = self.direct(self.stacked(sha_parent=self.S1), **self.STACK)
         self.assertEqual(why, f"{self.SHA[:7]} is not the next stacked commit on {self.S2[:7]}")
@@ -10341,7 +10352,9 @@ class TestChain(AutopilotBase):
                  "reordered": (0, f"{self.S2} {self.RB}\n{self.S1} {self.S2}\n{self.SHA} {self.S1}\n"),
                  "extra commit": (0, f"{self.S1} {self.RB}\n{X} {self.S1}\n{self.S2} {X}\n{self.SHA} {self.S2}\n"),
                  "merge": (0, f"{self.S1} {self.RB} {X}\n{self.S2} {self.S1}\n{self.SHA} {self.S2}\n"),
-                 "git error": (128, f"{self.S1} {self.RB}\n{self.S2} {self.S1}\n{self.SHA} {self.S2}\n")}
+                 "git error": (128, f"{self.S1} {self.RB}\n{self.S2} {self.S1}\n{self.SHA} {self.S2}\n"),
+                 # CHAINSTACK1FIX3: rc 1 with valid-looking history still refuses (kills a stack_proven taking rc <= 1)
+                 "git error rc 1": (1, f"{self.S1} {self.RB}\n{self.S2} {self.S1}\n{self.SHA} {self.S2}\n")}
         base = dict(self.git.fail)
         for name, (rc, out) in cases.items():
             with self.subTest(name):
