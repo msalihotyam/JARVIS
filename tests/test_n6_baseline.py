@@ -5,11 +5,13 @@ import hashlib
 import importlib.util
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from unittest import mock
 
 from jarvis import n6_kpi
 
@@ -46,9 +48,21 @@ class Fixture(unittest.TestCase):
         self.out = self.root / "build" / "n6" / "baseline.json"
         self.events.parent.mkdir(parents=True)
         self.kpi.parent.mkdir(parents=True)
+        home = mock.patch.object(nb, "OPERATOR_HOME", self.root / "home" / ".jarvis")
+        home.start()
+        self.addCleanup(home.stop)
 
     def tearDown(self):
         self._tmp.cleanup()
+
+    def run_out(self, *argv, root=None):
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            code = nb.main(list(argv), root=root or self.root)
+        return code, buf.getvalue()
+
+    def snapshot(self):
+        return {p: p.read_bytes() for p in self.root.rglob("*") if p.is_file()}
 
     def ledger(self, *lanes, raw=b""):
         lines = [json.dumps(e) for group in lanes for e in group]
@@ -181,6 +195,89 @@ class NegativeTests(Fixture):
         self.assertEqual(self.run_main("--kpi-db", str(self.root / "data" / "kpi.db")), 2)
         self.assertEqual(self.run_main("--events", str(self.root / "x" / "jarvis.db")), 2)
         self.assertEqual(self.run_main("--events", str(self.root / "data" / "events.jsonl")), 2)
+        self.assertFalse(self.out.exists())
+
+    def assert_refused(self, argv, reason, root=None):
+        before = self.snapshot()
+        code, text = self.run_out(*argv, root=root)
+        self.assertEqual(code, 2, text[:80])
+        self.assertIn(reason, text)
+        self.assertEqual(self.snapshot(), before)  # nothing written, created or overwritten
+
+    def test_out_refuses_operator_data(self):  # CDX-N6BASE1 F1
+        self.standard()
+        data, home = self.root / "data", self.root / "home" / ".jarvis"
+        outs = [data / "jarvis.db", data / "b.json", data / "x" / ".." / "b.json",
+                self.root / "elsewhere" / "JARVIS.DB", home / "b.json"]
+        if os.name == "nt":  # case-insensitive filesystem: DATA is data
+            outs.append(self.root / "DATA" / "b.json")
+        for out in outs:
+            with self.subTest(out=str(out)):
+                self.assert_refused(("--out", str(out)), "operator data")
+        self.assertFalse(data.exists())
+        self.assertFalse(home.exists())
+        # a worktree root: the main checkout's data/ is operator data too
+        work = self.root / "main" / ".claude" / "worktrees" / "w1"
+        self.assert_refused(("--events", str(self.events), "--kpi-db", str(self.kpi),
+                             "--out", str(self.root / "main" / "data" / "b.json")),
+                            "operator data", root=work)
+        self.assertFalse((self.root / "main").exists())
+
+    def test_out_refuses_its_own_sources(self):  # CDX-N6BASE1 F1
+        self.standard()
+        ledger = self.root / "ledger" / "events.jsonl"  # not under build/conveyor: _guard alone passes
+        ledger.parent.mkdir()
+        ledger.write_bytes(self.events.read_bytes())
+        os.link(ledger, ledger.with_name("hard.jsonl"))
+        sums_src = self.root / "ledger" / "x.json.sha256"
+        sums_src.write_bytes(b"keep")
+        fresh = self.root / "ledger" / "new.db"  # a --kpi-db not yet present
+        cases = [(ledger, self.kpi, ledger),
+                 (ledger, self.kpi, self.root / "ledger" / ".." / "ledger" / "events.jsonl"),
+                 (ledger, self.kpi, ledger.with_name("hard.jsonl")),
+                 (ledger, self.kpi, self.kpi),
+                 (ledger, self.kpi, self.kpi.with_name("kpi.db-wal")),
+                 (ledger, self.kpi, self.kpi.with_name("kpi.db-journal")),
+                 (ledger, sums_src, sums_src.with_name("x.json")),  # out.sha256 == --kpi-db
+                 (ledger, fresh, fresh)]
+        if os.name == "nt":  # NTFS is case-insensitive: another spelling is the same file
+            cases.append((ledger, self.kpi, self.kpi.with_name("KPI.DB")))
+        for events, kpi, out in cases:
+            with self.subTest(out=str(out), kpi=kpi.name):
+                self.assert_refused(("--events", str(events), "--kpi-db", str(kpi), "--out", str(out)),
+                                    "would overwrite the source")
+        self.assertFalse(fresh.exists())
+
+    def test_non_ascii_out_name_writes_utf8_checksum(self):  # CDX-N6BASE1 F2
+        self.standard()
+        out = self.root / "build" / "n6" / "çıktı_ğüş.json"
+        code, text = self.run_out("--out", str(out))
+        self.assertEqual(code, 0, text[:80])
+        digest = hashlib.sha256(out.read_bytes()).hexdigest()
+        self.assertEqual(out.with_name(out.name + ".sha256").read_bytes(),
+                         f"{digest}  çıktı_ğüş.json\n".encode("utf-8"))
+
+    def test_out_refuses_ambiguous_spellings_and_db_sidecars(self):  # N6BASE1FIX F2 probes
+        self.standard()
+        (self.root / "data").mkdir()
+        self.assert_refused(("--out", str(self.root / "elsewhere" / "jarvis.db-wal")), "operator data")
+        ambiguous = [self.root / "data " / "b.json", Path(str(self.kpi) + ":s"), Path(str(self.root / "data") + ":s"),
+                     self.root / "home" / ".jarvis." / "b.json", Path("\\\\?\\" + str(self.root / "data" / "b.json"))]
+        for out in ambiguous if os.name == "nt" else ambiguous[:4]:
+            with self.subTest(out=str(out)):
+                self.assert_refused(("--out", str(out)), "REFUSED")
+        self.assertEqual(list((self.root / "data").iterdir()), [])
+        self.assertFalse((self.root / "home").exists())
+
+    def test_nul_in_out_is_refused_not_a_traceback(self):
+        self.standard()
+        self.assert_refused(("--out", str(self.root / "build" / "n6" / "a\x00b.json")), "REFUSED")
+
+    def test_sums_write_failure_leaves_no_baseline(self):
+        self.standard()
+        self.out.with_name("baseline.json.sha256").mkdir()  # the .sha256 write fails
+        code, text = self.run_out()
+        self.assertEqual(code, 2, text[:80])
         self.assertFalse(self.out.exists())
 
     def test_nul_byte_alone_raises(self):

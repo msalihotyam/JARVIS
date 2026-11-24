@@ -10,7 +10,8 @@ Writer is codex when the ledger says so (a ``route`` event with worker codex, or
 ``codex_commit`` event), jules lanes are excluded, else claude. A measure with no reading is the string "missing", never 0
 (R32); a group with n < 10 is ``small_sample``. A torn or corrupt ledger line raises. The output
 holds no wall-clock value, so a rerun on the same input is byte-identical. The script refuses to
-write under ``build/conveyor/`` or ``dev/n6/acceptance/`` and never opens ``data/``/``jarvis.db``.
+write under ``build/conveyor/`` or ``dev/n6/acceptance/``, never opens ``data/``/``jarvis.db``/``~/.jarvis``
+(nor writes there) and never writes over its own ``--events``/``--kpi-db`` source.
 No network, no model call, nothing on the live conveyor. Exit: 0 written, 2 refused.
 """
 
@@ -19,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import sqlite3
 import statistics
@@ -32,6 +34,7 @@ from typing import cast
 
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN = (("build", "conveyor"), ("dev", "n6", "acceptance"))
+OPERATOR_HOME = Path.home() / ".jarvis"  # ~\.jarvis\ is operator data; tests patch it
 SMALL_SAMPLE = 10
 MISSING = "missing"
 CLASSES = ("code", "review")
@@ -230,10 +233,44 @@ def _guard(path: Path) -> Path:
 
 
 def _not_operator(path: Path, root: Path) -> Path:
+    """Refuse jarvis.db anywhere, data/ of this checkout and of the main checkout, and ~/.jarvis."""
     target = path.resolve()
-    if target.name.lower() == "jarvis.db" or target.is_relative_to(root.resolve() / "data"):
+    base = root.resolve()
+    protected = [base / "data", OPERATOR_HOME.resolve()]
+    if base.parent.name.casefold() == "worktrees" and base.parent.parent.name.casefold() == ".claude":
+        protected.append(base.parents[2] / "data")  # a worktree: the main checkout's data/
+    name = target.name.casefold()
+    if name == "jarvis.db" or name.startswith("jarvis.db-") or any(target.is_relative_to(p) for p in protected):
         raise BaselineError(f"refused: {target} is operator data, never opened")
     return target
+
+
+def _same(a: Path, b: Path) -> bool:
+    """Same file by case-normalised resolved path or, when both exist, by identity (hard/symlink)."""
+    if os.path.normcase(a) == os.path.normcase(b):
+        return True
+    return a.exists() and b.exists() and os.path.samefile(a, b)
+
+
+def _targets(out: Path, root: Path, sources: tuple[Path, ...]) -> tuple[Path, Path]:
+    """The checked ``out`` and ``out.sha256``: never conveyor/acceptance, operator data, a source or
+    a sqlite sidecar of one (-wal/-shm/-journal). Runs before anything is read or written."""
+    target = _guard(out)
+    sums = _guard(target.with_name(target.name + ".sha256"))
+    resolved = [s.resolve() for s in sources]
+    for path in (target, sums):
+        # Windows strips a trailing dot/space, \\?\ skips that, ":" names an NTFS stream: all alias a guarded path
+        if path.anchor.startswith(("\\\\?\\", "\\\\.\\")) or any(
+                ":" in p or p != p.rstrip(". ") for p in path.parts[1:]):
+            raise BaselineError(f"refused: {path} is an ambiguous path spelling")
+        _not_operator(path, root)
+        name = os.path.normcase(path.name)
+        for src in resolved:
+            sidecar = (os.path.normcase(path.parent) == os.path.normcase(src.parent)
+                       and name.startswith(os.path.normcase(src.name) + "-"))
+            if _same(path, src) or sidecar:
+                raise BaselineError(f"refused: {path} would overwrite the source {src}")
+    return target, sums
 
 
 def _sha(data: bytes) -> str:
@@ -256,15 +293,19 @@ def build(events_path: Path, kpi_path: Path, root: Path, since: datetime | None 
     return doc
 
 
-def write(doc: dict[str, object], out: Path) -> str:
-    """Write ``out`` and ``out.sha256`` (bytes, LF only) after the path guard; the sha256."""
-    target = _guard(out)
-    sums = _guard(target.with_name(target.name + ".sha256"))
+def write(doc: dict[str, object], out: Path, root: Path, sources: tuple[Path, ...]) -> str:
+    """Write ``out`` and ``out.sha256`` (bytes, LF only) after the path checks; the sha256."""
+    target, sums = _targets(out, root, sources)
     data = (json.dumps(doc, sort_keys=True, indent=2, allow_nan=False) + "\n").encode()
     digest = _sha(data)
+    line = f"{digest}  {target.name}\n".encode("utf-8")  # both byte strings before either write
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_bytes(data)
-    sums.write_bytes(f"{digest}  {target.name}\n".encode("ascii"))
+    try:
+        sums.write_bytes(line)
+    except OSError:
+        target.unlink(missing_ok=True)  # never a baseline.json without its .sha256
+        raise
     return digest
 
 
@@ -279,11 +320,11 @@ def main(argv: list[str] | None = None, root: Path = ROOT) -> int:
     try:
         since = _ts(args.since, "--since") if args.since else None  # pyright: ignore[reportAny]
         until = _ts(args.until, "--until") if args.until else None  # pyright: ignore[reportAny]
-        out = cast(Path, args.out)
-        _guard(out)  # refuse before reading anything
-        doc = build(cast(Path, args.events), cast(Path, args.kpi_db), root, since, until)
-        digest = write(doc, out)
-    except (BaselineError, OSError) as error:
+        out, events, kpi_db = cast(Path, args.out), cast(Path, args.events), cast(Path, args.kpi_db)
+        _targets(out, root, (events, kpi_db))  # refuse before reading anything
+        doc = build(events, kpi_db, root, since, until)
+        digest = write(doc, out, root, (events, kpi_db))
+    except (BaselineError, OSError, ValueError) as error:  # ValueError: NUL / unencodable path
         print(f"REFUSED: {error}")
         return 2
     print(f"WROTE {out} sha256 {digest}")
