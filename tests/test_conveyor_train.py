@@ -103,9 +103,81 @@ class TestTrain(tc.TestChain):
         self.assertTrue((self.base / "trains" / "INT-TRAIN1.json").exists())
 
 
+class TestTrainPushCas(tc.TestChain):
+    """TRAIN1FIX: the push gate itself refuses a train candidate not built on the current origin/main."""
+    TID = "INT-TRAIN1"
+
+    def gate(self, manifest, tid=TID, write=True):
+        self.git.main, self.git.origin = tc.MAIN, ORIGIN
+        self.git.contains, self.git.fail = "  origin/ci/int-train1\n", {}
+        p = self.base / "trains" / f"{tid}.json"
+        p.parent.mkdir(parents=True, exist_ok=True)
+        if isinstance(manifest, bytes):
+            p.write_bytes(manifest)
+        elif manifest is not None:
+            p.write_text(manifest if isinstance(manifest, str) else json.dumps(manifest), encoding="utf-8")
+        lanes = {tid: {"finished": True, "status": "GREEN",
+                       "ci": {"sha": tc.MAIN, "branch": "ci/int-train1", "cand": True}}}
+        return self.c.push_checks(f"push-{tc.MAIN}-int-train1", lanes)
+
+    def refused(self, why):
+        self.assertIsNotNone(why)
+        self.assertIn(f"origin/main is {ORIGIN[:7]}: rebuilt", why)
+        self.assertEqual(self.git.pushes(), [])
+
+    def test_matching_start_passes_cas(self):
+        why, sha, url = self.gate({"id": self.TID, "start": ORIGIN})
+        self.assertEqual((why, sha), (None, tc.MAIN))
+        self.assertTrue(url)
+
+    def test_moved_main_refused(self):
+        why = self.gate({"id": self.TID, "start": "d" * 40})[0]
+        self.refused(why)
+        self.assertIn("train INT-TRAIN1 was built on ddddddd", why)
+
+    def test_start_near_misses_refused(self):
+        for start in (ORIGIN[:7], ORIGIN.upper(), ORIGIN + "\n", " " + ORIGIN, "", None, 0, [ORIGIN]):
+            with self.subTest(start=start):
+                self.refused(self.gate({"id": self.TID, "start": start})[0])
+        self.refused(self.gate({"id": self.TID})[0])
+
+    def test_lost_or_broken_manifest_refused(self):
+        for manifest in (None, "", "{not json", b"\xff\xfe\x00", "[]", '"start"', "null", "5"):
+            with self.subTest(manifest=manifest):
+                p = self.base / "trains" / f"{self.TID}.json"
+                if p.is_file():
+                    p.unlink()
+                self.refused(self.gate(manifest)[0])
+        p.unlink()
+        p.mkdir()  # the manifest path is a directory: OSError, still refused
+        self.refused(self.gate(None)[0])
+
+    def test_lower_case_train_id_still_checked(self):
+        self.refused(self.gate({"start": "d" * 40}, tid="int-train1")[0])
+
+    def test_stacked_candidate_and_shared_sha_still_checked(self):
+        cand = "c" * 40  # candidate on top of local main: head != want, sha resolves to the candidate
+        self.git.main, self.git.origin, self.git.fail = tc.MAIN, ORIGIN, {
+            ("git", "merge-base", "--is-ancestor", tc.MAIN, cand): (0, ""),
+            ("git", "merge-base", "--is-ancestor", ORIGIN, cand): (0, "")}
+        (self.base / "trains").mkdir(parents=True, exist_ok=True)
+        (self.base / "trains" / f"{self.TID}.json").write_text(json.dumps({"start": "d" * 40}), encoding="utf-8")
+        ci = {"sha": cand, "branch": "ci/int-train1", "cand": True}
+        lanes = {"INT-X": {"finished": True, "ci": dict(ci)}, self.TID: {"finished": True, "ci": ci}}
+        why, sha, _ = self.c.push_checks(f"push-{cand}-int-train1", lanes)
+        self.assertEqual(sha, cand)
+        self.refused(why)
+
+    def test_non_train_lane_has_no_train_cas(self):
+        self.git.main, self.git.contains = tc.MAIN, "  origin/ci/int-x\n"
+        lanes = {"INT-X": {"finished": True, "status": "GREEN", "ci": {"sha": tc.MAIN, "cand": True}}}
+        self.assertIsNone(self.c.push_checks(f"push-{tc.MAIN}-int-x", lanes)[0])
+
+
 for _n in dir(tc.TestChain):  # only the train tests run here; TestChain runs in tests.test_conveyor
     if _n.startswith("test_"):
         setattr(TestTrain, _n, None)
+        setattr(TestTrainPushCas, _n, None)
 
 if __name__ == "__main__":
     unittest.main()
