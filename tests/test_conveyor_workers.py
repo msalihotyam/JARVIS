@@ -36,6 +36,8 @@ class FakeCodexProc:
 
 
 FLAGS = ["--ignore-user-config", "-c", "forced_login_method=chatgpt", "-c", "windows.sandbox=mxc"]
+CATALOGUE = {"id": "gpt-6.2-sol", "efforts": ["low", "medium", "high"]}  # one codex_state() model
+MODEL = ["-m", "gpt-6.2-sol", "-c", "model_reasoning_effort=medium"]  # the worker's default addition
 
 
 class CheckArgvTest(unittest.TestCase):
@@ -130,6 +132,43 @@ class CheckArgvTest(unittest.TestCase):
             with self.subTest(argv=argv), self.assertRaises(ValueError):
                 check_argv(argv)
 
+    def test_codexmodel1_model_and_effort_are_the_only_additions(self):
+        model = ["-m", "gpt-6.2-sol", "-c", "model_reasoning_effort=high"]
+        check_argv(self.OK[:-1] + model + ["-"])
+        check_argv(["codex", "exec", *FLAGS, "--model", "gpt-6.2-sol", "-c", "model_reasoning_effort=low",
+                    "--sandbox", "workspace-write", "-"])
+        bad = [
+            self.OK[:-1] + model + ["-m", "gpt-6.2-sol", "-"],  # model twice
+            self.OK[:-1] + model + ["-c", "model_reasoning_effort=low", "-"],  # effort twice
+            self.OK[:-1] + ["-m", "gpt 6", "-"],
+            self.OK[:-1] + ["-m", "-", "-"],
+            self.OK[:-1] + ["-m", "x" * 65, "-"],
+            self.OK[:-1] + ["-m"],  # no value
+            self.OK[:-1] + ["-mgpt-6.2-sol", "-"],
+            self.OK[:-1] + ["--model=gpt-6.2-sol", "-"],
+            self.OK[:-1] + ["--model-provider", "oss", "-"],
+            self.OK[:-1] + ["-c", "model_reasoning_effort=xhigh", "-"],
+            self.OK[:-1] + ["-c", "model_reasoning_effort=HIGH", "-"],
+            self.OK[:-1] + ["-c", "model_reasoning_effort=high ", "-"],
+            self.OK[:-1] + ["-c", "model=gpt-6.2-sol", "-"],
+            self.OK[:-1] + ["-cmodel_reasoning_effort=high", "-"],
+            self.OK[:-1] + ["--config", "model_reasoning_effort=high", "-"],
+            # the additions do not relax anything: weaker sandbox, no ignore, an extra -c
+            ["codex", "exec", *FLAGS, *model, "--sandbox", "danger-full-access", "-"],
+            ["codex", "exec", "-c", "forced_login_method=chatgpt", "-c", "windows.sandbox=mxc", *model,
+             "--sandbox", "workspace-write", "-"],
+            self.OK[:-1] + model + ["-c", "approval_policy=never", "-"],
+        ]
+        for argv in bad:
+            with self.subTest(argv=argv), self.assertRaises(ValueError):
+                check_argv(argv)
+
+    def test_codexmodel1_cdx_template_runs_gpt_6_2_sol(self):
+        text = (Path(workers.__file__).parent / "chain_templates" / "CDX.md").read_text(encoding="utf-8")
+        self.assertIn("codex exec -m gpt-6.2-sol -c model_reasoning_effort=high -s read-only", text)
+        self.assertIn('"LABEL: Codex gpt-6.2-sol, read-only sandbox, tools off"', text)
+        self.assertNotIn("gpt-6.1", text)
+
     def test_cd_must_be_exactly_the_lane_worktree(self):
         wt = "C:/repo/.claude/worktrees/CDXA"
         argv = lambda *cd: ["codex", "exec", *FLAGS, *cd, "--sandbox", "workspace-write", "-"]  # noqa: E731
@@ -187,7 +226,47 @@ class CodexWorkerTest(unittest.TestCase):
     def fresh(used=30, **quota):
         q = {"checked_at": int(T0), "has_credits": False, "primary": {"used_percent": used}}
         q.update(quota)
-        return {"status": "available", "quota": q}
+        return {"status": "available", "quota": q, "models": [dict(CATALOGUE)]}
+
+    def pace(self, **kw):
+        path = self.root / workers.PACE_FILE
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(kw), encoding="utf-8")
+
+    def test_codexmodel1_argv_carries_the_pace_model_and_effort(self):
+        self.assertEqual(self.w.admit(), (70, None))  # no pace.json: the defaults
+        argv = self.w.argv(self.wt)
+        self.assertEqual(argv[argv.index("-m") + 1], "gpt-6.2-sol")
+        self.assertIn("model_reasoning_effort=medium", argv)
+        self.pace(codex_model="gpt-6.2-sol", codex_effort="high", mode="normal")
+        self.assertEqual(self.w.admit(), (70, None))
+        argv = self.w.argv(self.wt)
+        self.assertEqual(argv.count("-m"), 1)
+        self.assertEqual([a for a in argv if a.startswith("model_reasoning")], ["model_reasoning_effort=high"])
+        sid = self.w.start("CDXA", self.wt, "go")
+        self.assertEqual(self.procs[-1].argv, argv)
+        self.assertEqual((self.w.info[sid]["model"], self.w.info[sid]["effort"]), ("gpt-6.2-sol", "high"))
+
+    def test_codexmodel1_bad_pace_holds_the_lane(self):
+        cases = [{"codex_model": "gpt 6"}, {"codex_model": ""}, {"codex_model": 6}, {"codex_model": "-m"},
+                 {"codex_model": "gpt-6.1-sol"},  # well formed, not in the catalogue
+                 {"codex_effort": "xhigh"}, {"codex_effort": "HIGH"}, {"codex_effort": None},
+                 {"codex_effort": "low"}]  # allowed, but the catalogue does not offer it
+        self.state["models"][0]["efforts"] = ["medium", "high"]
+        for pace in cases:
+            with self.subTest(pace=pace):
+                self.pace(**pace)
+                h, why = self.w.admit()
+                self.assertEqual(h, 70)
+                self.assertTrue(why.startswith("pace: "), why)
+                with self.assertRaises(ValueError):  # a start without a fresh admit cannot run
+                    self.w.argv(self.wt)
+        (self.root / workers.PACE_FILE).write_text("{not json", encoding="utf-8")
+        self.assertTrue(self.w.admit()[1].startswith("pace: "))
+        self.pace()
+        self.state["models"] = []
+        self.assertTrue(self.w.admit()[1].startswith("pace: "))
+        self.assertEqual(self.procs, [])
 
     def test_admit_needs_a_fresh_subscription_reading_without_credits(self):
         self.assertEqual(self.w.admit(), (70, None))
@@ -313,7 +392,7 @@ class CodexWorkerTest(unittest.TestCase):
         sid = self.w.start("CDXA", self.wt, "@jarvis lane=CDXA\nDo it.\n")
         self.assertEqual(sid, "codex-4242")
         p = self.procs[0]
-        self.assertEqual(p.argv, ["fake-codex.exe", "exec", "--json", *FLAGS, "-C", str(self.wt),
+        self.assertEqual(p.argv, ["fake-codex.exe", "exec", "--json", *FLAGS, *MODEL, "-C", str(self.wt),
                                   "--sandbox", "workspace-write", "-"])
         # no key, base URL, org or provider override reaches the child; the login home stays
         # allowlist (jarvis/codex.py route): PATH keeps only real, trusted directories
@@ -561,10 +640,10 @@ class CodexWorkerTest(unittest.TestCase):
     def test_argv_is_unchanged_by_the_tools_path(self):
         self.w.start("CDXA", self.wt, "x")
         argv = self.procs[0].argv
-        self.assertEqual(argv, ["fake-codex.exe", "exec", "--json", *FLAGS, "-C", str(self.wt),
+        self.assertEqual(argv, ["fake-codex.exe", "exec", "--json", *FLAGS, *MODEL, "-C", str(self.wt),
                                 "--sandbox", "workspace-write", "-"])
         self.assertNotIn("--add-dir", argv)
-        self.assertEqual(argv.count("-c"), 2)
+        self.assertEqual(argv.count("-c"), 3)  # CODEXMODEL1: + model_reasoning_effort
         self.assertNotIn(str(self.tools), " ".join(argv))
         with self.assertRaises(ValueError):
             check_argv([*argv[:-1], "--add-dir", str(self.tools), "-"], worktree=self.wt)
