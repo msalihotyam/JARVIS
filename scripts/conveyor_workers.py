@@ -53,6 +53,13 @@ FORCED_LOGIN = "forced_login_method=chatgpt"  # jarvis/codex.py's route bar
 # command is "blocked by policy"; mxc needs no admin and confines writes to the worktree.
 WINDOWS_SANDBOX = "windows.sandbox=mxc"
 CONFIGS = (FORCED_LOGIN, WINDOWS_SANDBOX)  # the only values -c may carry, each exactly once
+# CODEXMODEL1: model and effort are explicit, from build/conveyor/pace.json codex_model /
+# codex_effort; -m and -c model_reasoning_effort=<effort> each at most once, nothing else.
+PACE_FILE = "build/conveyor/pace.json"
+CODEX_MODEL_DEFAULT = "gpt-6.2-sol"  # `codex debug models` slug, verified 2026-11-24
+CODEX_EFFORT_DEFAULT = "medium"
+CODEX_EFFORTS = ("low", "medium", "high")
+EFFORT_KEY = "model_reasoning_effort="
 # A flag that can widen the sandbox, skip approvals, load other config or buy credits.
 BANNED_FLAGS = ("--dangerously-bypass-approvals-and-sandbox", "--yolo", "--full-auto",
                 "-c", "--config", "-p", "--profile", "--add-dir", "--oss",
@@ -68,10 +75,12 @@ def check_argv(argv, worktree=None):
     """Raise ValueError unless argv runs `codex exec` with exactly one sandbox no weaker
     than workspace-write, `--ignore-user-config`, `-c forced_login_method=chatgpt` and
     `-c windows.sandbox=mxc` exactly once each, and no other config or flag that widens
-    it or buys credits; given `worktree`, `-C` must name exactly that path, once."""
+    it or buys credits; given `worktree`, `-C` must name exactly that path, once. The only
+    additions: `-m <model>` (jarvis/codex.py CODEX_MODEL_PATTERN) and
+    `-c model_reasoning_effort=<low|medium|high>`, each at most once."""
     if len(argv) < 2 or argv[1] != "exec":
         raise ValueError("not codex exec")
-    sandboxes, configs, cds, ignores, skip = [], [], [], 0, False
+    sandboxes, configs, cds, models, efforts, ignores, skip = [], [], [], [], [], 0, False
     for i, a in enumerate(argv[1:], 1):
         if skip:
             skip = False
@@ -79,13 +88,25 @@ def check_argv(argv, worktree=None):
         if argv[i - 1] == "-C" and not a.startswith("-"):
             cds.append(a)
             continue  # the worktree path: a lane id like BYPASSFIX is no flag
+        value = argv[i + 1] if i + 1 < len(argv) else None
         if a == "-c":  # exact-match allowlist: nothing else may ride on -c
-            value = argv[i + 1] if i + 1 < len(argv) else None
-            if value not in CONFIGS:
+            if value in CONFIGS:
+                configs.append(value)
+            elif isinstance(value, str) and value.startswith(EFFORT_KEY) \
+                    and value[len(EFFORT_KEY):] in CODEX_EFFORTS:
+                efforts.append(value)
+            else:
                 raise ValueError(f"refused config: {argv[i + 1:i + 2]}")
-            configs.append(value)
             skip = True
             continue
+        if a in ("-m", "--model"):
+            if not isinstance(value, str) or not _jarvis_codex().CODEX_MODEL_PATTERN.match(value):
+                raise ValueError(f"refused model: {argv[i + 1:i + 2]}")
+            models.append(value)
+            skip = True
+            continue
+        if a[:2] == "-m" or a.startswith("--model"):  # attached (-mX, --model=X) or --model-*
+            raise ValueError(f"refused argument: {a}")
         if a == "--ignore-user-config":
             ignores += 1
             continue
@@ -99,6 +120,8 @@ def check_argv(argv, worktree=None):
             sandboxes.append(a.split("=", 1)[1] if "=" in a else (argv[i + 1] if i + 1 < len(argv) else ""))
     if sorted(configs) != sorted(CONFIGS) or ignores != 1:
         raise ValueError(f"needs --ignore-user-config and -c {' -c '.join(CONFIGS)} exactly once")
+    if len(models) > 1 or len(efforts) > 1:
+        raise ValueError(f"-m and -c {EFFORT_KEY}<effort> at most once each: {models} {efforts}")
     if len(sandboxes) != 1 or sandboxes[0] not in SANDBOXES:
         raise ValueError(f"sandbox must be one of {SANDBOXES}: {sandboxes}")
     norm = lambda p: os.path.normcase(os.path.abspath(str(p)))  # noqa: E731
@@ -325,13 +348,36 @@ class CodexWorker:
         self.info = {}  # sid -> {pid, start, log, offset}: what lanes.json keeps
         self.attached = {}  # sid -> (pid, start or None) re-attached after a restart
         self.offsets = {}  # lane -> byte offset of this run's first unread event
+        self.model, self.effort = CODEX_MODEL_DEFAULT, CODEX_EFFORT_DEFAULT  # admit() re-reads pace.json
+
+    def pace(self, catalogue):
+        """(model, effort) from pace.json codex_model / codex_effort (absent key = default),
+        or raise ValueError: unreadable file, wrong type, bad shape, a model not in the
+        account's `catalogue` or an effort it does not offer (fail closed)."""
+        path = self.root / PACE_FILE
+        pace = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
+        if not isinstance(pace, dict):
+            raise ValueError("pace.json is not an object")
+        model = pace.get("codex_model", CODEX_MODEL_DEFAULT)
+        effort = pace.get("codex_effort", CODEX_EFFORT_DEFAULT)
+        if not isinstance(model, str) or not _jarvis_codex().CODEX_MODEL_PATTERN.match(model):
+            raise ValueError(f"codex_model malformed: {str(model)[:64]!r}")
+        if effort not in CODEX_EFFORTS:
+            raise ValueError(f"codex_effort not in {CODEX_EFFORTS}: {str(effort)[:16]!r}")
+        offered = {m.get("id"): m for m in catalogue if isinstance(m, dict)} if isinstance(catalogue, list) else {}
+        if model not in offered:
+            raise ValueError(f"codex_model not in the catalogue: {model}")
+        if effort not in (offered[model].get("efforts") or ()):
+            raise ValueError(f"codex_effort {effort} not offered for {model}")
+        return model, effort
 
     def argv(self, worktree):
         exe = self.exe or _codex_exe()
         if not exe:
             raise FileNotFoundError("no trusted native codex binary")
         return check_argv([exe, "exec", "--json", "--ignore-user-config", "-c", FORCED_LOGIN,
-                           "-c", WINDOWS_SANDBOX, "-C", str(worktree), "--sandbox",
+                           "-c", WINDOWS_SANDBOX, "-m", self.model, "-c", EFFORT_KEY + str(self.effort),
+                           "-C", str(worktree), "--sandbox",
                            "workspace-write", "-"], worktree=worktree)  # prompt on stdin
 
     def admit(self):
@@ -360,7 +406,14 @@ class CodexWorker:
         h = headroom(quota)
         if h is None:
             return None, "unknown"
-        return (h, None) if h >= CODEX_MIN_HEADROOM else (h, "low")
+        if h < CODEX_MIN_HEADROOM:
+            return h, "low"
+        try:  # CODEXMODEL1: a bad pace.json model/effort holds the lane (one codex_hold event)
+            self.model, self.effort = self.pace(state.get("models"))
+        except (OSError, ValueError) as e:  # JSONDecodeError is a ValueError
+            self.model, self.effort = None, None  # argv() refuses None: start() cannot run stale
+            return h, f"pace: {e}"[:120]
+        return h, None
 
     def start(self, name, worktree, text):
         """Start `codex exec` in `worktree` with the prompt on stdin and a scrubbed
@@ -392,7 +445,7 @@ class CodexWorker:
             del self.procs[sid]
             raise RuntimeError("codex start: no process creation time, a restart could not verify it")
         self.info[sid] = {"pid": p.pid, "start": st, "log": str(self.log_dir / f"{name}.jsonl"),
-                          "offset": self.offsets[name]}
+                          "offset": self.offsets[name], "model": self.model, "effort": self.effort}
         return sid
 
     def attach(self, name, sid, info):
