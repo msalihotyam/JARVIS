@@ -1,5 +1,6 @@
 import io
 import stat
+import struct
 import tempfile
 import unittest
 from hashlib import sha256
@@ -95,6 +96,45 @@ class AttachmentIntakeTests(unittest.TestCase):
                         nul_part, backslash_part,
                         office_zip("[Content_Types].xml", "word/document.xml", "xl/workbook.xml")):
             self.assert_refused("invalid_content", "file.docx", content)
+
+    def test_unsupported_zip_version_is_refused(self):
+        content = bytearray(office_zip("[Content_Types].xml", "word/document.xml"))
+        content[content.find(b"PK\x01\x02") + 6] = 0x76
+        self.assert_refused("invalid_content", "file.docx", bytes(content))
+
+    def test_any_central_directory_read_failure_is_refused(self):
+        content = office_zip("[Content_Types].xml", "word/document.xml")
+        for error in (NotImplementedError, ValueError, EOFError, struct.error, OSError, RuntimeError):
+            with self.subTest(error=error), patch("jarvis.talk_attach.zipfile.ZipFile", side_effect=error):
+                self.assert_refused("invalid_content", "file.docx", content)
+
+    def display_name(self, name):
+        return intake_attachment(self.root, name, PNG).display_name
+
+    def test_display_name_drops_alternate_data_stream(self):
+        self.assertEqual(self.display_name("report:hidden.png"), "report.png")
+        self.assertEqual(self.display_name("report:$DATA:x.png"), "report.png")
+
+    def test_display_name_breaks_short_name_alias(self):
+        self.assertEqual(self.display_name("PROGRA~1.png"), "PROGRA_1.png")
+        self.assertEqual(self.display_name("notes~draft.png"), "notes~draft.png")
+
+    def test_display_name_escapes_reserved_device_names(self):
+        for stem in ("CON", "prn", "Aux", "nul", "COM1", "com9", "LPT1", "lpt9", "COM¹",
+                     "CON.tar", "nul .x", "CON."):
+            with self.subTest(stem=stem):
+                self.assertTrue(self.display_name(stem + ".png").startswith("_"))
+        self.assertEqual(self.display_name("CONSOLE.png"), "CONSOLE.png")
+
+    def test_display_name_trims_trailing_dots_and_spaces(self):
+        self.assertEqual(self.display_name("report. . .png"), "report.png")
+        long_name = "a" * 114 + ". .png"
+        self.assertFalse(self.display_name(long_name)[:-4].endswith((".", " ")))
+
+    def test_display_name_strips_bidi_and_zero_width(self):
+        hidden = "​‌‍⁠﻿‪‮⁦⁩‎‏؜"
+        self.assertEqual(self.display_name("re" + hidden + "port.png"), "report.png")
+        self.assertEqual(self.display_name(hidden + ".png"), "attachment.png")
 
     def test_invalid_text(self):
         for content in (b"hi\x00", b"hi\xff"):

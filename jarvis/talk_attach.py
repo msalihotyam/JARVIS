@@ -3,6 +3,7 @@
 import io
 import ntpath
 import os
+import re
 import stat
 import unicodedata
 import zipfile
@@ -16,6 +17,8 @@ _TEXT_KINDS = {"txt", "md", "csv", "json"}
 _OFFICE_PARTS = {"xlsx": "xl/workbook.xml", "docx": "word/document.xml"}
 _MAGIC = {b"\x89PNG\r\n\x1a\n": "png", b"\xff\xd8\xff": "jpg", b"%PDF-": "pdf"}
 _ALLOWED_KINDS = _TEXT_KINDS | _OFFICE_PARTS.keys() | set(_MAGIC.values()) | {"webp"}
+_TRIM = re.compile(r"^[\s.]+|[\s.]+$")
+_RESERVED = re.compile(r"(?i)CON|PRN|AUX|NUL|(?:COM|LPT)[0-9¹²³]")
 
 
 class AttachmentRefused(ValueError):
@@ -39,7 +42,7 @@ def _office_kind(content: bytes) -> str:
     try:
         with zipfile.ZipFile(io.BytesIO(content)) as archive:
             names = [info.orig_filename for info in archive.infolist()]
-    except (zipfile.BadZipFile, UnicodeError) as exc:
+    except Exception as exc:  # zipfile raises many types on crafted input (NotImplementedError, struct.error, ...)
         raise AttachmentRefused("invalid_content") from exc
 
     matches = [kind for kind, part in _OFFICE_PARTS.items() if part in names]
@@ -49,6 +52,16 @@ def _office_kind(content: bytes) -> str:
     if names.count(_OFFICE_PARTS[kind]) != 1:
         raise AttachmentRefused("invalid_content")
     return kind
+
+
+def _display_stem(stem: str, limit: int) -> str:
+    """A label that never reads as an NTFS stream, 8.3 alias, device name or trimmed Windows name."""
+    stem = "".join(char for char in stem if unicodedata.category(char) not in {"Cc", "Cf", "Cs"})
+    stem = re.sub(r"~(?=\d)", "_", stem.split(":", 1)[0])
+    stem = _TRIM.sub("", _TRIM.sub("", stem)[:limit]) or "attachment"
+    if _RESERVED.fullmatch(stem.split(".", 1)[0].rstrip()):
+        stem = "_" + stem[:limit - 1]
+    return stem
 
 
 def _check_content(content: bytes, extension: str) -> None:
@@ -118,8 +131,7 @@ def intake_attachment(
         raise AttachmentRefused("unsupported_extension")
     _check_content(content, extension)
 
-    clean_stem = "".join(char for char in stem if unicodedata.category(char) not in {"Cc", "Cf", "Cs"})
-    display_name = (clean_stem.strip() or "attachment")[:120 - len(suffix)] + suffix
+    display_name = _display_stem(stem, 120 - len(suffix)) + suffix
 
     root = Path(root)
     try:
