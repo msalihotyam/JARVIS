@@ -208,6 +208,21 @@ class KnownRedTests(unittest.TestCase):
                                                        text=text)})
                 self.assertEqual(verdict(checks=checks, known_red=[X, Y]).verdict, "red")
 
+    def test_known_red_text_on_a_non_failure_conclusion_is_red(self) -> None:
+        for conclusion in ("timed_out", "cancelled", "neutral", "skipped", "action_required",
+                           "stale", "startup_failure", None, "Failure", " failure",
+                           "failure\n", 1, True, ["failure"]):
+            with self.subTest(conclusion=conclusion):
+                shard = run("shard 1/2", text=FAIL_TEXT)
+                shard["conclusion"] = conclusion
+                got = verdict(checks=green_doc(**{"shard 1/2": shard}), known_red=[X, Y])
+                self.assertEqual(got.verdict, "red")
+                self.assertEqual(got.failing_checks, ("shard 1/2",))
+        mixed = green_doc(**{"shard 1/2": run("shard 1/2", conclusion="failure", text=FAIL_TEXT),
+                             "shard 2/2": run("shard 2/2", conclusion="timed_out",
+                                              text=FAIL_TEXT)})
+        self.assertEqual(verdict(checks=mixed, known_red=[X, Y]).verdict, "red")
+
     def test_malformed_known_red_entry_is_unknown(self) -> None:
         for known in ([("tests.test_a.A.test_x", "sig")], [KnownRed("", "sig")], "XY"):
             with self.subTest(known=known):
@@ -258,6 +273,16 @@ class FailClosedTests(unittest.TestCase):
         self.assertUnknown(ci_verdict("A" * 40, required=REQUIRED, checks=green_doc()))
         self.assertUnknown(ci_verdict(SHA[:39], required=REQUIRED, checks=green_doc()))
         self.assertUnknown(ci_verdict(None, required=REQUIRED, checks=green_doc()))  # type: ignore[arg-type]
+
+        class Loud:
+            def __str__(self) -> str:
+                raise RuntimeError("str called")
+
+        for sha in (10 ** 5000, Loud(), None, SHA.encode(), 7):
+            with self.subTest(sha=type(sha).__name__):
+                got = ci_verdict(sha, required=REQUIRED, checks=green_doc())  # type: ignore[arg-type]
+                self.assertUnknown(got)
+                self.assertEqual(got.sha, "")
         for required in ("aggregate", (), ("aggregate", "aggregate"), ("aggregate", "")):
             with self.subTest(required=required):
                 self.assertUnknown(ci_verdict(SHA, required=required, checks=green_doc()))

@@ -243,7 +243,9 @@ def _checks(sha: str, required: Sequence[str], text: str,
                 return _unknown(sha, f"check run {name!r} output text is not text")
             body = "\n".join(cast(str, p) for p in parts if p)
             found = failures(body)
-            unparsed = unparsed or not found or not _accounted(body, found)
+            # only a plain test failure can be known-red; timed_out, cancelled, etc. stay red
+            unparsed = (unparsed or run.get("conclusion") != "failure" or not found
+                        or not _accounted(body, found))
             pairs.extend(found)
     missing = [name for name in required if name not in seen]
     if failing:
@@ -284,7 +286,9 @@ def ci_verdict(sha: str, *, required: Sequence[str], events: str | None = None,
                checks: str | None = None, known_red: Iterable[KnownRed] = ()) -> CiVerdict:
     """One typed verdict for the exact candidate sha from the ledger and/or check-runs text."""
     if not isinstance(cast(object, sha), str) or not _SHA.fullmatch(sha):
-        return _unknown(str(sha), "candidate sha is not 40 lowercase hex")
+        # no str() of a non-str sha: a 5000-digit int or a raising __str__ would escape
+        return _unknown(sha if isinstance(cast(object, sha), str) else "",
+                        "candidate sha is not 40 lowercase hex")
     # a bare str is a Sequence too; only a real list/tuple of names is a required-check list
     names = list(cast(Sequence[object], required)) if isinstance(required, (list, tuple)) else []
     if (not names or not all(isinstance(n, str) and n for n in names)
