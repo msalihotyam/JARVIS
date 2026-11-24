@@ -1633,7 +1633,102 @@ class TestPager(Base):
         self.assertIn("A: STATUS STOP", self.pushes[-1])
 
 
-RESET_ALERT = "Haftalık kota %{}: sıfırlama hakkını şimdi kullanabilirsin"
+class TestNtfyScreen(Base):
+    """DORAGATE3: every ntfy text passes ntfy_send's Dora/secret screen (synthetic list, no network)."""
+
+    WORD = "zqxfoo"  # synthetic deny word, not a real one
+
+    def setUp(self):
+        super().setUp()
+        from jarvis import dora_screen
+        self.deny = self.root / "deny.json"
+        self.deny.write_text(json.dumps({"version": 1, "shapes": [r"zq-\d{4}"], "words": [self.WORD]}),
+                             encoding="utf-8")
+        for p in (mock.patch.object(dora_screen, "DENY_PATH", self.deny),
+                  mock.patch.dict(os.environ, {"JARVIS_NTFY_TOPIC": "topic_42"}),
+                  mock.patch.object(conveyor.urllib.request, "urlopen", side_effect=self.fake_urlopen)):
+            p.start()
+            self.addCleanup(p.stop)
+        self.sent = []  # (body, title) of every request that reached the HTTP layer
+        self.c.send = conveyor.ntfy_send
+
+    def fake_urlopen(self, req, timeout=None):
+        self.sent.append((req.data.decode("utf-8"), req.get_header("Title")))
+        return contextlib.nullcontext()
+
+    def logs(self):
+        return "".join((self.base / f).read_text(encoding="utf-8")
+                       for f in ("events.jsonl", "pager.json") if (self.base / f).exists())
+
+    def assert_withheld(self, result, why):
+        self.assertEqual(result, "withheld " + why)
+        self.assertEqual(self.sent, [(conveyor.NTFY_WITHHELD, "JARVIS")])
+        self.assertNotIn(self.WORD, self.logs())
+
+    def test_clean_text_unchanged(self):
+        self.assertEqual(conveyor.ntfy_send("A: STATUS PASS", title="Durum"), "sent")
+        self.assertEqual(self.sent, [("A: STATUS PASS", "Durum")])
+
+    def test_deny_hit_withheld(self):
+        self.assert_withheld(conveyor.ntfy_send("lane Zq.X.foo done"), "deny")
+
+    def test_deny_hit_in_title_withheld(self):
+        self.assert_withheld(conveyor.ntfy_send("ok", title=self.WORD), "deny")
+
+    def test_secret_withheld(self):
+        self.assert_withheld(conveyor.ntfy_send("token ghp_" + "a1" * 12), "secret")
+
+    def test_deny_list_failure_withholds(self):
+        for body in ("{not json", json.dumps({"version": 1, "shapes": [], "words": []})):
+            self.sent.clear()
+            self.deny.write_text(body, encoding="utf-8")
+            self.assert_withheld(conveyor.ntfy_send("A: STATUS PASS"), "doubt:list")
+        self.deny.unlink()
+        self.sent.clear()
+        self.assert_withheld(conveyor.ntfy_send("A: STATUS PASS"), "doubt:list")
+
+    def test_screen_error_withholds(self):
+        from jarvis import dora_screen
+        with mock.patch.object(dora_screen, "screen", side_effect=RuntimeError(self.WORD)):
+            self.assert_withheld(conveyor.ntfy_send("A: STATUS PASS"), "doubt:screen")
+
+    def test_page_path_withheld_and_not_retried(self):
+        self.c.page("A: " + self.WORD)
+        self.c.flush_pages()
+        ev = [e for e in self.events() if e["event"] == "page"]
+        self.assertEqual(ev[-1]["result"], "withheld deny")
+        self.assert_withheld(ev[-1]["result"], "deny")
+        self.assertEqual(self.c.pager_flag("pending"), [])
+        self.assertNotIn("last_page", self.c.load_pager())
+
+    def phone_results(self):
+        return [e["result"] for e in self.events() if e["event"] == "phone_send"]
+
+    def test_phone_durum_path(self):
+        with mock.patch.object(self.c, "durum_text", return_value="Durum: " + self.WORD):
+            self.c.phone_cmd({"id": "1", "message": "durum"}, {}, [])
+        self.assertEqual(self.phone_results(), ["withheld deny"])
+        self.assert_withheld("withheld deny", "deny")
+
+    def test_phone_replies_and_restart_pass_the_screen(self):
+        self.c.phone_cmd({"id": "1", "message": "durdur"}, {}, [])
+        self.c.phone_send("not", "Not " + self.WORD, "Not")
+        self.c.send_before_restart()
+        self.assertEqual(self.phone_results(), ["sent", "withheld deny", "sent"])
+        self.assertEqual([t for _, t in self.sent], ["Durdur", "JARVIS", "Yeniden baslat"])
+        self.assertNotIn(self.WORD, self.logs())
+
+    def test_no_bypass_of_the_choke_point(self):
+        src = Path(conveyor.__file__).read_text(encoding="utf-8")
+        self.assertEqual(src.count("ntfy_request("), 2)  # its def and the one call in ntfy_send
+        self.assertEqual(src.count("urlopen("), 3)  # ntfy_poll's GET, ntfy_send, anthropic_post (model)
+        self.assertEqual(src.count("ntfy.sh/"), 2)  # ntfy_poll's GET and ntfy_request
+        self.assertIn("send=ntfy_send", src)
+        body = src[src.index("def ntfy_send("):src.index("def ntfy_send(") + 1200]
+        self.assertLess(body.index("ntfy_screen("), body.index("ntfy_request("))
+
+
+RESET_ALERT ="Haftalık kota %{}: sıfırlama hakkını şimdi kullanabilirsin"
 
 
 class TestUsageGuard(Base):

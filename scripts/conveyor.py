@@ -929,17 +929,44 @@ def ntfy_request(topic, text, title):
 
 
 NTFY_TIMEOUT_S = 15  # urlopen timeout of one push; send_before_restart waits longer than this
+NTFY_WITHHELD = "JARVIS: message withheld by the Dora screen"
+
+
+def ntfy_screen(text, title):
+    """DORAGATE3: (text, title, "") when both pass the shared Dora/secret screen, else the
+    fixed content-free notice and a reason code (never the matched text). Fail closed."""
+    try:
+        if str(ROOT) not in sys.path:
+            sys.path.append(str(ROOT))
+        from jarvis import dora_screen
+    except Exception:
+        return NTFY_WITHHELD, "JARVIS", "doubt:import"
+    try:
+        deny = dora_screen.load_deny()
+    except Exception:
+        return NTFY_WITHHELD, "JARVIS", "doubt:list"
+    for part in (text, str(title)):
+        try:
+            ok, why = dora_screen.screen(part, deny)
+        except Exception:
+            ok, why = False, "doubt:screen"
+        if not ok:
+            return NTFY_WITHHELD, "JARVIS", why or "doubt:screen"
+    return text, title, ""
 
 
 def ntfy_send(text, title="JARVIS Konveyor"):
-    """Push text to ntfy. Returns a short result; the topic never leaves this function."""
+    """Push text to ntfy. Returns a short result; the topic never leaves this function.
+    The one choke point of every ntfy text: a screened-out text goes as NTFY_WITHHELD and
+    the result is 'withheld <reason>'."""
     topic = os.environ.get("JARVIS_NTFY_TOPIC", "")
     if not TOPIC_RE.fullmatch(topic):
         return "no-topic"
     try:
+        text, title, why = ntfy_screen(text, title)
         req = ntfy_request(topic, text, title)
         with urllib.request.urlopen(req, timeout=NTFY_TIMEOUT_S):  # nosec B310 - fixed https URL, topic validated
-            return "sent"
+            return "withheld " + why if why else "sent"
     except Exception as e:  # never str(e): keep any URL out of the log
         return "error " + type(e).__name__
 
@@ -1661,8 +1688,8 @@ class Conveyor:
             p["last_push"] = self.now()
         if result == "sent":  # PHONECMD: the durum report shows the last page
             p["last_page"] = {"text": text[:200], "ts": self.now()}
-        if result in ("sent", "no-topic"):
-            p["pending"] = []  # on a send error they are retried after the gap
+        if result in ("sent", "no-topic") or str(result).startswith("withheld"):
+            p["pending"] = []  # on a send error they are retried after the gap; withheld never
         self.save_pager(p)
 
     def pager_flag(self, key, value=None):
