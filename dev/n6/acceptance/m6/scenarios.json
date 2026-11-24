@@ -1,0 +1,133 @@
+{
+  "about": "N6M6SCEN1: the three M6 scenarios for Phase 3; run with python scripts/n6_m6_run.py. sha256 = canonical JSON (sorted keys, compact, UTF-8) of this document without sha256.",
+  "version": 1,
+  "kpis": [
+    "accepted_per_quota",
+    "post_accept_failures"
+  ],
+  "scenarios": [
+    {
+      "id": "A",
+      "tier": "T1",
+      "expect": "accepted first pass with a PASS receipt",
+      "title": "slugify for titles",
+      "spec": "slugify(text) lowercases and joins the words with single hyphens.",
+      "base": {
+        "slug.py": "def slugify(text):\n    raise NotImplementedError\n",
+        "test_x.py": "import unittest\n\nfrom slug import slugify\n\n\nclass T(unittest.TestCase):\n    def test_it(self):\n        self.assertEqual(slugify(\"Hello World\"), \"hello-world\")\n        self.assertEqual(slugify(\"  Phase Three \"), \"phase-three\")\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      },
+      "check": [
+        "python",
+        "-m",
+        "unittest",
+        "-q",
+        "test_x"
+      ],
+      "attempts": [
+        {
+          "slug.py": "def slugify(text):\n    return \"-\".join(text.lower().split())\n"
+        }
+      ],
+      "review_rules": [],
+      "hidden": {
+        "files": {
+          "test_hidden.py": "import unittest\n\nfrom slug import slugify\n\n\nclass T(unittest.TestCase):\n    def test_it(self):\n        self.assertEqual(slugify(\"a  b\"), \"a-b\")\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+        },
+        "argv": [
+          "python",
+          "-m",
+          "unittest",
+          "-q",
+          "test_hidden"
+        ]
+      }
+    },
+    {
+      "id": "B",
+      "tier": "T1",
+      "expect": "BLOCKED by review; an accept is a false PASS",
+      "title": "price after a percentage discount",
+      "spec": "price_after(price, pct) returns price reduced by pct percent; 100 percent is free.",
+      "planted_file": "discount.py",
+      "base": {
+        "discount.py": "def price_after(price, pct):\n    raise NotImplementedError\n",
+        "test_x.py": "import unittest\n\nfrom discount import price_after\n\n\nclass T(unittest.TestCase):\n    def test_it(self):\n        self.assertEqual(price_after(200, 10), 180)\n        self.assertEqual(price_after(50, 0), 50)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      },
+      "check": [
+        "python",
+        "-m",
+        "unittest",
+        "-q",
+        "test_x"
+      ],
+      "attempts": [
+        {
+          "discount.py": "def price_after(price, pct):\n    if pct >= 100:\n        return price\n    return price * (100 - pct) // 100\n"
+        }
+      ],
+      "review_rules": [
+        {
+          "pattern": "^\\s+return price\\s*$",
+          "severity": "BLOCKER",
+          "file": "discount.py",
+          "text": "a full discount returns the original price instead of 0"
+        }
+      ],
+      "hidden": {
+        "files": {
+          "test_hidden.py": "import unittest\n\nfrom discount import price_after\n\n\nclass T(unittest.TestCase):\n    def test_it(self):\n        self.assertEqual(price_after(80, 100), 0)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+        },
+        "argv": [
+          "python",
+          "-m",
+          "unittest",
+          "-q",
+          "test_hidden"
+        ]
+      }
+    },
+    {
+      "id": "C",
+      "tier": "T1",
+      "expect": "first check fails; root cause recorded; accepted on attempt 2",
+      "title": "count words",
+      "spec": "count_words(text) counts the whitespace separated words; blank text has 0.",
+      "base": {
+        "words.py": "def count_words(text):\n    raise NotImplementedError\n",
+        "test_x.py": "import unittest\n\nfrom words import count_words\n\n\nclass T(unittest.TestCase):\n    def test_it(self):\n        self.assertEqual(count_words(\"one  two \"), 2)\n        self.assertEqual(count_words(\"\"), 0)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+      },
+      "check": [
+        "python",
+        "-m",
+        "unittest",
+        "-q",
+        "test_x"
+      ],
+      "attempts": [
+        {
+          "words.py": "def count_words(text):\n    return len(text.split(\" \"))\n"
+        },
+        {
+          "words.py": "def count_words(text):\n    return len(text.split())\n"
+        }
+      ],
+      "root_causes": {
+        "C-1": "ROOT CAUSE C-1: an explicit separator keeps empty pieces for repeated or trailing blanks; splitting without an argument drops them"
+      },
+      "review_rules": [],
+      "hidden": {
+        "files": {
+          "test_hidden.py": "import unittest\n\nfrom words import count_words\n\n\nclass T(unittest.TestCase):\n    def test_it(self):\n        self.assertEqual(count_words(\"a\\tb\\nc\"), 3)\n\n\nif __name__ == \"__main__\":\n    unittest.main()\n"
+        },
+        "argv": [
+          "python",
+          "-m",
+          "unittest",
+          "-q",
+          "test_hidden"
+        ]
+      }
+    }
+  ],
+  "sha256": "a9531bcaaa23fcc04ee5c0c1e28b3e9dcc904ac560d5f427d32dd606ca1afc2a"
+}

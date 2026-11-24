@@ -1,0 +1,8 @@
+{
+ "version": 1,
+ "about": "N6M6SCEN1: seconds per test class for tests.test_n6_m6 (local measurement, same schema as scripts/test_durations.json).",
+ "classes": {
+  "tests.test_n6_m6.M6PinAndScoreTests": 0.076,
+  "tests.test_n6_m6.M6RunTests": 8.701
+ }
+}
