@@ -1,4 +1,5 @@
 import json
+import unicodedata
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -34,6 +35,10 @@ class TalkGlossaryTests(unittest.TestCase):
                 with self.subTest(mark=hex(ord(mark)), text=text):
                     self.assertEqual(glossary.correct(text), (text, []))
         self.assertEqual(glossary.correct("en altı᪰"), ("en altı᪰", []))
+        # Orphan marks and joiners with no word base before the alias.
+        for text in ("́en altı", ".́en altı", "\U0001f44d‍en altı", "❤️en altı", "x ­en altı"):
+            with self.subTest(text=text):
+                self.assertEqual(glossary.correct(text), (text, []))
 
     def test_decomposed_transcript_matches_precomposed_alias(self):
         glossary = self.load_rows([{"canonical": "N6", "aliases": ["í"]}])
@@ -46,6 +51,41 @@ class TalkGlossaryTests(unittest.TestCase):
                 {"canonical": "A", "aliases": ["í"]},
                 {"canonical": "B", "aliases": ["İ́"]},
             ])
+
+    def test_canonical_equivalents_that_tokenize_differently_match_and_conflict(self):
+        # Sm, Sk, Mn (composition exclusion), Mc, Mc: NFD changes the token count or the composed form.
+        for char in ("≠", "΅", "̈́", "ো", "ୈ"):
+            alias, decomposed = f"x{char}y", "x" + unicodedata.normalize("NFD", char) + "y"
+            with self.subTest(char=hex(ord(char))):
+                glossary = self.load_rows([{"canonical": "N6", "aliases": [alias]}])
+                self.assertEqual(glossary.correct(decomposed), ("N6", [Replacement(decomposed, "N6")]))
+                self.assertEqual(glossary.correct(f"a {alias}!"), ("a N6!", [Replacement(alias, "N6")]))
+                with self.assertRaisesRegex(ValueError, "ambiguous"):
+                    self.load_rows([
+                        {"canonical": "N6", "aliases": [alias]},
+                        {"canonical": "N7", "aliases": [decomposed]},
+                    ])
+
+    def test_non_word_token_never_folds_into_a_word_key(self):
+        glossary = self.load_rows([
+            {"canonical": "N6", "aliases": ["ι"]},
+            {"canonical": "N7", "aliases": ["N6x"]},
+        ])
+        for text in ("ͅx", "ͅ", "a ͅ b"):
+            with self.subTest(text=text):
+                self.assertEqual(glossary.correct(text), (text, []))
+        self.assertEqual(glossary.correct("ι x"), ("N6 x", [Replacement("ι", "N6")]))
+
+    def test_alias_containing_a_canonical_run_is_refused_at_load(self):
+        for alias in ("API kit", "my aPI", "the API kit", "SDK"):
+            with self.subTest(alias=alias), self.assertRaisesRegex(ValueError, "contains a canonical"):
+                self.load_rows([
+                    {"canonical": "API", "aliases": []},
+                    {"canonical": "SDK", "aliases": [alias]},
+                ])
+        # A word that only starts with the canonical is not a run of it.
+        glossary = self.load_rows([{"canonical": "API", "aliases": []}, {"canonical": "SDK", "aliases": ["APIs kit"]}])
+        self.assertEqual(glossary.correct("APIs kit"), ("SDK", [Replacement("APIs kit", "SDK")]))
 
     def test_turkish_case_folding(self):
         glossary = self.load_rows([

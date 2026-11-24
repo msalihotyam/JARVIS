@@ -11,11 +11,12 @@ DEFAULT_GLOSSARY_PATH = Path(__file__).resolve().parents[1] / "dev" / "talk" / "
 # Every combining mark (Mn/Mc/Me), format joiner (Cf, e.g. ZWNJ), connector (Pc, e.g. U+203F)
 # and emoji skin-tone modifier (Word_Break=Extend) stays inside a word,
 # so an alias never matches the start of a longer word. Python re has no \p{M}; scan once.
-_JOINERS = "".join(
-    re.escape(chr(code))
+_JOINER_CHARS = frozenset(
+    chr(code)
     for code in range(sys.maxunicode + 1)
     if unicodedata.category(chr(code)) in {"Mn", "Mc", "Me", "Cf", "Pc"} or 0x1F3FB <= code <= 0x1F3FF
 )
+_JOINERS = "".join(map(re.escape, sorted(_JOINER_CHARS)))
 _WORD = rf"\w[\w{_JOINERS}]*"
 _TOKEN = re.compile(rf"{_WORD}|\s+|[^\w\s]")
 _TURKISH_I = str.maketrans({"I": "ı", "İ": "i"})
@@ -24,12 +25,33 @@ _TURKISH_I = str.maketrans({"I": "ı", "İ": "i"})
 def _fold(token: str) -> str:
     if token.isspace():
         return " "
-    folded = unicodedata.normalize("NFC", token).translate(_TURKISH_I).casefold()
+    if not re.fullmatch(_WORD, token):
+        # A non-word token is never casefolded (U+0345 folds to a letter) and never equals a word key.
+        return "\0" + token
+    folded = token.translate(_TURKISH_I).casefold()
     return unicodedata.normalize("NFC", folded)
 
 
+def _nfc_with_offsets(text: str) -> tuple[str, dict[int, int]]:
+    """NFC the text in independently normalizable chunks; map each NFC chunk start to its original offset."""
+    bounds = [0]
+    for index in range(1, len(text)):
+        char, chunk = text[index], text[bounds[-1]:index]
+        if unicodedata.combining(unicodedata.normalize("NFD", char)[0]) == 0 and unicodedata.normalize(
+            "NFC", chunk + char
+        ) == unicodedata.normalize("NFC", chunk) + unicodedata.normalize("NFC", char):
+            bounds.append(index)
+    parts, offsets, position = [], {}, 0
+    for left, right in zip(bounds, bounds[1:] + [len(text)]):
+        offsets[position] = left
+        parts.append(unicodedata.normalize("NFC", text[left:right]))
+        position += len(parts[-1])
+    offsets[position] = len(text)
+    return "".join(parts), offsets
+
+
 def _term_key(term: str) -> tuple[str, ...]:
-    tokens = _TOKEN.findall(term)
+    tokens = _TOKEN.findall(unicodedata.normalize("NFC", term))
     if not tokens or not all(re.fullmatch(_WORD, token) for token in (tokens[0], tokens[-1])):
         raise ValueError(f"glossary term must start and end with a word: {term!r}")
     return tuple(map(_fold, tokens))
@@ -77,8 +99,10 @@ class Glossary:
                 previous = canonicals.get(key, aliases.get(key))
                 if previous is not None and previous != row.canonical:
                     raise ValueError(f"ambiguous glossary alias: {alias!r}")
-                if key not in canonicals:
-                    aliases[key] = row.canonical
+                # Canonical spans are protected, so such an alias could never fire.
+                if any(key[start:end] in canonicals for start in range(len(key)) for end in range(start + 1, len(key) + 1)):
+                    raise ValueError(f"glossary alias contains a canonical term: {alias!r}")
+                aliases[key] = row.canonical
 
         self._rows = rows
         self._canonicals = canonicals
@@ -124,7 +148,8 @@ class Glossary:
 
     def correct(self, transcript: str) -> tuple[str, list[Replacement]]:
         """Apply leftmost, longest aliases and report edits in transcript order."""
-        tokens = list(_TOKEN.finditer(transcript))
+        normalized, offsets = _nfc_with_offsets(transcript)
+        tokens = list(_TOKEN.finditer(normalized))
         keys = tuple(_fold(token.group()) for token in tokens)
         protected_until = 0
         protected = []
@@ -142,11 +167,15 @@ class Glossary:
         changes = []
         cursor = start = 0
         while start < len(tokens):
-            for size in self._sizes:
+            # An alias right after an orphan mark or joiner (no word base) is joined to it: no edit.
+            joined = start > 0 and tokens[start - 1].group()[-1] in _JOINER_CHARS
+            for size in [] if joined else self._sizes:
                 end = start + size
                 canonical = self._aliases.get(keys[start:end]) if end <= len(tokens) else None
-                if canonical is not None and not any(protected[start:end]):
-                    left, right = tokens[start].start(), tokens[end - 1].end()
+                left = offsets.get(tokens[start].start())
+                right = offsets.get(tokens[end - 1].end()) if end <= len(tokens) else None
+                # A span edge inside one NFC chunk has no original offset: fail closed, no edit.
+                if canonical is not None and left is not None and right is not None and not any(protected[start:end]):
                     pieces.extend((transcript[cursor:left], canonical))
                     changes.append(Replacement(transcript[left:right], canonical))
                     cursor, start = right, end
