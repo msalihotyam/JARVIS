@@ -29,14 +29,17 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
+from jarvis.providers import PROBED
+
 #: How old a provider line may be before opening the selector re-checks it.
 TTL_SECONDS = 300.0
 #: After a failed probe: try again this soon, not on every open.
 FAILURE_RETRY_SECONDS = 60.0
 
 CACHE_VERSION = 1
-#: Providers with a live probe, in display order; Qwen is a fixed "deferred" line.
-PROBED = ("claude", "codex", "google")
+#: Providers with a live probe, in display order (``PROBED``, from ``jarvis.providers``);
+#: Qwen is a fixed "deferred" line.
+
 
 _ENTRY_KEYS = ("id", "vendor", "name", "status", "evidence", "plan", "models", "quota", "research", "attachments")
 _MODEL_KEYS = ("id", "name", "resolved", "description", "efforts", "default_effort")

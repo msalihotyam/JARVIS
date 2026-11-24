@@ -69,6 +69,7 @@ from jarvis.connectors.project_folder import (
 )
 from jarvis.intent import INTENT_SYSTEM_PROMPT, claude_model_catalog
 from jarvis.model_retirement import codex_retirement
+from jarvis.providers import BY_ID as PROVIDER_BY_ID, CHAT_PROVIDERS as _CHAT_PROVIDERS, PROBED, PROVIDERS
 from jarvis.contracts import BillingClass, ErrorCode
 from jarvis.core import capture_gate_open
 from jarvis.memory import SQLiteMemoryStore
@@ -129,12 +130,8 @@ def approval_ticket(payload: Any) -> ApprovalTicket | None:
 #:   need nothing from the provider and grant it no file access.
 #: * No provider gets a file tool, a shell or a browser for this, and a
 #:   combination that is not supported is refused - never re-routed.
-ATTACHMENT_SUPPORT = {
-    "claude": {"image": True, "text": True},
-    "codex": {"image": True, "text": True},
-    "google": {"image": False, "text": False},
-    "qwen": {"image": False, "text": False},
-}
+#: One mutable dict (bridge imports it, tests patch it in place), built from ``jarvis.providers``.
+ATTACHMENT_SUPPORT = {p.id: dict(p.attachments) for p in PROVIDERS}
 
 
 class Backend:
@@ -319,7 +316,7 @@ class Backend:
 
     #: The provider lines a person can choose for General Chat / understanding.
     #: Choosing one changes who INTERPRETS a request - never what JARVIS may do.
-    CHAT_PROVIDERS = ("claude", "codex")
+    CHAT_PROVIDERS = _CHAT_PROVIDERS
 
 
     def providers(self) -> list[dict]:
@@ -328,11 +325,15 @@ class Backend:
         list; Codex's app-server account, plan limits and model catalog; whether
         the Antigravity CLI is installed (a file check - agy is never started).
         Qwen is deferred past V1."""
-        return [self.provider_line(pid) for pid in ("claude", "codex", "google")] + [self.qwen_line()]
+        return [self.provider_line(pid) for pid in PROBED] + [self.qwen_line()]
+
+    @staticmethod
+    def _labels(pid: str) -> dict:
+        return {"id": pid, "vendor": PROVIDER_BY_ID[pid].vendor, "name": PROVIDER_BY_ID[pid].name}
 
     @staticmethod
     def qwen_line() -> dict:
-        return {"id": "qwen", "vendor": "Alibaba Cloud", "name": "Qwen", "status": "deferred", "models": [],
+        return {**Backend._labels("qwen"), "status": "deferred", "models": [],
                 "research": False, "attachments": dict(ATTACHMENT_SUPPORT["qwen"])}
 
     def provider_line(self, pid: str) -> dict:
@@ -350,7 +351,7 @@ class Backend:
                 status = ("available" if billing_class is BillingClass.SUBSCRIPTION_INCLUDED
                           else "not_logged_in" if evidence == AUTH_NOT_LOGGED_IN_EVIDENCE else "unavailable")
                 models = self.claude_catalog() if status == "available" else []
-            return {"id": "claude", "vendor": "Anthropic", "name": "Claude", "status": status,
+            return {**self._labels("claude"), "status": status,
                     "evidence": evidence, "models": models, "research": status == "available",
                     "attachments": dict(ATTACHMENT_SUPPORT["claude"])}
         if pid == "codex":
@@ -369,13 +370,13 @@ class Backend:
             # a real call in this session showed - "usable", "failed" + reason, or
             # nothing yet ("" = discovered, not verified).
             models = [{**model, "verified": dict(self.codex_verified.get(model.get("id"), {}))} for model in offered]
-            return {"id": "codex", "vendor": "OpenAI", "name": "Codex", "status": state.get("status", "unavailable"),
+            return {**self._labels("codex"), "status": state.get("status", "unavailable"),
                     "plan": state.get("plan", ""), "models": models, "quota": state.get("quota") or {},
                     "retired": retired, "research": False, "attachments": dict(ATTACHMENT_SUPPORT["codex"])}
         try:
             google = self.google_state()
         except Exception:  # noqa: BLE001 - an unreadable check establishes nothing
-            google = {"id": "google", "vendor": "Google", "name": "Antigravity", "status": "unavailable", "models": [], "research": False}
+            google = {**self._labels("google"), "status": "unavailable", "models": [], "research": False}
         # Never selectable in V1: no chat, no research, read-only quota at most.
         return {**google, "attachments": dict(ATTACHMENT_SUPPORT["google"])}
 
