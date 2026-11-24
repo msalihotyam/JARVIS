@@ -9203,6 +9203,8 @@ class TestChain(AutopilotBase):
         self.tpl.mkdir(parents=True)
         for f in (Path(conveyor.__file__).parent / "chain_templates").glob("*.md"):
             (self.tpl / f.name).write_bytes(f.read_bytes())
+        self.base.mkdir(parents=True, exist_ok=True)  # TRAIN1: these tests pin the per-slice INT ("train": false)
+        (self.base / "pace.json").write_text(json.dumps({"train": False}), encoding="utf-8")
         self.commit()
 
     def commit(self, files=("scripts/a.py",)):

@@ -2146,6 +2146,7 @@
   "tests.test_conveyor.TestReader.test_unknown_status_with_pass_reading_pages": 0.121,
   "tests.test_conveyor.TestReader.test_valid_reading_makes_one_call": 0.092,
   "tests.test_conveyor.TestReader.test_valid_reading_recorded": 0.111,
+  "tests.test_conveyor_train.TestTrain": 1.5,
   "tests.test_cost_verification.CostAndVerificationTests.test_actual_usage_is_persisted_and_aggregated": 2.818,
   "tests.test_cost_verification.CostAndVerificationTests.test_both_settings_doors_reject_a_blank_approval_id": 0.233,
   "tests.test_cost_verification.CostAndVerificationTests.test_cancellation_is_persisted": 0.782,

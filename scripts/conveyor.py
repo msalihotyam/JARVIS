@@ -258,6 +258,8 @@ KEEP_MAX = 30  # CONVRESERVE: pace.json salih_keep_pct (written by the orchestra
 KEEP_ASK_BEFORE_S = 12 * 3600  # Salih is asked once, this long before window_start + days (Thursday 10:00)
 MIN_LANES = 2  # pace.json min_lanes default (not written; capped by the lane cap when not set)
 INT_RE = re.compile(r"(?i)^int(?![a-z])")  # integration lanes (INT7, int-x): one at a time
+TRAIN_RE = re.compile(r"(?i)^INT-TRAIN\d+$")  # TRAIN1: a train INT (several ready chain slices in one)
+TRAIN_MAX = 6  # TRAIN1: slices per train (architecture v2.3 11.2)
 # LANESPLIT: each lane reads LANE_RULES.md trimmed to its type. A rule block starts at a heading or
 # a rule id (C1.., C5B, C8b, I4b, F1.., KNOWN-RED); "[only: <types>]" at the end of its first line
 # limits it to those types (untagged = every type). Any doubt -> the lane keeps the full file.
@@ -4860,12 +4862,13 @@ class Conveyor:
                     self.error(f"autofix {name}: {type(e).__name__}: {e}"[:300])
             if not INT_RE.match(name) or role == "afx" or name.endswith("-AFX"):
                 continue  # a fix lane (also one started by hand) never gets key 1 or a chain
+            train = TRAIN_RE.match(name)  # TRAIN1: no pinned rerun, no AFX: chain_train rebuilds or bisects
             if st == "GREEN":
                 if self.push_deferred(ap.get("breaker")):
                     ln.pop("ap", None)  # a later pass retries
-                elif not self.chain_int_rerun(name, ln, ap):
+                elif train or not self.chain_int_rerun(name, ln, ap):
                     self.auto_approve(name, ln, lanes, ap)
-            elif st == "BLOCKED" and role is None and not name.endswith("-R"):
+            elif st == "BLOCKED" and role is None and not name.endswith("-R") and not train:
                 self.auto_fix(name, ln, chains, ap)
         ap["bad"] = [x for x in ap.get("bad", []) if self.now() - x[1] < BREAKER_WINDOW_S]
         if len(ap["bad"]) >= BREAKER_BAD:
@@ -4952,6 +4955,131 @@ class Conveyor:
             if why:  # the event first: if it cannot be written the flag stays off and the next pass refuses
                 self.event("chain_refused", src=s["id"], reason=why)
                 ln["chain_refused"], ln["chain_refused_at"] = why, self.now()
+        try:
+            self.chain_train(lanes, ap, ids)
+        except Exception as e:  # git, disk or a bad record: the ready set stays, a later pass retries
+            self.error(f"train: {type(e).__name__}: {e}"[:300])
+
+    def train_patch_id(self, picks):
+        """sha256 of the picks' diffs without index/hunk-position lines (a patch-id the injected git can give)."""
+        h = hashlib.sha256()
+        for p in picks:
+            rc, out = self.cmd(["git", "diff-tree", "-p", "--no-commit-id", p])
+            if rc != 0 or not out.strip():
+                raise RuntimeError(f"git diff-tree {p[:7]} rc={rc}")
+            h.update("\n".join(x.strip() for x in out.splitlines()
+                               if x.strip() and not x.startswith(("index ", "@@"))).encode("utf-8"))
+        return h.hexdigest()
+
+    def chain_train(self, lanes, ap, ids):
+        """TRAIN1 (architecture v2.3 11.1-11.3): the ready set (chain INTs whose reviews passed) lands in
+        ONE train INT: oldest first, <= TRAIN_MAX, pairwise disjoint files, base = origin/main, manifest
+        build/conveyor/trains/<id>.json first. Landed: members leave. origin/main moved: rebuilt from the
+        same set. Red: all members stay, a failed-combination record, the next train takes half."""
+        ready, open_, failed = ap.get("train_ready", []), ap.get("train_open"), ap.get("train_failed", [])
+        if (not isinstance(ready, list) or not all(isinstance(m, dict) and isinstance(m.get("files"), list)
+                                                   and isinstance(m.get("picks"), list) for m in ready)
+                or not isinstance(open_, (dict, type(None))) or not isinstance(failed, list)):
+            raise ValueError("malformed train state in autopilot.json")
+        if not ready and not open_:
+            return
+        rc, om = self.cmd(["git", "rev-parse", "--verify", "refs/remotes/origin/main"])
+        om = om.strip()
+        if rc != 0 or not SHA_RE.fullmatch(om):
+            raise RuntimeError("origin/main unknown")
+        if open_:
+            tid, keys = open_["id"], open_["members"]
+            ln = lanes.get(tid)
+            st = ln.get("status") if ln and ln.get("finished") else None
+            cand = (ln or {}).get("ci") or {}
+            if cand.get("cand") and SHA_RE.fullmatch(str(cand.get("sha"))) and self.is_ancestor(cand["sha"], om):
+                ap["train_ready"] = [m for m in ready if m["key"] not in keys]
+                if not any(k in f.get("members", []) for f in failed for k in
+                           (m["key"] for m in ap["train_ready"])):
+                    ap.pop("train_cap", None)  # the failed combination is drained: full trains again
+                kind = "TRAIN-LANDED"
+            elif om != open_["start"]:
+                kind = "TRAIN-INVALID"  # CAS lost: rebuilt from the same ready set, nothing blamed
+            elif st is None or st in ("GREEN", CI_PENDING):
+                return  # running, or waiting for key 1 / the push gate
+            else:
+                ap["train_failed"] = failed + [{"id": tid, "members": keys, "status": st, "at": self.now()}]
+                ap["train_cap"] = max(1, len(keys) // 2)
+                kind = "TRAIN-RED"
+                if len(keys) == 1:  # isolated: parked for the orchestrator, never retried by the train
+                    ap["train_ready"] = [m for m in ready if m["key"] not in keys]
+                    kind = "TRAIN-PARKED"
+            ap["train_open"] = None
+            self.chain_pending.append(dict(src=",".join(k.split("@")[0] for k in keys), step=kind, id=tid,
+                                           sha=open_["start"], main=om))
+            return
+        if any(INT_RE.match(n) and (not x.get("finished") or x.get("status") == CI_PENDING)
+               for n, x in lanes.items()):
+            return  # one INT at a time on main
+        ready = [m for m in ready if not all(self.is_ancestor(p, om) for p in m["picks"])]
+        ap["train_ready"] = ready
+        picked, used = [], set()
+        for m in sorted(ready, key=lambda m: m.get("at") or 0):
+            if len(picked) >= min(TRAIN_MAX, int(ap.get("train_cap") or TRAIN_MAX)):
+                break
+            if used.isdisjoint(m["files"]):  # T3: a slice that would overlap waits for the next train
+                picked.append(m)
+                used.update(m["files"])
+        if not picked:
+            return
+        n = 1 + len(ap.get("train_failed", [])) + sum(1 for x in ap.get("chain_slices", [])
+                                                      if TRAIN_RE.match(str(x.get("id", ""))))
+        while any(f"INT-TRAIN{n}".upper() in {str(x).upper() for x in c} for c in (lanes, ids, chain_int_ids(ap))) or (
+                self.root / "build/conveyor/prompts" / f"INT-TRAIN{n}.md").exists() or (
+                self.base / "trains" / f"INT-TRAIN{n}.json").exists():
+            n += 1
+        tid = f"INT-TRAIN{n}"
+        files = list(dict.fromkeys(f for m in picked for f in m["files"]))
+        tier = max((m["tier"] for m in picked), key=["T0", "T1", "T2"].index)
+        manifest = {"id": tid, "start": om, "files": files, "at": self.now(), "members": [
+            {"src": m["src"], "sha": m["sha"], "picks": m["picks"], "patch_id": self.train_patch_id(m["picks"]),
+             "reports": m["reports"]} for m in picked]}
+        tpl = (self.root / "scripts" / "chain_templates" / "INT.md").read_text(encoding="utf-8")
+        a = picked[0]
+        text = fill(tpl, SRC=a["src"], ID=tid, SHA=a["sha"], MAIN=om, TIER=tier, BRANCH=tid.lower(),
+                    FILES=", ".join(files))
+        picks = [p for m in picked for p in m["picks"]]
+        srcs = ", ".join(m["src"] for m in picked)
+        for old, new_ in ((f"Integration of {a['src']} ({tier})", f"Train integration of {srcs} ({tier})"),
+                          (f"build/reports/{a['src']}.md names COMMIT {a['sha']}",
+                           "; ".join(f"build/reports/{m['src']}.md names COMMIT {m['sha']}" for m in picked)),
+                          (f"git cherry-pick {a['sha']} (one commit, never merge).",
+                           f"git cherry-pick {' '.join(picks)} (these commits in this order, each its own commit,"
+                           " never merge).")):
+            if text.count(old) != 1:
+                raise ValueError("template INT.md rendered wrong for a train")
+            text = text.replace(old, new_)
+        text = text.rstrip("\n") + (f"\n\nTRAIN MANIFEST: build/conveyor/trains/{tid}.json (start {om}; push only"
+                                    f" while origin/main is still {om})\nPICKS: {' '.join(picks)}\n"
+                                    f"EXPECTED: {', '.join(files)}\nCONFLICT: {', '.join(files)}\n")
+        model, effort, route = CHAIN_MODELS[("INT", tier)]
+        first, _, rest = text.partition("\n")
+        text = re.sub(r"\bmodel=\S+ effort=\S+", f"model={model} effort={effort}", first, count=1) + "\n" + rest
+        new = {"id": tid, "title": f"Train INT of {srcs}", "tier": tier, "model": model, "effort": effort,
+               "route": route, "files": ["@main-checkout"], "depends_on": [m["last"] for m in picked],
+               "prompt": f"build/conveyor/prompts/{tid}.md"}
+        if all(m.get("approved") is True for m in picked):
+            new["approved"] = True
+        hdr, why = check_header(text, om)
+        bad = validate_slice(new) or lint_slice(new, text, lambda p: (self.root / p).exists(),
+                                                set(ids) | set(lanes) | {m["last"] for m in picked}) or why
+        if bad or hdr["lane"] != tid or any(p not in text for p in picks) or re.search(r"\{[A-Z_]+\}", text):
+            raise ValueError(f"generated {tid}: {bad or 'rendered wrong'}")
+        mf = self.base / "trains" / f"{tid}.json"
+        mf.parent.mkdir(parents=True, exist_ok=True)
+        dest = self.root / new["prompt"]
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if not (self.write_atomic(mf, json.dumps(manifest, indent=2)) and self.write_atomic(dest, text)):
+            raise OSError(f"{tid} manifest or prompt not written")
+        ap["chain_slices"] = ap.get("chain_slices", []) + [new]
+        ap["train_open"] = {"id": tid, "start": om, "members": [m["key"] for m in picked],
+                            "manifest": f"build/conveyor/trains/{tid}.json"}
+        self.chain_pending.append(dict(src=",".join(m["src"] for m in picked), step="TRAIN", id=tid, sha=om))
 
     def chain_verify(self, s, ln, sha):
         """(origin/main, files sha^..sha changes outside build/reports) or (None, why refused);
@@ -5139,15 +5267,27 @@ class Conveyor:
                         f.write(("\n" if old and not old.endswith(("\n", "\r")) else "") + "".join(y + "\n" for y in add))
             except (OSError, UnicodeDecodeError):
                 return "build/orch/POLISH.md not writable"
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        if not self.write_atomic(dest, text):
-            raise OSError(f"{new['prompt']} not written")
+        # TRAIN1: with the train on (pace.json "train", default on) the checked INT is not dispatched
+        # per slice: the slice joins the ready set and chain_train lands it with others in one INT
+        train = step == "INT" and self.load_pace()[0].get("train") is not False
+        if not train:
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            if not self.write_atomic(dest, text):
+                raise OSError(f"{new['prompt']} not written")
         record = {"steps": done + [nid], "at": rec["at"] if rec else self.now()}
         event = dict(src=src, step=step, id=nid, sha=sha)
         if step == "INT" and "CDX" not in s["chain"]:  # non-T2 only (validate_slice)
             record["g3"] = event["g3"] = ("low-risk exception: separate-session review" if "CLREV" in s["chain"]
                                           else "low-risk exception: no review")
-        ap["chain_slices"] = ap.get("chain_slices", []) + [new]
+        if train:
+            member = {"key": key, "src": src, "sha": sha, "picks": [*(stack or []), sha], "files": list(files),
+                      "tier": s["tier"], "approved": s.get("approved") is True, "g3": record.get("g3"),
+                      "reports": [f"build/reports/{d}.md" for d in done], "last": done[-1] if done else src,
+                      "at": self.now()}
+            ap["train_ready"] = [m for m in ap.get("train_ready", []) if m.get("key") != key] + [member]
+            event["step"] = "TRAIN-READY"
+        else:
+            ap["chain_slices"] = ap.get("chain_slices", []) + [new]
         ap.setdefault("chain", {})[key] = record
         self.chain_pending.append(event)
         return None
@@ -5997,6 +6137,14 @@ class Conveyor:
             return "origin/main unknown", sha, None
         if om == sha:
             return "already on origin/main", sha, None
+        tid = next((n for n, x in lanes.items() if TRAIN_RE.match(n) and (x.get("ci") or {}).get("sha") == sha), None)
+        if tid:  # TRAIN1 CAS: a train lands only on the main it was built on (fail closed on a lost manifest)
+            try:
+                start = json.loads((self.base / "trains" / f"{tid}.json").read_text(encoding="utf-8")).get("start")
+            except (OSError, ValueError, AttributeError):
+                start = None
+            if start != om:
+                return f"train {tid} was built on {str(start)[:7]}, origin/main is {om[:7]}: rebuilt", sha, None
         rc, _ = self.cmd(["git", "merge-base", "--is-ancestor", om, sha])
         if rc != 0:
             return f"not a fast-forward of origin/main {om[:7]}", sha, None
