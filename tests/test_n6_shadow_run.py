@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import subprocess
+import sys
 import tempfile
 import unittest
 from unittest import mock
@@ -341,6 +342,43 @@ class ShadowRunTest(unittest.TestCase):
     def test_main_without_the_switch_writes_no_daily_report(self) -> None:
         self.assertEqual(self.main_at(datetime(2026, 11, 12, 9, 0)), 0)
         self.assertFalse((self.root / "build/n6/daily").exists())
+
+    def copied_runner(self, scripts: Path, diff_source: str) -> object:
+        """The runner loaded from a temp scripts/ copy (its own load writes no cache) next to ``diff_source``."""
+        scripts.mkdir()
+        (scripts / "n6_shadow_run.py").write_bytes((ROOT / "scripts" / "n6_shadow_run.py").read_bytes())
+        (scripts / "n6_shadow_diff.py").write_text(diff_source, encoding="utf-8")
+        spec = importlib.util.spec_from_file_location("n6_shadow_run_copy", scripts / "n6_shadow_run.py")
+        assert spec and spec.loader
+        mod = importlib.util.module_from_spec(spec)
+        with mock.patch.object(sys, "dont_write_bytecode", True), mock.patch.object(sys, "path", list(sys.path)):
+            spec.loader.exec_module(mod)
+        return mod
+
+    def test_loading_the_diff_writes_no_bytecode_under_scripts(self) -> None:
+        # N6DAILY1FIX2 F1: the real diff write leaves only build/n6/daily/, no scripts/__pycache__.
+        self.on()
+        self.judge()
+        scripts = Path(self._tmp.name) / "copy" / "scripts"
+        scripts.parent.mkdir()
+        copy = self.copied_runner(scripts, (ROOT / "scripts" / "n6_shadow_diff.py").read_text(encoding="utf-8"))
+        for flag in (False, True):  # forced False: PYTHONDONTWRITEBYTECODE in the runner env must not mask it
+            with self.subTest(flag=flag), mock.patch.object(sys, "dont_write_bytecode", flag), \
+                    mock.patch.object(sys, "path", list(sys.path)):
+                copy._diff_write(self.root, self.NOW.date() - timedelta(days=1), until=self.NOW.replace(hour=0))
+                self.assertIs(sys.dont_write_bytecode, flag)  # restored after the load
+                self.assertEqual(sorted(p.name for p in scripts.rglob("*")), ["n6_shadow_diff.py", "n6_shadow_run.py"])
+        self.assertTrue((self.root / "build/n6/daily/2026-11-11.json").is_file())
+
+    def test_the_bytecode_flag_is_restored_when_the_diff_load_fails(self) -> None:
+        scripts = Path(self._tmp.name) / "broken" / "scripts"
+        scripts.parent.mkdir()
+        copy = self.copied_runner(scripts, "raise RuntimeError('broken diff module')\n")
+        with mock.patch.object(sys, "dont_write_bytecode", False):
+            with self.assertRaisesRegex(RuntimeError, "broken diff module"):
+                copy._diff_write(self.root, self.NOW.date(), until=self.NOW)
+            self.assertIs(sys.dont_write_bytecode, False)
+        self.assertFalse((scripts / "__pycache__").exists())
 
 
 if __name__ == "__main__":

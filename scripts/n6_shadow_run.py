@@ -253,7 +253,11 @@ def _diff_write(root: Path, day: Any, until: datetime) -> Any:
     if spec is None or spec.loader is None:
         raise ImportError("scripts/n6_shadow_diff.py not found")
     module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    cache, sys.dont_write_bytecode = sys.dont_write_bytecode, True  # no scripts/__pycache__: writes only build/n6/daily/
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.dont_write_bytecode = cache
     return module.write(root, day, until=until)
 
 
