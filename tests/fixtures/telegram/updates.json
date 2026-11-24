@@ -1,0 +1,7 @@
+{
+  "text": {"message": {"chat": {"id": -42}, "message_id": 7, "date": 123, "text": "hello"}},
+  "voice": {"message": {"chat": {"id": -42}, "message_id": 7, "date": 123, "voice": {"file_id": "voice", "duration": 3, "mime_type": "audio/ogg"}}},
+  "photo": {"message": {"chat": {"id": -42}, "message_id": 7, "date": 123, "photo": [{"file_id": "large", "width": 100, "height": 100, "file_size": 2048}, {"file_id": "small", "width": 10, "height": 10}], "caption": "photo"}},
+  "document": {"message": {"chat": {"id": -42}, "message_id": 7, "date": 123, "document": {"file_id": "doc", "file_size": 17, "mime_type": "application/pdf"}, "caption": "document"}},
+  "callback": {"callback_query": {"id": "query", "data": "button", "message": {"chat": {"id": -42}, "message_id": 7, "date": 123}}}
+}

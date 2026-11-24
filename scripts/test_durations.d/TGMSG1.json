@@ -1,0 +1,6 @@
+{
+  "version": 1,
+  "classes": {
+    "tests.test_telegram_wire.TelegramWireTests": 0.811
+  }
+}
