@@ -76,6 +76,16 @@ _UNSET = object()
 class OrphanTestCase(RecoveryTestCase):
     """A real generation whose executor died mid-connector-call."""
 
+    def setUp(self) -> None:
+        super().setUp()
+        # Speed only (ORPHANSPD1): one idle reader attached to the WAL keeps the
+        # store's many short connections from re-creating -wal/-shm each close
+        # (slow on Windows). It holds no lock or transaction, so it changes no
+        # behaviour; registered after the temp-dir cleanup, so it closes first.
+        sentinel = sqlite3.connect(self.database)
+        sentinel.execute("SELECT count(*) FROM sqlite_master").fetchall()
+        self.addCleanup(sentinel.close)
+
     def in_flight(self):
         """A dead owner's IN_FLIGHT attempt, produced by a real death.
 
