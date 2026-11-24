@@ -18,10 +18,11 @@ scripts/conveyor.py change, a T2 approval keeping the queue dry - in the build/p
 An ask closes when its condition clears; open/close log one decision each; unknown input gives no
 ask and one escalate. Ask text is redacted and never names a path outside the repo.
 
-BOTLIVE: build/bot/live.json {"ack", "asks", "hold_dispatch", "page_salih": bool} turns single actions live;
+BOTLIVE: build/bot/live.json {"ack", "asks", "hold_dispatch", "page_salih", "write_key1": bool} turns single
+actions live;
 missing/malformed = all shadow, build/bot/OFF = all shadow (checked every pass). Live writes only
 build/conveyor/ack/<name>, build/conveyor/PAUSE (text "bot: <rule>", removed only when the bot made it) and
-the asks.json pano marker; each one logs a decisions.jsonl line with mode "live", before/after and an undo
+the asks.json pano marker, key 1 through cv.write_key1 by=hands (write_key1_live, KEY1LIVE1FIX); each one logs a decisions.jsonl line with mode "live", before/after and an undo
 hint. page_salih never goes live: the conveyor pager reads only build/conveyor/pager.json. A loop guard
 trip demotes that action to shadow until live.demoted.<action> is deleted from shadow.json.
 
@@ -79,7 +80,8 @@ WEAK_RE = re.compile(r"(?im)^(?!" + _WEAK_CLEAN + r")[^\n]*weak"
 REVIEWER_RE = re.compile(r"(?im)^[ \t]*(?:reviewer|worker):[ \t]*(.+)$")
 SEC_RE = re.compile(r"(?i)secur|critical|secret|credential|breach|leak|incident")  # T5: never auto-acked
 DAILY_CAP = {"queue_fix_slice": 6, "page_salih": 3,  # T5: per-code daily caps (items 2 and 9)
-             "fix_seen": 6, "new_slice": 4}  # T5: observed FIX (item 2) and new slice (item 5) on the agree path
+             "fix_seen": 6, "new_slice": 4,  # T5: observed FIX (item 2) and new slice (item 5) on the agree path
+             "write_key1": 30}  # T5 / KEY1LIVE1FIX: live key-1 writes per UTC day; over it, Salih is asked
 CHAIN_ID_RE = re.compile(r"(?i)^(?:CDXINT|CLREV|CDX|INT|AFX)\d")  # ids the chain generates itself
 # T4: the hands write only schema-bound records of ids/enums, never free text, under a size cap (items 7, 10)
 HAND_FIELDS = {"notebook": {"ts": "int", "code": "rule", "action": "action", "target": "id", "ref": "id"},
@@ -183,10 +185,16 @@ LANES_MAX = 10
 CONVEYOR_PY = "scripts/conveyor.py"
 RESTART_CMD = ("Stop-ScheduledTask -TaskName 'JARVIS Konveyor'; Start-Sleep 310; "
                "Start-ScheduledTask -TaskName 'JARVIS Konveyor'")
-LIVE_KEYS = ("ack", "asks", "hold_dispatch", "page_salih")  # the live.json schema
+LIVE_KEYS = ("ack", "asks", "hold_dispatch", "page_salih", "write_key1")  # the live.json schema
 # Only these can ever go live. page_salih stays out: the conveyor pager reads build/conveyor/pager.json
 # only, which is outside what the bot may write; everything else in ACTIONS is never live.
-LIVE_OK = ("ack", "asks", "hold_dispatch")
+LIVE_OK = ("ack", "asks", "hold_dispatch", "write_key1")  # write_key1: authority, needs KEY1_DECISION active
+# KEY1LIVE1FIX: Salih's Devir B decision id for live key 1 (build/orch/decisions.json); None = od.require
+# refuses every live write, so live.json write_key1:true alone never writes a key 1
+KEY1_DECISION = None
+KEY1_CHECKS = ("ci", "ff", "files", "name", "patch-id", "reviews")  # what key1_check verified
+KEY1_REASON = "orchbot hands O26 green chain"
+CI_NAME_RE = re.compile(r"ci/[A-Za-z0-9._-]+")
 PAUSE_TEXT = "bot: "  # + rule; a PAUSE with other text is not the bot's and is never removed
 
 
@@ -208,6 +216,8 @@ def key1_side(path, name):
     first = h.group(0)
     if h["by"]:
         return "write_key1", "conveyor" if h["by"] == "conveyor" else "orchestrator", first
+    if h["manual"] == "hands":  # KEY1LIVE1FIX: the bot's own live write, never counted as the orchestrator
+        return "write_key1", "hands", first
     # DECISION TAKEN: by=manual classifies on its header reason, the only free text the writer produces
     # (alternative: the body); an O42 pre-approval is conveyor-side, outside key-1 graduation
     if PRE_RE.search(h["reason"]):
@@ -328,7 +338,7 @@ def klass(p, a):
     """The metric class of a verdict; key-1 splits by who wrote the approval."""
     k = (p or a)["key"].split(":")[0]
     if k == "key1":
-        return "key1_conveyor" if a and a["side"] == "conveyor" else "key1_orch"
+        return {"conveyor": "key1_conveyor", "hands": "key1_hands"}.get(a and a["side"], "key1_orch")
     return k if k in ("ack", "ask", "fix") else None
 
 
@@ -355,7 +365,7 @@ AGREE_SHAPES = {  # shadow.json "agreement"; a present key of another shape rese
     "start": lambda v: v is None or num(v),
     "since": lambda v: v is None or isinstance(v, str),
     "pending": lambda v: entries(v) and all(isinstance(e.get("rule"), str) for e in v),
-    "actual": lambda v: entries(v) and all(e.get("side") in ("orchestrator", "conveyor", "salih") for e in v),
+    "actual": lambda v: entries(v) and all(e.get("side") in ("orchestrator", "conveyor", "salih", "hands") for e in v),
     "known": known_ok,
     "answered": entries,
     "totals": counts,
@@ -698,7 +708,7 @@ class Bot:
         self.st["seen"][key] = at
         return True
 
-    def decide(self, at, saw, action, rule, target, detail="", key=None, decision=None):
+    def decide(self, at, saw, action, rule, target, detail="", key=None, decision=None, k1=None):
         assert action in ACTIONS, action  # nosec B101 - a programming error, the closed enum
         orig = action
         hist = [h for h in self.st["history"] if at - h[0] < LOOP_S]
@@ -733,6 +743,85 @@ class Bot:
                 self.demote(action, f"{e!r}"[:300], "FAILCLOSED")
                 self.decide(at, f"live {action} failed", "escalate_orchestrator", "FAILCLOSED", "live",
                             f"{e!r}"[:300])
+        elif action in self.live and action == "write_key1":
+            try:
+                self.write_key1_live(rec, at, target, k1)
+            except (OSError, ValueError, TypeError) as e:  # TypeError: a malformed backlog field
+                self.demote(action, f"{e!r}"[:300], "FAILCLOSED")
+                self.decide(at, f"live {action} failed", "escalate_orchestrator", "FAILCLOSED", "live",
+                            f"{e!r}"[:300])
+
+    def write_key1_live(self, rec, at, lane, k1):
+        """KEY1LIVE1FIX: the one live key-1 write, only after gate_key1 (key1_check PASS for this sha) and
+        od.require. Any doubt asks Salih; a moved origin/main or a failed re-verify escalates; nothing is
+        written then. The written file must pass the push gate's own key1_refusal, else demote + escalate."""
+        sha = (k1 or {}).get("sha")
+        if sha and self.approved(sha, done=True):
+            return self.live_rec(rec, "build/approvals", "present", "present", "none", did="none: already approved")
+        doubt = self.key1_doubt(lane, k1)
+        if doubt:
+            return self.decide(at, "live write_key1 refused", "ask_salih_key1", "CONVSAFE", lane, doubt)
+        import key1_check as kc
+        ci = kc.field(kc.read(self.root, lane) or "", "CI BRANCH")
+        if not (ci and CI_NAME_RE.fullmatch(ci)):
+            return self.decide(at, "live write_key1 refused", "ask_salih_key1", "CONVSAFE", lane,
+                               f"no valid CI BRANCH in the report ({ci!r})"[:200])
+        base = git_ref(self.root, "refs/remotes/origin/main")
+        ok, why = self.verified(lane, sha)
+        if base is None or base != k1.get("base") or not ok:  # re-verify just before the write
+            return self.decide(at, "live write_key1 re-verify", "escalate_orchestrator", "REVERIFY", lane,
+                               f"origin/main {str(k1.get('base'))[:7]} -> {str(base)[:7]}; key1_check: {why}"[:300])
+        if self.capped("write_key1", at):
+            return self.decide(at, "live write_key1 cap", "ask_salih_key1", "ALLOW-T5", lane,
+                               f"daily key-1 cap {DAILY_CAP['write_key1']} reached")
+        try:
+            p = cv.write_key1(self.root / "build" / "approvals", sha, ci, lane, "hands", KEY1_CHECKS,
+                              reason=KEY1_REASON, now=at)
+        except FileExistsError as e:  # someone wrote it first: never overwrite, never demote
+            return self.decide(at, "live write_key1 exists", "escalate_orchestrator", "REVERIFY", lane,
+                               f"{e!r}"[:300])
+        rel = f"build/approvals/{p.name}"
+        why = cv.key1_refusal(p, p.name)
+        if why is not None:  # remove nothing: the orchestrator looks at the file
+            self.demote("write_key1", f"{rel}: {why}"[:300], "FAILCLOSED")
+            return self.decide(at, "live write_key1 refused by the gate", "escalate_orchestrator", "FAILCLOSED",
+                               lane, f"{rel}: {why}"[:300])
+        self.live_rec(rec, rel, "absent", stamp(p), f"move {rel} to hold/")
+
+    def key1_doubt(self, lane, k1):
+        """Why a live key 1 for lane must ask Salih instead (None = no doubt): no gate context, a range
+        slice not tier T0/T1 (T2 is Salih's), a missing or unfinished chained review (exam d05, d10), or a
+        protected path in the range's files plus every backlog grant on it."""
+        if not k1 or not k1.get("sha") or not k1.get("base"):
+            return "no key1_check context for this sha"
+        bl = self.read_json(self.conv / "backlog.json", {})
+        sl = {x.get("id"): x for x in ((bl.get("slices") if isinstance(bl, dict) else None) or [])
+              if isinstance(x, dict)}
+        if lane not in sl:
+            return f"{lane} is not in the backlog"
+        deps = [str(d) for d in sl[lane].get("depends_on") or []]
+        srcs = list(dict.fromkeys(re.sub(r"^(CLREV|CDX)-", "", d) for d in deps)) or \
+            ([lane[4:]] if lane.startswith("INT-") else [])
+        for x in [lane] + srcs:
+            if sl.get(x, {}).get("tier") not in ("T0", "T1") or sl.get(x, {}).get("state") == "needs_t2_approval":
+                return f"{x} is tier {sl.get(x, {}).get('tier')!r}: Salih's key 1"
+        want = list(dict.fromkeys([d for d in deps if d.startswith(("CLREV-", "CDX-"))] + [f"CLREV-{x}" for x in srcs]
+                                  + [f"CDX-{x}" for x in srcs if "CDX" in (sl.get(x, {}).get("chain") or [])]))
+        if not want:
+            return "no chained review for the range"
+        bad = []
+        for n in want:
+            p = self.root / "build" / "reports" / f"{n}.md"
+            try:
+                ok = p.read_text(encoding="utf-8", errors="replace").startswith("STATUS: PASS")
+            except OSError:
+                ok = False
+            if not ok:
+                bad.append(n)
+        if bad:
+            return f"chained review not finished PASS: {', '.join(bad)}"[:200]
+        files = list(k1.get("files") or []) + [str(f) for x in [lane] + srcs + want for f in sl.get(x, {}).get("files") or []]
+        return protected(files)
 
     # ---- live (BOTLIVE) ----------------------------------------------------------------------
     def load_live(self):
@@ -1696,7 +1785,7 @@ class Bot:
         if why:
             self.decide(at, saw, "ask_salih_key1", "CONVSAFE", lane, why, key=key)
         else:
-            self.gate_key1(at, saw, lane, sha, f"build/approvals/push-{sha}-{lane}", key)
+            self.gate_key1(at, saw, lane, sha, f"build/approvals/push-{sha}-{lane}", key, files)
 
     def reviews(self, lane):
         """[(review id, text)] of the CLREV/CDX reports the lane's backlog entry (or INT- source) names."""
@@ -1726,7 +1815,8 @@ class Bot:
             return False, f"key1_check error {type(e).__name__}"
         return ok, next((x for x in out if x.startswith("FAIL")), "PASS")
 
-    def gate_key1(self, at, saw, lane, sha, detail, key):
+    def gate_key1(self, at, saw, lane, sha, detail, key, files=None):
+        base = git_ref(self.root, "refs/remotes/origin/main") if "write_key1" in self.live else None
         ok, why = self.verified(lane, sha)
         if not ok:
             return self.decide(at, saw, "ask_salih_key1", "ALLOW-T2", lane,
@@ -1736,8 +1826,8 @@ class Bot:
             m = REVIEWER_RE.search(t)
             who = re.sub(r"[^\w .,()=+-]", "", m.group(1))[:80].strip() if m else n
             ids.append(f"{n}={who}")
-        self.decide(at, saw, "write_key1", "O26", lane,
-                    f"{detail}; reviewers: {', '.join(ids) or 'none found'}", key=key)
+        self.decide(at, saw, "write_key1", "O26", lane, f"{detail}; reviewers: {', '.join(ids) or 'none found'}",
+                    key=key, decision=KEY1_DECISION, k1={"sha": sha, "base": base, "files": files})
 
     def seen_auto(self, ev, at, lane):
         ok = ev.get("event") == "auto_approve"

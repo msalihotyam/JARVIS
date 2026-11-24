@@ -396,6 +396,30 @@ class TestHeader(unittest.TestCase):
         self.assertIsNone(parse_header("@jarvis lane=A\x1cmodel=opus effort=high base=main"))
 
 
+class TestKey1HandsHeader(unittest.TestCase):
+    """KEY1LIVE1FIX: by=hands (orchbot's live write_key1) is a key-1 writer that must carry reason=."""
+    SHA = "a" * 40
+
+    def test_hands_with_reason_accepted(self):
+        import tempfile
+        h = conveyor.key1_header(self.SHA, "ci/x", "L1", "hands", ("ci", "name"), reason="orchbot hands", now=0)
+        m = conveyor.KEY1_HEADER_RE.fullmatch(h)
+        self.assertEqual((m["manual"], m["reason"], m["by"]), ("hands", "orchbot hands", None))
+        with tempfile.TemporaryDirectory() as d:
+            p = conveyor.write_key1(Path(d), self.SHA, "ci/x", "L1", "hands", ("ci", "name"), reason="r", now=0)
+            self.assertEqual(p.name, f"push-{self.SHA}-x")
+            self.assertIsNone(conveyor.key1_refusal(p, p.name))
+
+    def test_hands_without_reason_refused(self):
+        with self.assertRaises(ValueError):
+            conveyor.key1_header(self.SHA, "ci/x", "L1", "hands", ("ci",), now=0)
+
+    def test_unknown_by_refused(self):
+        for by in ("bot", "Hands", "hands ", "orchestrator", ""):
+            with self.subTest(by=by), self.assertRaises(ValueError):
+                conveyor.key1_header(self.SHA, "ci/x", "L1", by, ("ci",), reason="r", now=0)
+
+
 class TestOverlap(unittest.TestCase):
     def test_overlap(self):
         self.assertTrue(files_overlap(["jarvis/ui/**"], ["jarvis/ui/qml/X.qml"]))

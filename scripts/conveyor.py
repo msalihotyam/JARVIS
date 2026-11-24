@@ -365,11 +365,12 @@ READER_FOREIGN_RE = re.compile(
 PUSH_RETRY_S = 600  # a blocked approval is re-checked at most once per 10 min
 APPROVAL_RE = re.compile(r"push-([0-9a-f]{7,40})(?:-([A-Za-z0-9._-]+))?")
 # KEY1PATH1: key 1 is honoured only when its first line is this header (written by write_key1 alone);
-# reason (1-120 printable ASCII, no "=", no edge space) appears iff by=manual
+# reason (1-120 printable ASCII, no "=", no edge space) appears iff by=manual or by=hands (KEY1LIVE1FIX:
+# orchbot's live write_key1; the gate never branches on by, so hands is honoured exactly like manual)
 _KEY1_REASON = r"[\x21-\x3c\x3e-\x7e](?:[\x20-\x3c\x3e-\x7e]{0,118}[\x21-\x3c\x3e-\x7e])?"
 KEY1_HEADER_RE = re.compile(
     r"KEY1 v1 sha=(?P<sha>[0-9a-f]{40}) ci=(?P<ci>ci/[A-Za-z0-9._-]+) lane=(?P<lane>[A-Za-z0-9._-]+) "
-    rf"by=(?:(?P<by>key1_check|conveyor)|(?P<manual>manual) reason=(?P<reason>{_KEY1_REASON})) "
+    rf"by=(?:(?P<by>key1_check|conveyor)|(?P<manual>manual|hands) reason=(?P<reason>{_KEY1_REASON})) "
     r"checks=(?P<checks>[a-z0-9-]+(?:,[a-z0-9-]+)*) at=(?P<at>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
 # lanes run with --settings SETTINGS; dispatch refuses unless its deny list keeps lanes away from key 1:
 # the approvals paths and the writer itself (key1_check --write/--manual, write_key1). KEY1PATH1FIX: a
