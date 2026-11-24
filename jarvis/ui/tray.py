@@ -156,15 +156,10 @@ def outbox_fetch(bridge):
 
 
 def deliver(icon, sink) -> None:
-    """One poll: new rows in, at most one toast out (high = Warning icon)."""
-    from PySide6.QtWidgets import QSystemTrayIcon
+    """One poll: new rows in, at most one toast out through the tray Sink (high = Warning icon)."""
+    from jarvis import notify_sink
 
-    sink.poll()
-    toast = sink.toast()
-    if toast is not None:
-        title, text, importance = toast
-        kind = QSystemTrayIcon.MessageIcon.Warning if importance == "high" else QSystemTrayIcon.MessageIcon.Information
-        icon.showMessage(title, text, kind, _TOAST_MS)
+    notify_sink.deliver(sink, notify_sink.TraySink(icon, _TOAST_MS))
 
 
 def install_tray(app, bridge, window):

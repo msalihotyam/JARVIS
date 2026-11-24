@@ -178,6 +178,21 @@ class SinkProtocolTests(unittest.TestCase):
         self.assertEqual(("JARVIS", "2 yeni bildirim"), new[2][:2])
         self.assertTrue(all(m[3] == tray._TOAST_MS for m in new))
 
+    def test_tray_deliver_goes_through_the_sink(self) -> None:
+        # AUDNOTIFY1FIX: the live tray path is TraySink.show, not a copy of its mapping.
+        icon, outbox = self.Icon(), Outbox()
+        s = sink(outbox)
+        real_show = notify_sink.TraySink.show
+        with patch.object(notify_sink.TraySink, "show", autospec=True, side_effect=real_show) as show:
+            tray.deliver(icon, s)                           # seeding poll: no toast, no call
+            show.assert_not_called()
+            outbox.rows.append(row(1, "plan_ready", "high"))
+            tray.deliver(icon, s)
+        show.assert_called_once()
+        self.assertEqual(("Plan hazır", "Proje planını onaylayın.", "high"), show.call_args.args[1:])
+        self.assertEqual([("Plan hazır", "Proje planını onaylayın.", QSystemTrayIcon.MessageIcon.Warning,
+                           tray._TOAST_MS)], icon.messages)
+
     def test_a_new_channel_is_one_class(self) -> None:
         class Recorder:
             def __init__(self) -> None:
