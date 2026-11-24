@@ -8,12 +8,14 @@
 # No secrets, no tokens (read-only), no network calls from the tests. Every
 # third-party action is pinned to a full commit SHA.
 #
-# S0b: the suite runs as SHARDS duration-balanced shards (a deterministic plan
+# S0b: the suite runs as 16 duration-balanced shards (a deterministic plan
 # from scripts/test_durations.json; tests without a record go to the
 # least-loaded shard), then one aggregate job checks every shard's report
 # against a fresh discovery - the total count and the exact test-id set - and
 # gives the one result. The shard count is the matrix below and --shards in
-# the aggregate step: change both together.
+# the aggregate step: change both together. CISHARD16: 8 -> 16 (CIDIAG1
+# D6/D7: modelled median ~938 s -> ~515 s; 16 shards + types run at once,
+# the aggregate after them: under the 20-concurrent-job limit).
 #
 # THIZ: the plan's durations are CI's own. Each shard report carries every
 # test's seconds; the aggregate job writes them as ci-durations.json (in the
@@ -35,13 +37,13 @@ concurrency:
 
 jobs:
   shard:
-    name: shard ${{ matrix.shard }}/8
+    name: shard ${{ matrix.shard }}/16
     runs-on: windows-latest
     timeout-minutes: 90
     strategy:
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        shard: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
     env:
       PYTHONUTF8: "1"
     steps:
@@ -70,7 +72,7 @@ jobs:
       - name: Run this shard
         shell: pwsh
         run: |
-          python scripts/test_parallel.py --shard ${{ matrix.shard }}/8 --durations 30 --report shard-report.json *> shard-summary.txt
+          python scripts/test_parallel.py --shard ${{ matrix.shard }}/16 --durations 30 --report shard-report.json *> shard-summary.txt
           $code = $LASTEXITCODE
           Get-Content shard-summary.txt
           exit $code
@@ -124,7 +126,7 @@ jobs:
       - name: Check and combine the shards
         shell: pwsh
         run: |
-          python scripts/test_parallel.py --aggregate shards --shards 8 --durations 30 --write-durations ci-durations.json *> ci-summary.txt
+          python scripts/test_parallel.py --aggregate shards --shards 16 --durations 30 --write-durations ci-durations.json *> ci-summary.txt
           $code = $LASTEXITCODE
           # Per shard: its workers and totals when green, its whole summary (the traces) when not.
           foreach ($file in Get-ChildItem shards -Recurse -Filter shard-summary.txt | Sort-Object FullName) {
