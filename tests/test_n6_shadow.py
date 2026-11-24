@@ -107,6 +107,28 @@ class N6ShadowTests(unittest.TestCase):
                          ("agree", "block"))
         self.assertIn("CDX-N6-01 BLOCKED", records["N6-01"]["conveyor"]["reason"])
 
+    def test_neg_pending_chain_child_is_never_pass(self) -> None:
+        # EXAMSAFE1: a chained check absent or unfinished keeps N6 off PASS, commit and no-commit forms
+        sha = "1" * 40
+        chain = ({"event": "chain", "src": "L1", "id": "L1-CHK"},)
+        forms = ((f"STATUS: PASS\nCOMMIT: {sha}\n", {}), ("STATUS: PASS\nCOMMIT: none\n",
+                                                          {"files": ["build/reports/L1.md"]}))
+        for report, grant in forms:
+            lane = {"status": "PASS", "finished": True, **grant}
+            for child in ({"L1-CHK": {"status": "RUNNING", "finished": False}}, {}):
+                snap = n6_shadow.Snapshot({"L1": lane, **child}, chain, {"L1": report})
+                self.assertEqual(n6_shadow.n6_verdict(snap, "L1", lambda _l: sha),
+                                 ("unknown", "chained check L1-CHK pending"), (report, child))
+            done = n6_shadow.Snapshot({"L1": lane, "L1-CHK": {"status": "PASS", "finished": True}},
+                                      chain, {"L1": report})
+            self.assertEqual(n6_shadow.n6_verdict(done, "L1", lambda _l: sha)[0], "pass", report)
+            blocked = n6_shadow.Snapshot({"L1": lane, "L1-CHK": {"status": "BLOCKED", "finished": True},
+                                          "L1-CHK2": {"status": "RUNNING", "finished": False}},
+                                         chain + ({"event": "chain", "src": "L1", "id": "L1-CHK2"},),
+                                         {"L1": report})
+            self.assertEqual(n6_shadow.n6_verdict(blocked, "L1", lambda _l: sha),
+                             ("block", "chained check L1-CHK BLOCKED"), report)
+
     def test_neg_torn_snapshot_raises(self) -> None:
         lanes = (self.conveyor / "lanes.json").read_text(encoding="utf-8")
         reads: list[Path] = []

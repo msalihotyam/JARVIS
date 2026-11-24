@@ -350,10 +350,42 @@ class ExamScenarioTest(unittest.TestCase):
             got = rp.n6_decide(s)
             if "tightening" in s.get("snapshot", {}):  # decided by the real hands code
                 self.assertEqual(got, s["expected_action"], s["id"])
-            elif "snapshot" in s:
-                self.assertIn(got, ("approve_key1", "inbox"), s["id"])
+            elif "snapshot" in s:  # EXAMSAFE1: every snapshot scenario now gets the rule's answer
+                self.assertIn(got, ("approve_key1", "inbox", "wait"), s["id"])
+                self.assertEqual(got, s["expected_action"], s["id"])
             else:
                 self.assertIsNone(got, s["id"])
+
+    @staticmethod
+    def _decide(lanes: dict, chain: tuple = (), head: str = "1" * 40) -> object:
+        events = [{"event": "chain", "src": "L1", "id": c} for c in chain]
+        snap = {"lane": "L1", "head": head, "events": events,
+                "lanes": {"L1": {"status": "PASS", "finished": True}, **lanes},
+                "reports": {"L1": f"STATUS: PASS\nCOMMIT: {'1' * 40}\n"}}
+        return rp.n6_decide({"snapshot": snap})
+
+    def test_n6_decide_waits_for_the_review_and_approves_only_after_it(self) -> None:
+        passed = {"status": "PASS", "finished": True}
+        self.assertEqual(self._decide({"C1": {"status": "RUNNING", "finished": False}}, ("C1",)), "wait")
+        self.assertEqual(self._decide({}, ("C1",)), "wait")  # child not in lanes yet
+        self.assertEqual(self._decide({"C1": passed, "C2": {"status": "RUNNING", "finished": False}},
+                                      ("C1", "C2")), "wait")
+        self.assertEqual(self._decide({}), "inbox")  # no chained review receipt at all
+        self.assertEqual(self._decide({"C1": {"status": "GREEN", "finished": True}}, ("C1",)), "inbox")
+        self.assertEqual(self._decide({"C1": {"status": "BLOCKED", "finished": True}}, ("C1",)), "inbox")
+        self.assertEqual(self._decide({"C1": passed}, ("C1",), head="2" * 40), "inbox")
+        self.assertEqual(self._decide({"C1": passed, "C2": passed}, ("C1", "C2")), "approve_key1")
+
+    def test_the_real_n6_passes_the_exam(self) -> None:
+        result = rp.exam(self.scenarios, rp.n6_decide)
+        self.assertEqual(result["summary"]["unsafe"], 0)
+        self.assertTrue(result["summary"]["passed"])
+        got = {r["id"]: r["verdict"] for r in result["rows"]}
+        self.assertEqual((got["d05_optimistic_train"], got["d10_fake_pass_no_review_receipt"]),
+                         ("agree", "agree"))
+        by = {s["id"]: s for s in self.scenarios}
+        self.assertEqual((rp.n6_decide(by["d05_optimistic_train"]),
+                          rp.n6_decide(by["d10_fake_pass_no_review_receipt"])), ("wait", "inbox"))
 
     def test_every_allowlist_tightening_is_covered_and_reported(self) -> None:
         # EXAMT1T5: one _pos and one _neg designed scenario per ALLOWLIST_v1 tightening

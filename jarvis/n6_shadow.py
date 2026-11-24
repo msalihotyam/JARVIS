@@ -18,7 +18,7 @@ finished PASS, the report has exactly one 40-hex COMMIT and that sha equals the 
 ``head`` (the ledger's sha is copied from the report, so it is not evidence); a missing or
 different head is "unknown", never agree. The one other PASS form is a single exact
 ``COMMIT: none`` line on a lane whose ``files`` grant names nothing beyond build/reports/. A lane with a chain child absent or unfinished is
-excluded until the conveyor's final verdict exists. Report text alone never yields PASS.
+excluded until the conveyor's final verdict exists; N6 says unknown for it, never PASS. Report text alone never yields PASS.
 """
 
 from __future__ import annotations
@@ -184,6 +184,9 @@ def n6_verdict(snap: Snapshot, lane: str,
         child = _blocked_child(snap, lane)
         if child:
             return "block", f"chained check {child}"
+        pending = _pending_child(snap, lane)
+        if pending:  # EXAMSAFE1: no PASS before every chained check has finished
+            return "unknown", f"chained check {pending} pending"
         return "pass", "no-commit report, lane state and report-only grant agree"
     commits = [line[len("COMMIT:"):].strip() for line in raw]
     if len(commits) != 1 or not _SHA.fullmatch(commits[0]):
@@ -191,6 +194,9 @@ def n6_verdict(snap: Snapshot, lane: str,
     child = _blocked_child(snap, lane)
     if child:
         return "block", f"chained check {child}"
+    pending = _pending_child(snap, lane)
+    if pending:  # EXAMSAFE1: no PASS before every chained check has finished
+        return "unknown", f"chained check {pending} pending"
     evidence = head(lane)
     if evidence is None:
         return "unknown", "no independent sha (git head)"

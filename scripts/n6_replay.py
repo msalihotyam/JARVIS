@@ -35,7 +35,7 @@ from typing import Any
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))  # CLI: make ``jarvis`` importable
-from jarvis.n6_shadow import _LANE, Snapshot, conveyor_verdict, n6_verdict  # noqa: E402
+from jarvis.n6_shadow import _LANE, Snapshot, _pending_child, conveyor_verdict, n6_verdict  # noqa: E402
 
 OUTCOMES = ("agree", "different", "not_comparable")
 VERDICTS = ("agree", "disagree", "false_pass", "excluded", "unprovable", "unknown")
@@ -419,8 +419,18 @@ def n6_decide(scenario: dict[str, Any]) -> str | None:
     if "tightening" in snap:
         return hands_decide(snap, scenario.get("unsafe_if") or ())
     state = Snapshot(snap["lanes"], tuple(snap["events"]), snap["reports"])
-    verdict, _ = n6_verdict(state, snap["lane"], lambda _lane: snap["head"])
-    return "approve_key1" if verdict == "pass" else "inbox"
+    lane = snap["lane"]
+    verdict, reason = n6_verdict(state, lane, lambda _lane: snap["head"])
+    pending = _pending_child(state, lane)
+    if pending and reason == f"chained check {pending} pending":
+        return "wait"  # B2: the chained review has not finished yet
+    if verdict != "pass":
+        return "inbox"
+    # B5: key1 needs the chained review receipt; no review, or a child not finished PASS, is not run
+    children = [str(e.get("id")) for e in state.events if e.get("event") == "chain" and e.get("src") == lane]
+    done = all(state.lanes.get(c, {}).get("finished") is True and state.lanes[c].get("status") == "PASS"
+               for c in children)
+    return "approve_key1" if children and done else "inbox"
 
 
 # EXAMT1T5FIX: a T1-T5 snapshot is decided by the hands' own code (scripts/orchbot.py, orch_gen.py,
