@@ -357,7 +357,8 @@ class N6ScreenTests(N6NotifyTests.__base__):
         submit(self.path, Event("urgent", "c", "API_" + "KEY="))
         submit(self.path, Event("urgent", "d", "x" * 40))
         self.assertEqual(self.flush(at=DAY2), "API_" + "KEY=")
-        self.assertEqual(self.sent, ["Pli", "mb", "API_" + "KEY=", "x" * 40][:3])
+        self.assertEqual(self.flush(at=DAY2), "x" * 40)  # the deferred item is delivered
+        self.assertEqual(self.sent, ["Pli", "mb", "API_" + "KEY=", "x" * 40])
         for text in self.sent:
             self.assertTrue(n6_notify.dora_screen.screen(text)[0], text)
 
@@ -370,6 +371,8 @@ class N6ScreenTests(N6NotifyTests.__base__):
         submit(self.path, Event("urgent", "b", "mb"))
         self.assertEqual(self.flush(), "Pli")
         self.assertNotIn("mb", self.sent[0])
+        self.assertEqual(self.flush(), "mb")  # delivered later, on its own
+        self.assertEqual(self.state()["pending"], [])
 
     def test_neg_empty_list_sends_nothing(self):  # CDX-DORAGATE1 F2
         submit(self.path, Event("urgent", "a", "kota bitti"))
@@ -389,17 +392,31 @@ class N6ScreenTests(N6NotifyTests.__base__):
         state = self.state()
         self.assertEqual((state["asks"], state["outbox_asks"], state["outbox"]), (0, 0, ""))
 
-    def test_old_reader_keys_kept_and_legacy_refused_moves_to_sidecar(self):  # CLREV F3
-        submit(self.path, Event("urgent", "a", f"kota {self.WORD}"))
+    def test_neg_split_send_then_full_drop_keeps_ask_cap(self):  # DORAGATE1FIX3 review H1
+        self.set_words(self.WORD, "zqxvkmark")
+        submit(self.path, Event("status", "a", "not"))
         state = self.state()
-        state["refused"] = {"deny": 2}  # written by DORAGATE1
+        state.update(ask_day="2026-11-08", asks=4, outbox_asks=1,
+                     outbox="soru a | Öneri: evet zqxv\nkmark tail")
         self.path.write_text(json.dumps(state), encoding="utf-8")
+        self.assertEqual(self.flush(), "soru a | Öneri: evet zqxv")  # split: the join is refused
+        self.set_words(self.WORD, "zqxvkmark", "kmarktail")
+        submit(self.path, Event("ask", "q9", "soru 9", "evet"))
+        self.assertIsNone(self.flush())  # the rest is dropped; q9 would be the 5th ask today
+        state = self.state()
+        self.assertEqual((state["outbox"], state["outbox_asks"], state["asks"]), ("", 0, 4))
+        self.assertEqual([e["key"] for e in state["pending"]], ["q9"])
+        self.assertEqual(self.sent, ["soru a | Öneri: evet zqxv"])
+
+    def test_counts_only_in_sidecar_and_grow(self):  # CLREV F3, DORAGATE1FIX3
+        submit(self.path, Event("urgent", "a", f"kota {self.WORD}"))
         self.assertIsNone(self.flush())
-        self.assertEqual(self.counts(), {"deny": 3})
+        self.assertEqual(self.counts(), {"deny": 1})
         self.assertEqual(set(self.state()), self.OLD_KEYS)
         submit(self.path, Event("urgent", "b", f"yine {self.WORD}"))
         self.flush()
-        self.assertEqual(self.counts(), {"deny": 4})  # counts grow across flushes
+        self.assertEqual(self.counts(), {"deny": 2})  # counts grow across flushes
+        self.assertEqual(set(self.state()), self.OLD_KEYS)
         self.assertNotIn(self.WORD, self.sidecar.read_text("utf-8"))  # labels only
 
     def test_neg_unreadable_list_sends_nothing_and_keeps_pending(self):
@@ -418,11 +435,14 @@ class N6ScreenTests(N6NotifyTests.__base__):
         self.assertEqual(self.flush(), "kota bitti")
         self.assertFalse(self.sidecar.exists())  # written only after a refusal
         good = self.state()
-        for bad in ([], {"deny": 0}, {"deny": "1"}, {"deny": True}):
+        for bad in ([], {"deny": 0}, {"deny": "1"}, {"deny": True}, {"deny": 1}):
             self.path.write_text(json.dumps({**good, "refused": bad}), encoding="utf-8")
-            with self.assertRaises(StateError):
-                self.flush()
-            self.path.write_text(json.dumps(good), encoding="utf-8")
+            for call in (self.flush, lambda: submit(self.path, Event("urgent", "z", "x")),
+                         lambda: evening_summary(self.path, lambda _t: None)):
+                with self.assertRaises(StateError):  # the state never carries counts
+                    call()
+        self.path.write_text(json.dumps(good), encoding="utf-8")
+        for bad in ([], {"deny": 0}, {"deny": "1"}, {"deny": True}):
             self.sidecar.write_text(json.dumps(bad), encoding="utf-8")
             with self.assertRaises(StateError):
                 self.flush()
@@ -454,9 +474,31 @@ class N6ScreenTests(N6NotifyTests.__base__):
         state = self.state()
         state["outbox"] = "safe\nQQ-1234"
         self.path.write_text(json.dumps(state), encoding="utf-8")
-        self.assertIsNone(self.flush())
-        self.assertEqual(self.sent, [])
+        self.assertEqual(self.flush(), "safe")  # only the refused entry is dropped
+        self.assertEqual(self.sent, ["safe"])
         self.assertEqual(self.counts(), {"deny": 1})
+        self.assertEqual(self.state()["outbox"], "")
+
+    def test_neg_refused_outbox_entry_dropped_alone_rest_delivered(self):  # DORAGATE1FIX3
+        self.set_words(self.WORD, "plimb")
+        submit(self.path, Event("urgent", "p", "later"))
+        state = self.state()
+        state.update(ask_day="2026-11-08", asks=2, outbox_asks=2,
+                     outbox=f"Pli\nkota {self.WORD}\nmb")
+        self.path.write_text(json.dumps(state), encoding="utf-8")
+        self.assertEqual(self.flush(), "Pli")  # "Pli\nmb" would spell the deny word
+        state = self.state()
+        self.assertEqual(set(state), self.OLD_KEYS)
+        self.assertEqual((state["outbox"], state["outbox_asks"], state["asks"]), ("mb", 1, 2))
+        self.assertEqual([e["key"] for e in state["pending"]], ["p"])  # waits behind "mb"
+        self.assertEqual(self.flush(), "mb\nlater")  # the deferred entry is delivered
+        state = self.state()
+        self.assertEqual(set(state), self.OLD_KEYS)
+        self.assertEqual((state["outbox"], state["outbox_asks"], state["pending"]), ("", 0, []))
+        self.assertEqual(self.sent, ["Pli", "mb\nlater"])
+        self.assertEqual(self.counts(), {"deny": 1})
+        for text in self.sent:
+            self.assertTrue(n6_notify.dora_screen.screen(text)[0], text)
 
     def test_neg_sidecar_write_error_never_drops_the_event(self):  # CDX-DORAGATE1FIX F3
         submit(self.path, Event("urgent", "a", f"kota {self.WORD}"))
@@ -474,43 +516,11 @@ class N6ScreenTests(N6NotifyTests.__base__):
         self.assertEqual(self.flush(), "kota bitti")  # the retry still sends it
         self.assertEqual(self.sent, ["kota bitti"])
 
-    def test_legacy_refused_kept_on_first_load(self):  # CDX-DORAGATE1FIX F4
-        for first in (lambda: submit(self.path, Event("urgent", "b", "kota bitti")),
-                      lambda: evening_summary(self.path, lambda _t: None)):
-            submit(self.path, Event("status", "a", "not"))
-            state = self.state()
-            state["refused"] = {"deny": 2}  # written by DORAGATE1
-            self.path.write_text(json.dumps(state), encoding="utf-8")
-            self.sidecar.unlink(missing_ok=True)
-            first()
-            self.assertEqual(set(self.state()), self.OLD_KEYS)
-            self.assertEqual(self.counts(), {"deny": 2})
-
     def test_neg_bad_sidecar_never_blocks_submit(self):  # F2 probe H1
         submit(self.path, Event("urgent", "a", "kota bitti"))
         self.sidecar.write_text("{bad", encoding="utf-8")
         submit(self.path, Event("urgent", "b", "kota yine bitti"))
         self.assertEqual([e["key"] for e in self.state()["pending"]], ["a", "b"])
-
-    def test_neg_legacy_fold_error_keeps_event_and_counts(self):  # F2 probe H2
-        submit(self.path, Event("status", "a", "not"))
-        state = self.state()
-        state["refused"] = {"deny": 2}
-        self.path.write_text(json.dumps(state), encoding="utf-8")
-        real = n6_notify._write
-
-        def write(path, data):
-            if path.name.endswith(".refused"):
-                raise OSError("disk full")
-            real(path, data)
-
-        with mock.patch.object(n6_notify, "_write", write):
-            submit(self.path, Event("urgent", "b", "kota bitti"))
-        self.assertEqual([e["key"] for e in self.state()["pending"]], ["b"])
-        self.assertEqual(self.state()["refused"], {"deny": 2})  # kept for the next load
-        submit(self.path, Event("urgent", "c", "kota yine bitti"))
-        self.assertEqual(set(self.state()), self.OLD_KEYS)
-        self.assertEqual(self.counts(), {"deny": 2})
 
 
 if __name__ == "__main__":

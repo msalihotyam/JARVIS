@@ -26,7 +26,7 @@ import re
 import tempfile
 import unicodedata
 from collections.abc import Callable
-from dataclasses import asdict, astuple, dataclass, field
+from dataclasses import asdict, astuple, dataclass
 from datetime import date, datetime
 from pathlib import Path
 from typing import cast
@@ -49,7 +49,6 @@ _LINK = re.compile(
 _DOTS = {0x3002: ".", 0xFF61: "."}
 _KEYS = {"version", "pending", "daily", "ask_day", "asks", "outbox", "outbox_asks"}
 _ITEM_KEYS = ("kind", "key", "text", "recommendation")
-_OPT_KEYS = {"refused"}  # DORAGATE1: optional, written only when non-empty
 
 
 class Route(enum.Enum):
@@ -82,7 +81,6 @@ class _State:
     asks: int
     outbox: str
     outbox_asks: int = 0
-    refused: dict[str, int] = field(default_factory=lambda: {})
 
 
 def classify(kind: str) -> Route:
@@ -141,8 +139,8 @@ def _load(path: Path) -> _State:
     d = cast("dict[str, object]", data)
     version, pending_raw, daily_raw = d.get("version"), d.get("pending"), d.get("daily")
     day, asks, outbox = d.get("ask_day"), d.get("asks"), d.get("outbox")
-    oasks, refused_raw = d.get("outbox_asks"), d.get("refused", {})
-    if not _KEYS <= set(d) <= _KEYS | _OPT_KEYS or type(version) is not int or version != 1:
+    oasks = d.get("outbox_asks")
+    if set(d) != _KEYS or type(version) is not int or version != 1:
         raise _bad("keys or version")
     if not isinstance(pending_raw, list) or not isinstance(daily_raw, list):
         raise _bad("pending/daily")
@@ -155,11 +153,6 @@ def _load(path: Path) -> _State:
     lines_ok = all(x and x == clean(x) for x in outbox.split("\n")) if outbox else not oasks
     if len(outbox) > MAX_CHARS or not lines_ok:
         raise _bad("outbox")
-    if not isinstance(refused_raw, dict):
-        raise _bad("refused")
-    refused = cast("dict[object, object]", refused_raw)
-    if not all(isinstance(k, str) and type(v) is int and v > 0 for k, v in refused.items()):
-        raise _bad("refused")
     daily = cast("list[object]", daily_raw)
     if not all(isinstance(x, str) and x and x == clean(x) for x in daily):
         raise _bad("daily item")
@@ -175,8 +168,7 @@ def _load(path: Path) -> _State:
         if classify(ev.kind) is not Route.SALIH or not _valid(ev):
             raise _bad(f"pending item {ev.kind!r}")
         pending.append(ev)
-    return _State(pending, cast("list[str]", daily), day, asks, outbox, oasks,
-                  cast("dict[str, int]", refused))
+    return _State(pending, cast("list[str]", daily), day, asks, outbox, oasks)
 
 
 def _save(path: Path, s: _State) -> None:
@@ -184,8 +176,6 @@ def _save(path: Path, s: _State) -> None:
         "version": 1, "pending": [asdict(e) for e in s.pending], "daily": s.daily,
         "ask_day": s.ask_day, "asks": s.asks, "outbox": s.outbox, "outbox_asks": s.outbox_asks,
     }  # exactly _KEYS: the 00f3a20 reader rejects any other key (refusal counts: sidecar)
-    if s.refused:  # only a legacy key whose move to the sidecar failed: never drop counts
-        data["refused"] = s.refused
     _write(path, data)
 
 
@@ -194,7 +184,10 @@ def _counts_path(path: Path) -> Path:
 
 
 def _load_counts(path: Path) -> dict[str, int]:
-    """Refusal counts by reason label only, from the sidecar beside the state file."""
+    """Refusal counts by reason label only, from the sidecar beside the state file.
+
+    The counts are diagnostic: they are written after the state, which is the source of
+    truth, so a failed or interrupted sidecar write may lose them, never an event."""
     try:
         data = cast(object, json.loads(_counts_path(path).read_text(encoding="utf-8")))
     except FileNotFoundError:
@@ -206,30 +199,6 @@ def _load_counts(path: Path) -> dict[str, int]:
             for k, v in cast("dict[object, object]", data).items()):
         raise _bad("refused")
     return cast("dict[str, int]", data)
-
-
-def _open(path: Path, soft: bool = False) -> tuple[_State, dict[str, int]]:
-    """State and refusal counts. A DORAGATE1 state kept its counts in the state file:
-    they move to the sidecar here, before any save can drop that key (DORAGATE1FIX2).
-    ``soft`` (submit): a sidecar problem never blocks storing an event; the legacy counts
-    then stay in the state (_save keeps them) for a later load to move."""
-    s = _load(path)
-    if soft and not s.refused:
-        return s, {}  # submit needs no counts
-    try:
-        counts = _load_counts(path)
-        if s.refused:
-            for why, n in s.refused.items():
-                counts[why] = counts.get(why, 0) + n
-            # shortcut: a failed save right after this fold folds again next load (counts
-            # only, never events), upgrade if counts must be exact
-            _write(_counts_path(path), counts)
-            s.refused = {}
-    except (OSError, StateError):
-        if not soft:
-            raise
-        return s, {}
-    return s, counts
 
 
 def _write(path: Path, data: object) -> None:
@@ -261,7 +230,7 @@ def submit(state_path: Path | str, event: Event) -> Route:
     if not event.key.strip():
         raise ValueError("event key must not be empty")
     path = Path(state_path)
-    s, _ = _open(path, soft=True)
+    s = _load(path)
     if route is Route.DAILY:
         if (line := clean(event.text)) and line not in s.daily:
             s.daily.append(line)  # ponytail: dedupe by text, store keys if distinct items collide
@@ -290,12 +259,16 @@ def flush(
     for the next flush, so the text sent is always the text screened.
     DORAGATE1FIX2: a persisted outbox is screened joined and per line; the state is saved
     before the sidecar, so a sidecar write error can lose a count, never an event.
+    DORAGATE1FIX3: a refused outbox line is dropped alone; clean lines stay queued and are
+    re-joined under the join screen; a line whose join is refused waits, with every later
+    outbox line and before any pending event, for the next flush. Counts live only in the
+    sidecar; the state keeps exactly the pre-DORAGATE1 keys.
     """
     if at.utcoffset() is None:
         raise ValueError("at must be timezone-aware")
     deny = dora_screen.load_deny()  # fail closed: raises, nothing sent
     path = Path(state_path)
-    s, counts = _open(path)
+    s, counts = _load(path), _load_counts(path)
 
     def refuse(text: str) -> bool:
         ok, why = dora_screen.screen(text, deny)
@@ -303,16 +276,26 @@ def flush(
             counts[why] = counts.get(why, 0) + 1
         return not ok
 
-    if s.outbox and (refuse(s.outbox) or any(refuse(x) for x in s.outbox.split("\n"))):
-        s.asks -= s.outbox_asks  # its asks were never sent: free them for today
-        s.outbox, s.outbox_asks = "", 0
+    lines: list[str] = []
+    rest: list[str] = []  # clean outbox lines that wait for the next flush, in order
+    old = s.outbox.split("\n") if s.outbox else []
+    for x in old:
+        if refuse(x):
+            continue  # dropped alone, counted in the sidecar
+        if rest or (lines and not dora_screen.screen("\n".join([*lines, x]), deny)[0]):
+            rest.append(x)
+        else:
+            lines.append(x)
+    if old and not lines:  # every outbox line refused: its asks were never sent, free them
+        s.asks -= s.outbox_asks
+        s.outbox_asks = 0
+    # a partial drop frees no ask: which line was an ask is not stored (stricter cap only)
     day = at.astimezone(ISTANBUL).date().isoformat()
     if day > s.ask_day:  # a clock going backwards never resets the cap
         s.ask_day, s.asks = day, s.outbox_asks  # unsent asks count against the send day
-    lines = [s.outbox] if s.outbox else []
     queue, s.pending = s.pending, []
     try:
-        while queue:
+        while queue and not rest:  # deferred outbox lines are older: they go first
             ev = queue[0]
             if ev.kind == "ask" and s.asks >= ASKS_PER_DAY:
                 s.pending.append(queue.pop(0))
@@ -335,15 +318,19 @@ def flush(
             _ = queue.pop(0)
     finally:
         s.pending += queue
-        s.outbox = "\n".join(lines)
+        s.outbox = "\n".join([*lines, *rest])
         _save(path, s)  # first: the sidecar may fail, the events must not
         if counts:
             _write(_counts_path(path), counts)
-    if not s.outbox:
+    if not lines:
         return None
-    text = s.outbox
+    text = "\n".join(lines)  # every line and this join passed the screen
     send(text)
-    s.outbox, s.outbox_asks = "", 0
+    # which sent line was an ask is not stored: keep the upper bound for the rest (rollover)
+    # and count the gap to the lower bound now, so a later full drop never frees a sent ask
+    low = max(0, s.outbox_asks - len(lines))
+    s.outbox, s.outbox_asks = "\n".join(rest), min(s.outbox_asks, len(rest))
+    s.asks += max(0, s.outbox_asks - low)
     _save(path, s)
     return text
 
@@ -379,7 +366,7 @@ def evening_summary(state_path: Path | str, deliver: Callable[[str], None]) -> l
     """
     deny = dora_screen.load_deny()  # fail closed: raises, nothing delivered or consumed
     path = Path(state_path)
-    s, counts = _open(path)
+    s, counts = _load(path), _load_counts(path)
 
     def ok(text: str) -> bool:
         good, why = dora_screen.screen(text, deny)
