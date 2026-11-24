@@ -179,6 +179,47 @@ class LessonChunkLayerTests(unittest.TestCase):
         self.assertEqual(rep["dropped_dora"], rep["chunks"])
 
 
+class LessonFileLayerTests(unittest.TestCase):
+    """CDX-DORAEGRESS2 F1: run()'s whole-file _hit(hit_lines) gate is load-bearing. The marker is
+    split over a chunk boundary, so every chunk passes screen() alone; only the whole-file layer
+    sees it. Each control opens that one layer (hit_lines -> []) and shows the parts would leave."""
+
+    setUp = LessonGateTests.setUp
+    deny_file = LessonGateTests.deny_file
+    assert_outputs_clean = LessonGateTests.assert_outputs_clean
+
+    def check_split(self, lines):
+        f = self.root / "kayit" / "ACIK_KONULAR.md"
+        f.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        deny = L.load_deny(self.deny_file([MARK]))
+        parts = L.chunk_plain(f, "kayit/ACIK_KONULAR.md")
+        self.assertEqual(len(parts), 2)
+        for c in parts:  # each chunk alone passes the per-chunk screen
+            self.assertEqual(dora_screen.screen(c["text"], deny), (True, ""), c["text"])
+        self.assertNotEqual(L.hit_lines(f, deny), [])  # the whole file holds the marker
+        api = TrackingApi(self.tmp)
+        with mock.patch.object(L, "hit_lines", return_value=[]):
+            L.run(self.root, self.tmp / "out", 1.0, api, deny_path=self.deny_file([MARK]))
+        leaked = "\n".join(api.payloads)
+        self.assertIn("QQFRAGA", leaked)  # control: without the whole-file gate both parts leave
+        self.assertIn("QQFRAGB", leaked)
+        api = TrackingApi(self.tmp)
+        rep = L.run(self.root, self.tmp / "out", 1.0, api, deny_path=self.deny_file([MARK]))
+        sent = "\n".join(api.payloads)
+        for needle in ("QQFRAGA", "QQFRAGB", "zqxvk", MARK):
+            self.assertNotIn(needle, sent)
+        self.assertIn(CLEAN, sent)
+        self.assertGreaterEqual(rep["dropped_dora"], 3)  # ORCH_RULES and both parts
+        self.assert_outputs_clean(MARK, "QQFRAGA", "QQFRAGB")
+
+    def test_marker_split_at_heading_boundary_never_sent(self):
+        self.check_split(["Konu: QQFRAGA notu zqxvk", "# mark QQFRAGB notu"])
+
+    def test_marker_split_at_line_limit_boundary_never_sent(self):
+        filler = [f"satir {i} notu" for i in range(1, L.CHUNK_LINES)]
+        self.check_split([*filler, "QQFRAGA notu zqxvk", "mark QQFRAGB notu"])
+
+
 class BrokerGateTests(unittest.TestCase):
     """Model path: scripts/conveyor_api.call refuses non-model and non-text before anything is sent.
     CDX F1: the reason is asserted, so a later gate (cut switch, platform) cannot stand in."""
@@ -300,6 +341,77 @@ class N6FlushGateTests(unittest.TestCase):
         state = self.path.read_text("utf-8")
         self.assertNotIn(MARK, state)
         self.assertNotIn(SECRET, state)
+
+    # CDX-DORAEGRESS2 F2: two lines each clean alone, whose join spells MARK (the skeleton
+    # folds the newline). The joined-message screen sends them separately, never joined.
+    def check_pending_join(self, first, second):
+        deny = dora_screen.load_deny(self.deny)
+        self.assertEqual(dora_screen.screen(first, deny), (True, ""))
+        self.assertEqual(dora_screen.screen(second, deny), (True, ""))
+        self.assertEqual(dora_screen.screen(f"{first}\n{second}", deny), (False, "deny"))
+        submit(self.path, Event("urgent", "a", first))
+        submit(self.path, Event("urgent", "b", second))
+        self.assertEqual(self.flush(), first)
+        self.assertEqual(self.flush(), second)
+        self.assertEqual(self.sent, [first, second])
+        self.assertFalse(self.path.with_name(self.path.name + ".refused").exists())  # a wait, no refusal
+
+    def test_pending_lines_whose_join_is_refused_go_separately(self):
+        self.check_pending_join("kota zqxvk", "mark bitti")
+
+    def test_pending_join_refused_after_case_and_leet_folding(self):
+        self.check_pending_join("kota ZQXVK", "m4rk bitti")
+
+    # CDX-DORAEGRESS2 F3: a persisted outbox (queued by an earlier flush) is screened again.
+    def seed_outbox(self, *lines):
+        self.path.write_text(json.dumps({"version": 1, "pending": [], "daily": [], "ask_day": "",
+                                         "asks": 0, "outbox": "\n".join(lines), "outbox_asks": 0}),
+                             encoding="utf-8")
+
+    def test_seeded_outbox_forbidden_lines_dropped_and_counted(self):
+        self.seed_outbox(f"kota {MARK} bitti", f"anahtar {SECRET}", "durum temiz")
+        self.assertEqual(self.flush(), "durum temiz")
+        self.assertEqual(self.sent, ["durum temiz"])
+        self.assertEqual(self.counts(), {"deny": 1, "secret": 1})
+        state = self.path.read_text("utf-8")
+        self.assertNotIn(MARK, state)
+        self.assertNotIn(SECRET, state)
+
+    def test_seeded_outbox_join_refused_line_waits_before_pending(self):
+        self.seed_outbox("durum temiz", "kota zqxvk", "mark bitti")
+        submit(self.path, Event("urgent", "c", "kuyruk temiz"))
+        self.assertEqual(self.flush(), "durum temiz\nkota zqxvk")
+        self.assertEqual(self.flush(), "mark bitti\nkuyruk temiz")  # the waiting line goes first
+        self.assertEqual(self.sent, ["durum temiz\nkota zqxvk", "mark bitti\nkuyruk temiz"])
+        self.assertFalse(self.path.with_name(self.path.name + ".refused").exists())
+
+    # The join screen covers the whole message, not only the last pair: three lines, every
+    # line and every adjacent pair clean, only all three together spell MARK.
+    THREE = ("kota zqx", "vk", "mark bitti")
+
+    def check_three_clean_pairs(self):
+        deny = dora_screen.load_deny(self.deny)
+        a, b, c = self.THREE
+        for text in (a, b, c, f"{a}\n{b}", f"{b}\n{c}"):
+            self.assertEqual(dora_screen.screen(text, deny), (True, ""), text)
+        self.assertEqual(dora_screen.screen(f"{a}\n{b}\n{c}", deny), (False, "deny"))
+
+    def test_pending_three_line_split_never_joined(self):
+        self.check_three_clean_pairs()
+        for i, line in enumerate(self.THREE):
+            submit(self.path, Event("urgent", f"t{i}", line))
+        self.assertEqual(self.flush(), "kota zqx\nvk")
+        self.assertEqual(self.flush(), "mark bitti")
+        self.assertEqual(self.sent, ["kota zqx\nvk", "mark bitti"])
+        self.assertFalse(self.path.with_name(self.path.name + ".refused").exists())
+
+    def test_seeded_outbox_three_line_split_never_joined(self):
+        self.check_three_clean_pairs()
+        self.seed_outbox(*self.THREE)
+        self.assertEqual(self.flush(), "kota zqx\nvk")
+        self.assertEqual(self.flush(), "mark bitti")
+        self.assertEqual(self.sent, ["kota zqx\nvk", "mark bitti"])
+        self.assertFalse(self.path.with_name(self.path.name + ".refused").exists())
 
 
 if __name__ == "__main__":

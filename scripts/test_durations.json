@@ -1551,6 +1551,7 @@
   "tests.test_dora_screen.DoraScreenTests": 0.1,
   "tests.test_dora_egress.LessonGateTests": 0.1,
   "tests.test_dora_egress.LessonChunkLayerTests": 0.1,
+  "tests.test_dora_egress.LessonFileLayerTests": 0.1,
   "tests.test_dora_egress.BrokerGateTests": 0.1,
   "tests.test_dora_egress.N6FlushGateTests": 0.1,
   "tests.test_n6_breaker.N6BreakerGapTest": 0.1,
