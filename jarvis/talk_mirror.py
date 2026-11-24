@@ -18,12 +18,19 @@ def _text_parts(text, label):
         start = 0
         while len(text) - start > capacity:
             end = start + capacity
+            # A separator that straddles the cut still marks a paragraph end: cut before it.
+            # A whole separator wins over a later straddling one only when it ends later (newline runs).
             paragraph_end = max(
-                (boundary + len(separator)
+                [boundary + len(separator)
                  for separator in ("\n\n", "\r\n\r\n")
-                 if (boundary := text.rfind(separator, start, end)) != -1),
+                 if (boundary := text.rfind(separator, start, end)) != -1]
+                + [boundary
+                   for separator in ("\n\n", "\r\n\r\n")
+                   if (boundary := text.rfind(separator, start, end + len(separator) - 1)) > start],
                 default=end,
             )
+            if text[paragraph_end - 1:paragraph_end + 1] == "\r\n" and paragraph_end - 1 > start:
+                paragraph_end -= 1  # never split a CRLF pair
             parts.append(text[start:paragraph_end])
             start = paragraph_end
         parts.append(text[start:])

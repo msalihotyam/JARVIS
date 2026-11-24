@@ -45,6 +45,58 @@ class TalkMirrorTests(unittest.TestCase):
         self.assertEqual([a["text"] for a in actions],
                          ["(1/2) " + first + "\n\n", "(2/2) " + second])
 
+    def assert_split(self, text, head, prefix="", **overrides):
+        overrides.setdefault("delivered", {"pc": True})
+        actions = self.plan(text=text, **overrides)
+        parts = [a["text"] for a in actions]
+        self.assertEqual(len(parts), 2)
+        self.assertEqual(parts[0], f"{prefix}(1/2) {head}")
+        self.assertTrue(all(len(part) <= 4000 for part in parts))
+        rest = parts[1][len(f"{prefix}(2/2) "):]
+        self.assertEqual(head + rest, text)
+        return rest
+
+    def test_separator_straddling_cut_splits_before_it(self):
+        # jarvis, no label: capacity 4000 - (2 * 1 + 4) = 3994
+        for separator in ("\n\n", "\r\n\r\n"):
+            for inside in range(1, len(separator)):
+                with self.subTest(separator=separator, inside=inside):
+                    head = "a" * (3994 - inside)
+                    rest = self.assert_split(head + separator + "b" * 10, head, who="jarvis")
+                    self.assertEqual(rest, separator + "b" * 10)
+
+    def test_separator_ending_at_cut_stays_with_first_part(self):
+        for separator in ("\n\n", "\r\n\r\n"):
+            with self.subTest(separator=separator):
+                head = "a" * (3994 - len(separator)) + separator
+                self.assertEqual(self.assert_split(head + "b" * 10, head, who="jarvis"), "b" * 10)
+
+    def test_straddle_with_label_and_earlier_paragraph(self):
+        # salih telegram -> pc label "Telefon: " (9): capacity 3985
+        head = "a" * 100 + "\n\n" + "c" * 3882
+        rest = self.assert_split(head + "\r\n\r\n" + "b" * 10, head, prefix="Telefon: ",
+                                 who="salih", source="telegram", delivered={})
+        self.assertEqual(rest, "\r\n\r\n" + "b" * 10)
+
+    def test_newline_run_across_cut_keeps_whole_separator_in_first_part(self):
+        head = "a" * 3992 + "\n\n"
+        self.assertEqual(self.assert_split(head + "\nb" + "b" * 10, head, who="jarvis"),
+                         "\nb" + "b" * 10)
+
+    def test_cut_never_splits_a_crlf_pair(self):
+        for middle in ("\n\r\n", "\r\n\n", "\r\n"):
+            with self.subTest(middle=middle):
+                # place the "\r" as the last char inside capacity 3994
+                prefix = "a" * (3993 - middle.index("\r"))
+                head = prefix + middle[:middle.index("\r")]
+                rest = self.assert_split(prefix + middle + "b" * 10, head, who="jarvis")
+                self.assertTrue(rest.startswith("\r\n"))
+
+    def test_single_newline_is_not_a_paragraph_boundary(self):
+        head = "a" * 3993 + "\n"
+        tail = "b\nb\nb" + "b" * 10
+        self.assertEqual(self.assert_split(head + tail, head, who="jarvis"), tail)
+
     def test_long_word_splits_and_every_part_keeps_pc_label(self):
         word = "x" * 4001
         actions = self.plan(text=word)
