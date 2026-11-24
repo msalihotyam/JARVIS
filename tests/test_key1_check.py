@@ -1,9 +1,11 @@
 """scripts/key1_check.py: the read-only verifier for the orchestrator's key1 decision."""
 import importlib.util
 import json
+import shutil
 import subprocess
 import tempfile
 import unittest
+from functools import lru_cache
 from pathlib import Path
 from unittest import mock
 from types import SimpleNamespace
@@ -28,10 +30,8 @@ def commit(root, name, text):
     return git(root, "rev-parse", "HEAD")
 
 
-def make(tmp, chain=("CLREV", "CDX", "INT"), status="PASS", findings="none", files=("a.txt",),
-         on_main=False, review_commit=None, ci_branch="ci/int-x", tier=None, src_file="a.txt"):
-    """origin/main=base; source commit S on a branch; candidate C = S cherry-picked onto base
-    (same patch-id). Reports and backlog live under <root>/build like the conveyor's."""
+def make_history(tmp, src_file="a.txt"):
+    """Build the source and candidate histories once for the class (src_file: the file the source commit adds)."""
     root = Path(tmp)
     git(root, "init", "-q", "-b", "main")
     base = commit(root, "a.txt", "1\n")
@@ -42,7 +42,22 @@ def make(tmp, chain=("CLREV", "CDX", "INT"), status="PASS", findings="none", fil
     git(root, "checkout", "-q", "-b", "cand", "main")
     git(root, "cherry-pick", src)
     cand = git(root, "rev-parse", "HEAD")
-    git(root, "update-ref", "refs/remotes/origin/main", cand if on_main else base)
+    git(root, "update-ref", "refs/remotes/origin/main", base)
+    return SimpleNamespace(root=root, base=base, src=src, cand=cand, other=other)
+
+
+def make(tmp, history, chain=("CLREV", "CDX", "INT"), status="PASS", findings="none",
+         files=("a.txt",), on_main=False, review_commit=None, ci_branch="ci/int-x",
+         shared_git=None, tier=None, src_file="a.txt"):
+    """Write fresh reports and backlog and give mutable cases their own repo."""
+    root = Path(tmp)
+    if src_file != "a.txt":  # a different source file needs its own history
+        history, shared_git = make_history(tmp, src_file), None
+    elif shared_git is None:
+        shutil.copytree(history.root, root, dirs_exist_ok=True)
+    src, cand = history.src, history.cand
+    if on_main:
+        git(root, "update-ref", "refs/remotes/origin/main", cand)
     rep = root / "build" / "reports"
     rep.mkdir(parents=True)
     (rep / "INT-X.md").write_text(
@@ -55,7 +70,8 @@ def make(tmp, chain=("CLREV", "CDX", "INT"), status="PASS", findings="none", fil
     (root / "build" / "conveyor" / "backlog.json").write_text(
         json.dumps({"slices": [{"id": "X", "files": list(files), "chain": list(chain),
                                 **({"tier": tier} if tier else {})}]}), encoding="utf-8")
-    return SimpleNamespace(root=root, base=base, src=src, cand=cand, other=other)
+    return SimpleNamespace(root=root, base=history.base, src=src, cand=cand,
+                           other=history.other, git=shared_git or k1.make_git(root))
 
 
 def ci(sha, conclusion="success", status="completed"):
@@ -68,14 +84,29 @@ def snapshot(root):
 
 
 class Key1CheckTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        directory = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(directory.cleanup)
+        cls.history = make_history(directory.name)
+        run_git = k1.make_git(cls.history.root)
+
+        @lru_cache(maxsize=None)
+        def cached_git(args, stdin):
+            return run_git(args, stdin)
+
+        # Findings cases vary only the reports and reuse Git reads of the template.
+        cls.shared_git = staticmethod(lambda args, stdin=None: cached_git(tuple(args), stdin))
+        cls.addClassCleanup(cached_git.cache_clear)
+
     def run_lane(self, fx, gh=None, operator_tool=False):
-        out, ok = k1.verify("INT-X", fx.root, k1.make_git(fx.root), gh or ci(fx.cand), operator_tool)
+        out, ok = k1.verify("INT-X", fx.root, fx.git, gh or ci(fx.cand), operator_tool)
         return "\n".join(out), ok
 
-    def fx(self, **kw):
+    def fx(self, *, share_history=False, **kw):
         d = tempfile.TemporaryDirectory()
         self.addCleanup(d.cleanup)
-        return make(d.name, **kw)
+        return make(d.name, self.history, shared_git=self.shared_git if share_history else None, **kw)
 
     def test_all_pass_prints_approval_name_and_writes_nothing(self):
         fx = self.fx()
@@ -146,7 +177,8 @@ class Key1CheckTests(unittest.TestCase):
                          "none\nSTATUS : BLOCKED"):
             for op in (False, True):
                 with self.subTest(findings=findings, operator_tool=op):
-                    text, ok = self.run_lane(self.fx(findings=findings), operator_tool=op)
+                    text, ok = self.run_lane(self.fx(findings=findings, share_history=True),
+                                             operator_tool=op)
                     self.assertFalse(ok, text)
                     self.assertIn("FAIL 3", text)
 
@@ -156,7 +188,8 @@ class Key1CheckTests(unittest.TestCase):
                          "1\nF1 MINOR: x\n1. F2 МAJOR x", "1\nF2 MINOR (really MEDIUM, data loss)",
                          "1\nF1 MINOR x\nblocking: severe data loss"):
             with self.subTest(findings=findings):
-                text, ok = self.run_lane(self.fx(findings=findings), operator_tool=True)
+                text, ok = self.run_lane(self.fx(findings=findings, share_history=True),
+                                         operator_tool=True)
                 self.assertFalse(ok, text)
                 self.assertIn("FAIL 3", text)
 
