@@ -213,6 +213,7 @@ class LessonExtractTests(unittest.TestCase):
         self.assertTrue(L.denied("kisi.ad+etiket@ornek.com.tr", deny))
         self.assertFalse(L.denied("a" * 40000, deny))
         self.assertFalse(L.denied("." * 40000 + "@", deny))
+        self.assertTrue(L.denied("a" * 500 + " at example dot com", deny))  # POLISHLES1 F2: no local cap
 
 
 PHONES = {  # LESSONS1FIX: every Turkish phone shape is dropped before any call
@@ -333,6 +334,15 @@ OTHER_SHAPES = {  # LESSONS1FIX2 review: id, IBAN, e-mail and word variants
     "R_table_cell": "| 12345 678901 | 3 |",
     "R_at_sign_dot": "salih@example dot com",
     "R_nokta": "salih at gmail nokta com",
+    # POLISHLES1 (CDX-LESSONS1FIX4 MINOR): digit + one separator glued in front; 65+ char spelled local
+    "POL_F1_paren_glued": "1)12345 678901",
+    "POL_F1_dash_glued": "1-12345 678901",
+    "POL_F1_dot_glued": "1.12345-678901",
+    "POL_F1_newline_glued": "1\n12345 678901",
+    "POL_F1_comma_glued": "1,12345.678901",
+    "POL_F1_space_glued": "1 12345 678901",
+    "POL_F2_long_spelled_local": "a" * 65 + " at example dot com",
+    "POL_F2_long_dotted_local": "a.b" * 40 + " (at) example (dot) com",
 }
 SHA_DATE_RULE = "O9 kural 3ac9e3786a660ebac394c44a993e4801b4396058 2026-11-14 notu"
 NOT_PHONES = ("O52 kurali 2026-11-14 12:30 tarihinde", "600000 ms, 80 cagri, 45 dk",
