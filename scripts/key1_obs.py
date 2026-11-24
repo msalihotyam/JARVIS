@@ -13,11 +13,15 @@ import time
 from datetime import datetime
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from orchbot import PRE_RE, SALIH_RE  # noqa: E402  orchbot.key1_side's own classifiers, never a copy
+
 WINDOW_S = 2 * 3600  # a bot write with no real key 1 within 2 h is unsafe
-NAME_RE = re.compile(r"push-([0-9a-f]{40})-[A-Za-z0-9._-]+?(?:\.\d{8}-\d{6})?(\.refused)?")
+# conveyor.to_done stamps a name clash AFTER the suffix: <name>.refused.<YYYYmmdd-HHMMSS> (orchbot.STAMP_RE)
+NAME_RE = re.compile(r"push-([0-9a-f]{40})-[A-Za-z0-9._-]+?(\.refused)?(?:\.\d{8}-\d{6})?")
 # tolerant on by= (the live bot writes by=hands, which the push gate's header regex does not know yet)
-HEAD_RE = re.compile(r"KEY1 v1 sha=(?P<sha>[0-9a-f]{40}) ci=\S+ lane=(?P<lane>\S+) by=(?P<by>[A-Za-z0-9_]+) .*"
-                     r"at=(?P<at>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
+HEAD_RE = re.compile(r"KEY1 v1 sha=(?P<sha>[0-9a-f]{40}) ci=\S+ lane=(?P<lane>\S+) by=(?P<by>[A-Za-z0-9_]+)"
+                     r"(?: reason=(?P<reason>[^=]*))? .*at=(?P<at>\d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ)")
 SHA_RE = re.compile(r"push-([0-9a-f]{40})")
 V1_RE = re.compile(r"\s*KEY\s*1\s*V\s*1(?!\d)", re.I)  # legacy free text ("key1 INT-X ...") is not a v1 attempt
 
@@ -50,8 +54,26 @@ def load_decisions(path, since):
     return out
 
 
+def side(by, reason):
+    """orchbot.key1_side on this tolerant header: hands, conveyor, write_key1 (an orchestrator key 1 that may
+    AGREE) or ask_salih_key1 (the orchestrator escalated: a bot write against it never agrees)."""
+    if by.casefold() == "hands":
+        return "hands"
+    if by == "conveyor":  # exact case like the push gate; any other spelling is gate-invalid and fails closed
+        return "conveyor"
+    if by == "key1_check":
+        return "write_key1" if reason is None else "ask_salih_key1"
+    if by == "manual" and reason and PRE_RE.search(reason):
+        return "conveyor"  # an O42 pre-approval: conveyor side, outside key-1 graduation
+    # DECISION TAKEN: a Salih reason, a reason the push gate refuses (non-ASCII, missing) or an unknown writer
+    # is ask_salih_key1, fail closed (alternative: drop the file as no key 1)
+    if by == "manual" and reason and reason.isascii() and reason.isprintable() and not SALIH_RE.search(reason):
+        return "write_key1"
+    return "ask_salih_key1"
+
+
 def load_approvals(done):
-    """[{sha, lane, by, at, refused, name, bad}] of every approval in done/; ValueError on a malformed one."""
+    """[{sha, lane, by, side, at, refused, name, bad}] of every approval in done/; ValueError on a malformed one."""
     out = []
     for p in sorted(Path(done).iterdir()):
         m = NAME_RE.fullmatch(p.name)
@@ -62,13 +84,13 @@ def load_approvals(done):
         h = HEAD_RE.fullmatch(first)
         if not h:
             if m.group(2):  # a refused file may carry any text: its name is the record
-                out.append({"sha": m.group(1), "lane": "", "by": "?", "at": None, "refused": True, "name": p.name,
-                            "bad": False})
+                out.append({"sha": m.group(1), "lane": "", "by": "?", "side": "?", "at": None, "refused": True,
+                            "name": p.name, "bad": False})
                 continue
             if V1_RE.match(first):  # a KEY1 v1 header attempt that does not parse fails closed
                 raise ValueError(f"approval {p.name}: malformed KEY1 v1 header")
             continue  # legacy free-text approval (pre KEY1 v1): not a key 1 record
-        out.append({"sha": h["sha"], "lane": h["lane"], "by": h["by"], "at": ts(h["at"]),
+        out.append({"sha": h["sha"], "lane": h["lane"], "by": h["by"], "side": side(h["by"], h["reason"]), "at": ts(h["at"]),
                     "refused": bool(m.group(2)), "name": p.name, "bad": h["sha"] != m.group(1)})
     return out
 
@@ -78,44 +100,59 @@ def same(bot_lane, bot_sha, a):
 
 
 def report(decisions, approvals, since, now):
-    lines, c = [], {"agree": 0, "unsafe": 0, "stricter": 0, "unmatched": 0, "pending": 0}
+    lines, c = [], {"agree": 0, "unsafe": 0, "stricter": 0, "unmatched": 0, "pending": 0, "conveyor": 0}
     bad = [a for a in approvals if a["bad"]]  # header sha != name sha: a key 1 for neither sha
     approvals = [a for a in approvals if not a["bad"]]
     lines += [f"{a['name']} header sha={a['sha']} differs from its file name INCONSISTENT" for a in bad]
-    real = [a for a in approvals if a["by"] != "hands"]
-    used = set()
+    real = [a for a in approvals if a["side"] != "hands"]
+    used, paired = set(), set()  # paired: a key 1 already agreed with one shadow write never agrees again
     for t, act, mode, lane, sha in decisions:
         near = [a for a in real if same(lane, sha, a) and (a["at"] is None or abs(a["at"] - t) <= WINDOW_S)]
-        key1 = next((a for a in near if not a["refused"]), None)
+        # only an orchestrator-side key 1 pairs with the bot; a conveyor-side one is no orchestrator decision
+        key1 = next((a for a in near if not a["refused"] and a["side"] != "conveyor"
+                     and (act != "write_key1" or a["name"] not in paired)), None)
+        salih = any(not a["refused"] and a["side"] == "ask_salih_key1" for a in near)  # order-independent
+        conv = next((a for a in near if not a["refused"] and a["side"] == "conveyor"), None)
         refusal = next((a for a in near if a["refused"]), None)
         used.update(a["name"] for a in near)
+        shown = key1 or conv
+        real_txt = f"real key1 by={shown['by']} at={iso(shown['at'])}" if shown else "no real key1"
         if act == "ask_salih_key1":
-            if key1:
+            if key1 and key1["side"] == "write_key1":
                 c["stricter"] += 1
-                lines.append(f"{iso(t)} bot ask_salih_key1 {lane} {sha or '-'} | real key1 by={key1['by']} "
-                             f"at={iso(key1['at'])} STRICTER")
+                lines.append(f"{iso(t)} bot ask_salih_key1 {lane} {sha or '-'} | {real_txt} STRICTER")
+            elif shown:  # both escalated, or conveyor side: neither stricter nor a K2 count
+                lines.append(f"{iso(t)} bot ask_salih_key1 {lane} {sha or '-'} | {real_txt} "
+                             f"{'SAME' if key1 else 'CONVEYOR'}")
             continue
-        if key1 and not refusal:
+        if refusal or salih:  # bot laxer than the orchestrator
+            kind = "unsafe"
+        elif key1:
             kind = "agree"
-        elif refusal or now - t > WINDOW_S:
+            paired.add(key1["name"])
+        elif conv:
+            kind = "conveyor"
+        elif now - t > WINDOW_S:
             kind = "unsafe"
         else:
             kind = "pending"
         if mode != "live":  # K2 counts the shadow (switch OFF) writes only; live writes are K4's
             c[kind] += 1
-        real_txt = f"real key1 by={key1['by']} at={iso(key1['at'])}" if key1 else "no real key1"
         lines.append(f"{iso(t)} bot write_key1 ({mode}) {lane} {sha or '-'} | {real_txt}"
                      f"{' + refusal ' + refusal['name'] if refusal else ''} {kind.upper()}")
-    for a in real:  # a real key 1 no bot decision named
+    for a in real:  # a real key 1 no bot decision named; a conveyor-side one is listed, never unmatched
         if a["name"] not in used and not a["refused"] and a["at"] is not None and a["at"] >= since:
-            c["unmatched"] += 1
-            lines.append(f"{iso(a['at'])} real key1 by={a['by']} {a['lane']} {a['sha']} | no bot decision UNMATCHED")
+            conveyor = a["side"] == "conveyor"
+            c["unmatched"] += not conveyor
+            lines.append(f"{iso(a['at'])} real key1 by={a['by']} {a['lane']} {a['sha']} | no bot decision "
+                         f"{'CONVEYOR' if conveyor else 'UNMATCHED'}")
     live = {(d[4] or d[3].casefold()) for d in decisions if d[1] == "write_key1" and d[2] == "live"}
-    hands = [a for a in approvals if a["by"] == "hands" and a["at"] is not None and a["at"] >= since]
+    hands = [a for a in approvals if a["side"] == "hands" and a["at"] is not None and a["at"] >= since]
     # DECISION TAKEN: a hands key 1 mismatches when refused or no live bot write names its sha (alt: a verdict line)
     mism = sum(a["refused"] or (a["sha"] not in live and a["lane"].casefold() not in live) for a in hands)
     lines.append(f"agree {c['agree']}, unsafe {c['unsafe']}, bot-stricter {c['stricter']}, "
-                 f"unmatched {c['unmatched']}, pending {c['pending']}, inconsistent {len(bad)}")
+                 f"unmatched {c['unmatched']}, pending {c['pending']}, inconsistent {len(bad)}, "
+                 f"conveyor {c['conveyor']}")
     lines.append(f"K2: {c['agree']}/10 matching, unsafe {c['unsafe']}")
     lines.append(f"K4: {len(hands)} hands key1 audited, mismatches {mism}")
     return lines

@@ -177,6 +177,90 @@ class Key1ObsTests(unittest.TestCase):
         self.assertEqual(code, 0, out)
         self.assertIn("K4: 2 hands key1 audited, mismatches 1", out)
 
+    def test_only_orchestrator_side_key1_agrees(self):
+        # KEY1OBS1FIX3: classify like orchbot.key1_side; conveyor side never pairs, a Salih escalation never agrees
+        cases = [("conveyor", "CONVEYOR", "agree 0, unsafe 0"), ("Conveyor", "UNSAFE", "agree 0, unsafe 1"),
+                 ("manual reason=under O42 x", "CONVEYOR", "agree 0, unsafe 0"),
+                 ("manual reason=Pre-Approval", "CONVEYOR", "agree 0, unsafe 0"),
+                 ("manual reason=by salih", "UNSAFE", "agree 0, unsafe 1"),
+                 ("manual reason=Salih Onay", "UNSAFE", "agree 0, unsafe 1"),
+                 ("manual reason=chat ok onay", "UNSAFE", "agree 0, unsafe 1"),
+                 ("manual reason=Manual Key 1", "UNSAFE", "agree 0, unsafe 1"),
+                 ("manual reason=SALİH ONAY", "UNSAFE", "agree 0, unsafe 1"),  # non-ASCII: fails closed
+                 ("manual", "UNSAFE", "agree 0, unsafe 1"), ("other_bot", "UNSAFE", "agree 0, unsafe 1"),
+                 ("manual reason=ok", "AGREE", "agree 1, unsafe 0"), ("Key1_Check", "UNSAFE", "agree 0, unsafe 1"),
+                 ("manual reason=ok\tby_salih", "UNSAFE", "agree 0, unsafe 1"),  # gate-invalid reason
+                 ("key1_check reason=x", "UNSAFE", "agree 0, unsafe 1")]  # gate-invalid key1_check
+        for by, kind, summary in cases:
+            with self.subTest(by=by):
+                for p in self.done.iterdir():
+                    p.unlink()
+                self.write([bot("2026-11-24T08:00:00Z", "write_key1", "INT-X", A)], {})
+                (self.done / f"push-{A}-int-x").write_text(key1(A, "INT-X", by, "2026-11-24T08:01:00Z"),
+                                                           encoding="utf-8")
+                code, out, _ = self.run_obs()
+                self.assertEqual(code, 0, out)
+                self.assertIn(f"INT-X {A} | real key1 by=", out)
+                self.assertTrue(out.splitlines()[0].endswith(kind), out)
+                self.assertIn(summary, out)
+                self.assertIn("unmatched 0", out)
+                self.assertIn(f"conveyor {int(kind == 'CONVEYOR')}", out)
+
+    def test_conveyor_side_never_unmatched_nor_stricter(self):
+        self.write([bot("2026-11-24T08:00:00Z", "ask_salih_key1", "INT-W", D),
+                    bot("2026-11-24T08:00:00Z", "ask_salih_key1", "INT-S", E)], {
+            f"push-{A}-int-x": key1(A, "INT-X", "conveyor", "2026-11-24T08:30:00Z"),          # no bot decision
+            f"push-{B}-int-y": key1(B, "INT-Y", "manual reason=pre-approval", "2026-11-24T08:30:00Z"),
+            f"push-{C}-int-z": key1(C, "INT-Z", "key1_check", "2026-11-24T08:30:00Z"),        # orchestrator: counts
+            f"push-{D}-int-w": key1(D, "INT-W", "conveyor", "2026-11-24T08:05:00Z"),
+            f"push-{E}-int-s": key1(E, "INT-S", "manual reason=by salih", "2026-11-24T08:05:00Z"),
+        })
+        code, out, _ = self.run_obs()
+        self.assertEqual(code, 0, out)
+        self.assertIn("agree 0, unsafe 0, bot-stricter 0, unmatched 1, pending 0, inconsistent 0, conveyor 0", out)
+        self.assertIn(f"real key1 by=conveyor INT-X {A} | no bot decision CONVEYOR", out)
+        self.assertIn(f"real key1 by=manual INT-Y {B} | no bot decision CONVEYOR", out)
+        self.assertIn(f"real key1 by=key1_check INT-Z {C} | no bot decision UNMATCHED", out)
+        self.assertIn(f"ask_salih_key1 INT-W {D} | real key1 by=conveyor at=2026-11-24T08:05:00Z CONVEYOR", out)
+        self.assertIn(f"ask_salih_key1 INT-S {E} | real key1 by=manual at=2026-11-24T08:05:00Z SAME", out)
+
+    def test_salih_key1_unsafe_whatever_the_file_order(self):
+        for salih_name in (f"push-{A}-int-x.a", f"push-{A}-int-x.z"):  # sorted before / after the key1_check file
+            with self.subTest(salih_name=salih_name):
+                for p in self.done.iterdir():
+                    p.unlink()
+                self.write([bot("2026-11-24T08:00:00Z", "write_key1", "INT-X", A)],
+                           {f"push-{A}-int-x.m": key1(A, "INT-X", "key1_check", "2026-11-24T08:01:00Z"),
+                            salih_name: key1(A, "INT-X", "manual reason=by salih", "2026-11-24T08:02:00Z")})
+                code, out, _ = self.run_obs()
+                self.assertEqual(code, 0, out)
+                self.assertIn("agree 0, unsafe 1", out)
+
+    def test_clash_stamped_refusal_is_a_refusal(self):
+        # conveyor.to_done names a clashing refusal <name>.refused.<stamp>
+        self.write([bot("2026-11-24T08:00:00Z", "write_key1", "INT-X", A)],
+                   {f"push-{A}-int-x": key1(A, "INT-X", "key1_check", "2026-11-24T08:01:00Z"),
+                    f"push-{A}-int-x.refused.20261124-080200": "refused: ci red\n"})
+        code, out, _ = self.run_obs()
+        self.assertEqual(code, 0, out)
+        self.assertIn(f"+ refusal push-{A}-int-x.refused.20261124-080200 UNSAFE", out)
+        self.assertIn("agree 0, unsafe 1", out)
+
+    def test_one_key1_agrees_once(self):
+        self.write([bot("2026-11-24T08:00:00Z", "write_key1", "INT-X", A),
+                    bot("2026-11-24T08:00:30Z", "write_key1", "INT-X", A)],
+                   {f"push-{A}-int-x": key1(A, "INT-X", "key1_check", "2026-11-24T08:01:00Z")})
+        code, out, _ = self.run_obs()
+        self.assertEqual(code, 0, out)
+        self.assertIn("K2: 1/10 matching", out)
+
+    def test_hands_by_casefolded(self):
+        self.write([], {f"push-{A}-int-x": key1(A, "INT-X", "HANDS", "2026-11-24T08:00:05Z")})
+        code, out, _ = self.run_obs()
+        self.assertEqual(code, 0, out)
+        self.assertIn("K4: 1 hands key1 audited, mismatches 1", out)
+        self.assertIn("unmatched 0", out)
+
     def test_nothing_written(self):
         self.write([bot("2026-11-24T08:00:00Z", "write_key1", "INT-X", A)],
                    {f"push-{A}-int-x": key1(A, "INT-X", "key1_check", "2026-11-24T08:30:00Z")})
