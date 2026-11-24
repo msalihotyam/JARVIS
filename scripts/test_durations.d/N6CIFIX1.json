@@ -1,0 +1,8 @@
+{
+  "classes": {
+    "tests.test_n6_cifix.AcceptanceTests": 0.1,
+    "tests.test_n6_cifix.NegativeTests": 0.5,
+    "tests.test_n6_cifix.FailureClassTests": 0.1,
+    "tests.test_n6_cifix.ShadowTests": 0.5
+  }
+}
