@@ -32,13 +32,23 @@ _LANE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 _HEADER = re.compile(r"(?:FAIL|ERROR): \S+ \(([A-Za-z_][\w.]*)\)")
 _RULE = re.compile(r"(?:={10,}|-{10,})")
 _TOTALS = re.compile(r"FAILED \(([^)]*)\)")
-_COUNT = re.compile(r"\b(?:failures|errors)=(\d+)")
+# one item of unittest's FAILED (...) totals; ASCII digits, at most 9 (int() refuses > 4300)
+_TOTAL_ITEM = re.compile(r"(failures|errors|skipped|expected failures)=([0-9]{1,9})")
+_RAN = re.compile(r"Ran [0-9]+ tests? in [0-9.]+s")
 # json.loads raises ValueError (JSONDecodeError, int digit limit) or RecursionError (deep nesting)
 _PARSE_ERRORS = (ValueError, RecursionError)
 
 
 class MalformedInput(ValueError):
     """Input that does not parse into what this reader expects."""
+
+
+def _no_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    """json object_pairs_hook: json.loads keeps the last duplicate key, hiding evidence."""
+    doc = dict(pairs)
+    if len(doc) != len(pairs):
+        raise ValueError("duplicate JSON object key")
+    return doc
 
 
 @dataclass(frozen=True)
@@ -82,7 +92,7 @@ def parse_events(text: str) -> tuple[dict[str, Any], ...]:
         if not line.strip():
             continue
         try:
-            row = json.loads(line)
+            row = json.loads(line, object_pairs_hook=_no_duplicates)
         except _PARSE_ERRORS as error:
             raise MalformedInput(f"events.jsonl line {number} does not parse") from error
         if not isinstance(row, dict):
@@ -92,26 +102,34 @@ def parse_events(text: str) -> tuple[dict[str, Any], ...]:
 
 
 def failures(text: str) -> tuple[tuple[str, str], ...]:
-    """(test id, signature) per unittest FAIL/ERROR block; the signature is its last line."""
+    """(test id, signature) per unittest FAIL/ERROR block; the signature is its last line.
+
+    A block whose closing rule is not followed by a header or the "Ran N tests" line, or that
+    is cut off, gets the empty signature (never KNOWN-RED): the rule may be inside the message."""
+    if not isinstance(cast(object, text), str):
+        raise MalformedInput("failure output is not text")
     found: list[tuple[str, str]] = []
     current: str | None = None
     last = ""
     started = False  # the "-----" right under a header opens the traceback, it does not end it
-    for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n"):
-        header = _HEADER.fullmatch(line.strip())
+    lines = [line.strip() for line in text.replace("\r\n", "\n").replace("\r", "\n").split("\n")]
+    for index, line in enumerate(lines):
+        header = _HEADER.fullmatch(line)
         if header:
             if current is not None:
                 found.append((current, last))
             current, last, started = header.group(1), "", False
-        elif current is not None and _RULE.fullmatch(line.strip()):
+        elif current is not None and _RULE.fullmatch(line):
             if started:
-                found.append((current, last))
+                after = next((lines[i] for i in range(index + 1, len(lines)) if lines[i]), "")
+                trusted = _HEADER.fullmatch(after) or _RAN.fullmatch(after)  # unittest always ends with Ran
+                found.append((current, last if trusted else ""))
                 current = None
             started = True
-        elif current is not None and line.strip():
-            last = line.strip()
-    if current is not None:
-        found.append((current, last))
+        elif current is not None and line:
+            last = line
+    if current is not None:  # cut off before its closing rule: the last line may be mid-message
+        found.append((current, ""))
     return tuple(found)
 
 
@@ -122,7 +140,19 @@ def _accounted(text: str, found: tuple[tuple[str, str], ...]) -> bool:
     if any(line.startswith(("FAIL:", "ERROR:")) and not _HEADER.fullmatch(line) for line in lines):
         return False
     totals = [m.group(1) for m in map(_TOTALS.fullmatch, lines) if m]
-    return bool(totals) and sum(int(n) for t in totals for n in _COUNT.findall(t)) == len(found)
+    counted = 0
+    for total in totals:  # an unknown category (unexpected successes) is an unlisted failure
+        counts: dict[str, int] = {}
+        for item in total.split(", "):
+            part = _TOTAL_ITEM.fullmatch(item)
+            if part is None or part.group(1) in counts:
+                return False
+            counts[part.group(1)] = int(part.group(2))
+        bad = counts.get("failures", 0) + counts.get("errors", 0)
+        if not bad:
+            return False
+        counted += bad
+    return bool(totals) and counted == len(found)
 
 
 def _unknown(sha: str, reason: str) -> CiVerdict:
@@ -158,7 +188,7 @@ def _runs(sha: str, text: str) -> dict[str, dict[str, Any]] | CiVerdict:
     if not isinstance(cast(object, text), str):
         return _unknown(sha, "check-runs document is not text")
     try:
-        doc = json.loads(text)
+        doc = json.loads(text, object_pairs_hook=_no_duplicates)
     except _PARSE_ERRORS:
         return _unknown(sha, "check-runs document does not parse")
     if not isinstance(doc, dict):
@@ -301,14 +331,23 @@ def compare_finish(verdict: CiVerdict, finish: Mapping[str, Any], *,
     """
     row = cast(Mapping[str, Any], finish) if isinstance(cast(object, finish), Mapping) else {}
     lane, status = row.get("lane"), row.get("status")
+    typed = isinstance(cast(object, verdict), CiVerdict)
+    sha = getattr(verdict, "sha", None) if typed else None
+    n6 = getattr(verdict, "verdict", None) if typed else None
+    sha, n6 = (sha if isinstance(sha, str) else ""), (n6 if isinstance(n6, str) else "")
+
+    def text(value: object) -> str:
+        try:
+            return str(value)
+        except (ValueError, RecursionError):  # str() of a 5000-digit int or a very deep list
+            return ""
 
     def record(agreement: str, reason: str) -> ShadowRecord:
-        return ShadowRecord(str(lane), verdict.sha, agreement, reason, verdict.verdict,
-                            str(status))
+        return ShadowRecord(text(lane), sha, agreement, reason, n6, text(status))
 
     if row.get("event") != "finish" or not isinstance(lane, str) or not _LANE.fullmatch(lane):
         return record("disagree", "finish_malformed")
-    if verdict.verdict not in VERDICTS:
+    if not sha or n6 not in VERDICTS:
         return record("disagree", "n6_malformed")
     if status not in ("GREEN", "BLOCKED"):  # CI_PENDING, DEAD, STUCK...: not a CI verdict
         return record("disagree", "finish_not_ci")
@@ -324,14 +363,14 @@ def compare_finish(verdict: CiVerdict, finish: Mapping[str, Any], *,
     except MalformedInput:
         return record("disagree", "events_malformed")
     shas = [r.get("sha") for r in rows if r.get("event") == "ci_result" and r.get("lane") == lane]
-    if not shas or shas[-1] != verdict.sha:
+    if not shas or shas[-1] != sha:
         return record("disagree", "sha_unbound")
-    if verdict.verdict == "unknown":
+    if n6 == "unknown":
         return record("disagree", "n6_unknown")
-    if verdict.verdict in ("pending", "rerun-pending"):
+    if n6 in ("pending", "rerun-pending"):
         return record("disagree", "n6_not_final")
     if status == "GREEN":
-        return record(*(("agree", "both_green") if verdict.verdict == "green"
+        return record(*(("agree", "both_green") if n6 == "green"
                         else ("disagree", "false_red")))
-    return record(*(("disagree", "false_green") if verdict.verdict == "green"
+    return record(*(("disagree", "false_green") if n6 == "green"
                     else ("agree", "both_red")))

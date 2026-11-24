@@ -10,6 +10,7 @@ from jarvis.n6_ci_watch import (
     VERDICTS,
     CiVerdict,
     KnownRed,
+    MalformedInput,
     ci_verdict,
     compare_finish,
     failures,
@@ -153,6 +154,30 @@ class KnownRedTests(unittest.TestCase):
         self.assertEqual(got.test_ids, (X.test_id, Y.test_id))
         self.assertEqual(verdict(checks=self.failing(), known_red=(X, Y),
                                  events=ledger(result("failure"))).verdict, "known-red-only")
+        extra = FAIL_TEXT.replace("errors=1)", "errors=1, skipped=2, expected failures=1)")
+        checks = green_doc(**{"shard 1/2": run("shard 1/2", conclusion="failure", text=extra)})
+        self.assertEqual(verdict(checks=checks, known_red=[X, Y]).verdict, "known-red-only")
+
+    def test_rule_inside_a_message_is_red(self) -> None:
+        text = ("FAIL: test_x (tests.test_a.A.test_x)\n" + "-" * 70 + "\nAssertionError: 1 != 2\n"
+                + "-" * 70 + "\nNEW FAILURE DETAIL\n" + "-" * 70
+                + "\nRan 1 test in 0.1s\n\nFAILED (failures=1)\n")
+        self.assertEqual(failures(text), ((X.test_id, ""),))
+        checks = green_doc(**{"shard 1/2": run("shard 1/2", conclusion="failure", text=text)})
+        self.assertEqual(verdict(checks=checks, known_red=[X]).verdict, "red")
+        cut = text.split("NEW FAILURE")[0]  # output cut after an inner rule or mid-block
+        for part in (cut, cut.rstrip("-\n")):
+            with self.subTest(part=part):
+                self.assertEqual(failures(part), ((X.test_id, ""),))
+
+    def test_huge_or_bare_values_are_malformed_not_a_crash(self) -> None:
+        bare = CiVerdict.__new__(CiVerdict)
+        for case, (n6, row) in enumerate((
+                (bare, {"event": "finish", "lane": "L1", "status": "GREEN"}),
+                (verdict(), {"event": "finish", "lane": 10 ** 5000}),
+                (verdict(), {"event": "finish", "lane": "L1", "status": 10 ** 5000}))):
+            with self.subTest(case=case):
+                self.assertEqual(compare_finish(n6, row, events="").agreement, "disagree")
 
     def test_partial_or_inexact_match_is_red(self) -> None:
         wrong_sig = KnownRed(Y.test_id, "KeyError: 'other'")
@@ -170,7 +195,14 @@ class KnownRedTests(unittest.TestCase):
                                 "ERROR: test_y (tests.test_b.B.test_y) (k=1)")
         for text in (sub, FAIL_TEXT.replace("FAILED (failures=1, errors=1)", ""),
                      FAIL_TEXT.replace("errors=1", "errors=2"),
-                     FAIL_TEXT + "\nnpm ERR! lint failed\nFAILED (failures=1)\n"):
+                     FAIL_TEXT + "\nnpm ERR! lint failed\nFAILED (failures=1)\n",
+                     FAIL_TEXT.replace("errors=1)", "errors=1, unexpected successes=1)"),
+                     FAIL_TEXT.replace("failures=1", "failures=" + "9" * 5000),
+                     FAIL_TEXT.replace("errors=1", "errors=١"),
+                     FAIL_TEXT.replace("errors=1)", "errors=1, bogus=0)"),
+                     FAIL_TEXT.replace("errors=1)", "errors=1, errors=0)"),
+                     FAIL_TEXT.replace("failures=1, errors=1", "failures=1,, errors=1"),
+                     FAIL_TEXT + "\nFAILED (skipped=1)\n"):
             with self.subTest(text=text[-60:]):
                 checks = green_doc(**{"shard 1/2": run("shard 1/2", conclusion="failure",
                                                        text=text)})
@@ -244,6 +276,13 @@ class FailClosedTests(unittest.TestCase):
                 self.assertUnknown(verdict(events=ledger(result(bad)),  # type: ignore[arg-type]
                                            checks=green_doc()))
 
+    def test_duplicate_json_keys_are_unknown(self) -> None:
+        checks = green_doc().replace('"conclusion": "success"',
+                                     '"conclusion": "failure", "conclusion": "success"', 1)
+        self.assertUnknown(verdict(checks=checks))
+        row = f'{{"event": "ci_result", "sha": "{SHA}", "result": "failure", "result": "success"}}\n'
+        self.assertUnknown(verdict(events=row, checks=green_doc()))
+
     def test_rerun_then_failure_after_failed_rerun_is_red(self) -> None:
         events = ledger(result("failure"), rerun(1), result("failure"))
         self.assertEqual(verdict(events=events).verdict, "red")
@@ -254,6 +293,11 @@ class FailuresTests(unittest.TestCase):
         self.assertEqual(failures(FAIL_TEXT), (("tests.test_a.A.test_x", X.signature),
                                                ("tests.test_b.B.test_y", Y.signature)))
         self.assertEqual(failures("nothing here\n"), ())
+
+    def test_non_text_is_malformed(self) -> None:
+        for text in (None, b"FAIL: x (a.b)", 7):
+            with self.subTest(text=text), self.assertRaises(MalformedInput):
+                failures(text)  # type: ignore[arg-type]
 
 
 class CompareFinishTests(unittest.TestCase):
@@ -307,6 +351,16 @@ class CompareFinishTests(unittest.TestCase):
                 got = compare_finish(CiVerdict(SHA, "green", "r"), finish,  # type: ignore[arg-type]
                                      events=self.EVENTS)
                 self.assertEqual((got.agreement, got.reason), ("disagree", "finish_malformed"))
+
+    def test_non_verdict_is_malformed_not_a_crash(self) -> None:
+        row = {"event": "finish", "lane": "L1", "status": "GREEN"}
+        for n6 in (None, "green", {"sha": SHA}, CiVerdict(None, "green", "r"),  # type: ignore[arg-type]
+                   CiVerdict(SHA, None, "r")):  # type: ignore[arg-type]
+            with self.subTest(n6=n6):
+                got = compare_finish(n6, row, events=self.EVENTS)  # type: ignore[arg-type]
+                self.assertEqual((got.agreement, got.reason), ("disagree", "n6_malformed"))
+                self.assertEqual(compare_finish(n6, None,  # type: ignore[arg-type]
+                                                events=self.EVENTS).reason, "finish_malformed")
 
 
 if __name__ == "__main__":
