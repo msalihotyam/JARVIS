@@ -8,7 +8,8 @@ N6BASE1 baseline groups (build/n6/baseline.json), open disagreements with notes 
 verdict lines. N6 code decides nothing here: no verdict and no better/worse call of its own.
 A set whose bytes do not match SHA256SUMS, a baseline whose .sha256 does not match, a missing
 KPI database or a deny/secret hit (jarvis/dora_screen.py) refuses and writes nothing. The KPI
-database is opened ``mode=ro`` and backed up into a temp copy; ``data/`` and ``jarvis.db`` are
+database is copied into a private temp dir and only the copy is opened (linked sidecars refuse);
+``data/`` and ``jarvis.db`` are
 never opened. The packet holds no absolute path and no wall-clock value: same input, same
 bytes. It is written only under ``<root>/build/reports/``, never under ``dev/n6/acceptance/``.
 No network, no model call. Exit: 0 written, 2 refused.
@@ -22,9 +23,9 @@ import json
 import math
 import os
 import sqlite3
+import stat
 import sys
 import tempfile
-from contextlib import closing
 from pathlib import Path
 from typing import cast
 
@@ -90,23 +91,41 @@ def _guard(out: Path, root: Path) -> Path:
     for bad in FORBIDDEN:
         if any(parts[i:i + len(bad)] == bad for i in range(len(parts))):
             raise PackError(f"refused: output is under {'/'.join(bad)}/")
-    if not _under(out, root / "build" / "reports") or _parts(out) == _parts(root / "build" / "reports"):
+    # The reports folder is built from the resolved root without following build/ or
+    # build/reports: a link or junction there resolves elsewhere and is refused.
+    reports = tuple(p.casefold() for p in (root.resolve() / "build" / "reports").parts)
+    if parts[:len(reports)] != reports or parts == reports:
         raise PackError("refused: the packet is written only under build/reports/")
     return out.resolve()
 
 
+def _plain_sidecar(path: Path, root: Path) -> bool:
+    """True for a plain sidecar file, False when absent; a link, junction or non-file is refused."""
+    _not_operator(path, root)
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return False
+    reparse = getattr(info, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0)
+    if reparse or not stat.S_ISREG(info.st_mode) or info.st_nlink > 1:
+        raise PackError(f"refused: {path.name} is a link or not a plain file, never opened")
+    return True
+
+
 def _kpi(db: Path, root: Path) -> tuple[tuple[KpiRow, ...], tuple[LimitedEvent, ...]]:
-    """Rows and limited events from a read-only backup of ``db`` (n6_kpi opens read-write)."""
+    """Rows and limited events from a private copy of ``db``: sqlite never opens beside the source
+    (a WAL open would create or write -shm/-wal there, through any planted link)."""
     source = _not_operator(db, root)
-    if not source.is_file():  # sqlite3.connect would create an empty database
+    if not source.is_file():
         raise PackError(f"refused: no KPI database {db.name}")
-    for suffix in ("-wal", "-shm", "-journal"):  # sqlite opens these beside the db
-        _not_operator(source.with_name(source.name + suffix), root)
     with tempfile.TemporaryDirectory() as tmp:
         copy = Path(tmp) / "kpi.db"
-        with closing(sqlite3.connect(source.as_uri() + "?mode=ro", uri=True)) as src, \
-                closing(sqlite3.connect(copy)) as dst:
-            src.backup(dst)  # also takes rows still in a -wal file
+        copy.write_bytes(source.read_bytes())
+        for suffix in ("-wal", "-shm", "-journal"):
+            sidecar = source.with_name(source.name + suffix)
+            # -wal and a hot -journal carry rows/rollback; -shm is an index sqlite rebuilds.
+            if _plain_sidecar(sidecar, root) and suffix != "-shm":
+                Path(tmp, "kpi.db" + suffix).write_bytes(sidecar.read_bytes())
         return read_rows(copy), limited_events(copy)
 
 
@@ -140,7 +159,11 @@ def _num(value: object) -> str:
         return MISSING
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise PackError(f"refused: malformed baseline value {value!r}")
-    if math.isfinite(value):
+    try:
+        finite = math.isfinite(value)
+    except OverflowError as error:  # an int past float range, e.g. 10**400
+        raise PackError(f"refused: baseline value out of range: {error}") from error
+    if finite:
         return f"{value:.4g}"
     if value == math.inf:  # E8's own "no accepted slice" quota
         return "inf"
@@ -206,9 +229,10 @@ def build(acceptance_set: Path, kpi_db: Path, baseline: Path, root: Path) -> str
     lines += [f"{i}. {d}" for i, d in enumerate(disagreements, 1)]
     lines += ["", "## Verdicts (blank: filled by the judges and Salih, never by N6)"]
     lines += [f"- {v}" for v in VERDICT_LINES]
-    # A line break inside a data value (run id, verdict, group name) could forge a verdict line.
-    if any(ch in line for line in lines for ch in "\r\n\v\f\x1c\x1d\x1e\x85  "):
-        raise PackError("refused: a line break inside an input value")
+    # A line break inside a data value (run id, verdict, group name) could forge a verdict line,
+    # and inline HTML (<br>) could render one; no constant text here holds < or >.
+    if any(ch in line for line in lines for ch in "\r\n\v\f\x1c\x1d\x1e\x85  <>"):
+        raise PackError("refused: a line break or < > inside an input value")
     text = "\n".join(lines) + "\n"
     ok, label = screen(text)
     if not ok:
@@ -247,7 +271,7 @@ def _table(slice_ids: tuple[str, ...], by: dict[tuple[str, str], KpiRow],
             value = None if groups is None else groups[name].get(extra)
             cells.append(MISSING if value is None else str(value))
             if extra == "small_sample" and value is True:
-                notes.append(f"N6BASE1 {name} is a small sample (n < 10)")
+                notes.append(f"N6BASE1 {name} is a small sample (n under 10)")
         lines.append(f"- {extra}: " + "; ".join(f"{c}={v}" for c, v in zip(columns, cells)))
     return lines
 

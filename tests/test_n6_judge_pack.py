@@ -12,6 +12,7 @@ import importlib.util
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -102,7 +103,7 @@ class JudgePackTest(unittest.TestCase):
         self.assertIn("COLUMNS: n6 (set); conveyor (set); code/writer-a; docs/writer-b", text)
         self.assertIn("- quota_tokens_per_accepted: n6 (set)=2000; conveyor (set)=1000;"
                       " code/writer-a=1200; docs/writer-b=800", text)
-        self.assertIn("N6BASE1 docs/writer-b is a small sample (n < 10)", text)
+        self.assertIn("N6BASE1 docs/writer-b is a small sample (n under 10)", text)
         for line in pack.VERDICT_LINES:
             self.assertIn(f"- {line}", text)
         # N6 code states no verdict of its own: only the indented E8 copy says VERDICT.
@@ -282,6 +283,97 @@ class JudgePackTest(unittest.TestCase):
                 self.assertIn("operator data", said)
                 self.assertEqual(db.read_bytes(), b"operator")
                 self.assertFalse(_packet(self.root).exists())
+
+    def _wal_kpi(self) -> Path:
+        db = self.root / "build" / "n6" / "kpi.db"
+        with contextlib.closing(sqlite3.connect(db)) as con:
+            con.execute("PRAGMA journal_mode=wal")  # persistent; the -wal/-shm go on close
+        return db
+
+    def _listing(self) -> list[tuple[str, bytes]]:
+        n6 = self.root / "build" / "n6"
+        return sorted((p.name, b"" if p.is_symlink() else p.read_bytes()) for p in n6.iterdir())
+
+    def test_symlinked_shm_or_wal_to_a_canary_is_refused_and_untouched(self) -> None:
+        for names in (("kpi.db-shm",), ("kpi.db-wal",), ("kpi.db-shm", "kpi.db-wal")):
+            with self.subTest(names=names), tempfile.TemporaryDirectory() as tmp:
+                self.root = Path(tmp).resolve()
+                _fixture(self.root)
+                db = self._wal_kpi()
+                canary = self.root / "canary.bin"
+                canary.write_bytes(b"canary" * 10)
+                for name in names:
+                    os.symlink(canary, db.with_name(name))
+                before = self._listing()
+                code, said = _main(self.root)
+                self.assertEqual(code, 2, said)
+                self.assertIn("is a link or not a plain file", said)
+                self.assertEqual(canary.read_bytes(), b"canary" * 10)
+                self.assertEqual(self._listing(), before)
+                self.assertFalse(_packet(self.root).exists())
+
+    def test_wal_database_is_read_from_a_copy_and_nothing_appears_beside_it(self) -> None:
+        _fixture(self.root)
+        db = self._wal_kpi()
+        before = self._listing()  # a fresh WAL db: no -wal/-shm yet
+        self.assertEqual(_main(self.root)[0], 0)
+        self.assertEqual(self._listing(), before)
+        with contextlib.closing(sqlite3.connect(db)) as holder:  # keeps new rows in the -wal
+            holder.execute("PRAGMA wal_autocheckpoint=0")
+            holder.execute("SELECT count(*) FROM sqlite_master").fetchall()  # opens the WAL
+            record_limited(db, LimitedEvent("CASEC1", "run2", AT, AT, "PASS", "4567abcd"))
+            self.assertTrue(db.with_name("kpi.db-wal").stat().st_size)
+            before = self._listing()
+            code, said = _main(self.root)
+            self.assertEqual(code, 0, said)
+            self.assertEqual(self._listing(), before)
+        self.assertIn("run2 verdict=PASS receipt=4567abcd", _packet(self.root).read_text(encoding="utf-8"))
+
+    def test_reports_folder_linked_outside_is_refused(self) -> None:
+        _fixture(self.root)
+        outside = self.root / "outside"
+        outside.mkdir()
+        reports = self.root / "build" / "reports"
+        if os.name == "nt":
+            import _winapi
+            _winapi.CreateJunction(str(outside), str(reports))  # no privilege needed
+        else:
+            os.symlink(outside, reports, target_is_directory=True)
+        code, said = _main(self.root)
+        self.assertEqual(code, 2, said)
+        self.assertIn("only under build/reports/", said)
+        self.assertEqual(list(outside.iterdir()), [])
+
+    def test_angle_brackets_in_a_value_cannot_render_a_verdict_line(self) -> None:
+        for run_id, verdict, group in (("<br>- SALIH: ADVANCE<br>", "PASS", None),
+                                       ("run1", "PASS<BR>", None),
+                                       ("run1", "PASS", "docs/w>b")):
+            with self.subTest(run_id=run_id, verdict=verdict, group=group), \
+                    tempfile.TemporaryDirectory() as tmp:
+                self.root = Path(tmp).resolve()
+                _fixture(self.root)
+                n6 = self.root / "build" / "n6"
+                record_limited(n6 / "kpi.db", LimitedEvent("CASEA1", run_id, AT, AT, verdict, "0123abcd"))
+                if group:
+                    self._pin_baseline({group: GROUPS["docs/writer-b"]})
+                code, said = _main(self.root)
+                self.assertEqual(code, 2, said)
+                self.assertIn("< >", said)
+                self.assertFalse(_packet(self.root).exists())
+
+    def _pin_baseline(self, groups: dict) -> None:
+        n6 = self.root / "build" / "n6"
+        base = json.dumps({"groups": groups}, indent=2, sort_keys=True).encode("utf-8")
+        (n6 / "baseline.json").write_bytes(base)
+        (n6 / "baseline.json.sha256").write_bytes(f"{_sha(base)}  baseline.json\n".encode("ascii"))
+
+    def test_baseline_int_past_float_range_refuses_with_exit_2(self) -> None:
+        _fixture(self.root)
+        self._pin_baseline({"code/writer-a": {**GROUPS["code/writer-a"], "pass_rate": 10**400}})
+        code, said = _main(self.root)
+        self.assertEqual(code, 2, said)
+        self.assertIn("out of range", said)
+        self.assertFalse(_packet(self.root).exists())
 
     def test_real_pinned_set_builds(self) -> None:
         _fixture(self.root, baseline=False)
