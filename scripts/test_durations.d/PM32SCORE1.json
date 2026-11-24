@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "about": "PM32SCORE1: CI duration record for tests.test_pm32_compare (seconds, same schema as scripts/test_durations.json).",
+  "classes": {
+    "tests.test_pm32_compare.Pm32CompareTests": 1.0
+  },
+  "tests": {}
+}
