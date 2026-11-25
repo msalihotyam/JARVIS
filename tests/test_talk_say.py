@@ -2,6 +2,7 @@ import ast
 import io
 import random
 import sys
+import time
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
@@ -183,6 +184,56 @@ class RefusalTests(unittest.TestCase):
             sys.stdout.flush()
         finally:
             sys.stdout = old
+
+
+class ReviewFixTests(unittest.TestCase):
+    """TALKSAY1FIX: review findings F1-F5."""
+
+    def test_pipe_less_table_body_not_spoken(self):
+        for table in ("a | b\n--- | ---\n1 | gizli1\n2 | gizli2\n",
+                      "a | b\n:---|---:\ngizli1 |\n| gizli2\n",
+                      "a | b |\n---|---|\n1 \\| gizli1 | x\n",
+                      "a|b\n-|:-\n1|gizli1\n"):
+            r = say("Önce.\n" + table + "Son.")
+            self.assertEqual(r.spoken, "Önce.\n" + CUES["table"] + "\nSon.", table)
+            self.assertEqual(r.text_only, ("table",))
+
+    def test_table_ends_at_blank_or_pipe_less_line(self):
+        r = say("a | b\n--- | ---\n1 | 2\n\nx | y düz yazı")
+        self.assertEqual(r.spoken, CUES["table"] + "\nx y düz yazı")
+
+    def test_long_line_inputs_stay_fast(self):
+        n = MAX_INPUT_CHARS - 10
+        hostile = [" " * n + "x", " #" * (n // 2) + "x", "a." * (n // 2), "a-." * (n // 3), "a-" * (n // 2),
+                   "a/" * (n // 2), "a.py." * (n // 5), "a" + "_" * n + "a", "\t" * n + "x", "|---" * (n // 4) + "x"]
+        for text in hostile:
+            start = time.perf_counter()
+            self.assertIsInstance(prepare_speech({"text": text}), (Speech, Refusal))
+            self.assertLess(time.perf_counter() - start, 1.0, text[:8])  # was 1.5-5 s when quadratic
+
+    def test_kinds_inside_html_tag_reported(self):
+        cases = {"x <a href=https://e.com> y": ("x " + CUES["url"] + " y", ("url",)),
+                 "<img src=C:\\x\\y.png> z": (CUES["path"] + " z", ("path",)),
+                 "<b>etiket</b>": ("etiket", ())}
+        for text, (spoken, kinds) in cases.items():
+            r = say(text)
+            self.assertEqual((r.spoken, r.text_only), (spoken, kinds), text)
+
+    def test_autolink_brackets_dropped(self):
+        self.assertEqual(say("<https://x.y/z> bak").spoken, CUES["url"] + " bak")
+        self.assertEqual(say("<www.x.org> bak").spoken, CUES["url"] + " bak")
+        self.assertEqual(say("< ./a/b.py > bak").spoken, CUES["path"] + " bak")
+
+    def test_indented_code_not_spoken(self):
+        for text in ("Metin.\n\n    rm -rf gizli\n\n    gizli2\nSon.", "    gizli\nSon.", "a\n\n\tgizli\nSon.",
+                     "```\nkod\n```\n    gizli\nSon."):
+            r = say(text)
+            self.assertNotIn("gizli", r.spoken, text)
+            self.assertEqual(r.spoken.count(CUES["code"]), 1, text)
+            self.assertTrue(r.spoken.endswith("Son."), text)
+
+    def test_indented_line_after_paragraph_is_text(self):
+        self.assertEqual(say("Metin\n    devamı").spoken, "Metin\ndevamı")
 
 
 class PurityTests(unittest.TestCase):
