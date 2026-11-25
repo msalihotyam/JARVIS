@@ -192,6 +192,12 @@ class Settings:
     #: exactly ``True`` reads as off. Not authority: every warm-path check in
     #: the adapter is unchanged either way.
     warm_claude: bool = True
+    #: E1ROUTE1A: an optional faster model/effort for light understanding
+    #: turns (router_tr L0/L1). Both unset = routing off = one model for every
+    #: turn. Both or neither: one alone is refused. Operator authority only;
+    #: no code path sets them and there is no default.
+    claude_fast_model: str | None = None
+    claude_fast_effort: str | None = None
 
     @property
     def browser_profile_dir(self) -> Path:
@@ -383,6 +389,17 @@ class Settings:
             object.__setattr__(self, "memory_extract_model", "")
         if self.warm_claude is not True:
             object.__setattr__(self, "warm_claude", False)
+        if (self.claude_fast_model is None) != (self.claude_fast_effort is None):
+            raise ValueError(
+                "claude_fast_model and claude_fast_effort must be set together."
+            )
+        if self.claude_fast_model is not None:
+            object.__setattr__(
+                self, "claude_fast_model", validate_claude_model(self.claude_fast_model)
+            )
+            object.__setattr__(
+                self, "claude_fast_effort", validate_claude_effort(self.claude_fast_effort)
+            )
 
     def enable_paid_api(self, approval_id: str) -> Settings:
         if not approval_id.strip():
@@ -506,6 +523,11 @@ SKILLS_CONFIG_KEYS = frozenset(CONFIG_KEYS) | {SKILLS_ENABLED_KEY}
 #: A document without the key loads with warm on; a present value other than
 #: exactly ``true`` loads as off.
 WARM_CLAUDE_KEY = "warm_claude"
+
+#: E1ROUTE1A fast-model pair. Outside ``CONFIG_KEYS`` and written only when
+#: set, so a routing-off document is unchanged and stays readable by an older
+#: build. Both or neither: a document with only one is refused.
+CLAUDE_FAST_KEYS = frozenset({"claude_fast_model", "claude_fast_effort"})
 
 #: Raw provider tokens the canonical policy does not classify. It is
 #: syntax-aware - it reads labels and delimiters - and a raw token carries
@@ -722,31 +744,31 @@ def normalize_database_path(raw: str, *, base: Path | None = None) -> Path:
     return resolved
 
 
-def _exact_claude_model(value: object) -> str | None:
+def _exact_claude_model(value: object, key: str = "claude_model") -> str | None:
     """A validated model identifier or ``None``. The value is never echoed."""
     if value is None:
         return None
     if type(value) is not str:
-        _fail("'claude_model' must be a model identifier or null.")
+        _fail(f"'{key}' must be a model identifier or null.")
     try:
         return validate_claude_model(value)
     except ValueError:
-        _fail(_MODEL_GRAMMAR_MESSAGE)
+        _fail(_MODEL_GRAMMAR_MESSAGE.replace("claude_model", key, 1))
     raise AssertionError("unreachable")
 
 
-def _exact_claude_effort(value: object) -> str | None:
+def _exact_claude_effort(value: object, key: str = "claude_effort") -> str | None:
     """A validated effort value or ``None``. The value is never echoed."""
     if value is None:
         return None
     if type(value) is not str:
-        _fail("'claude_effort' must be one of: "
+        _fail(f"'{key}' must be one of: "
               + ", ".join(CLAUDE_EFFORT_VALUES) + ", or null.")
     try:
         return validate_claude_effort(value)
     except ValueError:
         _fail(
-            "'claude_effort' must be one of: "
+            f"'{key}' must be one of: "
             + ", ".join(CLAUDE_EFFORT_VALUES)
             + ", or null."
         )
@@ -838,6 +860,9 @@ def _document_from_settings(settings: Settings) -> dict[str, object]:
         document[SKILLS_ENABLED_KEY] = True
     if not settings.warm_claude:
         document[WARM_CLAUDE_KEY] = False
+    if settings.claude_fast_model is not None:
+        document["claude_fast_model"] = settings.claude_fast_model
+        document["claude_fast_effort"] = settings.claude_fast_effort
     return document
 
 
@@ -852,6 +877,8 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
     if type(document) is not dict:
         _fail("The configuration document must be a JSON object.")
     keys = set(document)
+    if CLAUDE_FAST_KEYS <= keys:
+        keys -= CLAUDE_FAST_KEYS    # one alone stays in and fails the shape check
     if keys not in (
         set(CONFIG_KEYS),
         set(SKILLS_CONFIG_KEYS),
@@ -933,6 +960,8 @@ def _settings_from_document(document: dict[str, object]) -> Settings:
             memory_extract_model=document.get("memory_extract_model", ""),
             # Absent means on; anything but exact true is off (constructor).
             warm_claude=document.get(WARM_CLAUDE_KEY, True),
+            claude_fast_model=_exact_claude_model(document.get("claude_fast_model"), "claude_fast_model"),
+            claude_fast_effort=_exact_claude_effort(document.get("claude_fast_effort"), "claude_fast_effort"),
         )
     except ValueError as exc:
         # The existing constructor refused it. Its message is already

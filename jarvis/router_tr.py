@@ -1,4 +1,4 @@
-"""Deterministic Turkish lane router (speed plan S2, not wired yet).
+"""Deterministic Turkish lane router (speed plan S2; app.py routes with it only when the fast-model settings are set).
 
 route(text) picks the lane before any model call:
   L0  answerable locally (time, date, greeting, thanks, close, cancel, stop)
