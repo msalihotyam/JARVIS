@@ -1218,7 +1218,10 @@ class _Origin(HTTPServer):
         self.redirects = redirects
         super().__init__(("127.0.0.1", 0), _OriginHandler)
         self.origin = f"http://127.0.0.1:{self.server_address[1]}"
-        threading.Thread(target=self.serve_forever, daemon=True).start()
+        # A short poll makes shutdown() return in ~10 ms, not the default 0.5 s.
+        threading.Thread(
+            target=self.serve_forever, kwargs={"poll_interval": 0.01}, daemon=True
+        ).start()
 
     def stop(self) -> None:
         self.shutdown()
