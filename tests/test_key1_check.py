@@ -139,7 +139,7 @@ class Key1CheckTests(unittest.TestCase):
         self.assertIn("FAIL 1", text)
 
     def test_review_commit_with_other_patch_id_fails(self):
-        fx = self.fx()
+        fx = self.fx(share_history=True)
         for r in ("CLREV", "CDX"):
             p = fx.root / "build" / "reports" / f"{r}-X.md"
             p.write_text(p.read_text().replace(fx.src, fx.other), encoding="utf-8")
@@ -148,7 +148,7 @@ class Key1CheckTests(unittest.TestCase):
         self.assertIn("FAIL 2", text)
 
     def test_missing_cdx_report_fails_but_clrev_only_chain_does_not_need_it(self):
-        fx = self.fx()
+        fx = self.fx(share_history=True)
         (fx.root / "build" / "reports" / "CDX-X.md").unlink()
         text, ok = self.run_lane(fx)
         self.assertFalse(ok)
@@ -157,15 +157,15 @@ class Key1CheckTests(unittest.TestCase):
     def test_findings_and_status_gate(self):
         # real MINOR format: a count plus F-lines; WARN only with --operator-tool
         minor = "1\nF1 MINOR: a.py:1 - nit - fix\nF2 NIT: b.py:2 - style"
-        text, ok = self.run_lane(self.fx(findings=minor))
+        text, ok = self.run_lane(self.fx(findings=minor, share_history=True))
         self.assertFalse(ok)
         self.assertIn("FAIL 3", text)
-        text, ok = self.run_lane(self.fx(findings=minor), operator_tool=True)
+        text, ok = self.run_lane(self.fx(findings=minor, share_history=True), operator_tool=True)
         self.assertTrue(ok, text)
         self.assertIn("WARN 3", text)
-        text, ok = self.run_lane(self.fx(status="FAIL"), operator_tool=True)
+        text, ok = self.run_lane(self.fx(status="FAIL", share_history=True), operator_tool=True)
         self.assertFalse(ok)
-        text, ok = self.run_lane(self.fx(findings="none\nSTATUS: BLOCKED"))
+        text, ok = self.run_lane(self.fx(findings="none\nSTATUS: BLOCKED", share_history=True))
         self.assertIn("FAIL 3", text)
 
     def test_findings_none_with_a_finding_line_fails(self):
@@ -196,7 +196,7 @@ class Key1CheckTests(unittest.TestCase):
     def test_u1rule1_t1_product_minor_warns_without_operator_tool(self):
         """U1RULE1 (Salih 11-22): a T1 slice whose diff is product code passes check 3 with MINOR/NIT as WARN."""
         minor = "1\nF1 MINOR: a.txt:1 - nit - fix\nF2 NIT: a.txt:2 - style"
-        text, ok = self.run_lane(self.fx(findings=minor, tier="T1"))
+        text, ok = self.run_lane(self.fx(findings=minor, tier="T1", share_history=True))
         self.assertTrue(ok, text)
         self.assertIn("WARN 3", text)
         self.assertIn("POLISH.md", text)
@@ -206,7 +206,7 @@ class Key1CheckTests(unittest.TestCase):
         minor = "1\nF1 MINOR: a.txt:1 - nit - fix"
         for files in (("a.txt", "build/reports/X.md"), ("a.txt", "build\\reports\\X.md")):
             with self.subTest(files=files):
-                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", files=files))
+                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", files=files, share_history=True))
                 self.assertTrue(ok, text)
                 self.assertIn("WARN 3", text)
         # only the exact build/reports/ prefix without ".." is dropped; anything else keeps the chain strict
@@ -216,7 +216,7 @@ class Key1CheckTests(unittest.TestCase):
                       ("a.txt", "build/reports/а.md"), ("a.txt", "build/reports/x\x00y"),
                       ("a.txt", "build/reports/x\n")):
             with self.subTest(files=files):
-                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", files=files))
+                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", files=files, share_history=True))
                 self.assertFalse(ok, text)
                 self.assertIn("FAIL 3", text)
 
@@ -227,13 +227,13 @@ class Key1CheckTests(unittest.TestCase):
         for p in REPORT_EXEMPT:
             with self.subTest(p=p):
                 self.assertTrue(k1.conveyor.chain_report_file(p))
-                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", files=("a.txt", p)))
+                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", files=("a.txt", p), share_history=True))
                 self.assertTrue(ok, text)
                 self.assertIn("WARN 3", text)
         for p in REPORT_COUNTED:
             with self.subTest(p=p):
                 self.assertFalse(k1.conveyor.chain_report_file(p))
-                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", files=("a.txt", p)))
+                text, ok = self.run_lane(self.fx(findings=minor, tier="T1", files=("a.txt", p), share_history=True))
                 self.assertFalse(ok, text)
                 self.assertIn("FAIL 3", text)
 
@@ -244,7 +244,7 @@ class Key1CheckTests(unittest.TestCase):
                    {"tier": "T1", "findings": "1\nF1 MAJOR: a.txt:1 - bug"},
                    {"tier": "T1", "findings": "1\nF1 MINOR: x (really major)"}):
             with self.subTest(**kw):
-                text, ok = self.run_lane(self.fx(**{"findings": minor, **kw}))
+                text, ok = self.run_lane(self.fx(**{"findings": minor, **kw}, share_history=True))
                 self.assertFalse(ok, text)
                 self.assertIn("FAIL 3", text)
 
@@ -267,7 +267,7 @@ class Key1CheckTests(unittest.TestCase):
                 self.assertIn("PASS 5", text)
 
     def test_ci_must_be_success_on_exactly_the_candidate(self):
-        fx = self.fx()
+        fx = self.fx(share_history=True)
         for gh in (ci(fx.cand, "failure"), ci(fx.cand, None, "in_progress"), ci("0" * 40),
                    lambda args: (1, "boom")):
             text, ok = self.run_lane(fx, gh)
@@ -275,12 +275,12 @@ class Key1CheckTests(unittest.TestCase):
             self.assertIn("FAIL 4", text)
 
     def test_file_outside_source_slice_files_fails(self):
-        text, ok = self.run_lane(self.fx(files=("other.txt",)))
+        text, ok = self.run_lane(self.fx(files=("other.txt",), share_history=True))
         self.assertFalse(ok)
         self.assertIn("FAIL 5", text)
 
     def test_bad_ci_branch_fails_approval_name(self):
-        text, ok = self.run_lane(self.fx(ci_branch="main"))
+        text, ok = self.run_lane(self.fx(ci_branch="main", share_history=True))
         self.assertFalse(ok)
         self.assertIn("FAIL 6", text)
 
