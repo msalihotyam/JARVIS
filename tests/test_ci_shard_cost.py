@@ -41,6 +41,17 @@ class ParseTests(unittest.TestCase):
             with self.subTest(text=text[:40]):
                 self.refused(text)
 
+    def test_huge_numbers_are_refused_not_overflowing(self):
+        huge = "1" + "0" * 400
+        for text in ('{"wall": %s}' % huge, '{"wall": 5, "durations": [[%s, "x"]]}' % huge,
+                     '{"wall": 5, "durations": [[1e308, "x"], [1e308, "y"]]}', '{"wall": 1.7e308}',
+                     '{"wall": 1000000001}', '{"wall": 5, "durations": [[1e9, "x"], [1.0000001e9, "y"]]}',
+                     '{"shard": [1, %s], "wall": 5}' % huge, '{"shard": [1, 1025], "wall": 5}'):
+            with self.subTest(text=text[:40]):
+                self.refused(text)
+        self.assertEqual(csc.parse('{"shard": [1, 1024], "wall": 1000000000, "durations": [[1e9, "x"]]}'),
+                         {"shards": 1024, "wall": 1e9, "tests_sum": 1e9})
+
     def test_missing_fields_are_not_measured(self):
         self.assertEqual(csc.parse('{"durations": [[1.5, "x"]]}'), {"shards": None, "wall": None, "tests_sum": 1.5})
         self.assertIsNone(csc.parse('{"wall": 5, "durations": [], "ran": 3}')["tests_sum"])
@@ -97,6 +108,19 @@ class ReportTests(unittest.TestCase):
         text = self.run_main()
         self.assertIn("usable: 8; refused: 6; inconsistent: 0", text)
         self.assertIn("fixed s: median 44.5", text)
+
+    def test_overflow_records_are_counted_and_report_written(self):
+        self.shards()
+        huge = "1" + "0" * 400
+        self.write("big1.json", '{"wall": %s}' % huge)
+        self.write("big2.json", '{"wall": 5, "durations": [[1e308, "x"], [1e308, "y"]]}')
+        self.write("big3.json", _report(1, wall=1.7e308))
+        self.write("big4.json", '{"shard": [1, %s], "wall": 5}' % huge)
+        text = self.run_main()
+        self.assertIn("usable: 8; refused: 4; inconsistent: 0", text)
+        self.assertNotIn("inf", text)
+        with mock.patch.object(csc, "parse", side_effect=OverflowError("backstop")):
+            self.assertIn("refused: 12;", csc.build_report(self.dir))
 
     def test_fewer_than_five_usable_is_insufficient(self):
         self.shards(4)

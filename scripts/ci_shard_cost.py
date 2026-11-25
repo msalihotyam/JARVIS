@@ -28,6 +28,8 @@ MODEL_SHARDS = (16, 24, 32)
 STEP = 8           # the CI matrix grows in steps of 8 shards
 GAIN = 0.05        # stop when one more step saves under 5% of the gate
 SEARCH_LIMIT = 1024
+MAX_SECONDS = 1e9  # any real time is far below; keeps sums, medians and products finite
+MAX_SHARDS = 1024
 NM = "not measured"
 
 
@@ -49,8 +51,9 @@ def _constant(name):
 def _time(value, what):
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise Refused(f"{what} is not numeric")
-    if not math.isfinite(value) or value < 0:
-        raise Refused(f"{what} is negative or not finite")
+    # compare before float(): int/float comparison is exact, float(10**400) raises OverflowError
+    if not 0 <= value <= MAX_SECONDS:
+        raise Refused(f"{what} is negative, not finite or over {MAX_SECONDS:g} s")
     return float(value)
 
 
@@ -70,7 +73,7 @@ def parse(text: str) -> dict:
         if shard is None:
             shards = 1
         elif (isinstance(shard, list) and len(shard) == 2 and all(type(v) is int for v in shard)
-              and 1 <= shard[0] <= shard[1]):
+              and 1 <= shard[0] <= shard[1] <= MAX_SHARDS):
             shards = shard[1]
         else:
             raise Refused("shard is not [i, n]")
@@ -153,7 +156,7 @@ def build_report(root: Path, max_files: int = MAX_FILES, concurrency: float = 1.
         name = path.relative_to(os.path.realpath(root)).as_posix()
         try:
             rec = parse(path.read_text(encoding="utf-8"))
-        except (Refused, OSError, UnicodeDecodeError) as exc:
+        except (Refused, OSError, UnicodeDecodeError, OverflowError) as exc:
             refused += 1
             lines.append(f"| {name} | | | | | refused: {exc} |")
             continue
