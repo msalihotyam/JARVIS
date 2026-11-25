@@ -1,5 +1,7 @@
 import abc
 from dataclasses import dataclass
+import re
+import unicodedata
 
 @dataclass(frozen=True)
 class WorkerResult:
@@ -48,7 +50,13 @@ class Worker(abc.ABC):
 # Aliases Windows resolves to another name: ":" streams/drives, "~" 8.3 short
 # names, globs; a part ending in "." or " " is the same file without it.
 _PATH_UNSAFE = frozenset(':~*?[]"<>|')
-_DEVICES = frozenset({"CON", "PRN", "AUX", "NUL", *(f"{d}{n}" for d in ("COM", "LPT") for n in range(1, 10))})
+_DEVICE = re.compile(r"con|prn|aux|nul|conin\$|conout\$|com[0-9]|lpt[0-9]")
+
+
+def _is_device(part: str) -> bool:
+    """A DOS device name in any form: case, NFKC lookalikes (COM¹), any extension, "NUL .txt"."""
+    folded = unicodedata.normalize("NFKC", part).casefold().replace("ı", "i")
+    return _DEVICE.fullmatch(folded.split(".")[0].rstrip(" ")) is not None
 
 
 def _path_parts(path: object) -> tuple[str, ...] | None:
@@ -61,7 +69,7 @@ def _path_parts(path: object) -> tuple[str, ...] | None:
     parts = tuple(part for part in path.split("/") if part not in ("", "."))
     for part in parts:
         if (part == ".." or part[-1] in ". " or _PATH_UNSAFE & set(part) or not part.isprintable()
-                or part.split(".")[0].upper() in _DEVICES):
+                or _is_device(part)):
             return None
     return parts
 

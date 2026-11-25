@@ -13,10 +13,11 @@ import shutil
 import stat
 import tempfile
 import types
+import unicodedata
 import unittest
 from pathlib import Path
 
-from jarvis.workers.base import AgentProfile, Worker
+from jarvis.workers.base import AgentProfile, Worker, _path_parts
 from jarvis.workers.claude import (
     DENIED_TOOLS,
     EMPTY_MCP_CONFIG,
@@ -389,7 +390,8 @@ class ParentAuthorityTests(WorkerTestCase):
         for path in ("src/../etc", "src2/", "SRC/a.py", "Src/a.py", "src./a.py", "src /a.py",
                      "SRC~1/a.py", "src/a.py:stream", "src/a.py.", "/", "", ".", "C:/src/a.py",
                      "src/*", "src/a\x00.py", "//./src/a.py", "\\\\.\\src\\a.py", "//server/src",
-                     "\\\\?\\src\\a.py", "src/NUL", "src/con.txt", "src/COM1"):  # fmt: skip
+                     "\\\\?\\src\\a.py", "src/NUL", "src/con.txt", "src/COM1",
+                     "src/COM².log", "src/LPT³", "src/CONOUT$", "src/NUL .txt"):  # fmt: skip
             with self.subTest(path=path):
                 self.refused(self.child(path), "parent_paths")
         self.refused(self.child("src/a.py"), "parent_paths", profile(paths=frozenset({"src/../"})))
@@ -401,6 +403,27 @@ class ParentAuthorityTests(WorkerTestCase):
         # A parent with network passes I9; the writer's own gate still refuses it.
         self.refused(self.child("src/a.py", network=True), "profile_network",
                      profile(paths=frozenset({"src/"}), network=True))
+
+
+class DeviceNameTests(unittest.TestCase):
+    """PM30I9BFIX: every Windows device-name form is refused in any path part."""
+
+    def test_every_device_form_refused(self) -> None:
+        names = ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$",
+                 *(f"{d}{n}" for d in ("COM", "LPT") for n in [*"0123456789", "¹", "²", "³"])]
+        for name in names:
+            for form in (name, name.lower(), name.title(), f"{name}.txt", f"{name}.tar.gz",
+                         f"{name} .txt", f"{name}  . .log", f"{name}　.txt", f"{name}․txt",
+                         unicodedata.normalize("NFKC", name).translate({c: c + 0xFEE0 for c in range(0x21, 0x7F)})):
+                for path in (f"src/{form}", f"{form}/a.py", f"src/{form}/a.py"):
+                    with self.subTest(path=path):
+                        self.assertIsNone(_path_parts(path))
+        self.assertIsNone(_path_parts("src/conın$"))  # Turkish dotless i
+
+    def test_near_misses_allowed(self) -> None:
+        for part in ("CONSOLE", "COM10", "LPT", "NULL.txt", "AUX_1", "CONIN", "comma.py", "con-x", "nul_.txt"):
+            with self.subTest(part=part):
+                self.assertEqual(_path_parts(f"src/{part}"), ("src", part))
 
 
 class SpawnRecheckTests(WorkerTestCase):
