@@ -193,6 +193,31 @@ class NegativeTests(unittest.TestCase):
         self.assertForwarded(Flips(entry(text=LABEL)))
         self.assertEqual(Flips.calls, 1)
 
+    def test_metaclass_eq_liar_type_refused(self):
+        class Liar(type):  # type(x) == anything is True; only identity tells it apart
+            def __eq__(cls, other):
+                return True
+
+            __hash__ = type.__hash__
+
+        class Fake(metaclass=Liar):
+            def __init__(self, truthy):
+                self.truthy = truthy
+
+            def __bool__(self):
+                return self.truthy
+
+            def __len__(self):
+                return int(self.truthy)
+
+        for truthy in (False, True):
+            fake = Fake(truthy)
+            for field, reason in (("who", "bad_who"), ("kind", "bad_kind"), ("text", "bad_text"),
+                                  ("attachments", "bad_attachments")):
+                with self.subTest(field=field, truthy=truthy):
+                    r = tr.route({**entry(text=LABEL), field: fake})
+                    self.assertEqual((r.path, r.reason), (tr.REFUSED, reason))
+
     def test_forwarded_membership_raises_refused(self):
         class Raises(dict):
             def __contains__(self, key):
