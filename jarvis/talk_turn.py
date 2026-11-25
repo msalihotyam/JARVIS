@@ -127,8 +127,8 @@ def _process(entry, steps, reply):
         reply, dropped_fields, dropped_names = _reduce(raw)
         if reply is None:
             return Outcome(FAILED, "bad_reply", None, dropped_fields, dropped_names)
-    elif not _valid_reply(reply):
-        raise _Stop(REFUSED, "bad_reply")
+    else:
+        reply = _retry_reply(reply)
     record = {"who": "jarvis", "kind": "text", "text": reply.text,
               "focus": focus, "reply_to": entry_id}
     try:
@@ -197,10 +197,9 @@ def _reduce(raw):
         dropped_fields = len(items) - len(fields)
         text = fields.get("text")
         needs_you = fields.get("needs_you", False)
-        names = fields.get("proposals", ())
+        kept, dropped_names = _names(fields.get("proposals", ()))
     except Exception:
         raise _Stop(FAILED, "bad_reply") from None
-    kept, dropped_names = _names(names)
     if not _valid_text(text):
         return None, dropped_fields, dropped_names
     reply = Reply(text, type(needs_you) is bool and needs_you, kept)
@@ -217,7 +216,7 @@ def _valid_name(name):
 
 
 def _names(names):
-    if type(names) not in (list, tuple):
+    if type(names) is not list and type(names) is not tuple:  # identity: no metaclass __eq__ runs
         return (), 1
     kept = []
     for name in names:
@@ -226,9 +225,17 @@ def _names(names):
     return tuple(kept), len(names) - len(kept)
 
 
-def _valid_reply(reply):
-    return (type(reply) is Reply and _valid_text(reply.text)
-            and type(reply.needs_you) is bool
-            and type(reply.proposals) is tuple
-            and len(reply.proposals) <= MAX_PROPOSALS
-            and all(_valid_name(n) for n in reply.proposals))
+def _retry_reply(reply):
+    """Read the retry Reply's fields once under a guard; the fresh Reply is used for record and Outcome."""
+    try:
+        if type(reply) is not Reply:
+            raise ValueError
+        # stored pairs, exact-str keys: a forged __dict__ key's __eq__ never runs, each field read once
+        fields = {k: v for k, v in list(vars(reply).items()) if type(k) is str}
+        text, needs_you, proposals = fields["text"], fields["needs_you"], fields["proposals"]
+    except Exception:  # includes a _Stop raised by a forged __dict__
+        raise _Stop(REFUSED, "bad_reply") from None
+    if not (_valid_text(text) and type(needs_you) is bool and type(proposals) is tuple
+            and len(proposals) <= MAX_PROPOSALS and all(_valid_name(n) for n in proposals)):
+        raise _Stop(REFUSED, "bad_reply")
+    return Reply(text, needs_you, proposals)
