@@ -16,11 +16,13 @@ import json
 import math
 import os
 import re
+import stat
 import subprocess  # nosec B404 - only for TimeoutExpired; spawning is the injected runner's job
 from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 from jarvis.connectors.claude_code import PROHIBITED_BILLING_ENV_VARS
+from jarvis.project_folders import _DRIVE_FIXED, _drive_type, _reserved
 from jarvis.settings import validate_claude_effort, validate_claude_model
 from jarvis.workers.claude import scrubbed_env
 
@@ -44,6 +46,9 @@ class BrainConfig(NamedTuple):
     max_budget_usd: float = 1.0
     timeout_seconds: int = 600
     max_output_bytes: int = 4 * 1024 * 1024
+    # False: the CLI keeps no transcript (--no-session-persistence) and resume() is refused.
+    # True: the first session is stored so resume() can continue it; the caller opts in knowingly.
+    resumable: bool = False
     # Asking for any of these is refused: the brain gets none of them.
     builtin_tools: tuple = ()
     extra_tool_servers: tuple = ()
@@ -114,6 +119,10 @@ def _build(config: Any, environ: Any, session_id: str | None) -> BrainCommand:
         raise _Refuse("add_dirs_refused")
     if config.extra_flags:  # closed argv: no extra flag at all, bypass or otherwise
         raise _Refuse("extra_flags_refused")
+    if type(config.resumable) is not bool:
+        raise _Refuse("resumable_invalid")
+    if session_id and not config.resumable:
+        raise _Refuse("resume_not_enabled")
     root = _root(config.root)
     command = _program(config.command, "command_invalid")
     server = _program(config.tool_server_command, "tool_server_invalid")
@@ -132,7 +141,10 @@ def _build(config: Any, environ: Any, session_id: str | None) -> BrainCommand:
         {"mcpServers": {TOOL_SERVER_NAME: {"command": server, "args": list(config.tool_server_args)}}},
         separators=(",", ":"),
     )
-    session = ["--resume", session_id] if session_id else []  # persisted, or resume would find nothing
+    if session_id:
+        session = ["--resume", session_id]
+    else:  # a non-resumable first session leaves no transcript in the CLI session store
+        session = [] if config.resumable else ["--no-session-persistence"]
     argv = [
         command, "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
         "--tools", "", "--safe-mode", "--strict-mcp-config", "--mcp-config", mcp_config,
@@ -173,14 +185,35 @@ def _model(model: Any, effort: Any) -> tuple[str, str | None]:
 
 
 def _root(value: Any) -> Path:
-    if type(value) is not str and not isinstance(value, Path):
+    if type(value) not in (str, type(Path())):  # exact types: a subclass's __fspath__ would run caller code
         raise _Refuse("root_invalid")
     text = os.fspath(value)
-    # UNC / device anchors would make a build do network or device I/O: refused before any stat.
+    # UNC / device anchors would make a build do network or device I/O: refused lexically.
     if not text or "\x00" in text or text[:1] in ("\\", "/") or not Path(text).is_absolute():
         raise _Refuse("root_invalid")
+    path = Path(text)
+    if any(_reserved(part) for part in path.parts[1:]):  # C:\NUL, C:\x\com1.txt open a device, not a folder
+        raise _Refuse("root_invalid")
+    try:  # a mapped (remote), removable or unknown drive is refused before any stat on it
+        fixed = _drive_type(path.anchor) == _DRIVE_FIXED
+    except Exception:  # noqa: BLE001 - an unanswered question refuses
+        fixed = False
+    if not fixed:
+        raise _Refuse("root_not_local")
+    # lstat each component before resolve: a link or junction could point at a share, and resolve would follow it.
+    for part in (*reversed(path.parents), path):
+        try:
+            info = os.lstat(part)
+        except OSError:
+            raise _Refuse("root_missing") from None
+        if stat.S_ISLNK(info.st_mode) or getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT:
+            raise _Refuse("root_not_canonical")
+    if not stat.S_ISDIR(info.st_mode):
+        raise _Refuse("root_not_dir")
+    # shortcut: a component swapped to a link between this walk and resolve is followed; the UNC check below
+    # still refuses the result. Hold the folder handle (project_folders._hold_folder) if a caller ever needs it.
     try:
-        root = Path(text).resolve(strict=True)
+        root = path.resolve(strict=True)
     except OSError:
         raise _Refuse("root_missing") from None
     if str(root).startswith(("\\", "/")) or not root.is_dir():  # a mapped drive resolves to UNC
