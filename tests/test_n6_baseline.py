@@ -269,6 +269,45 @@ class NegativeTests(Fixture):
         self.assertEqual(list((self.root / "data").iterdir()), [])
         self.assertFalse((self.root / "home").exists())
 
+    def test_prints_survive_a_cp1254_stdout(self):  # POLISHN6B1 F1
+        self.standard()
+        good = self.root / "build" / "n6" / "Ω.json"  # Ω is not in cp1254
+        for out, want, word in ((self.root / "data" / "Ω.json", 2, "REFUSED"), (good, 0, "WROTE")):
+            with self.subTest(out=str(out)):
+                raw = io.BytesIO()
+                stream = io.TextIOWrapper(raw, encoding="cp1254")  # strict, like a piped Turkish console
+                with contextlib.redirect_stdout(stream):
+                    code = nb.main(["--out", str(out)], root=self.root)
+                stream.flush()
+                text = raw.getvalue().decode("cp1254")
+                self.assertEqual(code, want, text[:80])
+                self.assertIn(word, text)
+                self.assertIn("\\u03a9", text)
+        self.assertTrue(good.with_name("Ω.json.sha256").is_file())
+
+    def test_out_refuses_main_data_from_a_detached_temp_worktree(self):  # POLISHN6B1 F2
+        self.standard()
+        main = self.root / "main"
+        (main / ".git").mkdir(parents=True)  # the main checkout: data/ beside a .git
+        work = self.root / "jarvis-base-x"  # a detached TEMP worktree, not under .claude/worktrees
+        work.mkdir()
+        (work / ".git").write_text(f"gitdir: {main / '.git' / 'worktrees' / 'x'}\n", encoding="utf-8")
+        self.assert_refused(("--events", str(self.events), "--kpi-db", str(self.kpi),
+                             "--out", str(main / "data" / "b.json")), "operator data", root=work)
+        self.assertFalse((main / "data").exists())
+
+    def test_out_refuses_unc_share_spelling(self):  # POLISHN6B1 F3
+        rest = str(self.root / "data" / "b.json").replace("\\", "/").replace(":", "$", 1).lstrip("/")
+        out = Path("//localhost/" + rest)  # \\localhost\C$\<root>\data\b.json
+        # refused before resolve(): resolving a UNC path opens an SMB connection to the host
+        with mock.patch.object(Path, "resolve", side_effect=AssertionError("resolve() touched the share")):
+            with self.assertRaisesRegex(nb.BaselineError, "ambiguous path spelling"):
+                nb._targets(out, self.root, ())
+        # a mapped drive resolves to the UNC form: refused after resolve() too
+        with mock.patch.object(Path, "resolve", lambda self, strict=False: out):
+            with self.assertRaisesRegex(nb.BaselineError, "ambiguous path spelling"):
+                nb._targets(Path("Z:/b.json"), self.root, ())
+
     def test_nul_in_out_is_refused_not_a_traceback(self):
         self.standard()
         self.assert_refused(("--out", str(self.root / "build" / "n6" / "a\x00b.json")), "REFUSED")
