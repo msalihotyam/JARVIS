@@ -22,21 +22,23 @@ class SpokenTextTests(unittest.TestCase):
 
     def test_each_kind_replaced_by_its_cue_once(self):
         text = (
-            "Önce şunu çalıştır:\n```python\nprint('gizli')\n```\n"
-            "Sonra yine:\n```\nx = 1\n```\n"
+            "Önce şunu çalıştır:\n"
             "| a | b |\n|---|---|\n| 1 | 2 |\n"
             "Dosya C:\\dev\\JARVIS\\jarvis\\core.py ve jarvis/talk_say.py içinde.\n"
             "Bkz https://example.com/a?b=1 ve www.example.org.\n"
-            "Commit a910ffb7c261d43706f7e5756f49d009b1124482 ile 7fcb077 geldi."
+            "Commit a910ffb7c261d43706f7e5756f49d009b1124482 ile 7fcb077 geldi.\n"
+            "```python\nprint('gizli')\n```\n"
+            "Sonra yine:\n```\nx = 1\n```"
         )
         r = say(text)
         for kind, cue in CUES.items():
             self.assertEqual(r.spoken.count(cue), 1, (kind, r.spoken[:80]))
-        self.assertEqual(r.text_only, ("code", "table", "path", "url", "hash"))
-        for leak in ("print", "gizli", "x = 1", "core.py", "talk_say", "example", "a910ffb", "7fcb077", "| a"):
+        self.assertEqual(r.text_only, ("code", "table", "path", "url", "hash", talk_say.REST))
+        for leak in ("print", "gizli", "x = 1", "Sonra yine", "core.py", "talk_say", "example", "a910ffb",
+                     "7fcb077", "| a"):
             self.assertNotIn(leak, r.spoken)
         self.assertIn("Önce şunu çalıştır", r.spoken)
-        self.assertFalse(r.rest_in_text)
+        self.assertTrue(r.rest_in_text)  # the first fence cuts the rest of the answer
 
     def test_inline_code_and_link_target_not_spoken(self):
         r = say("`git log -1` çalıştır, sonra [belgeye](https://x.test/doc) bak.")
@@ -94,11 +96,12 @@ class NegativeTests(unittest.TestCase):
     def test_unclosed_fence_rest_is_code(self):
         r = say("Açıklama burada.\n```\ngizli_kod()\nDüz yazı gibi görünen satır.\n")
         self.assertEqual(r.spoken, "Açıklama burada.\n" + CUES["code"])
-        self.assertEqual(r.text_only, ("code",))
+        self.assertEqual(r.text_only, ("code", talk_say.REST))
+        self.assertTrue(r.rest_in_text)
 
-    def test_tilde_fence_closed_only_by_tilde(self):
+    def test_fence_cuts_the_rest_whatever_closes_it(self):
         r = say("~~~\nkod\n```\nhâlâ kod\n~~~\nsonra")
-        self.assertEqual(r.spoken, CUES["code"] + "\nsonra")
+        self.assertEqual((r.spoken, r.text_only, r.rest_in_text), (CUES["code"], ("code", talk_say.REST), True))
 
     def test_only_code_speaks_only_the_cue(self):
         for text in ("```\nprint(1)\n```", "```py\na\n```\n\n```\nb\n```", "`x`"):
@@ -225,15 +228,121 @@ class ReviewFixTests(unittest.TestCase):
         self.assertEqual(say("< ./a/b.py > bak").spoken, CUES["path"] + " bak")
 
     def test_indented_code_not_spoken(self):
-        for text in ("Metin.\n\n    rm -rf gizli\n\n    gizli2\nSon.", "    gizli\nSon.", "a\n\n\tgizli\nSon.",
-                     "```\nkod\n```\n    gizli\nSon."):
+        for text in ("Metin.\n\n    rm -rf gizli\n\n    gizli2\nSon.", "    gizli\nSon.", "a\n\n\tgizli\nSon."):
             r = say(text)
             self.assertNotIn("gizli", r.spoken, text)
             self.assertEqual(r.spoken.count(CUES["code"]), 1, text)
             self.assertTrue(r.spoken.endswith("Son."), text)
+        self.assertEqual(say("```\nkod\n```\n    gizli\nSon.").spoken, CUES["code"])  # fence cuts the rest
 
     def test_indented_line_after_paragraph_is_text(self):
         self.assertEqual(say("Metin\n    devamı").spoken, "Metin\ndevamı")
+
+
+class ReviewFix2Tests(unittest.TestCase):
+    """TALKSAY1FIX2/3: CDX-TALKSAY1FIX F1, F2, F4-F8; the first fence-ish line cuts the rest (fail closed)."""
+
+    CONTAINER_VARIANTS = (  # (input, spoken before the cue); from build/reports/TALKSAY1FIX2.md
+        ("1. Calistir:\n    ```bash\n    rm -rf gizli\n    ```\nSon.", "1. Calistir:\n"),
+        ("- Step:\n    ```\n    rm -rf gizli\n    ```\nSon.", "Step:\n"),
+        ("> ```\n> rm -rf gizli\n> ```\nSon.", ""),
+        ("> - ```sh\n>   gizli\n>   ```\nSon.", ""),
+        ("1) ~~~\n   gizli\n   ~~~\nSon.", ""),
+        ("* Adim\n\t```\n\tgizli\n\t```\nSon.", "Adim\n"),
+        ("Metin\n        ```\n        gizli\n````\nSon.", "Metin\n"),
+        ("- a\n  ```\n  ``` gizli\n  gizli2\n  ```\nSon.", "a\n"),
+        ("> > ```\n> > gizli\n> > ```\nSon.", ""),
+    )
+
+    def assert_cut(self, text, before):
+        r = say(text)
+        self.assertEqual((r.spoken, r.text_only, r.rest_in_text),
+                         (before + CUES["code"], ("code", talk_say.REST), True), text)
+
+    def test_fence_inside_container_cuts_the_rest(self):
+        for text, before in self.CONTAINER_VARIANTS:
+            self.assert_cut(text, before)
+
+    def test_fence_like_line_inside_fence_never_reopens_speech(self):
+        for text in (  # H1 probes: a nested closer used to close the block early
+            "```markdown\n> ```\n> rm -rf GIZLI\n> ```\n```\nSon.",
+            "```\n- ```\nGIZLI\n```\nSon.",
+            "```markdown\n- Kur:\n    ```bash\n    pip install x\n    ```\n- GIZLI calistir\n```\nSon.",
+            "```python\nDOC = \'\'\'\n    ```\n\'\'\'\nos.system('GIZLI')\n```\nSon.",
+            "• ```bash\n  rm GIZLI\n  ```\nSon.",
+        ):
+            self.assert_cut(text, "")
+
+    def test_any_prefix_mix_cuts_and_mid_line_fence_does_not(self):
+        for text in ("Basla.\n- ```\n  gizli\n\nSon gizli2", "Basla.\n \t> \t- 2) + ~~~\ngizli",
+                     "Basla.\n**```\ngizli", "Basla.\n-```gizli", "Basla.\n>>>~~~~ gizli\nSon.",
+                     "Basla.\n- [ ] ```\ngizli", "Basla.\n> - [x] ~~~\ngizli"):
+            self.assert_cut(text, "Basla.\n")
+        r = say("a ```b``` c\nSon.")  # not at line start: an inline code span
+        self.assertEqual((r.spoken, r.rest_in_text), ("a " + CUES["code"] + " c\nSon.", False))
+
+    def test_code_span_closes_only_on_equal_run(self):
+        for text in ("``a`secret`b`` bak", "`` ` secret ` `` bak", "x ``` `secret` ``` bak"):
+            r = say(text)
+            self.assertNotIn("secret", r.spoken, text)
+            self.assertTrue(r.spoken.endswith(CUES["code"] + " bak"), text)
+        self.assertEqual(say("a ` b `` c").spoken, "a b c")  # unmatched runs are literal marks
+
+    def test_backtick_runs_stay_linear(self):
+        n = MAX_INPUT_CHARS - 10
+        for text in ("x " + "`" * n, "x" + " `" * (n // 2), "``x`" * (n // 4), "> " * (n // 2) + "x",
+                     "- " * (n // 2) + "x", "1. " * (n // 3) + "x", "> " * (n // 2) + "```"):
+            start = time.perf_counter()
+            self.assertIsInstance(prepare_speech({"text": text}), (Speech, Refusal))
+            self.assertLess(time.perf_counter() - start, 1.0, text[:8])  # "x "+"`"*n was 1.18 s
+
+    def test_url_keeps_balanced_parentheses(self):
+        r = say("Bak https://en.wikipedia.org/wiki/Function_(mathematics)#History simdi")
+        self.assertEqual(r.spoken, "Bak " + CUES["url"] + " simdi")
+        self.assertEqual(say("(bkz. https://x.org/a) son").spoken, "(bkz. " + CUES["url"] + " ) son")
+        self.assertEqual(say("[wiki](https://x.org/F_(m)) son").spoken, "wiki " + CUES["url"] + " son")
+
+    def test_setext_underline_dropped(self):
+        self.assertEqual(say("Baslik\n===\nMetin").spoken, "Baslik\nMetin")
+
+    def test_dotfile_relative_path_not_spoken(self):
+        for text in ("Dosya secrets/.env", "Dosya a/b/.gitignore"):
+            self.assertEqual((say(text).spoken, say(text).text_only), ("Dosya " + CUES["path"], ("path",)), text)
+
+    def test_image_target_reported_as_url(self):
+        r = prepare_speech({"text": "![](https://example.com/logo.png)"})
+        self.assertIsInstance(r, Speech)
+        self.assertEqual((r.spoken, r.text_only), (CUES["url"], ("url",)))
+        r = say("Logo ![](https://x/l.png) burada")
+        self.assertEqual((r.spoken, r.text_only), ("Logo " + CUES["url"] + " burada", ("url",)))
+
+    def test_fuzz_nothing_after_first_fence_ish_line_spoken(self):
+        rng = random.Random(20261125)
+        marks = (" ", "  ", "\t", ">", "> ", "- ", "* ", "+ ", "• ", "1. ", "2) ")
+        words = (  # no backticks: the head's only cue is the fence's
+            "Metin", "bir", "_kod_", "**kalin**", "| a |", "---", "x", "1.", "> alinti", "")
+        for case in range(500):
+            head = [rng.choice(("", "- ", "> ", "1. ")) + " ".join(rng.choices(words, k=3))
+                    for _ in range(rng.randint(0, 3))]
+            if case % 5 == 0:  # the 9 container variants, every secret line tagged
+                variant, before = self.CONTAINER_VARIANTS[case // 5 % 9]
+                head += [before.rstrip("\n")] if before else []
+                fence, *tail = variant.split("\n")[1 if before else 0:]
+            else:
+                fence = "".join(rng.choices(marks, k=rng.randint(0, 4))) + rng.choice("`~") * rng.randint(3, 5)
+                fence += rng.choice(("", "bash", " py"))
+                tail = [rng.choice(("", "    ", "> ", "- ")) + rng.choice(("", "```", "~~~", "rm ", "Son."))
+                        for _ in range(rng.randint(0, 5))]
+            tags = [f"zq{case}t{k}" for k in range(len(tail) + 1)]
+            text = "\n".join(head + [fence + " " + tags[0]] + [t + " " + g for t, g in zip(tail, tags[1:])])
+            start = time.perf_counter()
+            r = prepare_speech({"text": text})
+            self.assertLess(time.perf_counter() - start, 0.05, text)
+            self.assertIsInstance(r, Speech, text)
+            self.assertTrue(r.rest_in_text, text)
+            self.assertEqual(r.spoken.count(CUES["code"]), 1, text)
+            self.assertTrue(r.spoken.endswith(CUES["code"]), text)
+            self.assertNotIn("zq", r.spoken, text)
 
 
 class PurityTests(unittest.TestCase):
