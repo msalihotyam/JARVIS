@@ -210,6 +210,164 @@ class NegativeTests(_Base):
             self.assertIn(out["note"], (None, "kanal kapalı"))
 
 
+class _Eq:  # passes == / != against anything
+    __hash__ = object.__hash__
+
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+
+class _S(str):  # str subclass lying about equality and hash
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+    def __hash__(self):
+        return 1
+
+
+class _Big(int):  # int subclass whose comparisons always pass range checks
+    def __gt__(self, other):
+        return False
+
+    def __lt__(self, other):
+        return False
+
+    def __le__(self, other):
+        return True
+
+    def __ge__(self, other):
+        return True
+
+
+class _Coll:  # Collection-shaped but not a builtin container
+    def __contains__(self, item):
+        return False
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+
+class _Counting(Mapping):
+    def __init__(self, data):
+        self.data, self.reads = data, []
+
+    def __getitem__(self, key):
+        self.reads.append(key)
+        return self.data[key]
+
+    def __iter__(self):
+        return iter(self.data)
+
+    def __len__(self):
+        return len(self.data)
+
+
+class _Odd(BaseException):
+    pass
+
+
+class HardeningTests(_Base):
+    """TALKPHONE1FIX: forged refusals, exact types, channel-off ordering."""
+
+    def test_forged_or_uninitialised_refusal_never_escapes(self):
+        class Sub(tps._Refused):
+            reason, args = "too_large", ("too_large",)
+
+        forged = (tps._Refused.__new__(tps._Refused), tps._Refused("kanal_kapalı"), tps._Refused(_S("too_large")),
+                  tps._Refused("too_large", "x"), tps._Refused(), tps._Refused(None), tps._Refused("made_up"),
+                  Sub("too_large"), _Odd(), GeneratorExit())
+        for exc in forged:
+            for where in ("req", "att", "cfg"):
+                with self.subTest(exc=type(exc).__name__, args=getattr(exc, "args", None), where=where):
+                    out = self.refused("internal_error", **{where: _Hostile(exc)})
+                    self.assertIs(type(out["reason"]), str)
+                    self.assertEqual((out["note"], out["pointless"]), (None, False))
+        class BadClass(Exception):  # isinstance() on this raises; must not escape
+            @property
+            def __class__(self):
+                raise ValueError
+
+        legit = tuple(tps._Refused(code) for code in ("too_large", "channel_off", "already_on_phone", "request_used"))
+        for exc in legit + (BadClass(),):  # a legit code raised by caller code is still forged
+            for where in ("req", "att", "cfg"):
+                with self.subTest(exc=exc.args, where=where):
+                    out = self.refused("internal_error", **{where: _Hostile(exc)})
+                    self.assertEqual((out["note"], out["pointless"]), (None, False))
+
+    def test_operator_interrupt_is_not_swallowed(self):
+        for exc in (KeyboardInterrupt(), SystemExit()):
+            for where in ("req", "att", "cfg"):
+                with self.subTest(exc=exc, where=where), self.assertRaises(type(exc)):
+                    run(**{where: _Hostile(exc)})
+
+    def test_source_owner_command_need_exact_str(self):
+        for value in (_Eq(), _S("pc_view")):
+            self.refused("not_from_pc_view", req=request(source=value))
+        for value in (_Eq(), _S("salih")):
+            self.refused("not_from_owner", req=request(by=value))
+        for value in (_Eq(), _S("send_to_phone")):
+            self.refused("bad_command", req=request(command=value))
+
+    def test_ids_and_used_need_exact_str(self):
+        self.refused("bad_request", req=request(id=_S("req-1")))
+        self.refused("bad_attachment_id", req=request(attachment_id=_S("att-1")))
+        each(self, ({_S("req-2")}, ["req-2", 1], _Coll(), {"req-1": 1}, ("req-2", None)),
+             lambda v: self.refused("bad_used", used=v))
+        each(self, ({"req-1"}, frozenset({"req-1"}), ["x", "req-1"], ("req-1",)),
+             lambda v: self.refused("request_used", used=v))
+
+    def test_ints_need_exact_int(self):
+        self.refused("bad_attachment", att=attachment(bytes=_Big(10**9)))
+        self.refused("bad_config", cfg=config(chat_id=_Big(1)))
+        self.refused("bad_config", cfg=config(max_bytes=_Big(10**12)))
+
+    def test_kinds_need_exact_safe_str(self):
+        self.refused("kind_not_allowed", att=attachment(kind=_S("pdf")))
+        each(self, ("", "PDF", "../x", "toolongkd", "p f", "pdf\n", _S("pdf")),
+             lambda v: self.refused("bad_config", cfg=config(kinds=frozenset({"pdf", v}))))
+        self.refused("bad_config", cfg=config(kinds=_Coll()))
+
+    def test_record_fields_need_exact_str(self):
+        self.refused("not_in_log", att=attachment(id=_S("att-1")))
+        self.refused("not_in_log", att=attachment(id=_Eq()))
+        self.refused("bad_attachment", att=attachment(origin=_S("pc")))
+        self.refused("path_outside_root", att=attachment(path=_S(DIGEST + ".pdf")))
+        out = run(att=attachment(display_name=_S("rapor.pdf")))
+        self.assertTrue(out["ok"])
+        self.assertEqual((out["action"]["file_name"], out["action"]["name_replaced"]), ("attachment.pdf", True))
+        out = run(redact=lambda text: (_ for _ in ()).throw(_Odd()))  # odd BaseException from the filter
+        self.assertTrue(out["ok"])
+        self.assertTrue(out["action"]["name_replaced"])
+
+    def test_channel_off_wins_over_every_other_refusal(self):
+        off = config(telegram_enabled=False)
+        cases = ({"used": {"req-1"}}, {"used": None}, {"req": request(source="brain")}, {"req": request(id="../x")},
+                 {"req": _Hostile(RecursionError())}, {"req": _Hostile(tps._Refused("too_large"))}, {"req": None},
+                 {"redact": None}, {"att": None}, {"att": _Hostile(ValueError())}, {"att": attachment(bytes=10**9)})
+        for kw in cases:
+            with self.subTest(kw=kw):
+                self.assertEqual(self.refused("channel_off", cfg=off, **kw)["note"], "kanal kapalı")
+        out = self.refused("channel_off", cfg=config(telegram_enabled=False, chat_id=None, kinds=None))
+        self.assertEqual(out["note"], "kanal kapalı")
+        # fail closed: a bad config is never read as "off"
+        self.refused("bad_config", cfg=None, req=request(source="brain"))
+        self.refused("bad_config", cfg=config(telegram_enabled="false"), used={"req-1"})
+
+    def test_telegram_enabled_read_once(self):
+        cfg = _Counting(config())
+        self.assertTrue(run(cfg=cfg)["ok"])
+        self.assertEqual(cfg.reads.count("telegram_enabled"), 1)
+
+
 class GuardTests(unittest.TestCase):
     def test_module_imports_no_io(self):
         tree = ast.parse(MODULE.read_text(encoding="utf-8"))
