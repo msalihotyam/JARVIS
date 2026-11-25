@@ -4,6 +4,7 @@ drive and build_ports are faked at the module boundary; no worker, model,
 check process or network call runs, and the DB lives under TEMP.
 """
 
+import inspect
 import tempfile
 import unittest
 from dataclasses import replace
@@ -11,7 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
-from jarvis.contracts import RunStatus, TaskStatus
+from jarvis.contracts import MemoryStore, RunStatus, TaskStatus
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
@@ -380,6 +381,18 @@ class RealDriverTests(CoreProjectDriveTests):
     test_f1_unmapped_outcome_fails_closed_with_reason = None
     test_f2_multi_target_slice_leases_every_target_and_sees_only_its_own = None
     test_f2_empty_slice_targets_refused_before_state_changes = None
+
+
+class WorkStepProtocolTests(unittest.TestCase):
+    """INT-TRAIN34: AgentCore's work-step calls must be MemoryStore members."""
+
+    def test_work_step_methods_are_declared_with_the_store_signatures(self) -> None:
+        for name in ("append_work_step", "work_steps"):
+            with self.subTest(name=name):
+                self.assertTrue(hasattr(MemoryStore, name), name)
+                declared = inspect.signature(getattr(MemoryStore, name))
+                concrete = inspect.signature(getattr(SQLiteMemoryStore, name))
+                self.assertEqual(list(declared.parameters), list(concrete.parameters))
 
 
 if __name__ == "__main__":
