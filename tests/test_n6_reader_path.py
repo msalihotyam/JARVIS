@@ -22,7 +22,8 @@ SCRIPTS = Path(__file__).resolve().parents[1] / "scripts"
 # methods they name is scanned too, plus every conveyor.X that key1_check.py uses.
 CONVEYOR_ROOTS = ("write_key1", "key1_header", "key1_refusal", "key1_validated",
                   "Conveyor.save_lanes", "Conveyor.save_pager", "Conveyor.write_atomic",
-                  "Conveyor.ci_runs")
+                  "Conveyor.ci_runs", "Conveyor.push_gate", "Conveyor.autopilot",
+                  "Conveyor.ci_rerun_claim")
 API_ROOTS = ("main_checkout",)  # conveyor_api.py, imported by key1_check.py
 WHOLE_MODULES = ("key1_check.py",)  # scanned in full
 
@@ -106,6 +107,37 @@ def parse(path):
     return ast.parse(Path(path).read_text(encoding="utf-8"), filename=str(path))
 
 
+def state_writers(scripts=SCRIPTS):
+    """Conveyor methods that write_atomic a STATE_FILES file (self.<attr> set to self.base / name
+    in __init__); fails closed when it cannot resolve one attr per STATE_FILES name."""
+    tree = parse(scripts / "conveyor.py")
+    names = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign)
+                 and any(getattr(t, "id", "") == "STATE_FILES" for t in n.targets))
+    conv = defs(tree)
+    attrs = {}
+    for n in ast.walk(conv["Conveyor.__init__"]):
+        if (isinstance(n, ast.Assign) and isinstance(n.value, ast.BinOp)
+                and isinstance(n.value.right, ast.Constant) and n.value.right.value in names):
+            attrs.update({t.attr: n.value.right.value for t in n.targets if isinstance(t, ast.Attribute)})
+    if set(attrs.values()) != set(names):
+        raise AssertionError(f"state file attrs not resolved: {names} vs {attrs}")
+    def is_state(e, local):  # self.<attr>, inline self.base / "<name>", or a local bound to either
+        return ((isinstance(e, ast.Attribute) and e.attr in attrs)
+                or (isinstance(e, ast.BinOp) and isinstance(e.right, ast.Constant) and e.right.value in names)
+                or (isinstance(e, ast.Name) and e.id in local))
+    out = set()
+    for k, node in conv.items():
+        local = set()
+        for n in ast.walk(node):
+            if isinstance(n, ast.Assign) and is_state(n.value, set()):
+                local |= {t.id for t in n.targets if isinstance(t, ast.Name)}
+        for n in ast.walk(node):
+            if (isinstance(n, ast.Call) and "write_atomic" in names_in(n.func) and k != "Conveyor.write_atomic"
+                    and any(is_state(a, local) for a in n.args + [kw.value for kw in n.keywords])):
+                out.add(f"conveyor.{k}")
+    return out
+
+
 def scan(scripts=SCRIPTS):
     """(scanned set, hits) over the key-1 path and the state writers under `scripts`."""
     conv = defs(parse(scripts / "conveyor.py"))
@@ -135,8 +167,14 @@ class StaticScanTests(unittest.TestCase):
         scanned, found = scan()
         for must in ("key1_check.py", "conveyor.write_key1", "conveyor.key1_refusal",
                      "conveyor.Conveyor.save_lanes", "conveyor.Conveyor.save_pager",
-                     "conveyor.Conveyor.write_atomic", "conveyor_api.main_checkout"):
+                     "conveyor.Conveyor.write_atomic", "conveyor_api.main_checkout",
+                     "conveyor.Conveyor.push_gate", "conveyor.Conveyor.autopilot",
+                     "conveyor.Conveyor.ci_rerun_claim"):
             self.assertIn(must, scanned)
+        writers = state_writers()  # every lanes/autopilot/push.json writer, found by AST
+        self.assertGreaterEqual(writers, {"conveyor.Conveyor.save_lanes", "conveyor.Conveyor.push_gate",
+                                          "conveyor.Conveyor.autopilot"})
+        self.assertEqual(writers - set(scanned), set(), "state writer outside the scan: add it to CONVEYOR_ROOTS")
         self.assertNotIn("conveyor.Conveyor.write_status", scanned)
         self.assertNotIn("conveyor.Conveyor.read_report", scanned)
         self.assertEqual(found, [], f"reader output on the key-1/state-write path; scanned={scanned}")
@@ -170,6 +208,33 @@ class StaticScanTests(unittest.TestCase):
             (d / "conveyor.py").write_text(planted, encoding="utf-8")
             found = scan(d)[1]
             self.assertTrue(any("Conveyor.event" in h and "events.jsonl" in h for h in found), found)
+            # the push.json and autopilot.json writers are scanned too
+            for meth in ("push_gate", "autopilot", "ci_rerun_claim"):
+                with self.subTest(writer=meth):
+                    head = next(ln for ln in src.splitlines(keepends=True)
+                                if ln.startswith(f"    def {meth}(self"))
+                    planted = src.replace(head, head + "        _ = self.load_lanes().get('x', {}).get('reading')\n", 1)
+                    self.assertNotEqual(planted, src)
+                    (d / "conveyor.py").write_text(planted, encoding="utf-8")
+                    found = scan(d)[1]
+                    self.assertTrue(any(f"Conveyor.{meth}" in h and "reading" in h for h in found), found)
+            # a new state writer outside CONVEYOR_ROOTS is found and fails the completeness check,
+            # whether it passes the attr, a keyword, an inline path or a local alias
+            for body in ("self.write_atomic(self.push_file, '{}')",
+                         "self.write_atomic(path=self.auto_file, text='{}')",
+                         "self.write_atomic(self.base / 'lanes.json', '{}')",
+                         "f = self.auto_file\n        self.write_atomic(f, '{}')"):
+                with self.subTest(new_writer=body):
+                    planted = src.replace("    def save_lanes(self, lanes):\n",
+                                          f"    def zz_new_writer(self):\n        {body}\n\n"
+                                          "    def save_lanes(self, lanes):\n", 1)
+                    (d / "conveyor.py").write_text(planted, encoding="utf-8")
+                    self.assertIn("conveyor.Conveyor.zz_new_writer", state_writers(d) - set(scan(d)[0]))
+            # a renamed state attr fails closed instead of finding no writers
+            (d / "conveyor.py").write_text(src.replace('self.base / "push.json"', 'self.base / "pushx.json"', 1),
+                                           encoding="utf-8")
+            with self.assertRaises(AssertionError):
+                state_writers(d)
 
 
 VALID = {"kind": "pass", "summary": "ok", "next": "", "at": "2026-11-25T00:00:00Z"}
