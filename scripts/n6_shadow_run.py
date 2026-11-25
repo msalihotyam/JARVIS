@@ -155,7 +155,14 @@ def judge(root: Path, *, clock: Callable[[], datetime],
     for lane, why in sorted(snap.unreadable.items()):
         print(f"N6 {lane}: report unreadable: {why}", file=sys.stderr)
     usage_text = _read(n6, root / "build" / "ledger" / "usage.json")
-    usage = json.loads(usage_text).get("by_lane", {}) if usage_text else {}
+    try:
+        usage = json.loads(usage_text).get("by_lane", {}) if usage_text else {}
+    except (ValueError, RecursionError, AttributeError):  # RecursionError: deep nesting
+        usage = None
+    if not isinstance(usage, dict):
+        print("n6_shadow: usage.json unreadable: no lane has a token reading this pass",
+              file=sys.stderr)
+        usage = {}  # R32: every lane's tokens read as missing, so none is judged; retried next pass
     notes = _read(n6, notes_path)
     done = {(r.slice_id, r.source) for r in read_rows(db)} if db.is_file() else set()
     written = 0
@@ -327,11 +334,20 @@ def _cleanup(i: dict[str, Any]) -> Judged:
 
 
 def _intseq(i: dict[str, Any]) -> Judged:
-    shadow = compare_dispatch(sequence(i["candidates"], i["main_sha"]), i["events"])
+    seq = sequence(i["candidates"], i["main_sha"])
+    # an unknown candidate (malformed, duplicate, unreadable main_sha) is not judged, and it also
+    # holds every auto-key INT (O13), so no verdict of this sequence is a judgement
+    if any(v == "unknown" for _, v, _ in seq.verdicts):
+        return None
+    shadow = compare_dispatch(seq, i["events"])
+    if shadow.verdict not in ("agree", "disagree"):
+        return None
     return shadow.verdict, shadow.n6, shadow.conveyor
 
 
 def _presence(i: dict[str, Any]) -> Judged:
+    if type(i["prior"]) is not list or type(i["events"]) is not list:
+        return None  # a malformed container ({} / "" iterate as empty) is not a no-change signal
     state = state_from_events(i["prior"])
     if state is None:
         return None
@@ -375,8 +391,9 @@ def _text(value: Any) -> str:
     return text or "-"
 
 
-def _jsonl_rows(path: Path) -> list[dict[str, Any]] | None:
-    """The JSON-object lines of ``path``: [] when absent, None when it exists but is unreadable."""
+def _jsonl_rows(path: Path, *, strict: bool = False) -> list[dict[str, Any]] | None:
+    """The JSON-object lines of ``path``: [] when absent, None when it exists but is unreadable
+    (``strict``: also when a line nests too deep to parse, as it may hide a noted row)."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
     except FileNotFoundError:
@@ -387,6 +404,10 @@ def _jsonl_rows(path: Path) -> list[dict[str, Any]] | None:
     for line in lines:
         try:
             item = json.loads(line)
+        except RecursionError:  # a deeply nested line: not a ValueError
+            if strict:
+                return None
+            continue
         except ValueError:
             continue
         if isinstance(item, dict):
@@ -411,7 +432,7 @@ def feed(root: Path, events: list[dict[str, Any]], *, clock: Callable[[], dateti
     if not switch.exists():
         return 0
     base = root / "build" / "n6"
-    history = _jsonl_rows(base / PHASE4)
+    history = _jsonl_rows(base / PHASE4, strict=True)
     rows_out: list[dict[str, Any]] = []
     errors: list[str] = []
     if history is None:  # an unreadable history would re-append every noted event

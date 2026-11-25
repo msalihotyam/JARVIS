@@ -120,6 +120,18 @@ class ShadowRunTest(unittest.TestCase):
         self.assertEqual(self.judge(head=lambda lane: None), 0)  # A unknown, B has no tokens
         self.assertFalse(self.db.exists())
 
+    def test_unreadable_usage_json_judges_no_lane_and_never_raises(self) -> None:
+        # FIX3 F3: usage.json is parsed too; deep nesting, bad JSON or a non-object reads as no tokens
+        self.on()
+        for text in ("[" * 100000 + "]" * 100000, "{bad", "[]", '{"by_lane": []}'):
+            with self.subTest(text=text[:8]):
+                self.write("build/ledger/usage.json", text)
+                err = io.StringIO()
+                with contextlib.redirect_stderr(err):
+                    self.assertEqual(self.judge(), 0)
+                self.assertIn("usage.json unreadable", err.getvalue())
+        self.assertFalse(self.db.exists())
+
     def git(self, *args: str) -> str:
         return subprocess.run(
             ["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false",
@@ -571,6 +583,66 @@ class Phase4FeedTest(unittest.TestCase):
         self.assertEqual(self.feed([self.event("e1")]), 0)
         self.assertTrue(history.is_dir())
         self.assertEqual(run.shadow_rows(self.root), [])
+
+    @staticmethod
+    def cand(sid: str, n: int, **extra: object) -> dict:
+        return {"id": sid, "picks": [f"{n:040x}"], "files": [f"jarvis/{sid}.py"], "key": "auto",
+                "protected": False, "patch_ids": [f"{n + 100:040x}"], "age_s": 10, "base": SHA, **extra}
+
+    def test_intseq_an_unknown_sequence_verdict_is_never_a_counted_row(self) -> None:
+        # FIX3 F1: sequence() says unknown, compare_dispatch turns a dispatched unknown into disagree
+        a, b = self.cand("INT-A", 1), self.cand("INT-B", 2)
+        go = [{"event": "dispatch", "lane": "INT-A"}]
+        cases = {"main_sha None": ([a, b], None), "main_sha short": ([a, b], "abc"),
+                 "main_sha non-hex": ([a, b], "z" * 40), "main_sha upper": ([a, b], "A" * 40),
+                 "malformed dispatched": ([{"id": "INT-A"}, b], SHA),
+                 "duplicate dispatched": ([a, {**b, "id": "INT-A"}], SHA),
+                 "shared patch-id": ([a, {**b, "patch_ids": a["patch_ids"]}], SHA),
+                 "unknown not dispatched holds auto": ([a, {"id": "INT-C"}], SHA)}
+        for name, (cands, main) in cases.items():
+            with self.subTest(name):
+                self.assertEqual(run.compare_dispatch(run.sequence(cands, main), go).verdict, "disagree")
+                self.assertIsNone(run._intseq({"candidates": cands, "main_sha": main, "events": go}))
+        events = [{"event_id": f"e{n}", "origin": "live",
+                   "inputs": {"intseq": {"candidates": c, "main_sha": m, "events": go}}}
+                  for n, (c, m) in enumerate(cases.values())]
+        self.assertEqual(self.feed(events, run.PORTS), 0)
+        self.assertEqual(run.shadow_rows(self.root), [])
+        reasons = gate.check(run.shadow_rows(self.root), {}, [])["R31"][1]
+        self.assertIn("0 real shadow events, needs 5", reasons)
+        self.assertFalse(any("unsafe" in r for r in reasons), reasons)
+        self.assertIsNone(run._intseq({"candidates": [a, b], "main_sha": SHA, "events": []}))  # unknown
+        self.assertEqual(run._intseq({"candidates": [a, b], "main_sha": SHA, "events": go}),
+                         ("agree", ("INT-A", "INT-B"), ("INT-A",)))
+        manual = self.cand("INT-M", 3, key="manual", files=["jarvis/INT-A.py"])
+        self.assertEqual(run._intseq({"candidates": [a, manual], "main_sha": SHA, "events": go})[0],
+                         "disagree")  # a judged hold (O13 manual overlap) still counts
+
+    def test_presence_needs_list_containers(self) -> None:
+        # FIX3 F2: {} / "" iterate as empty and read as a no-change signal
+        given = {"prior": [], "idle_s": 0, "pace": None, "now": 0, "events": []}
+        with mock.patch.object(run, "sense", return_value=(presence.Signal(presence.PRESENT), presence.State())):
+            self.assertEqual(run._presence(given)[0], "agree")  # type: ignore[index]
+            for key in ("events", "prior"):
+                for bad in ({}, "", (), None, {"event": "x"}, "abc", 0):
+                    with self.subTest(key=key, bad=bad):
+                        self.assertIsNone(run._presence({**given, key: bad}))
+
+    def test_deeply_nested_json_lines_never_raise(self) -> None:
+        # FIX3 F3: json.loads raises RecursionError (not a ValueError) on deep nesting
+        deep = "[" * 100000 + "]" * 100000
+        with self.assertRaises(RecursionError):
+            json.loads(deep)
+        inbox = self.root / "inbox.jsonl"
+        inbox.write_text(deep + '\n{"event_id": "e1"}\n', encoding="utf-8")
+        self.assertEqual(run._jsonl(inbox), [{"event_id": "e1"}])  # the inbox skips the line
+        history = self.root / "build/n6/phase4.jsonl"
+        history.write_text('{"group": "R10", "event_id": "e0"}\n' + deep + "\n", encoding="utf-8")
+        before = history.read_bytes()
+        self.assertEqual(run.shadow_rows(self.root), [{"group": "R10", "event_id": "e0"}])
+        self.assertEqual(self.feed([self.event("e1")]), 0)  # history unreadable: pass skipped
+        self.assertEqual(history.read_bytes(), before)
+        self.assertIn("phase4.jsonl unreadable", (self.root / "build/n6/phase4_errors.log").read_text("utf-8"))
 
     def test_switch_off_writes_nothing(self) -> None:
         (self.root / "build/n6/SHADOW_ON").unlink()
