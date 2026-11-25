@@ -18,6 +18,12 @@ _INERT = str.maketrans({
 })
 _DROP = ("Cf", "Cs", "Co", "Cn")      # bidi/zero-width controls, surrogates, unassigned
 _SPACE = ("Cc", "Zs", "Zl", "Zp")     # newline, tab, NUL and other breaks -> one space
+# Unicode Default_Ignorable_Code_Point: invisible even when not Cf (CGJ, fillers, selectors).
+_IGNORABLE = ((0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160),
+              (0x17B4, 0x17B5), (0x180B, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E),
+              (0x2060, 0x206F), (0x3164, 0x3164), (0xFE00, 0xFE0F), (0xFEFF, 0xFEFF),
+              (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+              (0xE0000, 0xE0FFF))
 
 
 @dataclass(frozen=True)
@@ -33,7 +39,7 @@ def _clean(name):
         cat = unicodedata.category(ch)
         if cat in _SPACE:
             out.append(" ")
-        elif cat not in _DROP:
+        elif cat not in _DROP and not any(lo <= ord(ch) <= hi for lo, hi in _IGNORABLE):
             out.append(ch)
     cleaned = " ".join("".join(out).split())
     if not cleaned:
@@ -51,7 +57,9 @@ def _display(cleaned):
 def _key(cleaned):
     # Turkish I/İ/ı/i fold together so a case-only change is never a focus change.
     folded = "".join("i" if ch in "Iİı" else ch for ch in cleaned)
-    return unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", folded).casefold())
+    # casefold/lower of U+0130 is "i" + U+0307 (no NFC form): fold that pair to "i" last.
+    key = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", folded).casefold())
+    return key.replace("i̇", "i")
 
 
 class _Refused(Exception):
