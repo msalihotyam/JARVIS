@@ -30,7 +30,7 @@ COMMANDS = {
     "card_tap": ("card_id", "choice"),
     "resize": ("size",),
 }
-# same invisible set as talk_card; category C* covers bidi, zero-width and control chars
+# same invisible set as the talk card module;category C* covers bidi, zero-width and control chars
 _INVISIBLE = frozenset(
     [0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0x17B4, 0x17B5]
     + list(range(0x180B, 0x1810))
