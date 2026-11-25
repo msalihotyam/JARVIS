@@ -4470,3 +4470,108 @@ kaldırıldı. §4.27: zincir sürücüsü dilimleri yürütür; değişmez. V2.
 kararları: iki eşzamanlı çalıştırma, W2 veri sözleşmesi, `blocked:budget`
 ve API'ye geri düşüş yokluğu aynen geçerlidir; regresyon paketi yazıcı
 senaryolarıyla genişler (PM30).
+
+### 4.29 Yeni yüz (konuşma servisi) — saf parçalar, henüz bağlı değil (TALK/TG/FACE dilimleri, uygulandı; çalışan uygulamaya bağlı değil)
+
+**Bağlam.** 2026-11-24'ten beri yeni yüz geliştirilir (Salih onayı
+2026-11-24 23:30); eski büyük pencere artık geliştirilmez. Aşağıdaki
+modüller `main`'dedir ama çalışan uygulamadaki hiçbir kod onları import
+etmez. `talk_log` (yerel dosya) ve `talk_attach` (çağıranın verdiği
+dizine yazım) dışındakiler G/Ç yapmaz; ağ ve model çağrısı hiçbirinde
+yoktur. Her satır: modül — neye karar verir; değişmezi (dilim kimliği).
+
+**Konuşma (`talk_*`).**
+
+- `jarvis/talk_turn.py` — tek tur sıralayıcı: Salih girdisi → beyne bir
+  soru → JARVIS yanıt girdisi; dört işbirlikçi (`build_packet`,
+  `ask_brain`, `append_entry`, `has_reply`) enjekte edilir. Eylem yolu
+  yoktur: beyin çıktısı metin + `needs_you` + öneri kutusu kayıt adlarına
+  indirgenir, gerisi atılır ve sayılır; `approval_card` girdileri ve
+  dokunuşları beyne ulaşmaz (TALKTURN1, T2).
+- `jarvis/talk_log.py` — iki görünümün (pc, telegram) tek kaydı olan
+  yalnız-ekle yerel konuşma günlüğü ve görünüm başına teslim durumu.
+  64 sıfırlı başlangıçtan hash zinciri; kayıt ≤ 64 KiB, kilit + fsync;
+  sonlanmamış son satır yazmayı durdurur; `jarvis.db` ve alternatif akış
+  yolları reddedilir (TALKLOG1).
+- `jarvis/talk_inbound.py` — gelen öğe (Telegram kaydı ya da PC
+  gönderimi) → (kaynak, kaynak kimliği) anahtarıyla tam bir kez günlük
+  girdisi adayı, aksi halde DUPLICATE. `who` her zaman koddan "salih";
+  başka gelen alan (`trusted`, `approved`, `needs_you`, ...) kopyalanmaz;
+  tel katmanının izin listesi kararı "allowed" olmalıdır (TALKIN1).
+- `jarvis/talk_inbox.py` — salt-okur beynin yazabildiği tek şey olan
+  öneri kutusu kayıtlarının doğrulayıcısı (Salih, 2026-11-25 00:02).
+  Kayıt nereye/nasıl uygulanacağını adlandırmaz; hiçbir şey kaydı
+  onaylı işaretlemez; boyut/derinlik/metin sınırları (TALKINBOX1).
+- `jarvis/talk_packet.py` — tur başına beyin paketi: bir eşleme girer,
+  karakter bütçesi altında tek deterministik metin çıkar; `reply_to` tek
+  başına tur çekmez; ret ayrıntısı girdiyi asla yansıtmaz (TALKPACK1,
+  tasarım §6).
+- `jarvis/talk_rotate.py` — beyin oturumunun ne zaman değişeceği ve
+  devir paketi; açık onay kartları her zaman devredilir, konu başına bir
+  özet; hata durumunda kapalı kalır (TALKROTATE1).
+- `jarvis/talk_focus.py` — odak kararı (`decide`): SWITCH / ASK
+  ("Which project?") / OPEN_PROJECT. Tam bir bilinen aday yoksa ASK;
+  okuma/sohbet dışı niyette örtük proje geçişi ASK; ASK odağı
+  değiştirmez; `FocusState` iki görünümde ortaktır (TALKFOCUS1).
+- `jarvis/talk_label.py` — PC başlığı ve Telegram odak satırı için odak
+  etiketi: tek satır metin ya da tipli Refusal (TALKLABEL1, tasarım 10).
+- `jarvis/talk_mirror.py` — günlük girdisi ve teslim durumundan G/Ç'siz
+  giden yansıtma eylemleri (`plan_mirror`); Salih'in mesajı kendi kaynak
+  görünümüne geri gönderilmez, sistem girdisinin giden yolu yoktur,
+  metin 4000 karakterde bölünür (TALKMIRROR1).
+- `jarvis/talk_delivery.py` — neyin ne zaman yeniden gönderileceği ve
+  ne zaman vazgeçileceği; G/Ç yok, her kötü girdi ASCII nedenli tipli
+  ret (TALKDELIV1).
+- `jarvis/talk_attach.py` — konuşma ekinin doğrulanıp saklanması, içerik
+  belge olarak açılmadan: izinli tür listesi + sihirli bayt/ofis parçası
+  kontrolü, 20 MiB varsayılan sınır, çağıranın verdiği var olan kök
+  altında `<sha256>.<uzantı>` (kök reparse point olamaz); ret
+  `AttachmentRefused` kodudur (TALKATTACH1).
+- `jarvis/talk_say.py` — yazılı yanıtın seslendirme hazırlığı: kod
+  blokları, tablolar, dosya yolları, URL'ler ve hash'ler asla okunmaz,
+  her tür ilk görüldüğünde kısa Türkçe işaretle değişir; sesli metin
+  sınırlıdır (TALKSAY1, tasarım §8).
+- `jarvis/talk_hear.py` — gösterilen döküm ("Anladığım: ...") ve
+  düzeltmeden sözlük adayları; sözlüğe asla yazmaz, adaylar gözden
+  geçirme için döner (TALKHEAR1, tasarım §8).
+- `jarvis/talk_glossary.py` — yerel konuşma ipuçları ve deterministik
+  Türkçe döküm düzeltmesi (`dev/talk/glossary_tr.json`); bölütlemeden
+  önce NFC, Türkçe I katlaması (TALKGLOSS1).
+- `jarvis/talk_speech.py` — STT/TTS dikişi: motorlar enjekte edilen
+  sahtelerdir, motor kurulmaz ve ses gönderilmez; metin geri düşüşü,
+  istisna kaçmaz (TALKSPEECH1, AUD0 F9).
+
+**Telegram (`telegram_*`).**
+
+- `jarvis/telegram_wire.py` — Bot API update JSON'unun ağsız ayrıştırılması
+  (TextMessage, VoiceNote, Photo, Document, ButtonCallback; hepsi
+  güvenilmez) ve düz metin bildirim biçimi; sohbet izin listesi
+  (`is_allowed_chat`), update ≤ 256 KiB, bildirim ≤ 2048 karakter
+  (TGMSG1).
+- `jarvis/telegram_offset.py` — getUpdates offset defteri: her update
+  artan `update_id` sırasıyla tam bir kez işlenir, sonraki offset döner;
+  Refusal = hiçbir şey işleme, saklı offset'i koru (TGPOLL1).
+- `jarvis/telegram_out.py` — yansıtma eylemi → izinli dört yöntemden
+  biri için `(method, body)` (sendMessage, sendVoice, sendPhoto,
+  sendDocument). Token, URL ve soket yoktur; token ve yüklemenin sahibi
+  gönderen istemcidir (TGSEND1).
+- `jarvis/telegram_files.py` — indirmeden önce dosya/sesli not kabul
+  kararı; mime ve ad yalnız ipucudur, içerik indirmeden sonra çağıranca
+  doğrulanır; dosya kimliği opaktır (TGFILE1).
+
+**PC yüzü (`face/`).**
+
+- `jarvis/face/__init__.py` — yeni PC penceresi paketi; yalnız kabuk,
+  arka uç yok (FACESHELL1).
+- `jarvis/face/shell.py` — Salih'in bakması için tıklanabilir boş kabuk,
+  yalnız örnek veri: arka uç, dosya, ağ, mikrofon, pano veya ekran
+  erişimi yok; eski `jarvis.ui` import edilmez ve dokunulmaz.
+  Çalıştırma: `python -m jarvis.face.shell` (`--check`) (FACESHELL1).
+
+**Bağlantı henüz yapılmadı.** Eksikler: (1) bu saf parçaları G/Ç ile
+birleştiren servis döngüsü (Telegram çekme/gönderme istemcisi, günlük,
+teslim); (2) `talk_turn`'ün `ask_brain`'ini dolduracak beyin
+çalıştırıcısı; (3) canlı Telegram token'ı (yalnız Salih verir). Karar
+kaynağı "Project front" projesindeki
+`FRONT_20261125-0620_telegram-ADR.md` ADR'sidir: K1–K9 kararları
+ÖNERİLDİ (PROPOSED) durumunda, iki yetki sorusu açık.
