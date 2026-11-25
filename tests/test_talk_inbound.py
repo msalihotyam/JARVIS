@@ -1,4 +1,5 @@
 import ast
+import unicodedata
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
@@ -9,6 +10,35 @@ from tests.adversarial import HOSTILE_NUMBERS, HOSTILE_PATH_PARTS, HOSTILE_TEXT,
 
 SHA = "a" * 64
 T0 = "2026-11-25T10:00:00+00:00"
+
+# Test-side spec (Unicode Default_Ignorable_Code_Point), written independently of the module's table.
+_DI_SPEC = ("00AD 034F 061C 115F-1160 17B4-17B5 180B-180F 200B-200F 202A-202E 2060-206F 3164 FE00-FE0F "
+            "FEFF FFA0 FFF0-FFF8 1BCA0-1BCA3 1D173-1D17A E0000-E0FFF")
+DEFAULT_IGNORABLE = [tuple(int(h, 16) for h in (r.split("-") * 2)[:2]) for r in _DI_SPEC.split()]
+BIDI = set("؜‎‏‪‫‬‭‮⁦⁧⁨⁩")
+INVISIBLE_SAMPLES = (
+    "⁡⁢⁣⁤"  # invisible operators (Cf)
+    "⁪⁫⁬⁭⁮⁯⁥⁠"  # deprecated format, reserved, word joiner
+    "­​‌‍﻿"  # soft hyphen, zero-width space/joiners, BOM
+    "\U000e0001\U000e0020\U000e0041\U000e007f\U000e0080\U000e0fff"  # tags, reserved tag block
+    + "".join(chr(c) for c in range(0xFE00, 0xFE10))  # variation selectors 1-16
+    + "\U000e0100\U000e0150\U000e01ef"  # variation selectors supplement
+    "᠋᠌᠍᠎᠏͏"  # Mongolian FVS/vowel separator, CGJ
+    "ᅟᅠㅤﾠ឴឵"  # Hangul fillers, Khmer inherent vowels
+    "\U0001bca0\U0001bca3\U0001d173\U0001d17a￰￸￹￻"  # shorthand/musical format, specials
+)
+
+
+def expected_flags(text):
+    flags = set()
+    for ch in text:
+        if ch in BIDI:
+            flags.add("bidi")
+        elif unicodedata.category(ch) == "Cf" or any(lo <= ord(ch) <= hi for lo, hi in DEFAULT_IGNORABLE):
+            flags.add("zero_width")
+        elif ch not in "\n\t" and unicodedata.category(ch) == "Cc":
+            flags.add("control")
+    return tuple(sorted(flags))
 
 
 def tg(**over):
@@ -134,18 +164,40 @@ class InboundCandidateTests(unittest.TestCase):
         zw = to_candidate(pc(text="a\u200bb"), set())
         self.assertEqual((zw.text, zw.flags), ("a\u200bb", ("zero_width",)))
 
-        def check(text):
+        def check(text):  # expected text and flags derived from the input, not the output
             got = to_candidate(pc(text=text), set())
             if isinstance(got, Refusal):
-                self.assertIn(got.reason, ("too_long", "bad_text"))
+                self.assertIn(got.reason, ("too_long", "bad_text", "empty"))
                 return
-            self.assertNotIn("\x00", got.text)
-            if any(ch in got.text for ch in "\u202a\u202e\u2066\u2069"):
-                self.assertIn("bidi", got.flags)
-            if any(ch in got.text for ch in "\u200b\u200d\ufeff"):
-                self.assertIn("zero_width", got.flags)
-        each(self, HOSTILE_TEXT, check)
+            want = unicodedata.normalize("NFC", text.replace("\x00", ""))
+            self.assertEqual((got.text, got.flags), (want, expected_flags(want)))
+        each(self, HOSTILE_TEXT + tuple(f"a{ch}b" for ch in INVISIBLE_SAMPLES), check)
         self.refused(to_candidate(pc(text="a\ud800b"), set()), "bad_text")
+
+    # Negative 6 by class: every default-ignorable or Cf char outside bidi is kept and flagged zero_width
+    def test_invisible_chars_flagged(self):
+        def check(ch):
+            for text in (f"a{ch}b", f"{ch}ab", f"ab{ch}", f"a{ch}{ch}\u200bb"):
+                got = to_candidate(pc(text=text), set())
+                self.assertEqual((got.text, got.flags), (text, ("zero_width",)), repr(text)[:80])
+            mixed = to_candidate(pc(text=f"a{ch}\u202eb\x07"), set())
+            self.assertEqual(mixed.flags, ("bidi", "control", "zero_width"))
+        each(self, INVISIBLE_SAMPLES, check)
+        for ch in "\u202a\u202e\u2066\u2069\u200e\u200f\u061c":  # bidi stays bidi only
+            self.assertEqual(to_candidate(pc(text=f"a{ch}b"), set()).flags, ("bidi",))
+        for text in ("a\u00a0b", "a\u2028b", "\u0131\u00e9\u015f", "a\u3000b", "e\u0301"):  # visible: no flag
+            self.assertEqual(to_candidate(pc(text=text), set()).flags, (), repr(text))
+
+    def test_allowlist_read_once(self):
+        class Flip(dict):
+            calls = 0
+            def get(self, key, default=None):
+                if key == "allowlist":
+                    Flip.calls += 1
+                    return "not allowed" if Flip.calls == 1 else "allowed"
+                return super().get(key, default)
+        self.refused(to_candidate(Flip(tg()), set()), "not_allowed")
+        self.assertEqual(Flip.calls, 1)
 
     def test_hostile_fields_refused(self):
         for bad in ({"source": "email"}, {"source": None}, {"type": "transcript"}, {"type": None},

@@ -37,7 +37,13 @@ _SOURCE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.:-]{0,127}")
 _CARD_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 _BIDI = frozenset("\u061c\u200e\u200f\u202a\u202b\u202c\u202d\u202e\u2066\u2067\u2068\u2069")
-_ZERO_WIDTH = frozenset("\u034f\u115f\u180b\u180c\u180d\u180e\u200b\u200c\u200d\u2060\u3164\ufeff\ufe00\ufe0f")
+# Unicode Default_Ignorable_Code_Point ranges (DerivedCoreProperties); any other Cf char is flagged too.
+_IGNORABLE = (
+    (0x00AD, 0x00AD), (0x034F, 0x034F), (0x115F, 0x1160), (0x17B4, 0x17B5), (0x180B, 0x180F),
+    (0x200B, 0x200F), (0x202A, 0x202E), (0x2060, 0x206F), (0x3164, 0x3164), (0xFE00, 0xFE0F),
+    (0xFEFF, 0xFEFF), (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
 _NAME_BAD = frozenset('/\\:*?"<>|\u2215\u2044\u29f8\u2216\ufe68')
 _RESERVED = frozenset(
     {"CON", "PRN", "AUX", "NUL", "CLOCK$", "CONIN$", "CONOUT$"}
@@ -117,7 +123,8 @@ def _convert(item: object, seen: object) -> Candidate | Duplicate:
     if type(source) is not str or source not in SOURCES:
         raise _Refused("bad_source")
     source_id = _source_id(item.get("source_id"))
-    if source == "telegram" and not (type(item.get("allowlist")) is str and item.get("allowlist") == ALLOWED):
+    verdict = item.get("allowlist") if source == "telegram" else ALLOWED  # read once
+    if not (type(verdict) is str and verdict == ALLOWED):
         raise _Refused("not_allowed")
     item_type = item.get("type")
     if type(item_type) is not str or item_type not in ITEM_KINDS:
@@ -176,11 +183,16 @@ def _text(value: object) -> tuple[str, tuple[str, ...]]:
     for ch in value:
         if ch in _BIDI:
             flags.add("bidi")
-        elif ch in _ZERO_WIDTH:
+        elif _invisible(ch):
             flags.add("zero_width")
         elif ch not in "\n\t" and unicodedata.category(ch) == "Cc":
             flags.add("control")
     return value, tuple(sorted(flags))
+
+
+def _invisible(ch: str) -> bool:
+    cp = ord(ch)
+    return unicodedata.category(ch) == "Cf" or any(lo <= cp <= hi for lo, hi in _IGNORABLE)
 
 
 def _attachments(value: object) -> tuple[tuple[str, str], ...]:
