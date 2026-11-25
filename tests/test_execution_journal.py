@@ -7,6 +7,7 @@ restart are simulated with a fresh AgentCore over the same database file.
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -147,11 +148,34 @@ class JournalConnector(DummyConnector):
         return False
 
 
+_TEMPLATE: tempfile.TemporaryDirectory | None = None
+
+
+def setUpModule() -> None:
+    # One fresh-schema store built once; every test gets its own byte copy, so
+    # no test ever writes to the template. The migration tests below build
+    # their own legacy file and never use it.
+    global _TEMPLATE
+    _TEMPLATE = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    SQLiteMemoryStore(Path(_TEMPLATE.name) / "jarvis.db")
+    # All connections closed: the WAL is checkpointed into the main file, so
+    # a plain file copy is the complete database.
+    leftovers = sorted(p.name for p in Path(_TEMPLATE.name).iterdir())
+    if leftovers != ["jarvis.db"]:
+        raise RuntimeError(f"template database not self-contained: {leftovers}")
+
+
+def tearDownModule() -> None:
+    if _TEMPLATE is not None:
+        safe_cleanup(_TEMPLATE)
+
+
 class ExecutionJournalTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(safe_cleanup, self.temp)
         self.database = Path(self.temp.name) / "jarvis.db"
+        shutil.copyfile(Path(_TEMPLATE.name) / "jarvis.db", self.database)
 
     def store(self) -> SQLiteMemoryStore:
         return SQLiteMemoryStore(self.database)
