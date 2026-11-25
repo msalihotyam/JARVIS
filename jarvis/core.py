@@ -5,6 +5,7 @@ from __future__ import annotations
 import copy
 import difflib
 import hashlib
+import inspect
 import json
 import os
 import sqlite3
@@ -1770,12 +1771,14 @@ class AgentCore:
         usage: WorkUsage,
         quota_available: bool = True,
         large_budget: WorkBudget | None = None,
+        claimed: list[str] | None = None,
     ) -> WorkRun | ResumeRefused:
         """Explicit resume of an interrupted run. Revalidates in a fixed order
         before any work - policy and granted scope, the plan through the PM10
         validator, every target lease re-claimed, the D3 budget - and refuses
         on the first failure, leaving the run interrupted with no lease held.
-        On success the run returns to its saved phase; no worker is started."""
+        On success the run returns to its saved phase; no worker is started.
+        A caller-given ``claimed`` list receives every target this call claimed."""
         run = self.memory.latest_work_run(run_id)
         if run is None or run.state is not RunState.INTERRUPTED or run.resume_state is None:
             return ResumeRefused("not_interrupted", "only an interrupted run can resume")
@@ -1801,7 +1804,7 @@ class AgentCore:
         )
         if refusals:
             return ResumeRefused("plan", ", ".join(refusal.code for refusal in refusals))
-        claimed: list[str] = []
+        claimed = [] if claimed is None else claimed
         try:
             for target in _lease_targets(targets):
                 self.memory.claim_work_lease(target, run_id, boot_id, now=now, lease=lease)
@@ -1880,7 +1883,10 @@ class AgentCore:
         run = self.memory.latest_work_run(run_id)
         steps = {item.key: item for item in self.memory.work_steps(run_id)}
         step = next((item for item in steps.values() if item.ordinal == ordinal), None)
-        if run is None or step is None or run.state not in (RunState.BUILDING, RunState.INTERRUPTED):
+        # An INTERRUPTED run saved in another phase (AWAITING_APPROVAL) must never be forced to BUILDING.
+        if run is None or step is None or run.state not in (RunState.BUILDING, RunState.INTERRUPTED) or (
+            run.state is not RunState.BUILDING and run.resume_state is not RunState.BUILDING
+        ):
             return self._input_failure(
                 task, ErrorCode.INVALID_TASK, f"refused: not_resumable ({run_id})", session,
             )
@@ -1930,15 +1936,28 @@ class AgentCore:
             return self._input_failure(
                 task, ErrorCode.INVALID_TASK, f"refused: no_targets ({step.key})", session,
             )
-        proof = () if plan is None else tuple(_lease_targets(_plan_targets(plan)))
+        # A missing or unknown provider key is a typed refusal here, not a TypeError after the run moved.
+        try:
+            inspect.signature(work_ports.build_ports).bind(
+                store=self.memory, run_id=run_id, boot_id=boot_id, lease=lease, lease_target=(),
+                targets={}, jarvis_repo=False, plan_hash=None, **deps,
+            )
+        except TypeError as exc:
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, f"refused: drive_deps ({exc})", session,
+            )
         if run.state is RunState.BUILDING:
             self.advance_project_run(run_id, RunState.INTERRUPTED, boot_id=boot_id, at=now)
         # The revalidation claims are proof only; the step's port claims its own lease. Released in
-        # finally so no exception inside or after resume strands them (a double release is a no-op).
+        # finally so no exception inside or after resume strands them (a double release is a no-op);
+        # only what this call claimed, never a live lease of the same run and boot it did not take.
+        claimed: list[str] = []
         try:
-            resumed = self.resume_project_run(run_id, boot_id=boot_id, now=now, lease=lease, **resume_args)
+            resumed = self.resume_project_run(
+                run_id, boot_id=boot_id, now=now, lease=lease, claimed=claimed, **resume_args,
+            )
         finally:
-            self._release_project_leases(proof, run_id, boot_id, now)
+            self._release_project_leases(tuple(claimed), run_id, boot_id, now)
         if isinstance(resumed, ResumeRefused):
             return self._input_failure(
                 task, ErrorCode.INVALID_TASK, f"refused: {resumed.code}: {resumed.detail}", session,
