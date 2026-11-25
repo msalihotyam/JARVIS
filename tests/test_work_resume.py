@@ -1,5 +1,6 @@
 """PM05: project-run lifecycle, boot recovery and explicit crash resume."""
 
+import json
 import tempfile
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -173,7 +174,13 @@ class WorkResumeTests(unittest.TestCase):
         self.resume()
         events = self.memory.work_events("r1")
         self.assertEqual([event.seq for event in events], list(range(1, len(events) + 1)))
-        self.assertEqual(len(events), 5)
+        # PM27EMIT: recovery adds exactly one per-boot interrupted notification
+        self.assertEqual(len(events), 6)
+        notes = [json.loads(event.payload_json) for event in events
+                 if event.kind is EventKind.INTERRUPTED and "dedupe_key" in json.loads(event.payload_json)]
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0]["dedupe_key"], "boot:new")
+        self.assertEqual(notes[0]["point"], "interrupted")
         with self.assertRaises(WorkLedgerError):
             self.memory.append_work_event(WorkEvent(
                 run_id="r1", seq=1, kind=EventKind.RUN_STATE, at=T0,
