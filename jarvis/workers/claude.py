@@ -38,7 +38,7 @@ from jarvis.connectors.claude_code import (
 from jarvis.settings import validate_claude_effort, validate_claude_model
 from jarvis.trusted_exec import trusted_environment
 from jarvis.work_plan import AGENT_CONFIG_NAMES
-from jarvis.workers.base import AgentProfile, Worker, WorkerResult
+from jarvis.workers.base import AgentProfile, Worker, WorkerResult, effective_authority
 
 # The only tools a writer gets: read and edit files. No Bash (no shell, no
 # network through it), no WebFetch/WebSearch, no Task (no subagent fan-out).
@@ -367,6 +367,7 @@ class ClaudeWriterWorker(Worker):
         effort: str | None = None,
         environ: Mapping[str, str] | None = None,
         home: Any = None,
+        parent: AgentProfile | None = None,
     ) -> None:
         if not os.path.isabs(command):
             raise WorkerRefused("command_not_absolute")
@@ -380,6 +381,7 @@ class ClaudeWriterWorker(Worker):
         if effort is not None and not _effort_ok(effort):
             raise WorkerRefused("effort_invalid")
         self.profile = profile
+        self.parent = parent
         self.stage = stage
         self._runner = runner
         self._command = command
@@ -421,6 +423,24 @@ class ClaudeWriterWorker(Worker):
 
     def _check_profile(self) -> None:
         profile = self.profile
+        parent = self.parent
+        if parent is not None:
+            # I9: a child never holds more than its parent run. Exact type only:
+            # a mapping or subclass could fake the fields (fail closed).
+            if (
+                type(parent) is not AgentProfile
+                or type(parent.tools) is not frozenset
+                or type(parent.paths) is not frozenset
+                or type(parent.network) is not bool
+            ):
+                raise WorkerRefused("parent_invalid")
+            granted = effective_authority(parent, profile)
+            if profile.tools - granted.tools:
+                raise WorkerRefused("parent_tools")
+            if profile.paths - granted.paths:
+                raise WorkerRefused("parent_paths")
+            if profile.network and not granted.network:
+                raise WorkerRefused("parent_network")
         if profile.network:
             raise WorkerRefused("profile_network")
         if not profile.tools or not profile.tools <= WRITER_TOOLS:

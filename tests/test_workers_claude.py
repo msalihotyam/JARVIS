@@ -344,6 +344,65 @@ class RefusalTests(WorkerTestCase):
         self.assert_refused(drifting, "cwd_mismatch")
 
 
+class ParentAuthorityTests(WorkerTestCase):
+    """I9: a child writer never holds more tools, paths or network than its parent run."""
+
+    PARENT = profile(tools=frozenset({"Edit", "Read", "Write"}), paths=frozenset({"src/"}))
+
+    def child(self, *paths: str, **overrides) -> AgentProfile:
+        return profile(paths=frozenset(paths), **overrides)
+
+    def refused(self, prof: AgentProfile, code: str, parent=PARENT) -> None:
+        RefusalTests.assert_refused(self, self.worker(prof=prof, parent=parent), code)
+
+    def test_equal_or_narrower_child_runs(self) -> None:
+        for prof, parent in (
+            (self.PARENT, self.PARENT),
+            (self.child("src/a.py", tools=frozenset({"Read"})), self.PARENT),
+            (self.child("src\\a.py", "./src/b/c.py", "src"), self.PARENT),
+            (self.child("src/a.py"), profile(paths=frozenset({"/"}))),
+            (profile(), None),
+        ):
+            with self.subTest(paths=sorted(prof.paths), parent=parent and sorted(parent.paths)):
+                before = len(self.runner.started)
+                self.worker(prof=prof, parent=parent).start("task")
+                self.assertEqual(len(self.runner.started), before + 1)
+
+    def test_malformed_parent_refused(self) -> None:
+        class Wider(AgentProfile):
+            pass
+
+        fields = dict(name="p", tools=frozenset({"Edit", "Write"}), paths=frozenset({"/"}),
+                      network=False, max_turns=12, budget_sessions=2)
+        for parent in (
+            fields,
+            Wider(**fields),
+            types.SimpleNamespace(**fields),
+            profile(tools=["Edit", "Write"]),
+            profile(paths=["/"]),
+            profile(network=0),
+        ):
+            with self.subTest(parent=type(parent).__name__):
+                self.refused(self.child("src/a.py"), "parent_invalid", parent)
+
+    def test_path_tricks_refused(self) -> None:
+        for path in ("src/../etc", "src2/", "SRC/a.py", "Src/a.py", "src./a.py", "src /a.py",
+                     "SRC~1/a.py", "src/a.py:stream", "src/a.py.", "/", "", ".", "C:/src/a.py",
+                     "src/*", "src/a\x00.py", "//./src/a.py", "\\\\.\\src\\a.py", "//server/src",
+                     "\\\\?\\src\\a.py", "src/NUL", "src/con.txt", "src/COM1"):  # fmt: skip
+            with self.subTest(path=path):
+                self.refused(self.child(path), "parent_paths")
+        self.refused(self.child("src/a.py"), "parent_paths", profile(paths=frozenset({"src/../"})))
+
+    def test_wider_tools_and_network_refused(self) -> None:
+        narrow = profile(tools=frozenset({"Read"}), paths=frozenset({"src/"}))
+        self.refused(self.child("src/a.py"), "parent_tools", narrow)
+        self.refused(self.child("src/a.py", network=True), "parent_network")
+        # A parent with network passes I9; the writer's own gate still refuses it.
+        self.refused(self.child("src/a.py", network=True), "profile_network",
+                     profile(paths=frozenset({"src/"}), network=True))
+
+
 class SpawnRecheckTests(WorkerTestCase):
     """The runner calls verify_cwd right before the OS spawn (TOCTOU)."""
 

@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "about": "PM30I9B: CI duration record for the I9 parent-authority tests (seconds, same schema as scripts/test_durations.json).",
+  "classes": {
+    "tests.test_project_mode_regression.ProjectModeI9RegressionTests": 1.0,
+    "tests.test_workers_claude.ParentAuthorityTests": 1.0
+  },
+  "tests": {}
+}

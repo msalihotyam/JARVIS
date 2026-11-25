@@ -45,13 +45,48 @@ class Worker(abc.ABC):
     def collect(self, run_id: str) -> WorkerResult:
         pass
 
+# Aliases Windows resolves to another name: ":" streams/drives, "~" 8.3 short
+# names, globs; a part ending in "." or " " is the same file without it.
+_PATH_UNSAFE = frozenset(':~*?[]"<>|')
+_DEVICES = frozenset({"CON", "PRN", "AUX", "NUL", *(f"{d}{n}" for d in ("COM", "LPT") for n in range(1, 10))})
+
+
+def _path_parts(path: object) -> tuple[str, ...] | None:
+    """A profile path (repo-relative, "/" = the whole tree) as exact parts; None if unsafe."""
+    if type(path) is not str or not path:
+        return None
+    path = path.replace("\\", "/")
+    if path.startswith("//"):  # UNC or device namespace (//server, //./, //?/)
+        return None
+    parts = tuple(part for part in path.split("/") if part not in ("", "."))
+    for part in parts:
+        if (part == ".." or part[-1] in ". " or _PATH_UNSAFE & set(part) or not part.isprintable()
+                or part.split(".")[0].upper() in _DEVICES):
+            return None
+    return parts
+
+
+def _under(path: str, root: str) -> bool:
+    """Part-wise and case-exact: a case-only variant is refused, not folded in (fail closed)."""
+    child, parent = _path_parts(path), _path_parts(root)
+    return child is not None and parent is not None and child[: len(parent)] == parent
+
+
 def effective_authority(*profiles: AgentProfile) -> AgentProfile:
+    """The authority every profile grants: the I9 gate a child is checked against.
+
+    A path is kept only if it lies under some path of every profile, so a child
+    path outside its parent never survives, and an unsafe path never does.
+    """
     if not profiles:
         raise ValueError("at least one profile is required")
 
     first = profiles[0]
     tools = first.tools.intersection(*(p.tools for p in profiles[1:]))
-    paths = first.paths.intersection(*(p.paths for p in profiles[1:]))
+    paths = frozenset(
+        path for p in profiles for path in p.paths
+        if all(any(_under(path, root) for root in other.paths) for other in profiles)
+    )
     network = all(p.network for p in profiles)
     max_turns = min(p.max_turns for p in profiles)
     budget_sessions = min(p.budget_sessions for p in profiles)
