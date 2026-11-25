@@ -261,7 +261,8 @@ class DiagnosticHygieneTestCase(unittest.TestCase):
         self.database_connection.execute("PRAGMA journal_mode").close()
 
     def store(self) -> SQLiteMemoryStore:
-        self.database_connection.close()
+        # The keeper stays open: a fresh store still reads only committed data,
+        # and every later short connection skips the last-close WAL checkpoint.
         return SQLiteMemoryStore(self.database)
 
     def core(
