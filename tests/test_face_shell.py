@@ -63,6 +63,9 @@ class StaticTests(unittest.TestCase):
                     [node.module] if isinstance(node, ast.ImportFrom) else []
                 for name in names:
                     with self.subTest(file=path.name, module=name):
+                        if path.name == "capture.py" and name == "PySide6.QtCore":  # FACECAP1 grabber's PNG buffer only
+                            self.assertEqual({a.name for a in node.names}, {"QBuffer", "QIODevice"})
+                            continue
                         self.assertIn(name, allowed)
                         self.assertNotRegex(name, r"^jarvis\.(ui|app|core|memory|connectors)")
             self.assertNotIn("jarvis.db", path.read_text(encoding="utf-8"))
