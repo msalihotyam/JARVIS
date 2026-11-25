@@ -34,6 +34,7 @@ import subprocess
 import sys
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
@@ -95,9 +96,45 @@ def n6_live_slices(path, now):
 # CI, its build-time skip/allow lists, the conveyor itself and the Claude config
 PROTECTED_DIRS = (".github/workflows/", ".claude/")
 PROTECTED_FILES = {"scripts/test_parallel.py", "scripts/ci.ps1", "scripts/quality.ps1", "scripts/conveyor.py"}
+ALIAS_DIRS = (".claude", ".github", "workflows", "data", ".jarvis")
+WIN_DEVICES = {"con", "prn", "aux", "nul", "conin$", "conout$", *(f"{d}{i}" for d in ("com", "lpt") for i in range(1, 10))}
+
+def _hidden_char(ch):
+    """C0/C1 control, format (bidi, zero-width, BOM, tags) or another default-ignorable code point."""
+    o = ord(ch)
+    return (unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp") or o in (0x34F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x3164, 0xFFA0)
+            or 0x180B <= o <= 0x180F or 0xFE00 <= o <= 0xFE0F or 0xE0000 <= o <= 0xE0FFF)
+
+def _alias_suspect(p):
+    """PROTALIAS1 (fail closed): why path p may name something other than it reads (NTFS 8.3 alias,
+    stream/drive, Win32-trimmed name, device/UNC prefix, hidden character, reserved device, look-alike
+    of a protected dir), else None. Used by protected_path(), chain_strict() and protected_change()."""
+    if re.match(r"[\\/]{2}", p):
+        return "UNC or device path"
+    for c in re.split(r"[\\/]", p):
+        n = unicodedata.normalize("NFKC", c).casefold()
+        if re.search(r"~\d", c):
+            return f"8.3 short name {c!r}"
+        if ":" in c:
+            return f"stream or drive {c!r}"
+        if c.endswith(".") or c[-1:].isspace():  # any trailing Unicode space too (U+3000, NBSP): fail closed
+            return f"Win32-trimmed name {c!r}"
+        if any(_hidden_char(ch) for ch in c):
+            return f"hidden character in {c!r}"
+        if n.split(".")[0].rstrip(" ") in WIN_DEVICES:
+            return f"reserved device name {c!r}"
+        # NFKC folds fullwidth; a same-length name equal at every ASCII position catches Cyrillic/Greek look-alikes
+        if not c.isascii() and any(n == d or (len(n) == len(d) and all(not a.isascii() or a == b for a, b in zip(n, d)))
+                                   for d in ALIAS_DIRS):
+            return f"look-alike of a protected dir {c!r}"
+    return None
+
 def protected_path(p):
     """Never staged by the conveyor's codex commit (CODEXCOMMIT): uv.lock, operator data,
-    secrets, keys/certificates/databases, the retired dashboard, CI and the Claude config."""
+    secrets, keys/certificates/databases, the retired dashboard, CI and the Claude config;
+    PROTALIAS1: any _alias_suspect() path."""
+    if _alias_suspect(p):
+        return True
     p = p.replace("\\", "/").lower()
     base = p.rsplit("/", 1)[-1]
     return (base == "uv.lock" or base.startswith(".env") or p.startswith(("data/", "dev/dashboard/"))
@@ -5628,9 +5665,12 @@ class Conveyor:
                 rc, out = self.cmd(["git", "diff", "--name-only", "--no-renames", f"{om.strip()}..{sha}"])
             if rc != 0:
                 return f"protected-path check: git rc={rc}; {manual}"
-            for p in out.splitlines():
+            for p in re.split(r"\r?\n", out):  # PROTALIAS1: not splitlines(), which also cuts at \x85/  in a name
                 if p.startswith('"'):  # a quoted (non-ASCII) path cannot be matched: fail closed
                     return f"protected-path check: quoted path {p}; {manual}"
+                alias = _alias_suspect(p)  # PROTALIAS1: before strip(), a trailing space is itself an alias
+                if alias:
+                    return f"the range touches {p} ({alias}): {manual}"
                 p = p.strip().replace("\\", "/")
                 # lowercased like protected_path(): on Windows a path differing only in case is the same file
                 if p.lower().startswith(PROTECTED_DIRS) or p.lower() in PROTECTED_FILES or SKIPLIST_RE.search(p):

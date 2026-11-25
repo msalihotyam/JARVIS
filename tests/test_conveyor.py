@@ -12392,5 +12392,70 @@ class TestLeasegate1fix3NoPass(Base):
         self.assertEqual(spies["write_info"].call_args.args, (0,))
 
 
+class ProtAlias1Test(unittest.TestCase):
+    """PROTALIAS1: NTFS alias, stream, trimmed, device/UNC, hidden-char, reserved and look-alike paths are protected."""
+    CLASSES = {
+        "a 8.3": ("CLAUDE~1/settings.json", "GITHUB~2/workflows/ci.yml", "jarvis/CORE~1.PY"),
+        "b stream": (".github/workflows::$DATA", "data:x/y", "jarvis/core.py:evil", "C:/dev/x.py"),
+        "c trimmed": (".claude./x", ".claude /x", "jarvis/core.py.", "jarvis/core.py ", ".claude　/x", "data /x"),
+        "d unc": ("\\\\?\\C:\\dev\\JARVIS\\.claude\\x", "\\\\.\\pipe\\x", "\\\\server\\share\\x", "//server/share/x"),
+        "e hidden": ("scripts/conve\u200byor.py", "jarvis/a\u202ecod.py", "x/\u2066y.py", "x\x01/y", "x/y\x85", "\ufeffdata/x",
+                     "x/a\u00ady", "x/a\u034fy"),
+        "f device": ("CON.json", "x/nul", "PRN", "aux.py", "com1.txt", "x/LPT9.log", "COM\u00b9.txt", "con .txt"),
+        "g lookalike": (".cl\u0430ude/x", "\uff44\uff41\uff54\uff41/x", ".GIT\u0397UB/workflows/x", "x/w\u043erkflows/y",
+                        "\uff0ejarvis/x", ".clau\u0301de/x"),
+    }
+    SAFE = ("scripts/conveyor_workers.py", "jarvis/talk_quote.py", "tests/test_x.py", "jarvis/connectors/base.py",
+            "docs/data.md", "build/reports/X.md", "jarvis/ui/qml/Main.qml")
+
+    def test_every_class_is_protected(self):
+        for cls, paths in self.CLASSES.items():
+            for p in paths:
+                with self.subTest(cls=cls, p=ascii(p)):
+                    self.assertTrue(conveyor._alias_suspect(p))
+                    self.assertTrue(conveyor.protected_path(p))
+
+    def test_prompt_negatives(self):
+        for p in ("CLAUDE~1/settings.json", ".claude./x", ".claude /x", ".github/workflows::$DATA", "data:x/y",
+                  "\\\\?\\C:\\dev\\JARVIS\\.claude\\x", ".cl\u0430ude/x", "\uff44\uff41\uff54\uff41/x", "CON.json",
+                  "scripts/conve\u200byor.py"):
+            with self.subTest(p=ascii(p)):
+                self.assertTrue(conveyor.protected_path(p))
+        for p in self.SAFE:
+            with self.subTest(p=p):
+                self.assertIsNone(conveyor._alias_suspect(p))
+                self.assertFalse(conveyor.protected_path(p))
+
+    def test_chain_strict_on_every_class(self):
+        product = ["jarvis/talk_quote.py", "jarvis/core.py", "tests/test_x.py"]  # conveyor/build paths are strict already
+        self.assertFalse(conveyor.chain_strict("T1", product))
+        for cls, paths in self.CLASSES.items():
+            for p in paths:
+                with self.subTest(cls=cls, p=ascii(p)):
+                    self.assertTrue(conveyor.chain_strict("T1", ["jarvis/core.py", p]))
+
+    def _change(self, diff):
+        def cmd(argv):
+            return (0, "a" * 40 + "\n") if argv[1] == "rev-parse" else (0, diff)
+        return conveyor.Conveyor.protected_change(types.SimpleNamespace(cmd=cmd), "b" * 40)
+
+    def test_protected_change_on_every_class(self):
+        self.assertIsNone(self._change("\n".join(self.SAFE) + "\n"))
+        for cls, paths in self.CLASSES.items():
+            for p in paths:
+                with self.subTest(cls=cls, p=ascii(p)):
+                    why = self._change(f"jarvis/core.py\n{p}\n")
+                    self.assertIn("needs Salih's manual key 1", why or "")
+                    self.assertIn(p.strip(), why)
+        self.assertIn("quoted path", self._change('"\\303\\274.txt"\n'))  # git-quoted stays fail closed
+
+    def test_no_false_positive_on_the_real_tree(self):
+        out = subprocess.run(["git", "ls-files", "-z"], cwd=Path(__file__).resolve().parents[1],
+                             capture_output=True, check=True).stdout.decode("utf-8")
+        files = [f for f in out.split("\0") if f]
+        self.assertGreater(len(files), 100)
+        self.assertEqual([(f, conveyor._alias_suspect(f)) for f in files if conveyor._alias_suspect(f)], [])
+
+
 if __name__ == "__main__":
     unittest.main()
