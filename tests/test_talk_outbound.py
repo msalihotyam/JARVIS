@@ -1,4 +1,5 @@
 import ast
+import json
 import unittest
 from pathlib import Path
 
@@ -212,10 +213,18 @@ class HostileInputTests(unittest.TestCase):
             self.assertEqual(pump(*args), {"ok": False, "reason": "bad_input"})
 
     def test_was_sent_garbage_or_raising_refuses_without_sending(self):
-        garbage = ("sent", 1, {"state": "done", "attempts": 0}, {"state": "sent", "attempts": True},
-                   {"state": "sent", "attempts": -1}, {"state": "sent"}, RecursionError(), OSError())
+        class GetRaises(dict):
+            def get(self, *args):
+                raise ValueError("böse sk-secret-token")
 
-        def check(value):
+        bad_state = ("sent", 1, {"state": "done", "attempts": 0}, {"state": "sent", "attempts": True},
+                     {"state": "sent", "attempts": -1}, {"state": "sent"})
+        # Collaborator errors: their text (secrets, non-ASCII, parser messages) must never become the reason.
+        unreadable = (RecursionError(), OSError(), KeyError("k"), ValueError("böse sk-secret-token"),
+                      ValueError("bad_state"), ValueError(), json.JSONDecodeError("Expecting value", "{", 1),
+                      UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte"), GetRaises(state="sent"))
+
+        def check(value, reason):
             def was_sent(*key):
                 if isinstance(value, BaseException):
                     raise value
@@ -224,10 +233,11 @@ class HostileInputTests(unittest.TestCase):
             pc = Sender()
             out = pump([act(), act(entry_id=2)], {"pc": pc}, Store().record, was_sent)
             self.assert_typed(out)
-            self.assertEqual([r["result"] for r in out["results"]], ["refused", "refused"])
+            self.assertEqual([(r["result"], r["reason"]) for r in out["results"]], [("refused", reason)] * 2)
             self.assertEqual(pc.sent, [])
 
-        each(self, garbage, check)
+        each(self, bad_state, lambda v: check(v, "bad_state"))
+        each(self, unreadable, lambda v: check(v, "state_unreadable"))
 
     def test_record_raising_recursion_error_is_typed(self):
         def record(*args):
