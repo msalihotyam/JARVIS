@@ -5,10 +5,12 @@ or any database. The "jarvis.db" files below are fake bytes written in temp.
 """
 
 import ast
+import contextlib
 import os
 import pathlib
 import tempfile
 import unittest
+from unittest import mock
 
 from jarvis import brain_fs
 from jarvis.brain_fs import BrainFiles, Refusal, Resolved
@@ -177,21 +179,33 @@ class SuspiciousFormTests(RootCase):
                     self.assertIn(got.code, ("form", "refused_name"))
         self.assertEqual(spy.calls, [])
 
+    def check_part(self, spy, fs, part):
+        before = len(spy.calls)  # counted before resolve, so a port call inside it shows
+        got = fs.resolve(part)
+        if part in EXPECTED_ALLOWED:
+            self.assertIsInstance(got, Resolved)
+            real_root = os.path.realpath(self.root)
+            self.assertEqual(os.path.commonpath([real_root, got.path]), real_root)
+        else:
+            self.assertRefused(got)
+            self.assertEqual(spy.calls[before:], [])
+
     def test_hostile_path_parts_corpus(self):
         spy, fs = self.spied()
+        each(self, HOSTILE_PATH_PARTS, lambda part: self.check_part(spy, fs, part))
 
-        def check(part):
-            got = fs.resolve(part)
-            if part in EXPECTED_ALLOWED:
-                self.assertIsInstance(got, Resolved)
-                real_root = os.path.realpath(self.root)
-                self.assertEqual(os.path.commonpath([real_root, got.path]), real_root)
-            else:
-                before = len(spy.calls)
-                self.assertRefused(got)
-                self.assertEqual(spy.calls[before:], [])
+    def test_corpus_check_catches_a_port_call_before_refusal(self):
+        # BRAINFS1FIX F1: a resolve that touches the file system and then refuses must fail the check.
+        spy, fs = self.spied()
 
-        each(self, HOSTILE_PATH_PARTS, check)
+        class Leaky:
+            @staticmethod
+            def resolve(part):
+                spy.realpath(self.root)
+                return fs.resolve(part)
+
+        with self.assertRaises(AssertionError):
+            self.check_part(spy, Leaky, "..")
 
     def test_allowed_path_goes_through_the_ports(self):
         spy, fs = self.spied()
@@ -382,6 +396,45 @@ class SearchTests(RootCase):
         got = BrainFiles(self.root, clock=clock).search("hello")
         self.assertEqual(got.stopped, "time")
 
+    def counted_scandir(self):
+        """Patch the handle scanner with a wrapper counting the entries it yields."""
+        real, seen = brain_fs._scan_fd, [0]
+
+        def scan(fd):
+            for entry in real(fd):
+                seen[0] += 1
+                yield entry
+
+        patcher = mock.patch.object(brain_fs, "_scan_fd", scan)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return seen
+
+    def test_time_checked_while_listing_one_directory(self):
+        # BRAINFS1FIX F2: one huge directory is not listed (and sorted) before the deadline check.
+        for i in range(50):
+            self.write(f"big/f{i:02}.txt", b"hello\n")
+        ticks = [0]
+
+        def clock():  # first call sets the deadline, every later call is past it
+            ticks[0] += 1
+            return 0.0 if ticks[0] == 1 else 100.0
+
+        seen = self.counted_scandir()
+        got = BrainFiles(self.root, clock=clock).search("hello", "big")
+        self.assertEqual((got.stopped, got.files_scanned, got.matches), ("time", 0, ()))
+        self.assertLessEqual(seen[0], 1)
+
+    def test_entries_cap_per_directory(self):
+        # BRAINFS1FIX F2: at most MAX_ENTRIES names are taken from one directory.
+        for i in range(10):
+            self.write(f"big/f{i:02}.txt", b"hello\n")
+        seen = self.counted_scandir()
+        with mock.patch.object(brain_fs, "MAX_ENTRIES", 3):
+            got = self.fs.search("hello", "big")
+        self.assertEqual((got.stopped, got.files_scanned, len(got.matches)), ("entries", 3, 3))
+        self.assertLessEqual(seen[0], 4)
+
     def test_pattern_refusals(self):
         bad = ["", "a" * (brain_fs.MAX_PATTERN_CHARS + 1), None, 5, b"hello", "a\0", "a\nb", "a\rb"]
         each(self, bad, lambda p: self.assertRefused(self.fs.search(p), "pattern"))
@@ -390,6 +443,98 @@ class SearchTests(RootCase):
         self.write("docs/wide.txt", b"needle" + b"x" * 1000 + b"\n")
         (match,) = self.fs.search("needle").matches
         self.assertEqual(len(match.text), brain_fs.MAX_LINE_CHARS)
+
+
+class FinalPathTests(RootCase):
+    """BRAINFS1FIX F3: the opened handle's final path is checked again (swap after resolve)."""
+
+    def swapped_ports(self):
+        real_root = os.path.realpath(self.root)
+
+        def raises(fd):
+            raise OSError("handle gone")
+
+        return [
+            ("outside", lambda fd: os.path.join(os.path.realpath(self.outside), "secret.txt"), "outside"),
+            ("other drive", lambda fd: "Z:\\elsewhere\\x.txt" if os.name == "nt" else "/elsewhere/x", "outside"),
+            ("refused part", lambda fd: os.path.join(real_root, "data", "jarvis.db"), "refused_name"),
+            ("nested refused", lambda fd: os.path.join(real_root, ".claude", "worktrees", "w1", "data"),
+             "refused_name"),
+            ("other place", lambda fd: os.path.join(real_root, "jarvis", "a.py"), "link"),
+            ("raises", raises, "link"),
+            ("none", lambda fd: None, "link"),
+            ("bytes", lambda fd: os.fsencode(real_root), "link"),
+            ("empty", lambda fd: "", "link"),
+            ("nul", lambda fd: real_root + "\0", "link"),
+        ]
+
+    def test_swapped_handle_refused_everywhere(self):
+        for label, port, code in self.swapped_ports():
+            with self.subTest(label):
+                fs = BrainFiles(self.root, clock=frozen_clock, final_path=port)
+                self.assertRefused(fs.read_file("docs/notes.md"), code)
+                self.assertRefused(fs.list_dir("docs"), code)
+                self.assertRefused(fs.list_dir(""), code)
+                got = fs.search("hello")
+                self.assertEqual((got.matches, got.stopped), ((), ""))
+
+    def test_swapped_file_handle_skipped_in_search(self):
+        # directories verify, but every file handle reports another place
+        def port(fd):
+            final = brain_fs._final_path(fd)
+            return final if os.path.isdir(final) else os.path.join(os.path.realpath(self.root), "jarvis")
+
+        got = BrainFiles(self.root, clock=frozen_clock, final_path=port).search("hello")
+        self.assertEqual(got.matches, ())
+        self.assertGreater(got.files_scanned, 0)
+
+    def test_handles_are_closed_after_refusal(self):
+        fs = BrainFiles(self.root, clock=frozen_clock, final_path=lambda fd: None)
+        for _ in range(3):
+            fs.read_file("docs/notes.md")
+            fs.list_dir("docs")
+            fs.search("hello")
+        os.rename(os.path.join(self.root, "docs"), os.path.join(self.root, "docs2"))  # fails if a handle leaked
+
+    def test_directory_swapped_after_check_not_followed(self):
+        # BRAINFS1FIX review B1: entries come from the verified handle, never the path again.
+        self.write("swap/inner.txt", b"hello swap\n")
+        here, moved = os.path.join(self.root, "swap"), os.path.join(self.root, "swap_moved")
+        real_scandir, swapped = os.scandir, []
+
+        def port(fd):  # the attacker moves the checked folder and puts a junction there
+            final = brain_fs._final_path(fd)
+            if os.path.normcase(final) == os.path.normcase(os.path.realpath(here)) and not swapped:
+                with contextlib.suppress(OSError):  # the delete-less handle should block this
+                    os.rename(here, moved)
+                    LinkTests.make_link(self, self.outside, "swap")
+                    swapped.append(True)
+            return final
+
+        def scandir(target):
+            self.assertNotIsInstance(target, str, "listing walked a path after the handle check")
+            return real_scandir(target)
+
+        fs = BrainFiles(self.root, clock=frozen_clock, final_path=port)
+        with mock.patch.object(os, "scandir", scandir):
+            listed = fs.list_dir("swap")
+            found = fs.search("secret", "swap")
+        if os.name == "nt" or not isinstance(listed, Refusal):  # POSIX may refuse the moved handle
+            self.assertEqual(names(listed), {"inner.txt"})
+        self.assertEqual(found.matches, ())
+
+    def test_default_port_matches_resolved_path(self):
+        real = os.path.realpath(os.path.join(self.root, "docs", "notes.md"))
+        with open(real, "rb") as handle:
+            self.assertEqual(os.path.normcase(brain_fs._final_path(handle.fileno())), os.path.normcase(real))
+        fd = brain_fs._open_dir(os.path.dirname(real))
+        try:
+            self.assertEqual(os.path.normcase(brain_fs._final_path(fd)), os.path.normcase(os.path.dirname(real)))
+        finally:
+            os.close(fd)
+        self.assertEqual(self.fs.read_file("docs/notes.md").text, "hello docs\n")
+        self.assertIn("notes.md", names(self.fs.list_dir("docs")))
+        self.assertTrue(self.fs.search("hello").matches)
 
 
 class MalformedInputTests(RootCase):
@@ -472,7 +617,9 @@ class ModuleContractTests(unittest.TestCase):
                 imported |= {alias.name.split(".")[0] for alias in node.names}
             elif isinstance(node, ast.ImportFrom):
                 imported.add((node.module or "").split(".")[0])
-        self.assertLessEqual(imported, {"__future__", "fnmatch", "os", "stat", "time", "unicodedata", "typing"})
+        self.assertLessEqual(
+            imported, {"__future__", "ctypes", "fnmatch", "msvcrt", "os", "stat", "time", "unicodedata", "typing"}
+        )
         self.assertNotIn("subprocess", SOURCE)
 
     def test_every_open_is_binary_read(self):

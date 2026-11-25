@@ -9,9 +9,15 @@ constants and never echo the request.
 
 Out of scope (stated): a secret hidden in a file with an allowed name and no
 recognised header (a SQL text dump, a raw key pasted into a .txt). The name
-list plus the SQLite/PEM header sniff is the boundary. Between resolve and
-open a link could be swapped in (TOCTOU); the brain cannot write, so it cannot
-plant one itself.
+list plus the SQLite/PEM header sniff is the boundary.
+
+Swap between resolve and open (TOCTOU): every opened file or directory handle
+is checked again by its final path (GetFinalPathNameByHandleW on Windows,
+/proc/self/fd on Linux), which must be the resolved path inside the root and
+hit no refused name; else refuse. Directory entries are then read from that
+same handle (never by path again), so a junction swapped in after the check
+is not followed. On Windows the handles do not share delete, so the opened
+path cannot be renamed while it is read.
 
 Nothing in the running app imports this module yet.
 """
@@ -22,6 +28,23 @@ import stat
 import time
 import unicodedata
 from typing import NamedTuple
+
+if os.name == "nt":
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    _K32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    _K32.CreateFileW.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, ctypes.c_void_p,
+                                 wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    _K32.CreateFileW.restype = wintypes.HANDLE
+    _K32.GetFinalPathNameByHandleW.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    _K32.GetFinalPathNameByHandleW.restype = wintypes.DWORD
+    _K32.CloseHandle.argtypes = (wintypes.HANDLE,)
+    _K32.CloseHandle.restype = wintypes.BOOL
+    _K32.GetFileInformationByHandleEx.argtypes = (wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD)
+    _K32.GetFileInformationByHandleEx.restype = wintypes.BOOL
+    _INVALID_HANDLE = ctypes.c_void_p(-1).value
 
 # One constant: each entry is a run of consecutive folded segments (glob per
 # segment), matched at any depth (worktrees under .claude have their own data/).
@@ -100,7 +123,7 @@ class Match(NamedTuple):
 class SearchResult(NamedTuple):
     matches: tuple
     files_scanned: int
-    stopped: str  # "" | "files" | "matches" | "time"
+    stopped: str  # "" | "files" | "matches" | "time" | "entries" (a directory was cut at MAX_ENTRIES)
 
 
 class _Refuse(Exception):
@@ -119,6 +142,66 @@ def _is_link(path: str) -> bool:
         return True  # cannot tell -> treat as a link (fail closed)
     attrs = getattr(st, "st_file_attributes", 0)
     return stat.S_ISLNK(st.st_mode) or bool(attrs & stat.FILE_ATTRIBUTE_REPARSE_POINT)
+
+
+def _final_path(fd: int) -> str:
+    """Default final-path port: the path the open handle really points at."""
+    if os.name != "nt":
+        # shortcut: /proc is Linux only; elsewhere the path never matches, so every
+        # open refuses (fail closed); add F_GETPATH when macOS matters.
+        return os.path.realpath(f"/proc/self/fd/{fd}")
+    buf = ctypes.create_unicode_buffer(32768)
+    size = _K32.GetFinalPathNameByHandleW(msvcrt.get_osfhandle(fd), buf, len(buf), 0)
+    if size == 0 or size >= len(buf):
+        raise ctypes.WinError(ctypes.get_last_error())
+    final = buf.value
+    if final.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + final[8:]
+    if final.startswith("\\\\?\\"):
+        return final[4:]
+    return final
+
+
+def _open_dir(path: str) -> int:
+    """Read-only fd on a directory (Windows: no delete sharing, so it is pinned)."""
+    if os.name != "nt":
+        return os.open(path, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+    # FILE_LIST_DIRECTORY|FILE_READ_ATTRIBUTES, share read|write, OPEN_EXISTING, BACKUP_SEMANTICS.
+    handle = _K32.CreateFileW(path, 0x81, 0x3, None, 3, 0x02000000, None)
+    if handle is None or handle == _INVALID_HANDLE:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        return msvcrt.open_osfhandle(handle, os.O_RDONLY)
+    except BaseException:
+        _K32.CloseHandle(handle)
+        raise
+
+
+def _scan_fd(fd: int):
+    """(name, is_dir) of the directory the fd holds, read from the handle itself;
+    links and reparse points are left out (fail closed)."""
+    if os.name != "nt":
+        with os.scandir(fd) as scan:
+            for entry in scan:
+                if not entry.is_symlink():
+                    yield entry.name, entry.is_dir(follow_symlinks=False)
+        return
+    handle, buf, info_class = msvcrt.get_osfhandle(fd), ctypes.create_string_buffer(65536), 11
+    # FileIdBothDirectoryRestartInfo (11) first, then FileIdBothDirectoryInfo (10).
+    while _K32.GetFileInformationByHandleEx(handle, info_class, buf, len(buf)):
+        info_class, raw, offset = 10, buf.raw, 0
+        while True:  # FILE_ID_BOTH_DIR_INFO: attrs @56, name bytes @60, name @104
+            step = int.from_bytes(raw[offset:offset + 4], "little")
+            attrs = int.from_bytes(raw[offset + 56:offset + 60], "little")
+            size = int.from_bytes(raw[offset + 60:offset + 64], "little")
+            name = raw[offset + 104:offset + 104 + size].decode("utf-16-le", "surrogatepass")
+            if name not in (".", "..") and not attrs & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
+                yield name, bool(attrs & 0x10)
+            if not step:
+                break
+            offset += step
+    if ctypes.get_last_error() != 18:  # ERROR_NO_MORE_FILES
+        raise ctypes.WinError(ctypes.get_last_error())
 
 
 def _fold(text: str) -> str:
@@ -203,12 +286,14 @@ def _name_ok(parent_folded: list, name: str) -> bool:
 
 
 class BrainFiles:
-    """Read-only view of one root. realpath / is_link / clock are injectable ports."""
+    """Read-only view of one root. realpath / is_link / clock / final_path (fd -> path
+    of an open handle) are injectable ports."""
 
-    def __init__(self, root, *, realpath=None, is_link=None, clock=None):
+    def __init__(self, root, *, realpath=None, is_link=None, clock=None, final_path=None):
         self._realpath = realpath or os.path.realpath
         self._is_link = is_link or _is_link
         self._clock = clock or time.monotonic
+        self._final_path = final_path or _final_path
         self._root = None
         self._root_refusal = None
         try:
@@ -246,6 +331,14 @@ class BrainFiles:
         real = self._realpath(candidate)
         if not isinstance(real, str):
             raise _Refuse("internal", "resolver returned no path")
+        rel_segs = self._place(real)
+        if os.path.normcase(real) != os.path.normcase(candidate):
+            raise _Refuse("link", "path resolves to another place")
+        return Resolved(real, "/".join(rel_segs))
+
+    def _place(self, real: str) -> list:
+        """Root-relative segments of a real path; refuses outside or refused areas."""
+        root = self._root
         try:
             inside = os.path.commonpath([os.path.normcase(root), os.path.normcase(real)])
         except ValueError:  # another drive or a mix of absolute and relative
@@ -256,12 +349,23 @@ class BrainFiles:
         rel_segs = [] if rel == os.curdir else rel.split(os.sep)
         if _refused_name([_fold(s) for s in rel_segs]):
             raise _Refuse("refused_name", "real path is in a refused area")
-        if os.path.normcase(real) != os.path.normcase(candidate):
-            raise _Refuse("link", "path resolves to another place")
-        return Resolved(real, "/".join(rel_segs))
+        return rel_segs
+
+    def _verify(self, fd: int, expected: str) -> None:
+        """The open handle must still be the resolved path (closes the TOCTOU window)."""
+        try:
+            final = self._final_path(fd)
+        except Exception:  # noqa: BLE001 - cannot verify -> refuse (fail closed)
+            raise _Refuse("link", "opened path could not be verified") from None
+        if not isinstance(final, str) or not final or "\0" in final:
+            raise _Refuse("link", "opened path could not be verified")
+        self._place(final)
+        if os.path.normcase(final) != os.path.normcase(expected):
+            raise _Refuse("link", "opened path is another place")
 
     def _read_text(self, real: str) -> str:
         with open(real, "rb") as handle:
+            self._verify(handle.fileno(), real)
             info = os.fstat(handle.fileno())
             if not stat.S_ISREG(info.st_mode):
                 raise _Refuse("not_file", "path is not a regular file")
@@ -311,12 +415,15 @@ class BrainFiles:
         parent = [_fold(s) for s in target.rel.split("/")] if target.rel else []
         entries = []
         try:
-            with os.scandir(target.path) as scan:
-                for entry in scan:
-                    if not _name_ok(parent, entry.name) or self._is_link(entry.path):
+            fd = _open_dir(target.path)
+            try:
+                self._verify(fd, target.path)
+                for name, is_dir in _scan_fd(fd):
+                    if not _name_ok(parent, name) or self._is_link(os.path.join(target.path, name)):
                         continue
-                    kind = "dir" if entry.is_dir(follow_symlinks=False) else "file"
-                    entries.append(Entry(entry.name, kind))
+                    entries.append(Entry(name, "dir" if is_dir else "file"))
+            finally:
+                os.close(fd)
         except NotADirectoryError:
             raise _Refuse("not_dir", "path is not a directory") from None
         except OSError:
@@ -337,16 +444,29 @@ class BrainFiles:
             raise _Refuse("pattern", "pattern has NUL or a line break")
         start = self._resolve(_check_request(path))
         deadline = self._clock() + MAX_SEARCH_SECONDS
-        matches, scanned = [], 0
+        matches, scanned, cut = [], 0, False
         stack = [start.rel.split("/") if start.rel else []]
         while stack:
             segs = stack.pop()
             parent = [_fold(s) for s in segs]
+            dir_path = os.path.join(self._root, *segs)
+            names = []
             try:
-                with os.scandir(os.path.join(self._root, *segs)) as scan:
-                    names = sorted((e.name, e.is_dir(follow_symlinks=False)) for e in scan)
-            except OSError:
-                continue
+                fd = _open_dir(dir_path)
+                try:
+                    self._verify(fd, dir_path)
+                    for entry in _scan_fd(fd):  # deadline and cap per entry: no full listing first
+                        if self._clock() > deadline:
+                            return SearchResult(tuple(matches), scanned, "time")
+                        if len(names) >= MAX_ENTRIES:
+                            cut = True
+                            break
+                        names.append(entry)
+                finally:
+                    os.close(fd)
+            except (_Refuse, OSError):
+                continue  # swapped, refused or unreadable directories are skipped
+            names.sort()
             subdirs = []
             for name, is_dir in names:
                 if self._clock() > deadline:
@@ -371,7 +491,7 @@ class BrainFiles:
                         if len(matches) >= MAX_MATCHES:
                             return SearchResult(tuple(matches), scanned, "matches")
             stack.extend(reversed(subdirs))
-        return SearchResult(tuple(matches), scanned, "")
+        return SearchResult(tuple(matches), scanned, "entries" if cut else "")
 
 
 def resolve(root, requested):
