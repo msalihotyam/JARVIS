@@ -23,6 +23,7 @@ import contextlib
 import inspect
 import io
 import json
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -79,6 +80,34 @@ class _RecordingConnector:
         raise AssertionError("recovery reached the connector boundary")
 
 
+_TEMPLATE: tempfile.TemporaryDirectory | None = None
+
+
+def _template_database() -> Path:
+    """One freshly migrated, empty store per module; tests get a file copy.
+
+    Building the schema is most of setUp's cost. No test touches the
+    template itself: each copies it and opens its own store on the copy,
+    which still runs the store's full initialize path.
+    """
+    global _TEMPLATE
+    if _TEMPLATE is None:
+        _TEMPLATE = tempfile.TemporaryDirectory()
+        SQLiteMemoryStore(Path(_TEMPLATE.name) / "jarvis.db")
+    template = Path(_TEMPLATE.name) / "jarvis.db"
+    # A leftover WAL would hold pages a plain file copy misses.
+    if sorted(p.name for p in template.parent.iterdir()) != ["jarvis.db"]:
+        raise AssertionError("template store left side files; copy is unsafe")
+    return template
+
+
+def tearDownModule() -> None:
+    global _TEMPLATE
+    if _TEMPLATE is not None:
+        safe_cleanup(_TEMPLATE)
+        _TEMPLATE = None
+
+
 class RecoveryTestCase(unittest.TestCase):
     """A real SQLite store and real rows. No model, no network."""
 
@@ -86,6 +115,7 @@ class RecoveryTestCase(unittest.TestCase):
         self.root = tempfile.TemporaryDirectory()
         self.addCleanup(safe_cleanup, self.root)
         self.database = Path(self.root.name) / "jarvis.db"
+        shutil.copyfile(_template_database(), self.database)
         self.settings = Settings(memory_database=self.database)
         self.memory = SQLiteMemoryStore(self.database)
         self.connector = _RecordingConnector()
