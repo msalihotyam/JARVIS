@@ -12,6 +12,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
+from jarvis import work_ports
 from jarvis.contracts import MemoryStore, RunStatus, TaskStatus
 from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
@@ -24,6 +25,7 @@ from tests.test_work_driver import FAIL, FakePorts, result
 NOW = datetime(2026, 10, 1, 9, tzinfo=timezone.utc)
 LEASE = timedelta(minutes=10)
 ROOT = "C:/PM26W1-project"
+REAL_BUILD_PORTS = work_ports.build_ports  # captured before setUp patches it
 
 
 class CoreProjectDriveTests(unittest.TestCase):
@@ -287,6 +289,51 @@ class CoreProjectDriveTests(unittest.TestCase):
         self.assertEqual(resumed, [True])
         for target in ("src/a.py", "src/b.py"):
             # Same boot as the drive: a lease from another boot is dead by definition and would not conflict.
+            self.memory.claim_work_lease(target, "other", "new", now=self.drive_now, lease=LEASE)
+
+    # PM26W1POL1 F1: provider keys are bound to the build_ports signature before the run moves.
+    def test_pol1_f1_missing_or_unknown_build_ports_key_refused_before_state_changes(self):
+        typed = mock.patch("jarvis.work_ports.build_ports", mock.create_autospec(REAL_BUILD_PORTS)).start()
+        first, _ = self.ready()
+        base = self.core.project_drive
+        # setUp's provider gives only worker, so "missing" lacks manager, clock, checks and the rest;
+        # "unknown" supplies every required key and one bogus key, so only the unknown key is wrong.
+        core_given = {"store", "run_id", "boot_id", "lease", "lease_target", "targets", "jarvis_repo", "plan_hash"}
+        required = {
+            name: mock.Mock() for name, p in inspect.signature(REAL_BUILD_PORTS).parameters.items()
+            if p.default is inspect.Parameter.empty and name not in core_given | {"worker"}
+        }
+        for name, extra in (("missing", {}), ("unknown", {**required, "bogus": 1})):
+            with self.subTest(name=name):
+                self.core.project_drive = lambda run_id, step, extra=extra: {**base(run_id, step), **extra}
+                before_run, before_steps = self.memory.latest_work_run("r"), self.memory.work_steps("r")
+                result = self.resume(first)
+                self.assertIs(result.status, RunStatus.FAILED)
+                self.assertIn("refused: drive_deps", result.result.summary)
+                typed.assert_not_called()
+                self.worker.start.assert_not_called()
+                self.assertEqual(self.memory.latest_work_run("r"), before_run)
+                self.assertEqual(self.memory.work_steps("r"), before_steps)
+
+    # PM26W1POL1 F2: a refused resume never ends a live lease of the same run and boot it did not take.
+    def test_pol1_f2_refused_claim_keeps_a_live_lease_this_call_did_not_take(self):
+        first, _ = self.ready()
+        self.memory.claim_work_lease("src/a.py", "r", "new", now=self.drive_now, lease=LEASE)
+        self.assert_refused(self.resume(first), "lease")
+        with self.assertRaises(ValueError):  # still live: the drive did not release it
+            self.memory.claim_work_lease("src/a.py", "other", "new", now=self.drive_now, lease=LEASE)
+        self.memory.claim_work_lease("src/b.py", "other", "new", now=self.drive_now, lease=LEASE)
+
+    # PM26W1POL1 F3: an INTERRUPTED run saved in AWAITING_APPROVAL is a typed refusal, never forced to BUILDING.
+    def test_pol1_f3_interrupted_awaiting_approval_run_refused_typed(self):
+        first, _ = self.ready(approve=False)
+        self.core.recover_project_runs("new", now=NOW + timedelta(minutes=1))
+        run = self.memory.latest_work_run("r")
+        self.assertIs(run.state, RunState.INTERRUPTED)
+        self.assertIs(run.resume_state, RunState.AWAITING_APPROVAL)
+        self.assert_refused(self.resume(first), "not_resumable")
+        self.assertEqual(self.memory.latest_work_run("r"), run)
+        for target in ("src/a.py", "src/b.py"):
             self.memory.claim_work_lease(target, "other", "new", now=self.drive_now, lease=LEASE)
 
     # PM26W1FIX2 F1: only terminal outcomes save the chain task FAILED.
