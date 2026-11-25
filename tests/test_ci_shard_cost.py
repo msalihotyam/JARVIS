@@ -141,9 +141,61 @@ class ReportTests(unittest.TestCase):
         with mock.patch.object(csc.os.path, "islink", lambda p: str(p).endswith("link.json") or islink(p)), \
                 mock.patch.object(csc.os.path, "realpath", lambda p: outside if str(p).endswith("away.json") else real(p)):
             text = self.run_main()
-        self.assertIn("skipped (link, '..' or outside the folder): 3", text)
+        self.assertIn("skipped (link, junction, '..' or outside the folder): 3", text)
         self.assertIn("inconsistent: 0", text)
         self.assertNotIn("link.json", text.split("skipped")[1])
+
+    def test_untrusted_text_is_escaped_ascii(self):
+        self.assertEqual(csc._safe("a|b\nc\rd\te\ud800ğ\\"), "a\\x7cb\\nc\\rd\\te\\ud800\\u011f\\\\")
+        self.assertEqual(csc._safe("s1.json"), "s1.json")
+        self.shards()
+        self.write("\ud800x.json", _report(1))  # lone surrogate: a valid NTFS name
+        self.write("ğ.json", _report(2))
+        text = self.run_main()
+        self.assertTrue(text.isascii())
+        self.assertIn("| \\ud800x.json | 8 |", text)
+        self.assertIn("| \\u011f.json | 8 |", text)
+        with mock.patch.object(csc, "read_capped", side_effect=OSError("erişim \ud800|x")):
+            text = self.run_main()
+        self.assertTrue(text.isascii())
+        self.assertIn("refused: eri\\u015fim \\ud800\\x7cx |", text)
+        self.assertIn("refused: 10;", text)
+
+    def test_unencodable_text_never_truncates_previous_out(self):
+        self.out.parent.mkdir()
+        self.out.write_text("previous model\n", encoding="utf-8")
+        with mock.patch.object(csc, "build_report", return_value="\ud800"), self.assertRaises(UnicodeEncodeError):
+            csc.main([str(self.dir), "--out", str(self.out)])
+        self.assertEqual(self.out.read_text(encoding="utf-8"), "previous model\n")
+
+    def test_junction_and_dotdot_dirs_are_skipped_and_counted(self):
+        import _winapi  # Windows only, like the operator machine and CI
+        real = self.dir / "real"
+        real.mkdir()
+        (real / "s.json").write_text(_report(1), encoding="utf-8")
+        _winapi.CreateJunction(str(real), str(self.dir / "j1"))
+        self.addCleanup(os.rmdir, self.dir / "j1")  # removes the junction only, never its target
+        (self.dir / "a..b").mkdir()
+        (self.dir / "a..b" / "t.json").write_text(_report(2), encoding="utf-8")
+        files, found, unsafe = csc.collect(self.dir, 10)
+        self.assertEqual([p.name for p in files], ["s.json"])
+        self.assertEqual((found, unsafe), (1, 2))
+
+    def test_files_over_the_byte_cap_are_refused(self):
+        self.assertEqual(csc.MAX_BYTES, 16 * 1024 * 1024)
+        self.shards()
+        self.write("edge.json", _report(1).ljust(128))
+        self.write("over.json", _report(1).ljust(129))
+        with mock.patch.object(csc, "MAX_BYTES", 128):
+            text = self.run_main()
+        self.assertIn("| edge.json | 8 |", text)
+        self.assertIn("| over.json | | | | | refused: over 128 bytes |", text)
+        self.assertIn("usable: 9; refused: 1;", text)
+        big = self.dir / "sparse.json"
+        big.touch()
+        os.truncate(big, csc.MAX_BYTES + 1)  # sparse, never written (C11)
+        with self.assertRaises(csc.Refused):
+            csc.read_capped(big)
 
     def test_file_cap_is_stated(self):
         self.shards(7)
