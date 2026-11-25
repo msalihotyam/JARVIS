@@ -195,6 +195,60 @@ class HandoffTestCase(unittest.TestCase):
         )
         self.core = self.app.core
         self.memory = self.app.memory
+        self._answering_pristine = self._answering_knobs()
+
+    # -- shared source fixture ----------------------------------------------
+    #
+    # Speed only (MAHSPD1): the first default ``completed_source()`` of each
+    # class runs the real approved egress and snapshots the database; later
+    # default calls restore that snapshot into their own fresh, still-empty
+    # database (the SQLite backup API, so WAL content is carried). The source
+    # row holds no temp-root path and Core keeps no per-session state, so the
+    # handoff under test sees the same rows a live run would leave.
+
+    def _answering_knobs(self) -> dict[str, Any]:
+        knobs = dict(vars(self.answering))
+        knobs.pop("execute_calls", None)
+        return knobs
+
+    def _task_count(self) -> int:
+        connection = sqlite3.connect(self.database)
+        try:
+            return connection.execute("SELECT COUNT(*) FROM tasks").fetchone()[0]
+        finally:
+            connection.close()
+
+    @staticmethod
+    def _copy_database(source: Path, target: Path) -> None:
+        src, dst = sqlite3.connect(source), sqlite3.connect(target)
+        try:
+            src.backup(dst)
+        finally:
+            src.close()
+            dst.close()
+
+    def _template_eligible(self, text: str | None, classification: DataClassification) -> bool:
+        return (
+            text is None
+            and classification is DataClassification.INTERNAL
+            and self._answering_knobs() == self._answering_pristine
+            and self._task_count() == 0
+        )
+
+    def _save_source_template(self, task: Task, session: SessionState) -> None:
+        temp = tempfile.TemporaryDirectory()
+        type(self).addClassCleanup(safe_cleanup, temp)
+        path = Path(temp.name) / "source.db"
+        self._copy_database(self.database, path)
+        connection = sqlite3.connect(path)
+        try:
+            dump = "\n".join(connection.iterdump())
+        finally:
+            connection.close()
+        root = str(self.root)
+        if root in dump or json.dumps(root)[1:-1] in dump:
+            return  # a row names this test's temp root: never share it
+        type(self)._source_template = (path, task.id, session.id)
 
     # -- sources ------------------------------------------------------------
 
@@ -212,20 +266,30 @@ class HandoffTestCase(unittest.TestCase):
         classification: DataClassification = DataClassification.INTERNAL,
     ) -> tuple[Task, SessionState]:
         """One approved external-model run; returns (stored task, session)."""
-        if text is not None:
-            self.answering.answer_text = text
-        task = self.source_task(classification)
-        run = self.core.run(task)
-        self.assertEqual(RunStatus.AWAITING_APPROVAL, run.status, msg=str(run.error))
-        run = self.core.resume(
-            run.session.id,
-            task.id,
-            grant=PermissionGrant.for_request(run.permission_request),
-        )
-        self.assertEqual(RunStatus.COMPLETED, run.status, msg=str(run.error))
-        stored = self.memory.load_task(task.id)
+        templated = self._template_eligible(text, classification)
+        template = type(self).__dict__.get("_source_template") if templated else None
+        if template is not None:
+            path, task_id, session_id = template
+            self._copy_database(path, self.database)
+            session = self.memory.load_session(session_id)
+        else:
+            if text is not None:
+                self.answering.answer_text = text
+            task = self.source_task(classification)
+            run = self.core.run(task)
+            self.assertEqual(RunStatus.AWAITING_APPROVAL, run.status, msg=str(run.error))
+            run = self.core.resume(
+                run.session.id,
+                task.id,
+                grant=PermissionGrant.for_request(run.permission_request),
+            )
+            self.assertEqual(RunStatus.COMPLETED, run.status, msg=str(run.error))
+            task_id, session = task.id, run.session
+        stored = self.memory.load_task(task_id)
         self.assertTrue(stored.model_answer.present)
-        return stored, run.session
+        if templated and template is None:
+            self._save_source_template(stored, session)
+        return stored, session
 
     # -- targets ------------------------------------------------------------
 
