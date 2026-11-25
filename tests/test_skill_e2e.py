@@ -19,6 +19,7 @@ external-read step leaves no lesson (a2); no UPDATE/DELETE on skill tables (S9).
 from __future__ import annotations
 
 import re
+import shutil
 import tempfile
 import unittest
 from dataclasses import replace
@@ -71,6 +72,25 @@ def live_db_listing() -> tuple[int, int] | None:
 
 
 class SkillGateTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        # The taught Alpha skill is built once through teach() (all its asserts run here) and each
+        # test that starts from it gets its own copy of the database: no test writes the template.
+        live = live_db_listing()
+        template = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.addClassCleanup(safe_cleanup, template)
+        builder = cls("test_no_update_or_delete_on_skill_tables")
+        try:
+            builder.setUp()
+            cls.template_skill = builder.teach()
+            cls.template_projects = (builder.alpha, builder.beta)
+            shutil.copytree(builder.settings.memory_database.parent, template.name, dirs_exist_ok=True)
+            builder.tearDown()
+        finally:
+            builder.doCleanups()
+        cls.template = Path(template.name)
+        builder.assertEqual(live_db_listing(), live, "data/jarvis.db changed")
+
     def setUp(self) -> None:
         self.live = live_db_listing()
         patcher = mock.patch.dict(
@@ -166,6 +186,16 @@ class SkillGateTests(unittest.TestCase):
         self.assertEqual(skill["steps"], card["steps"])
         return saved["skill_id"]
 
+    def taught(self) -> str:
+        """teach()'s end state: a fresh app over this test's own copy of the class template."""
+        copy = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        self.addCleanup(safe_cleanup, copy)
+        shutil.copytree(self.template, copy.name, dirs_exist_ok=True)
+        self.settings = replace(self.settings, memory_database=Path(copy.name) / "jarvis.db")
+        self.app = self.compose()
+        self.alpha, self.beta = self.template_projects
+        return self.template_skill
+
     def use(self, app, objective: str = AGAIN, project_id: str | None = "alpha"):
         project_id = self.alpha if project_id == "alpha" else project_id
         run = app.core.run(self.task(objective, project_id), request=objective)
@@ -224,7 +254,7 @@ class SkillGateTests(unittest.TestCase):
                 self.assertEqual(skill["health"]["success_count"], 1)
 
     def test_turning_skills_off_stops_a_delegated_run_and_new_matches(self) -> None:
-        skill_id = self.teach()
+        skill_id = self.taught()
         run, anchor, owner = self.use(self.app)
         # The app's switch turns skills off in this running app's Core at once.
         temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
@@ -246,7 +276,7 @@ class SkillGateTests(unittest.TestCase):
     # -- D6 / D16 ---------------------------------------------------------------
 
     def test_declines_and_denials_are_no_use_and_teach_nothing(self) -> None:
-        skill_id = self.teach()
+        skill_id = self.taught()
         before = self.listed(self.alpha)[0]["health"]
         for _ in range(3):
             run, anchor, owner = self.use(self.app)
@@ -268,7 +298,7 @@ class SkillGateTests(unittest.TestCase):
     # -- S6 -----------------------------------------------------------------------
 
     def test_adapt_makes_a_new_skill_with_parent_provenance(self) -> None:
-        skill_id = self.teach()
+        skill_id = self.taught()
         history = self.store.history(skill_id, self.alpha)
         original = active_skill(history).to_dict()
         child = adapt(
@@ -283,7 +313,7 @@ class SkillGateTests(unittest.TestCase):
         self.assertEqual({s["skill_id"] for s in self.listed(self.alpha)}, {skill_id, child.skill_id})
 
     def test_a_corrected_run_proposes_v2_and_rollback_returns_to_v1(self) -> None:
-        skill_id = self.teach()
+        skill_id = self.taught()
         run, anchor, owner = self.use(self.app)
         self.grant(self.app, run)
         self.app.core.run_chain(run.session.id)
@@ -308,7 +338,7 @@ class SkillGateTests(unittest.TestCase):
     # -- S12 ----------------------------------------------------------------------
 
     def test_three_failures_make_the_skill_stale_and_it_is_not_used(self) -> None:
-        skill_id = self.teach()
+        skill_id = self.taught()
         failing = DummyConnector(outcome=OutcomeStatus.ERROR)
         app = self.compose(connector=failing)
         for _ in range(3):
@@ -325,7 +355,7 @@ class SkillGateTests(unittest.TestCase):
     # -- D4 -----------------------------------------------------------------------
 
     def test_delete_removes_the_skill_from_list_and_match(self) -> None:
-        skill_id = self.teach()
+        skill_id = self.taught()
         self.assertTrue(self.app.skill_delete(skill_id, project_id=self.alpha)["ok"])
         self.assertEqual(self.listed(self.alpha), [])
         run = self.app.core.run(self.task(AGAIN, self.alpha), request=AGAIN)
