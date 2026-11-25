@@ -39,6 +39,14 @@ _DEVICES = frozenset(
 # "/" only shows up in a folded segment (fullwidth solidus and friends under NFKC).
 _BAD_CHARS = frozenset('\\/:<>"|?*')
 _BAD_CATEGORIES = frozenset(("Cc", "Cf", "Co", "Cs", "Cn", "Zl", "Zp", "Zs"))
+# Unicode Default_Ignorable_Code_Point (DerivedCoreProperties): invisible chars that are
+# Mn/Lo (U+034F, fillers, variation selectors) and so slip past the category check;
+# plus blank-rendering U+2800, U+2D7F, U+FFFC, U+1D159.
+_IGNORABLE = re.compile(
+    "[\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u202a-\u202e"
+    "\u2060-\u206f\u2800\u2d7f\u3164\ufe00-\ufe0f\ufeff\uffa0\ufff0-\ufff8\ufffc\U0001bca0-\U0001bca3"
+    "\U0001d159\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+)
 _SHORT_NAME = re.compile(r"~\d")
 _SHADOW_SUFFIXES = (".pyc", ".pyd", ".pyw", ".so")
 _STARTUP_HOOKS = frozenset(("sitecustomize", "usercustomize"))
@@ -90,7 +98,7 @@ def _segments(raw: bytes):
         for form in (seg, fold):
             if form != form.strip(" ") or form.endswith("."):
                 return "segment starts or ends in space or ends in dot", None
-            if any(
+            if _IGNORABLE.search(form) or any(
                 ch in _BAD_CHARS or (ch != " " and unicodedata.category(ch) in _BAD_CATEGORIES)
                 for ch in form
             ):

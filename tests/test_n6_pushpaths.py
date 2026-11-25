@@ -165,6 +165,32 @@ class SuspiciousFormTests(unittest.TestCase):
         self.assertRefused("a:b", "a\\b", "a\x01b", "a\u202eb", "a\u200bb", "a\ufeffb",
                            "a\u00a0b", "a\uff1ab", "a\uff0fb", why="reserved, control, bidi")
 
+    def test_neg2_default_ignorable_code_points(self):
+        # Every Default_Ignorable_Code_Point range, Mn/Lo/Cf/Cn alike, first and last of each.
+        points = (0x00AD, 0x034F, 0x061C, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x180B, 0x180D,
+                  0x180E, 0x180F, 0x200B, 0x200F, 0x202A, 0x202E, 0x2060, 0x2065, 0x206F,
+                  0x3164, 0xFE00, 0xFE0F, 0xFEFF, 0xFFA0, 0xFFF0, 0xFFF8, 0x1BCA0, 0x1BCA3,
+                  0x1D173, 0x1D17A, 0xE0000, 0xE0001, 0xE0020, 0xE007F, 0xE0100, 0xE01EF,
+                  0xE0FFF,
+                  # Blank-rendering, not Default_Ignorable (F2 hits): braille blank, joiner,
+                  # object replacement, null notehead.
+                  0x2800, 0x2D7F, 0xFFFC, 0x1D159)
+        for cp in points:
+            ch = chr(cp)
+            self.assertRefused(f".e{ch}nv", f".g{ch}it/config", ch + "lead", "trail" + ch,
+                               f"dir/{ch}/x", why="zero-width")
+
+    def test_neg2_ignorable_review_probe_paths(self):
+        self.assertRefused(".g\u034fit/config", ".e\u034fnv", ".e\u180bnv", ".e\u3164nv",
+                           ".e\u115fnv", ".e\ufe00nv", ".e\u17b4nv", ".e\U000e0100nv",
+                           ".g\u200bit/config", why="zero-width")
+
+    def test_visible_non_ascii_still_allowed(self):
+        for path in ("caf\u00e9.txt", "docs/\u00fc\u011f\u015f\u0131.md", "\u65e5\u672c/a.py",
+                     "\ud55c\uae00.txt","\u0915\u094d\u0937.txt"):
+            with self.subTest(path=path):
+                self.assertEqual(hand(path), (ALLOW, ()))
+
     def test_neg2_reserved_device_names(self):
         self.assertRefused("CON", "nul.txt", "x/Aux.tar.gz", "COM1.py", "lpt9", "com\u00b9",
                            "PRN ", why="")
