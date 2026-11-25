@@ -1741,13 +1741,15 @@ class AgentCore:
             if old_boot == boot_id:
                 continue
             try:
-                self.advance_project_run(
+                moved = self.advance_project_run(
                     run_id, RunState.INTERRUPTED, boot_id=boot_id,
                     at=max(now, run.updated_at), extra={"old_boot_id": old_boot},
                 )
             except ValueError:
                 continue  # one unreadable run must not stop the sweep for the others
             interrupted.append(run_id)
+            # PM27EMIT: one per run per boot; best effort like every _clarify_notify
+            self._clarify_notify(moved, "interrupted", f"boot:{boot_id}")
             if not isinstance(old_boot, str) or not old_boot:
                 continue
             try:
