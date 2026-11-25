@@ -1882,7 +1882,23 @@ class AgentCore:
             return self._input_failure(
                 task, ErrorCode.INVALID_TASK, f"refused: not_resumable ({run_id})", session,
             )
-        deps = dict(self.project_drive(run_id, step))
+        provided = self.project_drive(run_id, step)
+        # A wiring mistake is a typed refusal before any state change, never a TypeError/KeyError mid-resume.
+        granted = provided.get("granted_targets") if isinstance(provided, Mapping) else None
+        if not (
+            isinstance(provided, Mapping)
+            and isinstance(provided.get("boot_id"), str) and provided["boot_id"].strip()
+            and isinstance(provided.get("now"), datetime) and isinstance(provided.get("lease"), timedelta)
+            and isinstance(granted, (list, tuple, set, frozenset))
+            and all(isinstance(item, str) and item for item in granted)
+            and isinstance(provided.get("usage"), WorkUsage)
+            and isinstance(provided.get("large_budget"), (WorkBudget, type(None)))
+        ):
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK,
+                "refused: drive_deps (boot_id, now, lease, granted_targets and usage are required)", session,
+            )
+        deps = dict(provided)
         boot_id, now, lease = deps.pop("boot_id"), deps.pop("now"), deps.pop("lease")
         boot = {name: deps.pop(name) for name in ("boot_scan", "boot_record", "boot_resume") if name in deps}
         resume_args = {
@@ -1892,30 +1908,43 @@ class AgentCore:
         # A slice with no target has nothing to lease: refuse it before any run or lease state changes.
         first, _ = self._project_run_payloads(run_id)
         try:
-            slices = WorkPlan.from_dict(first["plan"]).slices
+            plan = WorkPlan.from_dict(first["plan"])
         except (KeyError, TypeError, ValueError):
-            slices = None  # resume_project_run refuses an unreadable plan below
+            plan = None  # resume_project_run refuses an unreadable plan below
+        slices = None if plan is None else plan.slices
         if slices is not None and step.ordinal > len(slices):
             return self._input_failure(
                 task, ErrorCode.INVALID_TASK, f"refused: no_slice ({step.key})", session,
+            )
+        # A crash mid create_project_slice_tasks can store fewer steps than slices: never take them as the whole plan.
+        if slices is not None and set(steps) != {
+            step_key(run_id, index, piece.slice_id.lower()) for index, piece in enumerate(slices, start=1)
+        }:
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, f"refused: steps_incomplete ({len(steps)} of {len(slices)})", session,
             )
         piece_targets = None if slices is None else slices[step.ordinal - 1].targets
         if piece_targets is not None and not piece_targets:
             return self._input_failure(
                 task, ErrorCode.INVALID_TASK, f"refused: no_targets ({step.key})", session,
             )
+        proof = () if plan is None else tuple(_lease_targets(_plan_targets(plan)))
         if run.state is RunState.BUILDING:
             self.advance_project_run(run_id, RunState.INTERRUPTED, boot_id=boot_id, at=now)
-        resumed = self.resume_project_run(run_id, boot_id=boot_id, now=now, lease=lease, **resume_args)
+        # The revalidation claims are proof only; the step's port claims its own lease. Released in
+        # finally so no exception inside or after resume strands them (a double release is a no-op).
+        try:
+            resumed = self.resume_project_run(run_id, boot_id=boot_id, now=now, lease=lease, **resume_args)
+        finally:
+            self._release_project_leases(proof, run_id, boot_id, now)
         if isinstance(resumed, ResumeRefused):
             return self._input_failure(
                 task, ErrorCode.INVALID_TASK, f"refused: {resumed.code}: {resumed.detail}", session,
             )
-        first, _ = self._project_run_payloads(run_id)
-        plan = WorkPlan.from_dict(first["plan"])
-        targets = tuple(_plan_targets(plan))
-        # The revalidation claims are proof only; the step's port claims its own lease.
-        self._release_project_leases(tuple(_lease_targets(targets)), run_id, boot_id, now)
+        if plan is None:  # unreachable: resume refuses an unreadable plan
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, f"refused: plan unreadable ({run_id})", session,
+            )
         if resumed.state is not RunState.BUILDING:
             resumed = self.advance_project_run(run_id, RunState.BUILDING, boot_id=boot_id, at=now)
         piece = plan.slices[step.ordinal - 1]
