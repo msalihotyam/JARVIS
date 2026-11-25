@@ -1,5 +1,6 @@
 import ast
 import io
+import itertools
 import sys
 import unittest
 from collections.abc import Mapping
@@ -105,6 +106,32 @@ class TalkDeliveryTests(unittest.TestCase):
         self.assertEqual(out["refused"], [{"index": 0, "reason": "conflict"}])
         self.assertEqual(pairs(out), [("ok", "pc")])
 
+    def test_conflict_check_does_not_depend_on_record_order(self):
+        # Disagreement below the max seq is history, not a conflict, in every order.
+        clean = [rec(seq=2), rec(state="sent", attempts=1, last_try=NOW, seq=2), rec(state="sent", attempts=1, last_try=NOW, seq=3)]
+        conflicts = {
+            "state": [rec(seq=4), rec(state="sent", seq=4), rec(state="failed", attempts=1, last_try=NOW - 1, seq=1)],
+            "attempts": [rec(state="failed", attempts=1, last_try=NOW - 1, seq=4), rec(state="failed", attempts=2, last_try=NOW - 1, seq=4),
+                         rec(seq=2)],
+            "last_try": [rec(state="failed", attempts=1, last_try=NOW - 1, seq=4), rec(state="failed", attempts=1, last_try=NOW - 2, seq=4),
+                         rec(seq=3)],
+        }
+        for order in itertools.permutations(clean):
+            out = plan_delivery(req([{"id": "e", "records": list(order)}]))
+            self.assertEqual((out["actions"], out["refused"]), ([], []), order)
+        for name, records in conflicts.items():
+            for order in itertools.permutations(records):
+                out = plan_delivery(req([{"id": "e", "records": list(order)}, {"id": "ok", "records": [rec()]}]))
+                self.assertEqual(out["refused"], [{"index": 0, "reason": "conflict"}], name)
+                self.assertEqual(pairs(out), [("ok", "pc")], name)
+
+    def test_conflict_is_per_view_and_identical_duplicates_agree(self):
+        # A pc disagreement at an old seq does not refuse; telegram's own max seq decides telegram.
+        records = [rec("pc", seq=1), rec("pc", "sent", seq=1), rec("pc", seq=2), rec("telegram", seq=1), rec("telegram", seq=1)]
+        for order in itertools.permutations(records):
+            out = plan_delivery(req([{"id": "e", "records": list(order)}]))
+            self.assertEqual(pairs(out), [("e", "pc"), ("e", "telegram")], order)
+
     def test_duplicate_entry_id_is_refused(self):
         out = plan_delivery(req([{"id": "e", "records": [rec()]}, {"id": "e", "records": [rec()]}]))
         self.assertEqual(pairs(out), [("e", "pc")])
@@ -123,6 +150,42 @@ class TalkDeliveryTests(unittest.TestCase):
         out = plan_delivery(req(entries))
         self.assertEqual(pairs(out), [("good0", "pc"), ("good1", "pc")])
         self.assertEqual([r["reason"] for r in out["refused"]], list(bad))
+
+    def test_huge_int_time_is_refused_per_entry(self):
+        # json.loads yields ints beyond float range; one such record must not halt the whole plan.
+        entries = [
+            {"id": "big", "records": [rec(state="failed", attempts=1, last_try=10**400)]},
+            {"id": "neg", "records": [rec(state="failed", attempts=1, last_try=-10**400)]},
+            {"id": "mixed", "records": [rec("telegram"), rec("pc", "failed", 1, 10**400)]},
+            {"id": "good", "records": [rec()]},
+            {"id": "old", "records": [rec(state="failed", attempts=1, last_try=-10**300)]},
+            {"id": "many", "records": [rec(state="failed", attempts=10**400, last_try=NOW - 1, seq=10**400)]},
+        ]
+        out = plan_delivery(req(entries))
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["refused"], [{"index": 0, "reason": "bad_time"}, {"index": 1, "reason": "bad_time"},
+                                          {"index": 2, "reason": "bad_time"}])
+        self.assertEqual(out["actions"], [{"id": "good", "view": "pc", "not_before": NOW}, {"id": "old", "view": "pc", "not_before": NOW}])
+        self.assertEqual(out["gave_up"], [{"id": "many", "view": "pc"}])
+
+    def test_huge_int_params_refused_with_typed_reason(self):
+        entries = [{"id": "e", "records": [rec()]}]
+        for key in ("now", "base", "cap"):
+            for value in (10**400, -10**400):
+                out = plan_delivery({**req(entries), key: value})
+                self.assertEqual(out, {"ok": False, "reason": "bad_" + key}, (key, value > 0))
+
+    def test_overflowing_send_time_refused_per_entry(self):
+        # last_try + delay past float max would plan an "inf" send time.
+        big = 1.7e308
+        out = plan_delivery({"now": big, "base": 1e308, "cap": 1e308, "entries": [
+            {"id": "inf", "records": [rec("telegram"), rec("pc", "failed", 1, big)]},
+            {"id": "int", "records": [rec("pc", "failed", 2, 10**308)]},
+            {"id": "ok", "records": [rec()]},
+        ]})
+        self.assertTrue(out["ok"])
+        self.assertEqual(out["refused"], [{"index": 0, "reason": "bad_time"}, {"index": 1, "reason": "bad_time"}])
+        self.assertEqual(out["actions"], [{"id": "ok", "view": "pc", "not_before": big}])
 
     def test_nan_now_and_bad_params_refused(self):
         for extra in ({"now": float("nan")}, {"now": float("inf")}, {"now": True}, {"base": 0}, {"cap": 1.0},

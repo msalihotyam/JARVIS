@@ -27,7 +27,12 @@ def _int(value):
 
 
 def _num(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool) and math.isfinite(value)
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return False
+    try:
+        return math.isfinite(value)
+    except (OverflowError, ValueError, TypeError):  # int beyond float range (json.loads yields these)
+        return False
 
 
 def _params(request):
@@ -85,19 +90,49 @@ def _record(raw, now):
 
 
 def _latest(raw_entry, now):
-    """Latest record per view by seq; equal seq that disagrees is a conflict."""
+    """Latest record per view by seq; records at that max seq that disagree are a conflict.
+
+    Two passes so the result does not depend on record order.
+    """
     records = raw_entry.get("records")
     if not _seq(records):
         raise _Refused("bad_records")
+    parsed = [_record(raw, now) for raw in records]
     latest = {}
-    for raw in records:
-        view, rec = _record(raw, now)
+    for view, rec in parsed:
         held = latest.get(view)
         if held is None or rec[0] > held[0]:
             latest[view] = rec
-        elif rec[0] == held[0] and rec != held:
+    for view, rec in parsed:
+        if rec[0] == latest[view][0] and rec != latest[view]:
             raise _Refused("conflict")
     return latest
+
+
+def _entry_plan(entry_id, latest, now, params, resets):
+    actions, gave_up = [], []
+    for view in VIEWS:
+        if view not in latest:
+            continue
+        _, state, attempts, last_try = latest[view]
+        if state == "sent":
+            continue
+        if state == "gave_up":
+            # Only an explicit reset brings a given-up record back.
+            if (entry_id, view) in resets:
+                actions.append({"id": entry_id, "view": view, "not_before": now})
+            continue
+        if attempts >= params["max_attempts"]:
+            gave_up.append({"id": entry_id, "view": view})
+            continue
+        not_before = now
+        if attempts > 0:
+            delay = min(params["cap"], params["base"] * 2.0 ** min(attempts - 1, 64))
+            not_before = max(now, last_try + delay)
+            if not math.isfinite(not_before):  # last_try near float max: no real send time
+                raise _Refused("bad_time")
+        actions.append({"id": entry_id, "view": view, "not_before": not_before})
+    return actions, gave_up
 
 
 def _plan(request):
@@ -123,28 +158,12 @@ def _plan(request):
                 raise _Refused("duplicate_id")
             seen.add(entry_id)
             latest = _latest(raw_entry, now)
+            entry_actions, entry_gave_up = _entry_plan(entry_id, latest, now, params, resets)
         except _Refused as exc:
             refused.append({"index": index, "reason": exc.reason})
             continue
-        for view in VIEWS:
-            if view not in latest:
-                continue
-            _, state, attempts, last_try = latest[view]
-            if state == "sent":
-                continue
-            if state == "gave_up":
-                # Only an explicit reset brings a given-up record back.
-                if (entry_id, view) in resets:
-                    actions.append({"id": entry_id, "view": view, "not_before": now})
-                continue
-            if attempts >= params["max_attempts"]:
-                gave_up.append({"id": entry_id, "view": view})
-                continue
-            not_before = now
-            if attempts > 0:
-                delay = min(params["cap"], params["base"] * 2.0 ** min(attempts - 1, 64))
-                not_before = max(now, last_try + delay)
-            actions.append({"id": entry_id, "view": view, "not_before": not_before})
+        actions += entry_actions
+        gave_up += entry_gave_up
     batch = params["batch"]
     return {
         "ok": True,
