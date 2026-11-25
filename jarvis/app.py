@@ -4607,9 +4607,11 @@ class JarvisApp:
             model.warm_lane = f"{conversation_id}:{routed[0]}:{routed[1]}"
         # A lane switched back to missed the other lane's turns: resend the window. Unrouted
         # turns take part only once routing was used, so routing-off-only turns stay as before.
+        # E1ROUTE1AFIX2: no entry = unknown last lane (an unrecorded turn may have left this
+        # lane alive), so it resends; a cold lane sends the whole window anyway.
         lanes = warm and (routed is not None or conversation_id in _ROUTE_LAST)
         if lanes:
-            model.warm_resend = _ROUTE_LAST.get(conversation_id, model.warm_lane) != model.warm_lane
+            model.warm_resend = _ROUTE_LAST.get(conversation_id) != model.warm_lane
         lane = model.warm_lane if warm else None
         try:
             result = model.complete(intent_task, SessionState(objective=text))
