@@ -152,7 +152,7 @@ def _card_id(value):
 
 def _row(entry):
     entry_id = entry.get("id")
-    entry_id = entry_id if type(entry_id) in (int, str) else None
+    entry_id = entry_id if type(entry_id) is int or type(entry_id) is str else None
     kind, who = entry.get("kind"), entry.get("who")
     time = _time(entry.get("ts"))
     if not (_known(kind, KINDS) and _known(who, WHO)):
@@ -164,7 +164,7 @@ def _row(entry):
     if kind == "transcript":
         label = "Anladığım:"
     attachments = entry.get("attachments")
-    chips = tuple(_chip(a) for a in attachments) if type(attachments) in (list, tuple) else ()
+    chips = tuple(_chip(a) for a in attachments) if type(attachments) is list or type(attachments) is tuple else ()
     is_open = card_id is not None and _known(entry.get("state", "PENDING"), ("PENDING",))
     return Row(
         entry_id, kind, WHO[who], label, clean(entry.get("text")), time, chips,
@@ -184,7 +184,7 @@ def _safe_row(entry):
 def present(entries, status, focus, mode, window):
     """View model of the window's last N entries, or a Refusal. Never raises."""
     try:
-        if type(entries) not in (list, tuple):  # a subclass could slice to more than N
+        if not (type(entries) is list or type(entries) is tuple):  # identity: `in` uses a metaclass __eq__
             return Refusal("entries must be a list")
         if not _plain(status) or not _known(status.get("ring"), RING_STATES):
             return Refusal("unknown ring state")
