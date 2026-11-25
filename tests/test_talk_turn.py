@@ -150,6 +150,9 @@ class Hostile(dict):
     def keys(self):
         raise RuntimeError("boom")
 
+    def items(self):
+        raise RuntimeError("boom")
+
 
 class NegativeTests(unittest.TestCase):
     def test_brain_action_fields_dropped_counted_never_passed_on(self):
@@ -235,7 +238,7 @@ class NegativeTests(unittest.TestCase):
         fake = Fake()
         class Broken(Mapping):
             __getitem__ = __iter__ = __len__ = Hostile.keys
-        self.assertEqual(process(Broken(), fake.steps()).status, FAILED)
+        self.assertEqual(process(Broken(), fake.steps()).status, REFUSED)
         self.assertEqual(process(salih(), Fake(Hostile(text="t")).steps()).status, FAILED)
         for name in ("has_reply", "build_packet", "ask_brain"):
             steps = Fake().steps()
@@ -251,3 +254,168 @@ class NegativeTests(unittest.TestCase):
             steps = Fake().steps()
             steps["has_reply"] = lambda i, v=value: v
             self.assertEqual(process(salih(), steps).status, FAILED)
+
+
+class Once(str):
+    """A str-subclass key equal to its text on the first compare only."""
+
+    def __eq__(self, other):
+        first, self.seen = not getattr(self, "seen", False), True
+        return first and str.__eq__(self, other)
+
+    __hash__ = str.__hash__
+
+
+def raising(exc):
+    """A Mapping whose iteration, keys and reads all raise exc."""
+    class Raises(Mapping):
+        def __getitem__(self, key):
+            raise exc
+
+        def __iter__(self):
+            raise exc
+
+        def __len__(self):
+            return 4
+
+        def keys(self):
+            raise exc
+
+        def items(self):
+            raise exc
+    return Raises()
+
+
+class SubStop(tt._Stop):
+    @property
+    def status(self):
+        raise RuntimeError("status ran")
+
+    @status.setter
+    def status(self, value):
+        pass
+
+
+def stop_variants():
+    return (tt._Stop("PAYLOAD", "PAYLOAD"), tt._Stop(DONE, "ok"), tt._Stop(REFUSED, "x" * 9),
+            SubStop(REFUSED, "bad_entry"), RecursionError(), RuntimeError("boom"))
+
+
+class FixTests(unittest.TestCase):
+    """TALKTURN1FIX: every caller-Mapping touch is guarded; Outcomes come only from known constants."""
+
+    def test_stateful_str_subclass_who_key_never_reaches_packet(self):
+        for who in ("mallory", None):
+            key = Once("who")
+            entry = {key: "salih", "id": 7, "kind": "text", "text": "hi", "focus": None}
+            if who:
+                key.seen = True  # let a real "who" key in beside it, then re-arm the first-compare lie
+                entry["who"] = who
+                key.seen = False
+            fake = Fake()
+            out = process(entry, fake.steps())
+            self.assertEqual((out.status, out.reason), (REFUSED, "not_salih"), who)
+            self.assertEqual(fake.calls, [])
+
+    def test_entry_read_once_into_snapshot(self):
+        class Flip(Mapping):
+            reads = 0
+
+            def __getitem__(self, key):
+                if key == "who":
+                    self.reads += 1
+                    return "salih" if self.reads == 1 else "mallory"
+                return salih()[key]
+
+            def __iter__(self):
+                return iter(salih())
+
+            def __len__(self):
+                return 5
+        seen = []
+        steps = {**Fake().steps(), "build_packet": lambda e: seen.append(e) or "P"}
+        self.assertEqual(process(Flip(), steps).status, DONE)
+        self.assertEqual(seen[0]["who"], "salih")
+
+    def test_entry_mapping_raising_stop_is_fresh_refusal(self):
+        for exc in stop_variants():
+            fake = Fake()
+            out = process(raising(exc), fake.steps())
+            self.assertEqual((out.status, out.reason), (REFUSED, "bad_entry"), repr(exc)[:80])
+            self.assertEqual(fake.calls, [])
+
+    def test_class_property_raising_stop_is_refused_or_failed(self):
+        class Sneaky:
+            @property
+            def __class__(self):
+                raise tt._Stop(DONE, "ok")
+        self.assertEqual(process(Sneaky(), Fake().steps()).reason, "bad_entry")
+        self.assertEqual(process(salih(), Sneaky()).reason, "bad_steps")
+        out = process(salih(), Fake(Sneaky()).steps())
+        self.assertEqual((out.status, out.reason), (FAILED, "brain_failed"))
+
+    def test_steps_mapping_raising_stop_is_fresh_refusal(self):
+        for exc in stop_variants():
+            out = process(salih(), raising(exc))
+            self.assertEqual((out.status, out.reason), (REFUSED, "bad_steps"), repr(exc)[:80])
+
+            class Getter(dict):
+                def __getitem__(self, key, exc=exc):
+                    raise exc
+            out = process(salih(), Getter(Fake().steps()))
+            self.assertEqual((out.status, out.reason), (REFUSED, "bad_steps"), repr(exc)[:80])
+
+    def test_steps_names_exact_str_no_duplicates(self):
+        fake = Fake()
+        good = fake.steps()
+
+        class Dup(dict):
+            def keys(self):
+                return list(good) + ["has_reply"]
+        subclassed = {Once(k) if k == "has_reply" else k: v for k, v in good.items()}
+        for steps in (Dup(good), subclassed):
+            self.assertEqual(process(salih(), steps).reason, "bad_steps")
+        self.assertEqual(fake.calls, [])
+
+    def test_brain_raw_raising_stop_is_fresh_failure(self):
+        for exc in stop_variants():
+            fake = Fake(raising(exc))
+            out = process(salih(), fake.steps())
+            self.assertEqual((out.status, out.reason), (FAILED, "bad_reply"), repr(exc)[:80])
+            self.assertEqual(fake.log, [])
+
+    def test_brain_stateful_str_subclass_text_key_never_read(self):
+        key = Once("text")
+        answer = {key: "smuggled"}
+        key.seen = True
+        answer["text"] = "real"
+        key.seen = False
+        out = process(salih(), Fake(answer).steps())
+        self.assertEqual((out.status, out.reply.text, out.dropped_fields), (DONE, "real", 1))
+
+    def test_any_escaped_stop_rebuilt_from_known_constants(self):
+        original = tt._snapshot
+        for exc in stop_variants():
+            def boom(entry, exc=exc):
+                raise exc
+            tt._snapshot = boom
+            try:
+                out = process(salih(), Fake().steps())
+            finally:
+                tt._snapshot = original
+            self.assertEqual((out.status, out.reason), (FAILED, "internal"), repr(exc)[:80])
+        for pair in tt._STOPS:
+            out = tt._stopped(tt._Stop(*pair))
+            self.assertEqual((out.status, out.reason), pair)
+            self.assertIs(out.reason, pair[1])
+
+    def test_failed_bad_reply_keeps_dropped_counts(self):
+        cases = (({"text": "", "action": "x"}, 1, 0),
+                 ({"text": None, "proposals": ["ok", "a/b", 7], 1: 2, "tool": "t"}, 2, 2),
+                 ({"needs_you": True}, 0, 0))
+        for answer, fields, names in cases:
+            fake = Fake(answer)
+            out = process(salih(), fake.steps())
+            self.assertEqual((out.status, out.reason, out.reply), (FAILED, "bad_reply", None))
+            self.assertEqual((out.dropped_fields, out.dropped_proposals), (fields, names), repr(answer)[:80])
+            self.assertEqual(fake.log, [])
