@@ -153,6 +153,31 @@ class NegativeTests(unittest.TestCase):
             with self.subTest(text=ascii(text)):
                 self.assertEqual(redact(text).text, FIXED_LINE)
 
+    def test_case_variants_of_look_alikes_are_flagged(self):
+        # CDX-TALKREDACT2FIX F1: only one case of each look-alike was listed.
+        for text in ("PASSԜORD=hunter2", "ԀՕ ТОКЕN: x",
+                     "passԝord=hunter2", "հօ cօօkie: x",
+                     "PASSWՕRD=x", "βearer abcdefghijklmnop1234",
+                     "χ seсret=hunter2", "tοkεn=hunter2",
+                     "paςςword=hunter2"):
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(redact(text).text, FIXED_LINE)
+
+    def test_marks_and_format_chars_of_any_script_are_dropped(self):
+        # CDX-TALKREDACT2FIX F2: Mn/Mc/Me/Cf outside the old hand-picked blocks.
+        for mark in ("ְ", "֑", "َ", "ٰ", "ँ", "ा", "ั",
+                     "⃝", "؀", "۝", "\U000110bd", "᪰", "〪",
+                     "\x00", "\x1b", "\x7f", "\x9f"):
+            with self.subTest(mark=ascii(mark)):
+                self.assertEqual(redact(f"pass{mark}word=hunter2").text, FIXED_LINE)
+
+    def test_long_split_telegram_ids_are_flagged(self):
+        # CDX-TALKREDACT2FIX F3: split ids longer than 16 digits.
+        token = " ".join("A" * 35)
+        for digits in ("1" * 17, "1" * 30, "12 34567890123456789", "1" * 16):
+            with self.subTest(digits=len(digits)):
+                self.assertIn("telegram_bot_token", redact(digits + ":" + token).kinds)
+
     def test_ten_megabytes_stays_linear(self):
         for text in ("a b\n" * 2_500_000, "a b\n" * 2_499_999 + "password=x"):
             with self.subTest(flagged=text.endswith("x")):
