@@ -55,6 +55,9 @@ class _Record:
     def __setattr__(self, name, value):
         raise AttributeError(f"{type(self).__name__} is frozen")
 
+    def __delattr__(self, name):
+        raise AttributeError(f"{type(self).__name__} is frozen")
+
     def _key(self):
         return tuple(getattr(self, name) for name in self.__slots__)
 
