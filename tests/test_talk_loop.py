@@ -132,17 +132,38 @@ class NegativeTests(unittest.TestCase):
             self.assertEqual(result.code, "INPUT_INVALID", i)
         self.assertEqual(tl.poll_interval(failure_streak=0), tl.POLL_INTERVAL)
 
-    def test_huge_int_poll_due_not_rounded_without_backoff(self):
-        big = 10**308
-        self.assertEqual(step(poll_due_at=big, now=big).kind, tl.POLL)
+    def test_times_above_2_53_refused(self):
+        # CDX-TALKLOOP1FIX2 F1 probes: mixed int/float above 2**53 rounded; now refused, nothing decided
+        probes = [dict(poll_due_at=2.0**60, now=2**60 + 10, failure_streak=1),
+                  dict(delivery_due_at=2**60 + 10, now=2.0**60)]
+        for kw in probes:
+            self.assertEqual(step(**kw).code, "TIME_INVALID", kw)
+        for big in (2**53 + 1, 2.0**53 + 2, 2**60, 2.0**60, 10**308, 1e308, 2.0**1023):
+            for field in ("now", "delivery_due_at", "poll_due_at"):
+                with self.subTest(big=str(big)[:20], field=field):
+                    self.assertEqual(step(**{field: big}).code, "TIME_INVALID")
 
-    def test_backoff_survives_huge_timestamps(self):
-        for big in (2**53, 2**60, 2.0**60, 10**308, 1e308):
-            with self.subTest(big=str(big)[:20]):
+    def test_2_53_boundary_accepted_and_exact(self):
+        for big in (2**53, 2.0**53):
+            with self.subTest(big=str(big)):
                 s = step(poll_due_at=big, now=big, failure_streak=1)
                 self.assertEqual((s.kind, s.seconds), (tl.IDLE, 5.0))
-                if type(big) is int:  # big + 5 == big for these floats
-                    self.assertEqual(step(poll_due_at=big, now=big + 5, failure_streak=1).kind, tl.POLL)
+                self.assertEqual(step(poll_due_at=big, now=big).kind, tl.POLL)
+                self.assertEqual(step(delivery_due_at=big, now=big).kind, tl.DELIVER)
+        self.assertEqual(step(poll_due_at=2**53 - 5, now=2.0**53, failure_streak=1).kind, tl.POLL)
+        self.assertEqual(step(poll_due_at=2.0**53 - 4, now=2**53, failure_streak=1).seconds, 1.0)
+
+    def test_mixed_int_float_times_exact(self):
+        for base in (2**52, 10**9, 2**53 - 20):
+            with self.subTest(base=base):
+                s = step(poll_due_at=float(base), now=base + 10, failure_streak=1)
+                self.assertEqual(s.kind, tl.POLL)
+                s = step(poll_due_at=float(base), now=base + 4, failure_streak=1)
+                self.assertEqual((s.kind, s.seconds), (tl.IDLE, 1.0))
+                s = step(delivery_due_at=base + 10, now=float(base))
+                self.assertEqual((s.kind, s.seconds), (tl.IDLE, 10.0))
+                self.assertEqual(step(delivery_due_at=base + 1, now=float(base) + 1).kind, tl.DELIVER)
+                self.assertEqual(step(delivery_due_at=float(base) + 1, now=base).seconds, 1.0)
 
     def test_shutdown_with_turn_never_stops(self):
         for kw in (dict(), dict(inbound_waiting=9), dict(delivery_due_at=0.0),
