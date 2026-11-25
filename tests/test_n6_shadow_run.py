@@ -490,6 +490,39 @@ class Phase4FeedTest(unittest.TestCase):
         self.assertIs(row["safe"], False)
         self.assertIn("unsafe disagreement 1: e1", gate.check([row], {}, [])["R17R18"][1])
 
+    def cleanup_event(self, eid: str, main_shas) -> dict:
+        lane = {"lane": "L1", "worktree": "C:\\dev\\JARVIS\\.claude\\worktrees\\L1", "branch": "worktree-L1",
+                "head": SHA, "status": "PASS", "finished_ts": (T0 - timedelta(hours=2)).isoformat()}
+        return {"event_id": eid, "origin": "live", "inputs": {"cleanup": {
+            "lanes": [lane], "main_shas": main_shas,
+            "evidence": {"L1": {"report": True, "receipt": "INT PICKS a..", "merged": True}},
+            "events": [{"event": "cleanup", "lane": "L1", "result": "removed"}],
+            "now": T0.isoformat(), "timeout_s": 3600, "root": "C:\\dev\\JARVIS"}}}
+
+    def test_f1_main_judges_a_json_inbox_main_shas_list_and_refuses_bad_ones(self) -> None:
+        bad = {"str": SHA, "dict": {SHA: 1}, "null": None, "int": 1, "upper": [SHA.upper()],
+               "short": [SHA[:39]], "long": [SHA + "a"], "newline": [SHA + "\n"], "nonhex": ["g" * 40],
+               "int_entry": [1], "null_entry": [None], "nested": [[SHA]], "mixed": [SHA, "x"]}
+        events = [self.cleanup_event("ok", [SHA, SHA])] + [self.cleanup_event(k, v) for k, v in bad.items()]
+        (self.root / "build/n6/phase4_inbox.jsonl").write_text(
+            "".join(json.dumps(e) + "\n" for e in events), encoding="utf-8")
+        with mock.patch.object(run, "judge"), mock.patch.object(run, "daily"), \
+                contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(run.main(["--root", str(self.root)]), 0)
+        rows = run.shadow_rows(self.root)
+        self.assertEqual([(r["event_id"], r["port"], r["origin"]) for r in rows], [("ok", "cleanup", "live")])
+        self.assertEqual(rows[0]["n6_decision"], rows[0]["conveyor_decision"])  # agree: both removed
+
+    def test_f2_a_non_dict_event_is_skipped_and_logged(self) -> None:
+        self.assertEqual(self.feed([None, "e0", [], 3, self.event("e1")]), 5)
+        log = (self.root / "build/n6/phase4_errors.log").read_text("utf-8")
+        for name in ("NoneType", "str", "list", "int"):
+            self.assertIn(f"event is not an object: {name}", log)
+        for bad in (None, 5):  # a non-iterable events argument is refused, not raised
+            self.assertEqual(self.feed(bad), 0)
+            self.assertIn(f"events is not a list: {type(bad).__name__}",
+                          (self.root / "build/n6/phase4_errors.log").read_text("utf-8"))
+
     def test_real_ports_judge_or_skip_without_raising(self) -> None:
         ev = {"event_id": "e1", "origin": "live", "inputs": {
             "ci_watch": {"sha": SHA, "required": [], "events": "", "finish": {}},
