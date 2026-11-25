@@ -930,6 +930,38 @@ class ModuleContractTests(unittest.TestCase):
         self.assertEqual(public, {"resolve", "read_file", "list_dir", "search"})
 
     def test_running_app_does_not_import_module(self):
-        package = pathlib.Path(MODULE).parent
-        users = [p.name for p in package.rglob("*.py") if p.name != "brain_fs.py" and "brain_fs" in p.read_text(encoding="utf-8", errors="replace")]
-        self.assertEqual(users, [])
+        # BRAINFS1FIX5: only the brain's tool server may use the path policy; the rest of the app never does.
+        self.assertEqual(BRAIN_FS_USERS, frozenset({"brain_tools.py"}))
+        self.assertEqual(_unallowed_users(pathlib.Path(MODULE).parent), [])
+
+    def test_import_guard_allows_exactly_brain_tools(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            package = pathlib.Path(tmp)
+            (package / "sub").mkdir()
+            for rel in ("brain_fs.py", "brain_tools.py", "core.py", "sub/brain_tools.py", "sub/app.py"):
+                (package / rel).write_text("from jarvis import brain_fs\n", encoding="utf-8")
+            (package / "clean.py").write_text("import os\n", encoding="utf-8")
+            self.assertEqual(_unallowed_users(package), ["core.py", "sub/app.py", "sub/brain_tools.py"])
+            for rel in ("core.py", "sub/app.py", "sub/brain_tools.py"):
+                (package / rel).unlink()
+            self.assertEqual(_unallowed_users(package), [])
+        for extra in ("core.py", "app.py", "ui/bridge.py"):  # a second allowed name must fail the guard
+            with mock.patch(f"{__name__}.BRAIN_FS_USERS", frozenset({"brain_tools.py", extra})):
+                with self.assertRaises(AssertionError):
+                    self.test_running_app_does_not_import_module()
+
+
+BRAIN_FS_USERS = frozenset({"brain_tools.py"})  # paths relative to jarvis/, exact
+
+
+def _brain_fs_users(package):
+    return sorted(
+        p.relative_to(package).as_posix()
+        for p in package.rglob("*.py")
+        if p.relative_to(package).as_posix() != "brain_fs.py"
+        and "brain_fs" in p.read_text(encoding="utf-8", errors="replace")
+    )
+
+
+def _unallowed_users(package):
+    return [rel for rel in _brain_fs_users(package) if rel not in BRAIN_FS_USERS]
