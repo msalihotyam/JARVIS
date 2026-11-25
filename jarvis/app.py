@@ -53,6 +53,7 @@ from jarvis.connectors.project_folder import (
 )
 from jarvis import project_files
 from jarvis import project_folders
+from jarvis import router_tr
 from jarvis.contracts import (
     MemoryRecordOrigin,
     utc_now,
@@ -3749,6 +3750,27 @@ def _model_usage(model: Any, request_id: str) -> dict[str, Any]:
     return found
 
 
+# Last routed warm lane per conversation. Module-level like intent.WARM_SESSIONS
+# because the UI and CLI build a fresh JarvisApp for every call.
+_ROUTE_LAST: dict[str, str] = {}
+
+
+def _route_choice(settings: Any, text: str, model: Any) -> tuple[str | None, str | None] | None:
+    """E1ROUTE1A: the (model, effort) for this understanding turn, or ``None``
+    when routing is off (the operator set no fast pair). A light turn
+    (router_tr L0/L1, confidence >= 0.6) takes the fast pair; anything else,
+    an unsure route or a router error takes the adapter's default."""
+    fast = (getattr(settings, "claude_fast_model", None), getattr(settings, "claude_fast_effort", None))
+    if None in fast or not (hasattr(model, "model") and hasattr(model, "effort")):
+        return None
+    try:
+        found = router_tr.route(text)
+        light = found.lane in ("L0", "L1") and found.confidence >= 0.6
+    except Exception:  # noqa: BLE001 - a router error never blocks the turn
+        light = False
+    return fast if light else (model.model, model.effort)
+
+
 def _turn_timing(turn: Mapping[str, Any], now: float) -> dict[str, Any]:
     """DFSPEED: one text turn's phases in whole milliseconds, from ``time.monotonic()``
     marks - measured, never estimated; a phase that did not happen is absent.
@@ -3781,7 +3803,8 @@ def _turn_timing(turn: Mapping[str, Any], now: float) -> dict[str, Any]:
     # right after the spawn and before ``spawned`` is marked, so both read it.
     timing["lane"] = call.get("lane", "current")
     for key, name in (("model", "model"), ("effort", "effort")):
-        value = getattr(turn["model"], name, None)
+        # E1ROUTE1A: the model/effort a routed turn actually used (absent when off).
+        value = turn["route_" + name] if "route_" + name in turn else getattr(turn["model"], name, None)
         if isinstance(value, str):
             timing[key] = value
     if "routed" in turn:
@@ -4279,6 +4302,7 @@ class JarvisApp:
         self.core = core
         self.memory = memory
         self.settings = settings
+        #: E1ROUTE1A: each conversation's last routed warm lane (routing on only).
         #: The understanding model, or ``None`` when none is composed. Never
         #: a registered connector: it interprets, it does not execute.
         self.intent_model = intent_model
@@ -4572,8 +4596,18 @@ class JarvisApp:
         # SPEEDWARM2: the conversation is the warm-session lane for this turn
         # only; the adapter ignores it while ``warm_claude`` is off.
         warm = hasattr(model, "warm_lane")
+        # E1ROUTE1A: with no fast pair set, model, effort and lane stay as before.
+        routed = _route_choice(self.settings, text, model) if warm else None
         if warm:
             model.warm_lane = conversation_id
+        if routed is not None:
+            saved = (model.model, model.effort)
+            model.model, model.effort = turn["route_model"], turn["route_effort"] = routed
+            # One warm lane per model+effort, so alternating types never respawn.
+            model.warm_lane = f"{conversation_id}:{routed[0]}:{routed[1]}"
+            # A lane switched back to missed the other lane's turns: resend the window.
+            model.warm_resend = _ROUTE_LAST.get(conversation_id, model.warm_lane) != model.warm_lane
+            _ROUTE_LAST[conversation_id] = model.warm_lane
         try:
             result = model.complete(intent_task, SessionState(objective=text))
         except Exception as exc:  # noqa: BLE001 - adapter boundary; type only
@@ -4587,6 +4621,9 @@ class JarvisApp:
                 model.stream_listener = None
             if warm:
                 model.warm_lane = None
+            if routed is not None:
+                model.model, model.effort = saved
+                model.warm_resend = False
         turn["returned"] = time.monotonic()
         cancelled = request_id in self._cancelled_text
         self._cancelled_text.discard(request_id)
