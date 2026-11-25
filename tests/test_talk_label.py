@@ -89,7 +89,10 @@ class TalkLabelTests(unittest.TestCase):
 
     # Negative 3
     def test_empty_or_whitespace_refused(self):
-        for name in ("", " ", "\t\n", "​‮", "　"):
+        # Default_Ignorable blanks outside Cf: CGJ, variation selectors, Hangul fillers, ...
+        ignorable = ("͏", "︀", "️", "ㅤ", "ﾠ", "ᅟ", "ᅠ",
+                     "឴", "᠋", "\U000e0100", "͏ ️ㅤ")
+        for name in ("", " ", "\t\n", "​‮", "　") + ignorable:
             with self.subTest(name=ascii(name)):
                 self.assertEqual(pc_title({"topic": name}), Refusal("name_empty"))
                 self.assertEqual(pc_title({"project": name, "topic": "x"}),
@@ -101,7 +104,9 @@ class TalkLabelTests(unittest.TestCase):
     def test_case_and_unicode_form_not_a_change(self):
         pairs = [("Proje", "PROJE"), ("café", "café"),
                  ("İstanbul", "istanbul"), ("ISPARTA", "ısparta"),
-                 ("Straße", "STRASSE"), ("Ａbc", "abc")]
+                 ("Straße", "STRASSE"), ("Ａbc", "abc"),
+                 # lower()/casefold() of U+0130 is the decomposed "i" + U+0307
+                 ("İstanbul", "İstanbul".lower()), ("ISTANBUL", "i̇stanbul")]
         for a, b in pairs:
             with self.subTest(a=ascii(a), b=ascii(b)):
                 self.assertIsNone(telegram_line({"project": a, "topic": a},
