@@ -67,7 +67,8 @@ def _field(record, name):
 
 def _safe_relative(path):
     """Text-only check that path stays under the caller's root: no '..', absolute, UNC, ':' or '~digit'."""
-    if not isinstance(path, str) or not path or len(path) > 260:
+    # Exact str everywhere untrusted text is checked: a subclass could override split/strip/len.
+    if type(path) is not str or not path or len(path) > 260:
         return False
     for segment in path.split("/"):
         # The allowlist refuses '\\', ':', '~', leading '.', spaces and non-ASCII look-alikes.
@@ -78,24 +79,35 @@ def _safe_relative(path):
     return True
 
 
-def check_audio_record(record):
-    """None if record is a usable audio record, else an ASCII refusal code."""
-    if _field(record, "kind") != AUDIO_KIND:
-        return "record_wrong_kind"
-    digest = _field(record, "sha256")
-    if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
-        return "record_no_sha256"
-    size = _field(record, "bytes")
+def _checked(record):
+    """(None, plain copy) if usable, else (code, None); each field is read once and only the
+    copy is used after the check, so a record that answers differently on a later read cannot pass."""
+    fields = {name: _field(record, name) for name in ("kind", "sha256", "bytes", "relative_path")}
+    kind = fields["kind"]
+    if type(kind) is not str or kind != AUDIO_KIND:
+        return "record_wrong_kind", None
+    digest = fields["sha256"]
+    if type(digest) is not str or not _SHA256.fullmatch(digest):
+        return "record_no_sha256", None
+    size = fields["bytes"]
     if type(size) is not int or not 0 < size <= MAX_AUDIO_BYTES:
-        return "record_bad_size"
-    if not _safe_relative(_field(record, "relative_path")):
-        return "record_bad_path"
-    return None
+        return "record_bad_size", None
+    if not _safe_relative(fields["relative_path"]):
+        return "record_bad_path", None
+    return None, fields
+
+
+def check_audio_record(record):
+    """None if record is a usable audio record, else an ASCII refusal code; never raises."""
+    try:
+        return _checked(record)[0]
+    except Exception:
+        return "record_unreadable"
 
 
 def cut_hint(hint):
     """Cut hint to MAX_HINT at a term boundary (comma, semicolon or space); '' if no whole term fits."""
-    if not isinstance(hint, str):
+    if type(hint) is not str:
         return ""
     hint = hint.strip()
     if len(hint) <= MAX_HINT:
@@ -109,7 +121,7 @@ def cut_hint(hint):
 
 def _clean_text(text):
     """None if text is a usable transcript, else a flag."""
-    if not isinstance(text, str):
+    if type(text) is not str:
         return "not_text"
     if len(text) > MAX_TEXT:
         return "too_long"
@@ -134,7 +146,7 @@ def voice_in(audio_record, stt, build_hint, hear):
     a failing build_hint means an empty hint. Returns {"ok": True, "text", "seconds",
     "heard"} or a "not_understood" refusal with a flag and fallback "text" (type instead).
     """
-    problem = check_audio_record(audio_record)
+    problem, audio_record = _checked(audio_record)  # engine gets the checked copy only
     if problem:
         return _refuse(problem)
     if stt is None:
@@ -147,7 +159,7 @@ def voice_in(audio_record, stt, build_hint, hear):
         result = stt.transcribe(audio_record, hint)
     except Exception:
         return _not_understood("engine_failed")
-    if not isinstance(result, (tuple, list)) or len(result) != 2:
+    if type(result) not in (tuple, list) or len(result) != 2:
         return _not_understood("bad_result")
     text, seconds = result
     flag = _clean_text(text)
@@ -173,7 +185,7 @@ def voice_out(text, tts, prepare):
     The text is always left for reading. No engine, a failing engine or a bad audio record
     gives text only, flagged. Returns {"ok": True, "audio", "text", "flag"} or a refusal.
     """
-    if not isinstance(text, str) or len(text) > MAX_TEXT:
+    if type(text) is not str or len(text) > MAX_TEXT:
         return _refuse("text_invalid")
     if not text.strip():
         return _refuse("text_empty")
@@ -181,14 +193,14 @@ def voice_out(text, tts, prepare):
         return _text_only(text, "no_engine")
     try:
         spoken = text if prepare is None else prepare(text)
+        flag = _clean_text(spoken)  # inside the try: the text is never lost to a hostile return
     except Exception:
         return _text_only(text, "prepare_failed")
-    flag = _clean_text(spoken)
     if flag:
         return _text_only(text, flag)
     try:
-        audio = tts.speak(spoken)
-        bad = check_audio_record(audio)  # inside the try: a hostile record mapping may raise
+        # inside the try: a hostile record mapping may raise; the checked copy is returned
+        bad, audio = _checked(tts.speak(spoken))
     except Exception:
         return _text_only(text, "engine_failed")
     if bad:
