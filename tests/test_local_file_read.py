@@ -99,6 +99,30 @@ def replace_run_task(run, task):
     """The same run, reported against a freshly reloaded task."""
     return replace(run, task=task)
 
+_TEMPLATE_DATABASES: dict[PermissionMode, Path] = {}
+
+
+def _template_database(mode: PermissionMode) -> Path:
+    """A memory.db built once per module and permission mode by the same
+    create_app composition setUp uses. Each test gets its own copy, so no
+    test ever writes the template; reopening a copy is a normal second launch
+    and the initialised schema and rows are identical to a fresh build."""
+    if mode not in _TEMPLATE_DATABASES:
+        temp = tempfile.TemporaryDirectory()
+        unittest.addModuleCleanup(safe_cleanup, temp)
+        root = Path(temp.name).resolve()
+        create_app(
+            settings=Settings(memory_database=root / "memory.db", permission_mode=mode),
+            connectors=(
+                LocalFileReadConnector(
+                    allowed_roots=(root,), default_working_directory=root
+                ),
+            ),
+        )
+        _TEMPLATE_DATABASES[mode] = root / "memory.db"
+    return _TEMPLATE_DATABASES[mode]
+
+
 class LocalReadTestCase(unittest.TestCase):
     """One temp root, one connector, one app - the production composition."""
 
@@ -108,6 +132,9 @@ class LocalReadTestCase(unittest.TestCase):
         self._temp = tempfile.TemporaryDirectory()
         self.addCleanup(safe_cleanup, self._temp)
         self.root = Path(self._temp.name).resolve()
+        shutil.copyfile(
+            _template_database(self.permission_mode), self.root / "memory.db"
+        )
         self.settings = Settings(
             memory_database=self.root / "memory.db",
             permission_mode=self.permission_mode,
