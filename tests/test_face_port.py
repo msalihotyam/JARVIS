@@ -39,7 +39,30 @@ class Liar(str):
     __hash__ = str.__hash__
 
 
-CARD = entry(id=9, who="jarvis", kind="approval_card", card_id="card-abc", text="Dosya yazilsin mi?")
+class Alias(str):
+    """str key that hashes like another string and equals anything."""
+
+    def __eq__(self, other):
+        return True
+
+    def __hash__(self):
+        return hash(self.target)
+
+
+def alias(text, target):
+    key = Alias(text)
+    key.target = target
+    return key
+
+
+def swap_key(mapping, key, text="zz"):
+    """Copy of mapping whose literal key is replaced by an Alias that poses as it."""
+    out = {k: v for k, v in mapping.items() if k != key}
+    out[alias(text, key)] = mapping[key]
+    return out
+
+
+CARD =entry(id=9, who="jarvis", kind="approval_card", card_id="card-abc", text="Dosya yazilsin mi?")
 
 
 class PresentTests(unittest.TestCase):
@@ -115,6 +138,38 @@ class PresentTests(unittest.TestCase):
         self.assertEqual(view([entry(kind="file", attachments=[att])]).rows[0].chips[0].kind, "png")
         self.assertIsInstance(port.present([], {"ring": Liar("dancing")}, None, "yazili", "small"), port.Refusal)
         self.assertIsInstance(port.present([], STATUS, None, Liar("loud"), Liar("huge")), port.Refusal)
+
+    def test_liar_who_or_kind_never_renders_a_real_row(self):
+        # each case renders a real row (or an open card) if the exact-type guard on kind/who is loosened
+        for fields in [{"who": Liar("salih")}, {"who": Liar("jarvis")}, {"kind": Liar("text"), "card_id": "card-x"},
+                       {"kind": Liar("approval_card"), "card_id": "card-x"}]:
+            vm = view([entry(**fields)])
+            row = vm.rows[0]
+            self.assertIs(type(row.kind), str, fields)
+            self.assertEqual((row.kind, row.who, row.text, row.card_id, row.buttons, vm.open_cards),
+                             ("unsupported", "Sistem", port.UNSUPPORTED, None, (), frozenset()), fields)
+
+    def test_container_subclass_is_refused(self):
+        class Many(list):
+            def __getitem__(self, index):
+                return [entry(id=i) for i in range(500)]
+
+        for kind in (list, tuple):
+            sub = type("Sub", (kind,), {})
+            self.assertIsInstance(port.present(sub([entry()]), STATUS, None, "yazili", "small"), port.Refusal)
+            att = sub([{"name": "a.pdf", "size": 1}])
+            self.assertEqual(view([entry(kind="file", attachments=att)]).rows[0].chips, ())
+        self.assertIsInstance(port.present(Many([entry()]), STATUS, None, "yazili", "small"), port.Refusal)
+
+    def test_aliased_or_non_str_keys_are_not_plain(self):
+        self.assertIsInstance(port.present([], swap_key(STATUS, "ring"), None, "yazili", "small"), port.Refusal)
+        self.assertIsInstance(port.present([], {**STATUS, 1: "x"}, None, "yazili", "small"), port.Refusal)
+        for bad in [swap_key(entry(), "who"), swap_key(entry(), "kind"), {**entry(), 1: "x"}]:
+            row = view([bad]).rows[0]
+            self.assertEqual((row.kind, row.who, row.text), ("unsupported", "Sistem", port.UNSUPPORTED))
+        for att in [swap_key({"name": "a.pdf", "size": 1}, "name"), {"name": "a.pdf", "size": 1, 2: "x"}]:
+            chip = view([entry(kind="file", attachments=[att])]).rows[0].chips[0]
+            self.assertEqual(chip, port.Chip("dosya", None, "file"))
 
     def test_dict_subclass_is_not_a_plain_mapping(self):
         class Sub(dict):
@@ -211,6 +266,40 @@ class CommandTests(unittest.TestCase):
                         {"name": "card_tap", "card_id": Liar("card-zzz"), "choice": "approve"},
                         {"name": "card_tap", "card_id": "card-abc", "choice": Liar("maybe")}]:
             self.assertIsInstance(port.validate(command, vm), port.Refusal, command)
+
+    def test_aliased_or_non_str_command_keys_refused(self):
+        vm = view([CARD])
+        tap = {"name": "card_tap", "card_id": "card-abc", "choice": "approve"}
+        for command in [{alias("extra", "name"): "talk_start"}, swap_key({"name": "talk_start"}, "name"),
+                        swap_key({"name": "send_text", "text": "a"}, "text", "path"), swap_key(tap, "choice"),
+                        {"name": "talk_start", 1: "x"}]:
+            self.assertIsInstance(port.validate(command, vm), port.Refusal, command)
+
+    def test_card_tap_needs_a_real_view_with_plain_open_cards(self):
+        tap = {"name": "card_tap", "card_id": "card-a", "choice": "approve"}
+
+        class SubView(port.ViewModel):
+            pass
+
+        for cards in ["card-abc", {"card-a"}, ["card-a"], frozenset({alias("card-zzz", "card-a")})]:
+            hand = port.ViewModel((), "idle", "", "yazili", "small", cards)
+            self.assertIsInstance(port.validate(tap, hand), port.Refusal, cards)
+            fake = port.FakeService([hand])
+            fake.view()
+            self.assertIsInstance(fake.send(tap), port.Refusal, cards)
+        sub = SubView((), "idle", "", "yazili", "small", frozenset({"card-a"}))
+        self.assertIsInstance(port.validate(tap, sub), port.Refusal)
+        plain = port.ViewModel((), "idle", "", "yazili", "small", frozenset({"card-a"}))
+        self.assertIsInstance(port.validate(tap, plain), port.Command)
+
+    def test_two_choices_two_buttons_and_both_taps_succeed_on_open_card(self):
+        self.assertEqual(port.CHOICES, ("approve", "reject"))
+        self.assertEqual(port.BUTTONS, (("approve", "Onayla"), ("reject", "Reddet")))
+        vm = view([CARD])
+        self.assertEqual(vm.rows[0].buttons, (("approve", "Onayla"), ("reject", "Reddet")))
+        for choice in ("approve", "reject"):
+            result = port.validate({"name": "card_tap", "card_id": "card-abc", "choice": choice}, vm)
+            self.assertEqual(result, port.Command("card_tap", card_id="card-abc", choice=choice))
 
     def test_send_text_bounds(self):
         for text in ["", "   \n", "a" * (port.MAX_SEND_CHARS + 1), None, 5, b"a", ["a"]]:
