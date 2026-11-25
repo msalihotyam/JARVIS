@@ -31,10 +31,10 @@ from unittest import mock
 from jarvis.app import (
     OUTPUT_SCHEMA_VERSION,
     build_envelope,
-    create_app,
     decode_task_json,
     show_result,
 )
+from jarvis.app import create_app as _create_app
 from jarvis.connectors import claude_code, local_files
 from jarvis.connectors.base import BaseConnector
 from jarvis.connectors.local_files import (
@@ -83,6 +83,40 @@ from tests.helpers import DummyConnector, safe_cleanup
 from tests.test_local_file_read import make_directory_link
 
 MARKER = "WRITE-CONTENT-MARKER-7f31"
+
+#: A store initialized once per module (schema and migration rows only, no
+#: task data). Every test still gets its own private copy of it, so no test
+#: can see another's writes; only the repeated schema build is skipped.
+_template: tempfile.TemporaryDirectory | None = None
+_template_db: Path | None = None
+
+
+def setUpModule() -> None:
+    global _template, _template_db
+    _template = tempfile.TemporaryDirectory()
+    root = Path(_template.name).resolve()
+    _template_db = root / "template.db"
+    _create_app(
+        settings=Settings(memory_database=_template_db),
+        connectors=(LocalFileWriteConnector(allowed_roots=(root,)),),
+    )
+
+
+def tearDownModule() -> None:
+    if _template is not None:
+        safe_cleanup(_template)
+
+
+def create_app(*, settings: Settings, **kwargs: Any):
+    """``jarvis.app.create_app`` on a private copy of the template store.
+
+    An existing database (a restart test reopening its own store) is left
+    untouched; only a not-yet-created one is seeded from the template.
+    """
+    target = Path(settings.memory_database)
+    if _template_db is not None and not target.exists():
+        shutil.copyfile(_template_db, target)
+    return _create_app(settings=settings, **kwargs)
 
 #: A plain Win32 open asking for write access and offering every share mode
 #: itself, so the only thing that can refuse it is the share mode the
