@@ -80,6 +80,38 @@ def _relabel(match, kind):
     return _edit(lambda k, s, p: (kind, s, p) if match(k, s, p) else (k, s, p))
 
 
+def _drop(match, key):
+    return _edit(lambda k, s, p: (k, s, {a: b for a, b in p.items() if a != key}) if match(k, s, p) else (k, s, p))
+
+
+def _then(*items):
+    return lambda: _mk(_base() + list(items))
+
+
+def _apply_of(step):
+    return lambda k, s, p: s == step and "idempotency_key" in p
+
+
+_HUGE_SEQ = 9223372036854775807
+# (step/gate match, field, bad value): a wrong type the criteria would otherwise skip silently
+_BAD_FIELDS = {
+    "readback_turn_str": (_is("readback_ready"), "turn", "1"),
+    "readback_turn_bool": (_is("readback_ready"), "turn", True),
+    "attempt_bool": (_is("step_state", "s1", state="running"), "attempt", True),
+    "attempt_str": (_is("step_state", "s2", state="accepted"), "attempt", "1"),
+    "epoch_bool": (_is("step_state", "s1", state="running"), "epoch", True),
+    "confirm_turn_str": (_is("progress", gate="clarify_confirm"), "turn", "2"),
+    "confirm_confirmed_str": (_is("progress", gate="clarify_confirm"), "confirmed", "true"),
+    "scope_passed_str": (_is("progress", "s1", gate="scope"), "passed", "true"),
+    "checks_passed_int": (_is("progress", "s1", gate="checks"), "passed", 1),
+    "apply_passed_int": (_is("progress", "s1", gate="apply"), "passed", 1),
+    "apply_ref_int": (_is("progress", "s1", gate="apply"), "ref", 7),
+    "intent_key_int": (_is("progress", "s1", gate="apply_intent"), "idempotency_key", 1),
+    "no_quota_reason_int": (_is("progress", gate="no_quota"), "reason", 0),
+    "notify_point_int": (_is("progress", gate="notify"), "point", 1),
+}
+
+
 # name -> (log builder, the line that must be NOT_YET)
 MUTATIONS = {
     "no_events": (lambda: [], "log_integrity"),
@@ -130,6 +162,64 @@ MUTATIONS = {
                     "non_claude_or_no_quota"),
     "notify_off_point": (lambda: _set(_is("progress", gate="notify"), point="random_chatter"), "notify_points_only"),
     "run_failed": (lambda: _insert(4, ("run_state", None, {"state": "failed"})), "no_failed_state"),
+    # F2: acceptance evidence belongs to the accepted attempt's own running event
+    "attempt2_no_running": (_then(("step_state", "s1", {"state": "pending", "attempt": 2}),
+                                  ("step_state", "s1", {"state": "accepted", "attempt": 2})), "accepted_with_receipt"),
+    "attempt2_accepted_only": (_then(("step_state", "s1", {"state": "accepted", "attempt": 2})),
+                               "accepted_with_receipt"),
+    "attempt2_running_no_gates": (_then(("step_state", "s1", {"state": "running", "attempt": 2, "epoch": 3}),
+                                        ("step_state", "s1", {"state": "accepted", "attempt": 2})),
+                                  "accepted_with_receipt"),
+    "accepted_older_attempt": (_then(("step_state", "s1", {"state": "running", "attempt": 2, "epoch": 3}),
+                                     ("step_state", "s1", {"state": "accepted", "attempt": 1})),
+                               "accepted_with_receipt"),
+    "attempt1_running_late": (_then(("step_state", "s1", {"state": "running", "attempt": 1, "epoch": 3}),
+                                    ("step_state", "s1", {"state": "accepted", "attempt": 2})),
+                              "accepted_with_receipt"),
+    # F1: one receipt ref (or key) owned by two slices, also as a case/space variant
+    "shared_ref": (lambda: _set(_is("progress", "s2", gate="apply"), ref="ref-s1"), "accepted_with_receipt"),
+    "shared_ref_case": (lambda: _set(_is("progress", "s2", gate="apply"), ref="REF-S1"), "accepted_with_receipt"),
+    "shared_ref_space": (lambda: _set(_is("progress", "s2", gate="apply"), ref=" ref-s1 "), "accepted_with_receipt"),
+    "shared_key_case": (lambda: _set(_apply_of("s2"), idempotency_key="K-S1"), "accepted_with_receipt"),
+    # F3: a field a criterion reads, missing or of the wrong type, is a malformed event
+    "readback_turn_list": (lambda: _insert(2, ("readback_ready", None, {"turn": []})), "log_integrity"),
+    "readback_turn_missing": (lambda: _drop(_is("readback_ready"), "turn"), "log_integrity"),
+    "attempt_missing": (lambda: _drop(_is("step_state", "s1", state="accepted"), "attempt"), "log_integrity"),
+    "state_missing": (lambda: _drop(_is("step_state", "s2", state="running"), "state"), "log_integrity"),
+    **{name: ((lambda m=m, f=f, v=v: _set(m, **{f: v})), "log_integrity")
+       for name, (m, f, v) in _BAD_FIELDS.items()},
+    # F4: one corrupt huge seq is a bounded seq gap, never a huge range
+    "seq_huge": (lambda: _raw(_put(-1, "seq", _HUGE_SEQ)), "log_integrity"),
+    # review: Unicode spellings of one receipt (zero-width / fullwidth) are the same receipt
+    "shared_ref_zero_width": (lambda: _set(_is("progress", "s2", gate="apply"), ref="ref-s1​"),
+                              "accepted_with_receipt"),
+    "shared_ref_fullwidth": (lambda: _set(_is("progress", "s2", gate="apply"), ref="ｒｅｆ-s1"),
+                             "accepted_with_receipt"),
+    "shared_key_zero_width": (lambda: _set(_apply_of("s2"), idempotency_key="k-​s1"), "accepted_with_receipt"),
+    # review: a terminal step state inside the accepted attempt before its accept
+    "cancelled_then_accepted": (lambda: _insert(10, ("step_state", "s1", {"state": "cancelled", "attempt": 1})),
+                                "accepted_with_receipt"),
+    "accepted_needs_input_accepted": (lambda: _insert(10, ("step_state", "s1", {"state": "accepted", "attempt": 1}),
+                                                      ("step_state", "s1", {"state": "needs_input", "attempt": 1})),
+                                      "accepted_with_receipt"),
+    # review: step attempts start at 1
+    "attempt_zero": (lambda: _set(_is("step_state", "s1", state="running"), attempt=0), "log_integrity"),
+    "attempt_negative": (lambda: _set(_is("step_state", "s1", state="running"), attempt=-5), "log_integrity"),
+    # review: a cancelled run resumed to done is not a clean run
+    "run_cancelled_resumed": (lambda: _insert(4, ("run_state", None, {"state": "cancelled"}),
+                                              ("run_state", None, {"state": "building"})), "no_failed_state"),
+    "run_done_resumed": (lambda: _insert(11, ("run_state", None, {"state": "done"}),
+                                         ("run_state", None, {"state": "building"})), "no_failed_state"),
+    # review: a question between slices is mid-build even when run_state building is logged late
+    "question_before_late_building": (lambda: _mk(_base()[:2] + _base()[3:10] + [("questions_ready", None, {}),
+                                                  _base()[2]] + _base()[10:]), "no_mid_build_question"),
+    # review: a Claude worker spelled with a zero-width or fullwidth character is still Claude
+    "worker_zero_width_claude": (lambda: _edit(lambda k, s, p: ("progress", "s1", {
+        "gate": "worker_kind", "worker": "​claude-opus"}) if p.get("gate") == "no_quota" else (k, s, p)),
+                                 "non_claude_or_no_quota"),
+    "worker_fullwidth_claude": (lambda: _edit(lambda k, s, p: ("progress", "s1", {
+        "gate": "worker_kind", "worker": "Ｃlaude-opus"}) if p.get("gate") == "no_quota" else (k, s, p)),
+                                "non_claude_or_no_quota"),
 }
 
 
@@ -153,6 +243,18 @@ class EvaluateTests(unittest.TestCase):
         line = _line(_run(MUTATIONS["checks_failed"][0]()), "accepted_with_receipt")
         self.assertTrue(line.startswith("accepted_with_receipt: NOT_YET s2: checks not passed ["), line)
         self.assertRegex(line, r"\[\d+\]$")
+
+    def test_huge_seq_gap_evidence_is_bounded_to_the_first_20(self):
+        line = _line(_run(MUTATIONS["seq_huge"][0]()), "log_integrity")
+        self.assertEqual(line, "log_integrity: NOT_YET log integrity: seq gap [" + ",".join(map(str, range(20, 40))) + "]")
+        ev = _raw(_put(-1, "seq", _HUGE_SEQ))
+        ev[4]["seq"], ev[5]["seq"] = 7, 8  # a duplicate is reported before any gap
+        line = _line(_run(ev), "log_integrity")
+        self.assertEqual(line, "log_integrity: NOT_YET log integrity: duplicate seq [7,8]")
+        ev[4]["seq"], ev[5]["seq"] = 26, 27
+        line = _line(_run(ev), "log_integrity")
+        self.assertTrue(line.startswith("log_integrity: NOT_YET log integrity: seq gap [5,6,20,"), line)
+        self.assertEqual(line.count(","), 19, line)
 
     def test_each_mutation_is_not_yet_on_its_line(self):
         for name, (build, target) in MUTATIONS.items():
@@ -272,17 +374,19 @@ class LoaderTests(unittest.TestCase):
                 conn.execute("DELETE FROM work_event")
 
     def test_every_statement_names_only_work_event(self):
-        seen, real = [], pm._connect
+        seen, real = [], sqlite3.connect
 
-        def traced(path):
-            conn = real(path)
+        def traced(*args, **kwargs):  # trace from connect, before the checker runs any statement
+            conn = real(*args, **kwargs)
             conn.set_trace_callback(seen.append)
             return conn
 
-        with unittest.mock.patch.object(pm, "_connect", traced):
+        with unittest.mock.patch.object(pm.sqlite3, "connect", traced):
             self.assertEqual(_main(self.db, "R1", "--pm30-green", "yes", "--pm32-verdict", "yes")[0], 0)
-        self.assertTrue(seen)
-        for sql in seen:
+        self.assertIn("PRAGMA query_only = ON", seen)
+        rest = [sql for sql in seen if sql != "PRAGMA query_only = ON"]
+        self.assertTrue(rest)
+        for sql in rest:
             self.assertIn("work_event", sql)
             for table in ("work_run", "work_step", "work_lease", "notify_outbox"):
                 self.assertNotIn(table, sql)

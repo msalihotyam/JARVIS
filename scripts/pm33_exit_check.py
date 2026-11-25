@@ -11,7 +11,8 @@ defined here but jarvis/work_driver.py emits nothing, so real runs print NOT_YET
   clarify_exit           last readback_ready{turn:int} then a later
                          progress{gate:"clarify_confirm", confirmed:true, turn > readback turn}  (no writer yet)
   no_mid_build_question  run_state{state:"building"}; no questions_ready / readback_ready /
-                         plan_ready / approval_required after it (needs_input is allowed)
+                         plan_ready / approval_required after it or after the first step_state,
+                         whichever is earlier (needs_input is allowed)
   every_slice_leased     every slice ran, and every step_state{state:"running"} carries an int
                          "epoch" (the N6 lease fence the driver adds to every payload)
   non_claude_or_no_quota progress{gate:"worker_kind", worker:str not claude*} on a slice, or
@@ -21,11 +22,15 @@ defined here but jarvis/work_driver.py emits nothing, so real runs print NOT_YET
   accepted_with_receipt  each slice's LAST event is step_state accepted at its highest attempt; in
                          that attempt checks + regression passed and the receipt progress{gate:"apply",
                          passed:true, ref:str} follows an apply_intent with the same idempotency_key;
-                         no receipt key is shared by two slices
+                         that attempt opens with its own running event and has no other terminal step
+                         state before the accept; no receipt key or ref is shared by two slices
+                         (compared NFKC, format characters dropped, trimmed, casefolded)
   notify_points_only     progress{gate:"notify", point:str}, every point a section 2.1 point      (no writer yet)
-  no_failed_state        no run_state failed, step_state failed_after_cap or slice_failed_after_cap
+  no_failed_state        no run_state failed or cancelled, no run_state after a terminal one, no
+                         step_state failed_after_cap or slice_failed_after_cap
   pm30_pm32              pm30_green is True and pm32_verdict == "yes"
   log_integrity          seq 1..N contiguous, unique, one run id, every event well-formed
+                         (step_state attempt an int >= 1)
 OVERALL is PASS only when every line is PASS and the last terminal run event is done.
 """
 from __future__ import annotations
@@ -35,6 +40,7 @@ import json
 import re
 import sqlite3
 import sys
+import unicodedata
 from collections import Counter
 from collections.abc import Mapping
 from pathlib import Path
@@ -43,7 +49,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from jarvis.work_ledger import EventKind  # noqa: E402
+from jarvis.work_ledger import TERMINAL_STEP_STATES, EventKind  # noqa: E402
 
 KNOWN_KINDS = frozenset(k.value for k in EventKind)
 NOTIFY_POINTS = frozenset({
@@ -55,6 +61,20 @@ _QUESTIONS = frozenset({"questions_ready", "readback_ready", "plan_ready", "appr
 _TERMINAL = frozenset({"done", "failed", "cancelled"})
 _FIELDS = ("run_id", "seq", "kind", "step_key", "payload_json")
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+# Payload field types per event kind (progress: per gate), from the work_driver writers;
+# bool is not int here (type(...) is, not isinstance).
+_PASSED = {"passed": bool}
+_SHAPES: dict[str, dict[str, type]] = {
+    "readback_ready": {"turn": int},
+    "step_state": {"state": str, "attempt": int, "epoch": int},
+    "clarify_confirm": {"turn": int, "confirmed": bool},
+    "scope": _PASSED, "checks": _PASSED, "regression": _PASSED,
+    "apply_intent": {"idempotency_key": str},
+    "apply": {"passed": bool, "idempotency_key": str, "ref": str},
+    "worker_kind": {"worker": str}, "no_quota": {"reason": str}, "notify": {"point": str},
+}
+# Missing would also be skipped silently: a read-back without a turn, an attempt without a number.
+_REQUIRED = {"readback_ready": ("turn",), "step_state": ("state", "attempt")}
 
 
 def _no_dup(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -91,6 +111,13 @@ def _parse(raw: object) -> tuple[dict | None, str]:
         for key in ("state", "gate"):
             if key in payload and type(payload[key]) is not str:
                 return None, "bad " + key
+        # A criterion silently skips a field of the wrong type, so a wrong type is malformed here.
+        name = payload.get("gate", kind) if kind == EventKind.PROGRESS.value else kind
+        for key, want in _SHAPES.get(name, {}).items():
+            if (key in payload or key in _REQUIRED.get(name, ())) and type(payload.get(key)) is not want:
+                return None, f"bad {name}.{key}"
+        if name == "step_state" and payload["attempt"] < 1:
+            return None, "bad step_state.attempt"
         return {"run_id": run_id, "seq": seq, "kind": kind, "step": step, "p": payload}, ""
     except Exception as exc:  # malformed input is reported, never raised
         return None, type(exc).__name__
@@ -116,13 +143,21 @@ def _int(value: object) -> bool:
     return type(value) is int
 
 
+def _norm(value: str) -> str:
+    """One spelling per visible text: NFKC, format characters (zero-width) dropped, trimmed, casefolded."""
+    text = unicodedata.normalize("NFKC", value)
+    return "".join(c for c in text if unicodedata.category(c) != "Cf").strip().casefold()
+
+
 def _str(value: object) -> bool:
-    return type(value) is str and bool(value.strip())
+    return type(value) is str and bool(_norm(value))
 
 
 def _last_attempt(sl: list[dict]) -> list[dict]:
-    """The slice's events from its last running step_state on (empty if it never ran)."""
-    starts = [i for i, e in enumerate(sl) if _state(e, "step_state") == "running"]
+    """The slice's events from the last running step_state of its highest attempt on
+    (empty if that attempt never ran, so an earlier attempt's evidence never counts)."""
+    top = max((e["p"]["attempt"] for e in sl if e["kind"] == "step_state"), default=None)
+    starts = [i for i, e in enumerate(sl) if _state(e, "step_state") == "running" and e["p"]["attempt"] == top]
     return sl[starts[-1]:] if starts else []
 
 
@@ -147,7 +182,9 @@ def _mid_build(evs: list[dict], slices: dict) -> _Verdict:
     build = [e for e in evs if _state(e, "run_state") == "building"]
     if not build:
         return False, _NONE, []
-    asked = [e["seq"] for e in evs if e["seq"] > build[0]["seq"] and e["kind"] in _QUESTIONS]
+    # A slice step is building too, even if run_state building is logged late.
+    start = min([build[0]["seq"]] + [e["seq"] for e in evs if e["kind"] == "step_state"])
+    asked = [e["seq"] for e in evs if e["seq"] > start and e["kind"] in _QUESTIONS]
     return (False, "question after build start", asked) if asked else (True, "", [build[0]["seq"]])
 
 
@@ -165,7 +202,7 @@ def _leased(evs: list[dict], slices: dict) -> _Verdict:
 def _worker(evs: list[dict], slices: dict) -> _Verdict:
     hits = [e["seq"] for e in evs if (
         _gate(e, "worker_kind") and e["step"] is not None and _str(e["p"].get("worker"))
-        and not e["p"]["worker"].strip().lower().startswith("claude")
+        and not _norm(e["p"]["worker"]).startswith("claude")
     ) or (_gate(e, "no_quota") and _str(e["p"].get("reason")))]
     return (True, "", hits) if hits else (False, _NONE, [])
 
@@ -183,44 +220,53 @@ def _scope(evs: list[dict], slices: dict) -> _Verdict:
     return (False, _NONE + " (scope): " + ",".join(missing), []) if missing else (True, "", ids)
 
 
-def _slice_receipt(sl: list[dict]) -> tuple[str, str, list[int]]:
-    """(receipt key, why not accepted, evidence) for one slice; key is "" unless accepted."""
+def _slice_receipt(sl: list[dict]) -> tuple[str, str, str, list[int]]:
+    """(receipt key, receipt ref, why not accepted, evidence) for one slice; key is "" unless accepted."""
     last = sl[-1]
     attempts = [e["p"].get("attempt") for e in sl if e["kind"] == "step_state"]
     att = last["p"].get("attempt")
     if _state(last, "step_state") != "accepted":
-        return "", "last event not accepted", [last["seq"]]
+        return "", "", "last event not accepted", [last["seq"]]
     if not _int(att) or any(not _int(a) or a > att for a in attempts):
-        return "", "accepted attempt is not the highest", [last["seq"]]
+        return "", "", "accepted attempt is not the highest", [last["seq"]]
     window = _last_attempt(sl)
+    if not window or any(e["kind"] == "step_state" and e["p"].get("attempt") != att for e in window):
+        return "", "", "accepted attempt has no running event of its own", [last["seq"]]
+    ended = [e["seq"] for e in window[:-1] if _state(e, "step_state") in TERMINAL_STEP_STATES]
+    if ended:
+        return "", "", "terminal step state before the accept", ended
     for name in ("checks", "regression"):
         gates = [e for e in window if _gate(e, name)]
         if not gates or any(e["p"].get("passed") is not True for e in gates):
-            return "", name + " not passed", [e["seq"] for e in gates] or [last["seq"]]
+            return "", "", name + " not passed", [e["seq"] for e in gates] or [last["seq"]]
     applied = [e for e in window if _gate(e, "apply") and e["p"].get("passed") is True]
     if len(applied) != 1 or not _str(applied[0]["p"].get("ref")) or not _str(applied[0]["p"].get("idempotency_key")):
-        return "", "no single verifiable receipt", [e["seq"] for e in applied] or [last["seq"]]
+        return "", "", "no single verifiable receipt", [e["seq"] for e in applied] or [last["seq"]]
     rec = applied[0]
     key = rec["p"]["idempotency_key"]
     intents = [e for e in window if _gate(e, "apply_intent") and e["seq"] < rec["seq"]
                and e["p"].get("idempotency_key") == key]
     if not intents:
-        return "", "receipt fails verify (no matching apply_intent)", [rec["seq"]]
-    return key, "", [intents[0]["seq"], rec["seq"], last["seq"]]
+        return "", "", "receipt fails verify (no matching apply_intent)", [rec["seq"]]
+    return key, rec["p"]["ref"], "", [intents[0]["seq"], rec["seq"], last["seq"]]
 
 
 def _accepted(evs: list[dict], slices: dict) -> _Verdict:
     if not slices:
         return False, "no slices", []
     ids: list[int] = []
-    owner: dict[str, str] = {}
+    owner: dict[tuple[str, str], str] = {}
     for name, sl in sorted(slices.items()):
-        key, why, seqs = _slice_receipt(sl)
+        key, ref, why, seqs = _slice_receipt(sl)
         if not key:
             return False, f"{name}: {why}", seqs
-        if key in owner:
-            return False, f"receipt shared by {owner[key]} and {name}", seqs
-        owner[key] = name
+        # The driver's key is per run+step+attempt, so a reused receipt shows as a shared ref;
+        # spelling variants count as the same receipt (over-matching only fails closed).
+        for label, value in (("receipt", key), ("receipt ref", ref)):
+            norm = (label, _norm(value))
+            if norm in owner:
+                return False, f"{label} shared by {owner[norm]} and {name}", seqs
+            owner[norm] = name
         ids.extend(seqs)
     return True, "", ids
 
@@ -236,8 +282,11 @@ def _notify(evs: list[dict], slices: dict) -> _Verdict:
 def _no_failed(evs: list[dict], slices: dict) -> _Verdict:
     if not slices:
         return False, "no slices", []
-    bad = [e["seq"] for e in evs if _state(e, "run_state") == "failed"
-           or _state(e, "step_state") == "failed_after_cap" or e["kind"] == "slice_failed_after_cap"]
+    runs = [e for e in evs if e["kind"] == "run_state"]
+    # A terminal run state has no way out in the ledger, so a later run_state means a resumed run.
+    ended = {e["seq"] for e in runs[:-1] if e["p"].get("state") in _TERMINAL}
+    bad = sorted(ended | {e["seq"] for e in evs if _state(e, "run_state") in ("failed", "cancelled")
+                          or _state(e, "step_state") == "failed_after_cap" or e["kind"] == "slice_failed_after_cap"})
     return (False, "failed state", bad) if bad else (True, "", [])
 
 
@@ -279,7 +328,13 @@ def evaluate(events: object, pm30_green: object, pm32_verdict: object) -> list[s
         ids += dups
     if not bad and not dups and seqs != list(range(1, len(seqs) + 1)):
         problems.append("seq gap")
-        ids += sorted(set(range(1, (seqs[-1] if seqs else 0) + 1)) - set(seqs))[:20]
+        missing, want = [], 1  # walk the sorted seqs: a huge seq must not build a huge range
+        for s in seqs:
+            missing.extend(range(want, min(s, want + 20 - len(missing))))
+            want = s + 1
+            if len(missing) >= 20:
+                break
+        ids += missing
     runs = sorted({e["run_id"] for e in good})
     if len(runs) > 1:
         problems.append("more than one run id: " + ",".join(runs))
