@@ -1,0 +1,6 @@
+{
+ "version": 1,
+ "classes": {
+  "tests.test_notify_emit.NotifyEmitTest": 0.4
+ }
+}

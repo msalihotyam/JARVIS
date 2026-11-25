@@ -234,11 +234,14 @@ def _booted(ports: object) -> bool:
 
 def drive(
     run: WorkRun, steps: Iterable[WorkStep], ports: Ports, *, only: str | None = None,
+    manual_checks: bool = False,
 ) -> tuple[WorkRun, tuple[WorkStep, ...]]:
     """Drive a BUILDING run until it waits, pauses or every slice is done.
 
     ``only`` (PM26W1FIX, one chain step per call): drive just that step key and
     leave the run BUILDING while any other slice can still move.
+    ``manual_checks`` (PM27EMIT): the plan has manual acceptance checks, so entering
+    ACCEPTING notifies awaiting_acceptance once per run.
     Returns ``(run, steps)`` with the final ledger values.
     """
     by_key = {step.key: step for step in steps}
@@ -272,6 +275,8 @@ def drive(
         elif values and all(step.state == StepState.ACCEPTED for step in values):
             # The acceptance phase owns awaiting_acceptance/done eligibility.
             run = _run_to(run, RunState.ACCEPTING, ports)
+            if manual_checks is True:  # PM27EMIT: the caller owns manual-check eligibility
+                _notify(ports, "awaiting_acceptance", "acceptance", None)
         else:
             # Failed slices strand their dependents; the operator decides.
             run = _run_to(run, RunState.PAUSED, ports)
@@ -758,4 +763,6 @@ def _step_to(step: WorkStep, to: StepState, ports: Ports) -> WorkStep:
 def _run_to(run: WorkRun, to: RunState, ports: Ports) -> WorkRun:
     run = advance_run(run, to, at=ports.clock())
     ports.append_event(EventKind.RUN_STATE, None, {"state": run.state.value})
+    if to is RunState.DONE:  # PM27EMIT: one per run (run_id is in the identity); FAILED never notifies done
+        _notify(ports, "done", "done", None)
     return run
