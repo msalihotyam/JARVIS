@@ -16,6 +16,7 @@ needs_you: bool) and raises TimeoutError after ending the run itself.
 from __future__ import annotations
 
 import re
+import sys
 import threading
 from dataclasses import dataclass
 
@@ -33,6 +34,7 @@ FAILURES = {
     "busy": "Another brain call is running.",
     "bad_packet": "The packet must be non-empty text.",
     "metered_env": "A metered API credential is set; the brain call was refused.",
+    "bad_limit": "The brain time limit must be a finite number of seconds above zero.",
     "timeout": "The brain call ran past its time limit.",
     "exit": "The brain call ended with an error.",
     "runner_failed": "The brain runner failed.",
@@ -96,7 +98,8 @@ class BrainPort:
             try:
                 return self._ask(packet)
             except _Bad as bad:
-                code = bad.code
+                # An injected callable could raise _Bad with an unknown code: never let KeyError out.
+                code = bad.code if bad.code in FAILURES else "internal"
             except Exception:  # noqa: BLE001 - nothing may escape ask()
                 code = "internal"
             self._failures += 1
@@ -111,8 +114,13 @@ class BrainPort:
             stdin = packet.encode("utf-8")
         except UnicodeEncodeError:
             raise _Bad("bad_packet") from None
-        if any(str(key).upper() in METERED_ENV for key in self._env):
+        # A non-str key (bytes, subclass) cannot be checked by name: refuse it as metered.
+        if any(type(key) is not str or key.upper() in METERED_ENV for key in self._env):
             raise _Bad("metered_env")
+        limit = self._limit
+        # Finite, above zero, not bool; "not 0 < x" refuses NaN; an int past float range is refused too.
+        if type(limit) not in (int, float) or not 0 < limit <= sys.float_info.max:
+            raise _Bad("bad_limit")
         if self._session is not None:
             verdict = talk_rotate.decide(self._used, self._context_limit)
             # A refusal from the rotation rule rotates too: fail closed.
@@ -120,16 +128,16 @@ class BrainPort:
                 self._session, self._used = None, 0
                 self._rotations += 1
         start = self._clock()
-        deadline = start + self._limit
+        deadline = start + limit
         resumed, used = self._session, self._used
         # Any failed turn leaves no session behind, so the next ask starts fresh.
         self._session, self._used = None, 0
         try:
-            result = self._once(stdin, resumed, deadline)
+            result = self._once(stdin, resumed, deadline, limit)
             if result is None and resumed is not None:
                 # A failed resume starts a fresh session once, inside the same deadline.
                 used = 0
-                result = self._once(stdin, None, deadline)
+                result = self._once(stdin, None, deadline, limit)
             if result is None:
                 raise _Bad("exit")
         finally:
@@ -141,18 +149,19 @@ class BrainPort:
             self._session, self._used = session_id, used + len(packet) + len(text)
         return Reply(text, needs_you, self.counters())
 
-    def _once(self, stdin, session, deadline):
-        remaining = deadline - self._clock()
-        if remaining <= 0:
-            raise _Bad("timeout")
+    def _once(self, stdin, session, deadline, limit):
         argv = self._argv_for(session, self._tool_server)
+        # After argv_for, so builder time counts; the bounds refuse a NaN, inf or backwards clock.
+        remaining = deadline - self._clock()
+        if not 0 < remaining <= limit:
+            raise _Bad("timeout")
         try:
             result = self._runner(argv, stdin=stdin, timeout=remaining)
         except TimeoutError:
             raise _Bad("timeout") from None
         except Exception:  # noqa: BLE001 - a broken runner is a typed failure
             raise _Bad("runner_failed") from None
-        if self._clock() > deadline:
+        if not self._clock() <= deadline:
             raise _Bad("timeout")  # nothing partial is returned
         if type(result) is not tuple or len(result) != 4:
             raise _Bad("runner_failed")

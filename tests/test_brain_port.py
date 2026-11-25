@@ -1,5 +1,7 @@
 import ast
+import sys
 import unittest
+from decimal import Decimal
 from pathlib import Path
 
 from jarvis import brain_port
@@ -163,7 +165,8 @@ class OutputTests(unittest.TestCase):
         self.check_failure(ok(b"\xff\xfe partial"), "unreadable")
 
     def test_over_cap_is_failure_not_truncation(self):
-        self.check_failure(ok(b"x" * (brain_port.MAX_OUTPUT_BYTES + 1)), "oversized")
+        # Non-UTF-8 bytes would be "unreadable" if decoded: oversized proves the byte cap runs first.
+        self.check_failure(ok(b"\xff" * (brain_port.MAX_OUTPUT_BYTES + 1)), "oversized")
         self.check_failure(ok("é".encode() * (brain_port.MAX_REPLY_CHARS + 1)), "oversized")
 
     def test_wrong_shapes(self):
@@ -191,6 +194,74 @@ class GuardTests(unittest.TestCase):
             port, runner, _ = make(ok(), env={key: ""})
             self.assertEqual(port.ask("a").code, "metered_env")
             self.assertEqual(runner.calls, [])
+
+    def test_non_str_env_key_refused_as_metered(self):
+        class Key(str):
+            pass
+
+        for key in (b"ANTHROPIC_API_KEY", b"HOME", 7, Key("HOME"), "anthropıc_apı_key"):
+            port, runner, _ = make(ok(), env={key: ""})
+            self.assertEqual(port.ask("a").code, "metered_env", repr(key))
+            self.assertEqual(runner.calls, [])
+
+    def test_bad_limit_refused_before_runner(self):
+        for limit in (float("nan"), float("inf"), float("-inf"), 0, 0.0, -1, -0.5,
+                      True, False, None, "30", Decimal("30"), 10 ** 400):
+            port, runner, _ = make(ok(), limit=limit)
+            result = port.ask("a")
+            self.assertEqual(result.code, "bad_limit", repr(limit)[:40])
+            self.assertEqual(result.counters.failures, 1)
+            self.assertEqual(runner.calls, [])
+        port, runner, _ = make(ok(), limit=30)
+        self.assertIsInstance(port.ask("a"), Reply)
+        self.assertEqual(runner.calls[0][2], 30.0)
+
+    def test_nan_clock_times_out_before_runner(self):
+        port, runner, clock = make(ok())
+        clock.now = float("nan")
+        self.assertEqual(port.ask("a").code, "timeout")
+        self.assertEqual(runner.calls, [])
+
+    def test_inf_or_backwards_clock_never_lifts_the_limit(self):
+        # (clock at start, clock after argv_for, limit): each would give the runner timeout inf or > limit.
+        for start, after, limit in ((float("inf"), 100.0, 30.0), (100.0, float("-inf"), 30.0),
+                                    (1e308, 1e308, sys.float_info.max), (100.0, 50.0, 30.0)):
+            clock = Clock()
+            clock.now = start
+            runner = Runner(clock, ok())
+
+            def jump(session, tools, after=after, clock=clock):
+                clock.now = after
+                return argv_for(session, tools)
+
+            port = BrainPort(runner, jump, TOOLS, {}, clock, limit, 1000)
+            self.assertEqual(port.ask("a").code, "timeout", (start, after))
+            self.assertEqual(runner.calls, [])
+
+    def test_unknown_bad_code_from_injected_code_is_internal(self):
+        def bad_argv(session, tools):
+            raise brain_port._Bad("zzz")
+
+        port = BrainPort(Runner(Clock()), bad_argv, TOOLS, {}, Clock(), 30.0, 1000)
+        self.assertEqual(port.ask("a").code, "internal")
+
+    def test_argv_builder_time_counts_against_limit(self):
+        for spent, want in ((10.0, 20.0), (30.0, None), (31.0, None)):
+            clock = Clock()
+            runner = Runner(clock, ok())
+
+            def slow_argv(session, tools, spent=spent, clock=clock):
+                clock.now += spent
+                return argv_for(session, tools)
+
+            port = BrainPort(runner, slow_argv, TOOLS, {}, clock, 30.0, 1000)
+            result = port.ask("a")
+            if want is None:
+                self.assertEqual(result.code, "timeout", spent)
+                self.assertEqual(runner.calls, [])
+            else:
+                self.assertIsInstance(result, Reply)
+                self.assertEqual(runner.calls[0][2], want)
 
     def test_metered_list_covers_connector_guard(self):
         self.assertLessEqual(set(claude_code.PROHIBITED_BILLING_ENV_VARS), set(brain_port.METERED_ENV))
