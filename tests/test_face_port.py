@@ -139,6 +139,20 @@ class PresentTests(unittest.TestCase):
         self.assertIsInstance(port.present([], {"ring": Liar("dancing")}, None, "yazili", "small"), port.Refusal)
         self.assertIsInstance(port.present([], STATUS, None, Liar("loud"), Liar("huge")), port.Refusal)
 
+    def test_liar_window_alone_is_refused(self):
+        # every other input valid, so only the exact-type guard on window can refuse
+        self.assertIsInstance(port.present([], STATUS, None, "yazili", "small"), port.ViewModel)
+        self.assertIsInstance(port.present([], STATUS, None, "yazili", Liar("small")), port.Refusal)
+
+    def test_records_refuse_delete(self):
+        vm = view([CARD])
+        cmd = port.validate({"name": "card_tap", "card_id": "card-abc", "choice": "approve"}, vm)
+        self.assertIsInstance(cmd, port.Command)
+        for record, field in [(vm, "rows"), (vm, "open_cards"), (vm.rows[0], "card_id"), (cmd, "name")]:
+            with self.assertRaises(AttributeError, msg=(type(record).__name__, field)):
+                delattr(record, field)
+            self.assertTrue(hasattr(record, field), field)
+
     def test_liar_who_or_kind_never_renders_a_real_row(self):
         # each case renders a real row (or an open card) if the exact-type guard on kind/who is loosened
         for fields in [{"who": Liar("salih")}, {"who": Liar("jarvis")}, {"kind": Liar("text"), "card_id": "card-x"},
@@ -291,6 +305,18 @@ class CommandTests(unittest.TestCase):
         self.assertIsInstance(port.validate(tap, sub), port.Refusal)
         plain = port.ViewModel((), "idle", "", "yazili", "small", frozenset({"card-a"}))
         self.assertIsInstance(port.validate(tap, plain), port.Command)
+
+    def test_card_tap_frozenset_subclass_open_cards_refused(self):
+        class Always(frozenset):
+            def __contains__(self, item):
+                return True
+
+        tap = {"name": "card_tap", "card_id": "card-nope", "choice": "approve"}
+        forged = port.ViewModel((), "idle", "", "yazili", "small", Always({"card-a"}))
+        self.assertIsInstance(port.validate(tap, forged), port.Refusal)
+        fake = port.FakeService([forged])
+        fake.view()
+        self.assertIsInstance(fake.send(tap), port.Refusal)
 
     def test_two_choices_two_buttons_and_both_taps_succeed_on_open_card(self):
         self.assertEqual(port.CHOICES, ("approve", "reject"))
