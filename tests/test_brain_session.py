@@ -255,5 +255,38 @@ class RunTest(Base):
         self.assertEqual(calls, [])
 
 
+class OwnChecksTest(unittest.TestCase):
+    """FIX2: brain_session keeps its own drive/device-name checks (test_project_folders_6h a4 audit)."""
+
+    REFUSED = ("NUL", "nul", "Nul", "con.txt", "nul.tar.gz", "lpt9 ", "Lpt9 .log", "com0", "COM9",
+               "com\u00b9", "lpt\u00b3.x", "conin$", "CONOUT$", "aux.", "prn")
+    ALLOWED = ("", "com10", "nul2", "xnul", "nu l", " nul", "con_", "lpt", "com", "conin", "repo", "aux-x")
+
+    def test_source_does_not_name_project_folders(self):
+        text = Path(bs.__file__).read_text(encoding="utf-8")
+        self.assertNotIn("project_folders", text)
+
+    def test_reserved_names(self):
+        each(self, self.REFUSED, lambda part: self.assertTrue(bs._reserved(part), part))
+        each(self, self.ALLOWED, lambda part: self.assertFalse(bs._reserved(part), part))
+
+    def test_same_behaviour_as_project_folders(self):
+        from jarvis import project_folders as pf
+        self.assertEqual(pf._RESERVED_STEMS, bs._RESERVED_STEMS)
+        self.assertEqual(pf._DRIVE_FIXED, bs._DRIVE_FIXED)
+        for part in self.REFUSED + self.ALLOWED + HOSTILE_PATH_PARTS:
+            with self.subTest(part=part):
+                self.assertEqual(pf._reserved(part), bs._reserved(part))
+
+    def test_drive_type_asks_kernel32_for_the_anchor(self):
+        import ctypes
+        kernel = mock.Mock()
+        kernel.GetDriveTypeW.return_value = 3
+        with mock.patch.object(ctypes, "WinDLL", create=True, return_value=kernel) as dll:
+            self.assertEqual(3, bs._drive_type("C:\\"))
+        dll.assert_called_once_with("kernel32")
+        self.assertEqual("C:\\", kernel.GetDriveTypeW.call_args.args[0].value)
+
+
 if __name__ == "__main__":
     unittest.main()
