@@ -272,6 +272,44 @@ class VerifyTests(unittest.TestCase):
         self.broke([("talk-0001.jsonl", b""), ("TALK-0001.jsonl", b"")],
                    "NAME_DUPLICATE", "TALK-0001.jsonl", 0)
 
+    def test_complete_lines_break_before_a_torn_tail(self):
+        segments = build([2, 1])
+        first, second = segments[0][1].split(b"\n")[:2]
+        head, record = segments[1][1].split(b"\n")[:2]
+        self.broke([("talk-0001.jsonl", b"x\nx")], "RECORD_INVALID", "talk-0001.jsonl", 1)
+        self.broke([("talk-0001.jsonl", first.replace(b"m1", b"mX") + b"\nx")],
+                   "HASH_MISMATCH", "talk-0001.jsonl", 1)
+        self.broke([("talk-0001.jsonl", head + b"\nx")], "TAMPER", "talk-0001.jsonl", 1)
+        self.broke([("talk-0001.jsonl", second + b"\nx")], "HASH_MISMATCH", "talk-0001.jsonl", 1)
+        one, h1 = seal({"id": 1, "entry": {}}, GENESIS)
+        three, _ = seal({"id": 3, "entry": {}}, h1)
+        self.broke([("talk-0001.jsonl", one + three + b"x")], "ID_OUT_OF_ORDER", "talk-0001.jsonl", 2)
+        self.broke([segments[0], ("talk-0002.jsonl", record + b"\nx")],
+                   "HEADER_MISSING", "talk-0002.jsonl", 1)
+        self.broke([segments[0], ("talk-0002.jsonl", head.replace(b'"count":2', b'"count":1')
+                                  + b"\nx")], "HEADER_MISMATCH", "talk-0002.jsonl", 1)
+        # Nothing complete before the tear: the torn line itself is the first break.
+        self.broke([segments[0], ("talk-0002.jsonl", head)], "LINE_TORN", "talk-0002.jsonl", 1)
+        self.broke([("talk-0001.jsonl", b"x")], "LINE_TORN", "talk-0001.jsonl", 1)
+        self.broke([segments[0], ("talk-0002.jsonl", segments[1][1] + b"x")],
+                   "LINE_TORN", "talk-0002.jsonl", 3)
+
+    def test_content_of_earlier_segments_breaks_before_a_later_gap(self):
+        segments = build([1, 1, 1, 1])
+        self.broke([("talk-0001.jsonl", b"x\n"), ("talk-0003.jsonl", b"")],
+                   "RECORD_INVALID", "talk-0001.jsonl", 1)
+        self.broke([(segments[0][0], segments[0][1] + b"x"), segments[2]],
+                   "LINE_TORN", "talk-0001.jsonl", 2)
+        self.broke([segments[0], (segments[1][0], segments[1][1].replace(b"m2", b"mX")),
+                    segments[3]], "HASH_MISMATCH", "talk-0002.jsonl", 2)
+        self.broke([("talk-0001.jsonl", b""), segments[2]], "SEGMENT_EMPTY", "talk-0001.jsonl", 0)
+        self.broke([segments[0], segments[2], segments[3]], "SEGMENT_GAP", "talk-0003.jsonl", 0)
+        # Names that cannot be ordered still break before any content is read.
+        self.broke([("talk-0001.jsonl", b"x\n"), ("talk-1.jsonl", b"")],
+                   "NAME_INVALID", "talk-1.jsonl", 0)
+        self.broke([("talk-0001.jsonl", b"x\n"), ("talk-0001.jsonl", b"")],
+                   "SEGMENT_DUPLICATE", "talk-0001.jsonl", 0)
+
     def test_more_than_9999_segments_verify_in_number_order(self):
         segments = build([1] * 10001)
         last = hash_of(segments[-1][1].split(b"\n")[-2])
@@ -295,6 +333,24 @@ class PurityTests(unittest.TestCase):
                 self.assertNotIn((node.module or "").split(".")[0], self.BANNED)
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 self.assertNotIn(node.func.id, {"open", "__import__", "eval", "exec"})
+
+    def test_no_public_name_maker_and_no_public_call_raises(self):
+        self.assertFalse(hasattr(ts, "make_name"))
+        public = [value for key, value in vars(ts).items() if not key.startswith("_")
+                  and callable(value) and not isinstance(value, type)
+                  and getattr(value, "__module__", "") == ts.__name__]
+        self.assertEqual(sorted(fn.__name__ for fn in public),
+                         ["next_name", "order", "roll", "should_roll", "verify"])
+        for fn in public:
+            for bad in (None, "1", 0, -1, True, 10**9, 1.5, math.nan, [None], {}, b"x"):
+                for arity in range(4):
+                    with self.subTest(fn=fn.__name__, bad=repr(bad), arity=arity):
+                        try:
+                            result = fn(*([bad] * arity))
+                        except Exception as exc:  # pragma: no cover - the failure itself
+                            self.fail(f"{fn.__name__} raised {type(exc).__name__}")
+                        if type(result) is str:
+                            self.assertEqual(ts.order([result]), (result,))
 
     def test_refusal_texts_are_ascii(self):
         with adversarial.narrow_stdout() as stream:
