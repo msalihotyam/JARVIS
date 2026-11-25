@@ -322,9 +322,15 @@ def _ci_watch(i: dict[str, Any]) -> Judged:
     return rec.agreement, rec.n6, rec.conveyor
 
 
+_SHA40 = re.compile(r"[0-9a-f]{40}")
+
+
 def _cleanup(i: dict[str, Any]) -> Judged:
+    raw = i["main_shas"]  # JSON gives a list; cleanup_compare needs a set
+    if type(raw) is not list or not all(type(s) is str and _SHA40.fullmatch(s) for s in raw):
+        return None  # malformed main_shas: not judged, not counted
     now = datetime.fromisoformat(i["now"])
-    out = cleanup_compare(i["lanes"], i["main_shas"], i["evidence"], i["events"], clock=lambda: now,
+    out = cleanup_compare(i["lanes"], frozenset(raw), i["evidence"], i["events"], clock=lambda: now,
                           timeout=timedelta(seconds=i["timeout_s"]), root=i["root"])
     if out.get("error") or len(out["records"]) != 1:
         return None
@@ -438,9 +444,15 @@ def feed(root: Path, events: list[dict[str, Any]], *, clock: Callable[[], dateti
     if history is None:  # an unreadable history would re-append every noted event
         errors.append(f"{PHASE4} unreadable: pass skipped")
         events = []
-    seen = {(r["group"], r["event_id"]) for r in history or []
+    elif not isinstance(events, list):
+        errors.append(f"events is not a list: {type(events).__name__}")
+        events = []
+    seen ={(r["group"], r["event_id"]) for r in history or []
             if isinstance(r.get("group"), str) and isinstance(r.get("event_id"), str)}
     for event in events:
+        if not isinstance(event, dict):
+            errors.append(f"event is not an object: {type(event).__name__}")
+            continue
         eid = event.get("event_id")
         if not isinstance(eid, str) or not eid.strip():
             errors.append(f"event without event_id: {str(eid)[:80]!r}")
