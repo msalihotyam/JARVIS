@@ -40,16 +40,20 @@ def report(ids, *, shard=None, green=True, failures=0, errors=0, wall=10.0, dura
 IDS = ["tests.test_a.A.test_1", "tests.test_b.B.test_1"]
 
 
-def write_run(base: Path, name: str, *, windows=None, linux=None, win_summary="", linux_summary="") -> Path:
+def write_run(base: Path, name: str, *, windows=None, linux=None, win_summary="", linux_summary="",
+              run_id=None) -> Path:
     run = base / name
+    run_id = name if run_id is None else run_id  # tests.yml writes github.run_id beside each report
     if windows is not None:
         (run / "ci-shard-1").mkdir(parents=True)
         (run / "ci-shard-1" / "shard-report.json").write_text(json.dumps(windows), encoding="utf-8")
         (run / "ci-shard-1" / "shard-summary.txt").write_text(win_summary, encoding="utf-8")
+        (run / "ci-shard-1" / "run-id.txt").write_text(run_id, encoding="utf-8")
     if linux is not None:
         (run / "ci-os-shadow").mkdir(parents=True)
         (run / "ci-os-shadow" / "os-shadow-report.json").write_text(json.dumps(linux), encoding="utf-8")
         (run / "ci-os-shadow" / "os-shadow-summary.txt").write_text(linux_summary, encoding="utf-8")
+        (run / "ci-os-shadow" / "run-id.txt").write_text(run_id, encoding="utf-8")
     run.mkdir(parents=True, exist_ok=True)
     return run
 
@@ -155,6 +159,32 @@ class CompareTests(unittest.TestCase):
             self.assertEqual(shadow.main(["compare", a, b, "--runs-needed", "2"]), 2)
         self.assertIn("same report", err.getvalue())
 
+    def test_fix2_run_dirs_must_each_hold_one_distinct_ci_run(self):
+        def refused(*dirs):
+            err = io.StringIO()
+            with mock.patch.object(shadow, "read_list", return_value=MODS), \
+                    contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+                self.assertEqual(shadow.main(["compare", *map(str, dirs), "--runs-needed", "2"]), 2)
+            return err.getvalue()
+
+        other = report(IDS, wall=41.0)
+        mixed = write_run(self.tmp, "mixed", windows=GREEN_W, linux=other)
+        (mixed / "ci-os-shadow" / "run-id.txt").write_text("999", encoding="utf-8")
+        self.assertIn("mixes the artifacts of CI runs", refused(mixed, write_run(self.tmp, "ok1", linux=GREEN_L)))
+        for name, content in (("no run id", None), ("empty run id", " \n")):
+            with self.subTest(name):
+                run = write_run(self.tmp, name.replace(" ", "-"), windows=GREEN_W, linux=other)
+                beside = run / "ci-shard-1" / "run-id.txt"
+                beside.unlink() if content is None else beside.write_text(content, encoding="utf-8")
+                self.assertIn("has no run-id.txt", refused(run, write_run(self.tmp, f"ok-{name[0]}", linux=GREEN_L)))
+        a = write_run(self.tmp, "rerun-a", windows=GREEN_W, run_id="42")
+        b = write_run(self.tmp, "rerun-b", linux=GREEN_L, run_id="42")
+        self.assertIn("same CI run", refused(a, b))
+        good = [str(write_run(self.tmp, f"good{i}", windows=report(IDS, shard=[1, 1], wall=100.0 + i),
+                              linux=report(IDS, wall=40.0 + i))) for i in range(2)]
+        with mock.patch.object(shadow, "read_list", return_value=MODS), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(shadow.main(["compare", *good, "--runs-needed", "2"]), 0)
+
     def test_fix_a_skip_on_either_side_is_never_pass_same_or_safe(self):
         skip_a = [("tests.test_a.A.test_1", "no tool")]
         red_l = dict(linux=report(IDS, green=False, failures=1, skips=skip_a), linux_summary=FAIL_B)
@@ -168,7 +198,8 @@ class CompareTests(unittest.TestCase):
                      linux=report(IDS, green=False, failures=1, skips=skip_a),
                      win_summary="FAIL: test_2 (tests.test_a.A.test_2)\n",
                      linux_summary="FAIL: test_2 (tests.test_a.A.test_2)\n"),
-                 "setUpClass skip (class id)": dict(windows=GREEN_W, linux=report(IDS, skips=[("tests.test_a.A", "x")]))}
+                 "setUpClass skip (class id)": dict(windows=GREEN_W, linux=report(IDS, skips=[("tests.test_a.A", "x")])),
+                 "module id skip": dict(windows=GREEN_W, linux=report(IDS, skips=[("tests.test_a", "x")]))}
         for name, kw in cases.items():
             with self.subTest(name):
                 runs = self.runs(10, **kw)
@@ -178,10 +209,19 @@ class CompareTests(unittest.TestCase):
                 self.assertEqual(rows["tests.test_a"]["verdicts"], ["skipped"] * 10)
                 self.assertFalse(rows["tests.test_a"]["safe"])
 
-    def test_fix_a_skip_in_an_unlisted_module_leaves_listed_modules_alone(self):
-        rows = shadow.compare(self.runs(10, windows=GREEN_W, linux=report(IDS, skips=[("tests.test_c.C.t", "x")])),
-                              MODS, 10)
-        self.assertTrue(all(r["safe"] for r in rows.values()))
+    def test_fix2_a_skip_on_an_id_not_dispatched_makes_the_side_unknown(self):
+        # CIOSSHADOW1FIX2 F1: an id that is not a dispatched id nor its class/module hides which test skipped
+        foreign = ["tests.test_c.C.t", "tests.test_a.A.test_9", "tests.test_a.Z", "tests.test_a.A.test_",
+                   "tests.test_a.A.tes", "tests.test_a.A.", "tests.test_a.A.test_1.x", "tests.test_A.A.test_1",
+                   " tests.test_a.A.test_1", "tests.test_a.A.test_1 ", "tests", "", "tests.test_", None, 5,
+                   ["tests.test_a.A.test_1"]]
+        for test in foreign:
+            with self.subTest(test=test):
+                run = self.runs(1, windows=GREEN_W, linux=report(IDS, skips=[(test, "x")]))[0]
+                self.assertEqual({s for s, _, _ in run["linux"]["results"].values()}, {"unknown"})
+        runs = self.runs(10, windows=report(IDS, shard=[1, 1], skips=[("tests.test_c.C.t", "x")]), linux=GREEN_L)
+        self.assertEqual({s for s, _, _ in runs[-1]["windows"]["results"].values()}, {"unknown"})
+        self.assertFalse(any(r["safe"] for r in shadow.compare(runs, MODS, 10).values()))
 
     def test_fix_unaccountable_skips_make_the_side_unknown(self):
         unnamed = report(IDS, skips=[("?", "x")])
@@ -209,7 +249,9 @@ class StaticCheckTests(unittest.TestCase):
               "import ctypes.wintypes as w", "ctypes.oledll.ole32", "from ctypes import WINFUNCTYPE",
               "raise ctypes.WinError()", "ctypes.GetLastError()", "ctypes.FormatError(5)",
               "ctypes.CDLL('kernel32')", "ctypes.cdll.LoadLibrary('User32.dll')", "import _winapi",
-              "import winsound", "os.startfile(path)"]
+              "import winsound", "os.startfile(path)",
+              # CIOSSHADOW1FIX2 F3
+              "ctypes.get_last_error()", "ctypes.set_last_error(0)", "hr = HRESULT(0)"]
 
     def setUp(self):
         self.tests = Path(tempfile.mkdtemp(prefix="ciosshadow1-tests-"))
