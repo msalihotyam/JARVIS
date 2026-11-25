@@ -107,7 +107,7 @@ def _route(entry: object, hold_seconds: object) -> Route:
         return Route(REFUSED, "bad_text")
     if attachments is None:
         attachments = ()
-    if type(attachments) not in (list, tuple):
+    if type(attachments) is not list and type(attachments) is not tuple:  # identity: `in` falls back to ==
         return Route(REFUSED, "bad_attachments")
 
     if kind == "approval_tap":  # before any text rule: a tap never becomes a turn
