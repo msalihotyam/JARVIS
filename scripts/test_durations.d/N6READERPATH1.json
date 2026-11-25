@@ -1,0 +1,7 @@
+{
+ "version": 1,
+ "classes": {
+  "tests.test_n6_reader_path.GarbageReaderOutputTests": 25.0,
+  "tests.test_n6_reader_path.StaticScanTests": 4.0
+ }
+}
