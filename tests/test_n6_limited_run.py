@@ -10,6 +10,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 from jarvis import n6_deps, n6_kpi, n6_lease, n6_notify
 from jarvis.notify import NotificationCore
@@ -70,7 +71,7 @@ class LimitedRun(unittest.TestCase):
             raise AssertionError("an N6 port was called with the switch off")
 
         notes = lr.tick(self.root, lr.Ports(now=boom, verify=boom, tier=boom, situation=boom,
-                                            run=boom, ttl_s=600.0, page=boom))
+                                            run=boom, ttl_s=600.0, page=boom, stop=boom))
         self.assertEqual(notes, [])
         self.assertEqual(sorted(p.name for p in self.n6.iterdir()), before)
         self.assertEqual(self.states(), snap)
@@ -626,6 +627,162 @@ class LimitedInputs(unittest.TestCase):
         self.assertEqual(lr.sync_backlog(self.root, deps), ["A: queued for N6"])
         self.assertEqual(lr.sync_backlog(self.root, deps), [])
         self.assertEqual([e["id"] for e in json.loads(deps.read_text())["backlog"]], ["A"])
+
+
+def V(decision, reason="x"):
+    return lr.n6_stop.Verdict(decision, reason)
+
+
+OLD, NEW = datetime.fromtimestamp(500, timezone.utc), datetime.fromtimestamp(2000, timezone.utc)
+UNREADABLE = "n6 stopped: stop record unreadable (fix it by hand)"
+NO_NOTE, NO_GO = "n6 stopped: no root-cause note", "n6 stopped: no operator go for this stop"
+
+
+class StopGate(unittest.TestCase):
+    """N6STOP2B: the runner obeys jarvis.n6_stop under the lease; a stop record gates every tick."""
+
+    setUp, on, backlog, run_port = LimitedRun.setUp, LimitedRun.on, LimitedRun.backlog, LimitedRun.run_port
+    ports, live, states = LimitedRun.ports, LimitedRun.live, LimitedRun.states
+
+    def go(self, *items, **kw):
+        self.on()
+        self.backlog(*(items or (n6_deps.Item("A-1"),)))
+        return lr.tick(self.root, self.ports(**kw))
+
+    def rec(self):
+        return json.loads((self.n6 / "stop.json").read_text(encoding="utf-8"))
+
+    def real(self, usage=40.0):
+        conv = self.root / "build" / "conveyor"
+        conv.mkdir(parents=True, exist_ok=True)
+        (conv / "status.json").write_text(json.dumps({"usage_pct": usage}), encoding="utf-8")
+        return lambda sid: lr._stop_check(sid, self.root)
+
+    def kpi(self, sid, source, tokens, security=0, at=OLD):
+        n6_kpi.record(self.n6 / "kpi.db", n6_kpi.KpiRow(sid, source, True, 0, 0, tokens, 1.0, security, at))
+
+    def event(self, run, verdict, at=OLD):
+        n6_kpi.record_limited(self.n6 / "kpi.db", n6_kpi.LimitedEvent("Z-9", run, at, at, verdict, "0123abcd"))
+
+    def test_stop_starts_nothing_releases_and_records(self):
+        notes = self.go(stop=lambda s: V("STOP", "security_incident"))
+        self.assertEqual(self.ran, [])
+        self.assertIn("A-1: handed back (n6 stop: security_incident)", notes)
+        self.assertEqual(self.live(), frozenset())
+        self.assertRegex(self.rec()["id"], r"^[0-9a-f]{16}$")
+        self.assertEqual(self.rec()["slice_id"], "A-1")
+        self.assertIn('"pending"', self.states())
+
+    def test_pause_hands_back_without_a_record(self):
+        notes = self.go(stop=lambda s: V("PAUSE", "quota_line"))
+        self.assertEqual(self.ran, [])
+        self.assertIn("A-1: handed back (n6 pause: quota_line)", notes)
+        self.assertFalse((self.n6 / "stop.json").exists())
+        self.assertEqual(self.live(), frozenset())
+
+    def test_continue_runs(self):
+        self.assertIn("A-1: PASS", self.go(stop=lambda s: V("CONTINUE", "ok")))
+        self.assertEqual(self.ran, ["A-1"])
+
+    def test_record_refuses_until_note_and_go_for_this_stop(self):
+        self.go(stop=lambda s: V("STOP"))
+        sid, ok = self.rec()["id"], (lambda s: V("CONTINUE", "ok"))
+        tick = lambda: lr.tick(self.root, self.ports(stop=ok))  # noqa: E731
+        self.assertIn(NO_NOTE, tick())  # negative 1
+        (self.n6 / "stop_rootcause.md").write_text("some other stop", encoding="utf-8")
+        self.assertIn(NO_NOTE, tick())
+        (self.n6 / "stop_rootcause.md").write_text(f"stop {sid}: the cause", encoding="utf-8")
+        self.assertIn(NO_GO, tick())  # negative 2
+        (self.n6 / "stop_go").write_text("not-the-id", encoding="utf-8")
+        self.assertIn(NO_GO, lr.tick(self.root, self.ports()))  # refused with no stop port too
+        self.assertEqual(self.ran, [])
+        (self.n6 / "stop_go").write_text(sid + "\n", encoding="utf-8")
+        self.assertIn("A-1: PASS", tick())
+        self.go(n6_deps.Item("C-4"), stop=lambda s: V("STOP"))  # a second STOP: the old note/go are stale
+        self.assertNotEqual(self.rec()["id"], sid)
+        self.assertIn(NO_NOTE, tick())
+        self.assertEqual(self.ran, ["A-1"])
+
+    def test_corrupt_record_counts_as_stop(self):  # negative 3
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        for text in ("{bad", "[]", '{"id": ""}', '{"id": "  "}', '{"id": 7}', "", '{"x": 1}'):
+            with self.subTest(text=text):
+                (self.n6 / "stop.json").write_text(text, encoding="utf-8")
+                self.assertIn(UNREADABLE, lr.tick(self.root, self.ports(stop=lambda s: V("CONTINUE"))))
+        self.assertEqual(self.ran, [])
+
+    def test_raising_or_unknown_evaluator_starts_nothing(self):  # negative 4
+        def boom(sid):
+            raise RuntimeError("evaluator down")
+        cases = [(boom, "A-1: handed back (RuntimeError)"),
+                 (lambda s: "CONTINUE", "A-1: handed back (n6 stop check: no verdict)"),
+                 (lambda s: V("MAYBE"), "A-1: handed back (n6 stop check: no verdict)")]
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        for stop, want in cases:
+            with self.subTest(want=want):
+                self.assertIn(want, lr.tick(self.root, self.ports(stop=stop)))
+        self.assertEqual(self.ran, [])
+        self.assertEqual(self.live(), frozenset())
+        self.assertFalse((self.n6 / "stop.json").exists())
+
+    def test_main_wires_the_real_stop_check(self):
+        self.on()
+        seen = []
+        with mock.patch.object(lr, "ROOT", self.root), \
+                mock.patch.object(lr, "tick", side_effect=lambda root, ports: seen.append(ports) or []):
+            self.assertEqual(lr.main([]), 0)
+        self.assertIs(seen[0].stop, lr._stop_check)
+
+    def test_healthy_real_inputs_continue_end_to_end(self):  # acceptance 4 and 5
+        self.kpi("Z-9", "conveyor", 1000)
+        self.kpi("Z-9", "n6", 0)
+        self.event("1", "PASS")
+        stop = self.real()
+        self.assertEqual(stop("A-1"), V("CONTINUE", "ok"))
+        with mock.patch.object(lr.n6_stop, "evaluate", wraps=lr.n6_stop.evaluate) as ev:
+            notes = self.go(stop=stop)
+        self.assertEqual(self.ran, ["A-1"])
+        self.assertIn("A-1: PASS", notes)
+        ev.assert_called_once()
+        self.assertEqual(set(ev.call_args.kwargs), {"rows", "events", "usage_pct", "n6_share_pct"})
+        self.assertTrue(all(v is not None for v in ev.call_args.kwargs.values()))
+        self.assertEqual(len(ev.call_args.kwargs["rows"]), 2)
+
+    def test_real_inputs_map_to_pause_and_stop(self):
+        for run in "123":
+            self.event(run, "BLOCKED")
+        self.assertEqual(self.real()("A-1"), V("PAUSE", "blocked_streak"))
+        self.assertEqual(self.real(usage=96.0)("A-1"), V("PAUSE", "quota_line"))
+        self.kpi("Z-8", "n6", 500)
+        self.kpi("Z-8", "conveyor", 500)
+        self.event("4", "PASS")
+        self.assertEqual(self.real()("A-1"), V("PAUSE", "n6_share_cap"))
+
+    def test_security_row_stops_and_a_cleared_stop_rejudges_only_newer_evidence(self):
+        self.kpi("Z-9", "conveyor", 10, security=1)
+        notes = self.go(stop=self.real())
+        self.assertIn("A-1: handed back (n6 stop: security_incident)", notes)
+        self.assertEqual(self.ran, [])
+        sid = self.rec()["id"]
+        (self.n6 / "stop_rootcause.md").write_text(sid, encoding="utf-8")
+        (self.n6 / "stop_go").write_text(sid, encoding="utf-8")
+        self.assertIn("A-1: PASS", lr.tick(self.root, self.ports(stop=self.real())))
+        self.kpi("Z-7", "n6", 0, security=1, at=NEW)  # newer than the cleared stop: STOP again
+        self.assertEqual(self.real()("C-4"), V("STOP", "security_incident"))
+
+    def test_unreadable_status_starts_nothing_and_creates_no_db(self):
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        for text in (None, "{bad", '{"usage_pct": null}', '{"usage_pct": "40"}'):
+            with self.subTest(text=text):
+                stop = self.real()
+                path = self.root / "build" / "conveyor" / "status.json"
+                path.unlink() if text is None else path.write_text(text, encoding="utf-8")
+                self.assertIn("A-1: handed back (ValueError)", lr.tick(self.root, self.ports(stop=stop)))
+        self.assertEqual(self.ran, [])
+        self.assertFalse((self.n6 / "kpi.db").exists())
 
 
 if __name__ == "__main__":

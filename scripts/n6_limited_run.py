@@ -27,6 +27,14 @@ or refuses it, writing build/n6/claim_result.json. The next tick settles the
 claim: a refused or expired claim goes back to pending, a started one waits for
 the conveyor's lanes.json verdict, then n6_record_finish + n6_deps.record.
 A runner that raises after the mark hands the slice back to pending.
+
+N6STOP2B: under the lease, before anything else, ``ports.stop`` (production:
+``_stop_check``, jarvis.n6_stop.evaluate over build/n6/kpi.db and the conveyor's
+status.json) is consulted. PAUSE hands the slice back; STOP hands it back and
+writes build/n6/stop.json {"id", ...}; a raising or unknown verdict hands it
+back. While stop.json exists every tick is refused until build/n6/stop_rootcause.md
+names its id AND build/n6/stop_go holds exactly that id; an unreadable record
+counts as a STOP.
 """
 
 from __future__ import annotations
@@ -37,6 +45,7 @@ import json
 import math
 import os
 import re
+import secrets
 import sqlite3
 import subprocess
 import sys
@@ -51,7 +60,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from jarvis import n6_deps, n6_kpi, n6_lease  # noqa: E402
+from jarvis import n6_deps, n6_kpi, n6_lease, n6_stop  # noqa: E402
 from jarvis.n6_breaker import BAD, GOOD  # noqa: E402
 from jarvis.work_planner import n6_next  # noqa: E402
 from jarvis.work_supervisor import DEFAULT_POLICY, Situation, n6_record_finish, supervise  # noqa: E402
@@ -70,6 +79,7 @@ class Ports:
     ttl_s: float  # >= the runner's wall cap; the lease is never renewed here
     page: Callable[[Path], object] | None = None  # e.g. n6_notify.flush over notify.json
     receipt: Callable[[str], object] | None = None  # N6EVT1: the finished run's receipt id (8 hex)
+    stop: Callable[[str], object] | None = None  # N6STOP2B: an n6_stop.Verdict; None = no check (tests only)
 
 
 def _emit(n6: Path, sid: str, run_id: str, start: float, end: float, verdict: str,
@@ -203,6 +213,9 @@ def _step(root: Path | str, n6: Path, ports: Ports) -> list[str]:
     t0 = ports.now()
     if _expires(t0, ports.ttl_s) is None:
         return [held]
+    refused = _stopped(n6)
+    if refused:
+        return [refused]
     if n6_lease.live_slices(lease_path, t0) != frozenset():
         return ["lease held: nothing started"]
     pick = n6_deps.pick(deps, ports.verify)  # read-only: nothing is marked before the lease
@@ -222,6 +235,9 @@ def _step(root: Path | str, n6: Path, ports: Ports) -> list[str]:
         return [*notes, "lease held: nothing started"]
     ran = marked = kept = False
     try:
+        stopped = _consult(n6, ports, sid, t0)  # a raising evaluator lands in except: handed back
+        if stopped:
+            return [*notes, stopped]
         decision = supervise(ports.situation(sid), n6_dir=n6, slice_id=sid)
         if decision.constraint != "any":  # N6 lanes are Claude: non_claude_only holds too
             return [*notes, f"{sid}: handed back ({decision.rule_id})"]
@@ -423,6 +439,75 @@ def _read_json(path: Path) -> object:
         return None
 
 
+def _stopped(n6: Path) -> str | None:
+    """N6STOP2B: a stop record refuses every tick until its root-cause note and operator go exist."""
+    rec_path = n6 / "stop.json"
+    if not rec_path.exists():
+        return None
+    rec = _read_json(rec_path)
+    sid = rec.get("id") if isinstance(rec, dict) else None
+    if not isinstance(sid, str) or not sid.strip():
+        return "n6 stopped: stop record unreadable (fix it by hand)"  # corrupt counts as STOP
+    try:
+        note = (n6 / "stop_rootcause.md").read_text(encoding="utf-8")
+    except (OSError, ValueError):
+        note = ""
+    if sid not in note:
+        return "n6 stopped: no root-cause note"
+    try:
+        go = (n6 / "stop_go").read_text(encoding="utf-8").strip()
+    except (OSError, ValueError):
+        go = ""
+    return None if go == sid else "n6 stopped: no operator go for this stop"
+
+
+def _consult(n6: Path, ports: Ports, sid: str, t0: float) -> str | None:
+    if ports.stop is None:
+        return None
+    v = ports.stop(sid)
+    if not isinstance(v, n6_stop.Verdict):
+        return f"{sid}: handed back (n6 stop check: no verdict)"
+    if v.decision == n6_stop.CONTINUE:
+        return None
+    if v.decision == n6_stop.PAUSE:
+        return f"{sid}: handed back (n6 pause: {v.reason})"
+    if v.decision == n6_stop.STOP:
+        _put(n6 / "stop.json", {"id": secrets.token_hex(8), "slice_id": sid, "reason": v.reason,
+                                "at": _now(ports, t0)})
+        return f"{sid}: handed back (n6 stop: {v.reason})"
+    return f"{sid}: handed back (n6 stop check: no verdict)"
+
+
+def _stop_inputs(root: Path | str = ROOT) -> dict[str, object]:
+    """The evaluator's inputs from the real state; never None. Unreadable status raises (no start)."""
+    root = Path(root)
+    n6, kpi = root / "build" / "n6", root / "build" / "n6" / "kpi.db"
+    rows = list(n6_kpi.rows(kpi)) if kpi.exists() else []  # exists(): sqlite3.connect creates files
+    done = sorted(n6_kpi.limited_events(kpi), key=lambda e: e.ended_at) if kpi.exists() else []
+    st = _read_json(root / "build" / "conveyor" / "status.json")
+    usage = st.get("usage_pct") if isinstance(st, dict) else None
+    if not _num(usage):
+        raise ValueError("status.json usage_pct unreadable")
+    # shortcut: lifetime quota_tokens share, not weekly, and limited-run tokens are not attributed
+    # to n6 (n6_shadow_run writes 0 for n6 rows); upgrade when a weekly N6 token count exists.
+    total = sum(r.quota_tokens for r in rows)
+    share = 100.0 * sum(r.quota_tokens for r in rows if r.source == "n6") / total if total else 0.0
+    # A cleared stop (gate passed) only re-judges evidence newer than it; else an old row re-STOPs forever.
+    rec = _read_json(n6 / "stop.json")
+    at = rec.get("at") if isinstance(rec, dict) else None
+    if _num(at):
+        cut = datetime.fromtimestamp(at, timezone.utc)  # pyright: ignore[reportArgumentType]
+        rows = [r for r in rows if r.recorded_at > cut]
+        done = [e for e in done if e.ended_at > cut]
+    events = [n6_stop.Event("pass" if e.verdict in GOOD else "blocked", "n6")
+              for e in done if e.verdict in GOOD | BAD]
+    return {"rows": rows, "events": events, "usage_pct": usage, "n6_share_pct": min(share, 100.0)}
+
+
+def _stop_check(sid: str, root: Path | str = ROOT) -> n6_stop.Verdict:
+    return n6_stop.evaluate(**_stop_inputs(root))  # pyright: ignore[reportArgumentType]
+
+
 def backfill(root: Path | str = ROOT) -> list[str]:
     """N6EVT1, read-only: every past N6 slice (deps.json done/blocked) marked "evidenced <receipt>"
     only when an N6 dispatch event, its finished lanes.json entry and the recorded state all
@@ -486,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     # ponytail: no phone send wired (page=None); n6_notify.flush when the LIMITED phase wants it.
     ports = Ports(now=time.time, verify=_verify, tier=_tier, situation=_situation,
-                  run=lambda sid, lease: write_claim(n6, lease), ttl_s=900.0)
+                  run=lambda sid, lease: write_claim(n6, lease), ttl_s=900.0, stop=_stop_check)
     for note in tick(ROOT, ports):
         print(note)
     return 0
