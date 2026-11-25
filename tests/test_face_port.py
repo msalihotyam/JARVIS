@@ -175,6 +175,16 @@ class PresentTests(unittest.TestCase):
             self.assertEqual(view([entry(kind="file", attachments=att)]).rows[0].chips, ())
         self.assertIsInstance(port.present(Many([entry()]), STATUS, None, "yazili", "small"), port.Refusal)
 
+    def test_metaclass_eq_subclass_is_refused(self):
+        # a metaclass __eq__ fools `type(x) in (...)`; only identity checks refuse these
+        meta = type("Meta", (type,), {"__eq__": lambda cls, other: True, "__hash__": type.__hash__})
+        many = meta("Many", (list,), {"__getitem__": lambda self, index: [entry(id=i) for i in range(500)]})
+        self.assertIsInstance(port.present(many([entry()]), STATUS, None, "yazili", "small"), port.Refusal)
+        att = meta("Att", (list,), {})([{"name": "a.pdf", "size": 1}])
+        self.assertEqual(view([entry(kind="file", attachments=att)]).rows[0].chips, ())
+        sneaky_id = meta("Id", (int,), {})(7)
+        self.assertIsNone(view([entry(id=sneaky_id)]).rows[0].entry_id)
+
     def test_aliased_or_non_str_keys_are_not_plain(self):
         self.assertIsInstance(port.present([], swap_key(STATUS, "ring"), None, "yazili", "small"), port.Refusal)
         self.assertIsInstance(port.present([], {**STATUS, 1: "x"}, None, "yazili", "small"), port.Refusal)
