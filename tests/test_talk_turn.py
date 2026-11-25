@@ -419,3 +419,99 @@ class FixTests(unittest.TestCase):
             self.assertEqual((out.status, out.reason, out.reply), (FAILED, "bad_reply", None))
             self.assertEqual((out.dropped_fields, out.dropped_proposals), (fields, names), repr(answer)[:80])
             self.assertEqual(fake.log, [])
+
+
+def forged_reply(field, lie, real):
+    """A Reply whose __dict__ holds a Once key lying about field beside the real stored value."""
+    reply = Reply("ok", False, ())
+    key = Once(field)
+    fields = {key: lie, **{k: v for k, v in vars(reply).items() if k != field}}
+    key.seen = True
+    fields[field] = real
+    key.seen = False
+    object.__setattr__(reply, "__dict__", fields)
+    return reply
+
+
+class Fix2Tests(unittest.TestCase):
+    """TALKTURN1FIX2: retry Reply fields read once into a fresh Reply; proposals type checked by identity."""
+
+    def test_forged_dict_retry_reply_refused(self):
+        cases = (("text", "ok", {"action": "x"}), ("needs_you", False, "yes"),
+                 ("proposals", (), ["a"]), ("proposals", (), ("../a",)))
+        for field, lie, real in cases:
+            fake = Fake()
+            out = process(salih(), fake.steps(), forged_reply(field, lie, real))
+            self.assertEqual((out.status, out.reason, out.reply), (REFUSED, "bad_reply", None), field)
+            self.assertEqual(fake.log, [])
+            self.assertNotIn("build_packet", fake.names())
+
+    def test_retry_record_and_outcome_share_one_fresh_reply(self):
+        forged = forged_reply("text", "smuggled", "real")
+        fake = Fake()
+        out = process(salih(), fake.steps(), forged)
+        self.assertEqual((out.status, out.reply), (DONE, Reply("real", False, ())))
+        self.assertIsNot(out.reply, forged)
+        self.assertIs(type(out.reply.text), str)
+        self.assertIs(fake.log[0]["text"], out.reply.text)
+
+    def test_retry_reply_dict_raising_missing_or_subclass_refused(self):
+        class Sub(Reply):
+            pass
+        replies = [Sub("ok", False, ())]
+        missing = Reply("ok", False, ())
+        object.__setattr__(missing, "__dict__", {"text": "ok", "needs_you": False})
+        replies.append(missing)
+        for exc in stop_variants():
+            class Raises(dict):
+                def items(self, exc=exc):
+                    raise exc
+            reply = Reply("ok", False, ())
+            object.__setattr__(reply, "__dict__", Raises(vars(reply)))
+            replies.append(reply)
+        for reply in replies:
+            fake = Fake()
+            out = process(salih(), fake.steps(), reply)
+            self.assertEqual((out.status, out.reason), (REFUSED, "bad_reply"), type(reply).__name__)
+            self.assertEqual(fake.log, [])
+
+    def test_proposals_metaclass_eq_never_runs(self):
+        class Forge(type):
+            def __eq__(cls, other):
+                raise tt._Stop(REFUSED, "not_salih")
+            __hash__ = type.__hash__
+
+        class Yes(type):
+            def __eq__(cls, other):
+                return True
+            __hash__ = type.__hash__
+
+        class P(metaclass=Forge):
+            pass
+
+        class L(list, metaclass=Yes):
+            def __len__(self):
+                return 0
+
+        class T(tuple, metaclass=Forge):
+            pass
+        for proposals in (P(), L(["a"]), T(("a",)), L()):
+            fake = Fake({"text": "fine", "proposals": proposals})
+            out = process(salih(), fake.steps())
+            self.assertEqual((out.status, out.reason, out.reply), (DONE, "ok", Reply("fine", False, ())))
+            self.assertEqual(out.dropped_proposals, 1, type(proposals).__name__)
+            self.assertEqual(fake.log[0]["text"], "fine")
+
+    def test_names_runs_inside_reduce_guard(self):
+        original = tt._names
+        for exc in stop_variants():
+            def boom(names, exc=exc):
+                raise exc
+            tt._names = boom
+            try:
+                fake = Fake()
+                out = process(salih(), fake.steps())
+            finally:
+                tt._names = original
+            self.assertEqual((out.status, out.reason), (FAILED, "bad_reply"), repr(exc)[:80])
+            self.assertEqual(fake.log, [])
