@@ -7,6 +7,7 @@ import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Protocol
 
 from jarvis import talk_speech as ts
 from tests.adversarial import HOSTILE_NUMBERS, HOSTILE_PATH_PARTS, HOSTILE_TEXT, each
@@ -47,8 +48,10 @@ def ascii_codes(case, result):
 
 class InterfaceTests(unittest.TestCase):
     def test_protocols_and_fakes(self):
-        self.assertTrue(hasattr(ts.SpeechToText, "transcribe"))
-        self.assertTrue(hasattr(ts.TextToSpeech, "speak"))
+        for proto, method in ((ts.SpeechToText, "transcribe"), (ts.TextToSpeech, "speak")):
+            self.assertIs(getattr(proto, "_is_protocol", False), True, proto)
+            self.assertIn(Protocol, proto.__mro__)
+            self.assertTrue(callable(getattr(proto, method)))
         stt = ts.FakeSpeechToText("selam", 2.5)
         self.assertEqual(stt.transcribe(GOOD, "h"), ("selam", 2.5))
         self.assertEqual(stt.calls, [(GOOD, "h")])
@@ -251,6 +254,134 @@ class VoiceOutTests(unittest.TestCase):
         for text in ("a\x00b", "a\ud800b", "a\u202eb"):
             self.assert_text_only(ts.voice_out(text, ts.FakeTextToSpeech(), None), text,
                                   "unsafe_text")
+
+
+class LyingStr(str):
+    """str subclass whose methods lie: the value must never pass an exact-str check."""
+
+    def split(self, *args):
+        return ["safe.wav"]
+
+    def strip(self, *args):
+        return "ok"
+
+    def __len__(self):
+        return 1
+
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+    __hash__ = str.__hash__
+
+
+class Raising:
+    def __init__(self, error):
+        self.error = error
+
+    def __len__(self):
+        raise self.error
+
+    def strip(self):
+        raise self.error
+
+
+class TypeConfusionTests(unittest.TestCase):
+    """TALKSPEECH1FIX: exact str/tuple checks; a hostile prepare return keeps the text."""
+
+    def test_str_subclass_record_fields_refused_before_engine(self):
+        refusal = RecordRefusalTests("assert_refused_before_engine")
+        cases = (("relative_path", LyingStr("../escape.wav"), "record_bad_path"),
+                 ("relative_path", LyingStr("voice/a.wav"), "record_bad_path"),
+                 ("sha256", LyingStr(GOOD["sha256"]), "record_no_sha256"),
+                 ("kind", LyingStr("png"), "record_wrong_kind"),
+                 ("kind", LyingStr("audio"), "record_wrong_kind"))
+        for field, value, reason in cases:
+            with self.subTest(field=field, value=str.__str__(value)):
+                refusal.assert_refused_before_engine(record(**{field: value}), reason)
+        self.assertEqual(ts.check_audio_record(record(kind=SimpleNamespace(__ne__=None))),
+                         "record_wrong_kind")
+
+    def test_str_subclass_hint_text_and_result_refused(self):
+        stt = ts.FakeSpeechToText()
+        self.assertTrue(ts.voice_in(GOOD, stt, lambda: LyingStr("x" * 500), Spy())["ok"])
+        self.assertEqual(stt.calls[0][1], "")
+        self.assertIs(type(ts.cut_hint(LyingStr("a"))), str)
+        hear = Spy()
+        self.assertEqual(ts.voice_in(GOOD, ts.FakeSpeechToText(LyingStr("hi")), Spy(""), hear),
+                         {"ok": False, "reason": "not_understood", "flag": "not_text",
+                          "fallback": "text"})
+        self.assertEqual(hear.calls, [])
+
+        class Pair(tuple):
+            def __len__(self):
+                return 2
+
+        class Engine:
+            def transcribe(self, rec, hint):
+                return Pair(("a", 1.0, "extra"))
+        self.assertEqual(ts.voice_in(GOOD, Engine(), Spy(""), Spy())["flag"], "bad_result")
+
+    def test_voice_out_text_subclass_refused(self):
+        tts = ts.FakeTextToSpeech()
+        self.assertEqual(ts.voice_out(LyingStr("hello"), tts, None),
+                         {"ok": False, "reason": "text_invalid"})
+        self.assertEqual(tts.calls, [])
+
+    def test_hostile_prepare_return_keeps_text(self):
+        for spoken in (Raising(ValueError("x")), Raising(RecursionError()),
+                       Raising(TypeError("x"))):
+            with self.subTest(error=type(spoken.error).__name__):
+                tts = ts.FakeTextToSpeech()
+                self.assertEqual(ts.voice_out("hello", tts, Spy(spoken)),
+                                 {"ok": True, "audio": None, "text": "hello",
+                                  "flag": "not_text"})
+                self.assertEqual(tts.calls, [])
+        tts = ts.FakeTextToSpeech()
+        self.assertEqual(ts.voice_out("hello", tts, Spy(LyingStr("spoken"))),
+                         {"ok": True, "audio": None, "text": "hello", "flag": "not_text"})
+        self.assertEqual(tts.calls, [])
+
+
+class FlippingRecord(dict):
+    """Safe path on the first read of relative_path, an escaping one on every later read."""
+
+    def __init__(self, base):
+        super().__init__(base)
+        self.reads = 0
+
+    def get(self, name, default=None):
+        if name == "relative_path":
+            self.reads += 1
+            return GOOD["relative_path"] if self.reads == 1 else "../escape.wav"
+        return super().get(name, default)
+
+
+class RecordReadOnceTests(unittest.TestCase):
+    def test_engine_gets_checked_copy_not_flipping_record(self):
+        stt = ts.FakeSpeechToText()
+        result = ts.voice_in(FlippingRecord(GOOD), stt, Spy(""), Spy("ok"))
+        self.assertTrue(result["ok"])
+        (given, _hint), = stt.calls
+        self.assertIs(type(given), dict)
+        self.assertEqual(given, GOOD)
+
+    def test_voice_out_returns_checked_copy_not_flipping_record(self):
+        result = ts.voice_out("hello", ts.FakeTextToSpeech(record=FlippingRecord(GOOD)), None)
+        self.assertIs(type(result["audio"]), dict)
+        self.assertEqual(result["audio"], GOOD)
+
+    def test_check_audio_record_never_raises(self):
+        class Broken:
+            @property
+            def kind(self):
+                raise ValueError("unreadable")
+
+        for bad in (HostileMapping(GOOD), Broken()):
+            with self.subTest(record=type(bad).__name__):
+                self.assertEqual(ts.check_audio_record(bad), "record_unreadable")
 
 
 class StaticImportTests(unittest.TestCase):
