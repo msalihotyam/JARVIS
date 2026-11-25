@@ -381,5 +381,117 @@ class ShadowRunTest(unittest.TestCase):
         self.assertFalse((scripts / "__pycache__").exists())
 
 
+_gspec = importlib.util.spec_from_file_location("n6_group_gate", ROOT / "scripts" / "n6_group_gate.py")
+gate = importlib.util.module_from_spec(_gspec)  # type: ignore[arg-type]
+_gspec.loader.exec_module(gate)  # type: ignore[union-attr]
+
+
+def _stub(verdict: str):  # an adapter judging every event the same way
+    return lambda i: (verdict, i.get("n6", "keep"), i.get("conveyor", "keep"))
+
+
+STUB_PORTS = tuple((port, group, _stub("agree")) for port, group, _ in run.PORTS)
+
+
+class Phase4FeedTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+        (self.root / "build" / "n6").mkdir(parents=True)
+        (self.root / "build" / "n6" / "SHADOW_ON").write_text("", encoding="utf-8")
+
+    def event(self, eid: str, origin: str = "live") -> dict:
+        inputs = {port: {} for port, _, _ in run.PORTS}
+        inputs["ffrehearse"] = {"status": "ok", "conveyor": "ok"}
+        return {"event_id": eid, "origin": origin, "inputs": inputs}
+
+    def feed(self, events: list, ports=STUB_PORTS) -> int:
+        return run.feed(self.root, events, clock=lambda: T0, ports=ports)
+
+    def gate_input(self) -> Path:
+        path = self.root / "gate.json"
+        path.write_text(json.dumps({"shadow": run.shadow_rows(self.root)}), encoding="utf-8")
+        return path
+
+    def test_a1_one_pass_one_row_per_port_read_by_the_gate(self) -> None:
+        self.assertEqual(self.feed([self.event("e1")]), 5)
+        rows = run.shadow_rows(self.root)
+        self.assertEqual(sorted(r["port"] for r in rows), sorted(p for p, _, _ in run.PORTS))
+        result = gate.check(rows, {}, [])
+        for group in ("R17R18", "R21", "R31", "R10"):
+            self.assertIn("1 real shadow events, needs 5", result[group][1])
+        self.assertIn("0 real shadow events, needs 5", result["R19R20"][1])  # rehearsal port
+        self.assertFalse(any("unsafe" in r for _, rs in result.values() for r in rs))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            self.assertEqual(gate.main(["--input", str(self.gate_input())]), 0)
+        self.assertNotIn("REFUSED", out.getvalue())
+
+    def test_a1_five_events_reach_the_gate_minimum(self) -> None:
+        self.feed([self.event(f"e{n}") for n in range(5)])
+        result = gate.check(run.shadow_rows(self.root), {}, [])
+        self.assertFalse(any("real shadow events" in r for r in result["R17R18"][1]))
+
+    def test_a2_repeated_pass_appends_nothing(self) -> None:
+        events = [self.event("e1"), self.event("e2")]
+        self.assertEqual(self.feed(events), 10)
+        before = (self.root / "build/n6/phase4.jsonl").read_bytes()
+        self.assertEqual(self.feed(events), 0)
+        self.assertEqual((self.root / "build/n6/phase4.jsonl").read_bytes(), before)
+
+    def test_n1_a_raising_port_leaves_the_others_noted(self) -> None:
+        def boom(_):
+            raise RuntimeError("port broke")
+        ports = tuple((p, g, boom if p == "cleanup" else a) for p, g, a in STUB_PORTS)
+        self.assertEqual(self.feed([self.event("e1")], ports), 4)
+        self.assertNotIn("cleanup", {r["port"] for r in run.shadow_rows(self.root)})
+        self.assertIn("cleanup 'e1': RuntimeError", (self.root / "build/n6/phase4_errors.log").read_text("utf-8"))
+        self.assertEqual(self.feed([self.event("e1")]), 1)  # retried on the next pass
+
+    def test_n2_nothing_written_outside_build_n6(self) -> None:
+        def boom(_):
+            raise ValueError("x")
+        self.feed([self.event("e1"), {"event_id": ""}],
+                  STUB_PORTS[:2] + tuple((p, g, boom) for p, g, _ in STUB_PORTS[2:]))
+        written = [p.relative_to(self.root).as_posix() for p in self.root.rglob("*") if p.is_file()]
+        self.assertTrue(written)
+        self.assertTrue(all(p.startswith("build/n6/") for p in written), written)
+
+    def test_n3_fixture_rehearsal_and_sweep_events_are_not_real(self) -> None:
+        self.feed([self.event("f1", "fixture"), self.event("r1", "rehearsal"), self.event("x1", "")])
+        run.feed(self.root, [self.event("s1")], clock=lambda: T0, ports=STUB_PORTS, origin="sweep")
+        rows = run.shadow_rows(self.root)
+        self.assertEqual(len(rows), 20)
+        self.assertFalse(any(r["origin"] == "live" for r in rows))
+        for group, (_, reasons) in gate.check(rows, {}, []).items():
+            if group != "R26":
+                self.assertIn("0 real shadow events, needs 5", reasons)
+
+    def test_disagree_and_unjudged(self) -> None:
+        ports = (("ci_watch", "R17R18", _stub("disagree")), ("cleanup", "R21", _stub("unknown")),
+                 ("intseq", "R31", lambda i: None))
+        self.assertEqual(self.feed([self.event("e1")], ports), 1)
+        row = run.shadow_rows(self.root)[0]
+        self.assertNotEqual(row["n6_decision"], row["conveyor_decision"])
+        self.assertIs(row["safe"], False)
+        self.assertIn("unsafe disagreement 1: e1", gate.check([row], {}, [])["R17R18"][1])
+
+    def test_real_ports_judge_or_skip_without_raising(self) -> None:
+        ev = {"event_id": "e1", "origin": "live", "inputs": {
+            "ci_watch": {"sha": SHA, "required": [], "events": "", "finish": {}},
+            "ffrehearse": {"status": "ok", "conveyor": "refused"}}}
+        self.feed([ev], run.PORTS)
+        rows = {r["port"]: r for r in run.shadow_rows(self.root)}
+        self.assertEqual(rows["ffrehearse"]["origin"], "rehearsal")
+        self.assertNotEqual(rows["ffrehearse"]["n6_decision"], rows["ffrehearse"]["conveyor_decision"])
+        self.assertEqual(rows["ci_watch"]["group"], "R17R18")  # malformed finish: a real disagreement
+        gate.check(list(rows.values()), {}, [])  # rows always in the gate's shape
+
+    def test_switch_off_writes_nothing(self) -> None:
+        (self.root / "build/n6/SHADOW_ON").unlink()
+        self.assertEqual(self.feed([self.event("e1")]), 0)
+        self.assertFalse((self.root / "build/n6/phase4.jsonl").exists())
+
+
 if __name__ == "__main__":
     unittest.main()
