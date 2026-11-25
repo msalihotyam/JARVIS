@@ -14,8 +14,8 @@ Rules
   R4 At most 3 days; entry opens a FIX request (data only). The test keeps running and reporting (check
      always says run=True). Expiry is computed from the clock, no write needed. An extension needs an
      approval record with approver == "salih"; anything else is refused and journalled.
-  R5 Cancelled when the quarantined test fails 3 runs in a row, or its failure rate over the last (up to)
-     10 runs is at least double its entry rate.
+  R5 Cancelled when the quarantined test fails 3 runs in a row, or its failure rate over the last 10 runs (a full window
+     of 10 recorded runs; fewer never cancel on rate) is at least double its entry rate.
   R6 At most 5 active quarantines; the sixth entry is refused with "lane_growth_stop": true.
   R7 State is one JSON file (default build/ci/quarantine.json) with a generation number. Only Registry (the
      executor) writes it: under a lock file it re-reads the generation, refuses when it is not the one the
@@ -112,8 +112,10 @@ ALLOWED_PREFIXES = {
 ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$")
 
 _NORMALIZE = (  # order matters: paths, then timestamps, then hex ids, then bare numbers
-    (re.compile(r"[A-Za-z]:(?:[\\/][^\s'\"]*?)?[\\/](?:temp|tmp)[\\/][^\s'\"]*", re.I), "<tmp>"),
-    (re.compile(r"(?<![\w.])/(?:var/folders|private/var|tmp|var/tmp)/[^\s'\"]*", re.I), "<tmp>"),
+    # one linear pass per drive path token (';' ends a token: PATH-style lists); <tmp> iff it holds a temp dir
+    (re.compile(r"[A-Za-z]:[\\/][^\s'\";]*"),
+     lambda m: "<tmp>" if re.search(r"[\\/](?:temp|tmp)[\\/]", m.group(), re.I) else m.group()),
+    (re.compile(r"(?<![\w.])/(?:var/folders|private/var|tmp|var/tmp)/[^\s'\";]*", re.I), "<tmp>"),
     (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"), "<ts>"),
     (re.compile(r"\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\b"), "<ts>"),
     (re.compile(r"\b0x[0-9a-f]+\b", re.I), "<hex>"),
@@ -188,6 +190,11 @@ def load_state(path) -> dict:
     if (not isinstance(data, dict) or type(data.get("generation")) is not int
             or not isinstance(data.get("entries"), dict) or not isinstance(data.get("fix_requests"), list)):
         raise ValueError(f"malformed quarantine state: {path}")
+    for test_id, entry in data["entries"].items():  # entry_counts feeds the R5 rate compare: exact ints only
+        counts = entry.get("entry_counts") if isinstance(entry, dict) else None
+        if (not isinstance(counts, list) or len(counts) != 2 or any(type(c) is not int for c in counts)
+                or not 1 <= counts[0] <= counts[1]):
+            raise ValueError(f"malformed quarantine state: {path}: entries[{test_id}].entry_counts")
     return data
 
 
@@ -225,7 +232,8 @@ def _rows(evidence) -> tuple:
         if not isinstance(row, dict) or row.get("outcome") not in ("pass", "fail"):
             raise ValueError(f"results[{i}]: outcome must be 'pass' or 'fail'")
         for key in ("sha", "run"):
-            if not isinstance(row.get(key), (str, int)) or str(row.get(key)).strip() == "":
+            value = row.get(key)  # bool is an int subclass: True/False are not ids
+            if isinstance(value, bool) or not isinstance(value, (str, int)) or str(value).strip() == "":
                 raise ValueError(f"results[{i}]: {key} is required")
         exc = row.get("exception")
         if row["outcome"] == "fail" and (not isinstance(exc, str) or not exc.strip()):
@@ -331,8 +339,9 @@ def decide_extension(state: dict, test_id: str, approval, now: datetime) -> tupl
 # ---- the executor (the only writer) -----------------------------------------------------------------------
 
 class Registry:
-    """R7: every decision takes the lock, appends one journal line, and writes the state only when the
-    generation on disk is still the one the caller loaded (CAS); temp file + os.replace."""
+    """R7: every decision takes the lock, writes the state only when the generation on disk is still the one
+    the caller loaded (CAS; temp file + os.replace), and then appends one journal line. A write decision's
+    line is written only after os.replace, so no ok line ever names a generation that did not land."""
 
     def __init__(self, path=DEFAULT_STATE, clock=utc_now):
         self.path = Path(path)
@@ -369,18 +378,20 @@ class Registry:
                 new["generation"] = disk + 1
                 fd, tmp = tempfile.mkstemp(dir=self.path.parent, prefix=self.path.name + ".", suffix=".tmp")
                 decision = {**decision, "generation": new["generation"]}
-                journaled = False
+                landed = False
                 try:
                     with os.fdopen(fd, "w", encoding="utf-8") as fh:
                         json.dump(new, fh, indent=2, sort_keys=True)
                         fh.write("\n")
-                    self._journal(decision)  # journal before state: no committed decision without its line
-                    journaled = True
-                    os.replace(tmp, self.path)
+                    # open first so an unwritable journal aborts before the state moves; write the line after
+                    with open(self.journal, "a", encoding="utf-8") as jh:
+                        os.replace(tmp, self.path)
+                        landed = True
+                        jh.write(json.dumps(decision, sort_keys=True) + "\n")
                 except BaseException:
-                    with contextlib.suppress(OSError):
-                        os.unlink(tmp)
-                    if journaled:  # the line above names a generation that never landed; mark it
+                    if not landed:  # nothing landed: drop the temp file and record the aborted generation
+                        with contextlib.suppress(OSError):
+                            os.unlink(tmp)
                         with contextlib.suppress(OSError):
                             self._journal({**decision, "ok": False, "reason": "write_failed",
                                            "generation": disk, "aborted_generation": new["generation"]})

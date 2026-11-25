@@ -7,6 +7,7 @@ import io
 import json
 import tempfile
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -126,6 +127,32 @@ class EntryTests(Base):  # R2
             self.assertEqual(q.normalize_message(f"at {path} end"), "at <tmp> end", path)
         self.assertEqual(q.normalize_message(r"at C:\TempFolder\x end"), r"at C:\TempFolder\x end")
 
+    def test_r2_temp_path_does_not_swallow_semicolon_joined_paths(self):  # POLISHQ1 F5
+        for text, want in ((r"C:\Temp\a;C:\keep\b", r"<tmp>;C:\keep\b"),
+                           (r"C:\keep\b;D:\Temp\a", r"C:\keep\b;<tmp>"),
+                           (r"C:\keep\b;/tmp/a", r"C:\keep\b;<tmp>"),
+                           ("/private/var/a;/home/keep", "<tmp>;/home/keep"),
+                           (r"c:/tmp/x;c:/keep;d:\temp\y", r"<tmp>;c:/keep;<tmp>")):
+            self.assertEqual(q.normalize_message(text), want, text)
+
+    def test_r2_normalize_is_linear_on_repeated_drive_prefixes(self):  # POLISHQ1 F6
+        for unit in ("C:/", "C:\\", "C:/x"):
+            start = time.perf_counter()
+            out = q.normalize_message(unit * 50000)
+            self.assertLess(time.perf_counter() - start, 1.0, unit)
+            self.assertNotIn("<tmp>", out)
+
+    def test_r2_bool_sha_or_run_is_refused(self):  # POLISHQ1 F4
+        for key in ("sha", "run"):
+            for value in (True, False):
+                ev = flaky()
+                ev["results"][0][key] = value
+                with self.assertRaises(ValueError, msg=f"{key}={value}"):
+                    q.evaluate(ev, NOW)
+        ev = flaky()
+        ev["results"][1]["run"] = 7
+        self.assertTrue(q.evaluate(ev, NOW)["ok"])  # a plain int run id is still accepted
+
     def test_r2_malformed_evidence_is_refused(self):
         for bad in ([], {"test_id": UI}, {"test_id": UI, "results": [{"sha": "a", "run": "1", "outcome": "maybe",
                                                                      "at": NOW.isoformat()}]},
@@ -225,6 +252,15 @@ class CancelTests(Base):  # R5
         self.assertEqual([o["reason"] for o in out], ["recorded"] * 9 + ["cancelled"])
         self.assertEqual((out[-1]["cancel_reason"], out[-1]["rate"]), ("rate_doubled", 0.4))
 
+    def test_r5_rate_needs_a_full_ten_run_window_and_the_doc_says_so(self):  # POLISHQ1 F2
+        self.assertNotIn("(up to)", q.__doc__)
+        self.assertIn("last 10 runs (a full window", q.__doc__)
+        self.enter(extra=[row(f"p{i}", f"x{i}", "pass") for i in range(6)])  # entry rate 0.2
+        out = self.runs(["fail", "fail", "pass", "fail", "fail", "pass", "fail", "fail", "pass"])  # 6/9, no streak
+        self.assertEqual({o["reason"] for o in out}, {"recorded"})
+        last = self.runs(["fail"])[0]
+        self.assertEqual((last["reason"], last["cancel_reason"]), ("cancelled", "rate_doubled"))
+
     def test_r5_mixed_runs_below_double_rate_stay_active(self):
         self.enter(extra=[row(f"p{i}", f"x{i}", "pass") for i in range(6)])
         out = self.runs(["fail", "fail", "pass", "fail", "pass", "pass", "pass", "pass", "pass", "pass", "pass"])
@@ -302,9 +338,48 @@ class StateTests(Base):  # R7
         self.assertFalse(self.path.exists())
         self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
         self.assertFalse(self.reg.lock.exists())
-        self.assertEqual([(j["reason"], j["generation"]) for j in self.journal()],
-                         [("entered", 1), ("write_failed", 0)])
+        self.assertEqual([(j["reason"], j["generation"]) for j in self.journal()], [("write_failed", 0)])
         self.assertEqual(self.journal()[-1]["aborted_generation"], 1)
+
+    def test_r7_no_journal_line_before_the_state_lands(self):  # POLISHQ1 F1
+        real, seen = q.os.replace, []
+
+        def replace(src, dst):
+            seen.append(self.reg.journal.read_text(encoding="utf-8") if self.reg.journal.exists() else "")
+            real(src, dst)
+
+        with mock.patch.object(q.os, "replace", side_effect=replace):
+            self.enter()
+        self.assertEqual(seen, [""])  # a crash inside replace leaves no ok line for an unlanded generation
+        self.assertEqual([(j["reason"], j["generation"]) for j in self.journal()], [("entered", 1)])
+
+    def test_r7_journal_failure_after_landing_writes_no_failure_line(self):  # POLISHQ1 F1
+        state = self.reg.load()
+        decision, new = q.decide_entry(state, flaky(), NOW)
+        with mock.patch.object(q.json, "dumps", side_effect=OSError("disk")), self.assertRaises(OSError):
+            self.reg._apply(state, decision, new)
+        self.assertEqual(self.reg.load()["generation"], 1)  # landed; never journalled as write_failed
+        self.assertEqual(self.reg.journal.read_text(encoding="utf-8"), "")
+        self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
+        self.assertFalse(self.reg.lock.exists())
+
+    def test_r7_bad_entry_counts_are_refused_at_load(self):  # POLISHQ1 F3
+        self.enter()
+        good = json.loads(self.path.read_text(encoding="utf-8"))
+        for bad in (None, [], [2], [2, 4, 6], "2/4", {"a": 1}, [True, 4], [2, True], [2.0, 4], [2, "4"],
+                    [0, 4], [-1, 4], [5, 4], [2, 0], [-2, -1], "missing", "not_a_dict"):
+            state = json.loads(json.dumps(good))
+            if bad == "missing":
+                del state["entries"][UI]["entry_counts"]
+            elif bad == "not_a_dict":
+                state["entries"][UI] = [2, 4]
+            else:
+                state["entries"][UI]["entry_counts"] = bad
+            self.path.write_text(json.dumps(state), encoding="utf-8")
+            with self.assertRaises(ValueError, msg=repr(bad)):
+                self.reg.load()
+        self.path.write_text(json.dumps(good), encoding="utf-8")
+        self.assertEqual(self.reg.load()["entries"][UI]["entry_counts"], [2, 4])
 
     def test_r7_journal_failure_leaves_state_unchanged(self):
         self.enter()
