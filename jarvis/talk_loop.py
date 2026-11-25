@@ -129,11 +129,13 @@ def next_step(state, *, inbound_waiting, turn_in_progress, delivery_due_at,
         return Step(RECOVER, 0.0, LoopState(True, 0))
 
     backoff = poll_interval(failure_streak) - POLL_INTERVAL
-    if poll_due_at is not None and backoff:  # adding 0.0 would round a huge int due time
-        poll_due_at += backoff
-    deliver_due = delivery_due_at is not None and delivery_due_at <= now
+    # work in offsets from now: due + backoff rounds the backoff away at huge timestamps
+    deliver_left = None if delivery_due_at is None else delivery_due_at - now
+    poll_left = None if poll_due_at is None else poll_due_at - now + backoff
+    deliver_due = deliver_left is not None and delivery_due_at <= now
     # no new inbound is fetched during shutdown; the poll time still paces IDLE
-    poll_due = poll_due_at is not None and poll_due_at <= now and not shutdown_requested
+    poll_due = (poll_due_at is not None and not shutdown_requested
+                and (poll_due_at <= now if not backoff else poll_due_at - now <= -backoff))
 
     if inbound_waiting and not turn_in_progress and not shutdown_requested:
         other_due = deliver_due or poll_due
@@ -146,6 +148,6 @@ def next_step(state, *, inbound_waiting, turn_in_progress, delivery_due_at,
         return Step(DELIVER, 0.0, fresh)
     if poll_due:
         return Step(POLL, 0.0, fresh)
-    dues = [d for d in (delivery_due_at, poll_due_at) if d is not None]
-    wait = min(dues) - now if dues else MAX_WAIT
+    lefts = [d for d in (deliver_left, poll_left) if d is not None]
+    wait = min(lefts) if lefts else MAX_WAIT
     return Step(IDLE, float(min(max(wait, MIN_WAIT), MAX_WAIT)), fresh)

@@ -136,6 +136,14 @@ class NegativeTests(unittest.TestCase):
         big = 10**308
         self.assertEqual(step(poll_due_at=big, now=big).kind, tl.POLL)
 
+    def test_backoff_survives_huge_timestamps(self):
+        for big in (2**53, 2**60, 2.0**60, 10**308, 1e308):
+            with self.subTest(big=str(big)[:20]):
+                s = step(poll_due_at=big, now=big, failure_streak=1)
+                self.assertEqual((s.kind, s.seconds), (tl.IDLE, 5.0))
+                if type(big) is int:  # big + 5 == big for these floats
+                    self.assertEqual(step(poll_due_at=big, now=big + 5, failure_streak=1).kind, tl.POLL)
+
     def test_shutdown_with_turn_never_stops(self):
         for kw in (dict(), dict(inbound_waiting=9), dict(delivery_due_at=0.0),
                    dict(poll_due_at=0.0, failure_streak=3), dict(recover_needed=True)):
@@ -169,9 +177,7 @@ class NegativeTests(unittest.TestCase):
 
 
 class StaticTests(unittest.TestCase):
-    BANNED = {"os", "io", "pathlib", "socket", "urllib", "http", "subprocess", "requests",
-              "shutil", "sqlite3", "importlib", "ctypes", "tempfile", "time", "datetime",
-              "asyncio", "threading", "random", "ssl", "select"}
+    ALLOWED = {"__future__", "math", "dataclasses"}  # allowlist: any new import must be reviewed here
 
     def test_no_io_network_or_clock_imports(self):
         tree = ast.parse(SOURCE.read_text(encoding="utf-8"))
@@ -182,7 +188,8 @@ class StaticTests(unittest.TestCase):
             elif isinstance(node, ast.ImportFrom):
                 names = [node.module or ""]
             for name in names:
-                self.assertNotIn(name.split(".")[0], self.BANNED, name)
+                self.assertIn(name, self.ALLOWED, name)
+                self.assertEqual(getattr(node, "level", 0), 0, name)
             if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 self.assertNotIn(node.func.id, {"open", "__import__", "eval", "exec"})
 
