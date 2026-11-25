@@ -182,11 +182,24 @@ class GmailStub(StubConnector):
 
 
 class IntentTestCase(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls) -> None:
+        # The fresh schema build is the module's main cost: build it once per
+        # class and give every test its own byte copy, so no test shares state.
+        super().setUpClass()
+        template_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        cls.addClassCleanup(safe_cleanup, template_dir)
+        cls._template_database = Path(template_dir.name) / "jarvis.db"
+        SQLiteMemoryStore(cls._template_database)
+        with contextlib.closing(sqlite3.connect(cls._template_database)) as connection:
+            connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(safe_cleanup, self.temp)
         self.root = Path(self.temp.name)
         self.database = self.root / "jarvis.db"
+        shutil.copyfile(self._template_database, self.database)
         self.memory = SQLiteMemoryStore(self.database)
         self.settings = Settings(memory_database=self.database)
 
