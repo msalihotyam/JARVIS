@@ -120,7 +120,8 @@ def _seal(record, previous):
     return _encode({"hash": digest, "record": record}) + b"\n", digest
 
 
-def make_name(number):
+def _make_name(number):
+    # Private: callers pass an int already checked to be 1..MAX_DIGITS digits.
     return f"{PREFIX}{number:0{WIDTH}d}{SUFFIX}"
 
 
@@ -130,11 +131,11 @@ def _number(name):
         return None
     number = int(match.group(1))
     # Canonical width only: talk-00001 would alias talk-0001.
-    return number if number >= 1 and make_name(number) == name else None
+    return number if number >= 1 and _make_name(number) == name else None
 
 
-def _numbered(names):
-    """((number, name), ...) sorted by number; raises _Bad."""
+def _sorted(names):
+    """((number, name), ...) sorted by number; raises _Bad for names that cannot be ordered."""
     exact, folded = set(), set()
     for name in names:
         if type(name) is not str:
@@ -152,16 +153,25 @@ def _numbered(names):
             raise _Bad("NAME_INVALID", name)
         pairs.append((number, name))
     pairs.sort(key=lambda pair: pair[0])
-    for expected, (number, name) in enumerate(pairs, 1):
-        if number != expected:
-            raise _Bad("SEGMENT_GAP" if number > expected else "SEGMENT_DUPLICATE", name)
     return tuple(pairs)
+
+
+def _gap(expected, number):
+    """None when number is the expected next one, else the break code."""
+    if number == expected:
+        return None
+    return "SEGMENT_GAP" if number > expected else "SEGMENT_DUPLICATE"
 
 
 def _names(names):
     if type(names) not in (list, tuple):
         raise _Bad("NAMES_INVALID")
-    return _numbered(tuple(names))
+    pairs = _sorted(tuple(names))
+    for expected, (number, name) in enumerate(pairs, 1):
+        code = _gap(expected, number)
+        if code:
+            raise _Bad(code, name)
+    return pairs
 
 
 def _break(code, segment, line):
@@ -208,7 +218,7 @@ def next_name(existing):
         return _refuse(bad.code)
     if len(str(number)) > MAX_DIGITS:
         return _refuse("NAME_SPACE_FULL")
-    return make_name(number)
+    return _make_name(number)
 
 
 @_guarded
@@ -231,7 +241,11 @@ def should_roll(size, entries, limits):
 
 @_guarded
 def verify(segments):
-    """Ok for an unbroken chain over (name, bytes) pairs, else the first Break."""
+    """Ok for an unbroken chain over (name, bytes) pairs, else the first Break.
+
+    First in segment-number order, then line order. Names that cannot be ordered
+    (invalid, case-folded or exact duplicates) break before any content is read.
+    """
     if type(segments) not in (list, tuple):
         return _refuse("SEGMENTS_INVALID")
     items = tuple(segments)
@@ -239,22 +253,26 @@ def verify(segments):
            for item in items):
         return _refuse("SEGMENTS_INVALID")
     try:
-        pairs = _numbered(tuple(name for name, _ in items))
+        pairs = _sorted(tuple(name for name, _ in items))
     except _Bad as bad:
         return _break(bad.code, bad.segment, 0)
     contents = dict(items)
     previous, last_id, total = GENESIS, 0, 0
     prev_name, prev_count = "", 0
-    for number, name in pairs:
-        if number > 1 and prev_count == 0:
+    for expected, (number, name) in enumerate(pairs, 1):
+        if expected > 1 and prev_count == 0:
             return _break("SEGMENT_EMPTY", prev_name, 0)
+        code = _gap(expected, number)
+        if code:
+            return _break(code, name, 0)
         content = contents[name]
-        if content and not content.endswith(b"\n"):
-            return _break("LINE_TORN", name, content.count(b"\n") + 1)
-        lines = [line + b"\n" for line in content.split(b"\n")[:-1]]
+        torn = bool(content) and not content.endswith(b"\n")
+        lines = [line + b"\n" for line in content.split(b"\n")[:-1]]  # complete lines only
         start = 0
         if number > 1:
-            if not lines or _shape(lines[0])[0] != "header":
+            if not lines:
+                return _break("LINE_TORN" if torn else "HEADER_MISSING", name, 1)
+            if _shape(lines[0])[0] != "header":
                 return _break("HEADER_MISSING", name, 1)
             if lines[0] != _header(prev_name, prev_count, previous):
                 return _break("HEADER_MISMATCH", name, 1)
@@ -269,15 +287,17 @@ def verify(segments):
                 return _break("RECORD_INVALID", name, index + 1)
             record = envelope["record"]
             try:
-                expected, digest = _seal(record, previous)
+                sealed, digest = _seal(record, previous)
             except (TypeError, ValueError, RecursionError):
                 return _break("RECORD_INVALID", name, index + 1)
-            if line != expected:
+            if line != sealed:
                 return _break("HASH_MISMATCH", name, index + 1)
             if type(record) is not dict or type(record.get("id")) is not int \
                     or record["id"] != last_id + 1:
                 return _break("ID_OUT_OF_ORDER", name, index + 1)
             last_id, previous, count = last_id + 1, digest, count + 1
+        if torn:  # only after every complete line verified
+            return _break("LINE_TORN", name, len(lines) + 1)
         total += count
         prev_name, prev_count = name, count
     return Ok(len(pairs), total, last_id, prev_name, previous, prev_count)
@@ -290,10 +310,10 @@ def roll(segments):
     if type(result) is not Ok:
         return result
     if result.segments == 0:
-        return Next(make_name(1), b"")
+        return Next(_make_name(1), b"")
     if result.last_count == 0:
         return _refuse("SEGMENT_EMPTY")
     if len(str(result.segments + 1)) > MAX_DIGITS:
         return _refuse("NAME_SPACE_FULL")
-    return Next(make_name(result.segments + 1),
+    return Next(_make_name(result.segments + 1),
                 _header(result.last_name, result.last_count, result.last_hash))
