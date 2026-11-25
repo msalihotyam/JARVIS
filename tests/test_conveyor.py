@@ -7,6 +7,7 @@ import itertools
 import json
 import os
 import re
+import shutil
 import stat
 import subprocess
 import sys
@@ -4323,6 +4324,20 @@ class TestPreserved(Base):
     finished = TestCleanup.finished
     cli = TestCleanup.cli
 
+    @classmethod
+    def setUpClass(cls):
+        # CONVSPD1: build the base repo + lane worktree once; each test gets a private copy
+        super().setUpClass()
+        cls.tpl_tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(cls.tpl_tmp.cleanup)
+        cls.tpl = Path(cls.tpl_tmp.name)
+        for args in (["init", "-q", "-b", "main"], ["add", "f.txt"], ["commit", "-q", "-m", "base"],
+                     ["worktree", "add", "-q", "-b", "lane-a", str(cls.tpl / ".claude" / "worktrees" / "A")]):
+            if args[0] == "add":
+                (cls.tpl / "f.txt").write_text("base\n")
+            subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c", "commit.gpgsign=false", *args],
+                           cwd=cls.tpl, capture_output=True, text=True, check=True)
+
     def setUp(self):
         super().setUp()
         self.ledger_runs, self.ledger_error, self.ledger_skip = 0, None, set()
@@ -4331,12 +4346,18 @@ class TestPreserved(Base):
         self.c.stop_finished = lambda *a: None
         self.git_fail, self.git_fail_on = None, ["git"]
         self.c.cmd = self.run_git
-        self.g("init", "-q", "-b", "main")
-        (self.root / "f.txt").write_text("base\n")
-        self.g("add", "f.txt")
-        self.g("commit", "-q", "-m", "base")
+        for name in (".git", ".claude"):
+            shutil.copytree(self.tpl / name, self.root / name, dirs_exist_ok=True)
+        shutil.copy2(self.tpl / "f.txt", self.root / "f.txt")
         self.wt = self.root / ".claude" / "worktrees" / "A"
-        self.g("worktree", "add", "-q", "-b", "lane-a", str(self.wt))
+        old, new = Path(os.path.realpath(self.tpl)).as_posix(), Path(os.path.realpath(self.root)).as_posix()
+        for link in (self.root / ".git" / "worktrees" / "A" / "gitdir", self.wt / ".git"):
+            with open(link, "r+") as f:  # r+: Windows refuses "w" on the hidden <wt>/.git file git writes
+                text = f.read()
+                self.assertIn(old, text)  # the copied worktree links must point at this test's root
+                f.seek(0)
+                f.write(text.replace(old, new))
+                f.truncate()
 
     def g(self, *args, cwd=None):
         p = conveyor.subprocess.run(
@@ -7575,7 +7596,9 @@ class TestLock(Base):
 
     def test_heartbeat_falls_back_in_place_when_replace_is_denied(self):
         """A reader holding the file on Windows denies os.replace: the beat goes on in place."""
-        with mock.patch.object(conveyor.os, "replace", side_effect=PermissionError("held")):
+        # CONVSPD1: the retry backoff schedule is TestSharedWrite's; here only the in-place fallback matters
+        with mock.patch.object(conveyor.os, "replace", side_effect=PermissionError("held")), \
+                mock.patch.object(conveyor.time, "sleep"):
             self.assertTrue(self.c.acquire_lock())
             self.t += 61
             self.c.beat()
