@@ -29,6 +29,7 @@ MAX_HOLD_SECONDS = 600
 # Exact reply-mode labels (the reply keyboard's button texts) -> mode. Matched raw: no strip/case/NFKC.
 MODE_LABELS = {"Sesli yanıt": "voice", "Yazılı yanıt": "text"}
 GREETING = "/start"
+_MISSING = object()  # get() default: tells an absent "forwarded" apart from any stored value
 
 # Fixed Turkish lines for NOTE results; kept apart from the ASCII REASONS.
 NOTES = {
@@ -90,9 +91,10 @@ def _route(entry: object, hold_seconds: object) -> Route:
     try:  # one guarded snapshot; the caller's mapping is never touched again
         if not isinstance(entry, Mapping):
             return Route(REFUSED, "bad_entry")
-        who, kind, text, attachments, forwarded = (
-            entry.get(k) for k in ("who", "kind", "text", "attachments", "forwarded"))
-        has_forwarded = "forwarded" in entry
+        who, kind, text, attachments = (entry.get(k) for k in ("who", "kind", "text", "attachments"))
+        forwarded = entry.get("forwarded", _MISSING)  # read once; the value decides
+        # get says absent: membership must agree, else fail closed as forwarded (no second value read)
+        is_forwarded = forwarded is not False and (forwarded is not _MISSING or "forwarded" in entry)
     except Exception:
         return Route(REFUSED, "bad_entry")
     if type(who) is not str or who != WHO:
@@ -123,7 +125,7 @@ def _route(entry: object, hold_seconds: object) -> Route:
         return Route(HOLD, "attachment_hold", seconds=hold_seconds)
     if blank:
         return Route(REFUSED, "empty")
-    if has_forwarded and forwarded is not False:  # anything but an explicit False counts as forwarded
+    if is_forwarded:  # anything but an explicit False or an agreed absence counts as forwarded
         return Route(TURN, "forwarded")
     if text == GREETING:
         return Route(NOTE, "greeting", note=NOTES["greeting"])
