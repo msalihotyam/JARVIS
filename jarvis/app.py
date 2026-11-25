@@ -4605,9 +4605,12 @@ class JarvisApp:
             model.model, model.effort = turn["route_model"], turn["route_effort"] = routed
             # One warm lane per model+effort, so alternating types never respawn.
             model.warm_lane = f"{conversation_id}:{routed[0]}:{routed[1]}"
-            # A lane switched back to missed the other lane's turns: resend the window.
+        # A lane switched back to missed the other lane's turns: resend the window. Unrouted
+        # turns take part only once routing was used, so routing-off-only turns stay as before.
+        lanes = warm and (routed is not None or conversation_id in _ROUTE_LAST)
+        if lanes:
             model.warm_resend = _ROUTE_LAST.get(conversation_id, model.warm_lane) != model.warm_lane
-            _ROUTE_LAST[conversation_id] = model.warm_lane
+        lane = model.warm_lane if warm else None
         try:
             result = model.complete(intent_task, SessionState(objective=text))
         except Exception as exc:  # noqa: BLE001 - adapter boundary; type only
@@ -4623,10 +4626,16 @@ class JarvisApp:
                 model.warm_lane = None
             if routed is not None:
                 model.model, model.effort = saved
+            if lanes:
                 model.warm_resend = False
         turn["returned"] = time.monotonic()
         cancelled = request_id in self._cancelled_text
         self._cancelled_text.discard(request_id)
+        # E1ROUTE1AFIX: only an answered turn moves the conversation's lane; a failed or
+        # cancelled one may never have reached that lane's live process, so the next turn
+        # there resends the window.
+        if lanes and result.ok and not cancelled:
+            _ROUTE_LAST[conversation_id] = lane
         usage.update({
             **_model_usage(model, request_id),
             "request_chars": len(text),
