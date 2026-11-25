@@ -166,9 +166,26 @@ class TelegramFileTests(unittest.TestCase):
         self.assertFalse(imports & forbidden)
         self.assertFalse(names & {"open", "__import__", "eval", "exec"})
 
+    # The only sanctioned importer, by exact package-relative path; test_telegram_client
+    # guards that nothing else in jarvis/ or scripts/ names telegram_client.
+    SANCTIONED = ("telegram_client.py",)
+
+    @classmethod
+    def _users(cls, package):
+        return [path.relative_to(package).as_posix() for path in package.rglob("*.py")
+                if path.relative_to(package).as_posix() not in ("telegram_files.py",) + cls.SANCTIONED
+                and "telegram_files" in path.read_text(encoding="utf-8", errors="replace")]
+
     def test_running_app_does_not_import_module(self):
-        package = Path(tf.__file__).parent
-        users = [path.name for path in package.rglob("*.py")
-                 if path.name != "telegram_files.py"
-                 and "telegram_files" in path.read_text(encoding="utf-8", errors="replace")]
-        self.assertEqual(users, [])
+        self.assertEqual(self.SANCTIONED, ("telegram_client.py",))
+        self.assertEqual(self._users(Path(tf.__file__).parent), [])
+
+    def test_import_guard_still_flags_any_other_importer(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            package = Path(tmp)
+            (package / "sub").mkdir()
+            line = "from jarvis.telegram_files import DownloadPlan\n"
+            for name in ("telegram_files.py", "telegram_client.py", "other.py", "sub/telegram_client.py"):
+                (package / name).write_text(line, encoding="utf-8")
+            self.assertEqual(sorted(self._users(package)), ["other.py", "sub/telegram_client.py"])
