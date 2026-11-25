@@ -187,6 +187,36 @@ class TalkDeliveryTests(unittest.TestCase):
         self.assertEqual(out["refused"], [{"index": 0, "reason": "bad_time"}, {"index": 1, "reason": "bad_time"}])
         self.assertEqual(out["actions"], [{"id": "ok", "view": "pc", "not_before": big}])
 
+    def test_all_int_overflow_refused_per_entry_sibling_planned(self):
+        # Int arithmetic past float max must not drop the whole plan.
+        big = 10**308
+        for attempts in (1, 2, 3):
+            for params in ({"base": big, "cap": big}, {"base": big, "cap": 1.0e308}, {"base": 9 * 10**307, "cap": 1.0e308}):
+                out = plan_delivery({"now": big, **params, "entries": [
+                    {"id": "x", "records": [rec("pc", "failed", attempts, big)]},
+                    {"id": "ok", "records": [rec()]},
+                ]})
+                self.assertTrue(out["ok"], (attempts, params, out))
+                self.assertEqual(out["refused"], [{"index": 0, "reason": "bad_time"}], (attempts, params))
+                self.assertEqual(pairs(out), [("ok", "pc")])
+
+    def test_backoff_keeps_doubling_past_two_to_the_64_until_cap(self):
+        out = plan_delivery({"now": 0, "base": 1, "cap": 1e30, "max_attempts": 100,
+                             "entries": [{"id": "e", "records": [rec("pc", "failed", 66, 0)]}]})
+        self.assertEqual(out["actions"][0]["not_before"], 2.0**65)
+        tiny = plan_delivery({"now": 0, "base": 5e-324, "cap": 1e308, "max_attempts": 10**400,
+                              "entries": [{"id": "e", "records": [rec("pc", "failed", 10**399, 0)]}]})
+        self.assertEqual(tiny["actions"][0]["not_before"], 1e308)
+
+    def test_record_missing_last_try_is_refused(self):
+        for attempts in (0, 1):
+            raw = rec("pc", "pending", attempts)
+            del raw["last_try"]
+            out = plan_delivery(req([{"id": "m", "records": [raw]}, {"id": "ok", "records": [rec()]}]))
+            self.assertEqual(out["refused"], [{"index": 0, "reason": "bad_time"}], attempts)
+            self.assertEqual(pairs(out), [("ok", "pc")])
+        self.assertEqual(pairs(plan_delivery(req([{"id": "n", "records": [rec(last_try=None)]}]))), [("n", "pc")])
+
     def test_nan_now_and_bad_params_refused(self):
         for extra in ({"now": float("nan")}, {"now": float("inf")}, {"now": True}, {"base": 0}, {"cap": 1.0},
                       {"max_attempts": 0}, {"batch": 1.5}, {"reset": "e"}, {"reset": [{"id": "e", "view": "fax"}]}):

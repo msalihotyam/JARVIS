@@ -75,6 +75,8 @@ def _record(raw, now):
     if not isinstance(state, str) or state not in STATES:
         raise _Refused("unknown_state")
     seq, attempts, last_try = raw.get("seq"), raw.get("attempts"), raw.get("last_try")
+    if "last_try" not in raw:  # a missing field is refused, never read as None
+        raise _Refused("bad_time")
     if not _int(seq) or seq < 0:
         raise _Refused("bad_seq")
     if not _int(attempts) or attempts < 0:
@@ -127,8 +129,13 @@ def _entry_plan(entry_id, latest, now, params, resets):
             continue
         not_before = now
         if attempts > 0:
-            delay = min(params["cap"], params["base"] * 2.0 ** min(attempts - 1, 64))
-            not_before = max(now, last_try + delay)
+            # Float arithmetic: an int sum past float max would raise OverflowError in isfinite.
+            cap, delay = float(params["cap"]), float(params["base"])
+            for _ in range(attempts - 1):  # stops at cap: at most ~2100 doublings for finite floats
+                if delay >= cap:
+                    break
+                delay *= 2.0
+            not_before = max(now, float(last_try) + min(cap, delay))
             if not math.isfinite(not_before):  # last_try near float max: no real send time
                 raise _Refused("bad_time")
         actions.append({"id": entry_id, "view": view, "not_before": not_before})
