@@ -13,8 +13,9 @@ list plus the SQLite/PEM header sniff is the boundary.
 
 Swap between resolve and open (TOCTOU): every opened file or directory handle
 is checked again by its final path (GetFinalPathNameByHandleW on Windows,
-/proc/self/fd on Linux), which must be the resolved path inside the root and
-hit no refused name; else refuse. Directory entries are then read from that
+/proc/self/fd on Linux), which must be exactly (on-disk case, no case
+folding) the resolved path inside the root and hit no refused name; else
+refuse. Directory entries are then read from that
 same handle (never by path again), so a junction swapped in after the check
 is not followed. On Windows the handles do not share delete, so the opened
 path cannot be renamed while it is read.
@@ -337,16 +338,18 @@ class BrainFiles:
         return Resolved(real, "/".join(rel_segs))
 
     def _place(self, real: str) -> list:
-        """Root-relative segments of a real path; refuses outside or refused areas."""
+        """Root-relative segments of a real path; refuses outside or refused areas.
+
+        Exact on-disk case, never case folding: realpath and the handle's final path
+        both return on-disk case, and a case-only sibling of the root (repo vs REPO on
+        a case-sensitive parent) is another directory."""
         root = self._root
-        try:
-            inside = os.path.commonpath([os.path.normcase(root), os.path.normcase(real)])
-        except ValueError:  # another drive or a mix of absolute and relative
-            raise _Refuse("outside", "real path is outside the root") from None
-        if inside != os.path.normcase(root):
+        if os.path.normpath(real) != real:  # "..", ".", empty segment, alt separator, trailing separator
+            raise _Refuse("outside", "real path is not in normal form")
+        prefix = root if root.endswith(os.sep) else root + os.sep
+        if real != root and not real.startswith(prefix):
             raise _Refuse("outside", "real path is outside the root")
-        rel = os.path.relpath(real, root)
-        rel_segs = [] if rel == os.curdir else rel.split(os.sep)
+        rel_segs = real[len(prefix):].split(os.sep) if real != root else []
         if _refused_name([_fold(s) for s in rel_segs]):
             raise _Refuse("refused_name", "real path is in a refused area")
         return rel_segs
@@ -360,7 +363,7 @@ class BrainFiles:
         if not isinstance(final, str) or not final or "\0" in final:
             raise _Refuse("link", "opened path could not be verified")
         self._place(final)
-        if os.path.normcase(final) != os.path.normcase(expected):
+        if final != expected:  # exact case: a case-only sibling is another place
             raise _Refuse("link", "opened path is another place")
 
     def _read_text(self, real: str) -> str:
@@ -424,15 +427,24 @@ class BrainFiles:
     def _list_dir(self, path) -> Listing:
         target = self._resolve(_check_request(path))
         parent = [_fold(s) for s in target.rel.split("/")] if target.rel else []
-        entries = []
+        # Stop at MAX_ENTRIES+1 allowed names (enough for the truncated flag) and at the
+        # search clock budget (a flood of skipped links or refused names); only the
+        # collected names are sorted, so a huge directory is never held or sorted whole.
+        entries, timed_out = [], False
+        deadline = self._clock() + MAX_SEARCH_SECONDS
         try:
             fd = _open_dir(target.path)
             try:
                 self._verify(fd, target.path)
                 for name, is_dir in _scan_fd(fd):
+                    if self._clock() > deadline:
+                        timed_out = True
+                        break
                     if is_dir is None or not _name_ok(parent, name) or self._is_link(os.path.join(target.path, name)):
                         continue
                     entries.append(Entry(name, "dir" if is_dir else "file"))
+                    if len(entries) > MAX_ENTRIES:
+                        break
             finally:
                 os.close(fd)
         except NotADirectoryError:
@@ -440,7 +452,7 @@ class BrainFiles:
         except OSError:
             raise _Refuse("io", "directory could not be listed") from None
         entries.sort()
-        return Listing(tuple(entries[:MAX_ENTRIES]), len(entries) > MAX_ENTRIES)
+        return Listing(tuple(entries[:MAX_ENTRIES]), timed_out or len(entries) > MAX_ENTRIES)
 
     def search(self, pattern, path=""):
         """Literal substring search over allowed text files; SearchResult or Refusal."""

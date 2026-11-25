@@ -354,6 +354,57 @@ class ListDirTests(RootCase):
         self.assertIn(self.fs.list_dir("docs/notes.md").code, ("not_dir", "io"))
         self.assertRefused(self.fs.list_dir("missing"), "io")
 
+    def fake_scan(self, names_in_order):
+        """Patch the handle scanner to yield the given file names; returns the pulled count."""
+        pulled = [0]
+
+        def scan(fd):
+            for name in names_in_order:
+                pulled[0] += 1
+                yield name, False
+
+        patcher = mock.patch.object(brain_fs, "_scan_fd", scan)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return pulled
+
+    def test_listing_stops_after_cap_plus_one(self):
+        # BRAINFS1FIX3 F2: a huge directory is not collected and sorted whole.
+        pulled = self.fake_scan([f"f{i:02}.txt" for i in reversed(range(10))])
+        with mock.patch.object(brain_fs, "MAX_ENTRIES", 3):
+            first, again = self.fs.list_dir("docs"), self.fs.list_dir("docs")
+        self.assertEqual(pulled[0], 8)  # two calls, MAX_ENTRIES + 1 each
+        self.assertEqual([e.name for e in first.entries], ["f06.txt", "f07.txt", "f08.txt"])
+        self.assertTrue(first.truncated)
+        self.assertEqual(first, again)
+
+    def test_exactly_cap_is_not_truncated(self):
+        pulled = self.fake_scan(["c.txt", "a.txt", "b.txt"])
+        with mock.patch.object(brain_fs, "MAX_ENTRIES", 3):
+            got = self.fs.list_dir("docs")
+        self.assertEqual(([e.name for e in got.entries], got.truncated, pulled[0]), (["a.txt", "b.txt", "c.txt"], False, 3))
+
+    def test_refused_name_flood_bounded_by_clock(self):
+        # BRAINFS1FIX3 F2: skipped names never reach the count cap, so the clock bounds them.
+        pulled = self.fake_scan([f"x{i}.db" for i in range(10)])
+        ticks = [0]
+
+        def clock():  # first call sets the deadline, every later call is past it
+            ticks[0] += 1
+            return 0.0 if ticks[0] == 1 else 100.0
+
+        got = BrainFiles(self.root, clock=clock).list_dir("docs")
+        self.assertEqual((got.entries, got.truncated), ((), True))
+        self.assertLessEqual(pulled[0], 1)
+
+    def test_real_directory_over_cap_is_sorted_and_stable(self):
+        for i in range(10):
+            self.write(f"big/f{i:02}.txt", b"x\n")
+        with mock.patch.object(brain_fs, "MAX_ENTRIES", 3):
+            first, again = self.fs.list_dir("big"), self.fs.list_dir("big")
+        got = [e.name for e in first.entries]
+        self.assertEqual((len(got), got == sorted(got), first.truncated, first), (3, True, True, again))
+
 
 class SearchTests(RootCase):
     def test_allowed_files_only(self):
@@ -540,6 +591,79 @@ class FinalPathTests(RootCase):
         self.assertEqual(self.fs.read_file("docs/notes.md").text, "hello docs\n")
         self.assertIn("notes.md", names(self.fs.list_dir("docs")))
         self.assertTrue(self.fs.search("hello").matches)
+
+
+class CaseExactTests(RootCase):
+    """BRAINFS1FIX3 F1: containment is exact on-disk case; a case-only sibling is another place.
+
+    On a case-sensitive directory repo and REPO (or docs and DOCS) are two directories; the
+    injected ports below play such a resolver / handle while the real files stay readable.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.real_root = os.path.realpath(self.root)
+
+    def sibling(self, path, old=None, new=None):
+        """Same path with its root part (or the old prefix) swapped for a case-only sibling."""
+        old = old or self.real_root
+        new = new or os.path.join(os.path.dirname(self.real_root), "REPO")
+        if path == old or path.startswith(old + os.sep):
+            return new + path[len(old):]
+        return path
+
+    def assertNoDocsMatch(self, fs):
+        got = fs.search("hello")
+        self.assertNotIn("docs/notes.md", {m.path for m in got.matches})
+
+    def test_resolver_into_case_sibling_of_root_refused(self):
+        # V1: realpath answers in REPO for everything below the root.
+        def realpath(p):
+            real = os.path.realpath(p)
+            return real if real == self.real_root else self.sibling(real)
+
+        fs = BrainFiles(self.root, clock=frozen_clock, realpath=realpath, is_link=lambda p: False)
+        self.assertRefused(fs.resolve("docs/notes.md"), "outside")
+        self.assertRefused(fs.read_file("docs/notes.md"), "outside")
+        self.assertRefused(fs.list_dir("docs"), "outside")
+        self.assertEqual(fs.search("hello").matches, ())
+
+    def test_handle_in_case_sibling_of_root_refused(self):
+        # V2 + V4: the opened file, folder and root handle all sit in REPO.
+        fs = BrainFiles(self.root, clock=frozen_clock, final_path=lambda fd: self.sibling(brain_fs._final_path(fd)))
+        self.assertRefused(fs.read_file("docs/notes.md"), "outside")
+        self.assertRefused(fs.list_dir("docs"), "outside")
+        self.assertRefused(fs.list_dir(""), "outside")
+        self.assertEqual(fs.search("hello").matches, ())
+
+    def test_handle_in_case_sibling_inside_root_refused(self):
+        # V3: docs swapped for a junction to DOCS, a case-only sibling inside the root.
+        docs = os.path.join(self.real_root, "docs")
+        upper = os.path.join(self.real_root, "DOCS")
+        fs = BrainFiles(self.root, clock=frozen_clock,
+                        final_path=lambda fd: self.sibling(brain_fs._final_path(fd), docs, upper))
+        self.assertRefused(fs.read_file("docs/notes.md"), "link")
+        self.assertRefused(fs.list_dir("docs"), "link")
+        self.assertNoDocsMatch(fs)
+        self.assertEqual(fs.read_file("jarvis/a.py").text, "print('hello world')\nx = 1\n")
+
+    def test_prefix_and_non_normal_forms_refused(self):
+        # V5: an exact string prefix must not admit a name-prefix sibling or a non-normal path.
+        r, sep = self.real_root, os.sep
+        forms = {
+            "name prefix": r + "2" + sep + "notes.md",
+            "case name prefix": os.path.join(os.path.dirname(r), "REPO2", "notes.md"),
+            "dot dot": sep.join([r, "..", "outside", "secret.txt"]),
+            "dot": sep.join([r, ".", "docs", "notes.md"]),
+            "empty segment": r + sep + sep + "docs" + sep + "notes.md",
+            "trailing separator": os.path.join(r, "docs", "notes.md") + sep,
+        }
+        if os.altsep:
+            forms["alt separator"] = r + os.altsep + "docs" + os.altsep + "notes.md"
+        for label, final in forms.items():
+            with self.subTest(label):
+                fs = BrainFiles(self.root, clock=frozen_clock, final_path=lambda fd, final=final: final)
+                self.assertRefused(fs.read_file("docs/notes.md"), "outside")
 
 
 class HardLinkAndSpecialFileTests(RootCase):
