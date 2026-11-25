@@ -5,6 +5,7 @@ import contextlib
 import importlib.util
 import io
 import json
+import os
 import tempfile
 import threading
 import time
@@ -126,6 +127,7 @@ class EntryTests(Base):  # R2
         for path in (r"C:\Temp\abc\f.txt", "c:/tmp/x", r"D:\TEMP\x", r"C:\Users\x\AppData\Local\Temp\y"):
             self.assertEqual(q.normalize_message(f"at {path} end"), "at <tmp> end", path)
         self.assertEqual(q.normalize_message(r"at C:\TempFolder\x end"), r"at C:\TempFolder\x end")
+        self.assertEqual(q.normalize_message("at \u212a:\\Temp\\x end"), "at <tmp> end")  # POLISHQ1FIX F3: re.I kept
 
     def test_r2_temp_path_does_not_swallow_semicolon_joined_paths(self):  # POLISHQ1 F5
         for text, want in ((r"C:\Temp\a;C:\keep\b", r"<tmp>;C:\keep\b"),
@@ -367,7 +369,8 @@ class StateTests(Base):  # R7
         self.enter()
         good = json.loads(self.path.read_text(encoding="utf-8"))
         for bad in (None, [], [2], [2, 4, 6], "2/4", {"a": 1}, [True, 4], [2, True], [2.0, 4], [2, "4"],
-                    [0, 4], [-1, 4], [5, 4], [2, 0], [-2, -1], "missing", "not_a_dict"):
+                    [0, 4], [-1, 4], [5, 4], [2, 0], [-2, -1], "missing", "not_a_dict",
+                    [1, 10], [1, 1], [2, 2], [4, 4], [10, 10]):  # POLISHQ1FIX F2: evaluate() never yields these
             state = json.loads(json.dumps(good))
             if bad == "missing":
                 del state["entries"][UI]["entry_counts"]
@@ -380,6 +383,45 @@ class StateTests(Base):  # R7
                 self.reg.load()
         self.path.write_text(json.dumps(good), encoding="utf-8")
         self.assertEqual(self.reg.load()["entries"][UI]["entry_counts"], [2, 4])
+        good["entries"][UI]["entry_counts"] = [2, 3]  # the smallest pair evaluate() can produce
+        self.path.write_text(json.dumps(good), encoding="utf-8")
+        self.assertEqual(self.reg.load()["entries"][UI]["entry_counts"], [2, 3])
+
+    def _replace_then(self, after):
+        real = q.os.replace
+
+        def replace(src, dst):
+            real(src, dst)
+            after()
+        return mock.patch.object(q.os, "replace", side_effect=replace)
+
+    def test_r7_interrupt_after_replace_is_journalled_as_landed(self):  # POLISHQ1FIX F1
+        def interrupt():
+            raise KeyboardInterrupt
+        with self._replace_then(interrupt), self.assertRaises(KeyboardInterrupt):
+            self.reg.propose(self.reg.load(), flaky())
+        self.assertEqual(self.reg.load()["generation"], 1)
+        self.assertEqual([(j["reason"], j["generation"]) for j in self.journal()], [("entered", 1)])
+        self.assertEqual(list(self.path.parent.glob("*.tmp")), [])
+        self.assertFalse(self.reg.lock.exists())
+
+    def test_r7_interrupt_after_replace_with_unreadable_state_trusts_tmp_gone(self):  # POLISHQ1FIX F1
+        def corrupt_then_interrupt():
+            self.path.write_text("{not json", encoding="utf-8")
+            raise KeyboardInterrupt
+        with self._replace_then(corrupt_then_interrupt), self.assertRaises(KeyboardInterrupt):
+            self.reg.propose(self.reg.load(), flaky())
+        self.assertEqual([j["reason"] for j in self.journal()], ["entered"])  # no write_failed line
+        self.assertFalse(self.reg.lock.exists())
+
+    def test_r7_vanished_tmp_with_failed_replace_is_still_write_failed(self):  # POLISHQ1FIX F1
+        def replace(src, dst):
+            os.unlink(src)
+            raise OSError("disk")
+        with mock.patch.object(q.os, "replace", side_effect=replace), self.assertRaises(OSError):
+            self.reg.propose(self.reg.load(), flaky())
+        self.assertFalse(self.path.exists())  # the disk generation decides, not the missing tmp
+        self.assertEqual([(j["reason"], j["generation"]) for j in self.journal()], [("write_failed", 0)])
 
     def test_r7_journal_failure_leaves_state_unchanged(self):
         self.enter()

@@ -113,7 +113,7 @@ ID = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*(\.[A-Za-z_][A-Za-z0-9_]*)+$")
 
 _NORMALIZE = (  # order matters: paths, then timestamps, then hex ids, then bare numbers
     # one linear pass per drive path token (';' ends a token: PATH-style lists); <tmp> iff it holds a temp dir
-    (re.compile(r"[A-Za-z]:[\\/][^\s'\";]*"),
+    (re.compile(r"[A-Za-z]:[\\/][^\s'\";]*", re.I),
      lambda m: "<tmp>" if re.search(r"[\\/](?:temp|tmp)[\\/]", m.group(), re.I) else m.group()),
     (re.compile(r"(?<![\w.])/(?:var/folders|private/var|tmp|var/tmp)/[^\s'\";]*", re.I), "<tmp>"),
     (re.compile(r"\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2})?"), "<ts>"),
@@ -193,7 +193,7 @@ def load_state(path) -> dict:
     for test_id, entry in data["entries"].items():  # entry_counts feeds the R5 rate compare: exact ints only
         counts = entry.get("entry_counts") if isinstance(entry, dict) else None
         if (not isinstance(counts, list) or len(counts) != 2 or any(type(c) is not int for c in counts)
-                or not 1 <= counts[0] <= counts[1]):
+                or not MIN_FLIPS <= counts[0] < counts[1]):  # evaluate(): >= MIN_FLIPS fails and >= 1 pass
             raise ValueError(f"malformed quarantine state: {path}: entries[{test_id}].entry_counts")
     return data
 
@@ -389,7 +389,11 @@ class Registry:
                         landed = True
                         jh.write(json.dumps(decision, sort_keys=True) + "\n")
                 except BaseException:
-                    if not landed:  # nothing landed: drop the temp file and record the aborted generation
+                    if not landed and self._landed(tmp, new["generation"]):
+                        # an async exception between os.replace and landed=True: it landed, so journal the ok line
+                        with contextlib.suppress(OSError):
+                            self._journal(decision)
+                    elif not landed:  # nothing landed: drop the temp file and record the aborted generation
                         with contextlib.suppress(OSError):
                             os.unlink(tmp)
                         with contextlib.suppress(OSError):
@@ -401,6 +405,13 @@ class Registry:
                 decision = {**decision, "generation": disk}
             self._journal(decision)
         return decision
+
+    def _landed(self, tmp: str, generation: int) -> bool:
+        """Under the lock only this call can have written `generation`, so the disk decides; unreadable -> tmp gone."""
+        try:
+            return load_state(self.path)["generation"] == generation
+        except (OSError, ValueError):
+            return not os.path.exists(tmp)
 
     def _journal(self, decision: dict) -> None:
         with open(self.journal, "a", encoding="utf-8") as fh:
