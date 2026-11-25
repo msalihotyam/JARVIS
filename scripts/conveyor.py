@@ -552,6 +552,7 @@ STUCK_NOTE ="(no report: the conveyor marked this lane STUCK - re-dispatched twi
 BREAKER_ID = "breaker"  # attention id; build/conveyor/breaker-reset (touched) closes it
 BREAKER_BAD = 3  # this many lanes finishing BAD within BREAKER_WINDOW_S open the breaker
 BREAKER_WINDOW_S = 7200
+BREAKER_PAGE_S = 1200  # BREAKERPAGE1: only a breaker open this long pages (most close by themselves in minutes)
 NIGHT_HOURS = range(2, 8)  # 02:00-08:00 local: the 30 min escalation page waits, unless breaker open
 AUTO_LINE_S = 3600  # the band shows "auto-approved <sha7>" this long
 AUTOFIX_MODEL, AUTOFIX_EFFORT = "opus", "high"  # routing table: auto-fix lanes
@@ -4674,8 +4675,8 @@ class Conveyor:
         return i == BREAKER_ID or i in URGENT_PAGE_IDS or i in self.salih or (not wake and i not in self.quiet)
 
     def backstop(self, items):
-        """Page Salih once per urgent or needs_salih item left unacked ATTENTION_PAGE_S (the breaker at
-        once). The orchestrator's own routine items never page while a heartbeat exists: a late
+        """Page Salih once per urgent or needs_salih item left unacked ATTENTION_PAGE_S (the breaker once it
+        has been open BREAKER_PAGE_S, once per open). The orchestrator's own routine items never page while a heartbeat exists: a late
         orchestrator is hb_watch.py's single alarm (PAGEFIX). Without a heartbeat file nobody watches
         them: they page one by one as before (quiet ones never). At night
         (NIGHT_HOURS) the page waits for the morning, unless the breaker is open."""
@@ -4687,7 +4688,7 @@ class Conveyor:
             if i in (DRY_ID, CLEANUP_REGISTRY_ID):  # never page here: board / rm_registry's own page
                 continue
             if i == BREAKER_ID:
-                due, text = True, f"Devre kesici açık: {why}"
+                due, text = now - since >= BREAKER_PAGE_S, f"Devre kesici açık: {why}"
             elif self.for_salih(i, wake):
                 due, text = now - since >= ATTENTION_PAGE_S, \
                     f"Orkestratör {ATTENTION_PAGE_S // 60} dk tepki vermedi: {i}: {why}"
