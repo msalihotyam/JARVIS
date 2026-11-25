@@ -10,6 +10,7 @@ model, auth or network call.
 
 from __future__ import annotations
 
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -42,11 +43,31 @@ from jarvis.settings import Settings
 from tests.helpers import DUMMY_CAPABILITY, DummyConnector, make_task, open_core, safe_cleanup
 
 
+_TEMPLATE_DIR: tempfile.TemporaryDirectory | None = None
+
+
+def _template_database() -> Path:
+    """A fully migrated, empty store built once per process. Each test copies
+    it and still opens SQLiteMemoryStore on its own copy (the reopen path), so
+    no test shares or mutates the template; MigrationTests keep building fresh."""
+    global _TEMPLATE_DIR
+    if _TEMPLATE_DIR is None:
+        directory = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        path = Path(directory.name) / "template.db"
+        SQLiteMemoryStore(path)
+        wal = path.with_name(path.name + "-wal")
+        if wal.exists() and wal.stat().st_size:
+            raise RuntimeError("template database left a non-empty WAL")
+        _TEMPLATE_DIR = directory
+    return Path(_TEMPLATE_DIR.name) / "template.db"
+
+
 class ProjectMemoryTestCase(unittest.TestCase):
     def setUp(self) -> None:
         self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.addCleanup(safe_cleanup, self.temp)
         self.database = Path(self.temp.name) / "jarvis.db"
+        shutil.copyfile(_template_database(), self.database)
         self.memory = SQLiteMemoryStore(self.database)
 
     def core(self, connector: DummyConnector) -> AgentCore:
