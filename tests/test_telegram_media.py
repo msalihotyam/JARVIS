@@ -87,6 +87,20 @@ class AcceptanceTests(unittest.TestCase):
                 (item,) = tm.describe(msg(**{name: {"secret": "dropped"}}))
                 self.assertEqual((item.kind, item.type_name, item.file), ("unsupported", name, None))
 
+    def test_real_animation_with_backcompat_document(self):
+        gif = {"file_id": "CgACAgQAAx0", "file_size": 9000, "mime_type": "video/mp4"}
+        unsupported = tm.Descriptor("unsupported", type_name="animation")
+        self.assertEqual(tm.describe(msg(animation=gif, document=gif)), (unsupported,))
+        for bad in (None, "x", {}, {"file_id": "a\nb"}):
+            with self.subTest(document=repr(bad)[:20]):  # dropped, never read or emitted
+                self.assertEqual(tm.describe(msg(animation=gif, document=bad)), (unsupported,))
+        item, caption = tm.describe(msg(animation=gif, document=gif, caption="lol"))
+        self.assertEqual((item, caption.text), (unsupported, "lol"))
+        edit, forward, item = tm.describe(msg(animation=gif, document=gif, edit_date=9,
+                                              forward_date=1, media_group_id="42"))
+        self.assertEqual((edit.kind, forward.kind, item.type_name, item.album_key,
+                          item.not_salihs_words), ("edit", "forward", "animation", "42", True))
+
 
 class NegativeTests(unittest.TestCase):
     def test_bad_photo_refused(self):
@@ -110,7 +124,11 @@ class NegativeTests(unittest.TestCase):
         for fields in ({"photo": [SMALL], "document": PDF}, {"voice": VOICE, "audio": VOICE},
                        {"document": PDF, "sticker": {}}, {"text": "a", "caption": "b"},
                        {"text": "a", "photo": [SMALL]}, {"caption": "lonely"},
-                       {"media_group_id": "1", "text": "a"}):
+                       {"media_group_id": "1", "text": "a"}, {"document": PDF, "photo": [SMALL]},
+                       {"animation": {}, "document": PDF, "sticker": {}},
+                       {"animation": {}, "document": PDF, "photo": [SMALL]},
+                       {"animation": {}, "video": {}}, {"animation": {}, "document": PDF,
+                                                        "text": "a"}):
             with self.subTest(fields=sorted(fields)):
                 self.assertEqual(tm.describe(msg(**fields)), R.AMBIGUOUS)
 

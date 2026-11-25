@@ -142,6 +142,8 @@ def _describe(message: object, max_photo_bytes: object) -> tuple[Descriptor, ...
     message_id = msg.get("message_id")
     _check(_count(message_id, 1), Refusal.MESSAGE_ID_INVALID)
     media = [key for key in _MEDIA if key in msg]
+    if "animation" in media:  # Bot API also sets document beside animation (backward compat)
+        media = [key for key in media if key != "document"]
     has_text, has_caption = "text" in msg, "caption" in msg
     conflicts = (len(media) > 1 or (has_text and (has_caption or bool(media)))
                  or (not media and (has_caption or "media_group_id" in msg)))
