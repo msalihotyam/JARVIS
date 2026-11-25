@@ -6267,8 +6267,14 @@ class TestNightQuiet(AutopilotBase):
         for n in "ABC":
             self.report(n, "BLOCKED")
         self.c.pass_once()
-        self.assertEqual(self.status()["breaker"], "open")
-        self.assertEqual(len(self.pushes), 1)  # at once, no ATTENTION_PAGE_S wait
+        st = self.status()
+        self.assertEqual(st["breaker"], "open")
+        self.assertIn(conveyor.BREAKER_ID, [a["id"] for a in st["attention"]])  # item and status at once
+        self.assertEqual(self.pushes, [])  # BREAKERPAGE1: the push waits BREAKER_PAGE_S
+        self.t += conveyor.BREAKER_PAGE_S
+        self.c.pass_once()
+        self.c.pass_once()
+        self.assertEqual(len(self.pushes), 1)  # at night too, no ATTENTION_PAGE_S wait
         self.assertIn("breaker", self.pushes[0])
 
 
@@ -7992,6 +7998,9 @@ class TestConvHeal(AutopilotBase):
     def test_code_lane_blocked_three_times_still_opens_the_breaker(self):
         self.assertNotEqual(self.blocked_three(["A1", "B2", "C3"]), "closed")
 
+    def test_int_and_fix_lanes_blocked_three_times_still_open_the_breaker(self):
+        self.assertNotEqual(self.blocked_three(["INT7", "INT-TRAIN8", "PROTALIAS1FIX"]), "closed")
+
     def test_stuck_inbox_prompt_does_not_block_the_rest(self):
         start = self.c.start
         self.c.start = lambda name, *a, **kw: None if name == "X" else start(name, *a, **kw)
@@ -8215,14 +8224,46 @@ class TestBackstopPage(PageBase):
         for i in ids:
             self.assertEqual(len(self.pages(f"{i}: why")), 1)
 
-    def test_breaker_pages_at_once_even_at_night(self):
+    def test_breaker_open_20_min_pages_once_even_at_night(self):
         self.beat(str(self.t + 6 * 3600))
         self.hour = 3
-        self.c.breaker = {"reason": "kota", "since": self.t}
-        items = [(conveyor.BREAKER_ID, "kota", self.t)]
+        since = self.t
+        self.c.breaker = {"reason": "kota", "since": since}
+        items = [(conveyor.BREAKER_ID, "kota", since)]
         self.c.backstop(items)
+        self.t = since + conveyor.BREAKER_PAGE_S - 60
+        self.c.backstop(items)
+        self.assertEqual(self.pages(), [])  # BREAKERPAGE1: the push waits, the item does not
+        self.t = since + 21 * 60
+        self.c.backstop(items)
+        self.c.backstop(items)
+        self.t = since + 60 * 60
         self.c.backstop(items)
         self.assertEqual(len(self.pages("Devre kesici açık: kota")), 1)
+        # closes, re-opens: a new page only after its own BREAKER_PAGE_S
+        self.c.breaker = None
+        self.c.backstop([])
+        since2 = self.t + 60
+        self.c.breaker = {"reason": "kota2", "since": since2}
+        items = [(conveyor.BREAKER_ID, "kota2", since2)]
+        self.t = since2 + 19 * 60
+        self.c.backstop(items)
+        self.assertEqual(self.pages("kota2"), [])
+        self.t = since2 + 21 * 60
+        self.c.backstop(items)
+        self.assertEqual(len(self.pages("Devre kesici açık: kota2")), 1)
+        self.assertEqual(len(self.pages("Devre kesici")), 2)
+
+    def test_breaker_closing_within_5_min_sends_no_page(self):
+        since = self.t
+        self.c.breaker = {"reason": "kota", "since": since}
+        self.c.backstop([(conveyor.BREAKER_ID, "kota", since)])
+        self.t = since + 5 * 60
+        self.c.backstop([(conveyor.BREAKER_ID, "kota", since)])
+        self.c.breaker = None  # auto-closed: the item is gone
+        self.t = since + 60 * 60
+        self.c.backstop([])
+        self.assertEqual(self.pages(), [])
 
     def test_night_holds_needs_salih_until_morning(self):
         self.beat(str(self.t + 6 * 3600))
