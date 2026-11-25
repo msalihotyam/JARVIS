@@ -15,7 +15,7 @@ MAX_TEXT = 4000
 MAX_CANDIDATES = 5
 MAX_SIDE_WORDS = 4
 _EDGE_PUNCT = ".,;:!?\"'()[]{}«»“”‘’…"
-_DOMAIN = re.compile(r"[^\W_]\.[^\W\d_]{2,}")  # x.com, app.py: a bare domain counts as a URL
+_DOMAIN = re.compile(r"[\w-]\.+[^\W\d_]{2,}")  # x.com, x..com, foo-.com: a bare domain counts as a URL
 
 
 def _refuse(reason):
@@ -111,11 +111,19 @@ def build_shown(raw, corrector):
             "replacements": records, "uncorrected": False}
 
 
-def fold(text):
-    """Turkish case folding over NFC: I -> ı, İ -> i, then lower."""
+def _fold(text):
+    """Turkish case folding over NFC: I -> ı, İ -> i, then casefold (ß -> ss)."""
     text = unicodedata.normalize("NFC", text)
-    text = text.replace("I", "ı").replace("İ", "i").lower()
+    text = text.replace("I", "ı").replace("İ", "i").casefold()
     return unicodedata.normalize("NFC", text)
+
+
+def _plain(ch):
+    # Allowlist, not a denylist: a separator homoglyph (ː ⧵ ∶ ꓽ), a combining overlay (c̶) or another
+    # script's letter is none of ASCII-minus-separators or a Latin letter (Turkish ç ğ ı ö ş ü pass).
+    if ch.isascii():
+        return ch not in "/\\:@"
+    return ch.isalpha() and unicodedata.name(ch, "").startswith("LATIN ")
 
 
 def _words(text):
@@ -130,10 +138,11 @@ def _words(text):
 def _unsafe(phrase):
     if any(unicodedata.category(ch).startswith("C") for ch in phrase):
         return True  # control, format (bidi, zero-width), private, unassigned
-    # Per word, after NFKC (fullwidth : / . fold to ASCII). Any inner ":" covers every URI
-    # scheme (mailto:, javascript:, tel:), drives and times; "@" emails; dotted words bare domains.
-    for word in unicodedata.normalize("NFKC", phrase).replace("。", ".").lower().split():
-        if (any(ch in word for ch in "/\\:@∶꞉⁄∕⧸") or word.startswith(("~", "www."))
+    # Per word, after the comparison fold and NFKC (fullwidth : / . fold to ASCII). Any inner ":"
+    # covers every URI scheme (mailto:, javascript:, tel:), drives and times; "@" emails; dotted
+    # words bare domains (x.İo folds to x.io first). NFKC on both sides of the fold: ᵂ -> W -> w.
+    for word in unicodedata.normalize("NFKC", _fold(unicodedata.normalize("NFKC", phrase))).split():
+        if (not all(map(_plain, word)) or word.startswith(("~", "www."))
                 or _DOMAIN.search(word)):
             return True
     return False
@@ -143,7 +152,7 @@ def _unsafe(phrase):
 def correction_candidates(shown, corrected):
     """Word-level differences between shown and corrected text as heard -> meant records.
 
-    Words compare by fold(). If the changed word count (per differing block, the
+    Words compare by _fold(). If the changed word count (per differing block, the
     larger side) is more than half of the longer text's word count, the correction
     is a new sentence and gives no candidates. Only replaced blocks become
     candidates, each side at most MAX_SIDE_WORDS words; unsafe ones are dropped;
@@ -154,8 +163,8 @@ def correction_candidates(shown, corrected):
         if problem:
             return _refuse(problem)
     heard_words, meant_words = _words(shown), _words(corrected)
-    matcher = difflib.SequenceMatcher(None, [fold(w) for w in heard_words],
-                                      [fold(w) for w in meant_words], autojunk=False)
+    matcher = difflib.SequenceMatcher(None, [_fold(w) for w in heard_words],
+                                      [_fold(w) for w in meant_words], autojunk=False)
     ops = [op for op in matcher.get_opcodes() if op[0] != "equal"]
     changed = sum(max(i2 - i1, j2 - j1) for _, i1, i2, j1, j2 in ops)
     if changed * 2 > max(len(heard_words), len(meant_words)):
@@ -165,7 +174,7 @@ def correction_candidates(shown, corrected):
         if tag != "replace" or i2 - i1 > MAX_SIDE_WORDS or j2 - j1 > MAX_SIDE_WORDS:
             continue
         heard, meant = " ".join(heard_words[i1:i2]), " ".join(meant_words[j1:j2])
-        key = (fold(heard), fold(meant))
+        key = (_fold(heard), _fold(meant))
         if _unsafe(heard) or _unsafe(meant) or key in seen:
             continue
         seen.add(key)

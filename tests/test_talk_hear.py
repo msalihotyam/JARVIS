@@ -6,7 +6,8 @@ import unittest
 import unicodedata
 
 from jarvis import talk_hear
-from jarvis.talk_hear import build_shown, correction_candidates, fold
+from jarvis.talk_hear import _fold as fold
+from jarvis.talk_hear import build_shown, correction_candidates
 
 MODULE = pathlib.Path(talk_hear.__file__)
 
@@ -81,6 +82,15 @@ class TalkHearTests(unittest.TestCase):
         self.assertEqual(got["candidates"], [])
         got = correction_candidates("KIZ kulesi nerede bugün", "kiz kulesi nerede bugün")
         self.assertEqual(got["candidates"], [{"heard": "KIZ", "meant": "kiz"}])
+        # casefold, not lower(): the words are equal, so no candidate
+        self.assertEqual(fold("Straße"), fold("STRASSE"))
+        self.assertEqual(correction_candidates("a Straße b c d", "a STRASSE b c d")["candidates"], [])
+
+    def test_fold_private_and_public_api_refuses_non_text(self):
+        self.assertFalse(hasattr(talk_hear, "fold"))
+        for shown, corrected, reason in ((None, "x", "shown_not_text"), ("x", None, "corrected_not_text"),
+                                         (b"x", "x", "shown_not_text"), ("x", 3, "corrected_not_text")):
+            self.assertEqual(correction_candidates(shown, corrected), {"ok": False, "reason": reason})
 
     # N1 more than half changed -> new sentence
     def test_more_than_half_changed_no_candidates(self):
@@ -101,15 +111,24 @@ class TalkHearTests(unittest.TestCase):
                     "javascript\uff1ax", "a\uff0fb", "x\uff0ecom", "x\u3002com", "\u0458avascript:x",
                     "java\u200bscript:x", "14:30", "javascript\u2236x", "javascript\ua789x",
                     "a\u2044b", "a\u2215b", "a\u29f8b", "x\ufe52com", "x\u2024com", "a\uff20b",
-                    # DECISION TAKEN: bare domains and emails count as URLs
-                    "x.com", "github.com", "a@b"):
+                    # separators NFKC does not fold (Lm, Sm, Lo, So), combining marks, fold before domain
+                    "javascript\u02d0x", "src\u29f5app", "a\ua4fdb", "a\u2571b", "a\u0338b",
+                    "x.c\u0336om", "github\u0336.com", "x.i\u0307o", "x.\u0130o", "github.\u0130o", "x.IO",
+                    "g\u043eogle", "x.c\u03bfm", "a\u00a6b",
+                    # NFKC to several dots, non-word char before the dot, fold after NFKC, compat forms
+                    "x\u2026com", "x\u2025com", "x..com", "foo_.com", "foo-.com", "\u1d42ww.x",
+                    "a\u2100b", "a\ufe55b", "a\ufe6bb", "\U0001d416\U0001d416\U0001d416.xy",
+                    # DECISION TAKEN: bare domains and emails count as URLs; non-ASCII punctuation drops
+                    "x.com", "github.com", "a@b", "Ankara\u2019ya"):
             with self.subTest(bad=repr(bad)):
                 got = correction_candidates(base.replace("şunu", "dosya"), base.replace("şunu", bad))
                 self.assertEqual(got["candidates"], [])
                 got = correction_candidates(base.replace("şunu", bad), base.replace("şunu", "dosya"))
                 self.assertEqual(got["candidates"], [])
         # normal words, a trailing colon and a decimal number stay candidates
-        for good, meant in (("saat:", "saat"), ("İzmir", "İzmir"), ("3.5", "3.5")):
+        for good, meant in (("saat:", "saat"), ("İzmir", "İzmir"), ("3.5", "3.5"), ("Göğüş", "Göğüş"),
+                            ("ÇIĞLIK", "ÇIĞLIK"), ("Ankara'ya", "Ankara'ya"), ("Kâğıt", "Kâğıt"),
+                            ("DİKKAT", "DİKKAT"), (unicodedata.normalize("NFD", "Göğüş"), "Göğüş")):
             with self.subTest(good=good):
                 got = correction_candidates(base.replace("şunu", "dosya"), base.replace("şunu", good))
                 self.assertEqual(got["candidates"], [{"heard": "dosya", "meant": meant}])
