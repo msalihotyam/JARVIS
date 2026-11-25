@@ -118,8 +118,13 @@ def _known(value, choices):
     return type(value) is str and value in choices
 
 
+def _plain(mapping):
+    """Exact dict with exact-str keys: a key subclass could alias a field by hash and __eq__."""
+    return type(mapping) is dict and all(type(k) is str for k in mapping)
+
+
 def _chip(attachment):
-    if type(attachment) is not dict:
+    if not _plain(attachment):
         return Chip("dosya", None, "file")
     raw = attachment.get("name")
     raw = raw if type(raw) is str else attachment.get("path")
@@ -156,7 +161,7 @@ def _row(entry):
     if kind == "transcript":
         label = "Anladığım:"
     attachments = entry.get("attachments")
-    chips = tuple(_chip(a) for a in attachments) if isinstance(attachments, (list, tuple)) else ()
+    chips = tuple(_chip(a) for a in attachments) if type(attachments) in (list, tuple) else ()
     is_open = card_id is not None and _known(entry.get("state", "PENDING"), ("PENDING",))
     return Row(
         entry_id, kind, WHO[who], label, clean(entry.get("text")), time, chips,
@@ -166,7 +171,7 @@ def _row(entry):
 
 def _safe_row(entry):
     try:
-        if type(entry) is dict:
+        if _plain(entry):
             return _row(entry)
     except Exception:  # nosec B110 - a hostile entry becomes a neutral row, never dropped
         pass
@@ -176,9 +181,9 @@ def _safe_row(entry):
 def present(entries, status, focus, mode, window):
     """View model of the window's last N entries, or a Refusal. Never raises."""
     try:
-        if not isinstance(entries, (list, tuple)):
+        if type(entries) not in (list, tuple):  # a subclass could slice to more than N
             return Refusal("entries must be a list")
-        if type(status) is not dict or not _known(status.get("ring"), RING_STATES):
+        if not _plain(status) or not _known(status.get("ring"), RING_STATES):
             return Refusal("unknown ring state")
         if focus is not None and type(focus) is not str:
             return Refusal("focus must be a string or none")
@@ -198,7 +203,7 @@ def present(entries, status, focus, mode, window):
 
 
 def _command(command, view):
-    if type(command) is not dict:  # a subclass could hide fields behind its own keys()/get
+    if not _plain(command):  # a subclass or an aliasing key could hide or forge fields
         return Refusal("command must be a mapping")
     name = command.get("name")
     if type(name) is not str or name not in COMMANDS:
@@ -220,7 +225,9 @@ def _command(command, view):
     if name == "card_tap":
         if args["choice"] not in CHOICES:
             return Refusal("unknown card choice")
-        if not isinstance(view, ViewModel) or args["card_id"] not in view.open_cards:
+        cards = view.open_cards if type(view) is ViewModel else None
+        plain = type(cards) is frozenset and all(type(c) is str for c in cards)
+        if not plain or args["card_id"] not in cards:
             return Refusal("card is not open in the view")
     return Command(name, **args)
 
