@@ -31,6 +31,10 @@ def _parse(index, action):
             item["reason"] = "bad_action"
             return item
         snap = dict(action)
+        # Keys too: a non-str key could answer .get with one value and hand send() another.
+        if any(type(k) is not str for k in snap):
+            item["reason"] = "bad_action"
+            return item
         entry_id, view, part, text = (snap.get(k) for k in ("entry_id", "view", "part", "text"))
         # Exact types: a str/int subclass could lie in __eq__/__hash__ and dodge the dedup key.
         if type(entry_id) not in (int, str):

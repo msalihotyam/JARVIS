@@ -239,6 +239,40 @@ class HostileInputTests(unittest.TestCase):
         each(self, bad_state, lambda v: check(v, "bad_state"))
         each(self, unreadable, lambda v: check(v, "state_unreadable"))
 
+    def test_action_key_not_exactly_str_is_refused_and_never_sent(self):
+        class Stateful(str):  # equals its text only when armed, once: dedup reads one value, send() another
+            armed = False
+
+            def __eq__(self, other):
+                hit, Stateful.armed = Stateful.armed, False
+                return hit and str.__eq__(self, other)
+
+            __hash__ = str.__hash__
+
+        class Plain(str):
+            pass
+
+        class Mimic:
+            def __eq__(self, other):
+                return other == "entry_id"
+
+            def __hash__(self):
+                return hash("entry_id")
+
+        def check(key):
+            hostile = {key: 1, **act(entry_id=2, text="x")}
+            Stateful.armed = True
+            out, store, senders = run([act(entry_id=2, text="y"), hostile])
+            self.assert_typed(out)
+            by_index = {r["index"]: r for r in out["results"]}
+            self.assertEqual(by_index[1], {"index": 1, "entry_id": None, "view": None, "part": None,
+                                                 "result": "refused", "reason": "bad_action"})
+            self.assertEqual(senders["pc"].sent, [(2, 1)])
+            self.assertEqual(store.log, [(2, "pc", 1, "sending", 0), (2, "pc", 1, "sent", 1)])
+
+        each(self, (Stateful("entry_id"), Plain("entry_id"), Plain("note"), Mimic(), 1, None,
+                    ("entry_id",), b"entry_id"), check)
+
     def test_record_raising_recursion_error_is_typed(self):
         def record(*args):
             raise RecursionError()
