@@ -4,7 +4,8 @@ Every side effect goes through injected callables, so this module imports no
 I/O, network or other talk/telegram module. A send is keyed by
 (entry id, view, part); it is recorded "sending" before and "sent"/"failed"
 after. A key already "sent" is skipped; a "sending" with no result (a crash
-mid-send) is reported "unknown" and never resent here. Never raises.
+mid-send) is reported "unknown" and never resent here. A part goes only when
+every lower part of its entry and view is stored "sent". Never raises.
 """
 
 from collections.abc import Mapping
@@ -114,8 +115,9 @@ def pump(actions, senders, record, was_sent):
     part) -> None or {"state": "sending"|"sent"|"failed", "attempts": int}.
     Returns {"ok": True, "results": [...]} or {"ok": False, "reason"}. Result
     codes: sent, failed, skipped, duplicate, unknown, refused, blocked (an
-    earlier part of the entry did not go), stopped (the view's record broke),
-    sent_unrecorded, failed_unrecorded.
+    earlier part of the entry in this call did not go), held (reason
+    lower_part_not_sent: a lower part of the entry/view is not stored "sent"),
+    stopped (the view's record broke), sent_unrecorded, failed_unrecorded.
     """
     try:
         if (not isinstance(actions, (list, tuple)) or not isinstance(senders, Mapping)
@@ -148,12 +150,30 @@ def _run(items, senders, record, was_sent):
     for view in VIEWS:  # views run independently: one stopping never touches the other
         stopped = False
         for chain in chains[view].values():
-            blocked = False
+            blocked, done = False, 0  # parts 1..done of this entry/view are known sent
             for item in sorted(chain, key=lambda i: i["part"]):
                 if stopped or blocked:
                     results.append(_out(item, "stopped" if stopped else "blocked"))
                     continue
+                if item["reason"] is None and not _lower_sent(was_sent, item, done):
+                    results.append(_out(item, "held", "lower_part_not_sent"))
+                    blocked = True
+                    continue
                 out, stopped = _deliver(item, senders[view], record, was_sent)
                 results.append(out)
                 blocked = out["result"] not in ("sent", "skipped")
+                done = item["part"]
     return {"ok": True, "results": results}
+
+
+def _lower_sent(was_sent, item, done):
+    """True when every part done+1..part-1 of the item's entry/view is stored "sent".
+
+    The first part not stored sent (failed, sending, missing, unreadable) ends the
+    loop, so an honest store bounds it by the parts it really sent.
+    """
+    entry_id, view, part = item["key"]
+    for lower in range(done + 1, part):
+        if _prior(was_sent, (entry_id, view, lower))[0] != "sent":
+            return False
+    return True

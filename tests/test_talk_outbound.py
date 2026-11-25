@@ -163,6 +163,82 @@ class NegativeTests(unittest.TestCase):
         self.assertEqual(senders["telegram"].sent, [(2, 1)])
         self.assertNotIn((1, "telegram", 1), store.states)
 
+    def test_7_part_goes_only_when_every_lower_part_is_stored_sent(self):
+        unreadable = object()  # was_sent raises for part 1
+        stored = {"sent": {"state": "sent", "attempts": 1}, "failed": {"state": "failed", "attempts": 1},
+                  "sending": {"state": "sending", "attempts": 0}, "missing": None,
+                  "bad_state": {"state": "done", "attempts": 1}, "unreadable": unreadable}
+        # (part 1 stored state, part 1 in this call, part 1 send ok) -> (results, sends)
+        table = [
+            ("sent", True, True, ["skipped", "sent"], [(1, 2)]),
+            ("failed", True, True, ["sent", "sent"], [(1, 1), (1, 2)]),
+            ("failed", True, False, ["failed", "blocked"], [(1, 1)]),
+            ("sending", True, True, ["unknown", "blocked"], []),
+            ("missing", True, True, ["sent", "sent"], [(1, 1), (1, 2)]),
+            ("missing", True, False, ["failed", "blocked"], [(1, 1)]),
+            ("bad_state", True, True, ["refused", "blocked"], []),
+            ("unreadable", True, True, ["refused", "blocked"], []),
+            ("sent", False, True, ["sent"], [(1, 2)]),
+            ("failed", False, True, ["held"], []),
+            ("sending", False, True, ["held"], []),
+            ("missing", False, True, ["held"], []),
+            ("bad_state", False, True, ["held"], []),
+            ("unreadable", False, True, ["held"], []),
+        ]
+        for state, in_call, ok, want, sends in table:
+            with self.subTest(state=state, in_call=in_call, ok=ok):
+                store = Store()
+                if stored[state] is not None:
+                    store.states[(1, "pc", 1)] = stored[state]
+                real = store.was_sent
+
+                def was_sent(*key, real=real):
+                    if real(*key) is unreadable:
+                        raise OSError("db locked")
+                    return real(*key)
+
+                pc = Sender(lambda a, ok=ok: {"ok": ok or a["part"] != 1})
+                actions = ([act(part=1)] if in_call else []) + [act(part=2)]
+                out = pump(actions, {"pc": pc}, store.record, was_sent)
+                self.assertEqual([r["result"] for r in out["results"]], want)
+                self.assertEqual(pc.sent, sends)
+                self.assertNotEqual(store.states.get((1, "pc", 2), {}).get("state"), "sending")
+                if want[-1] == "held":
+                    self.assertEqual(out["results"][-1]["reason"], "lower_part_not_sent")
+                    self.assertNotIn((1, "pc", 2), store.states)
+
+    def test_8_every_lower_part_is_checked_not_only_the_one_below(self):
+        sent = {"state": "sent", "attempts": 1}
+        for gap in ("failed", "sending", None):
+            with self.subTest(gap=gap):
+                states = {(1, "pc", 1): sent, (1, "telegram", 1): sent, (1, "telegram", 2): sent}
+                if gap:
+                    states[(1, "pc", 2)] = {"state": gap, "attempts": 1}
+                out, store, senders = run([act(part=1), act(part=3), act(part=4), act(view="telegram", part=3),
+                                           act(entry_id=2, part=2)], Store(states))
+                self.assertEqual(results(out), [(1, "pc", 1, "skipped"), (1, "pc", 3, "held"),
+                                                (1, "pc", 4, "blocked"), (2, "pc", 2, "held"),
+                                                (1, "telegram", 3, "sent")])
+                self.assertEqual(senders["pc"].sent, [])
+                self.assertEqual(senders["telegram"].sent, [(1, 3)])
+
+    def test_9_restart_never_sends_a_part_past_a_failed_or_crashed_lower_part(self):
+        store = Store()
+        three = [act(part=1), act(part=2), act(part=3)]
+        out, store, senders = run(three, store, pc=Sender(lambda a: {"ok": a["part"] != 2}))
+        self.assertEqual([r["result"] for r in out["results"]], ["sent", "failed", "blocked"])
+        out, store, senders = run([act(part=3)], store)  # restart: only part 3 is planned again
+        self.assertEqual(results(out), [(1, "pc", 3, "held")])
+        self.assertEqual(senders["pc"].sent, [])
+        out, store, senders = run([act(part=2)], store)
+        out, store, senders = run([act(part=3)], store)
+        self.assertEqual(results(out), [(1, "pc", 3, "sent")])
+        # A crash mid-send leaves part 1 "sending": part 2 alone after the restart is held.
+        crashed = Store({(5, "pc", 1): {"state": "sending", "attempts": 0}})
+        out, crashed, senders = run([act(entry_id=5, part=2)], crashed)
+        self.assertEqual(results(out), [(5, "pc", 2, "held")])
+        self.assertEqual((senders["pc"].sent, crashed.log), ([], []))
+
 
 class HostileInputTests(unittest.TestCase):
     def assert_typed(self, out):
@@ -177,8 +253,10 @@ class HostileInputTests(unittest.TestCase):
             for field in ("part", "entry_id"):
                 out, store, _ = run([act(**{field: value})])
                 self.assert_typed(out)
-                self.assertEqual(out["results"][0]["result"], "sent" if valid[field] else "refused")
-                self.assertEqual(len(store.log), 2 if valid[field] else 0)
+                # A valid part above 1 with no part 1 stored sent is held, never sent.
+                expected = ("held" if field == "part" and value != 1 else "sent") if valid[field] else "refused"
+                self.assertEqual(out["results"][0]["result"], expected)
+                self.assertEqual(len(store.log), 2 if expected == "sent" else 0)
 
         each(self, HOSTILE_NUMBERS + (0, -1, 1.0), check)
 
