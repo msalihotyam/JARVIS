@@ -9,6 +9,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 from jarvis import brain_session as bs
 from jarvis.connectors.claude_code import PROHIBITED_BILLING_ENV_VARS
@@ -95,15 +96,28 @@ class AcceptanceTest(Base):
             self.refused(bs.build(self.config(model=bad), self.environ), "model_invalid")
 
     def test_resume_reuses_same_limits(self):
-        fresh = self.built()
-        again = bs.resume(self.config(), "abc-123_X", self.environ)
+        fresh = self.built(resumable=True)
+        again = bs.resume(self.config(resumable=True), "abc-123_X", self.environ)
         self.assertIs(type(again), bs.BrainCommand, again)
         i = again.argv.index("--resume")
         self.assertEqual(again.argv[i + 1], "abc-123_X")
         self.assertEqual(again.argv[:i] + again.argv[i + 2:], fresh.argv)
-        self.assertNotIn("--no-session-persistence", fresh.argv)  # the first session must be resumable
+        self.assertNotIn("--no-session-persistence", fresh.argv)  # opted in: the first session is resumable
+        self.assertNotIn("--no-session-persistence", again.argv)
         self.assertEqual((again.env, again.mcp_config, again.cwd), (fresh.env, fresh.mcp_config, fresh.cwd))
-        self.assertIs(type(bs.resume(self.config(), "x" * 64, self.environ)), bs.BrainCommand)
+        self.assertIs(type(bs.resume(self.config(resumable=True), "x" * 64, self.environ)), bs.BrainCommand)
+
+    def test_fresh_session_not_persisted_by_default(self):
+        argv = self.built().argv
+        self.assertEqual(argv.count("--no-session-persistence"), 1)
+        self.assertNotIn("--resume", argv)
+        self.assertEqual(argv, self.built(resumable=False).argv)
+        self.refused(bs.resume(self.config(), "abc-123_X", self.environ), "resume_not_enabled")
+        self.refused(bs.resume(self.config(resumable=False), "abc", self.environ), "resume_not_enabled")
+        for bad in (1, 0, "yes", "", None, (True,)):
+            with self.subTest(resumable=bad):
+                self.refused(bs.build(self.config(resumable=bad), self.environ), "resumable_invalid")
+                self.refused(bs.resume(self.config(resumable=bad), "abc", self.environ), "resumable_invalid")
 
 
 class RefusalTest(Base):
@@ -127,6 +141,42 @@ class RefusalTest(Base):
         each(self, roots, lambda root: self.refused(bs.build(self.config(root=root), self.environ)))
         each(self, HOSTILE_PATH_PARTS,
              lambda part: self.refused(bs.build(self.config(root=str(self.root) + "\\" + part), self.environ)))
+
+    def test_non_fixed_drive_refused_before_any_stat(self):
+        # 0 unknown, 1 no root, 2 removable, 4 remote (mapped share), 5 cdrom, 6 ramdisk; a raising query refuses too.
+        answers = [0, 1, 2, 4, 5, 6, OSError("x"), AttributeError("no WinDLL")]
+        for answer in answers:
+            with self.subTest(answer=answer), \
+                    mock.patch.object(bs, "_drive_type", side_effect=[answer]) as drive, \
+                    mock.patch.object(bs.os, "lstat") as lstat, \
+                    mock.patch.object(bs.Path, "resolve") as resolve:
+                self.refused(bs.build(self.config(root="Z:\\repo"), self.environ), "root_not_local")
+                drive.assert_called_once_with("Z:\\")
+                lstat.assert_not_called()
+                resolve.assert_not_called()
+
+    def test_device_name_or_path_subclass_refused_before_any_stat(self):
+        class Sub(type(Path())):
+            pass
+
+        roots = ("C:\\NUL", "C:\\x\\con.txt", "C:\\COM1", "C:\\x\\Lpt9 ", str(self.root / "aux"), Sub(self.root))
+        with mock.patch.object(bs.os, "lstat") as lstat, mock.patch.object(bs, "_drive_type") as kind:
+            for root in roots:
+                with self.subTest(root=root):
+                    self.refused(bs.build(self.config(root=root), self.environ), "root_invalid")
+        lstat.assert_not_called()
+        kind.assert_not_called()
+
+    def test_link_component_refused_before_resolve(self):
+        import _winapi  # CPython's own junction helper: no symlink privilege needed
+        (self.root / "sub").mkdir()
+        link = self.tmp / "link"
+        _winapi.CreateJunction(str(self.root), str(link))
+        self.addCleanup(os.rmdir, link)  # removes the junction only, never the target
+        for root in (link, link / "sub"):
+            with self.subTest(root=root), mock.patch.object(bs.Path, "resolve") as resolve:
+                self.refused(bs.build(self.config(root=str(root)), self.environ), "root_not_canonical")
+                resolve.assert_not_called()
 
     def test_session_id_must_be_opaque(self):
         bad = ["a/b", "a\\b", "a b", "x" * 65, "", "-p", "--resume", "abc\n", "a.b", "..", 7, None, *HOSTILE_TEXT]
