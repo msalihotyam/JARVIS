@@ -58,17 +58,24 @@ def _refuse(reason: str) -> Refusal:
 
 _MARK = "\x00{}\x00"  # NUL never survives _clean, so it is a safe placeholder
 _MARK_RE = re.compile(r"\x00(\w+)\x00")
-_FENCE_RE = re.compile(r"^\s{0,3}(`{3,}|~{3,})")
+# A fence-ish line: ``` or ~~~ after any mix of spaces, quote (">") and list
+# ("-", "*", "+", "•", "1.", "1)", task box "[ ]") markers. It ends speech for the
+# rest of the answer; no closer is ever matched, so nested code is never read aloud.
+_FENCE_RE = re.compile(r"(?:[\s>*+•-]|\d{1,9}[.)]|\[[ xX]\])*(?:```|~~~)")
 # Patterns below avoid two adjacent runs over the same characters and start
 # only at the beginning of a run: a 20000-char line must stay linear.
 _TABLE_SEP_RE = re.compile(r"\|?\s*:?-+:?\s*(?:\|\s*:?-+:?\s*)*\|?")  # fullmatch on a stripped line
-_INLINE_CODE_RE = re.compile(r"(`+)[^`\n]+?\1")
-_IMAGE_RE = re.compile(r"!\[([^\]\n]{0,200})\]\([^)\n]{0,2000}\)")
-_LINK_RE = re.compile(r"\[([^\]\n]{0,200})\]\([^)\n]{0,2000}\)")
-_URL_RE = re.compile(r"(?:\b[a-zA-Z][a-zA-Z0-9+.-]{1,15}://|\bwww\.)[^\s<>\"')\]\x00]+")
+_BACKTICKS_RE = re.compile(r"`+")
+_TARGET = r"\((?:[^()\n]|\([^()\n]{0,2000}\)){0,2000}\)"  # one level of balanced parentheses
+_IMAGE_RE = re.compile(r"!\[([^\]\n]{0,200})\]" + _TARGET)
+_LINK_RE = re.compile(r"\[([^\]\n]{0,200})\]" + _TARGET)
+_URL_RE = re.compile(
+    r"(?:\b[a-zA-Z][a-zA-Z0-9+.-]{1,15}://|\bwww\.)(?:[^\s<>\"'()\]\x00]|\([^\s<>\"'()\]\x00]*\)?)+"
+)
 _PATH_RE = re.compile(
     r"(?:\b[A-Za-z]:[\\/]|\\\\|~[\\/]|\.{1,2}[\\/]|(?<![\w.])/(?=[\w.-]))[^\s<>\"'`|\x00]*"
     r"|(?<![\w.\\/-])[\w.-]+(?:[\\/][\w.-]+)+\.[A-Za-z0-9]{1,8}\b"
+    r"|(?<![\w.\\/-])[\w.-]+(?:[\\/][\w.-]+)*[\\/]\.\w[\w.-]*"  # dotfile last segment: secrets/.env
     r"|(?<![\w-])[\w-]+\.(?:py|md|json|txt|js|ts|qml|toml|ya?ml|ps1|sh|csv|log|db|html|css|cfg|ini|exe|dll)\b"
 )
 _HASH_RE = re.compile(r"\b(?=[0-9a-fA-F]*\d)(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,}\b")
@@ -77,6 +84,7 @@ _WRAPPED_MARK_RE = re.compile(r"<\s*(\x00\w+\x00)\s*>")  # autolink "<https://x>
 _ESCAPE_RE = re.compile(r"\\([\\`*_{}\[\]()#+\-.!|>~])")
 _LINE_MARKS = (
     (re.compile(r"^\s*(?:[-*_]\s*){3,}$"), ""),  # horizontal rule
+    (re.compile(r"^\s*=+\s*$"), ""),  # setext heading underline
     (re.compile(r"^\s*(?:>\s?)+"), ""),  # blockquote
     (re.compile(r"^\s{0,3}#{1,6}\s+"), ""),  # heading
     (re.compile(r"(?<=\s)#+\s*$"), ""),  # closing heading hashes
@@ -101,33 +109,27 @@ def _clean(text: str) -> str:
     )
 
 
-def _blocks(lines: list[str]) -> list[str]:
-    """Replace fenced/indented code and table lines by one marker line per block."""
+def _blocks(lines: list[str]) -> tuple[list[str], bool]:
+    """Replace indented code and table lines by one marker line per block.
+
+    The first fence-ish line becomes a code marker and cuts the rest of the
+    answer (the second value is True): fail closed, never read code aloud.
+    """
     out: list[str] = []
-    fence = ""
     table = indented = False
     prev_blank = True
     for i, line in enumerate(lines):
         stripped = line.strip()
         blank_before, prev_blank = prev_blank, not stripped
-        if fence:
-            m = _FENCE_RE.match(line)
-            if m and m.group(1)[0] == fence[0] and len(m.group(1)) >= len(fence):
-                if not line.strip().strip(fence[0]):
-                    fence = ""
-                    prev_blank = True  # no paragraph to continue: an indent after it is code
-            continue
+        if _FENCE_RE.match(line):
+            out.append(_MARK.format("code"))
+            return out, True
         # Indented code runs through blank lines; it cannot interrupt a paragraph.
         if indented and (not stripped or line.startswith("    ")):
             continue
         indented = False
         if blank_before and stripped and line.startswith("    "):
             indented = True
-            out.append(_MARK.format("code"))
-            continue
-        m = _FENCE_RE.match(line)
-        if m:
-            fence = m.group(1)  # unclosed fence: the rest of the text is code
             out.append(_MARK.format("code"))
             continue
         if table and "|" in stripped:
@@ -144,7 +146,7 @@ def _blocks(lines: list[str]) -> list[str]:
                 out.append(_MARK.format("table"))
             continue
         out.append(line)
-    return out
+    return out, False
 
 
 def _tag(m: re.Match) -> str:
@@ -154,9 +156,28 @@ def _tag(m: re.Match) -> str:
     return " " + "".join(_MARK.format(k) for k in _MARK_RE.findall(inner)) + " "
 
 
+def _code_spans(line: str) -> str:
+    """CommonMark code spans in one linear pass: a run closes only on the next equal-length run."""
+    runs = [(m.start(), m.end()) for m in _BACKTICKS_RE.finditer(line)]
+    nxt: list[int | None] = [None] * len(runs)
+    last: dict[int, int] = {}
+    for i in range(len(runs) - 1, -1, -1):
+        size = runs[i][1] - runs[i][0]
+        nxt[i], last[size] = last.get(size), i
+    out, pos, i = [], 0, 0
+    while i < len(runs):
+        j = nxt[i]
+        if j is None:
+            i += 1  # no closer: a literal run, dropped later with the other marks
+            continue
+        out += [line[pos:runs[i][0]], _MARK.format("code")]
+        pos, i = runs[j][1], j + 1
+    return "".join(out) + line[pos:]
+
+
 def _inline(line: str) -> str:
-    line = _INLINE_CODE_RE.sub(_MARK.format("code"), line)
-    line = _IMAGE_RE.sub(r"\1", line)
+    line = _code_spans(line)
+    line = _IMAGE_RE.sub(r"\1 " + _MARK.format("url"), line)  # alt text spoken, target not
     line = _LINK_RE.sub(r"\1 " + _MARK.format("url"), line)  # label spoken, target not
     line = _URL_RE.sub(_MARK.format("url"), line)
     line = _HTML_TAG_RE.sub(_tag, line)  # before paths, or "</b>" reads as a path
@@ -182,7 +203,8 @@ def _cap(spoken: str) -> tuple[str, bool]:
 
 
 def _prepare(text: str) -> Speech | Refusal:
-    lines = [_inline(line) for line in _blocks(_clean(text).split("\n"))]
+    blocks, cut = _blocks(_clean(text).split("\n"))
+    lines = [_inline(line) for line in blocks]
     joined = "\n".join(line for line in lines if line)
     seen: list[str] = []
 
@@ -199,7 +221,8 @@ def _prepare(text: str) -> Speech | Refusal:
     spoken = "\n".join(line for line in spoken.split("\n") if line)
     if not spoken:
         return _refuse("empty")
-    spoken, rest = _cap(spoken)
+    spoken, capped = _cap(spoken)
+    rest = capped or cut
     kinds = tuple(k for k in CUES if k in seen) + ((REST,) if rest else ())
     return Speech(spoken, kinds, rest)
 
