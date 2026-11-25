@@ -48,10 +48,12 @@ class FakeLog:
         return [dict(x) for x in self.lines]
 
     def terminal_for(self, item):
+        """True only when this item's own terminal line exists."""
         rid = item.get("id") if type(item) is dict else None
-        if type(rid) is str and self._find("in:pc:" + rid) and self._find("in:pc:" + rid)["kind"] != "refused":
-            return self._find("reply:" + rid) is not None
-        return any(x["kind"] == "refused" and x["key"].startswith("in:pc:") for x in self.lines)
+        if not (type(rid) is str and tb.ID_RE.fullmatch(rid)):
+            rid = tb._tag(item)
+        line = self._find("in:pc:" + rid)
+        return line is not None and (line["kind"] == "refused" or self._find("reply:" + rid) is not None)
 
 
 class FakeBrain:
@@ -221,6 +223,111 @@ class UnknownTests(unittest.TestCase):
                      (4, True), (4, "40"), (None, None), (10**400, 40)):
             with self.subTest(repr(args)[:40]):
                 self.assertTrue(w.core(*args).refused)
+
+
+def once(real, key, result):
+    """The first call for key gives result (or raises before any write); later calls pass through."""
+    hit = []
+
+    def call(k, *rest):
+        if k == key and not hit:
+            hit.append(k)
+            if result == "raise":
+                raise OSError("before")
+            return result
+        return real(k, *rest)
+    return call
+
+
+class PendingAnswerTests(unittest.TestCase):
+    """An answer whose reply line did not land is kept and its write retried; never re-asked."""
+
+    def world(self, *items, fail=()):
+        w = World(*(items or (text("a1", "soru"),)), fail=fail)
+        real = w.brain.ask
+        w.brain.ask = lambda q: real(q) + " #%d" % len(w.brain.asked)  # each answer differs
+        return w
+
+    def test_reply_append_not_landed_then_later_steps_never_reask(self):
+        for label, result in (("failed", "failed"), ("raise_before", "raise"), ("wrong_type", object())):
+            with self.subTest(label):
+                w = self.world()
+                w.log.append = once(w.log.append, "reply:a1", result)
+                core = w.core()
+                core.step()
+                self.assertNotIn("reply:a1", w.keys("reply:"))
+                self.assertEqual(len(w.inbox.items), 1)  # not acked before its reply line
+                for _ in range(3):
+                    core.step()
+                self.assertEqual(w.brain.asked, ["soru"])
+                self.assertEqual(w.log.get("reply:a1")["text"], "cevap: soru #1")
+                self.assertEqual((w.inbox.items, w.inbox.acked[0][1]), ([], True))
+                self.assertEqual((core.pending, core.model()["held"]), ({}, []))
+
+    def test_unknown_append_and_get_holds_then_absent_retries_the_same_answer(self):
+        w = self.world()
+        real_get, seen = w.log.get, []
+        w.log.get = lambda k: (seen.append(k) or "unknown") if k == "reply:a1" and w.brain.asked and not seen \
+            else real_get(k)
+        w.log.append = once(w.log.append, "reply:a1", "raise")
+        core = w.core()
+        self.assertEqual(core.step()["held"], ["reply:a1"])
+        core.step()
+        self.assertEqual(w.brain.asked, ["soru"])
+        self.assertEqual(w.log.get("reply:a1")["text"], "cevap: soru #1")
+        self.assertEqual(w.inbox.items, [])
+
+    def test_failure_line_not_landed_is_retried_without_a_new_ask(self):
+        w = World(text("a1", "soru"), fail={"soru"})
+        w.log.append = once(w.log.append, "reply:a1", "failed")
+        core = w.core()
+        for _ in range(3):
+            core.step()
+        self.assertEqual(w.brain.asked, ["soru"])
+        self.assertEqual(w.log.get("reply:a1")["text"], tb.FAILED_TEXT)
+
+    def test_bad_read_keeps_the_pending_answer(self):
+        w = self.world()
+        w.log.append = once(w.log.append, "reply:a1", "failed")
+        core = w.core()
+        core.step()
+        good_read, w.log.read = w.log.read, lambda: 5
+        core.step()
+        self.assertIn("reply:a1", core.pending)
+        w.log.read = good_read
+        core.step()
+        self.assertEqual((w.brain.asked, w.log.get("reply:a1")["text"]), (["soru"], "cevap: soru #1"))
+
+    def test_line_stored_by_another_writer_wins_and_releases_the_answer(self):
+        w = self.world()
+        w.log.append = once(w.log.append, "reply:a1", "failed")
+        core = w.core()
+        core.step()
+        w.log.append("reply:a1", {"key": "reply:a1", "kind": "reply", "text": "ilk", "time": 1})
+        core.step()
+        self.assertEqual((w.brain.asked, w.log.get("reply:a1")["text"]), (["soru"], "ilk"))
+        self.assertEqual((core.pending, w.inbox.items), ({}, []))
+
+    def test_in_append_unknown_without_budget_for_its_get_holds_the_key(self):
+        # budget 17, max_pc 4: clock+read+take 3, two good turns 5 each, a refused item 2,
+        # so the in-line append of "t" leaves 1 unit: its get is not afforded
+        w = World(text("g1", "q1"), text("g2", "q2"), {"id": 7, "kind": "text", "text": "x"}, text("t", "q3"))
+        w.log.append = once(w.log.append, "in:pc:t", "unknown")
+        core = w.core(max_pc=4, budget=17)
+        self.assertEqual(core.step()["held"], ["in:pc:t"])
+        self.assertEqual(len(w.inbox.items), 1)
+        core.step()
+        self.assertEqual(w.brain.asked, ["q1", "q2", "q3"])
+        self.assertEqual((w.log.get("reply:t")["text"], w.inbox.items), ("cevap: q3", []))
+
+    def test_terminal_oracle_matches_the_items_own_key(self):
+        log, bad, good = FakeLog(), {"id": 7, "kind": "text", "text": "x"}, text("a1", "x")
+        log.append("k", {"key": "in:pc:" + tb._tag(bad), "kind": "refused", "text": "r", "time": 1})
+        self.assertEqual((log.terminal_for(bad), log.terminal_for(good)), (True, False))
+        log.append("k", {"key": "in:pc:a1", "kind": "text", "text": "x", "time": 1})
+        self.assertFalse(log.terminal_for(good))
+        log.append("k", {"key": "reply:a1", "kind": "reply", "text": "y", "time": 1})
+        self.assertTrue(log.terminal_for(good))
 
 
 class BudgetTests(unittest.TestCase):

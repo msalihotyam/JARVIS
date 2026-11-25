@@ -147,6 +147,51 @@ class BrainViewTests(unittest.TestCase):
         self.assertIs(tb.View(raw(show=boom)).publish({}), tb.UNKNOWN)
 
 
+class TagTests(unittest.TestCase):
+    """Items json.dumps cannot encode still get one stable key part each."""
+
+    def test_unencodable_items_get_distinct_stable_tags(self):
+        class Loud:
+            def __repr__(self):
+                raise RuntimeError("repr")
+
+        class Meta(type):
+            def __eq__(cls, other):
+                raise RuntimeError("eq")
+            __hash__ = type.__hash__
+
+        odd = Meta("Odd", (), {})
+        big = 10**5000
+        cyc = []
+        cyc.extend([cyc] * 10)
+        items = [{"id": big}, {"id": big + 1}, {"id": [big]}, {"id": [big, 2]},
+                 {1: "a", "b": 2}, {1: "a", "b": 3}, {(1, 2): "x"}, {"id": Loud(), "n": 1},
+                 {"id": Loud(), "n": 2}, cyc, [big, 255], [big, ["int", "ff"]], [big, {"a": 1}],
+                 [big, [["a", 1]]], [big, (1,)], [big, [1]], [big, "Loud"], {"id": odd(), "n": 1},
+                 {"id": odd(), "n": 2}]
+        tags = [tb._tag(x) for x in items]
+        self.assertEqual(len(set(tags)), len(tags))
+        self.assertEqual(tags, [tb._tag(x) for x in items])  # stable
+        self.assertEqual(tb._tag({"x": {1, 9}}), tb._tag({"x": {9, 1}}))  # equal sets, no repr order
+        self.assertTrue(tb.KEY_RE.fullmatch("in:pc:" + tb._tag([big] + list(range(200_000)))))  # width cut
+        for t in tags:
+            self.assertTrue(tb.KEY_RE.fullmatch("in:pc:" + t))
+        self.assertNotIn(tb._tag({"id": 10**5000}), {tb._tag(x) for x in ("unencodable", "~", None)})
+
+    def test_one_type_raising_repr_shares_a_tag_by_design(self):
+        class Loud:
+            def __repr__(self):
+                raise RuntimeError("repr")
+
+        self.assertEqual(tb._tag({"id": Loud()}), tb._tag({"id": Loud()}))
+
+    def test_inbox_refuses_each_unencodable_item_under_its_own_key(self):
+        raw = SimpleNamespace(take=lambda n: [{"id": 10**5000}, {"id": 10**5000 + 2}], ack=lambda v: None)
+        got = tb.PcInbox(raw).take(4)
+        self.assertEqual([x.reason for x in got], ["bad_id", "bad_id"])
+        self.assertNotEqual(got[0].item_id, got[1].item_id)
+
+
 class ClockTests(unittest.TestCase):
     def test_seconds_become_milliseconds(self):
         self.assertEqual(tb.Clock(raw(now=lambda: 1.5)).now(), tb.Tick(1500))

@@ -24,6 +24,7 @@ class Core:
     def __init__(self, ports, config):
         self.p, self.cfg = ports, config
         self.lines, self.held, self.left, self.now = {}, set(), 0, 0
+        self.pending = {}  # reply key -> answer line not yet in the log (in-process only)
 
     def _call(self, fn, *args, need=2):
         """need: units this call and what must follow it in the step require."""
@@ -40,7 +41,10 @@ class Core:
             return OK
         if got is not EXISTS and got is not UNKNOWN:
             return got
-        return self._lookup(line.key)
+        found = self._lookup(line.key)
+        if found is NO_BUDGET and got is UNKNOWN:
+            self.held.add(line.key)  # unknown = hold, even when its get is not afforded
+        return found
 
     def _lookup(self, key):
         got = self._call(self.p.log.get, key)
@@ -70,6 +74,7 @@ class Core:
             if items is not UNKNOWN and items is not NO_BUDGET:
                 for item in items:
                     self._item(item)
+        self.pending = {k: v for k, v in self.pending.items() if k not in self.lines}
         model = self.model()
         self._call(self.p.view.publish, model, need=1)
         return model
@@ -95,6 +100,9 @@ class Core:
     def _answer(self, stored, rkey):
         if rkey in self.held or self._lookup(rkey) is not ABSENT:
             return
+        if rkey in self.pending:  # asked before, the write did not land: retry it, never re-ask
+            self._write(self.pending[rkey])
+            return
         question = stored.text
         if stored.kind == "retry":
             target = self.lines.get("in:pc:" + stored.text)
@@ -103,14 +111,16 @@ class Core:
                 self._write(LogLine(rkey, "refused", REFUSED_TEXT, self.now))
                 return
             question = target.text
-        # ask + reply append + its get + ack + view: an answer is never asked for and then dropped
+        # ask + reply append + its get + ack + view: within one Core an answer is never dropped
         got = self._call(self.p.brain.ask, question, need=5)
         if got is NO_BUDGET:
             return
         if got is UNKNOWN or got.refused:
-            self._write(LogLine(rkey, "failed", FAILED_TEXT, self.now))
+            line = LogLine(rkey, "failed", FAILED_TEXT, self.now)
         else:
-            self._write(LogLine(rkey, "reply", got.text, self.now))  # EXISTS: stored one wins
+            line = LogLine(rkey, "reply", got.text, self.now)
+        self.pending[rkey] = line  # released by step() once the key holds a line; EXISTS: stored one wins
+        self._write(line)
 
     def model(self):
         """Plain mappings: one turn per in line, oldest first."""

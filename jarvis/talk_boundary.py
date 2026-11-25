@@ -111,12 +111,37 @@ def _text(v, cap):
     return type(v) is str and len(v) <= cap and "\x00" not in v
 
 
+def _canon(v, depth, left):
+    """A type-tagged JSON-safe stand-in for a value json.dumps refused; ints as hex (no
+    digit limit). Never calls repr and compares types by identity only. Past depth 16 or
+    the node budget in left[0] (a cycle, a huge item) a container is cut short or only
+    its type, as is any other object (a set, a class instance): such items may share a tag."""
+    left[0] -= 1
+    t = type(v)
+    if t is int:
+        return ["int", "%x" % v]
+    if t is str or t is float or t is bool or v is None:
+        return v
+    if depth < 16 and left[0] > 0:
+        if t is list or t is tuple:
+            return [t.__name__, [_canon(x, depth + 1, left) for x in v[:left[0]]]]
+        if t is dict:
+            pairs = [[_canon(k, depth + 1, left), _canon(x, depth + 1, left)]
+                     for k, x in list(v.items())[:left[0]]]
+            return ["dict", sorted(pairs, key=json.dumps)]
+    return ["type", t.__name__]
+
+
 def _tag(raw):
-    """A stable key part for an item with no usable id."""
+    """A stable key part for an item with no usable id; distinct items get distinct
+    parts except as _canon says. No repr: a set's repr changes with its insertion order."""
     try:
-        blob = json.dumps(raw, sort_keys=True, default=repr)
-    except Exception:  # a 5000-digit int, a raising repr, mixed keys: one shared tag
-        blob = "unencodable"
+        blob = json.dumps(raw, sort_keys=True)
+    except Exception:  # a 5000-digit int, any non-JSON object, mixed keys, a cycle
+        try:
+            blob = "~" + json.dumps(_canon(raw, 0, [10_000]))  # "~": no plain JSON blob starts so
+        except Exception:
+            blob = "unencodable"
     return "~" + hashlib.sha256(blob.encode("utf-8", "surrogatepass")).hexdigest()[:32]
 
 
