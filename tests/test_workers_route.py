@@ -256,7 +256,7 @@ class TestRouteVetoParity(unittest.TestCase):
         for path in _PROTALIAS1_SAFE:
             with self.subTest(safe=path):
                 self.assertFalse(r._alias_suspect(path))
-        for path in ("jarvis/talk_quote.py", "tests/test_x.py", "docs/data.md", "jarvis/ui/qml/Main.qml"):
+        for path in ("jarvis/talk_quote.py", "tests/test_x.py", "docs/data.md", "jarvis/ui/bridge.py"):
             self.assertFalse(r._veto(path), path)
 
 
@@ -436,7 +436,7 @@ _PROTALIAS1 = {
                     "\uff0ejarvis/x", ".clau\u0301de/x"),
 }
 _PROTALIAS1_SAFE = ("scripts/conveyor_workers.py", "jarvis/talk_quote.py", "tests/test_x.py",
-                    "jarvis/connectors/base.py", "docs/data.md", "build/reports/X.md", "jarvis/ui/qml/Main.qml")
+                    "jarvis/connectors/base.py", "docs/data.md", "build/reports/X.md", "jarvis/ui/bridge.py")
 # Copy of tests.adversarial HOSTILE_PATH_PARTS (ADVCORPUS1, not yet on this base) plus hidden-char text.
 _HOSTILE_PARTS = (
     "CLAUDE~1", "GITHUB~1", "PROGRA~1", "x:stream", "x::$DATA", "a.", "a ", "CON", "PRN", "AUX", "NUL",
