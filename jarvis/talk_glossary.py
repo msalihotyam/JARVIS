@@ -22,13 +22,26 @@ _TOKEN = re.compile(rf"{_WORD}|\s+|[^\w\s]")
 _TURKISH_I = str.maketrans({"I": "ı", "İ": "i"})
 
 
+def _dotted_i(token: str) -> str:
+    """Fold I + U+0307 to i on the NFD form: NFC may compose I with a lower mark (U+0323) and strand the dot."""
+    chars = list(unicodedata.normalize("NFD", token))
+    for index, char in enumerate(chars):
+        if char == "I":
+            after = index + 1
+            while after < len(chars) and 0 < unicodedata.combining(chars[after]) < 230:
+                after += 1
+            if after < len(chars) and chars[after] == "̇":
+                chars[index], chars[after] = "i", ""
+    return unicodedata.normalize("NFC", "".join(chars))
+
+
 def _fold(token: str) -> str:
     if token.isspace():
         return " "
     if not re.fullmatch(_WORD, token):
         # A non-word token is never casefolded (U+0345 folds to a letter) and never equals a word key.
         return "\0" + token
-    folded = token.translate(_TURKISH_I).casefold()
+    folded = _dotted_i(token).translate(_TURKISH_I).casefold()
     return unicodedata.normalize("NFC", folded)
 
 
