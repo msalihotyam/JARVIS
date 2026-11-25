@@ -113,8 +113,13 @@ def _time(ts):
     return f"{hh}:{mm}" if ok else ""
 
 
+def _known(value, choices):
+    """Exact str in choices: a str subclass with its own __eq__ never matches."""
+    return type(value) is str and value in choices
+
+
 def _chip(attachment):
-    if not isinstance(attachment, dict):
+    if type(attachment) is not dict:
         return Chip("dosya", None, "file")
     raw = attachment.get("name")
     raw = raw if type(raw) is str else attachment.get("path")
@@ -125,7 +130,7 @@ def _chip(attachment):
     size = size if type(size) is int and 0 <= size <= MAX_SIZE else None
     kind = attachment.get("kind")
     ext = name.rsplit(".", 1)[-1].lower() if "." in name else ""
-    kind = kind if type(kind) is str and kind in CHIP_KINDS else ext if ext in CHIP_KINDS else "file"
+    kind = kind if _known(kind, CHIP_KINDS) else ext if ext in CHIP_KINDS else "file"
     return Chip(name, size, kind)
 
 
@@ -142,15 +147,17 @@ def _row(entry):
     entry_id = entry_id if type(entry_id) in (int, str) else None
     kind, who = entry.get("kind"), entry.get("who")
     time = _time(entry.get("ts"))
+    if not (_known(kind, KINDS) and _known(who, WHO)):
+        kind = who = None
     card_id = _card_id(entry.get("card_id")) if kind == "approval_card" else None
-    if kind not in KINDS or who not in WHO or (kind == "approval_card" and card_id is None):
+    if kind is None or (kind == "approval_card" and card_id is None):
         return Row(entry_id, "unsupported", WHO["system"], "", UNSUPPORTED, time)
-    label = "Telefon" if who == "salih" and entry.get("source") == "telegram" else ""
+    label = "Telefon" if who == "salih" and _known(entry.get("source"), ("telegram",)) else ""
     if kind == "transcript":
         label = "Anladığım:"
     attachments = entry.get("attachments")
     chips = tuple(_chip(a) for a in attachments) if isinstance(attachments, (list, tuple)) else ()
-    is_open = card_id is not None and entry.get("state", "PENDING") == "PENDING"
+    is_open = card_id is not None and _known(entry.get("state", "PENDING"), ("PENDING",))
     return Row(
         entry_id, kind, WHO[who], label, clean(entry.get("text")), time, chips,
         card_id, BUTTONS if is_open else (),
@@ -159,7 +166,7 @@ def _row(entry):
 
 def _safe_row(entry):
     try:
-        if isinstance(entry, dict):
+        if type(entry) is dict:
             return _row(entry)
     except Exception:  # nosec B110 - a hostile entry becomes a neutral row, never dropped
         pass
@@ -171,7 +178,7 @@ def present(entries, status, focus, mode, window):
     try:
         if not isinstance(entries, (list, tuple)):
             return Refusal("entries must be a list")
-        if not isinstance(status, dict) or status.get("ring") not in RING_STATES:
+        if type(status) is not dict or not _known(status.get("ring"), RING_STATES):
             return Refusal("unknown ring state")
         if focus is not None and type(focus) is not str:
             return Refusal("focus must be a string or none")
@@ -180,7 +187,7 @@ def present(entries, status, focus, mode, window):
         if type(window) is not str or window not in WINDOW_ROWS:
             return Refusal("unknown window size")
         count = WINDOW_ROWS[window]
-        rows = tuple(_safe_row(e) for e in entries[len(entries) - count:]) if count else ()
+        rows = tuple(_safe_row(e) for e in entries[-count:]) if count else ()
         open_cards = frozenset(r.card_id for r in rows if r.buttons)
         return ViewModel(
             rows, status["ring"], clean(focus, MAX_LABEL_CHARS, newlines=False), mode, window,
@@ -191,13 +198,13 @@ def present(entries, status, focus, mode, window):
 
 
 def _command(command, view):
-    if not isinstance(command, dict):
+    if type(command) is not dict:  # a subclass could hide fields behind its own keys()/get
         return Refusal("command must be a mapping")
     name = command.get("name")
     if type(name) is not str or name not in COMMANDS:
         return Refusal("unknown command")
     fields = COMMANDS[name]
-    if set(command.keys()) != {"name", *fields}:
+    if set(command) != {"name", *fields}:
         return Refusal("unexpected or missing command fields")
     args = {f: command[f] for f in fields}
     if any(type(v) is not str for v in args.values()):

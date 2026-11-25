@@ -30,6 +30,15 @@ def view(entries, window="small", focus="Proje", mode="yazili", status=STATUS):
     return port.present(entries, status, focus, mode, window)
 
 
+class Liar(str):
+    """str subclass that claims to equal anything."""
+
+    def __eq__(self, other):
+        return True
+
+    __hash__ = str.__hash__
+
+
 CARD = entry(id=9, who="jarvis", kind="approval_card", card_id="card-abc", text="Dosya yazilsin mi?")
 
 
@@ -87,6 +96,34 @@ class PresentTests(unittest.TestCase):
         for size, n in port.WINDOW_ROWS.items():
             rows = view(entries, window=size).rows
             self.assertEqual([r.entry_id for r in rows], list(range(10_000 - n, 10_000)))
+
+    def test_window_shows_every_entry_when_log_is_shorter(self):
+        for size, n in port.WINDOW_ROWS.items():
+            for length in sorted({0, 1, n // 2, n // 2 + 1, n - 1, n, n + 1, 20, 29, 150, 199, 201}):
+                for kind in (list, tuple):
+                    rows = view(kind(entry(id=i) for i in range(length)), window=size).rows
+                    want = list(range(max(0, length - n), length)) if n else []
+                    self.assertEqual([r.entry_id for r in rows], want, (size, length, kind))
+
+    def test_str_subclass_never_matches_a_known_value(self):
+        for fields in [{"kind": Liar("hologram")}, {"who": Liar("mallory")}, {"kind": Liar("text")}]:
+            self.assertEqual(view([entry(**fields)]).rows[0].kind, "unsupported", fields)
+        self.assertEqual(view([entry(source=Liar("pc"))]).rows[0].label, "")
+        vm = view([dict(CARD, state=Liar("APPROVED"))])
+        self.assertEqual((vm.rows[0].buttons, vm.open_cards), ((), frozenset()))
+        att = {"name": "x.png", "kind": Liar("exe")}
+        self.assertEqual(view([entry(kind="file", attachments=[att])]).rows[0].chips[0].kind, "png")
+        self.assertIsInstance(port.present([], {"ring": Liar("dancing")}, None, "yazili", "small"), port.Refusal)
+        self.assertIsInstance(port.present([], STATUS, None, Liar("loud"), Liar("huge")), port.Refusal)
+
+    def test_dict_subclass_is_not_a_plain_mapping(self):
+        class Sub(dict):
+            pass
+
+        self.assertEqual(view([Sub(entry())]).rows[0].kind, "unsupported")
+        chip = view([entry(kind="file", attachments=[Sub(name="a.pdf", size=1)])]).rows[0].chips[0]
+        self.assertEqual(chip, port.Chip("dosya", None, "file"))
+        self.assertIsInstance(port.present([], Sub(STATUS), None, "yazili", "small"), port.Refusal)
 
     def test_row_text_is_cleaned_original_kept(self):
         def check(text):
@@ -156,6 +193,24 @@ class CommandTests(unittest.TestCase):
                {"name": "send_text", "text": "a", "path": "b"}]
         for command in bad:
             self.assertIsInstance(port.validate(command), port.Refusal, command)
+
+    def test_dict_subclass_command_refused(self):
+        class Hide(dict):
+            def keys(self):
+                return ["name"]
+
+        class Sub(dict):
+            pass
+
+        for command in [Hide(name="talk_start", x="1"), Sub(name="talk_start"), Hide(name="send_text", text="a")]:
+            self.assertIsInstance(port.validate(command), port.Refusal, command)
+
+    def test_str_subclass_command_values_refused(self):
+        vm = view([CARD])
+        for command in [{"name": Liar("talk_start")}, {"name": "set_mode", "mode": Liar("loud")},
+                        {"name": "card_tap", "card_id": Liar("card-zzz"), "choice": "approve"},
+                        {"name": "card_tap", "card_id": "card-abc", "choice": Liar("maybe")}]:
+            self.assertIsInstance(port.validate(command, vm), port.Refusal, command)
 
     def test_send_text_bounds(self):
         for text in ["", "   \n", "a" * (port.MAX_SEND_CHARS + 1), None, 5, b"a", ["a"]]:
@@ -231,19 +286,50 @@ class SafetyTests(unittest.TestCase):
         for path in (ROOT / "jarvis").rglob("*.py"):
             if path.name == "port.py" and path.parent.name == "face":
                 continue
-            tree = ast.parse(path.read_text(encoding="utf-8"))
-            for node in ast.walk(tree):
-                if isinstance(node, ast.ImportFrom):
-                    mods = [node.module or ""] + [f"{node.module}.{a.name}" for a in node.names]
-                elif isinstance(node, ast.Import):
-                    mods = [a.name for a in node.names]
-                else:
-                    continue
-                hit = any(m == "jarvis.face.port" or m.endswith("face.port") for m in mods)
-                hit = hit or (isinstance(node, ast.ImportFrom) and node.level and "port" in [a.name for a in node.names]
-                              and path.parent.name == "face")
-                self.assertFalse(hit, path)
+            parts = path.relative_to(ROOT).with_suffix("").parts
+            self.assertEqual(port_imports(path.read_text(encoding="utf-8"), parts), [], path)
 
+    def test_import_guard_sees_every_form(self):
+        sub, face, work = ("jarvis", "face", "sub", "x"), ("jarvis", "face", "x"), ("jarvis", "work", "x")
+        hits = [
+            ("import jarvis.face.port as p", work), ("from jarvis.face import port", work),
+            ("from jarvis.face.port import present", work), ("from . import port", face),
+            ("from .port import present", face), ("from .. import port", sub), ("from ..port import Row", sub),
+            ("from ...face import port", sub), ("from ...face.port import Row", sub),
+            ("from . import port", ("jarvis", "face", "__init__")),
+            ("__import__('jarvis.face.port')", work), ("__import__('jarvis.face', fromlist=['port'])", work),
+            ("importlib.import_module('jarvis.face.port')", work), ("import_module('.port', 'jarvis.face')", work),
+        ]
+        for source, parts in hits:
+            self.assertTrue(port_imports(source, parts), source)
+        misses = [("from . import port", work), ("from .work_ports import x", work), ("import jarvis.face.shell", work),
+                  ("from .. import shell", sub), ("importlib.import_module('jarvis.face.shell')", work)]
+        for source, parts in misses:
+            self.assertEqual(port_imports(source, parts), [], source)
+
+
+def port_imports(source, parts):
+    """Line numbers where source (module path parts under ROOT) imports jarvis.face.port, statically or by literal."""
+    package = parts[:-1]
+    found = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.ImportFrom):
+            base = node.module or ""
+            if node.level:
+                base = ".".join(package[: len(package) - node.level + 1] + tuple(filter(None, base.split("."))))
+            mods = [base] + [f"{base}.{a.name}" for a in node.names]
+        elif isinstance(node, ast.Import):
+            mods = [a.name for a in node.names]
+        elif isinstance(node, ast.Call) and getattr(node.func, "id", getattr(node.func, "attr", "")) in (
+                "__import__", "import_module"):
+            # fail-closed: any literal naming a "port" module counts, resolved or not
+            mods = [c.value for c in ast.walk(node) if isinstance(c, ast.Constant) and type(c.value) is str]
+            mods = ["jarvis.face.port" for m in mods if m == "port" or m.endswith(".port") or "face.port" in m]
+        else:
+            continue
+        if any(m == "jarvis.face.port" or m.startswith("jarvis.face.port.") or m.endswith("face.port") for m in mods):
+            found.append(node.lineno)
+    return found
 
 if __name__ == "__main__":
     unittest.main()
