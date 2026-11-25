@@ -9,7 +9,6 @@ text starting with "/" is plain text for a turn, except the exact greeting "/sta
 from __future__ import annotations
 
 import math
-from collections.abc import Mapping
 from dataclasses import dataclass
 
 TURN = "TURN"
@@ -29,7 +28,6 @@ MAX_HOLD_SECONDS = 600
 # Exact reply-mode labels (the reply keyboard's button texts) -> mode. Matched raw: no strip/case/NFKC.
 MODE_LABELS = {"Sesli yanıt": "voice", "Yazılı yanıt": "text"}
 GREETING = "/start"
-_MISSING = object()  # get() default: tells an absent "forwarded" apart from any stored value
 
 # Fixed Turkish lines for NOTE results; kept apart from the ASCII REASONS.
 NOTES = {
@@ -53,7 +51,7 @@ REASONS = {
     "edit": "edited messages are not processed",
     "unsupported": "unsupported message kind",
     # refused
-    "bad_entry": "entry must be a readable mapping",
+    "bad_entry": "entry must be a plain dict with string keys",
     "bad_who": "entry author must be salih",
     "bad_kind": "entry kind is missing or not in the fixed list",
     "bad_text": "entry text must be a string",
@@ -88,15 +86,13 @@ def route(entry: object, *, hold_seconds: object = DEFAULT_HOLD_SECONDS) -> Rout
 def _route(entry: object, hold_seconds: object) -> Route:
     if not _hold_ok(hold_seconds):
         return Route(REFUSED, "bad_hold")
-    try:  # one guarded snapshot; the caller's mapping is never touched again
-        if not isinstance(entry, Mapping):
-            return Route(REFUSED, "bad_entry")
-        who, kind, text, attachments = (entry.get(k) for k in ("who", "kind", "text", "attachments"))
-        forwarded = entry.get("forwarded", _MISSING)  # read once; the value decides
-        # get says absent: membership must agree, else fail closed as forwarded (no second value read)
-        is_forwarded = forwarded is not False and (forwarded is not _MISSING or "forwarded" in entry)
-    except Exception:
+    # Identity, not isinstance: a subclass or Mapping can override get/__contains__ and a spoofed
+    # __class__ fools isinstance. Exact str keys: a str-subclass key with its own hash/eq could hide
+    # or fake "forwarded". With both, iteration and get below run no caller code.
+    if type(entry) is not dict or any(type(k) is not str for k in entry):
         return Route(REFUSED, "bad_entry")
+    who, kind, text, attachments = (entry.get(k) for k in ("who", "kind", "text", "attachments"))
+    is_forwarded = entry.get("forwarded", False) is not False  # absent or explicit False only
     if type(who) is not str or who != WHO:
         return Route(REFUSED, "bad_who")
     if type(kind) is not str or kind not in KINDS:

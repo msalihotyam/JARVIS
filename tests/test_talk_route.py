@@ -138,14 +138,18 @@ class NegativeTests(unittest.TestCase):
         self.assertEqual(tr.route(entry(text=LABEL, forwarded=False)).path, tr.MODE)
         self.assertEqual(tr.route(entry("image", LABEL, ATT)).path, tr.TURN)
 
-    def assertForwarded(self, e):
-        r = tr.route(e)
-        self.assertEqual((r.path, r.reason, r.mode, r.note), (tr.TURN, "forwarded", None, None))
-
-    def test_forwarded_get_and_contains_disagree_is_turn(self):
-        class Hides(dict):  # value present, membership denies it (CDX-TALKROUTE1 F1)
+    def test_lying_containers_refused(self):
+        # CDX-TALKROUTE1FIX2 F1/F2: only an exact dict is read; overridable reads never decide
+        class Hides(dict):  # value present, membership denies it
             def __contains__(self, key):
                 return False if key == "forwarded" else super().__contains__(key)
+
+        class Liar(dict):  # get and membership both deny a present forwarded=True
+            def __contains__(self, key):
+                return key != "forwarded" and super().__contains__(key)
+
+            def get(self, key, default=None):
+                return default if key == "forwarded" else super().get(key, default)
 
         class Claims(dict):  # membership claims it, get reports the caller default
             def __contains__(self, key):
@@ -154,7 +158,15 @@ class NegativeTests(unittest.TestCase):
             def get(self, key, default=None):
                 return default if key == "forwarded" else super().get(key, default)
 
-        class View(Mapping):  # non-dict Mapping, membership denies a present value
+        class Flips(dict):  # first get says True, any later get says False
+            def get(self, key, *default):
+                return True if key == "forwarded" else super().get(key, *default)
+
+        class Raises(dict):
+            def __contains__(self, key):
+                raise RuntimeError("no")
+
+        class View(Mapping):  # non-dict Mapping
             def __init__(self, data):
                 self.data = data
 
@@ -167,31 +179,48 @@ class NegativeTests(unittest.TestCase):
             def __len__(self):
                 return len(self.data)
 
+        class Spoof:  # not a Mapping; __class__ claims dict so isinstance(x, dict) passes
+            def __init__(self, data):
+                self.data = data
+
+            @property
+            def __class__(self):
+                return dict
+
+            def get(self, key, default=None):
+                return self.data.get(key, default)
+
             def __contains__(self, key):
-                return False
+                return key in self.data
 
-        for text in (LABEL, "Yazılı yanıt", "/start"):
-            for fwd in (True, 1, "yes", None, [], 0):
-                with self.subTest(text=text, fwd=repr(fwd)):
-                    self.assertForwarded(Hides(entry(text=text, forwarded=fwd)))
-                    self.assertForwarded(View(entry(text=text, forwarded=fwd)))
-            with self.subTest(text=text, claims=True):
-                self.assertForwarded(Claims(entry(text=text)))
-        # explicit False through get is still honoured even if membership denies it
-        self.assertEqual(tr.route(Hides(entry(text=LABEL, forwarded=False))).path, tr.MODE)
+        self.assertIsInstance(Spoof({}), dict)
+        for text in (LABEL, "Yazılı yanıt", "/start", "merhaba"):
+            for fwd in (True, False, None, "absent"):
+                e = entry(text=text) if fwd == "absent" else entry(text=text, forwarded=fwd)
+                for cls in (Hides, Liar, Claims, Flips, Raises, View, Spoof):
+                    with self.subTest(text=text, fwd=fwd, cls=cls.__name__):
+                        self.assertRefused(tr.route(cls(e)), "bad_entry")
+        # F1 exact probe: its own __getitem__ and iteration report forwarded=True
+        liar = Liar(entry(text=LABEL, forwarded=True))
+        self.assertTrue(liar["forwarded"] is True and "forwarded" in list(liar))
+        self.assertRefused(tr.route(liar), "bad_entry")
 
-    def test_forwarded_read_once(self):
-        class Flips(dict):  # first get says True, any later get says False
-            calls = 0
+    def test_lying_keys_refused(self):
+        class Key(str):  # str subclass key: own hash hides it from get("forwarded")
+            def __hash__(self):
+                return 7
 
-            def get(self, key, *default):
-                if key != "forwarded":
-                    return super().get(key, *default)
-                Flips.calls += 1
-                return Flips.calls == 1
+            def __eq__(self, other):
+                return str.__eq__(self, other)
 
-        self.assertForwarded(Flips(entry(text=LABEL)))
-        self.assertEqual(Flips.calls, 1)
+        class Same(str):  # same hash and eq as the real key
+            __hash__ = str.__hash__
+
+        for key in (Key("forwarded"), Same("forwarded"), 1, ("forwarded",), None):
+            with self.subTest(key=repr(key)):
+                e = {**entry(text=LABEL), key: True}
+                self.assertRefused(tr.route(e), "bad_entry")
+        self.assertRefused(tr.route({Same("who"): "salih", "kind": "text", "text": "x"}), "bad_entry")
 
     def test_metaclass_eq_liar_type_refused(self):
         class Liar(type):  # type(x) == anything is True; only identity tells it apart
@@ -217,14 +246,6 @@ class NegativeTests(unittest.TestCase):
                 with self.subTest(field=field, truthy=truthy):
                     r = tr.route({**entry(text=LABEL), field: fake})
                     self.assertEqual((r.path, r.reason), (tr.REFUSED, reason))
-
-    def test_forwarded_membership_raises_refused(self):
-        class Raises(dict):
-            def __contains__(self, key):
-                raise RuntimeError("no")
-
-        self.assertRefused(tr.route(Raises(entry(text=LABEL))), "bad_entry")
-        self.assertForwarded(Raises(entry(text=LABEL, forwarded=True)))  # value decides; no membership asked
 
     def test_who_not_salih_refused(self):
         values = ("Salih", "SALIH", "salih ", " salih", "salıh", "jarvis", "system", "", None, 1,
