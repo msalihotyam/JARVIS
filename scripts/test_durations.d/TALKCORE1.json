@@ -1,0 +1,13 @@
+{"classes": {
+  "tests.test_talk_boundary.InboxShapeTests": 0.3,
+  "tests.test_talk_boundary.LogShapeTests": 0.2,
+  "tests.test_talk_boundary.BrainViewTests": 0.1,
+  "tests.test_talk_boundary.ClockTests": 0.1,
+  "tests.test_talk_boundary.ConfigTests": 0.1,
+  "tests.test_talk_boundary.RecordTests": 0.1,
+  "tests.test_talk_core.FlowTests": 0.2,
+  "tests.test_talk_core.UnknownTests": 0.2,
+  "tests.test_talk_core.BudgetTests": 0.2,
+  "tests.test_talk_core.FaultMatrixTests": 2.0,
+  "tests.test_talk_core.StaticTests": 0.1
+}}
