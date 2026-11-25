@@ -206,11 +206,20 @@ class ToolCallTests(unittest.TestCase):
 
     def test_deep_nesting_never_calls(self):
         nested = {"a": {"b": {"c": {"d": {"e": {"f": {"g": {"h": 1}}}}}}}}
-        replies, _, fake = run([call("read_file", path=nested),
-                                (json.dumps(call("read_file")).replace("{}}", '{"path": %s}}' % deep_json(), 1)
-                                 .encode() + b"\n")])
-        self.assertEqual(replies[0]["error"]["code"], bt.INVALID_REQUEST)
-        self.assertIn("error", replies[1])
+        meta = call("read_file", 2, path="a")
+        meta["params"]["_meta"] = nested
+        replies, session, fake = run([call("read_file", path=nested),
+                                      (json.dumps(call("read_file")).replace("{}}", '{"path": %s}}' % deep_json(), 1)
+                                       .encode() + b"\n"),
+                                      call("read_file", 3, path=[[[[[[[1]]]]]]]), meta,
+                                      {"jsonrpc": "2.0", "id": 4, "method": "ping", "params": {"arguments": nested}}])
+        # deep tool arguments -> tool error (spec negative test 4); deep envelope -> JSON-RPC -32600
+        self.assertEqual(text_of(replies[0]), ["refused: bad_arguments"])
+        self.assertTrue(replies[0]["result"]["isError"])
+        self.assertIn("error", replies[1])  # unparseable depth: parse error, no id known
+        self.assertEqual(text_of(replies[2]), ["refused: bad_arguments"])
+        self.assertEqual([r["error"]["code"] for r in replies[3:]], [bt.INVALID_REQUEST] * 2)
+        self.assertEqual(session.stats()["errors"], 2)
         self.assertEqual(fake.calls, [])
 
     def test_injected_raise_gives_fixed_text(self):
@@ -332,9 +341,44 @@ class FramingTests(unittest.TestCase):
         reader, out = Endless(50), io.BytesIO()
         bt.serve(reader, out, Fake().tools())
         self.assertEqual(set(reader.limits), {bt.MAX_LINE_BYTES + 1})
-        self.assertEqual(len(reader.limits), 52)
+        self.assertEqual(len(reader.limits), 2)  # the cap chunk plus one drain chunk, then the session ends
         self.assertEqual([json.loads(r)["error"]["message"] for r in out.getvalue().splitlines()],
                          ["message too large"])
+
+    def test_never_ending_line_gets_error_and_reading_stops(self):
+        out, chunk = io.BytesIO(), bt.MAX_LINE_BYTES + 1
+        endless = (b"x" * chunk for _ in iter(int, 1))  # never ends: no newline, no EOF
+
+        class Reader:
+            read = 0
+
+            def readline(self, limit=-1):
+                if self.read >= chunk:  # second read: the error must already be out
+                    self_test.assertIn(b"message too large", out.getvalue())
+                if self.read + limit > 2 * chunk:
+                    raise AssertionError("read past the cap plus one chunk")
+                data = next(endless)[:limit]
+                self.read += len(data)
+                return data
+
+        self_test = self
+        reader = Reader()
+        bt.serve(reader, out, Fake().tools())
+        self.assertLessEqual(reader.read, 2 * chunk)
+        self.assertEqual([json.loads(r)["error"]["message"] for r in out.getvalue().splitlines()],
+                         ["message too large"])
+
+    def test_oversize_past_one_drain_chunk_ends_session(self):
+        for tail in (b"\n", b"\r\n", b""):
+            with self.subTest(tail=tail):
+                replies, _, fake = run([b"x" * (3 * bt.MAX_LINE_BYTES) + tail, PING])
+                self.assertEqual([r["error"]["message"] for r in replies], ["message too large"])
+                self.assertEqual(fake.calls, [])
+
+    def test_line_at_cap_is_a_message(self):
+        ping = json.dumps(PING).encode()
+        replies, _, _ = run([ping + b" " * (bt.MAX_LINE_BYTES - len(ping)) + b"\n", PING | {"id": 8}])
+        self.assertEqual([r.get("result") for r in replies], [{}, {}])
 
 
 SOURCE = ROOT / "jarvis" / "brain_tools.py"
