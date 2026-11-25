@@ -68,6 +68,14 @@ def escaped(text: str) -> str:
     return json.dumps(text, ensure_ascii=False)[1:-1]
 
 
+def hold_wal_open(case: unittest.TestCase, database: Path) -> None:
+    """Speed only: an idle reader keeps SQLite from deleting and recreating
+    the -wal/-shm files on every store connect/close (slow on Windows CI).
+    Registered after the temp-dir cleanup, so it closes first (LIFO)."""
+    connection = sqlite3.connect(database)
+    case.addCleanup(connection.close)
+
+
 def without_instruction(payload: dict) -> dict:
     return {k: v for k, v in payload.items() if k != PROJECT_INSTRUCTION_KEY}
 
@@ -83,6 +91,7 @@ class InstructionStoreTests(unittest.TestCase):
         self.addCleanup(safe_cleanup, temp)
         self.database = Path(temp.name) / "jarvis.db"
         self.memory = SQLiteMemoryStore(self.database)
+        hold_wal_open(self, self.database)
         self.settings = Settings(memory_database=self.database)
         self.project = self.memory.create_project("P")
 
@@ -208,7 +217,8 @@ class IntentInstructionTests(IntentTestCase):
 
     def setUp(self) -> None:
         super().setUp()
-        self.p = self.memory.create_project("P")
+        hold_wal_open(self, self.memory.database_path)
+        self.p =self.memory.create_project("P")
         self.q = self.memory.create_project("Q")
         self.in_p = self.memory.create_conversation(self.p.id).id
 
@@ -350,6 +360,7 @@ class ConnectorInstructionTests(unittest.TestCase):
         self.addCleanup(safe_cleanup, temp)
         self.root = Path(temp.name).resolve()
         self.memory = SQLiteMemoryStore(self.root / "jarvis.db")
+        hold_wal_open(self, self.memory.database_path)
         self.connector = ClaudeCodeConnector(allowed_roots=(self.root,), default_working_directory=self.root,
                                              max_budget_usd=0.15)
         registry = ToolRegistry()
