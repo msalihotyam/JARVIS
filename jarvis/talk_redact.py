@@ -9,15 +9,20 @@ Over-masking is accepted, leaking is not.
 Markers are detected on a folded copy only (zero-width/bidi removed, NFKD,
 every mark/format char dropped, look-alike letters/colons mapped in both cases
 and again after casefold):
-a secret word followed anywhere on its line by ``=``, ``:`` (also ``=>`` and a
-quote-colon) or ``%3A``/``%3D`` (or by one at the start of the next non-blank
-line); Telegram bot tokens (also split by whitespace runs or ``%3A``); sk- and
-GitHub keys; JWTs; any PEM BEGIN line; Bearer tokens; AWS AKIA/ASIA ids; Google
-AIza keys; and anything ``jarvis.contracts.redact_credentials`` would change.
-Two class rules close what a look-alike table never will: mixed_script (a word
-mixing Latin with another script's letters, judged before the map) and
-unicode_separator (any non-ASCII char other than a Latin letter or digit right
-after a secret word, past its identifier tail, whitespace and closing quotes).
+a secret word followed anywhere on its line by ``=``, ``:`` (also ``=>``, a
+quote-colon and any char named COLON/EQUALS) or ``%3A``/``%3D`` (or by one at the
+start of the next non-blank line); Telegram bot tokens (also split by whitespace
+runs or ``%3A``); sk- and GitHub keys; JWTs; any PEM BEGIN line; Bearer tokens;
+AWS AKIA/ASIA ids; Google AIza keys; and anything
+``jarvis.contracts.redact_credentials`` would change.
+Class rules close what a look-alike table never will: mixed_script (a word mixing
+Latin with another script's letters, judged before the map) and unicode_separator.
+unicode_separator is a complement rule, so no separator list exists to be
+incomplete: on a skeleton (NFKC, casefold, Latin letters folded to their ASCII
+base, marks skippable between a word's letters, other Latin letters wildcards) a
+secret word plus its ``[a-z0-9_]`` tail is clean only at the end of the text or
+before ASCII spaces/tabs and an ASCII letter; anything else holds ("şifre." too).
+It also holds a single-script foreign word (all-Lisu "PASSWORD") before a separator.
 
 Pure: no I/O, no network, deterministic, linear time. A non-str input, a
 too-deep input or any detector exception gives a typed Refusal, never the text.
@@ -101,11 +106,20 @@ _CASED_SHAPES = (
 
 # Class rules instead of a longer look-alike map. A word: a run of letters/digits.
 _ALNUM = re.compile(r"[^\W_]+")
-# After a secret word: its identifier tail (Latin combining marks stay in it), then
-# whitespace and closing quotes/brackets; the char after that is judged.
-_TAIL = re.compile(r"[a-z0-9_̀-ͯ]*+")
 _GAP = re.compile("[\\s\"'`)\\]}’”»›“‘«‹„]*+")
 _ASCII_SEP = (":", "=", "%3a", "%3d", "%3A", "%3D")
+_COLON_NAME = re.compile(r"\b(?:COLON|EQUALS)\b")
+
+# Complement rule skeleton: "\x00" = other Latin letter (wildcard), "\x01" = mark or
+# format char (skippable between a word's letters), "\x02" = non-Latin letter. Input
+# never holds \x00-\x02 (_IGNORABLE drops them first).
+_WORDS = ("password", "passwd", "passphrase", "pwd", "token", "secret", "credential",
+          "api key", "private key", "access key", "authorization", "cookie", "sifre", "parola")
+# One pattern per word: a shared alternation would let "pwd" shadow "private key".
+_SKELETON_WORDS = tuple(re.compile(
+    "\x01*+".join("[_. \t-]*+" if c == " " else f"[{c}\x00]" for c in word)) for word in _WORDS)
+_TAIL_STOP = re.compile(r"[^a-z0-9_]")
+_CLEAN_FOLLOW = re.compile(r"[ \t]++[a-z]")
 
 
 def _latin(c):
@@ -113,12 +127,45 @@ def _latin(c):
 
 
 def _fold(text):
-    """(marks dropped, marks dropped + look-alikes mapped, marks kept) copies."""
-    kept = unicodedata.normalize("NFKD", _IGNORABLE.sub("", text))
-    plain = kept
-    if not kept.isascii():
-        plain = "".join(c for c in kept if unicodedata.category(c) not in _DROP)
-    return plain, _IGNORABLE.sub("", plain.translate(_LOOKALIKE)), kept
+    """(marks dropped, marks dropped + look-alikes mapped) copies."""
+    plain = unicodedata.normalize("NFKD", _IGNORABLE.sub("", text))
+    if not plain.isascii():
+        plain = "".join(c for c in plain if unicodedata.category(c) not in _DROP)
+    return plain, _IGNORABLE.sub("", plain.translate(_LOOKALIKE))
+
+
+def _skeleton_char(c):
+    if unicodedata.category(c) in _DROP:
+        return "\x01"
+    if not c.isalpha():
+        return c
+    base = "".join(x for x in unicodedata.normalize("NFKD", c)
+                   if unicodedata.category(x) not in _DROP).translate(_LOOKALIKE)
+    if base.isascii() and base.isalpha():
+        return base.lower()
+    return "\x00" if _latin(c) else "\x02"
+
+
+def _complement(text):
+    # Clean only at the end or before ASCII spaces/tabs + an ASCII letter; else a marker.
+    s = _IGNORABLE.sub("", text).replace("İ", "i")
+    s = unicodedata.normalize("NFKC", unicodedata.normalize("NFKC", s).casefold())
+    if not s.isascii():
+        s = s.translate({ord(c): _skeleton_char(c) for c in set(s) if not c.isascii()})
+    size = len(s)
+    for word in _SKELETON_WORDS:
+        pos, scanned, tail = 0, -1, -1
+        while match := word.search(s, pos):
+            # Tail end = first non-[a-z0-9_] at or after the match; reuse the last scan
+            # when the match ends inside it so "pwdpwd..." stays linear.
+            if not scanned <= match.end() <= tail:
+                scanned = match.end()
+                stop = _TAIL_STOP.search(s, scanned)
+                tail = stop.start() if stop else size
+            if tail < size and not _CLEAN_FOLLOW.match(s, tail):
+                return True
+            pos = match.start() + 1
+    return False
 
 
 def _lower(folded):
@@ -134,22 +181,6 @@ def _mixed_script(plain):
             if len(scripts) == 2:
                 return True
     return False
-
-
-def _unicode_separator(lower):
-    # Any non-ASCII char that is not a Latin letter or a digit right after a secret word.
-    pos, size = 0, len(lower)
-    while True:
-        match = _WORD.search(lower, pos)
-        if match is None:
-            return False
-        tail = _TAIL.match(lower, match.end()).end()
-        at = _GAP.match(lower, tail).end()
-        if at < size and not _latin(lower[at]) and not lower[at].isdecimal():
-            return True
-        # A word starting inside the tail ends within its last 8 chars ("private key"
-        # breaks the tail at its gap), so resume there: each char is scanned O(1) times.
-        pos = max(match.start() + 1, tail - 16)
 
 
 def _foreign_separator(folded):
@@ -182,18 +213,18 @@ def _secret_word(lower):
 
 
 def _kinds(text):
-    plain, folded, kept = _fold(text)
+    plain, folded = _fold(text)
     lower = _lower(folded)
     found = {kind for kind, shape in _LOWER_SHAPES if shape.search(lower)}
     found.update(kind for kind, shape in _CASED_SHAPES if shape.search(folded))
-    if _secret_word(lower):
+    # Any char named COLON/EQUALS counts as a separator later on the line ("password is≔x").
+    colons = {ord(c): ":" for c in set(lower)
+              if not c.isascii() and _COLON_NAME.search(unicodedata.name(c, ""))}
+    if _secret_word(lower.translate(colons) if colons else lower):
         found.add("secret_word")
     if _mixed_script(plain):
         found.add("mixed_script")
-    # The mark-kept copy catches a spacing mark (visarga) used as a separator.
-    if _unicode_separator(lower) or _foreign_separator(folded) or (
-            kept is not plain and _unicode_separator(
-            _lower(_IGNORABLE.sub("", kept.translate(_LOOKALIKE))))):
+    if _complement(text) or _foreign_separator(folded):
         found.add("unicode_separator")
     if redact_credentials(text)[0] != text or (
             folded != text and redact_credentials(folded)[0] != folded):

@@ -70,12 +70,13 @@ CLEAN = (
     "def add(a, b):\n    return a + b\n",
     "for i in range(10):\n    print(i)\n",
     "Merhaba, toplant\u0131 saat 15:30'da. Parola politikas\u0131 de\u011fi\u015fti",
+    "\u015fifre nedir",
+    "Passw\u00f6rter sind sicher",
 )
 
 # Turkish letters in both cases (incl. dotless i, dotted I) and emoji not right after a
 # secret word must pass the mixed-script and Unicode-separator markers.
 TURKISH_EMOJI_CLEAN = (
-    "Token “budget” is a misleading name.",
     "Привет мир, время 15:30",
     "\u00c7ok g\u00fczel bir g\u00fcn, \u015fehirde \u0131\u015f\u0131k var \U0001f600",
     "\u0130stanbul'da \u00f6\u011fle yeme\u011fi, \u00c7AR\u015eAMBA \u011e\u00d6\u015e\u00dc",
@@ -85,7 +86,6 @@ TURKISH_EMOJI_CLEAN = (
     "The password policy changed \U0001f389 \u2014 see the wiki",
     "Toplant\u0131 \u00e7ar\u015famba \u2615\ufe0f saat 10'da",
     "\u0130\u015f \u0131\u015f\u0131k \u00e7\u00f6p \u015f\u00fc\u011f\u00fc \u00d6\u00dc\u00c7\u015e\u011e\u0130 \U0001f44b\U0001f3fd",
-    "\u015eifre \u2014 yeni kural, token\u2013tabanl\u0131 giri\u015f",
 )
 
 
@@ -155,9 +155,21 @@ class NegativeTests(unittest.TestCase):
                 self.assertFalse(hasattr(result, "text"))
 
     def test_secret_word_without_separator_is_not_flagged(self):
-        for text in ("token budget is low", "reset your password today", "secret plans\nnone"):
+        for text in ("token budget is low", "reset your password today", "secret plans\nnone",
+                     "the token", "password\tpolicy"):
             with self.subTest(text=text):
                 self.assertFalse(redact(text).flagged)
+
+    def test_complement_rule_over_holds_by_design(self):
+        # TALKREDACT2FIX4: after a secret word only "spaces/tabs + ASCII letter" or the
+        # end is clean, so these (clean before FIX4) are now held; over-holding is accepted.
+        for text in ("Token “budget” is a misleading name.",
+                     "Şifre — yeni kural, token–tabanlı giriş",
+                     "token.", "şifre.", "the cookie, she said"):
+            with self.subTest(text=ascii(text)):
+                result = redact(text)
+                self.assertEqual(result.text, FIXED_LINE)
+                self.assertIn("unicode_separator", result.kinds)
 
     def test_hidden_or_look_alike_markers_are_flagged(self):
         hidden = (
@@ -246,6 +258,44 @@ class NegativeTests(unittest.TestCase):
                 self.assertEqual(result.text, FIXED_LINE)
                 self.assertIn("unicode_separator", result.kinds)
 
+    def test_fix3_f1_latin_tail_letter_then_separator_is_flagged(self):
+        # CLREV-TALKREDACT2FIX3 F1: a non-ASCII Latin letter in the tail hid the U+2254.
+        for text in ("passwordæ≔hunter2", "passwordł≔hunter2",
+                     "tokenø≔x", "secretə≔x"):
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(redact(text).text, FIXED_LINE)
+
+    def test_review_probes_of_the_series_are_flagged(self):
+        # Every CLREV/CDX probe of TALKREDACT2..FIX3 not pinned above, plus the
+        # complement rule's own class: any follower but "spaces + ASCII letter" holds.
+        probes = (
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.c2lnbmF0dXJl",  # CLREV-TALKREDACT2
+            "password＝x", "password﹕x", "password：x",
+            "passwordˑx", "passwordꓽx", "passwordःx", "password᛬x",
+            "password→x", "secret܃x", "token፥x",
+            "соокіе≔x", "password ≔x",
+            "password　≔x", "“password”≔x", "token\U0001f511x",
+            "password»x", "password«x", "password›x", "password„x",
+            "passwordǃx", "password٠x", "password\nx", "passwørd≔x",
+            "password؀x", "password 1", "password 'x'", "password (x)",
+            "password is≔x", "token ist꞉ x",
+        )
+        for text in probes:
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(redact(text).text, FIXED_LINE)
+
+    def test_shadowed_and_far_words_are_flagged(self):
+        # F2 (FIX4): "pwd" shadowed "private key"/"api key", "secret" shadowed "sifre",
+        # and a 16-char skip-ahead jumped past a word stretched by marks.
+        probes = (
+            "pɍɨvate key:hunter2", "p\xf8\xf8vate key:hunter2",
+            "pɍɨvate key\xb7hunter2", "p\xf8" + "̶" * 20 + "\xf8i key\xb7hunter2",
+            "s\xf8\xf8re\xf8 hunter2", "api  key\xb7hunter2", "api\tkey\xb7hunter2",
+        )
+        for text in probes:
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(redact(text).text, FIXED_LINE)
+
     def test_ten_megabytes_stays_linear(self):
         for text in ("a b\n" * 2_500_000, "a b\n" * 2_499_999 + "password=x"):
             with self.subTest(flagged=text.endswith("x")):
@@ -263,6 +313,7 @@ class PerformanceTests(unittest.TestCase):
                  "\u200b", "\uff10", "{\"a\":", "password\n", "-----", "1:",
                  "eyJa", "eyj_", "xeyJa", "EYJA", "ж", "token≔", "tokentoken",
                  "tokeń", "≔ ", "password_ç", "á")
+        units += ("pwd", "pwd a ", "p" + "̶" * 50)  # FIX4 per-word scan
         for unit in units:
             text = (unit * (n // len(unit) + 1))[:n]
             with self.subTest(unit=ascii(unit)):
