@@ -40,9 +40,29 @@ _RESERVED = frozenset(
 )
 # Bot token shape (<bot id>:<35 char secret>), the Bot API host or any URL: never in output.
 _LEAK_RE = re.compile(
-    r"\d{5,}:[A-Za-z0-9_-]{30,}|api\.telegram\.org|[a-z][a-z0-9+.-]*://|www\.",
+    # Lookbehinds start each run once (linear on NFKC-expanded input); the scheme run may
+    # begin with a digit: broader than RFC 3986, fail closed.
+    r"(?<!\d)\d{5,}:[A-Za-z0-9_-]{30,}|api\.telegram\.org|(?<![a-z0-9+.-])[a-z0-9+.-]+://"
+    r"|www\.",
     re.IGNORECASE,
 )
+# Text and card_id only (a stored file path like "voice.ogg" is not shown): forms Telegram
+# clients auto-link or resolve. Scheme runs are checked in code: a letter before the colon.
+_SCHEME_RUN_RE = re.compile(r"(?<![\w+.-])([\w+.-]+):(?=\S)")  # mailto:x, http:\\x, host:8080
+_BARE_LINK_RE = re.compile(
+    r"\w[.\u3002\uff0e\uff61][^\W\d_]{2}"  # t.me/x, evil.com, IDN, ideographic/fullwidth dots
+    r"|\d{1,3}(?:\.\d{1,3}){3}"  # bare IPv4
+)
+# Default_Ignorable_Code_Point (DerivedCoreProperties) outside Cc/Cf/Cs: invisible, stripped.
+# U+FE0F (emoji presentation selector) is deliberately kept so emoji render as sent.
+_DEFAULT_IGNORABLE = (
+    (0x00AD, 0x00AD), (0x034F, 0x034F), (0x061C, 0x061C), (0x115F, 0x1160),
+    (0x17B4, 0x17B5), (0x180B, 0x180F), (0x200B, 0x200F), (0x202A, 0x202E),
+    (0x2060, 0x206F), (0x3164, 0x3164), (0xFE00, 0xFE0E), (0xFEFF, 0xFEFF),
+    (0xFFA0, 0xFFA0), (0xFFF0, 0xFFF8), (0x1BCA0, 0x1BCA3), (0x1D173, 0x1D17A),
+    (0xE0000, 0xE0FFF),
+)
+_BAD_PATH_CHARS = frozenset('*?"<>|')  # invalid in Windows file names
 
 
 @dataclass(frozen=True)
@@ -131,13 +151,12 @@ def _required(action: Mapping, key: str) -> object:
 
 
 def _clean_text(value: object) -> tuple[str, tuple[str, ...]]:
-    if not isinstance(value, str):
+    if type(value) is not str:  # hostile str subclasses (overridden __iter__) refused
         raise _Refused("bad_text_type")
     kept: list[str] = []
     removed: set[str] = set()
     for ch in value:
-        # Cc = controls (NUL...), Cf = format (bidi overrides, zero-width, BOM).
-        if ch not in _KEEP_CONTROLS and unicodedata.category(ch) in ("Cc", "Cf", "Cs"):
+        if ch not in _KEEP_CONTROLS and _invisible(ch):
             removed.add(f"U+{ord(ch):04X}")
         else:
             kept.append(ch)
@@ -147,16 +166,39 @@ def _clean_text(value: object) -> tuple[str, tuple[str, ...]]:
     # Telegram counts UTF-16 units; counting them is never below len(), so fail-closed.
     if len(text.encode("utf-16-le")) // 2 > MAX_TEXT:
         raise _Refused("text_too_long")
+    _refuse_links(text)  # after the cap: regex input is bounded, all patterns linear
     return text, tuple(sorted(removed))
 
 
+def _invisible(ch: str) -> bool:
+    # Cc = controls (NUL...), Cf = format (bidi overrides, zero-width, BOM), Cs = surrogates.
+    if unicodedata.category(ch) in ("Cc", "Cf", "Cs"):
+        return True
+    code = ord(ch)
+    return any(lo <= code <= hi for lo, hi in _DEFAULT_IGNORABLE)
+
+
+def _refuse_links(value: str) -> None:
+    folded = unicodedata.normalize("NFKC", value)  # NFKC: fullwidth forms
+    # Marks (Indic/Thai vowel signs) and the kept U+FE0F are not word chars: dropping
+    # them lets the letter-dot-letter check see marked IDN hosts and "evil\ufe0f.com".
+    bare = "".join(c for c in folded if c != "\ufe0f" and unicodedata.category(c)[0] != "M")
+    for form in (value, folded, bare):
+        if _LEAK_RE.search(form) or _BARE_LINK_RE.search(form):
+            raise _Refused("token_or_url_in_output")
+        for run in _SCHEME_RUN_RE.finditer(form):
+            if any(c.isalpha() for c in run.group(1)):  # "15:00" passes, "1mailto:x" not
+                raise _Refused("token_or_url_in_output")
+
+
 def _card_id(value: object) -> str:
-    if not isinstance(value, str):
+    if type(value) is not str:
         raise _Refused("bad_card_id_type")
     if len(value.encode("utf-8")) > MAX_CALLBACK_BYTES:
         raise _Refused("card_id_too_long")
     if not _CALLBACK_RE.fullmatch(value):  # ASCII printable, no space, no bidi
         raise _Refused("bad_card_id")
+    _refuse_links(value)
     return value
 
 
@@ -171,9 +213,11 @@ def _file_record(value: object) -> dict:
 
 
 def _relative_path(path: object) -> str:
-    if not isinstance(path, str):
+    if type(path) is not str:  # a subclass could override replace()/split()
         raise _Refused("bad_path_type")
     if len(path) > MAX_PATH or not _PATH_CHAR_RE.fullmatch(path):
+        raise _Refused("bad_path_chars")
+    if _BAD_PATH_CHARS.intersection(path):
         raise _Refused("bad_path_chars")
     if ":" in path:  # drive letter or NTFS alternate data stream
         raise _Refused("path_colon")

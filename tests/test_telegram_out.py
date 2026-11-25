@@ -185,6 +185,74 @@ class TelegramOutTests(unittest.TestCase):
         self.assertEqual(req.body["text"], "abcdef\n\tg")
         self.assertEqual(req.stripped, ("U+0000", "U+200B", "U+202E", "U+2066", "U+FEFF"))
 
+    def test_link_forms_in_text_refused(self):
+        # TGSEND1FIX F1: one per variant Telegram clients auto-link or resolve.
+        for text in ("mailto:x@y.z", "javascript:alert(1)", "JaVaScRiPt:x", "tel:+1",
+                     "data:text/html,x", "vbscript:x", "tg:resolve", "http:\\\\x.y",
+                     "http:/x.y", "https:\\x", "localhost:8080", "1mailto:x@y.z",
+                     "-javascript:alert(1)", "_tel:+1", "go mailto:x", "t.me/joinchat/abc",
+                     "evil.com/login", "evil.com", "x@evil.com",
+                     "\u043f\u0440\u0438\u043c\u0435\u0440.\u0440\u0444",
+                     "evil.c\u043em", "evil\u3002com", "evil\uff0ecom", "evil\uff61com",
+                     "\uff48\uff54\uff54\uff50\uff53\uff1a\uff0f\uff0fx",
+                     "\uff4d\uff41\uff49\uff4c\uff54\uff4f\uff1ax", "ht\u200btps://x.y",
+                     "evil\u034f.com", "1.2.3.4/x", "1http://x"):
+            with self.subTest(text=text):
+                self.refused(build_request(text_action(text=text), CHAT),
+                             "token_or_url_in_output")
+
+    def test_marked_idn_links_refused(self):
+        # Review hits: combining marks or U+FE0F right before the dot or in the TLD.
+        for text in ("\u0939\u093f\u0902\u0926\u0940.com/login", "\u0e17\u0e35\u0e48.com",
+                     "evil\ufe0f.com", "x.\u092d\u093e\u0930\u0924"):
+            with self.subTest(text=text):
+                self.refused(build_request(text_action(text=text), CHAT),
+                             "token_or_url_in_output")
+
+    def test_str_subclasses_refused(self):
+        class Hostile(str):
+            def replace(self, *args):
+                return "C:/Windows/System32/x.dll"
+
+        self.refused(build_request(text_action(text=Hostile("hi")), CHAT), "bad_text_type")
+        self.refused(build_request(text_action(kind="approval", card_id=Hostile("c1")), CHAT),
+                     "bad_card_id_type")
+        self.refused(build_request(media_action("document", path=Hostile("a/b.txt")), CHAT),
+                     "bad_path_type")
+
+    def test_link_forms_in_card_id_refused(self):
+        for card_id in ("mailto:x@y.z", "javascript:x", "t.me/x", "a.bc", "http:\\\\x",
+                        "1.2.3.4"):
+            with self.subTest(card_id=card_id):
+                self.refused(build_request(text_action(kind="approval", card_id=card_id),
+                                           CHAT), "token_or_url_in_output")
+
+    def test_times_and_prose_still_pass(self):
+        for text in ("15:00", "at 10:30 ok", "Note: x", "e.g. x", "wait...ok", "v1.2",
+                     "@someone #tag +905551234567"):
+            with self.subTest(text=text):
+                self.assertEqual(build_request(text_action(text=text), CHAT).body["text"], text)
+
+    def test_default_ignorable_stripped_per_char(self):
+        # TGSEND1FIX F2: Default_Ignorable code points outside Cc/Cf/Cs.
+        for code in (0x034F, 0x115F, 0x1160, 0x3164, 0xFFA0, 0xFE00, 0xE0100, 0x2065,
+                     0x17B4, 0x180B, 0xFFF0):
+            with self.subTest(code=hex(code)):
+                req = build_request(text_action(text=f"a{chr(code)}b"), CHAT)
+                self.assertEqual(req.body["text"], "ab")
+                self.assertEqual(req.stripped, (f"U+{code:04X}",))
+        heart = build_request(text_action(text="\u2764\ufe0f"), CHAT)  # U+FE0F kept: emoji
+        self.assertEqual((heart.body["text"], heart.stripped), ("\u2764\ufe0f", ()))
+        self.refused(build_request(text_action(text="\u034f\u3164\uffa0"), CHAT), "empty_text")
+
+    def test_windows_invalid_path_chars_refused(self):
+        # TGSEND1FIX F3: * ? " < > | in any component.
+        for ch in '*?"<>|':
+            for path in (f"a{ch}b.txt", f"files/ab/x{ch}.ogg"):
+                with self.subTest(path=path):
+                    self.refused(build_request(media_action("document", path=path), CHAT),
+                                 "bad_path_chars")
+
     def test_bad_paths_refused(self):
         cases = {
             "a/../b": "path_traversal", "..": "path_traversal", "a//b": "path_traversal",
