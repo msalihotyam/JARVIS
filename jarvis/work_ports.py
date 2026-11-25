@@ -20,6 +20,7 @@ recorded old under the same expected-value transaction.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -215,7 +216,8 @@ def _transact(repo: _Repo, *lines: str) -> None:
     _git(repo, "update-ref", "--no-deref", "--stdin", input=body.encode())
 
 
-def build_ports(*, store: MemoryStore, manager: StageManager, target: _Repo, lease_target: str,
+def build_ports(*, store: MemoryStore, manager: StageManager, target: _Repo,
+                lease_target: str | Sequence[str],
                 run_id: object, boot_id: str, clock: Callable[[], datetime], lease: timedelta,
                 targets: dict[str, str], jarvis_repo: bool, checks: Sequence[Sequence[str]],
                 base_result: TestResult, locked_fixture_hash: str,
@@ -228,7 +230,8 @@ def build_ports(*, store: MemoryStore, manager: StageManager, target: _Repo, lea
                 binary_targets: Iterable[str] = ()) -> types.SimpleNamespace:
     """Return the ports object jarvis.work_driver.drive expects.
 
-    lease_target is the literal relative name the lease is held under.
+    lease_target is the literal relative name the lease is held under, or a
+    sequence of them, all claimed per step or none.
     review(stage, diff) returns a work_review.GateDecision; fixture_hash(dir)
     hashes the fixtures of a git-free export of the judged commit.
     """
@@ -255,11 +258,32 @@ def build_ports(*, store: MemoryStore, manager: StageManager, target: _Repo, lea
         return notifier.notify(run_id, point, dedupe_key, seq=next_seq(), at=clock(),
                                step_key=step_key)
 
+    leased = (lease_target,) if isinstance(lease_target, str) else tuple(lease_target)
+    if not leased:
+        raise StageError("no lease target")
+
     def lease_claim(step: WorkStep):
-        return store.claim_work_lease(lease_target, run_id, boot_id, now=clock(), lease=lease)
+        # All or nothing: a refused target releases the ones already taken, then re-raises.
+        claims: list[dict[str, Any]] = []
+        try:
+            for name in leased:
+                claims.append(store.claim_work_lease(name, run_id, boot_id, now=clock(), lease=lease))
+        except BaseException:
+            for name in leased[:len(claims)]:
+                with contextlib.suppress(Exception):
+                    store.release_work_lease(name, run_id, boot_id, now=clock())
+            raise
+        return claims[0] if len(claims) == 1 else tuple(claims)
 
     def lease_release(step: WorkStep):
-        store.release_work_lease(lease_target, run_id, boot_id, now=clock())
+        failure: Exception | None = None
+        for name in leased:
+            try:
+                store.release_work_lease(name, run_id, boot_id, now=clock())
+            except Exception as error:  # every target is tried before the first failure surfaces
+                failure = failure or error
+        if failure is not None:
+            raise failure
 
     def stage_create(step: WorkStep):
         # A resumed step reattaches to its recorded stage; a slice never gets two.

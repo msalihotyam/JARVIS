@@ -157,6 +157,54 @@ class CoreProjectDriveTests(unittest.TestCase):
         last = [step for step in self.memory.work_steps("r") if step.ordinal == 1][-1]
         self.assertIs(last.state, StepState.BLOCKED_BY_GATE)
 
+    # PM26W1FIX2 F1: only terminal outcomes save the chain task FAILED.
+    def test_f1_movable_step_outcomes_keep_the_task_resumable(self):
+        for state in (StepState.PENDING, StepState.ACCEPTING, StepState.NEEDS_INPUT):
+            with self.subTest(state=state):
+                self.setUp()
+                first, _ = self.ready()
+                self.outcome = state
+                result = self.resume(first)
+                self.assertIs(result.status, RunStatus.FAILED)
+                self.assertIn("waiting:", result.result.summary)
+                self.assertIsNot(self.memory.load_task(first.id).status, TaskStatus.FAILED)
+                self.outcome = StepState.ACCEPTED
+                self.assertIs(self.resume(first).status, RunStatus.COMPLETED)
+                self.assertEqual(len(self.drive_calls), 2)
+                self.assertIs(self.memory.load_task(first.id).status, TaskStatus.COMPLETED)
+
+    def test_f1_terminal_step_outcomes_save_the_task_failed(self):
+        # FAILED_AFTER_CAP needs a reached revision cap: RealDriverTests drives it for real.
+        first, _ = self.ready()
+        self.outcome = StepState.CANCELLED
+        self.assertIs(self.resume(first).status, RunStatus.FAILED)
+        saved = self.memory.load_task(first.id)
+        self.assertIs(saved.status, TaskStatus.FAILED)
+        self.assertIn("cancelled", str(saved.result_snapshot))
+
+    def test_f1_unmapped_outcome_fails_closed_with_reason(self):
+        first, _ = self.ready()
+        self.outcome = StepState.RUNNING
+        self.assertIs(self.resume(first).status, RunStatus.FAILED)
+        saved = self.memory.load_task(first.id)
+        self.assertIs(saved.status, TaskStatus.FAILED)
+        self.assertIn("running", str(saved.result_snapshot))
+
+    # PM26W1FIX2 F2: every permitted target of the slice is leased; the targets map is the slice's.
+    def test_f2_multi_target_slice_leases_every_target_and_sees_only_its_own(self):
+        self.plan = replace(
+            self.plan,
+            slices=(PlanSlice("s1", "repair a", ("src/a.py", "lib/c.py", "src/a.py"), ("c1",)),
+                    PlanSlice("s2", "repair b", ("src/b.py",), ("c1",))),
+            targets=("src/a.py", "src/b.py", "lib/c.py"),
+        )
+        self.granted = {"src/", "lib/"}
+        first, _ = self.ready()
+        self.assertIs(self.resume(first).status, RunStatus.COMPLETED)
+        kwargs = self.build.call_args.kwargs
+        self.assertEqual(sorted(kwargs["lease_target"]), ["lib/c.py", "src/a.py"])
+        self.assertEqual(kwargs["targets"], {"src/a.py": "file", "lib/c.py": "file"})
+
 
 class RealDriverTests(CoreProjectDriveTests):
     """PM26W1FIX: the real work_driver.drive behind a FakePorts, so run moves are exercised."""
@@ -172,10 +220,13 @@ class RealDriverTests(CoreProjectDriveTests):
     def build_fake(self, **_):
         script = dict(self.port_kw)
         no_root_cause = script.pop("root_cause", True) is None
+        unbooted = script.pop("unbooted", False)
         self.ports = FakePorts(self.scripts, **script)
         self.ports.now = NOW + timedelta(minutes=2)
         if no_root_cause:
             self.ports.root_cause = None  # like production build_ports: no root_cause port
+        if unbooted:
+            self.ports.boot_scan = None  # drive acts on nothing: run and steps come back unchanged
         return self.ports
 
     def run_state(self):
@@ -215,6 +266,42 @@ class RealDriverTests(CoreProjectDriveTests):
         self.assertIs(self.resume(first).status, RunStatus.COMPLETED)
         self.assertIs(self.run_state(), RunState.ACCEPTING)
 
+    # PM26W1FIX2 F1 with the real driver: the review's three probes.
+    def test_f1_budget_keeps_the_task_resumable(self):
+        first, _ = self.ready()
+        self.port_kw = {"budget_exhausted": [True]}
+        result = self.resume(first)
+        self.assertIs(result.status, RunStatus.FAILED)
+        self.assertIs(self.run_state(), RunState.BLOCKED_BUDGET)
+        self.assertIsNot(self.memory.load_task(first.id).status, TaskStatus.FAILED)
+        # Waiting on budget: a later resume is refused, never saved FAILED, and the task stays open.
+        self.assertIn("refused: not_resumable", self.resume(first).result.summary)
+        self.assertIsNot(self.memory.load_task(first.id).status, TaskStatus.FAILED)
+
+    def test_f1_needs_input_keeps_the_task_resumable(self):
+        first, _ = self.ready()
+        self.scripts["s1"] = [result(summary="question?")]
+        self.assertIs(self.resume(first).status, RunStatus.FAILED)
+        self.assertIs(self.step_states()[0], StepState.NEEDS_INPUT)
+        self.assertIsNot(self.memory.load_task(first.id).status, TaskStatus.FAILED)
+
+    def test_f1_unbooted_drive_keeps_the_task_resumable(self):
+        first, _ = self.ready()
+        self.port_kw = {"unbooted": True}
+        self.assertIs(self.resume(first).status, RunStatus.FAILED)
+        self.assertIs(self.run_state(), RunState.BUILDING)
+        self.assertEqual(self.step_states()[0], StepState.PENDING)
+        self.assertIsNot(self.memory.load_task(first.id).status, TaskStatus.FAILED)
+        self.port_kw = {}
+        self.assertIs(self.resume(first).status, RunStatus.COMPLETED)
+
+    def test_f1_failed_after_cap_saves_the_task_failed(self):
+        first, _ = self.ready()
+        self.scripts["s1"] = [result()] * 4
+        self.port_kw = {"regress": [FAIL] * 4}
+        self.assertIs(self.resume(first).status, RunStatus.FAILED)
+        self.assertIs(self.memory.load_task(first.id).status, TaskStatus.FAILED)
+
     # The fake-drive wiring tests do not apply to the real driver.
     test_a1_each_slice_is_one_chain_task_driven_once_per_resume = None
     test_a2_gates_rechecked_before_every_step = None
@@ -224,6 +311,10 @@ class RealDriverTests(CoreProjectDriveTests):
     test_n2_narrowed_scope = None
     test_n3_plan_hash_mismatch = None
     test_n4_failed_check_means_no_apply_and_failed_with_evidence = None
+    test_f1_movable_step_outcomes_keep_the_task_resumable = None
+    test_f1_terminal_step_outcomes_save_the_task_failed = None
+    test_f1_unmapped_outcome_fails_closed_with_reason = None
+    test_f2_multi_target_slice_leases_every_target_and_sees_only_its_own = None
 
 
 if __name__ == "__main__":
