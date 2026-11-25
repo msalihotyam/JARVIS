@@ -7999,7 +7999,25 @@ class TestConvHeal(AutopilotBase):
         self.assertNotEqual(self.blocked_three(["A1", "B2", "C3"]), "closed")
 
     def test_int_and_fix_lanes_blocked_three_times_still_open_the_breaker(self):
-        self.assertNotEqual(self.blocked_three(["INT7", "INT-TRAIN8", "PROTALIAS1FIX"]), "closed")
+        # one INT lane runs at a time: INT-TRAIN8 starts only after INT7 finishes, so report it after its own start
+        (self.base / "pace.json").write_text(json.dumps({**conveyor.PACE_DEFAULTS, "max_lanes": 6}), encoding="utf-8")
+        for i, n in enumerate(["INT7", "INT-TRAIN8", "PROTALIAS1FIX"]):
+            self.lane(n, age=i)
+        self.c.pass_once()
+        self.assertNotIn("INT-TRAIN8", self.fake.bg_names())
+        for n in ["INT7", "PROTALIAS1FIX"]:
+            self.report(n, "BLOCKED", where=n, mtime=self.t)
+        self.t += 60
+        self.c.pass_once()
+        bad = lambda: sorted(x[0] for x in json.loads((self.base / "autopilot.json").read_text())["bad"])  # noqa: E731
+        self.assertEqual(bad(), ["INT7", "PROTALIAS1FIX"])
+        self.assertEqual(self.status()["breaker"], "closed")
+        self.assertIn("INT-TRAIN8", self.fake.bg_names())
+        self.report("INT-TRAIN8", "BLOCKED", where="INT-TRAIN8", mtime=self.t)
+        self.t += 60
+        self.c.pass_once()
+        self.assertEqual(bad(), ["INT-TRAIN8", "INT7", "PROTALIAS1FIX"])
+        self.assertNotEqual(self.status()["breaker"], "closed")
 
     def test_stuck_inbox_prompt_does_not_block_the_rest(self):
         start = self.c.start
