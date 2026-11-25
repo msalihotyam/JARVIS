@@ -233,12 +233,15 @@ def _guard(path: Path) -> Path:
 
 
 def _not_operator(path: Path, root: Path) -> Path:
-    """Refuse jarvis.db anywhere, data/ of this checkout and of the main checkout, and ~/.jarvis."""
+    """Refuse jarvis.db anywhere, data/ of this checkout and of the main checkout, any data/ beside a
+    .git (the main checkout from any worktree, also a detached TEMP one), and ~/.jarvis."""
     target = path.resolve()
     base = root.resolve()
     protected = [base / "data", OPERATOR_HOME.resolve()]
     if base.parent.name.casefold() == "worktrees" and base.parent.parent.name.casefold() == ".claude":
         protected.append(base.parents[2] / "data")  # a worktree: the main checkout's data/
+    protected += [p for p in (target, *target.parents)
+                  if p.name.casefold() == "data" and (p.parent / ".git").exists()]
     name = target.name.casefold()
     if name == "jarvis.db" or name.startswith("jarvis.db-") or any(target.is_relative_to(p) for p in protected):
         raise BaselineError(f"refused: {target} is operator data, never opened")
@@ -255,12 +258,15 @@ def _same(a: Path, b: Path) -> bool:
 def _targets(out: Path, root: Path, sources: tuple[Path, ...]) -> tuple[Path, Path]:
     """The checked ``out`` and ``out.sha256``: never conveyor/acceptance, operator data, a source or
     a sqlite sidecar of one (-wal/-shm/-journal). Runs before anything is read or written."""
+    if out.anchor.startswith(("\\\\", "//")):  # before resolve(), which would contact the share's host
+        raise BaselineError(f"refused: {out} is an ambiguous path spelling")
     target = _guard(out)
     sums = _guard(target.with_name(target.name + ".sha256"))
     resolved = [s.resolve() for s in sources]
     for path in (target, sums):
-        # Windows strips a trailing dot/space, \\?\ skips that, ":" names an NTFS stream: all alias a guarded path
-        if path.anchor.startswith(("\\\\?\\", "\\\\.\\")) or any(
+        # Windows strips a trailing dot/space, \\?\ skips that, ":" names an NTFS stream, a UNC share
+        # (\\localhost\C$\...) is not under the drive-letter root: all alias a guarded path
+        if path.anchor.startswith(("\\\\", "//")) or any(
                 ":" in p or p != p.rstrip(". ") for p in path.parts[1:]):
             raise BaselineError(f"refused: {path} is an ambiguous path spelling")
         _not_operator(path, root)
@@ -325,10 +331,15 @@ def main(argv: list[str] | None = None, root: Path = ROOT) -> int:
         doc = build(events, kpi_db, root, since, until)
         digest = write(doc, out, root, (events, kpi_db))
     except (BaselineError, OSError, ValueError) as error:  # ValueError: NUL / unencodable path
-        print(f"REFUSED: {error}")
+        _say(f"REFUSED: {error}")
         return 2
-    print(f"WROTE {out} sha256 {digest}")
+    _say(f"WROTE {out} sha256 {digest}")
     return 0
+
+
+def _say(text: str) -> None:
+    """Print ASCII only: a piped stdout (cp1254) cannot encode every path character."""
+    print(text.encode("ascii", "backslashreplace").decode("ascii"))
 
 
 if __name__ == "__main__":
