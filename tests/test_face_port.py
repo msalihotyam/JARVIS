@@ -1,0 +1,249 @@
+"""FACEPORT1: window view model, closed command set and fake service.
+
+Guarantees under test: present() shows the window's last N rows with labels, chips and
+open approval cards; ring/focus/mode come from the caller; commands are a closed set with
+typed refusals; no exception escapes; the module imports no Qt, no talk_* and no I/O, and
+nothing in jarvis/ imports it.
+"""
+from __future__ import annotations
+
+import ast
+import unicodedata
+import unittest
+from pathlib import Path
+
+from jarvis.face import port
+from tests.adversarial import HOSTILE_NUMBERS, HOSTILE_PATH_PARTS, HOSTILE_TEXT, deep_json, each
+
+ROOT = Path(__file__).resolve().parents[1]
+TS = "2026-11-25T10:56:00+03:00"
+STATUS = {"ring": "thinking"}
+
+
+def entry(**fields):
+    base = {"id": 1, "ts": TS, "source": "pc", "who": "salih", "kind": "text", "text": "merhaba"}
+    base.update(fields)
+    return base
+
+
+def view(entries, window="small", focus="Proje", mode="yazili", status=STATUS):
+    return port.present(entries, status, focus, mode, window)
+
+
+CARD = entry(id=9, who="jarvis", kind="approval_card", card_id="card-abc", text="Dosya yazilsin mi?")
+
+
+class PresentTests(unittest.TestCase):
+    def test_text_row_fields(self):
+        row = view([entry()]).rows[0]
+        self.assertEqual((row.who, row.label, row.text, row.time), ("Salih", "", "merhaba", "10:56"))
+
+    def test_telegram_salih_row_is_telefon(self):
+        self.assertEqual(view([entry(source="telegram")]).rows[0].label, "Telefon")
+        self.assertEqual(view([entry(source="telegram", who="jarvis")]).rows[0].label, "")
+
+    def test_transcript_row_label(self):
+        self.assertEqual(view([entry(kind="transcript")]).rows[0].label, "Anladığım:")
+
+    def test_attachment_is_chip(self):
+        att = {"sha256": "0" * 64, "path": "C:\\x\\rapor.pdf", "name": "rapor.pdf", "size": 1200}
+        chip = view([entry(kind="file", attachments=[att])]).rows[0].chips[0]
+        self.assertEqual(chip, port.Chip("rapor.pdf", 1200, "pdf"))
+
+    def test_open_card_row_has_two_buttons(self):
+        vm = view([CARD])
+        self.assertEqual(vm.rows[0].card_id, "card-abc")
+        self.assertEqual(vm.rows[0].buttons, port.BUTTONS)
+        self.assertEqual(vm.open_cards, frozenset({"card-abc"}))
+
+    def test_resolved_card_has_no_buttons(self):
+        vm = view([dict(CARD, state="APPROVED")])
+        self.assertEqual((vm.rows[0].buttons, vm.open_cards), ((), frozenset()))
+
+    def test_status_fields_are_taken_not_recomputed(self):
+        for ring in port.RING_STATES:
+            vm = port.present([CARD], {"ring": ring}, "Odak", "sesli", "large")
+            self.assertEqual((vm.ring, vm.focus_label, vm.mode, vm.window), (ring, "Odak", "sesli", "large"))
+        self.assertEqual(view([], focus=None).focus_label, "")
+
+    def test_deterministic(self):
+        entries = [entry(id=i, text=f"t{i}") for i in range(50)] + [CARD]
+        self.assertEqual(view(entries), view(entries))
+
+    def test_bad_inputs_are_refused(self):
+        cases = [
+            ("x", STATUS, None, "yazili", "small"),
+            ([], {"ring": "dancing"}, None, "yazili", "small"),
+            ([], None, None, "yazili", "small"),
+            ([], STATUS, 7, "yazili", "small"),
+            ([], STATUS, None, "loud", "small"),
+            ([], STATUS, None, "yazili", 30),
+        ]
+        for args in cases:
+            self.assertIsInstance(port.present(*args), port.Refusal, args)
+
+    def test_window_shows_only_last_n_of_10k(self):
+        entries = [entry(id=i) for i in range(10_000)]
+        for size, n in port.WINDOW_ROWS.items():
+            rows = view(entries, window=size).rows
+            self.assertEqual([r.entry_id for r in rows], list(range(10_000 - n, 10_000)))
+
+    def test_row_text_is_cleaned_original_kept(self):
+        def check(text):
+            original = entry(text=text)
+            shown = view([original]).rows[0].text
+            self.assertFalse(any(unicodedata.category(c).startswith("C") for c in shown if c not in "\n\t"))
+            self.assertEqual(original["text"], text)
+
+        each(self, [t for t in HOSTILE_TEXT if type(t) is str] + ["a\u200bb\u2067c\x07"], check)
+        self.assertEqual(view([entry(text="a\u202eb\u200bc")]).rows[0].text, "abc")
+
+    def test_unknown_kind_is_neutral_row_not_dropped(self):
+        bad = [entry(kind="hologram"), entry(who="mallory"), "not a mapping", None,
+               entry(kind="approval_card", card_id="x y"), entry(text=deep_json())]
+        rows = view(bad + [entry(id=2)]).rows
+        self.assertEqual(len(rows), 7)
+        for row in rows[:5]:
+            self.assertEqual((row.kind, row.text, row.buttons), ("unsupported", port.UNSUPPORTED, ()))
+        self.assertEqual(rows[6].entry_id, 2)
+
+    def test_hostile_chip_names_are_cleaned(self):
+        def check(part):
+            att = {"path": f"C:\\in\\{part}", "name": f"..\\..\\{part}\u202e\x00:evil.png"}
+            chip = view([entry(kind="file", attachments=[att])]).rows[0].chips[0]
+            self.assertTrue(chip.name)
+            for bad in ("\\", "/", ":", "\x00", "\u202e"):
+                self.assertNotIn(bad, chip.name)
+            self.assertEqual(att["path"], f"C:\\in\\{part}")
+
+        each(self, HOSTILE_PATH_PARTS, check)
+
+    def test_hostile_values_never_raise(self):
+        class Boom(dict):
+            def get(self, *a):
+                raise RecursionError("deep")
+
+        for value in list(HOSTILE_NUMBERS) + [deep_json(), Boom(), {"size": 10**400}]:
+            entries = [entry(attachments=[value], ts=value, id=value), Boom(), value]
+            self.assertIsInstance(view(entries), port.ViewModel)
+        self.assertIsInstance(port.present([], Boom(), None, "yazili", "small"), port.Refusal)
+
+
+VALID = [
+    {"name": "send_text", "text": "selam"},
+    {"name": "talk_start"},
+    {"name": "talk_stop"},
+    {"name": "attach_file", "path": "C:\\Users\\s\\rapor.pdf"},
+    {"name": "attach_screenshot"},
+    {"name": "set_mode", "mode": "sesli"},
+    {"name": "card_tap", "card_id": "card-abc", "choice": "approve"},
+    {"name": "resize", "size": "large"},
+]
+
+
+class CommandTests(unittest.TestCase):
+    def test_closed_set_each_valid_command_is_typed(self):
+        self.assertEqual({c["name"] for c in VALID}, set(port.COMMANDS))
+        vm = view([CARD])
+        for command in VALID:
+            result = port.validate(command, vm)
+            self.assertIsInstance(result, port.Command, command)
+            self.assertEqual(result.name, command["name"])
+
+    def test_unknown_command_or_extra_field_refused(self):
+        bad = [{"name": "rm_rf"}, {"name": "SEND_TEXT", "text": "a"}, {}, None, "send_text",
+               {"name": 1}, {"name": "talk_start", "x": 1}, {"name": "send_text"},
+               {"name": "send_text", "text": "a", "path": "b"}]
+        for command in bad:
+            self.assertIsInstance(port.validate(command), port.Refusal, command)
+
+    def test_send_text_bounds(self):
+        for text in ["", "   \n", "a" * (port.MAX_SEND_CHARS + 1), None, 5, b"a", ["a"]]:
+            self.assertIsInstance(port.validate({"name": "send_text", "text": text}), port.Refusal)
+        cap = port.validate({"name": "send_text", "text": "a" * port.MAX_SEND_CHARS})
+        self.assertIsInstance(cap, port.Command)
+
+    def test_attach_file_path_is_opaque_and_untouched(self):
+        def check(part):
+            path = f"..\\{part}\\x\u202e.txt"
+            self.assertEqual(port.validate({"name": "attach_file", "path": path}).path, path)
+
+        each(self, HOSTILE_PATH_PARTS, check)
+        self.assertIsInstance(port.validate({"name": "attach_file", "path": ""}), port.Refusal)
+
+    def test_card_tap_choice_and_card_must_match_view(self):
+        vm = view([CARD])
+        for card_id, choice in [("card-abc", "Approve"), ("card-abc", "yes"), ("card-abc", " approve"),
+                                ("card-zzz", "approve"), ("card-abc", "")]:
+            command = {"name": "card_tap", "card_id": card_id, "choice": choice}
+            self.assertIsInstance(port.validate(command, vm), port.Refusal, command)
+        tap = {"name": "card_tap", "card_id": "card-abc", "choice": "reject"}
+        self.assertIsInstance(port.validate(tap), port.Refusal)
+        self.assertIsInstance(port.validate(tap, view([dict(CARD, state="EXPIRED")])), port.Refusal)
+
+    def test_mode_and_size_closed(self):
+        self.assertIsInstance(port.validate({"name": "set_mode", "mode": "loud"}), port.Refusal)
+        self.assertIsInstance(port.validate({"name": "resize", "size": "30"}), port.Refusal)
+
+    def test_hostile_command_never_raises(self):
+        class Boom(dict):
+            def get(self, *a):
+                raise RecursionError("deep")
+
+        for value in list(HOSTILE_TEXT) + [deep_json(), Boom({"name": "talk_start"})]:
+            self.assertIsInstance(port.validate({"name": "send_text", "text": value}), (port.Command, port.Refusal))
+            self.assertIsInstance(port.validate(value), port.Refusal)
+
+    def test_refusal_texts_are_ascii(self):
+        reasons = [port.validate(c).reason for c in [None, {"name": "x"}, {"name": "send_text", "text": ""}]]
+        reasons.append(port.present(None, STATUS, None, "yazili", "small").reason)
+        self.assertTrue(all(r.isascii() for r in reasons))
+
+
+class FakeServiceTests(unittest.TestCase):
+    def test_records_commands_and_replays_views(self):
+        first, second = view([CARD]), view([dict(CARD, state="APPROVED")])
+        fake = port.FakeService([first, second])
+        tap = {"name": "card_tap", "card_id": "card-abc", "choice": "approve"}
+        self.assertIsInstance(fake.send(tap), port.Refusal)  # no view replayed yet
+        self.assertIs(fake.view(), first)
+        self.assertIsInstance(fake.send(tap), port.Command)
+        self.assertIs(fake.view(), second)
+        self.assertIs(fake.view(), second)
+        self.assertIsInstance(fake.send(tap), port.Refusal)
+        fake.send({"name": "talk_start"})
+        self.assertEqual([c.name for c in fake.commands], ["card_tap", "talk_start"])
+        self.assertEqual(len(fake.refused), 2)
+
+    def test_empty_script(self):
+        self.assertIsNone(port.FakeService().view())
+
+
+class SafetyTests(unittest.TestCase):
+    def test_port_imports_only_pure_modules(self):
+        tree = ast.parse((ROOT / "jarvis" / "face" / "port.py").read_text(encoding="utf-8"))
+        names = {a.name for n in ast.walk(tree) if isinstance(n, ast.Import) for a in n.names}
+        names |= {n.module for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)}
+        self.assertEqual(names, {"__future__"})
+        self.assertFalse(any("Qt" in n or "talk_" in n for n in names))
+
+    def test_nothing_in_the_app_imports_port(self):
+        for path in (ROOT / "jarvis").rglob("*.py"):
+            if path.name == "port.py" and path.parent.name == "face":
+                continue
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom):
+                    mods = [node.module or ""] + [f"{node.module}.{a.name}" for a in node.names]
+                elif isinstance(node, ast.Import):
+                    mods = [a.name for a in node.names]
+                else:
+                    continue
+                hit = any(m == "jarvis.face.port" or m.endswith("face.port") for m in mods)
+                hit = hit or (isinstance(node, ast.ImportFrom) and node.level and "port" in [a.name for a in node.names]
+                              and path.parent.name == "face")
+                self.assertFalse(hit, path)
+
+
+if __name__ == "__main__":
+    unittest.main()

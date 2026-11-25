@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "classes": {
+    "tests.test_face_port.PresentTests": 0.3,
+    "tests.test_face_port.CommandTests": 0.1,
+    "tests.test_face_port.FakeServiceTests": 0.1,
+    "tests.test_face_port.SafetyTests": 0.5
+  }
+}
