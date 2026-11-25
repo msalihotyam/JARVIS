@@ -506,18 +506,19 @@ FIXTURE = [
 # 136: the orchestrator moved a 2-pick INT forward after 47 min (O11 threshold is 60).
 # 355: hour 1 is outside NIGHT (2, 8); the branch is pace.ahead (51 vs 44.6) and the
 # orchestrator paused overnight instead; the later night plan (396) runs non-Claude.
-# 400/284a/228a: the alarm is suppressed (no alarm raised, as recorded), but quota is
-# now a required gate and a suppressed alarm hides nothing, so the decision is the
-# quota dispatch; the old 36/38 counted them only because quota was absent.
-KNOWN_MISSES = {"136", "355", "400", "284a", "228a"}
+# 400/284a/228a (PM35RATE): the suppressed alarm names the on-line quota dispatch
+# ("suppress", worker constraint unchanged) after every work row, so it hides nothing.
+KNOWN_MISSES = {"136", "355"}
+# N1: every case that agreed before PM35RATE (33/38) still agrees.
+AGREED_BEFORE_PM35RATE = {ref for ref, _, _ in FIXTURE} - {"136", "355", "400", "284a", "228a"}
 # Under this week's DEFAULT_POLICY (limit 100, Claude at night) 140 and 287 also differ.
 DEFAULT_MISSES = KNOWN_MISSES | {"140", "287"}
 # 370/406/424 were recorded without a pacing line, so they hit pace.unknown_line;
 # memory-ok items now report the quota decision (pace.on_line) behind the memory gate.
 RULE_IDS = {
     "122": "O5.cap", "129": "O5.fix", "151": "O5.fix", "187": "O5.fix", "190": "O5.cap",
-    "204": "O5.fix", "389": "O5.cap", "400": "pace.on_line", "284a": "pace.on_line",
-    "284b": "O33.new", "228a": "pace.on_line", "228b": "O33.new", "387": "O11.split",
+    "204": "O5.fix", "389": "O5.cap", "400": "O33.finished", "284a": "O33.duplicate",
+    "284b": "O33.new", "228a": "O33.finished", "228b": "O33.new", "387": "O11.split",
     "395": "O11.batch", "419": "O13.running", "136": "O11.small", "140": "O23.limit",
     "271": "pace.on_line", "287": "pace.night", "355": "pace.ahead",
     "370": "pace.unknown_line", "406": "pace.unknown_line", "424": "pace.unknown_line",
@@ -536,7 +537,11 @@ class ReplayTests(unittest.TestCase):
         agreement = 1 - len(misses) / len(FIXTURE)
         self.assertEqual(len(FIXTURE), 38)
         self.assertEqual(misses, KNOWN_MISSES)
-        self.assertEqual(round(agreement * 38), 33)  # 33/38 = 86.8 %
+        self.assertGreaterEqual(agreement, 35 / 38)  # PM35RATE bar: >= 35/38 = 92.1 %
+        self.assertEqual(round(agreement * 38), 36)  # 36/38 = 94.7 %
+        agreeing = {ref for ref, d, want in decisions if d.action == want}
+        self.assertEqual(len(AGREED_BEFORE_PM35RATE), 33)
+        self.assertLessEqual(AGREED_BEFORE_PM35RATE, agreeing)  # N1: no agree -> disagree
         self.assertEqual({ref: d.rule_id for ref, d, _ in decisions}, RULE_IDS)
         for _, d, _ in decisions:
             self.assertIsInstance(d, Decision)
@@ -549,7 +554,7 @@ class ReplayTests(unittest.TestCase):
     def test_agreement_under_default_policy(self):
         misses = {ref for ref, s, want in FIXTURE
                   if supervise(_sit(policy=DEFAULT_POLICY, **s)).action != want}
-        self.assertEqual(misses, DEFAULT_MISSES)  # 31/38 = 81.6 %
+        self.assertEqual(misses, DEFAULT_MISSES)  # 34/38 = 89.5 %
 
     def test_proposals_never_leave_allowlist(self):
         for ref, s, _ in FIXTURE:
@@ -608,7 +613,7 @@ class PrecedenceTests(unittest.TestCase):
             ("operator_pause", "pause"), ("gate", None), ("memory", "wait"),
             ("quota", "pause"), ("quota", "non_claude_only"), ("alarm", "alarm"),
             ("fix", None), ("integration", None), ("proposal", None),
-            ("approval", None), ("push", None), ("quota", "dispatch")))
+            ("approval", None), ("push", None), ("alarm", "suppress"), ("quota", "dispatch")))
 
     def test_rows_in_order(self):
         work = self.ALL_WORK
@@ -655,6 +660,10 @@ class PrecedenceTests(unittest.TestCase):
     def test_suppressed_alarm_hides_nothing(self):
         d = supervise(_sit(**_a("A", "stuck", alarmed={"stuck"}), **_f("X", 0)))
         self.assertEqual(d.rule_id, "O5.fix")
+        for alarm, rule_id in ((_a("A", "stuck", alarmed={"stuck"}), "O33.duplicate"),
+                               (_a("A", "stuck", finished={"A"}), "O33.finished")):
+            d = supervise(_sit(**alarm))
+            self.assertEqual((d.action, d.rule_id, d.constraint), ("suppress", rule_id, "any"))
 
 
 class _Evil(str):

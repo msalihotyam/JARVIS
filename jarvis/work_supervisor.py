@@ -346,12 +346,13 @@ PRECEDENCE = (
     ("memory", "wait"),
     ("quota", "pause"),
     ("quota", "non_claude_only"),   # constraining row
-    ("alarm", "alarm"),             # a suppressed alarm hides nothing
+    ("alarm", "alarm"),
     ("fix", None),
     ("integration", None),
     ("proposal", None),
     ("approval", None),             # N6-09: every hold above also holds these two
     ("push", None),
+    ("alarm", "suppress"),          # hides no work; only names an on-line quota dispatch
     ("quota", "dispatch"),
 )
 
@@ -424,6 +425,12 @@ def _decide(s: Situation) -> Decision:
         if action == "non_claude_only":
             constraint = "non_claude_only"
             continue
+        if action == "suppress":
+            # PM35RATE: a suppressed alarm never changes the worker set; under any
+            # quota hold the quota decision stands, as before.
+            if found["quota"].action != "dispatch":
+                continue
+            return d._replace(constraint=_final(found["quota"], constraint).constraint)
         return _final(d, constraint)
     return _final(found["quota"], constraint)   # non_claude_only and no work
 
