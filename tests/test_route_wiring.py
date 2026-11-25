@@ -18,6 +18,7 @@ from unittest.mock import patch
 import jarvis.app as app_module
 from jarvis import router_tr
 from jarvis.connectors.claude_code import ClaudeCodeConnector
+from jarvis.contracts import ErrorCode, OutcomeStatus, SessionState, StructuredError, ToolResult
 from jarvis.intent import ClaudeIntentAdapter
 from jarvis.settings import ConfigError, Settings, _document_from_settings, _settings_from_document
 from tests.test_intent import IntentTestCase, ScriptedModel, proposal, stream_line
@@ -208,6 +209,80 @@ class RouteWarmTests(WarmTest):
         self.assertEqual("base-model", base.args[base.args.index("--model") + 1])
         self.assertEqual([True, True, False], [MARKER in line for line in fast.user_lines()])
         self.assertEqual([True], [MARKER in line for line in base.user_lines()])
+
+    def test_cancel_before_start_on_a_switch_keeps_the_process_and_the_retry_gets_the_window(self) -> None:
+        # E1ROUTE1AFIX: the switch back is cancelled before it reaches the live fast
+        # process, so the app keeps the old lane and the retry resends (warm_resend=True).
+        self.lane_turn("fake-fast", "low", False)
+        self.lane_turn("base-model", "high", True)
+        self.adapter.warm_lane, self.adapter.warm_resend = "c1:fake-fast:low", True
+        self.adapter.model, self.adapter.effort = "fake-fast", "low"
+        task = self.task()
+        self.adapter.cancel(task.id)
+        self.assertEqual(ErrorCode.CANCELLED, self.adapter.execute(task, SessionState()).error.code)
+        self.assertIsNone(self.lane_turn("fake-fast", "low", True).error)
+        self.assertEqual(2, self.popen.call_count)
+        fast, _ = self.processes
+        self.assertEqual([True, True], [MARKER in line for line in fast.user_lines()])
+
+
+class OutcomeModel(RecordingModel):
+    """A RecordingModel whose calls end as scripted: "ok", "raise", an error result, or "cancel"
+    (answered, but the turn was cancelled meanwhile)."""
+
+    def __init__(self, *outcomes):
+        super().__init__(*[proposal(kind="chat", reply=REPLY)] * len(outcomes))
+        self.outcomes, self.app = list(outcomes), None
+
+    def complete(self, task, session):
+        outcome = self.outcomes.pop(0)
+        if outcome == "cancel":
+            self.app._cancelled_text.add(task.id)
+        elif outcome != "ok":
+            self.on_complete(task)
+            if outcome == "raise":
+                raise RuntimeError("boom")
+            return ToolResult(outcome=OutcomeStatus.ERROR, summary=outcome.message, error=outcome)
+        return super().complete(task, session)
+
+
+class RouteRollbackTests(IntentTestCase):
+    """E1ROUTE1AFIX: only an answered turn moves the conversation's lane (_ROUTE_LAST)."""
+
+    def run_turns(self, *turns):
+        """``turns``: (text, outcome[, routing on]); returns each call's warm_resend and _ROUTE_LAST."""
+        conversation = self.memory.create_conversation()
+        model = OutcomeModel(*[t[1] for t in turns])
+        texts = {"a": light, "b": heavy}
+        with tick_clock(), patch.dict(app_module._ROUTE_LAST, clear=True), \
+                patch.object(router_tr, "route", side_effect=lambda t: texts[t](t)):
+            for text, _, *on in turns:
+                model.app = self.build_on(model) if on in ([], [True]) else self.build(model)
+                model.app.submit_text(text, conversation_id=conversation.id)
+            last = dict(app_module._ROUTE_LAST)
+        return [resend for *_, resend in model.seen], last, conversation.id
+
+    def build_on(self, model):
+        return self.build(model, settings=Settings(memory_database=self.database, **FAST))
+
+    def test_a_failed_or_cancelled_switch_leaves_the_lane_so_the_retry_resends(self) -> None:
+        for outcome in ("raise", StructuredError(ErrorCode.CANCELLED, "cancelled before start"),
+                        StructuredError(ErrorCode.EGRESS_REFUSED, "refused before spawn"), "cancel"):
+            with self.subTest(outcome=str(outcome)[:40]):
+                resend, last, cid = self.run_turns(("a", "ok"), ("b", "ok"), ("a", outcome), ("a", "ok"), ("a", "ok"))
+                self.assertEqual([False, True, True, True, False], resend)
+                self.assertEqual({cid: f"{cid}:fake-fast:low"}, last)
+
+    def test_switching_routing_on_and_off_makes_each_lane_resend_once(self) -> None:
+        # The routing-off lane (the conversation id) missed the routed turns, and back.
+        resend, last, cid = self.run_turns(("a", "ok", False), ("a", "ok"), ("b", "ok", False), ("b", "ok", False),
+                                           ("a", "ok"), ("a", "ok"))
+        self.assertEqual([False, False, True, False, True, False], resend)
+        self.assertEqual({cid: f"{cid}:fake-fast:low"}, last)
+
+    def test_a_failed_first_turn_and_off_only_turns_write_nothing(self) -> None:
+        self.assertEqual(([False], {}), self.run_turns(("a", "raise"))[:2])
+        self.assertEqual(([False, False], {}), self.run_turns(("a", "ok", False), ("b", "ok", False))[:2])
 
 
 class RouteSettingsTests(unittest.TestCase):
