@@ -179,12 +179,12 @@ def _open_dir(path: str) -> int:
 
 def _scan_fd(fd: int):
     """(name, is_dir) of the directory the fd holds, read from the handle itself;
-    links and reparse points are left out (fail closed)."""
+    links and reparse points come as (name, None) so callers still count them
+    toward the deadline, and must skip them (fail closed)."""
     if os.name != "nt":
         with os.scandir(fd) as scan:
             for entry in scan:
-                if not entry.is_symlink():
-                    yield entry.name, entry.is_dir(follow_symlinks=False)
+                yield entry.name, None if entry.is_symlink() else entry.is_dir(follow_symlinks=False)
         return
     handle, buf, info_class = msvcrt.get_osfhandle(fd), ctypes.create_string_buffer(65536), 11
     # FileIdBothDirectoryRestartInfo (11) first, then FileIdBothDirectoryInfo (10).
@@ -195,8 +195,8 @@ def _scan_fd(fd: int):
             attrs = int.from_bytes(raw[offset + 56:offset + 60], "little")
             size = int.from_bytes(raw[offset + 60:offset + 64], "little")
             name = raw[offset + 104:offset + 104 + size].decode("utf-16-le", "surrogatepass")
-            if name not in (".", "..") and not attrs & 0x400:  # FILE_ATTRIBUTE_REPARSE_POINT
-                yield name, bool(attrs & 0x10)
+            if name not in (".", ".."):  # FILE_ATTRIBUTE_REPARSE_POINT (0x400) -> None
+                yield name, None if attrs & 0x400 else bool(attrs & 0x10)
             if not step:
                 break
             offset += step
@@ -364,11 +364,22 @@ class BrainFiles:
             raise _Refuse("link", "opened path is another place")
 
     def _read_text(self, real: str) -> str:
-        with open(real, "rb") as handle:
+        # Nonblocking open: a POSIX FIFO without a writer must not hang before the S_ISREG check.
+        # O_NOFOLLOW/O_NOCTTY: a final component swapped to a link or a tty is never opened with side effects.
+        fd = os.open(real, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0)
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NOCTTY", 0))
+        try:
+            handle = os.fdopen(fd, "rb")
+        except BaseException:
+            os.close(fd)
+            raise
+        with handle:
             self._verify(handle.fileno(), real)
             info = os.fstat(handle.fileno())
             if not stat.S_ISREG(info.st_mode):
                 raise _Refuse("not_file", "path is not a regular file")
+            if info.st_nlink != 1:  # a hard link aliases a file outside or excluded under an allowed name
+                raise _Refuse("link", "file has more than one link")
             if info.st_size > MAX_FILE_BYTES:
                 raise _Refuse("too_large", "file is over the size cap")
             data = handle.read(MAX_FILE_BYTES + 1)
@@ -419,7 +430,7 @@ class BrainFiles:
             try:
                 self._verify(fd, target.path)
                 for name, is_dir in _scan_fd(fd):
-                    if not _name_ok(parent, name) or self._is_link(os.path.join(target.path, name)):
+                    if is_dir is None or not _name_ok(parent, name) or self._is_link(os.path.join(target.path, name)):
                         continue
                     entries.append(Entry(name, "dir" if is_dir else "file"))
             finally:
@@ -458,6 +469,8 @@ class BrainFiles:
                     for entry in _scan_fd(fd):  # deadline and cap per entry: no full listing first
                         if self._clock() > deadline:
                             return SearchResult(tuple(matches), scanned, "time")
+                        if entry[1] is None:  # link or reparse point: timed above, never followed
+                            continue
                         if len(names) >= MAX_ENTRIES:
                             cut = True
                             break

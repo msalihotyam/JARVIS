@@ -8,6 +8,7 @@ import ast
 import contextlib
 import os
 import pathlib
+import stat
 import tempfile
 import unittest
 from unittest import mock
@@ -521,7 +522,11 @@ class FinalPathTests(RootCase):
             found = fs.search("secret", "swap")
         if os.name == "nt" or not isinstance(listed, Refusal):  # POSIX may refuse the moved handle
             self.assertEqual(names(listed), {"inner.txt"})
-        self.assertEqual(found.matches, ())
+        if swapped:  # BRAINFS1FIX2 F4: POSIX lets the rename through; "swap" is now a link out
+            self.assertRefused(found)
+            self.assertIn(found.code, ("link", "outside"))
+        else:
+            self.assertEqual(found.matches, ())
 
     def test_default_port_matches_resolved_path(self):
         real = os.path.realpath(os.path.join(self.root, "docs", "notes.md"))
@@ -535,6 +540,81 @@ class FinalPathTests(RootCase):
         self.assertEqual(self.fs.read_file("docs/notes.md").text, "hello docs\n")
         self.assertIn("notes.md", names(self.fs.list_dir("docs")))
         self.assertTrue(self.fs.search("hello").matches)
+
+
+class HardLinkAndSpecialFileTests(RootCase):
+    """BRAINFS1FIX2: hard-link alias (F1), non-regular file (F3), link-only folder (F2)."""
+
+    def hard_link(self, target, rel):
+        dest = os.path.join(self.root, *rel.split("/"))
+        os.link(target, dest)
+        return rel
+
+    def assertHidden(self, rel, text):
+        self.assertRefused(self.fs.read_file(rel), "link")
+        got = self.fs.search(text)
+        self.assertEqual((got.matches, got.stopped), ((), ""))
+
+    def test_hard_link_to_outside_file_refused(self):
+        rel = self.hard_link(os.path.join(self.outside, "secret.txt"), "docs/alias.txt")
+        self.assertHidden(rel, "outside secret")
+
+    def test_hard_link_to_excluded_file_refused(self):
+        excluded = [(".env", "KEY=hello"), ("talk/state/turn.json", '"hello": 1'), (".git/config", "hello git")]
+        for i, (src, text) in enumerate(excluded):
+            with self.subTest(src):
+                rel = self.hard_link(os.path.join(self.root, *src.split("/")), f"docs/alias{i}.txt")
+                self.assertHidden(rel, text)
+
+    def test_hard_link_between_allowed_names_refused(self):
+        # decision: the alias cannot be told apart from an attack, so both names are refused
+        self.hard_link(os.path.join(self.root, "docs", "notes.md"), "jarvis/twin.md")
+        self.assertRefused(self.fs.read_file("docs/notes.md"), "link")
+        self.assertRefused(self.fs.read_file("jarvis/twin.md"), "link")
+        self.assertEqual(self.fs.search("hello docs").matches, ())
+
+    def test_link_made_during_handle_check_refused(self):
+        # the link count is read from the verified handle after the check, not before
+        src, made = os.path.join(self.root, "docs", "notes.md"), []
+
+        def port(fd):
+            if not made:  # the link count changes between open and the fstat
+                os.link(src, os.path.join(self.outside, "copy.md"))
+                made.append(True)
+            return brain_fs._final_path(fd)
+
+        fs = BrainFiles(self.root, clock=frozen_clock, final_path=port)
+        self.assertRefused(fs.read_file("docs/notes.md"), "link")
+
+    def test_non_regular_handle_refused(self):
+        real = os.fstat
+
+        def fifo_stat(fd):
+            return os.stat_result((stat.S_IFIFO | 0o644,) + tuple(real(fd))[1:])
+
+        with mock.patch.object(brain_fs.os, "fstat", fifo_stat):
+            self.assertRefused(self.fs.read_file("docs/notes.md"), "not_file")
+        if hasattr(os, "mkfifo"):  # POSIX: a FIFO with no writer must not block the open
+            os.mkfifo(os.path.join(self.root, "docs", "pipe.txt"))
+            self.assertRefused(self.fs.read_file("docs/pipe.txt"))
+            self.assertEqual(self.fs.search("hello docs").stopped, "")
+
+    def test_link_only_folder_bounded_by_deadline(self):
+        os.makedirs(os.path.join(self.root, "links"))
+        for i in range(5):
+            try:
+                LinkTests.make_link(self, self.outside, os.path.join("links", f"l{i}"))
+            except unittest.SkipTest as exc:  # the lane forbids skips: no link support is a failure here
+                self.fail(f"cannot create link: {exc}")
+        self.assertEqual(names(self.fs.list_dir("links")), set())
+        ticks = [0]
+
+        def clock():  # first call sets the deadline, every later call is past it
+            ticks[0] += 1
+            return 0.0 if ticks[0] == 1 else 100.0
+
+        got = BrainFiles(self.root, clock=clock).search("outside", "links")
+        self.assertEqual((got.matches, got.stopped), ((), "time"))
 
 
 class MalformedInputTests(RootCase):
@@ -623,12 +703,19 @@ class ModuleContractTests(unittest.TestCase):
         self.assertNotIn("subprocess", SOURCE)
 
     def test_every_open_is_binary_read(self):
-        opens = [n for n in ast.walk(TREE) if isinstance(n, ast.Call) and getattr(n.func, "id", None) == "open"]
+        calls = [n for n in ast.walk(TREE) if isinstance(n, ast.Call)]
+        opens = [n for n in calls if getattr(n.func, "id", None) == "open" or getattr(n.func, "attr", None) == "fdopen"]
+        os_opens = [n for n in calls if getattr(n.func, "attr", None) == "open"]
         self.assertTrue(opens)
+        self.assertTrue(os_opens)
         for node in opens:
             modes = [a.value for a in node.args[1:2] if isinstance(a, ast.Constant)]
             modes += [k.value.value for k in node.keywords if k.arg == "mode" and isinstance(k.value, ast.Constant)]
             self.assertEqual(modes, ["rb"])
+        for node in os_opens:  # BRAINFS1FIX2: low-level opens are read-only by flag
+            flags = {n.attr for n in ast.walk(node.args[1]) if isinstance(n, ast.Attribute)}
+            self.assertIn("O_RDONLY", flags)
+            self.assertFalse(flags & {"O_WRONLY", "O_RDWR", "O_CREAT", "O_TRUNC", "O_APPEND"}, flags)
 
     def test_no_mutating_or_exec_call(self):
         for node in ast.walk(TREE):
