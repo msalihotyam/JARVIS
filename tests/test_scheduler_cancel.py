@@ -67,6 +67,16 @@ from tests.test_scheduler_recovery import ACTOR, WHY, WORKER_C, RecoveryTestCase
 class CancelTestCase(RecoveryTestCase):
     """A real generation, and the operator asking it to stop."""
 
+    def setUp(self) -> None:
+        super().setUp()
+        # Speed only: an idle reader keeps the store's per-call connection from
+        # being the last one, so SQLite does not delete and recreate the WAL and
+        # shm files on every call. It never holds a transaction or open cursor,
+        # so no checkpoint waits on it and no lock or result changes.
+        keep = sqlite3.connect(self.database)
+        keep.execute("SELECT 1 FROM sqlite_master").fetchall()
+        self.addCleanup(keep.close)
+
     def cancel(self, run_id, *, worker=WORKER_B, store=None, **over):
         fields = dict(actor_label=ACTOR, reason=WHY)
         fields.update(over)
