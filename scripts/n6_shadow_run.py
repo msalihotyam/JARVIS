@@ -43,7 +43,7 @@ from jarvis.n6_shadow import BLOCK, Snapshot, compare, conveyor_verdict, load  #
 from jarvis.n6_ci_watch import ci_verdict, compare_finish  # noqa: E402
 from jarvis.n6_cleanup import compare as cleanup_compare  # noqa: E402
 from jarvis.n6_intseq import compare_dispatch, sequence  # noqa: E402
-from jarvis.n6_presence import read_pace, sense, shadow_compare, state_from_events  # noqa: E402
+from jarvis.n6_presence import AWAY, PRESENT, read_pace, sense, shadow_compare, state_from_events  # noqa: E402
 
 JUDGED = ("agree", "disagree", "false_pass")
 
@@ -336,16 +336,32 @@ def _presence(i: dict[str, Any]) -> Judged:
     if state is None:
         return None
     signal, _ = sense(state, i["idle_s"], read_pace(i["pace"]), i["now"])
-    comps = shadow_compare([(signal, i["events"])])
+    events = i["events"]
+    # shadow_compare agrees on unknown vs presence_unknown (and no-change vs only presence_unknown):
+    # either side unknown means the event was not judged
+    if signal.presence not in (PRESENT, AWAY) or any(
+            isinstance(e, dict) and e.get("event") == "presence_unknown" for e in events):
+        return None
+    comps = shadow_compare([(signal, events)])
     verdicts = {c.verdict for c in comps}
     if not comps or verdicts - {"agree", "disagree"}:
         return None  # any unknown tick: N6 did not judge this event
     return ("disagree" if "disagree" in verdicts else "agree"), [c.n6 for c in comps], [c.conveyor for c in comps]
 
 
+# "refused" is also a sandbox/target refusal and the receipt carries no step, so only "pass" is an
+# N6 decision; the conveyor side must use the same vocabulary or it could never agree
+FF_DECISIONS = frozenset({"pass"})
+FF_CONVEYOR = frozenset({"pass", "refused"})
+
+
 def _ffrehearse(i: dict[str, Any]) -> Judged:
     # rehearse() runs git in a sandbox the running repo refuses under build/n6/: read its receipt only
-    return ("agree" if i["status"] == i["conveyor"] else "disagree"), i["status"], i["conveyor"]
+    status, conveyor = i.get("status"), i.get("conveyor")
+    if not (isinstance(status, str) and status in FF_DECISIONS
+            and isinstance(conveyor, str) and conveyor in FF_CONVEYOR):
+        return None  # unknown / unjudged / malformed: no row, retried next pass
+    return ("agree" if status == conveyor else "disagree"), status, conveyor
 
 
 PORTS: tuple[tuple[str, str, Callable[[dict[str, Any]], Judged]], ...] = (
@@ -359,11 +375,14 @@ def _text(value: Any) -> str:
     return text or "-"
 
 
-def _jsonl(path: Path) -> list[dict[str, Any]]:
+def _jsonl_rows(path: Path) -> list[dict[str, Any]] | None:
+    """The JSON-object lines of ``path``: [] when absent, None when it exists but is unreadable."""
     try:
         lines = path.read_text(encoding="utf-8").splitlines()
-    except OSError:
+    except FileNotFoundError:
         return []
+    except (OSError, ValueError):  # ValueError: UnicodeDecodeError on non-UTF-8 bytes
+        return None
     out: list[dict[str, Any]] = []
     for line in lines:
         try:
@@ -373,6 +392,10 @@ def _jsonl(path: Path) -> list[dict[str, Any]]:
         if isinstance(item, dict):
             out.append(cast("dict[str, Any]", item))
     return out
+
+
+def _jsonl(path: Path) -> list[dict[str, Any]]:
+    return _jsonl_rows(path) or []
 
 
 def shadow_rows(root: Path) -> list[dict[str, Any]]:
@@ -388,9 +411,14 @@ def feed(root: Path, events: list[dict[str, Any]], *, clock: Callable[[], dateti
     if not switch.exists():
         return 0
     base = root / "build" / "n6"
-    seen = {(r.get("group"), r.get("event_id")) for r in shadow_rows(root)}
+    history = _jsonl_rows(base / PHASE4)
     rows_out: list[dict[str, Any]] = []
     errors: list[str] = []
+    if history is None:  # an unreadable history would re-append every noted event
+        errors.append(f"{PHASE4} unreadable: pass skipped")
+        events = []
+    seen = {(r["group"], r["event_id"]) for r in history or []
+            if isinstance(r.get("group"), str) and isinstance(r.get("event_id"), str)}
     for event in events:
         eid = event.get("event_id")
         if not isinstance(eid, str) or not eid.strip():
