@@ -1,0 +1,9 @@
+{
+ "version": 1,
+ "classes": {
+  "tests.test_talk_recover.AcceptanceTests": 0.1,
+  "tests.test_talk_recover.NegativeTests": 0.3,
+  "tests.test_talk_recover.NoEscapeTests": 0.1,
+  "tests.test_talk_recover.PurityTests": 0.1
+ }
+}
