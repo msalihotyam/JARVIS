@@ -167,17 +167,31 @@ class PerformanceTests(unittest.TestCase):
         n = 200_000
         units = ("token ", "1 ", "1", "12345678:" + " " * 7, "a", "eyJa.", "-", "\n",
                  "sk-", "bearer ", "\\", '"', "%3a", "password ", "1  ", "ghp_", "AKIA",
-                 "\u200b", "\uff10", "{\"a\":", "password\n", "-----", "1:")
+                 "\u200b", "\uff10", "{\"a\":", "password\n", "-----", "1:",
+                 "eyJa", "eyj_", "xeyJa", "EYJA")
         for unit in units:
             text = (unit * (n // len(unit) + 1))[:n]
             with self.subTest(unit=ascii(unit)):
                 start = time.perf_counter()
                 redact(text)
                 self.assertLess(time.perf_counter() - start, 0.25)
-        tail = "12345678:" + " " * n
-        start = time.perf_counter()
-        redact(tail)
-        self.assertLess(time.perf_counter() - start, 0.25)
+        for tail in ("12345678:" + " " * n, "eyJaa." + "eyJa" * (n // 4)):
+            with self.subTest(tail=ascii(tail[:12])):
+                start = time.perf_counter()
+                redact(tail)
+                self.assertLess(time.perf_counter() - start, 0.25)
+
+    def test_jwt_inside_a_token_run_is_still_flagged(self):
+        # The anchored start must not lose an "eyJ" that follows other token chars.
+        for text in ("xeyJhbGciOi.eyJzdWIiOi.sig", "ab_-eyeyJhbGciOi.eyJzdWIiOi.sig",
+                     "EYJHBGCIOI.EYJZDWIIOI.SIG", "eyjeyJhbGciOi.eyJzdWIiOi.sig"):
+            with self.subTest(text=text):
+                result = redact(text)
+                self.assertIs(result.flagged, True)
+                self.assertIn("jwt", result.kinds)
+        for text in ("xeyJa.eyJzdWIiOi", "eyJ.eyJzdWIiOi.sig", "eyJhbGciOi.eyJ.sig"):
+            with self.subTest(text=text):
+                self.assertNotIn("jwt", redact(text).kinds)
 
 
 class StaticTests(unittest.TestCase):
