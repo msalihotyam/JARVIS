@@ -25,12 +25,23 @@ def text(*parts):
 
 
 def links(doc):
-    found = []
+    """Every link/image chip anywhere: block inlines, list items and their children, table header and rows."""
+    groups = []
     for b in doc.blocks:
-        found += [i for i in b.inlines if i.kind in ("link", "image")]
+        groups += [b.inlines, *b.header, *(cell for row in b.rows for cell in row)]
         for item in b.items:
-            found += [i for i in item.inlines if i.kind in ("link", "image")]
-    return found
+            groups += [item.inlines, *(c.inlines for c in item.children)]
+    return [i for g in groups for i in g if i.kind in ("link", "image")]
+
+
+def shape(doc):
+    """List blocks as [(item text, [child texts])] per block, for nesting asserts."""
+    flat = lambda inl: "".join(i.text for i in inl)  # noqa: E731
+    return [[(flat(i.inlines), [flat(c.inlines) for c in i.children]) for i in b.items] for b in doc.blocks]
+
+
+# Default_Ignorable_Code_Point that are not Cf (from Unicode DerivedCoreProperties), one per range end
+IGNORABLE_NOT_CF = "͏ᅟᅠ឴឵᠋᠍᠏ㅤ︀️ﾠ\U000e0100\U000e01ef"
 
 
 class StaticTests(unittest.TestCase):
@@ -42,8 +53,7 @@ class StaticTests(unittest.TestCase):
                 imported |= {a.name for a in node.names}
             elif isinstance(node, ast.ImportFrom):
                 imported.add(node.module)
-        self.assertLessEqual(imported, {"__future__", "bisect", "re", "string", "unicodedata", "dataclasses",
-                                        "urllib.parse"})
+        self.assertLessEqual(imported, {"__future__", "re", "string", "unicodedata", "dataclasses", "urllib.parse"})
         called = {n.func.id for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)}
         self.assertFalse(called & {"open", "eval", "exec", "compile", "__import__"})
 
@@ -210,6 +220,63 @@ class NegativeTests(unittest.TestCase):
                        "".join(line + ("\r\n", "\n", "\r")[i % 3] for i, line in enumerate(SAMPLE.split("\n")))):
             with self.subTest(source=source[:20]):
                 self.assertEqual(md.parse(source).blocks, lf.blocks)
+
+    def test_8_nesting_is_relative_to_the_root_marker_indent(self):
+        cases = {
+            "- a\n- b\n": [[("a", []), ("b", [])]],
+            " - a\n - b\n": [[("a", []), ("b", [])]],
+            "  - a\n  - b\n": [[("a", []), ("b", [])]],
+            "   - a\n   - b\n   - c\n": [[("a", []), ("b", []), ("c", [])]],
+            "\t- a\n\t- b\n": [[("a", []), ("b", [])]],  # tab root (expands to 4)
+            "  - a\n   - b\n": [[("a", []), ("b", [])]],  # root + 1 is still a sibling
+            "  - a\n    - b\n  - c\n": [[("a", ["b"]), ("c", [])]],  # root + 2 nests
+            "   1. a\n      - b\n   2. c\n": [[("a", ["b"]), ("c", [])]],
+            "   - a\n- b\n  - c\n": [[("a", []), ("b", ["c"])]],  # root drifts 3 -> 0, child measured from 0
+            "  - a\n  1. b\n": [[("a", [])], [("b", [])]],  # type switch at an indented root: new list
+        }
+        for source, want in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(shape(md.parse(source)), want)
+        for child in ("  - c\n", "  1. c\n"):  # child overflow is dropped and flagged, never promoted to a root
+            with self.subTest(child=child):
+                doc = md.parse("- p\n" + child * (md.MAX_ITEMS + 3) + "- q\n")
+                self.assertTrue(doc.truncated)
+                self.assertEqual([(t, len(c)) for t, c in shape(doc)[0]], [("p", md.MAX_ITEMS), ("q", 0)])
+                self.assertEqual(len(doc.blocks), 1)
+        doc = md.parse("1. step\n\n   - a\n   - b\n")  # common LLM shape: blank line, then an indented list
+        self.assertEqual([b.kind for b in doc.blocks], ["list", "list"])
+        self.assertEqual(shape(doc)[1], [("a", []), ("b", [])])
+        source = "  - a\n  - b\n    - b.1\n  - c\n\nend\n"
+        full = md.parse(source)
+        for k in range(len(source) + 1):
+            doc = md.parse(source[:k])
+            with self.subTest(k=k):
+                self.assertEqual(doc.blocks[:doc.stable], full.blocks[:doc.stable])
+
+    def test_9_default_ignorable_removed_from_targets_kept_in_text(self):
+        for ch in IGNORABLE_NOT_CF:
+            with self.subTest(ch=hex(ord(ch))):
+                doc = md.parse(f"[x{ch}](https://ex.example/a{ch}b)\n")
+                self.assertEqual(links(doc), [Inline("link", f"x{ch}", "https://ex.example/ab")])
+                doc = md.parse(f"[x](ht{ch}tps://ex.example/)\n")  # inside the scheme: stripped, then checked
+                self.assertEqual(links(doc), [Inline("link", "x", "https://ex.example/")])
+                doc = md.parse(f"[x]({ch}javascript:alert(1))\n")
+                self.assertEqual(links(doc), [])
+        for ch in "⁥￰\U000e0080":  # unassigned default-ignorables: the whole link stays text
+            with self.subTest(ch=hex(ord(ch))):
+                self.assertEqual(links(md.parse(f"[x](https://ex.example/a{ch}b)\n")), [])
+
+    def test_10_links_helper_sees_children_and_table_cells(self):
+        doc = md.parse("- a\n  - [c](https://c.example/)\n\n| [h](https://h.example/) |\n|---|\n"
+                       "| [r](https://r.example/) |\n")
+        self.assertEqual([i.href for i in links(doc)], ["https://c.example/", "https://h.example/",
+                                                        "https://r.example/"])
+        for href in ("javascript:alert(1)", "https://ex.example/͏"):
+            source = f"- a\n  - [c]({href})\n\n| [h]({href}) |\n|---|\n| [r]({href}) |\n"
+            with self.subTest(href=href):
+                for link in links(md.parse(source)):
+                    self.assertTrue(link.href.startswith("https://"))
+                    self.assertFalse(set(link.href) & set(IGNORABLE_NOT_CF))
 
     def test_7_non_text_is_refused(self):
         class Sneaky(str):
