@@ -20,6 +20,7 @@ assert _spec and _spec.loader
 run = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(run)
 
+from jarvis.n6_ci_watch import ShadowRecord  # noqa: E402
 from jarvis.n6_kpi import KpiRow, record, rows  # noqa: E402
 
 SHA = "a" * 40
@@ -484,8 +485,33 @@ class Phase4FeedTest(unittest.TestCase):
         rows = {r["port"]: r for r in run.shadow_rows(self.root)}
         self.assertEqual(rows["ffrehearse"]["origin"], "rehearsal")
         self.assertNotEqual(rows["ffrehearse"]["n6_decision"], rows["ffrehearse"]["conveyor_decision"])
-        self.assertEqual(rows["ci_watch"]["group"], "R17R18")  # malformed finish: a real disagreement
+        self.assertNotIn("ci_watch", rows)  # malformed finish: not a CI judgement, no row
         gate.check(list(rows.values()), {}, [])  # rows always in the gate's shape
+
+    def test_ci_watch_sha_unbound_writes_no_row_and_is_retried(self) -> None:
+        given = {"sha": SHA, "required": [], "events": "",
+                 "finish": {"event": "finish", "lane": "L1", "status": "GREEN"}}
+        verdict = run.ci_verdict(SHA, required=[], events="", checks=None)
+        self.assertEqual(run.compare_finish(verdict, given["finish"], events="").reason, "sha_unbound")
+        ev = {"event_id": "e1", "origin": "live", "inputs": {"ci_watch": given}}
+        self.assertEqual(self.feed([ev], run.PORTS), 0)
+        self.assertEqual(run.shadow_rows(self.root), [])
+        self.assertIn("0 real shadow events, needs 5", gate.check([], {}, [])["R17R18"][1])
+        self.assertEqual(self.feed([ev]), 1)  # no (group, event_id) left behind: judged on a later pass
+
+    def test_ci_watch_only_ci_judgement_reasons_make_a_row(self) -> None:
+        non = ("finish_malformed", "n6_malformed", "finish_not_ci", "finish_stacked_base",
+               "finish_blocked_other", "events_malformed", "sha_unbound", "n6_unknown", "n6_not_final",
+               "BOTH_GREEN", " both_green", "", "future_reason")
+        cases = [("disagree", r, None) for r in non] + [("agree", r, None) for r in non]
+        cases += [("agree", "false_red", None), ("disagree", "both_green", None), ("agree", None, None)]
+        cases += [(a, r, (a, "n", "c")) for a, r in (("agree", "both_green"), ("agree", "both_red"),
+                                                    ("disagree", "false_red"), ("disagree", "false_green"))]
+        given = {"sha": SHA, "required": [], "events": "", "finish": {}}
+        for agreement, reason, want in cases:
+            with self.subTest(agreement=agreement, reason=reason), mock.patch.object(
+                    run, "compare_finish", return_value=ShadowRecord("L1", SHA, agreement, reason, "n", "c")):
+                self.assertEqual(run._ci_watch(given), want)
 
     def test_switch_off_writes_nothing(self) -> None:
         (self.root / "build/n6/SHADOW_ON").unlink()

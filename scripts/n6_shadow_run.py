@@ -301,9 +301,17 @@ PHASE4_ERRORS = "phase4_errors.log"
 Judged = tuple[str, Any, Any] | None  # (agree | disagree | other, n6, conveyor); None = not judged
 
 
+# compare_finish's only CI judgements; finish_* / events_malformed / sha_unbound / n6_* and any
+# unknown reason are not judgements (allowlist: a new reason code stays unjudged until listed here)
+CI_JUDGEMENTS = {"both_green": "agree", "both_red": "agree", "false_red": "disagree", "false_green": "disagree"}
+
+
 def _ci_watch(i: dict[str, Any]) -> Judged:
     verdict = ci_verdict(i["sha"], required=i["required"], events=i["events"], checks=i.get("checks"))
     rec = compare_finish(verdict, i["finish"], events=i["events"])
+    reason = rec.reason if isinstance(rec.reason, str) else ""
+    if CI_JUDGEMENTS.get(reason) != rec.agreement:
+        return None  # not judged: no row, retried next pass
     return rec.agreement, rec.n6, rec.conveyor
 
 
