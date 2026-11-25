@@ -72,6 +72,22 @@ CLEAN = (
     "Merhaba, toplant\u0131 saat 15:30'da. Parola politikas\u0131 de\u011fi\u015fti",
 )
 
+# Turkish letters in both cases (incl. dotless i, dotted I) and emoji not right after a
+# secret word must pass the mixed-script and Unicode-separator markers.
+TURKISH_EMOJI_CLEAN = (
+    "Token “budget” is a misleading name.",
+    "Привет мир, время 15:30",
+    "\u00c7ok g\u00fczel bir g\u00fcn, \u015fehirde \u0131\u015f\u0131k var \U0001f600",
+    "\u0130stanbul'da \u00f6\u011fle yeme\u011fi, \u00c7AR\u015eAMBA \u011e\u00d6\u015e\u00dc",
+    "Parolan\u0131z\u0131 kimseyle payla\u015fmay\u0131n \U0001f44d",
+    "\u015eifrenizi g\u00fcncellediniz mi? \U0001f512 Evet.",
+    "Token s\u00fcresi doldu, yeniden giri\u015f yap\u0131n \u2705",
+    "The password policy changed \U0001f389 \u2014 see the wiki",
+    "Toplant\u0131 \u00e7ar\u015famba \u2615\ufe0f saat 10'da",
+    "\u0130\u015f \u0131\u015f\u0131k \u00e7\u00f6p \u015f\u00fc\u011f\u00fc \u00d6\u00dc\u00c7\u015e\u011e\u0130 \U0001f44b\U0001f3fd",
+    "\u015eifre \u2014 yeni kural, token\u2013tabanl\u0131 giri\u015f",
+)
+
 
 class AcceptanceTests(unittest.TestCase):
     def test_clean_text_is_same_object_not_flagged(self):
@@ -80,6 +96,13 @@ class AcceptanceTests(unittest.TestCase):
                 result = redact(text)
                 self.assertIs(result.text, text)
                 self.assertEqual((result.flagged, result.kinds), (False, ()))
+
+    def test_turkish_prose_and_emoji_stay_clean(self):
+        for text in TURKISH_EMOJI_CLEAN:
+            with self.subTest(text=ascii(text)):
+                result = redact(text)
+                self.assertIs(result.text, text)
+                self.assertIs(result.flagged, False)
 
     def test_every_old_leak_probe_gives_only_the_fixed_line(self):
         for name, probe, secret in LEAK_PROBES:
@@ -178,6 +201,51 @@ class NegativeTests(unittest.TestCase):
             with self.subTest(digits=len(digits)):
                 self.assertIn("telegram_bot_token", redact(digits + ":" + token).kinds)
 
+    def test_cdx_fix2_probes_are_flagged(self):
+        # CDX-TALKREDACT2FIX2 F1 (palochka) and F2 (U+2254, U+2E2C): the exact probes.
+        cases = (("credentiaӏ=x", "mixed_script"), ("CREDENTIAӀ=x", "mixed_script"),
+                 ("password≔hunter2", "unicode_separator"),
+                 ("pwd≔x", "unicode_separator"), ("token≔x", "unicode_separator"),
+                 ("password⸬x", "unicode_separator"))
+        for text, kind in cases:
+            with self.subTest(text=ascii(text)):
+                result = redact(text)
+                self.assertEqual(result.text, FIXED_LINE)
+                self.assertIn(kind, result.kinds)
+
+    def test_mixed_script_words_are_flagged(self):
+        # Class rule, not a map entry: Latin plus another script in one word holds.
+        for text in ("creΔential=x", "tokeռ=x", "Ꮪecret=x", "ꓑassword=x",
+                     "Ꮪecret plans", "passσword", "aж"):
+            with self.subTest(text=ascii(text)):
+                result = redact(text)
+                self.assertEqual(result.text, FIXED_LINE)
+                self.assertIn("mixed_script", result.kinds)
+
+    def test_single_script_lookalike_word_before_separator_is_flagged(self):
+        # Whole word in Lisu/Cherokee look-alikes: one script, so not mixed_script.
+        lisu = "ꓑꓮꓢꓢꓪꓳꓣꓓ"
+        for text in (lisu + "=hunter2", lisu + " = hunter2", lisu + " %3Dx",
+                     lisu + "≔x", "ᏚᎬᏟᎡᎬᎢ: x"):
+            with self.subTest(text=ascii(text)):
+                result = redact(text)
+                self.assertEqual(result.text, FIXED_LINE)
+                self.assertIn("unicode_separator", result.kinds)
+
+    def test_unicode_separator_after_secret_word_is_flagged(self):
+        # Any non-ASCII char that is not a Latin letter right after a secret word,
+        # past its identifier tail, whitespace and ASCII quotes/punctuation.
+        for text in ("password≕x", "token⦂x", "secret܃x", "pwd⹀x",
+                     "password \U0001f511 hunter2", "password ≔ x", "DB_PASSWORD_1≔x",
+                     "passwords≔x", '"password"≔"x"', "token budget; password≔x",
+                     "password ꓽ x", "password ः hunter2", "passwordःhunter2",
+                     "password ⃝ x", "password ̈ x", "password؀x",
+                     "şifre≔x", "PASSWORD ≔ x"):
+            with self.subTest(text=ascii(text)):
+                result = redact(text)
+                self.assertEqual(result.text, FIXED_LINE)
+                self.assertIn("unicode_separator", result.kinds)
+
     def test_ten_megabytes_stays_linear(self):
         for text in ("a b\n" * 2_500_000, "a b\n" * 2_499_999 + "password=x"):
             with self.subTest(flagged=text.endswith("x")):
@@ -193,7 +261,8 @@ class PerformanceTests(unittest.TestCase):
         units = ("token ", "1 ", "1", "12345678:" + " " * 7, "a", "eyJa.", "-", "\n",
                  "sk-", "bearer ", "\\", '"', "%3a", "password ", "1  ", "ghp_", "AKIA",
                  "\u200b", "\uff10", "{\"a\":", "password\n", "-----", "1:",
-                 "eyJa", "eyj_", "xeyJa", "EYJA")
+                 "eyJa", "eyj_", "xeyJa", "EYJA", "ж", "token≔", "tokentoken",
+                 "tokeń", "≔ ", "password_ç", "á")
         for unit in units:
             text = (unit * (n // len(unit) + 1))[:n]
             with self.subTest(unit=ascii(unit)):

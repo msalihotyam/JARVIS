@@ -14,6 +14,10 @@ quote-colon) or ``%3A``/``%3D`` (or by one at the start of the next non-blank
 line); Telegram bot tokens (also split by whitespace runs or ``%3A``); sk- and
 GitHub keys; JWTs; any PEM BEGIN line; Bearer tokens; AWS AKIA/ASIA ids; Google
 AIza keys; and anything ``jarvis.contracts.redact_credentials`` would change.
+Two class rules close what a look-alike table never will: mixed_script (a word
+mixing Latin with another script's letters, judged before the map) and
+unicode_separator (any non-ASCII char other than a Latin letter or digit right
+after a secret word, past its identifier tail, whitespace and closing quotes).
 
 Pure: no I/O, no network, deterministic, linear time. A non-str input, a
 too-deep input or any detector exception gives a typed Refusal, never the text.
@@ -95,11 +99,71 @@ _CASED_SHAPES = (
 )
 
 
+# Class rules instead of a longer look-alike map. A word: a run of letters/digits.
+_ALNUM = re.compile(r"[^\W_]+")
+# After a secret word: its identifier tail (Latin combining marks stay in it), then
+# whitespace and closing quotes/brackets; the char after that is judged.
+_TAIL = re.compile(r"[a-z0-9_̀-ͯ]*+")
+_GAP = re.compile("[\\s\"'`)\\]}’”»›“‘«‹„]*+")
+_ASCII_SEP = (":", "=", "%3a", "%3d", "%3A", "%3D")
+
+
+def _latin(c):
+    return c < "\x80" or unicodedata.name(c, "").startswith("LATIN")
+
+
 def _fold(text):
-    text = unicodedata.normalize("NFKD", _IGNORABLE.sub("", text))
-    if not text.isascii():
-        text = "".join(c for c in text if unicodedata.category(c) not in _DROP)
-    return _IGNORABLE.sub("", text.translate(_LOOKALIKE))
+    """(marks dropped, marks dropped + look-alikes mapped, marks kept) copies."""
+    kept = unicodedata.normalize("NFKD", _IGNORABLE.sub("", text))
+    plain = kept
+    if not kept.isascii():
+        plain = "".join(c for c in kept if unicodedata.category(c) not in _DROP)
+    return plain, _IGNORABLE.sub("", plain.translate(_LOOKALIKE)), kept
+
+
+def _lower(folded):
+    # Map again after casefold: a casefolded form may be a look-alike the cased copy was not.
+    return folded.casefold().translate(_LOOKALIKE).casefold()
+
+
+def _mixed_script(plain):
+    # Latin plus any other script's letter in one word (Turkish letters are Latin).
+    for word in _ALNUM.findall(plain):
+        if not word.isascii():
+            scripts = {_latin(c) for c in set(word) if c.isalpha()}  # distinct chars: name() is slow
+            if len(scripts) == 2:
+                return True
+    return False
+
+
+def _unicode_separator(lower):
+    # Any non-ASCII char that is not a Latin letter or a digit right after a secret word.
+    pos, size = 0, len(lower)
+    while True:
+        match = _WORD.search(lower, pos)
+        if match is None:
+            return False
+        tail = _TAIL.match(lower, match.end()).end()
+        at = _GAP.match(lower, tail).end()
+        if at < size and not _latin(lower[at]) and not lower[at].isdecimal():
+            return True
+        # A word starting inside the tail ends within its last 8 chars ("private key"
+        # breaks the tail at its gap), so resume there: each char is scanned O(1) times.
+        pos = max(match.start() + 1, tail - 16)
+
+
+def _foreign_separator(folded):
+    # A word with another script's letters (all-Lisu/Cherokee "PASSWORD", single script
+    # so not mixed) right before a separator; over-holds such lines in Cyrillic/Greek.
+    for match in _ALNUM.finditer(folded):
+        word = match.group()
+        if not word.isascii() and any(c.isalpha() and not _latin(c) for c in set(word)):
+            at = _GAP.match(folded, match.end()).end()
+            if folded.startswith(_ASCII_SEP, at) or (
+                    at < len(folded) and not folded[at].isascii()
+                    and unicodedata.category(folded[at])[0] in "PS"):
+                return True
+    return False
 
 
 def _secret_word(lower):
@@ -118,13 +182,19 @@ def _secret_word(lower):
 
 
 def _kinds(text):
-    folded = _fold(text)
-    # Map again after casefold: a casefolded form may be a look-alike the cased copy was not.
-    lower = folded.casefold().translate(_LOOKALIKE).casefold()
+    plain, folded, kept = _fold(text)
+    lower = _lower(folded)
     found = {kind for kind, shape in _LOWER_SHAPES if shape.search(lower)}
     found.update(kind for kind, shape in _CASED_SHAPES if shape.search(folded))
     if _secret_word(lower):
         found.add("secret_word")
+    if _mixed_script(plain):
+        found.add("mixed_script")
+    # The mark-kept copy catches a spacing mark (visarga) used as a separator.
+    if _unicode_separator(lower) or _foreign_separator(folded) or (
+            kept is not plain and _unicode_separator(
+            _lower(_IGNORABLE.sub("", kept.translate(_LOOKALIKE))))):
+        found.add("unicode_separator")
     if redact_credentials(text)[0] != text or (
             folded != text and redact_credentials(folded)[0] != folded):
         found.add("credential")
