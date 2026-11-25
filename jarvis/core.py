@@ -1432,9 +1432,10 @@ def _lease_covers(outer: str, inner: str) -> bool:
 _STEP_TERMINAL_FAILED = frozenset({StepState.FAILED_AFTER_CAP, StepState.CANCELLED})
 _RUN_TERMINAL_FAILED = frozenset({RunState.PAUSED, RunState.FAILED, RunState.CANCELLED})
 _RUN_WAITING = frozenset({RunState.BLOCKED_BUDGET, RunState.NEEDS_INPUT})
-# With the run still BUILDING: unbooted (PENDING), mid-acceptance (ACCEPTING), boot-marked (INTERRUPTED).
-# INTERRUPTED is left out: nothing moves it back to PENDING, so waiting on it never ends.
-_STEP_MOVABLE = frozenset({StepState.PENDING, StepState.ACCEPTING})
+# With the run still BUILDING: unbooted (PENDING) plus work_driver._REVISABLE (ACCEPTING, BLOCKED_BY_GATE,
+# TIMEOUT), joined at use so the two cannot drift. INTERRUPTED is left out: nothing moves it back to
+# PENDING, so waiting on it never ends.
+_STEP_MOVABLE = frozenset({StepState.PENDING})
 
 
 def _plan_targets(plan: WorkPlan) -> tuple[str, ...]:
@@ -1888,6 +1889,21 @@ class AgentCore:
             name: deps.pop(name)
             for name in ("granted_targets", "usage", "quota_available", "large_budget") if name in deps
         }
+        # A slice with no target has nothing to lease: refuse it before any run or lease state changes.
+        first, _ = self._project_run_payloads(run_id)
+        try:
+            slices = WorkPlan.from_dict(first["plan"]).slices
+        except (KeyError, TypeError, ValueError):
+            slices = None  # resume_project_run refuses an unreadable plan below
+        if slices is not None and step.ordinal > len(slices):
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, f"refused: no_slice ({step.key})", session,
+            )
+        piece_targets = None if slices is None else slices[step.ordinal - 1].targets
+        if piece_targets is not None and not piece_targets:
+            return self._input_failure(
+                task, ErrorCode.INVALID_TASK, f"refused: no_targets ({step.key})", session,
+            )
         if run.state is RunState.BUILDING:
             self.advance_project_run(run_id, RunState.INTERRUPTED, boot_id=boot_id, at=now)
         resumed = self.resume_project_run(run_id, boot_id=boot_id, now=now, lease=lease, **resume_args)
@@ -1932,7 +1948,7 @@ class AgentCore:
         terminal = (after.state in _STEP_TERMINAL_FAILED or moved.state in _RUN_TERMINAL_FAILED)
         if not terminal and (
             moved.state in _RUN_WAITING or after.state is StepState.NEEDS_INPUT
-            or (moved.state is RunState.BUILDING and after.state in _STEP_MOVABLE)
+            or (moved.state is RunState.BUILDING and after.state in _STEP_MOVABLE | work_driver._REVISABLE)
         ):
             # Budget, input and a step that did not finish stay resumable: nothing is saved FAILED.
             return self._input_failure(task, ErrorCode.INVALID_TASK, f"waiting: {outcome}", session)

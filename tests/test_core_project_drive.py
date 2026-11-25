@@ -46,8 +46,9 @@ class CoreProjectDriveTests(unittest.TestCase):
         self.outcome = StepState.ACCEPTED
         self.granted = {"src/"}
         self.drive_calls = []
+        self.drive_now = NOW + timedelta(minutes=2)
         self.core.project_drive = lambda run_id, step: {
-            "boot_id": "new", "now": NOW + timedelta(minutes=2), "lease": LEASE,
+            "boot_id": "new", "now": self.drive_now, "lease": LEASE,
             "granted_targets": frozenset(self.granted), "usage": Usage(),
             "large_budget": Budget(10, 7200, 50), "worker": self.worker,
         }
@@ -145,21 +146,54 @@ class CoreProjectDriveTests(unittest.TestCase):
         self.assert_refused(self.resume(first), "plan")
 
     def test_n4_failed_check_means_no_apply_and_failed_with_evidence(self):
+        # PM26W1FIX3: a gate block is a revision, so the task waits (not FAILED) with the evidence kept;
+        # a check failed past the cap saves FAILED (RealDriverTests.test_f1_failed_after_cap_...).
         first, _ = self.ready()
         self.outcome = StepState.BLOCKED_BY_GATE
         result = self.resume(first)
         self.assertIs(result.status, RunStatus.FAILED)
         self.assertEqual(self.applied, [])
-        self.assertIn("blocked", result.result.summary)
-        saved = self.memory.load_task(first.id)
-        self.assertIs(saved.status, TaskStatus.FAILED)
-        self.assertIn("blocked", str(saved.result_snapshot))
+        self.assertIn("ended blocked_by_gate (run building)", result.result.summary)
+        self.assertIsNot(self.memory.load_task(first.id).status, TaskStatus.FAILED)
         last = [step for step in self.memory.work_steps("r") if step.ordinal == 1][-1]
         self.assertIs(last.state, StepState.BLOCKED_BY_GATE)
 
+    # PM26W1FIX3 F2: a slice with no target is refused before any run, lease or task state changes.
+    def test_f2_empty_slice_targets_refused_before_state_changes(self):
+        self.plan = replace(
+            self.plan,
+            slices=(PlanSlice("s1", "repair a", (), ("c1",)), PlanSlice("s2", "repair b", ("src/b.py",), ("c1",))),
+        )
+        first, _ = self.ready()
+        before_run, before_steps = self.memory.latest_work_run("r"), self.memory.work_steps("r")
+        result = self.resume(first)
+        self.assert_refused(result, "no_targets")
+        self.assertEqual(self.drive_calls, [])
+        self.assertEqual(self.memory.latest_work_run("r"), before_run)
+        self.assertEqual(self.memory.work_steps("r"), before_steps)
+        self.assertIsNot(self.memory.load_task(first.id).status, TaskStatus.FAILED)
+
+    def test_f2_step_ordinal_past_the_plan_refused_before_state_changes(self):
+        first, _ = self.ready()
+        real = self.core._project_run_payloads
+
+        def no_slices(run_id):
+            head, rest = real(run_id)
+            return {**head, "plan": {**head["plan"], "slices": head["plan"]["slices"][:0]}}, rest
+
+        before_run, before_steps = self.memory.latest_work_run("r"), self.memory.work_steps("r")
+        with mock.patch.object(self.core, "_project_run_payloads", no_slices):
+            result = self.resume(first)
+        self.assert_refused(result, "no_slice")
+        self.assertEqual(self.drive_calls, [])
+        self.assertEqual(self.memory.latest_work_run("r"), before_run)
+        self.assertEqual(self.memory.work_steps("r"), before_steps)
+        self.assertIsNot(self.memory.load_task(first.id).status, TaskStatus.FAILED)
+
     # PM26W1FIX2 F1: only terminal outcomes save the chain task FAILED.
     def test_f1_movable_step_outcomes_keep_the_task_resumable(self):
-        for state in (StepState.PENDING, StepState.ACCEPTING, StepState.NEEDS_INPUT):
+        for state in (StepState.PENDING, StepState.ACCEPTING, StepState.NEEDS_INPUT,
+                      StepState.BLOCKED_BY_GATE, StepState.TIMEOUT):
             with self.subTest(state=state):
                 self.setUp()
                 first, _ = self.ready()
@@ -222,7 +256,7 @@ class RealDriverTests(CoreProjectDriveTests):
         no_root_cause = script.pop("root_cause", True) is None
         unbooted = script.pop("unbooted", False)
         self.ports = FakePorts(self.scripts, **script)
-        self.ports.now = NOW + timedelta(minutes=2)
+        self.ports.now = self.drive_now
         if no_root_cause:
             self.ports.root_cause = None  # like production build_ports: no root_cause port
         if unbooted:
@@ -295,6 +329,36 @@ class RealDriverTests(CoreProjectDriveTests):
         self.port_kw = {}
         self.assertIs(self.resume(first).status, RunStatus.COMPLETED)
 
+    # PM26W1FIX3 F1: a revisable step left by a budget block, run back to BUILDING, then an unbooted drive.
+    def test_f1_revisable_step_under_unbooted_drive_keeps_the_task_resumable(self):
+        cases = {
+            StepState.BLOCKED_BY_GATE: ([result()], {"scope_check": [["out_of_scope:y"]]}),
+            StepState.TIMEOUT: ([result("timeout"), result()], {}),
+        }
+        for state, (script, extra) in cases.items():
+            with self.subTest(state=state):
+                self.setUp()
+                first, _ = self.ready()
+                self.scripts["s1"] = script
+                self.port_kw = {"budget_exhausted": [False, True], **extra}
+                self.assertIs(self.resume(first).status, RunStatus.FAILED)
+                self.assertIs(self.run_state(), RunState.BLOCKED_BUDGET)
+                self.assertIs(self.step_states()[0], state)
+                blocked_at = self.memory.latest_work_run("r").updated_at
+                self.core.advance_project_run("r", RunState.BUILDING, boot_id="new", at=blocked_at)
+                self.drive_now = blocked_at + timedelta(minutes=1)
+                self.port_kw = {"unbooted": True}
+                result_ = self.resume(first)
+                self.assertIs(result_.status, RunStatus.FAILED)
+                self.assertIn("waiting:", result_.result.summary)
+                self.assertIs(self.run_state(), RunState.BUILDING)
+                self.assertIs(self.step_states()[0], state)
+                self.assertIsNot(self.memory.load_task(first.id).status, TaskStatus.FAILED)
+                # Booted again, the kept task reaches the driver and the revision is attempted (not lost).
+                self.scripts["s1"], self.port_kw = [result()], {"budget_exhausted": [False]}
+                self.assertNotIn("refused", self.resume(first).result.summary)
+                self.assertIn(("claim", "s1"), [entry[:2] for entry in self.ports.log])
+
     def test_f1_failed_after_cap_saves_the_task_failed(self):
         first, _ = self.ready()
         self.scripts["s1"] = [result()] * 4
@@ -315,6 +379,7 @@ class RealDriverTests(CoreProjectDriveTests):
     test_f1_terminal_step_outcomes_save_the_task_failed = None
     test_f1_unmapped_outcome_fails_closed_with_reason = None
     test_f2_multi_target_slice_leases_every_target_and_sees_only_its_own = None
+    test_f2_empty_slice_targets_refused_before_state_changes = None
 
 
 if __name__ == "__main__":
