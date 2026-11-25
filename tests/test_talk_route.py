@@ -306,7 +306,7 @@ class NegativeTests(unittest.TestCase):
     def test_hostile_text_routes_as_turn(self):
         def check(text):
             r = tr.route(entry(text=text))
-            self.assertIn(r.path, (tr.TURN, tr.REFUSED))
+            self.assertEqual((r.path, r.reason), (tr.TURN, "text"))
             self.assertEqual(r, tr.route(entry(text=text)))
         each(self, HOSTILE_TEXT, check)
 
