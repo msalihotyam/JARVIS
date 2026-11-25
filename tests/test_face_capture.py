@@ -187,6 +187,22 @@ class NegativeTests(unittest.TestCase):
         clock.t += cap.DEFAULT_MAX_AGE + 1
         self.assertEqual(Run().go(token, clock).reason, "token_expired")
 
+    def test_pol1_result_is_immutable_and_internal_error_cannot_be_poisoned(self) -> None:
+        clock = Clock()
+        boom = lambda: (_ for _ in ()).throw(RecursionError())  # noqa: E731
+        first = cap.capture(cap.click_token(clock), boom, boom, lambda: None, lambda: None, boom)
+        for name, value in (("ok", True), ("reason", "captured"), ("record", object()), ("extra", 1)):
+            with self.assertRaises(AttributeError):
+                setattr(first, name, value)
+        for name in ("ok", "reason", "record"):
+            with self.assertRaises(AttributeError):
+                delattr(first, name)
+        with self.assertRaises(AttributeError):
+            object.__setattr__(Run().go(cap.click_token(clock), clock), "extra", 1)  # slots: no __dict__
+        later = cap.capture(cap.click_token(clock), boom, boom, lambda: None, lambda: None, boom)
+        self.assertEqual((later.ok, later.reason, later.record), (False, "internal_error", None))
+        self.assertEqual((first.ok, first.reason, first.record), (False, "internal_error", None))
+
 
 class StaticTests(unittest.TestCase):
     def test_n5_no_timer_thread_scheduler_socket_subprocess_and_grab_only_after_token(self) -> None:

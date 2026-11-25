@@ -33,7 +33,14 @@ class CaptureResult:
     __slots__ = ("ok", "reason", "record")
 
     def __init__(self, ok: bool, reason: str, record: object = None) -> None:
-        self.ok, self.reason, self.record = ok, reason, record
+        for name, value in (("ok", ok), ("reason", reason), ("record", record)):
+            object.__setattr__(self, name, value)
+
+    def __setattr__(self, name: str, value: object) -> None:  # immutable: _INTERNAL_ERROR is shared
+        raise AttributeError("CaptureResult is immutable")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError("CaptureResult is immutable")
 
     def __repr__(self) -> str:
         return f"CaptureResult(ok={self.ok}, reason={self.reason!r})"
