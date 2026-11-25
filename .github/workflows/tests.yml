@@ -80,6 +80,7 @@ jobs:
       - name: Run this shard
         shell: pwsh
         run: |
+          Set-Content -Encoding utf8 run-id.txt "${{ github.run_id }}"
           python scripts/test_parallel.py --shard ${{ matrix.shard }}/16 --durations 30 --report shard-report.json *> shard-summary.txt
           $code = $LASTEXITCODE
           Get-Content shard-summary.txt
@@ -94,6 +95,7 @@ jobs:
           path: |
             shard-summary.txt
             shard-report.json
+            run-id.txt
           if-no-files-found: warn
 
   aggregate:
@@ -246,6 +248,7 @@ jobs:
       - name: Run the OS-independent modules
         shell: bash
         run: |
+          echo "${{ github.run_id }}" > run-id.txt
           modules=$(python scripts/ci_os_shadow.py modules) || exit 1
           [ -n "$modules" ] || exit 1
           code=0
@@ -263,4 +266,5 @@ jobs:
           path: |
             os-shadow-summary.txt
             os-shadow-report.json
+            run-id.txt
           if-no-files-found: warn
