@@ -1,0 +1,6 @@
+{
+ "version": 1,
+ "classes": {
+  "tests.test_talk_inbound.InboundCandidateTests": 0.1
+ }
+}
