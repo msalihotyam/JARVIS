@@ -72,7 +72,10 @@ _LOWER_SHAPES = (
         r"(?<!\d)(?:\d\s*){7,15}\d\s*(?::|%3a)(?:\s*[a-z0-9_-]){35,}")),
     ("openai_key", re.compile(r"(?<![a-z0-9])sk-[a-z0-9_-]{12,}")),
     ("github_token", re.compile(r"(?<![a-z0-9])(?:gh[pousr]_[a-z0-9]{16,}|github_pat_[a-z0-9_]{20,})")),
-    ("jwt", re.compile(r"eyj[a-z0-9_-]{2,}\.eyj[a-z0-9_-]{2,}\.")),
+    # Start only at a run start and skip to its first "eyj" (a later one cannot fit
+    # better); possessive scans keep it one pass per run, same matches as unanchored.
+    ("jwt", re.compile(
+        r"(?<![a-z0-9_-])(?:(?!eyj)[a-z0-9_-])*+eyj[a-z0-9_-]{2,}+\.eyj[a-z0-9_-]{2,}+\.")),
     ("pem", re.compile(r"-----\s*begin")),
     ("bearer", re.compile(r"(?<![a-z0-9])bearer\s+[a-z0-9._~+/-]{16,}")),
 )
