@@ -1,7 +1,7 @@
 """Ring status and heartbeat record (TALKSTATUS1, T1).
 
 ring_state() turns activity flags into the one value the face ring shows,
-needs_you() says whether Salih still owes an answer, and heartbeat() /
+needs_you() says whether Salih still owes an answer, and alive_record() /
 parse_heartbeat() / last_alive() keep the short alive record a restart reads
 (TALKRECOVER1).
 
@@ -148,7 +148,7 @@ def _needs_you(cards, entries, now):
     return card_open or asked > answered
 
 
-def heartbeat(now: object, boot_id: object) -> str | Refusal:
+def alive_record(now: object, boot_id: object) -> str | Refusal:
     """Serialise one alive record: "hb1 <epoch seconds> <boot id>"."""
     return _guard(lambda: f"hb1 {_time(now)} {_boot(boot_id)}")
 

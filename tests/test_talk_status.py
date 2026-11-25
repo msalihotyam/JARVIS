@@ -5,7 +5,7 @@ from pathlib import Path
 
 import jarvis.talk_status as ts
 from jarvis.talk_status import (
-    RING_STATES, UNKNOWN, Heartbeat, Refusal, heartbeat, last_alive, needs_you,
+    RING_STATES, UNKNOWN, Heartbeat, Refusal, alive_record, last_alive, needs_you,
     parse_heartbeat, ring_state,
 )
 from tests.adversarial import HOSTILE_JSON, HOSTILE_NUMBERS, HOSTILE_TEXT, deep_json, each
@@ -51,14 +51,14 @@ class AcceptanceTests(unittest.TestCase):
         self.assertIs(needs_you([], [], NOW), False)
 
     def test_heartbeat_round_trip(self):
-        text = heartbeat(NOW, BOOT)
+        text = alive_record(NOW, BOOT)
         self.assertEqual(text, f"hb1 {NOW} {BOOT}")
         self.assertLessEqual(len(text), ts.MAX_RECORD_CHARS)
         self.assertEqual(parse_heartbeat(text), Heartbeat(NOW, BOOT))
-        self.assertEqual(parse_heartbeat(heartbeat(0, "x")), Heartbeat(0, "x"))
+        self.assertEqual(parse_heartbeat(alive_record(0, "x")), Heartbeat(0, "x"))
 
     def test_last_alive_is_last_record(self):
-        records = [heartbeat(NOW - 60, BOOT), heartbeat(NOW - 30, BOOT)]
+        records = [alive_record(NOW - 60, BOOT), alive_record(NOW - 30, BOOT)]
         self.assertEqual(last_alive(records, NOW, BOOT), NOW - 30)
         self.assertEqual(last_alive(tuple(records), NOW - 30, BOOT), NOW - 30)
         self.assertEqual(last_alive([], NOW, BOOT), UNKNOWN)
@@ -66,7 +66,7 @@ class AcceptanceTests(unittest.TestCase):
     def test_deterministic(self):
         for _ in range(3):
             self.assertEqual(ring_state({"thinking": True, "listening": True}), "thinking")
-            self.assertEqual(heartbeat(NOW, BOOT), f"hb1 {NOW} {BOOT}")
+            self.assertEqual(alive_record(NOW, BOOT), f"hb1 {NOW} {BOOT}")
             self.assertIs(needs_you([], [entry(2, "jarvis", True)], NOW), True)
 
 
@@ -85,12 +85,12 @@ class NegativeTests(unittest.TestCase):
         self.assertIs(needs_you([{"resolved": True, "expires_at": NOW + 99}], [], NOW), False)
 
     def test_corrupt_future_or_foreign_heartbeat_unknown(self):
-        good = heartbeat(NOW - 10, BOOT)
+        good = alive_record(NOW - 10, BOOT)
         bad_rows = ["", "hb1", f"hb2 {NOW} {BOOT}", f"hb1 {NOW} {BOOT} ", f"hb1  {NOW} {BOOT}",
                     f"hb1 0{NOW} {BOOT}", f"hb1 +{NOW} {BOOT}", f"hb1 -{NOW} {BOOT}",
                     f"hb1 {NOW}.0 {BOOT}", f"hb1 {NOW} {BOOT}\n", f"hb1 {NOW}",
                     f"hb1 ١٢ {BOOT}", f"hb1 {NOW} bоot", f"hb1 {NOW} " + "b" * 65,
-                    f"hb1 {NOW + 1} {BOOT}", heartbeat(NOW - 5, "boot-b"),
+                    f"hb1 {NOW + 1} {BOOT}", alive_record(NOW - 5, "boot-b"),
                     f"hb1 {10**11} {BOOT}"] + [s for s in HOSTILE_TEXT if s.isascii()][:8]
         each(self, bad_rows, lambda row: self.assertEqual(last_alive([good, row], NOW, BOOT), UNKNOWN))
         each(self, list(HOSTILE_TEXT) + list(HOSTILE_JSON) + [deep_json()],
@@ -111,11 +111,11 @@ class NegativeTests(unittest.TestCase):
                      {"talking": True}, {1: True}, {"idle": True}, {"thinking": "yes"}]
         each(self, bad_flags, lambda f: refused(self, ring_state(f), "bad_flags"))
         each(self, [n for n in HOSTILE_NUMBERS if type(n) is not int or n > ts.MAX_TIME] + [-1, 1.0],
-             lambda n: (refused(self, heartbeat(n, BOOT), "bad_time"),
+             lambda n: (refused(self, alive_record(n, BOOT), "bad_time"),
                         refused(self, needs_you([], [], n), "bad_time"),
                         refused(self, last_alive([], n, BOOT), "bad_time")))
         each(self, [None, "", 5, "a b", "a" * 65, "bоot"] + list(HOSTILE_TEXT),
-             lambda b: (refused(self, heartbeat(NOW, b), "bad_boot"),
+             lambda b: (refused(self, alive_record(NOW, b), "bad_boot"),
                         refused(self, last_alive([], NOW, b), "bad_boot")))
         each(self, [None, "x", {}, iter([]), [1], [b"hb1 1 a"]],
              lambda r: refused(self, last_alive(r, NOW, BOOT), "bad_records"))
@@ -150,6 +150,13 @@ class StaticTests(unittest.TestCase):
             elif isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
                 self.assertNotIn(node.func.id, {"open", "exec", "eval", "compile", "__import__"})
         self.assertLessEqual(imported, {"__future__", "re", "collections.abc", "dataclasses"})
+
+    def test_no_scheduler_forbidden_tokens(self):
+        # TALKSTATUS1FIX: the scheduler boundary tests forbid these in every jarvis/*.py.
+        source = Path(ts.__file__).read_text(encoding="utf-8")
+        for forbidden in ("def heartbeat", "heartbeat_at", "auto_reclaim", "orphan_recovery",
+                          "def due_jobs", "def scan_due", "def run_scheduler"):
+            self.assertNotIn(forbidden, source, forbidden)
 
     def test_reason_texts_ascii(self):
         for reason, text in ts.REASONS.items():
