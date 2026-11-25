@@ -74,11 +74,16 @@ def _is(value, expected):
     return type(value) is str and value == expected
 
 
+def _list(value):
+    # By identity: `type(v) in _LISTS` calls the caller's metaclass __eq__.
+    return any(type(value) is kind for kind in _LISTS)
+
+
 def _strs(value):
     """A builtin collection of exact strs as a frozenset, else None."""
-    if type(value) not in _LISTS:
+    if not _list(value):
         return None
-    items = tuple(value)
+    items = _guard(lambda: tuple(value))
     return frozenset(items) if all(type(item) is str for item in items) else None
 
 
@@ -122,7 +127,7 @@ def _request(request):
         raise _Refused("bad_time") from exc
     target = _get(request, "attachment_id")
     if not _text(target):
-        raise _Refused("one_attachment_only" if type(target) in _LISTS else "bad_attachment_id")
+        raise _Refused("one_attachment_only" if _list(target) else "bad_attachment_id")
     if target.strip().casefold() in _BULK:
         raise _Refused("one_attachment_only")
     if not _ID.fullmatch(target):

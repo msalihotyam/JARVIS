@@ -367,6 +367,41 @@ class HardeningTests(_Base):
         self.assertTrue(run(cfg=cfg)["ok"])
         self.assertEqual(cfg.reads.count("telegram_enabled"), 1)
 
+    def test_collection_type_compared_by_identity(self):
+        """TALKPHONE1FIX2: a metaclass __eq__ or __iter__ never runs, so its refusal is never honoured."""
+        calls = []
+
+        def hostile(eq_result, raise_exc, base=object):
+            class Meta(type):
+                __hash__ = type.__hash__
+
+                def __eq__(cls, other):
+                    calls.append(other)
+                    if raise_exc is not None:
+                        raise raise_exc
+                    return eq_result
+
+            def it(self):
+                calls.append("iter")
+                raise raise_exc or tps._Refused("channel_off")
+
+            return Meta("Coll", (base,), {"__iter__": it})()
+
+        legit = ("channel_off", "already_on_phone", "request_used", "too_large")
+        values = [hostile(True, None), hostile(False, None), hostile(True, RecursionError()),
+                  hostile(True, _Odd()), hostile(True, KeyboardInterrupt())]
+        values += [hostile(True, tps._Refused(code)) for code in legit]
+        values += [hostile(True, tps._Refused(code), base) for code in legit for base in (list, set, tuple)]
+        where = {"used": lambda v: {"used": v}, "kinds": lambda v: {"cfg": config(kinds=v)},
+                 "attachment_id": lambda v: {"req": request(attachment_id=v)}}
+        reasons = {"used": "bad_used", "kinds": "bad_config", "attachment_id": "bad_attachment_id"}
+        for name, kw in where.items():
+            for i, value in enumerate(values):
+                with self.subTest(where=name, case=i):
+                    out = self.refused(reasons[name], **kw(value))
+                    self.assertEqual((out["note"], out["pointless"]), (None, False))
+        self.assertEqual(calls, [])  # neither the metaclass __eq__ nor __iter__ was ever called
+
 
 class GuardTests(unittest.TestCase):
     def test_module_imports_no_io(self):
