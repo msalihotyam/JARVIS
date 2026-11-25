@@ -22,7 +22,6 @@ from pathlib import Path
 from typing import Any, Callable, NamedTuple
 
 from jarvis.connectors.claude_code import PROHIBITED_BILLING_ENV_VARS
-from jarvis.project_folders import _DRIVE_FIXED, _drive_type, _reserved
 from jarvis.settings import validate_claude_effort, validate_claude_model
 from jarvis.workers.claude import scrubbed_env
 
@@ -184,6 +183,24 @@ def _model(model: Any, effort: Any) -> tuple[str, str | None]:
     return model, effort
 
 
+_DRIVE_FIXED = 3  # GetDriveTypeW: DRIVE_FIXED
+# Win32 device names open a device under any extension, case or trailing spaces; superscript digits count too.
+_RESERVED_STEMS = frozenset(
+    {"con", "prn", "aux", "nul", "conin$", "conout$"}
+    | {f"{kind}{digit}" for kind in ("com", "lpt") for digit in "0123456789¹²³"}
+)
+
+
+def _reserved(component: str) -> bool:
+    return component.split(".")[0].rstrip(" ").casefold() in _RESERVED_STEMS
+
+
+def _drive_type(anchor: str) -> int:
+    import ctypes
+
+    return int(ctypes.WinDLL("kernel32").GetDriveTypeW(ctypes.c_wchar_p(anchor)))
+
+
 def _root(value: Any) -> Path:
     if type(value) not in (str, type(Path())):  # exact types: a subclass's __fspath__ would run caller code
         raise _Refuse("root_invalid")
@@ -211,7 +228,7 @@ def _root(value: Any) -> Path:
     if not stat.S_ISDIR(info.st_mode):
         raise _Refuse("root_not_dir")
     # shortcut: a component swapped to a link between this walk and resolve is followed; the UNC check below
-    # still refuses the result. Hold the folder handle (project_folders._hold_folder) if a caller ever needs it.
+    # still refuses the result. Hold a folder handle if a caller ever needs it.
     try:
         root = path.resolve(strict=True)
     except OSError:
