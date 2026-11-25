@@ -104,8 +104,17 @@ def _no_constant(_name):
     raise ValueError("constant")
 
 
-def _too_deep(obj):
-    stack = [(obj, 1)]
+def _envelope(msg):
+    """msg without tools/call arguments: their depth is a tool error, checked in Session._call."""
+    params = msg.get("params")
+    if msg.get("method") == "tools/call" and type(params) is dict and "arguments" in params:
+        return {**msg, "params": {**params, "arguments": None}}
+    return msg
+
+
+def _too_deep(obj, depth=1):
+    """depth = obj's nesting level inside the whole message (arguments sit at 3)."""
+    stack = [(obj, depth)]
     while stack:
         value, depth = stack.pop()
         if isinstance(value, (dict, list)):
@@ -179,7 +188,7 @@ class Session:
             return _error(None, PARSE_ERROR, "parse error")
         if isinstance(msg, list):
             return _error(None, INVALID_REQUEST, "batch not supported")
-        if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or _too_deep(msg):
+        if not isinstance(msg, dict) or msg.get("jsonrpc") != "2.0" or _too_deep(_envelope(msg)):
             return _error(None, INVALID_REQUEST, "invalid request")
         if "method" not in msg:
             if "result" in msg or "error" in msg:
@@ -234,7 +243,7 @@ class Session:
         self._calls[name] += 1
         args = params.get("arguments", {})
         spec = _ARGS[name]
-        if type(args) is not dict or not set(args) <= set(spec):
+        if type(args) is not dict or not set(args) <= set(spec) or _too_deep(args, 3):
             return _result(rid, self._fail("bad_arguments"))
         for key, (kind, required) in spec.items():
             if key not in args:
@@ -295,28 +304,22 @@ class Session:
         return _tool_error(code)
 
 
-def _read_message(reader):
-    """Next line as bytes, b"" at EOF, or None when over the cap (rest drained, bounded)."""
-    line = reader.readline(MAX_LINE_BYTES + 1)
-    if len(line) <= MAX_LINE_BYTES or line.endswith(b"\n"):
-        return line
-    while line and not line.endswith(b"\n"):
-        line = reader.readline(MAX_LINE_BYTES + 1)
-    return None
-
-
 def serve(reader, writer, tools):
     """Serve binary streams (sys.stdin.buffer / sys.stdout.buffer) until EOF; returns the Session."""
     session = Session(tools)
     while True:
-        line = _read_message(reader)
+        line = reader.readline(MAX_LINE_BYTES + 1)
         if line == b"":
             return session
-        reply = (_error(None, INVALID_REQUEST, "message too large") if line is None
+        oversize = len(line) > MAX_LINE_BYTES and not line.endswith(b"\n")
+        reply = (_error(None, INVALID_REQUEST, "message too large") if oversize
                  else session.handle_line(line))
         if reply is not None:
             writer.write(encode(reply))
             writer.flush()
+        # error is out first; one more chunk may end the line, a line still unended ends the session
+        if oversize and not reader.readline(MAX_LINE_BYTES + 1).endswith(b"\n"):
+            return session
 
 
 def real_tools(root, store):
