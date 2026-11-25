@@ -17,7 +17,7 @@ from jarvis.core import AgentCore
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.registry import ToolRegistry
 from jarvis.work_controls import Budget, Usage
-from jarvis.work_ledger import EventKind, RunSize, RunState, StepState, advance_run
+from jarvis.work_ledger import EventKind, RunSize, RunState, StepState, WorkStep, advance_run, step_key
 from jarvis.work_plan import Plan, PlanBudget, PlanCheck, PlanSlice
 from tests.test_work_driver import FAIL, FakePorts, result
 
@@ -190,6 +190,104 @@ class CoreProjectDriveTests(unittest.TestCase):
         self.assertEqual(self.memory.latest_work_run("r"), before_run)
         self.assertEqual(self.memory.work_steps("r"), before_steps)
         self.assertIsNot(self.memory.load_task(first.id).status, TaskStatus.FAILED)
+
+    # PM26W1FIX5 F1: stored steps must cover every plan slice, never stand in for the whole plan.
+    def test_fix5_f1_stored_steps_not_covering_the_plan_refused(self):
+        real_steps, real_payloads = None, None
+
+        def one_slice(run_id):
+            head, rest = real_payloads(run_id)
+            return {**head, "plan": {**head["plan"], "slices": head["plan"]["slices"][:1]}}, rest
+
+        def extra(run_id):  # a second step at ordinal 1: the ordinal set alone still looks complete
+            return [*real_steps(run_id), WorkStep(run_id, step_key(run_id, 1, "s1x"), 1, "s1x", StepState.PENDING, NOW)]
+
+        def stale(run_id):  # right ordinals, keys of another plan's slices
+            return [replace(s, key=step_key(run_id, s.ordinal, f"old{s.ordinal}"), slug=f"old{s.ordinal}")
+                    for s in real_steps(run_id)]
+
+        for name in ("fewer_steps", "extra_step", "duplicate_ordinal", "stale_slug"):
+            with self.subTest(name=name):
+                self.setUp()
+                first, _ = self.ready()
+                real_steps, real_payloads = self.memory.work_steps, self.core._project_run_payloads
+                before_run, before_steps = self.memory.latest_work_run("r"), real_steps("r")
+                if name == "fewer_steps":  # a crash after the first append_work_step
+                    patch = mock.patch.object(self.memory, "work_steps", lambda run_id: real_steps(run_id)[:1])
+                elif name == "extra_step":  # two stored steps against a one-slice plan
+                    patch = mock.patch.object(self.core, "_project_run_payloads", one_slice)
+                else:
+                    patch = mock.patch.object(
+                        self.memory, "work_steps", extra if name == "duplicate_ordinal" else stale)
+                with patch:
+                    result = self.resume(first)
+                self.assert_refused(result, "steps_incomplete")
+                self.assertEqual(self.drive_calls, [])
+                self.assertEqual(self.memory.latest_work_run("r"), before_run)
+                self.assertEqual(real_steps("r"), before_steps)
+
+    # PM26W1FIX5 F2: a bad project_drive result is a typed refusal before any state change.
+    def test_fix5_f2_bad_drive_deps_refused_before_state_changes(self):
+        good = {"boot_id": "new", "now": NOW + timedelta(minutes=2), "lease": LEASE,
+                "granted_targets": frozenset({"src/"}), "usage": Usage()}
+        cases = {
+            "none": None, "list": [], "no_lease": {k: v for k, v in good.items() if k != "lease"},
+            "now_none": {**good, "now": None}, "now_str": {**good, "now": "2026-10-01"},
+            "lease_int": {**good, "lease": 600}, "empty_boot": {**good, "boot_id": ""},
+            "no_usage": {k: v for k, v in good.items() if k != "usage"},
+            "no_granted": {k: v for k, v in good.items() if k != "granted_targets"},
+            # Present but the wrong type: these used to raise mid-resume with the proof leases held.
+            "blank_boot": {**good, "boot_id": "   "}, "usage_object": {**good, "usage": object()},
+            "usage_dict": {**good, "usage": {}}, "granted_int": {**good, "granted_targets": 5},
+            "granted_ints": {**good, "granted_targets": [1]}, "large_str": {**good, "large_budget": "x"},
+        }
+        for name, provided in cases.items():
+            with self.subTest(name=name):
+                self.setUp()
+                first, _ = self.ready()
+                self.core.project_drive = lambda run_id, step, provided=provided: provided
+                before_run, before_steps = self.memory.latest_work_run("r"), self.memory.work_steps("r")
+                self.assert_refused(self.resume(first), "drive_deps")
+                self.assertEqual(self.memory.latest_work_run("r"), before_run)
+                self.assertEqual(self.memory.work_steps("r"), before_steps)
+                for target in ("src/a.py", "src/b.py"):  # no lease was claimed, so none can leak
+                    self.memory.claim_work_lease(target, "other", "new", now=self.drive_now, lease=LEASE)
+
+    # PM26W1FIX5 F3: an exception inside resume_project_run (not a ValueError) strands no lease either.
+    def test_fix5_f3_proof_leases_released_when_resume_raises(self):
+        first, _ = self.ready()
+        with mock.patch("jarvis.core.budget_verdict", side_effect=RuntimeError("budget read")):
+            with self.assertRaises(RuntimeError):
+                self.resume(first)
+        self.assertEqual(self.drive_calls, [])
+        for target in ("src/a.py", "src/b.py"):
+            self.memory.claim_work_lease(target, "other", "new", now=self.drive_now, lease=LEASE)
+
+    # PM26W1FIX5 F3: nothing after resume_project_run can strand its proof leases.
+    def test_fix5_f3_proof_leases_released_when_a_later_read_raises(self):
+        first, _ = self.ready()
+        resumed, real_resume, real_payloads = [], self.core.resume_project_run, self.core._project_run_payloads
+
+        def mark(*args, **kwargs):
+            out = real_resume(*args, **kwargs)
+            resumed.append(True)  # only after resume holds its proof leases
+            return out
+
+        def payloads(run_id):
+            if resumed:
+                raise RuntimeError("store read after resume")
+            return real_payloads(run_id)
+
+        with mock.patch.object(self.core, "resume_project_run", mark), \
+                mock.patch.object(self.core, "_project_run_payloads", payloads):
+            try:
+                self.resume(first)
+            except RuntimeError:
+                pass
+        self.assertEqual(resumed, [True])
+        for target in ("src/a.py", "src/b.py"):
+            # Same boot as the drive: a lease from another boot is dead by definition and would not conflict.
+            self.memory.claim_work_lease(target, "other", "new", now=self.drive_now, lease=LEASE)
 
     # PM26W1FIX2 F1: only terminal outcomes save the chain task FAILED.
     def test_f1_movable_step_outcomes_keep_the_task_resumable(self):
