@@ -12,7 +12,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
-from jarvis import n6_deps, n6_kpi, n6_lease, n6_notify
+from jarvis import n6_deps, n6_kpi, n6_lease, n6_notify, n6_sensors
 from jarvis.notify import NotificationCore
 from tests.test_n6_e8 import GOOD_SET, e8
 from tests.test_n6_notify import Ledger
@@ -25,6 +25,7 @@ sys.modules["n6_limited_run"] = lr  # dataclasses resolves annotations through s
 _spec.loader.exec_module(lr)
 
 TIERS = {"A-1": "T1", "B-2": "T2", "INT-3": "T1", "C-4": "T1"}
+T, HEALTHY = 5000.0, n6_sensors.Reading(16.0, 40.0, 50.0)  # injected clock and sensor
 
 
 class LimitedRun(unittest.TestCase):
@@ -582,20 +583,23 @@ class LimitedInputs(unittest.TestCase):
         data.update(kw)
         (self.conv / "status.json").write_text(json.dumps(data))
 
+    def sit(self, **kw):
+        return lr._situation("A", self.root, **{"sense": lambda: (T, HEALTHY), "now": lambda: T, **kw})
+
     def test_situation_clear_only_when_every_hold_is_false(self):
         self.status()
-        self.assertFalse(lr._situation("A", self.root).operator_pause)
+        self.assertFalse(self.sit().operator_pause)
         for kw in [*({h: True} for h in lr._HOLDS), {"breaker": "open"}, {"usage_pct": None}]:
             with self.subTest(kw=kw):
                 self.status(**kw)
-                self.assertTrue(lr._situation("A", self.root).operator_pause)
+                self.assertTrue(self.sit().operator_pause)
         (self.conv / "status.json").write_text("{bad")
-        self.assertTrue(lr._situation("A", self.root).operator_pause)
+        self.assertTrue(self.sit().operator_pause)
         (self.conv / "status.json").unlink()
-        self.assertTrue(lr._situation("A", self.root).operator_pause)
+        self.assertTrue(self.sit().operator_pause)
         self.status()
         (self.conv / "PAUSE").write_text("")
-        self.assertTrue(lr._situation("A", self.root).operator_pause)
+        self.assertTrue(self.sit().operator_pause)
 
     def test_full_burn_uses_limit_pct_as_the_line(self):
         from jarvis.work_supervisor import supervise
@@ -610,7 +614,7 @@ class LimitedInputs(unittest.TestCase):
         for pace, used, line, constraint in cases:
             with self.subTest(pace=pace, used=used):
                 self.status(pace=pace, usage_pct=used)
-                s = lr._situation("A", self.root)
+                s = self.sit()
                 self.assertFalse(s.operator_pause)
                 self.assertEqual(s.quota["line_pct"], line)
                 d = supervise(s)
@@ -627,6 +631,67 @@ class LimitedInputs(unittest.TestCase):
         self.assertEqual(lr.sync_backlog(self.root, deps), ["A: queued for N6"])
         self.assertEqual(lr.sync_backlog(self.root, deps), [])
         self.assertEqual([e["id"] for e in json.loads(deps.read_text())["backlog"]], ["A"])
+
+
+class SensorWire(unittest.TestCase):
+    """N6SENSEWIRE1: _situation feeds the injected n6_sensors reading into supervise()."""
+
+    setUp, on, backlog, run_port, states = (LimitedRun.setUp, LimitedRun.on, LimitedRun.backlog,
+                                            LimitedRun.run_port, LimitedRun.states)
+    ports, write_status = LimitedRun.ports, LimitedInputs.status  # self.status is the run result
+
+    def ready(self):
+        self.conv = self.root / "build" / "conveyor"
+        self.conv.mkdir(parents=True, exist_ok=True)
+        self.write_status()
+
+    def tick(self, sense):
+        self.ready()
+        self.on()
+        self.backlog(n6_deps.Item("A-1"))
+        snap = self.states()
+        sit = lambda sid: lr._situation(sid, self.root, sense=sense, now=lambda: T)  # noqa: E731
+        lr.tick(self.root, self.ports(situation=sit))
+        return snap, sit("A-1")
+
+    def assert_nothing_starts(self, sense, rule="mem.unknown"):
+        snap, s = self.tick(sense)
+        self.assertEqual(self.ran, [])
+        self.assertEqual(self.states(), snap)
+        if rule:
+            self.assertEqual(lr.supervise(s).rule_id, rule)
+
+    def test_healthy_reading_flows_into_situation_and_starts(self):
+        _, s = self.tick(lambda: (T, HEALTHY))
+        self.assertEqual(self.ran, ["A-1"])
+        self.assertEqual(s.memory, {"free_gb": 16.0, "held": False, "ok_for_s": 0,
+                                    "commit_pct": 40.0, "disk_free_gb": 50.0})
+        self.assertEqual(lr.supervise(s).constraint, "any")
+
+    def test_raising_sensor_holds_and_nothing_starts(self):
+        def boom():
+            raise OSError("sensor unreadable")
+        self.assert_nothing_starts(boom, rule=None)
+        self.assertTrue(lr._situation("A", self.root, sense=boom, now=lambda: T).operator_pause)
+
+    def test_stale_reading_is_unknown_and_nothing_starts(self):
+        self.assert_nothing_starts(lambda: (T - n6_sensors.MEM_OK_S - 1, HEALTHY))
+
+    def test_reading_at_the_freshness_limit_or_from_the_future(self):
+        self.ready()
+        fresh = lr._situation("A", self.root, sense=lambda: (T - n6_sensors.MEM_OK_S, HEALTHY),
+                              now=lambda: T)
+        self.assertEqual(fresh.memory["free_gb"], 16.0)
+        ahead = lr._situation("A", self.root, sense=lambda: (T + 1, HEALTHY), now=lambda: T)
+        self.assertIsNone(ahead.memory["free_gb"])
+
+    def test_malformed_reading_is_unknown_and_nothing_starts(self):
+        for bad in (lambda: (T, {"free_ram_gb": 16.0}), lambda: HEALTHY, lambda: None,
+                    lambda: ("5000", HEALTHY), lambda: (float("nan"), HEALTHY),
+                    lambda: (T, HEALTHY, 1)):
+            with self.subTest(bad=bad()):
+                self.setUp()  # fresh root per case
+                self.assert_nothing_starts(bad)
 
 
 def V(decision, reason="x"):

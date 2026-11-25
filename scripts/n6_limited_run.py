@@ -60,7 +60,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from jarvis import n6_deps, n6_kpi, n6_lease, n6_stop  # noqa: E402
+from jarvis import n6_deps, n6_kpi, n6_lease, n6_sensors, n6_stop  # noqa: E402
 from jarvis.n6_breaker import BAD, GOOD  # noqa: E402
 from jarvis.work_planner import n6_next  # noqa: E402
 from jarvis.work_supervisor import DEFAULT_POLICY, Situation, n6_record_finish, supervise  # noqa: E402
@@ -403,9 +403,31 @@ def _num(v: object) -> bool:
     return type(v) in (int, float) and math.isfinite(v)  # pyright: ignore[reportArgumentType]
 
 
-def _situation(sid: str, root: Path | str = ROOT) -> Situation:
+def _sense() -> tuple[float, n6_sensors.Reading]:
+    """N6SENSEWIRE1: one host reading and the time it was taken (production sensor port)."""
+    return time.time(), n6_sensors.sense()
+
+
+def _reading(sense: Callable[[], object], now: Callable[[], float]) -> n6_sensors.Reading:
+    """A fresh, well-formed Reading, else an all-unknown one (supervise then waits).
+    Fresh means taken within MEM_OK_S: n6_sensors has no limit of its own, and it
+    is the window the memory hold already trusts. A raising sensor propagates."""
+    got, t = sense(), now()
+    unknown = n6_sensors.Reading(None, None, None)
+    if not (isinstance(got, tuple) and len(got) == 2) or type(got[1]) is not n6_sensors.Reading:
+        return unknown
+    taken, reading = got
+    if not _num(taken) or not _num(t) or not 0 <= t - taken <= n6_sensors.MEM_OK_S:
+        return unknown
+    return reading
+
+
+def _situation(sid: str, root: Path | str = ROOT, sense: Callable[[], object] = _sense,
+               now: Callable[[], float] = time.time) -> Situation:
     """N6-LIMIT1: the supervisor's view built read-only from the conveyor's status.json
-    and PAUSE. Anything unreadable, missing or not exactly "no hold" pauses."""
+    and PAUSE. Anything unreadable, missing or not exactly "no hold" pauses.
+    N6SENSEWIRE1: memory is the injected ``sense`` reading (RAM, commit, disk); a raising
+    sensor pauses, a stale or malformed one is unknown and supervise waits."""
     pause = Situation(operator_pause=True)
     conv = Path(root) / "build" / "conveyor"
     try:
@@ -426,10 +448,14 @@ def _situation(sid: str, root: Path | str = ROOT) -> Situation:
         line = pace.get("limit_pct")
     if not _num(used) or not _num(free):
         return pause
+    try:
+        reading = _reading(sense, now)
+    except Exception:
+        return pause
     return Situation(operator_pause=False, policy=DEFAULT_POLICY,
                      quota={"used_pct": used, "line_pct": line if _num(line) else None,
                             "hour": time.localtime().tm_hour},
-                     memory={"free_gb": free, "held": False})
+                     memory=n6_sensors.memory_situation(reading, held=False))
 
 
 def _read_json(path: Path) -> object:
