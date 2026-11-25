@@ -30,9 +30,9 @@ WORKFLOW = (ROOT / ".github" / "workflows" / "tests.yml").read_text(encoding="ut
 MODS = ["tests.test_a", "tests.test_b"]
 
 
-def report(ids, *, shard=None, green=True, failures=0, errors=0, wall=10.0, durations=None):
+def report(ids, *, shard=None, green=True, failures=0, errors=0, wall=10.0, durations=None, skips=()):
     return {"shard": shard, "green": green, "wall": wall, "units": [], "dispatched": ids, "ran": len(ids),
-            "skipped": 0, "skips": [], "failures": failures, "errors": errors, "accounted": True,
+            "skipped": len(skips), "skips": [list(s) for s in skips], "failures": failures, "errors": errors, "accounted": True,
             "rule_d": [], "discovered": len(ids),
             "durations": durations if durations is not None else [[1.0, f"x ({i})"] for i in ids]}
 
@@ -115,7 +115,8 @@ class CompareTests(unittest.TestCase):
     def test_negative_6_fewer_than_n_runs_not_enough_and_no_safe_set(self):
         rows = shadow.compare(self.runs(9, windows=GREEN_W, linux=GREEN_L), MODS, 10)
         self.assertTrue(all(r["safe"] is None for r in rows.values()))
-        dirs = [str(write_run(self.tmp, f"c{i}", windows=GREEN_W, linux=GREEN_L)) for i in range(3)]
+        dirs = [str(write_run(self.tmp, f"c{i}", windows=report(IDS, shard=[1, 1], wall=100.0 + i),
+                              linux=report(IDS, wall=40.0 + i))) for i in range(3)]
         out = io.StringIO()
         with mock.patch.object(shadow, "read_list", return_value=MODS), contextlib.redirect_stdout(out):
             self.assertEqual(shadow.main(["compare", *dirs]), 0)
@@ -145,11 +146,70 @@ class CompareTests(unittest.TestCase):
                 contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
             self.assertNotEqual(shadow.main(["compare", run, run, "--runs-needed", "2"]), 0)
 
+    def test_fix_a_report_copied_into_two_run_dirs_is_refused(self):
+        a = str(write_run(self.tmp, "copy-a", windows=GREEN_W, linux=GREEN_L))
+        b = str(write_run(self.tmp, "copy-b", windows=GREEN_W, linux=report(IDS, wall=41.0)))
+        err = io.StringIO()
+        with mock.patch.object(shadow, "read_list", return_value=MODS), \
+                contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(err):
+            self.assertEqual(shadow.main(["compare", a, b, "--runs-needed", "2"]), 2)
+        self.assertIn("same report", err.getvalue())
+
+    def test_fix_a_skip_on_either_side_is_never_pass_same_or_safe(self):
+        skip_a = [("tests.test_a.A.test_1", "no tool")]
+        red_l = dict(linux=report(IDS, green=False, failures=1, skips=skip_a), linux_summary=FAIL_B)
+        cases = {"linux skip beside a named failure": dict(windows=GREEN_W, **red_l),
+                 "linux allowed skip, green": dict(windows=GREEN_W, linux=report(IDS, skips=skip_a)),
+                 "windows shard skip": dict(windows=report(IDS, shard=[1, 1], skips=skip_a), linux=GREEN_L),
+                 "skip on both sides": dict(windows=report(IDS, shard=[1, 1], skips=skip_a),
+                                            linux=report(IDS, skips=skip_a)),
+                 "fail and skip in the module on both sides": dict(
+                     windows=report(IDS, shard=[1, 1], green=False, failures=1, skips=skip_a),
+                     linux=report(IDS, green=False, failures=1, skips=skip_a),
+                     win_summary="FAIL: test_2 (tests.test_a.A.test_2)\n",
+                     linux_summary="FAIL: test_2 (tests.test_a.A.test_2)\n"),
+                 "setUpClass skip (class id)": dict(windows=GREEN_W, linux=report(IDS, skips=[("tests.test_a.A", "x")]))}
+        for name, kw in cases.items():
+            with self.subTest(name):
+                runs = self.runs(10, **kw)
+                side = "windows" if "windows" in name else "linux"
+                self.assertEqual(runs[-1][side]["results"]["tests.test_a"][0], "skipped")
+                rows = shadow.compare(runs, MODS, 10)
+                self.assertEqual(rows["tests.test_a"]["verdicts"], ["skipped"] * 10)
+                self.assertFalse(rows["tests.test_a"]["safe"])
+
+    def test_fix_a_skip_in_an_unlisted_module_leaves_listed_modules_alone(self):
+        rows = shadow.compare(self.runs(10, windows=GREEN_W, linux=report(IDS, skips=[("tests.test_c.C.t", "x")])),
+                              MODS, 10)
+        self.assertTrue(all(r["safe"] for r in rows.values()))
+
+    def test_fix_unaccountable_skips_make_the_side_unknown(self):
+        unnamed = report(IDS, skips=[("?", "x")])
+        short = report(IDS, skips=[("tests.test_a.A.test_1", "x")])
+        short["skipped"] = 2
+        malformed = report(IDS, skips=[("tests.test_a.A.test_1", "x")])
+        malformed["skips"] = [["tests.test_a.A.test_1"]]
+        missing = report(IDS)
+        del missing["skips"]
+        not_list = report(IDS)
+        not_list["skips"] = "tests.test_a.A.test_1"
+        for name, linux in (("unnamed", unnamed), ("count", short), ("malformed", malformed),
+                            ("missing", missing), ("not a list", not_list)):
+            with self.subTest(name):
+                run = self.runs(1, windows=GREEN_W, linux=linux)[0]
+                self.assertEqual({s for s, _, _ in run["linux"]["results"].values()}, {"unknown"})
+
 
 class StaticCheckTests(unittest.TestCase):
     MARKED = ["import ctypes\nctypes.windll.user32", "import winreg", "import msvcrt", "import win32api",
               "import comtypes", "import uiautomation", "from PySide6 import QtCore", "from jarvis.ui import x",
-              "run('powershell -NoProfile')", "script = 'tools/x.ps1'", "if sys.platform == 'win32': pass"]
+              "run('powershell -NoProfile')", "script = 'tools/x.ps1'", "if sys.platform == 'win32': pass",
+              # CIOSSHADOW1FIX F3: from-import and other Windows-only ctypes names
+              "from ctypes import windll", "from ctypes import wintypes", "from ctypes import WinDLL",
+              "import ctypes.wintypes as w", "ctypes.oledll.ole32", "from ctypes import WINFUNCTYPE",
+              "raise ctypes.WinError()", "ctypes.GetLastError()", "ctypes.FormatError(5)",
+              "ctypes.CDLL('kernel32')", "ctypes.cdll.LoadLibrary('User32.dll')", "import _winapi",
+              "import winsound", "os.startfile(path)"]
 
     def setUp(self):
         self.tests = Path(tempfile.mkdtemp(prefix="ciosshadow1-tests-"))

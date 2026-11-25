@@ -103,7 +103,6 @@ tests.test_model_answer_handoff
 tests.test_model_catalog
 tests.test_model_retirement
 tests.test_mutate
-tests.test_mutgen
 tests.test_n6_boot
 tests.test_n6_breaker
 tests.test_n6_ci_watch
@@ -124,7 +123,6 @@ tests.test_n6_presence
 tests.test_n6_quota
 tests.test_n6_receipt
 tests.test_n6_refcheck
-tests.test_n6_replay
 tests.test_n6_review_route
 tests.test_n6_rootcause
 tests.test_n6_sensors
@@ -141,7 +139,6 @@ tests.test_orchbot
 tests.test_orchbot_replay
 tests.test_orphan_parity
 tests.test_pm32_compare
-tests.test_policy_guard
 tests.test_policy_proxy
 tests.test_privacy_canary
 tests.test_project_files
@@ -194,7 +191,6 @@ tests.test_skill_types
 tests.test_skill_unsuppress
 tests.test_speedcache
 tests.test_speedwarm
-tests.test_stage_git
 tests.test_storage_abstraction
 tests.test_stt_bench
 tests.test_talk_attach
@@ -232,6 +228,5 @@ tests.test_work_scout
 tests.test_work_store
 tests.test_work_supervisor
 tests.test_workers_base
-tests.test_workers_claude
 tests.test_workers_route
 tests.test_write_scope

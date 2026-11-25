@@ -8,7 +8,7 @@ beside the Windows shard reports of the same runs.
   scan [--write]       static check (CIDIAG1 D4 markers); --write regenerates the list file
   check                refuse a list with duplicates, path-like/non-module entries or flagged modules
   modules              the checked list, space separated (the shadow job's argv)
-  compare RUN_DIR...   per module same / differs / missing and the time ratio, oldest run first
+  compare RUN_DIR...   per module same / differs / skipped / missing and the time ratio, oldest run first
                        (consecutive = the order given); safe to move = same and passing in each
                        of the last N runs (--runs-needed, default 10); then the modelled gate time
 
@@ -33,8 +33,11 @@ LIST = ROOT / "dev" / "ci" / "os_independent.txt"
 RUNS_NEEDED = 10
 
 MARKERS = {  # CIDIAG1 D4, plus the platform gate (such a module may skip off Windows, not fail)
-    "winapi": re.compile(r"ctypes\.windll|\bWinDLL\b|ctypes\.wintypes|\bwinreg\b|\bmsvcrt\b|\bwin32\w*"
-                         r"|\bpywintypes\b|\bcomtypes\b|\buiautomation\b"),
+    # bare names, so `from ctypes import windll` and the like are caught, not only `ctypes.windll`
+    "winapi": re.compile(r"(?i:\bwindll\b|\boledll\b)|\bwintypes\b|\bWINFUNCTYPE\b|\bWinError\b|\bGetLastError\b"
+                         r"|\bFormatError\b|\bwinreg\b|\bmsvcrt\b|\bwin32\w*"
+                         r"|\bpywintypes\b|\bcomtypes\b|\buiautomation\b"
+                         r"|(?i:\b(?:kernel|user|advapi|shell|gdi|ole|ws2_)32\b)|\b_winapi\b|\bwinsound\b|\bstartfile\b"),
     "powershell": re.compile(r"powershell|\bpwsh\b|\.ps1\b", re.IGNORECASE),
     "qml_qt": re.compile(r"PySide6|\bQQml|\bQml|\.qml\b|\bjarvis\.ui\b"),
     "platform_gate": re.compile(r"sys\.platform|os\.name\s*[!=]=|platform\.system\(\)"
@@ -111,8 +114,9 @@ def _module_of(test_id: str) -> str:
 
 
 def read_report(path: Path) -> dict | None:
-    """One report as {dispatched, failing, seconds, wall, shard}; None when it cannot be accounted for
-    (unreadable, a test count that does not add up, or a red run whose failures are not all named)."""
+    """One report as {dispatched, failing, skipped, seconds, wall, shard}; None when it cannot be accounted
+    for (unreadable, a test count that does not add up, a red run whose failures are not all named, or a
+    skip that is not on a tests.* id)."""
     try:
         report = json.loads(path.read_text(encoding="utf-8-sig", errors="replace"))
         dispatched = list(report["dispatched"])
@@ -128,19 +132,28 @@ def read_report(path: Path) -> dict | None:
                             if where.startswith("unittest.loader._FailedTest") else _module_of(where))
             if not failing or len(named) < int(report["failures"]) + int(report["errors"]):
                 return None  # red, but which modules failed is not in the (possibly truncated) summary
+        skips = report["skips"]  # [[id, reason]]; a skipped test never ran, so its module is not "pass"
+        if not isinstance(skips, list) or len(skips) != int(report["skipped"]):
+            return None
+        skipped = set()
+        for test, _reason in skips:
+            if not _MODULE.match(str(test)):
+                return None  # a skip that cannot be put on a module: no module can be called passing
+            skipped.add(_module_of(test))
         seconds: dict[str, float] = {}
         for value, name in report["durations"]:
             match = _IN_NAME.search(name)
             if match:
                 seconds[match.group(1)] = seconds.get(match.group(1), 0.0) + float(value)
         return {"dispatched": {_module_of(t) for t in dispatched}, "ids": set(dispatched), "failing": failing,
-                "seconds": seconds, "wall": float(report["wall"]), "shard": report["shard"]}
+                "skipped": skipped, "seconds": seconds, "wall": float(report["wall"]), "shard": report["shard"]}
     except (OSError, ValueError, KeyError, TypeError):
         return None
 
 
 def read_run(run_dir: Path, modules: list[str]) -> dict:
-    """{side: {"results": {module: (pass|fail|missing|unknown, seconds, test ids)}, "walls": [(wall, {module: s})]}}.
+    """{side: {"results": {module: (pass|fail|skipped|missing|unknown, seconds, test ids)},
+    "walls": [(wall, {module: s})]}}.
     A side is unknown when a report is unreadable, a Windows shard is absent or doubled (a module's
     classes can sit in several shards), or there is more than one Linux report."""
     out = {}
@@ -164,7 +177,9 @@ def read_run(run_dir: Path, modules: list[str]) -> dict:
             elif not any(module in r["dispatched"] for r in good):
                 status = "missing"
             else:
-                status = "fail" if any(module in r["failing"] for r in good) else "pass"
+                # a skip beats fail too, so a module with skipped tests is never "same" (even fail/fail)
+                status = ("skipped" if any(module in r["skipped"] for r in good)
+                          else "fail" if any(module in r["failing"] for r in good) else "pass")
             results[module] = (status, seconds, ids)
         out[side] = {"results": results, "walls": [(r["wall"], r["seconds"]) for r in good]}
     return out
@@ -175,6 +190,8 @@ def verdict(windows: str, linux: str) -> str:
         return "missing"
     if "unknown" in (windows, linux):
         return "unknown"
+    if "skipped" in (windows, linux):
+        return "skipped"  # tests that did not run on a side cannot show the same result
     return "same" if windows == linux else "differs"
 
 
@@ -253,6 +270,10 @@ def main(argv: list[str] | None = None) -> int:
             raise Refused("compare needs existing run dirs and --runs-needed >= 1")
         if len({d.resolve() for d in args.run_dirs}) < len(args.run_dirs):
             raise Refused("compare: a run dir is given twice (one run would count as several)")
+        # shortcut: catches copied reports only; a dir mixing two runs' artifacts needs a run id in them
+        copies = [p.read_bytes() for d in args.run_dirs for name in SIDES for p in d.rglob(name)]
+        if len(set(copies)) < len(copies):
+            raise Refused("compare: the same report is in two places (one run would count as several)")
         runs = [read_run(d, modules) for d in args.run_dirs]
         rows = compare(runs, modules, args.runs_needed)
         for module, row in rows.items():
