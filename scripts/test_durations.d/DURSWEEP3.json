@@ -1,0 +1,6 @@
+{
+ "version": 1,
+ "classes": {
+  "tests.test_providers.ProviderGoldenTests": 1.0
+ }
+}
