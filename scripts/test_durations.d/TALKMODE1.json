@@ -1,0 +1,6 @@
+{
+ "version": 1,
+ "classes": {
+  "tests.test_talk_mode.TalkModeTests": 0.001
+ }
+}
