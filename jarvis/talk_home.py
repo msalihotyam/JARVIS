@@ -22,10 +22,17 @@ import os
 import re
 import secrets
 import stat as stat_mod
+from contextlib import contextmanager
 from dataclasses import dataclass
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 FOLDERS = ("log", "attachments", "inbox", "state")
 LOCK_NAME = "talk.lock"
+GUARD_NAME = LOCK_NAME + ".guard"
 MAX_LOCK_BYTES = 512
 MAX_ROOT_CHARS = 200
 INTERRUPTED = "previous run interrupted"
@@ -102,9 +109,9 @@ def _guarded(fn):
             return refused.refusal
         except RecursionError:
             return Refusal("INPUT_TOO_DEEP", REFUSALS["INPUT_TOO_DEEP"])
-        except PermissionError:
-            return Refusal("LOCK_BUSY", REFUSALS["LOCK_BUSY"])
-        except OSError:
+        except OSError as err:
+            if getattr(err, "winerror", None) in (32, 33):  # sharing/lock violation: someone has it open
+                return Refusal("LOCK_BUSY", REFUSALS["LOCK_BUSY"])
             return Refusal("IO_ERROR", REFUSALS["IO_ERROR"])
         except Exception:  # fail closed: no exception escapes a public call
             return Refusal("INPUT_INVALID", REFUSALS["INPUT_INVALID"])
@@ -132,7 +139,7 @@ def _check_root(root):
     for part in parts:
         if part in ("", ".", "..") or part[-1] in ". " or _BAD_CHARS & set(part):
             raise _Refused("ROOT_INVALID")
-        if part.split(".")[0].upper() in _RESERVED:
+        if part.split(".")[0].rstrip(" ").upper() in _RESERVED:  # "NUL .txt" is NUL too
             raise _Refused("ROOT_INVALID")
         protected |= part.casefold() in _PROTECTED_PARTS
     if protected:
@@ -234,15 +241,60 @@ def _read(path):
         os.close(fd)
 
 
+def _is_link(st):
+    return stat_mod.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & _REPARSE_POINT
+
+
 def _load(path, stat):
-    """(raw bytes, record); FileNotFoundError passes through to the caller."""
+    """Validated record; FileNotFoundError passes through to the caller."""
     st = stat(path)
-    if stat_mod.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
+    if _is_link(st):
         raise _Refused("LINK_REFUSED")
     if not stat_mod.S_ISREG(st.st_mode):
         raise _Refused("UNKNOWN_HOLDER")
-    raw = _read(path)
-    return raw, _parse(raw)
+    return _parse(_read(path))
+
+
+@contextmanager
+def _guard(state, stat):
+    """Cross-process critical section around every look-then-change of the lock.
+
+    A byte lock on state/talk.lock.guard: the OS drops it when the holding
+    handle closes or its process dies, so the guard is never stale. Busy means
+    another acquire/release/reset is mid-change: refuse, never wait.
+    """
+    path = os.path.join(state, GUARD_NAME)
+    try:
+        st = stat(path)
+    except FileNotFoundError:
+        pass
+    else:
+        if _is_link(st):
+            raise _Refused("LINK_REFUSED")
+        if not stat_mod.S_ISREG(st.st_mode):
+            raise _Refused("IO_ERROR")
+    try:
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_BINARY", 0), 0o600)
+    except PermissionError:
+        raise _Refused("IO_ERROR") from None  # read-only or denied guard: not busy, opens share
+    try:
+        try:
+            if os.name == "nt":
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)  # per handle: conflicts inside one process too
+            else:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # flock, not lockf: per open file
+        except OSError:
+            raise _Refused("LOCK_BUSY") from None
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                try:
+                    msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                except OSError:
+                    pass  # close below drops the byte lock anyway; never mask the result
+    finally:
+        os.close(fd)
 
 
 def _create(path, record):
@@ -258,26 +310,6 @@ def _create(path, record):
             os.remove(path)
     if not ok:
         raise OSError("short write")
-
-
-def _move_aside(path, raw):
-    """Rename the lock away only if it still holds raw; otherwise put it back and refuse."""
-    aside = f"{path}.{secrets.token_hex(8)}.old"
-    try:
-        os.rename(path, aside)
-    except FileNotFoundError:
-        raise _Refused("RACE_LOST") from None
-    if _read(aside) == raw:
-        return aside
-    try:  # someone replaced the lock between our read and rename: restore theirs
-        if os.name == "nt":
-            os.rename(aside, path)  # Windows rename never replaces an existing file
-        else:
-            os.link(aside, path)
-            os.remove(aside)
-    except OSError:
-        pass
-    raise _Refused("RACE_LOST")
 
 
 def _dead(alive, pid):
@@ -307,27 +339,26 @@ def acquire(root, boot_id, pid, now, *, alive, stat=os.lstat):
     path = os.path.join(home.state, LOCK_NAME)
     token = secrets.token_hex(16)
     record = {"version": 1, "boot_id": boot_id, "pid": pid, "since": now, "token": token}
-    for _ in range(2):
+    with _guard(home.state, stat):  # detection and replacement in one critical section
         try:
             _create(path, record)
             return Lease(token, path, "")
         except FileExistsError:
             pass
         try:
-            raw, held = _load(path, stat)
+            held = _load(path, stat)
         except FileNotFoundError:
-            continue  # released in between: try the atomic create once more
+            raise _Refused("RACE_LOST") from None  # only a writer outside this module
         if held["boot_id"] == boot_id and not _dead(alive, held["pid"]):
             raise _Refused("HELD", f" pid {held['pid']} boot {held['boot_id']} since {held['since']}")
-        aside = _move_aside(path, raw)
+        new = path + ".new"  # write aside, then swap: a failed write keeps the stale lock and its note
         try:
-            _create(path, record)
-        except FileExistsError:
-            raise _Refused("RACE_LOST") from None
-        finally:
-            os.remove(aside)
+            os.remove(new)  # leftover of a crashed swap; only guard holders touch it
+        except FileNotFoundError:
+            pass
+        _create(new, record)
+        os.replace(new, path)
         return Lease(token, path, INTERRUPTED)
-    raise _Refused("RACE_LOST")
 
 
 def _lock_path(root, stat):
@@ -343,13 +374,14 @@ def release(root, token, stat=os.lstat):
     if not isinstance(token, str) or not _TOKEN.fullmatch(token):
         raise _Refused("TOKEN_INVALID")
     path = _lock_path(root, stat)
-    try:
-        raw, held = _load(path, stat)
-    except FileNotFoundError:
-        raise _Refused("NO_LOCK") from None
-    if not hmac.compare_digest(held["token"], token):
-        raise _Refused("WRONG_TOKEN")
-    os.remove(_move_aside(path, raw))
+    with _guard(os.path.dirname(path), stat):
+        try:
+            held = _load(path, stat)
+        except FileNotFoundError:
+            raise _Refused("NO_LOCK") from None
+        if not hmac.compare_digest(held["token"], token):
+            raise _Refused("WRONG_TOKEN")
+        os.remove(path)
     return True
 
 
@@ -357,11 +389,12 @@ def release(root, token, stat=os.lstat):
 def operator_reset(root, stat=os.lstat):
     """Explicit operator call: drop whatever lock file is there. True if one was removed."""
     path = _lock_path(root, stat)
-    try:
-        st = stat(path)
-    except FileNotFoundError:
-        return False
-    if stat_mod.S_ISLNK(st.st_mode) or getattr(st, "st_file_attributes", 0) & _REPARSE_POINT:
-        raise _Refused("LINK_REFUSED")
-    os.remove(path)
+    with _guard(os.path.dirname(path), stat):
+        try:
+            st = stat(path)
+        except FileNotFoundError:
+            return False
+        if _is_link(st):
+            raise _Refused("LINK_REFUSED")
+        os.remove(path)
     return True

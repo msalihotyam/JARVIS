@@ -8,6 +8,7 @@ import tempfile
 import types
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from jarvis import talk_home as th
 from tests.adversarial import HOSTILE_JSON, HOSTILE_NUMBERS, HOSTILE_PATH_PARTS, HOSTILE_TEXT, each
@@ -127,6 +128,9 @@ class RootRefusalTests(_Home):
                  "\\\\?\\C:\\talk", "\\\\.\\C:\\talk", "//host/share/talk", self.root + os.sep,
                  self.base + os.sep + "a" * 250, self.root + ":stream", self.root + "\x00")
         each(self, roots, self.assert_refused_untouched)
+        for stem in ("NUL .txt", "COM1 .log", "nul  .x", "CONIN$ .txt", "Aux .a.b"):  # F3: spaces end the stem
+            with self.subTest(stem=stem):
+                self.assert_refused_untouched(self.base + os.sep + stem, ("ROOT_INVALID",))
         each(self, HOSTILE_TEXT, lambda text: self.assert_refused_untouched(self.base + os.sep + text))
 
 
@@ -155,7 +159,7 @@ class LockTests(_Home):
         lease = self.acquire(boot="b1")
         self.assertEqual(lease.note, th.INTERRUPTED)
         self.assertEqual(self.read_lock()["token"], lease.token)
-        self.assertEqual(os.listdir(os.path.dirname(self.lock)), [th.LOCK_NAME])
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.lock))), [th.LOCK_NAME, th.GUARD_NAME])
 
     def test_dead_holder_is_taken_over_odd_liveness_is_alive(self):
         self.write_lock(_record(boot="b1", pid=7).encode())
@@ -192,42 +196,116 @@ class LockTests(_Home):
             self.assertEqual((calls, Path(self.lock).read_bytes()), ([], data))
         each(self, corrupt, check)
 
-        self.write_lock(valid)
-        os.truncate(self.lock, th.MAX_LOCK_BYTES + 1)  # oversized
+        padded = _record(boot="b1").encode()  # F4: valid JSON, only whitespace makes it big
+        self.write_lock(padded + b" " * (th.MAX_LOCK_BYTES - len(padded)))
+        self.assertEqual(self.acquire(alive=DEAD).note, th.INTERRUPTED)  # exactly MAX still parses
+        self.write_lock(padded + b" " * (th.MAX_LOCK_BYTES + 1 - len(padded)))
         self.refused(self.acquire(alive=DEAD), "UNKNOWN_HOLDER")
         self.assertIs(th.operator_reset(self.root), True)
         self.assertIs(th.operator_reset(self.root), False)
         self.assertEqual(self.acquire().note, "")
 
-    def test_race_inside_liveness_check_has_exactly_one_winner(self):
+    def test_contenders_during_a_takeover_are_busy_and_one_wins(self):
         self.write_lock(_record(boot="b1", pid=7).encode())
-        rival = []
+        others = []
 
-        def alive(pid):
-            if not rival:
-                rival.append(self.acquire(pid=8, alive=DEAD))
+        def alive(pid):  # runs inside the takeover's critical section
+            if not others:
+                others.extend([self.acquire(pid=8, alive=DEAD), self.acquire(boot="b2", pid=9, alive=DEAD),
+                               th.release(self.root, "a" * 32), th.operator_reset(self.root)])
             return False
 
-        mine = self.acquire(pid=9, alive=alive)
-        self.assertIsInstance(rival[0], th.Lease)
-        self.refused(mine, "RACE_LOST")
-        self.assertEqual(self.read_lock()["token"], rival[0].token)
-        self.assertEqual(os.listdir(os.path.dirname(self.lock)), [th.LOCK_NAME])
+        mine = self.acquire(pid=10, alive=alive)
+        for other in others:
+            self.refused(other, "LOCK_BUSY")
+        self.assertEqual(len(others), 4)
+        self.assertEqual(mine.note, th.INTERRUPTED)
+        self.assertEqual(self.read_lock()["token"], mine.token)
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.lock))), [th.LOCK_NAME, th.GUARD_NAME])
 
-    def test_race_on_atomic_create_has_exactly_one_winner(self):
+    def test_takeover_during_a_release_is_busy(self):
+        lease = self.acquire()
         rival = []
-        state = os.path.join(self.root, "state")
 
         def port(path):
-            if path == state and os.path.isdir(path) and not rival:
-                rival.append(self.acquire(pid=8))
+            if path == self.lock and not rival:
+                rival.append(self.acquire(boot="b9", pid=8, alive=DEAD))
             return os.lstat(path)
 
-        mine = self.acquire(pid=9, stat=port)
-        self.assertIsInstance(rival[0], th.Lease)
+        self.assertIs(th.release(self.root, lease.token, stat=port), True)
+        self.refused(rival[0], "LOCK_BUSY")
+        self.assertFalse(os.path.exists(self.lock))
+
+    def test_guard_is_free_after_every_exit(self):
+        self.write_lock(_record(boot="b1").encode())
+        self.refused(self.acquire(), "HELD")
+
+        def deep(path):
+            if path == self.lock:
+                raise RecursionError
+            return os.lstat(path)
+
+        self.refused(self.acquire(stat=deep), "INPUT_TOO_DEEP")
+        self.refused(th.release(self.root, "a" * 32, stat=deep), "INPUT_TOO_DEEP")
+        self.write_lock(b"{")
+        self.refused(self.acquire(), "UNKNOWN_HOLDER")
+        self.assertIs(th.operator_reset(self.root), True)
+        self.assertEqual(self.acquire().note, "")
+
+    def test_guard_that_is_a_link_or_folder_is_refused(self):
+        self.write_lock(_record().encode())
+        guard = os.path.join(self.root, "state", th.GUARD_NAME)
+        port = _fake_stat(guard, st_mode=stat.S_IFLNK)
+        self.refused(self.acquire(stat=port), "LINK_REFUSED")
+        self.refused(th.release(self.root, "a" * 32, stat=port), "LINK_REFUSED")
+        self.refused(th.operator_reset(self.root, stat=port), "LINK_REFUSED")
+        os.mkdir(guard)
+        self.refused(self.acquire(alive=DEAD), "IO_ERROR")
+        self.refused(th.release(self.root, "a" * 32), "IO_ERROR")
+        self.assertTrue(os.path.exists(self.lock))
+
+    def test_failed_takeover_keeps_the_stale_lock_and_denied_guard_is_io_error(self):
+        stale = _record(boot="b0").encode()
+        self.write_lock(stale)
+
+        def full(fd, data):
+            raise OSError(28, "no space")
+
+        with mock.patch.object(th.os, "write", full):
+            self.refused(self.acquire(), "IO_ERROR")
+        self.assertEqual(Path(self.lock).read_bytes(), stale)  # the note is not lost with the write
+        self.assertEqual(sorted(os.listdir(os.path.dirname(self.lock))), [th.LOCK_NAME, th.GUARD_NAME])
+        guard, real_open = os.path.join(self.root, "state", th.GUARD_NAME), os.open
+
+        def denied(path, flags, *args):
+            if path == guard:
+                raise PermissionError(13, "denied")
+            return real_open(path, flags, *args)
+
+        with mock.patch.object(th.os, "open", denied):
+            self.refused(self.acquire(), "IO_ERROR")  # not LOCK_BUSY: nobody holds it
+            self.refused(th.operator_reset(self.root), "IO_ERROR")
+        self.assertEqual(self.acquire().note, th.INTERRUPTED)
+
+    def test_race_on_atomic_create_has_exactly_one_winner(self):
+        self.assertIsInstance(th.ensure(self.root), th.Layout)
+        real_open, rival = os.open, _record(boot="b1", pid=8, token="c" * 32).encode()
+        excl = []
+
+        def opener(path, flags, *args):  # F5: the rival creates at the very open the outer O_EXCL makes
+            if path == self.lock and flags & os.O_EXCL and not excl:
+                excl.append(path)
+                fd = real_open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_BINARY", 0))
+                os.write(fd, rival)
+                os.close(fd)
+            return real_open(path, flags, *args)
+
+        with mock.patch.object(th.os, "open", opener):
+            mine = self.acquire(pid=9)
+        self.assertEqual(excl, [self.lock])
         self.refused(mine, "HELD")
         self.assertIn("pid 8", mine.text)
-        self.assertEqual(self.read_lock()["token"], rival[0].token)
+        self.assertEqual(Path(self.lock).read_bytes(), rival)
 
     def test_release_needs_the_holders_token(self):
         lease = self.acquire()
