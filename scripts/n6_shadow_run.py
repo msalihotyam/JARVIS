@@ -40,6 +40,10 @@ sys.path.insert(0, str(ROOT))  # CLI: make ``jarvis`` importable
 from jarvis.n6_kpi import SOURCES, KpiError, KpiRow, record, rows as read_rows  # noqa: E402
 from jarvis.n6_root import N6  # noqa: E402
 from jarvis.n6_shadow import BLOCK, Snapshot, compare, conveyor_verdict, load  # noqa: E402
+from jarvis.n6_ci_watch import ci_verdict, compare_finish  # noqa: E402
+from jarvis.n6_cleanup import compare as cleanup_compare  # noqa: E402
+from jarvis.n6_intseq import compare_dispatch, sequence  # noqa: E402
+from jarvis.n6_presence import read_pace, sense, shadow_compare, state_from_events  # noqa: E402
 
 JUDGED = ("agree", "disagree", "false_pass")
 
@@ -290,6 +294,139 @@ def daily(root: Path, *, clock: Callable[[], datetime], writer: Callable[..., An
         return False
 
 
+# N6PHASE4FEED1: Phase 4 ports, judged read-only per finished event, one gate row each
+PHASE4 = "phase4.jsonl"  # rows in scripts/n6_group_gate.py's shape (+ port)
+PHASE4_INBOX = "phase4_inbox.jsonl"  # finished events: {event_id, origin, inputs: {port: {...}}}
+PHASE4_ERRORS = "phase4_errors.log"
+Judged = tuple[str, Any, Any] | None  # (agree | disagree | other, n6, conveyor); None = not judged
+
+
+def _ci_watch(i: dict[str, Any]) -> Judged:
+    verdict = ci_verdict(i["sha"], required=i["required"], events=i["events"], checks=i.get("checks"))
+    rec = compare_finish(verdict, i["finish"], events=i["events"])
+    return rec.agreement, rec.n6, rec.conveyor
+
+
+def _cleanup(i: dict[str, Any]) -> Judged:
+    now = datetime.fromisoformat(i["now"])
+    out = cleanup_compare(i["lanes"], i["main_shas"], i["evidence"], i["events"], clock=lambda: now,
+                          timeout=timedelta(seconds=i["timeout_s"]), root=i["root"])
+    if out.get("error") or len(out["records"]) != 1:
+        return None
+    rec = out["records"][0]
+    verdict = "disagree" if rec["verdict"] == "false_remove" else rec["verdict"]  # excluded/unknown: no row
+    return verdict, rec["n6"]["verdict"], rec["conveyor"]["verdict"]
+
+
+def _intseq(i: dict[str, Any]) -> Judged:
+    shadow = compare_dispatch(sequence(i["candidates"], i["main_sha"]), i["events"])
+    return shadow.verdict, shadow.n6, shadow.conveyor
+
+
+def _presence(i: dict[str, Any]) -> Judged:
+    state = state_from_events(i["prior"])
+    if state is None:
+        return None
+    signal, _ = sense(state, i["idle_s"], read_pace(i["pace"]), i["now"])
+    comps = shadow_compare([(signal, i["events"])])
+    verdicts = {c.verdict for c in comps}
+    if not comps or verdicts - {"agree", "disagree"}:
+        return None  # any unknown tick: N6 did not judge this event
+    return ("disagree" if "disagree" in verdicts else "agree"), [c.n6 for c in comps], [c.conveyor for c in comps]
+
+
+def _ffrehearse(i: dict[str, Any]) -> Judged:
+    # rehearse() runs git in a sandbox the running repo refuses under build/n6/: read its receipt only
+    return ("agree" if i["status"] == i["conveyor"] else "disagree"), i["status"], i["conveyor"]
+
+
+PORTS: tuple[tuple[str, str, Callable[[dict[str, Any]], Judged]], ...] = (
+    ("ci_watch", "R17R18", _ci_watch), ("cleanup", "R21", _cleanup), ("intseq", "R31", _intseq),
+    ("presence", "R10", _presence), ("ffrehearse", "R19R20", _ffrehearse))
+REHEARSAL_PORTS = frozenset({"ffrehearse"})  # never a real event, whatever the event says
+
+
+def _text(value: Any) -> str:
+    text = " ".join(str(v) for v in value) if isinstance(value, (list, tuple)) else str(value)
+    return text or "-"
+
+
+def _jsonl(path: Path) -> list[dict[str, Any]]:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return []
+    out: list[dict[str, Any]] = []
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except ValueError:
+            continue
+        if isinstance(item, dict):
+            out.append(cast("dict[str, Any]", item))
+    return out
+
+
+def shadow_rows(root: Path) -> list[dict[str, Any]]:
+    """The Phase 4 rows for n6_group_gate's ``--input`` ``shadow`` list."""
+    return _jsonl(root / "build" / "n6" / PHASE4)
+
+
+def feed(root: Path, events: list[dict[str, Any]], *, clock: Callable[[], datetime],
+         ports: tuple[tuple[str, str, Callable[[dict[str, Any]], Judged]], ...] = PORTS,
+         origin: str = "live") -> int:
+    """One row per (port, finished event) not yet noted; returns rows written. Never raises."""
+    switch, _, _ = _paths(root)
+    if not switch.exists():
+        return 0
+    base = root / "build" / "n6"
+    seen = {(r.get("group"), r.get("event_id")) for r in shadow_rows(root)}
+    rows_out: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for event in events:
+        eid = event.get("event_id")
+        if not isinstance(eid, str) or not eid.strip():
+            errors.append(f"event without event_id: {str(eid)[:80]!r}")
+            continue
+        raw = event.get("origin")
+        label = raw if isinstance(raw, str) and raw else "unknown"
+        if label == "live":
+            label = origin  # a sweep or replay pass never stamps live
+        inputs = event.get("inputs")
+        for port, group, adapter in ports:
+            given = inputs.get(port) if isinstance(inputs, dict) else None
+            if (group, eid) in seen or not isinstance(given, dict):
+                continue
+            try:
+                judged = adapter(cast("dict[str, Any]", given))
+            except Exception as exc:  # noqa: BLE001 - one port never fails the pass
+                errors.append(f"{port} {eid!r}: {type(exc).__name__}")
+                continue
+            if judged is None or judged[0] not in ("agree", "disagree"):
+                continue  # not judged: no row, retried next pass
+            verdict, n6, conveyor = judged
+            n6_text, conveyor_text = _text(n6), _text(conveyor)
+            if verdict == "agree":
+                n6_text = conveyor_text
+            elif n6_text == conveyor_text:
+                n6_text = f"disagree: {n6_text}"
+            seen.add((group, eid))
+            rows_out.append({"group": group, "event_id": eid, "n6_decision": n6_text,
+                             "conveyor_decision": conveyor_text, "safe": False,
+                             "origin": "rehearsal" if port in REHEARSAL_PORTS else label, "port": port})
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+        with (base / PHASE4).open("a", encoding="utf-8") as out:
+            out.writelines(json.dumps(r, sort_keys=True) + "\n" for r in rows_out)
+        if errors:
+            stamp = clock().isoformat()
+            with (base / PHASE4_ERRORS).open("a", encoding="utf-8") as log:
+                log.writelines(f"{stamp} {e}\n" for e in errors)
+    except OSError:
+        return 0
+    return len(rows_out)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="N6 shadow runner (Phase 1)")
     parser.add_argument("--live", type=int, metavar="N", help="print the last N judged slices")
@@ -305,6 +442,8 @@ def main(argv: list[str] | None = None) -> int:
         args.origin = "live"
         print("origin=live (default)", file=sys.stderr)  # a manual run is visible; conveyor path stays live
     judge(root, clock=lambda: datetime.now(timezone.utc), origin=cast(str, args.origin))
+    feed(root, _jsonl(root / "build" / "n6" / PHASE4_INBOX), clock=lambda: datetime.now(timezone.utc),
+         origin=cast(str, args.origin))
     daily(root, clock=lambda: datetime.now().astimezone())  # local day; never fails the pass
     return 0
 
