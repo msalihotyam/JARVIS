@@ -22,6 +22,7 @@ _spec.loader.exec_module(run)
 
 from jarvis.n6_ci_watch import ShadowRecord  # noqa: E402
 from jarvis.n6_kpi import KpiRow, record, rows  # noqa: E402
+from jarvis import n6_presence as presence  # noqa: E402
 
 SHA = "a" * 40
 T0 = datetime(2026, 11, 11, 12, 0, tzinfo=timezone.utc)
@@ -404,7 +405,7 @@ class Phase4FeedTest(unittest.TestCase):
 
     def event(self, eid: str, origin: str = "live") -> dict:
         inputs = {port: {} for port, _, _ in run.PORTS}
-        inputs["ffrehearse"] = {"status": "ok", "conveyor": "ok"}
+        inputs["ffrehearse"] = {"status": "pass", "conveyor": "pass"}
         return {"event_id": eid, "origin": origin, "inputs": inputs}
 
     def feed(self, events: list, ports=STUB_PORTS) -> int:
@@ -480,7 +481,7 @@ class Phase4FeedTest(unittest.TestCase):
     def test_real_ports_judge_or_skip_without_raising(self) -> None:
         ev = {"event_id": "e1", "origin": "live", "inputs": {
             "ci_watch": {"sha": SHA, "required": [], "events": "", "finish": {}},
-            "ffrehearse": {"status": "ok", "conveyor": "refused"}}}
+            "ffrehearse": {"status": "pass", "conveyor": "refused"}}}
         self.feed([ev], run.PORTS)
         rows = {r["port"]: r for r in run.shadow_rows(self.root)}
         self.assertEqual(rows["ffrehearse"]["origin"], "rehearsal")
@@ -512,6 +513,64 @@ class Phase4FeedTest(unittest.TestCase):
             with self.subTest(agreement=agreement, reason=reason), mock.patch.object(
                     run, "compare_finish", return_value=ShadowRecord("L1", SHA, agreement, reason, "n", "c")):
                 self.assertEqual(run._ci_watch(given), want)
+
+    def test_presence_unknown_on_either_side_writes_no_row(self) -> None:
+        unknown = {"prior": [], "idle_s": 0, "pace": None, "now": 0, "events": [{"event": "presence_unknown"}]}
+        signal, _ = run.sense(run.state_from_events([]), 0, run.read_pace(None), 0)
+        self.assertEqual(signal.presence, presence.UNKNOWN)
+        self.assertEqual([c.verdict for c in run.shadow_compare([(signal, unknown["events"])])], ["agree"])
+        self.assertIsNone(run._presence(unknown))
+        for events, want in (([{"event": "presence_unknown"}], None), ([], "agree")):
+            with self.subTest(events=events), mock.patch.object(
+                    run, "sense", return_value=(presence.Signal(presence.PRESENT), presence.State())):
+                if want is None:  # mirror: N6 no change vs only presence_unknown compares None == None
+                    self.assertEqual([c.verdict for c in run.shadow_compare(
+                        [(presence.Signal(presence.PRESENT), events)])], ["agree"])
+                judged = run._presence({**unknown, "events": events})
+                self.assertEqual(judged and judged[0], want)
+        self.assertEqual(self.feed([{"event_id": "e1", "origin": "live", "inputs": {"presence": unknown}}],
+                                   run.PORTS), 0)
+
+    def test_ffrehearse_judges_only_a_final_pass_against_the_conveyor_vocabulary(self) -> None:
+        bad = ("unknown", "refused", None, ["pass"], {"s": 1}, 1, "PASS", " pass", "", "ok", "missing")
+        for key in ("status", "conveyor"):
+            for value in bad:
+                if key == "conveyor" and value == "refused":
+                    continue  # a valid conveyor outcome: judged below
+                given: dict = {"status": "pass", "conveyor": "pass"}
+                if value == "missing":
+                    del given[key]
+                else:
+                    given[key] = value
+                with self.subTest(key=key, value=value):
+                    self.assertIsNone(run._ffrehearse(given))
+        self.assertEqual(run._ffrehearse({"status": "pass", "conveyor": "pass"}), ("agree", "pass", "pass"))
+        self.assertEqual(run._ffrehearse({"status": "pass", "conveyor": "refused"}),
+                         ("disagree", "pass", "refused"))
+        ev = {"event_id": "e1", "origin": "live", "inputs": {"ffrehearse": {"status": "unknown", "conveyor": "pass"}}}
+        self.assertEqual(self.feed([ev], run.PORTS), 0)
+        self.assertEqual(run.shadow_rows(self.root), [])
+
+    def test_history_rows_with_non_str_ids_are_skipped(self) -> None:
+        (self.root / "build/n6/phase4.jsonl").write_text("".join(json.dumps(r) + "\n" for r in (
+            {"group": ["R10"], "event_id": "e1"}, {"group": "R10", "event_id": {"x": 1}},
+            {"group": "R10", "event_id": 7}, {"group": None, "event_id": None})), encoding="utf-8")
+        self.assertEqual(self.feed([self.event("e1")]), 5)
+
+    def test_unreadable_files_never_raise_and_unreadable_history_skips_the_pass(self) -> None:
+        inbox = self.root / "inbox.jsonl"
+        inbox.write_bytes(b'{"event_id": "e1"}\n\xff\xfe\n')
+        self.assertEqual(run._jsonl(inbox), [])
+        history = self.root / "build/n6/phase4.jsonl"
+        history.write_bytes(b'{"group": "R10", "event_id": "e1"}\n\xff\n')
+        self.assertEqual(self.feed([self.event("e1")]), 0)
+        self.assertEqual(history.read_bytes(), b'{"group": "R10", "event_id": "e1"}\n\xff\n')
+        self.assertIn("phase4.jsonl unreadable", (self.root / "build/n6/phase4_errors.log").read_text("utf-8"))
+        history.unlink()
+        history.mkdir()
+        self.assertEqual(self.feed([self.event("e1")]), 0)
+        self.assertTrue(history.is_dir())
+        self.assertEqual(run.shadow_rows(self.root), [])
 
     def test_switch_off_writes_nothing(self) -> None:
         (self.root / "build/n6/SHADOW_ON").unlink()
