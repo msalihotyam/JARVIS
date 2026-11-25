@@ -29,6 +29,7 @@ too-deep input or any detector exception gives a typed Refusal, never the text.
 """
 
 from dataclasses import dataclass
+from functools import lru_cache
 import re
 import unicodedata
 
@@ -108,6 +109,9 @@ _CASED_SHAPES = (
 _ALNUM = re.compile(r"[^\W_]+")
 _GAP = re.compile("[\\s\"'`)\\]}’”»›“‘«‹„]*+")
 _ASCII_SEP = (":", "=", "%3a", "%3d", "%3A", "%3D")
+# Prefilter for _foreign_separator: whole _ALNUM words followed by a gap and an ASCII
+# separator or a non-ASCII non-word char (P/S are never \w); the loop re-checks exactly.
+_SEP_WORD = re.compile(r"(?<![^\W_])[^\W_]++(?=" + _GAP.pattern + r"(?:[:=]|%3[adAD]|[^\x00-\x7f\w]))")
 _COLON_NAME = re.compile(r"\b(?:COLON|EQUALS)\b")
 
 # Complement rule skeleton: "\x00" = other Latin letter (wildcard), "\x01" = mark or
@@ -122,25 +126,33 @@ _TAIL_STOP = re.compile(r"[^a-z0-9_]")
 _CLEAN_FOLLOW = re.compile(r"[ \t]++[a-z]")
 
 
+# Per-character lookups are memoised: bounded by the code point space, and the slow
+# unicodedata.name call otherwise dominates non-Latin text (CLREV F1).
+_name = lru_cache(maxsize=None)(lambda c: unicodedata.name(c, ""))
+_category = lru_cache(maxsize=None)(unicodedata.category)
+
+
+@lru_cache(maxsize=None)
 def _latin(c):
-    return c < "\x80" or unicodedata.name(c, "").startswith("LATIN")
+    return c < "\x80" or _name(c).startswith("LATIN")
 
 
 def _fold(text):
     """(marks dropped, marks dropped + look-alikes mapped) copies."""
     plain = unicodedata.normalize("NFKD", _IGNORABLE.sub("", text))
     if not plain.isascii():
-        plain = "".join(c for c in plain if unicodedata.category(c) not in _DROP)
+        plain = plain.translate({ord(c): None for c in set(plain) if _category(c) in _DROP})
     return plain, _IGNORABLE.sub("", plain.translate(_LOOKALIKE))
 
 
+@lru_cache(maxsize=None)
 def _skeleton_char(c):
-    if unicodedata.category(c) in _DROP:
+    if _category(c) in _DROP:
         return "\x01"
     if not c.isalpha():
         return c
     base = "".join(x for x in unicodedata.normalize("NFKD", c)
-                   if unicodedata.category(x) not in _DROP).translate(_LOOKALIKE)
+                   if _category(x) not in _DROP).translate(_LOOKALIKE)
     if base.isascii() and base.isalpha():
         return base.lower()
     return "\x00" if _latin(c) else "\x02"
@@ -175,6 +187,8 @@ def _lower(folded):
 
 def _mixed_script(plain):
     # Latin plus any other script's letter in one word (Turkish letters are Latin).
+    if len({_latin(c) for c in set(plain) if c.isalpha()}) < 2:
+        return False  # one script in the whole text: no word can mix (skips the word loop)
     for word in _ALNUM.findall(plain):
         if not word.isascii():
             scripts = {_latin(c) for c in set(word) if c.isalpha()}  # distinct chars: name() is slow
@@ -186,13 +200,13 @@ def _mixed_script(plain):
 def _foreign_separator(folded):
     # A word with another script's letters (all-Lisu/Cherokee "PASSWORD", single script
     # so not mixed) right before a separator; over-holds such lines in Cyrillic/Greek.
-    for match in _ALNUM.finditer(folded):
+    for match in _SEP_WORD.finditer(folded):
         word = match.group()
         if not word.isascii() and any(c.isalpha() and not _latin(c) for c in set(word)):
             at = _GAP.match(folded, match.end()).end()
             if folded.startswith(_ASCII_SEP, at) or (
                     at < len(folded) and not folded[at].isascii()
-                    and unicodedata.category(folded[at])[0] in "PS"):
+                    and _category(folded[at])[0] in "PS"):
                 return True
     return False
 
@@ -219,7 +233,7 @@ def _kinds(text):
     found.update(kind for kind, shape in _CASED_SHAPES if shape.search(folded))
     # Any char named COLON/EQUALS counts as a separator later on the line ("password is≔x").
     colons = {ord(c): ":" for c in set(lower)
-              if not c.isascii() and _COLON_NAME.search(unicodedata.name(c, ""))}
+              if not c.isascii() and _COLON_NAME.search(_name(c))}
     if _secret_word(lower.translate(colons) if colons else lower):
         found.add("secret_word")
     if _mixed_script(plain):

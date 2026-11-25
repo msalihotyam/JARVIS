@@ -326,6 +326,40 @@ class PerformanceTests(unittest.TestCase):
                 redact(tail)
                 self.assertLess(time.perf_counter() - start, 0.25)
 
+    def test_distinct_non_latin_inputs_are_fast(self):
+        # CLREV-TALKREDACT2FIX4 F1: per-char unicodedata lookups made these 0.3-0.6 s.
+        n = 200_000
+
+        def cjk(i):
+            return chr(0x4E00 + i % 20992)
+
+        texts = {
+            "cjk_spaced": "".join(cjk(i) + " " for i in range(n // 2)),
+            "cjk_unspaced": "".join(cjk(i) for i in range(n)),
+            "cjk_500_repeated": "".join(cjk(i) for i in range(500)) * (n // 500),
+            "cyrillic": "".join(chr(0x400 + i % 256) + ("" if i % 6 else " ")
+                                for i in range(n))[:n],
+            "mixed": "".join(("a", chr(0x430 + i % 32), cjk(i), "ж1 ", chr(0x3B1 + i % 24))[i % 5]
+                             for i in range(n))[:n],
+        }
+        for name, text in texts.items():
+            with self.subTest(input=name):
+                best = 1.0
+                for _ in range(3):
+                    start = time.perf_counter()
+                    result = redact(text)
+                    best = min(best, time.perf_counter() - start)
+                self.assertLess(best, 0.25)
+                self.assertIsInstance(result, RedactResult)
+        self.assertEqual(redact(texts["cjk_spaced"]).text, texts["cjk_spaced"])
+
+    def test_foreign_word_before_unicode_separator_still_flagged(self):
+        # The _SEP_WORD prefilter must keep every word the exact check would flag.
+        for text in ("密码 ≔ x", "密码：x", "пароль » = x", "ᏢᎪᏚᏚ: x", "a 密码→x",
+                     "ꓑꓮꓢꓢ %3A x"):
+            with self.subTest(text=ascii(text)):
+                self.assertEqual(redact(text).text, FIXED_LINE)
+
     def test_jwt_inside_a_token_run_is_still_flagged(self):
         # The anchored start must not lose an "eyJ" that follows other token chars.
         for text in ("xeyJhbGciOi.eyJzdWIiOi.sig", "ab_-eyeyJhbGciOi.eyJzdWIiOi.sig",
@@ -348,7 +382,7 @@ class StaticTests(unittest.TestCase):
                 names.update(alias.name for alias in node.names)
             elif isinstance(node, ast.ImportFrom):
                 names.add(node.module)
-        self.assertLessEqual(names, {"dataclasses", "re", "unicodedata", "jarvis.contracts"})
+        self.assertLessEqual(names, {"dataclasses", "functools", "re", "unicodedata", "jarvis.contracts"})
 
     def test_refusal_reasons_are_ascii(self):
         for reason in ("input_not_text", "input_too_deep", "redaction_failed"):
