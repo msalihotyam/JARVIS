@@ -19,6 +19,11 @@ _MAGIC = {b"\x89PNG\r\n\x1a\n": "png", b"\xff\xd8\xff": "jpg", b"%PDF-": "pdf"}
 _ALLOWED_KINDS = _TEXT_KINDS | _OFFICE_PARTS.keys() | set(_MAGIC.values()) | {"webp"}
 _TRIM = re.compile(r"^[\s.]+|[\s.]+$")
 _RESERVED = re.compile(r"(?i)CON|PRN|AUX|NUL|(?:COM|LPT)[0-9¹²³]")
+# Default_Ignorable_Code_Point (DerivedCoreProperties); Cc/Cf alone misses CGJ, variation selectors and fillers.
+_IGNORABLE = re.compile(
+    "[­͏؜ᅟᅠ឴឵᠋-᠏​-‏‪-‮⁠-⁯"
+    "ㅤ︀-️﻿ﾠ￰-￸\U0001bca0-\U0001bca3\U0001d173-\U0001d17a\U000e0000-\U000e0fff]"
+)
 
 
 class AttachmentRefused(ValueError):
@@ -57,10 +62,10 @@ def _office_kind(content: bytes) -> str:
 def _display_stem(stem: str, limit: int) -> str:
     """A label that never reads as an NTFS stream, 8.3 alias, device name or trimmed Windows name."""
     stem = "".join(char for char in stem if unicodedata.category(char) not in {"Cc", "Cf", "Cs"})
-    stem = re.sub(r"~(?=\d)", "_", stem.split(":", 1)[0])
+    stem = re.sub(r"~(?=\d)", "_", _IGNORABLE.sub("", stem).split(":", 1)[0])
     stem = _TRIM.sub("", _TRIM.sub("", stem)[:limit]) or "attachment"
     if _RESERVED.fullmatch(stem.split(".", 1)[0].rstrip()):
-        stem = "_" + stem[:limit - 1]
+        stem = _TRIM.sub("", "_" + stem[:limit - 1])
     return stem
 
 

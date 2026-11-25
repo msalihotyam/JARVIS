@@ -126,6 +126,18 @@ class AttachmentIntakeTests(unittest.TestCase):
                 self.assertTrue(self.display_name(stem + ".png").startswith("_"))
         self.assertEqual(self.display_name("CONSOLE.png"), "CONSOLE.png")
 
+    def test_display_name_reserved_escape_retrims_after_truncation(self):
+        self.assertEqual(self.display_name("CON." + "a" * 110 + ".x.png"), "_CON." + "a" * 110 + ".png")
+        self.assertEqual(self.display_name("CON." + "a" * 110 + " x.png"), "_CON." + "a" * 110 + ".png")
+
+    def test_display_name_strips_default_ignorables_before_reserved_check(self):
+        # CGJ, variation selectors, Mongolian FVS, Hangul fillers, VS17: Mn/Lo, not Cc/Cf.
+        for char in ("͏", "︀", "️", "᠋", "᠍", "ᅟ", "ᅠ", "ㅤ", "ﾠ",
+                     "឴", "\U000e0100"):
+            with self.subTest(char=hex(ord(char))):
+                self.assertEqual(self.display_name("CON" + char + ".png"), "_CON.png")
+                self.assertEqual(self.display_name("re" + char + "port.png"), "report.png")
+
     def test_display_name_trims_trailing_dots_and_spaces(self):
         self.assertEqual(self.display_name("report. . .png"), "report.png")
         long_name = "a" * 114 + ". .png"

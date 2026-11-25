@@ -45,6 +45,15 @@ class TalkGlossaryTests(unittest.TestCase):
         self.assertEqual(glossary.correct("İ́"), ("N6", [Replacement("İ́", "N6")]))
         self.assertEqual(glossary.correct("í"), ("N6", [Replacement("í", "N6")]))
 
+    def test_dotted_capital_i_with_a_lower_mark_folds_to_i(self):
+        # NFC composes I with the lower mark first (U+1ECA, U+012E, U+1E2C) and strands U+0307.
+        for mark in ("̣", "̨", "̰"):
+            glossary = self.load_rows([{"canonical": "N6", "aliases": ["i" + mark]}])
+            for text in ("İ" + mark, "I" + mark + "̇", "İ" + mark):
+                with self.subTest(mark=hex(ord(mark)), text=ascii(text)):
+                    self.assertEqual(glossary.correct(text), ("N6", [Replacement(text, "N6")]))
+                    self.assertEqual(glossary.correct("N6"), ("N6", []))
+
     def test_aliases_equal_after_fold_and_nfc_are_refused_at_load(self):
         with self.assertRaisesRegex(ValueError, "ambiguous"):
             self.load_rows([
