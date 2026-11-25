@@ -92,6 +92,13 @@ class RecoveryTestCase(DispatchTestCase):
 
     def setUp(self) -> None:
         super().setUp()
+        # Speed only: an idle autocommit reader keeps the WAL/-shm files alive
+        # between the store's per-operation connections, so Windows does not
+        # delete and recreate them on every call. It holds no transaction or
+        # lock (cursor fully consumed), so checkpoints and writes are unchanged.
+        keeper = sqlite3.connect(self.database, isolation_level=None)
+        keeper.execute("SELECT count(*) FROM sqlite_master").fetchall()
+        self.addCleanup(keeper.close)
         # ``at`` claims and binds; the lease runs five minutes from there.
         self.expiry = self.at + LEASE
         self.just_live = self.expiry - timedelta(microseconds=1)
