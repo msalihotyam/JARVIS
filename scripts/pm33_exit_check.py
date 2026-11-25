@@ -22,15 +22,16 @@ defined here but jarvis/work_driver.py emits nothing, so real runs print NOT_YET
   accepted_with_receipt  each slice's LAST event is step_state accepted at its highest attempt; in
                          that attempt checks + regression passed and the receipt progress{gate:"apply",
                          passed:true, ref:str} follows an apply_intent with the same idempotency_key;
-                         that attempt opens with its own running event and has no other terminal step
-                         state before the accept; no receipt key or ref is shared by two slices
-                         (compared NFKC, format characters dropped, trimmed, casefolded)
+                         that attempt opens with its own running event; the slice has no other
+                         terminal step state (any attempt) before the accept; no accepted receipt
+                         key or ref was applied (apply passed:true, any attempt) by another slice
+                         or the run (format characters dropped, NFKC, trimmed, casefolded)
   notify_points_only     progress{gate:"notify", point:str}, every point a section 2.1 point      (no writer yet)
-  no_failed_state        no run_state failed or cancelled, no run_state after a terminal one, no
-                         step_state failed_after_cap or slice_failed_after_cap
+  no_failed_state        no run_state failed or cancelled, no run_state or done event after a
+                         terminal one, no step_state failed_after_cap or slice_failed_after_cap
   pm30_pm32              pm30_green is True and pm32_verdict == "yes"
   log_integrity          seq 1..N contiguous, unique, one run id, every event well-formed
-                         (step_state attempt an int >= 1)
+                         (seq <= 2**63-1, step_state attempt an int >= 1)
 OVERALL is PASS only when every line is PASS and the last terminal run event is done.
 """
 from __future__ import annotations
@@ -60,6 +61,7 @@ NOTIFY_POINTS = frozenset({
 _QUESTIONS = frozenset({"questions_ready", "readback_ready", "plan_ready", "approval_required"})
 _TERMINAL = frozenset({"done", "failed", "cancelled"})
 _FIELDS = ("run_id", "seq", "kind", "step_key", "payload_json")
+_MAX_SEQ = 2**63 - 1
 _RUN_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
 # Payload field types per event kind (progress: per gate), from the work_driver writers;
 # bool is not int here (type(...) is, not isinstance).
@@ -97,7 +99,7 @@ def _parse(raw: object) -> tuple[dict | None, str]:
         run_id, seq, kind, step, text = (raw[name] for name in _FIELDS)
         if type(run_id) is not str or not _RUN_ID.fullmatch(run_id):
             return None, "bad run_id"
-        if type(seq) is not int or seq < 1:
+        if type(seq) is not int or not 1 <= seq <= _MAX_SEQ:  # SQLite INTEGER is 64-bit
             return None, "bad seq"
         if type(kind) is not str or not kind:
             return None, "bad kind"
@@ -144,9 +146,10 @@ def _int(value: object) -> bool:
 
 
 def _norm(value: str) -> str:
-    """One spelling per visible text: NFKC, format characters (zero-width) dropped, trimmed, casefolded."""
-    text = unicodedata.normalize("NFKC", value)
-    return "".join(c for c in text if unicodedata.category(c) != "Cf").strip().casefold()
+    """One spelling per visible text: format characters (zero-width) dropped, then NFKC, trimmed,
+    casefolded (dropping first lets a split combining sequence compose)."""
+    text = "".join(c for c in value if unicodedata.category(c) != "Cf")
+    return unicodedata.normalize("NFKC", text).strip().casefold()
 
 
 def _str(value: object) -> bool:
@@ -232,7 +235,8 @@ def _slice_receipt(sl: list[dict]) -> tuple[str, str, str, list[int]]:
     window = _last_attempt(sl)
     if not window or any(e["kind"] == "step_state" and e["p"].get("attempt") != att for e in window):
         return "", "", "accepted attempt has no running event of its own", [last["seq"]]
-    ended = [e["seq"] for e in window[:-1] if _state(e, "step_state") in TERMINAL_STEP_STATES]
+    # A terminal step state has no way out in the ledger, whatever attempt or place it was logged at.
+    ended = [e["seq"] for e in sl[:-1] if _state(e, "step_state") in TERMINAL_STEP_STATES]
     if ended:
         return "", "", "terminal step state before the accept", ended
     for name in ("checks", "regression"):
@@ -254,19 +258,27 @@ def _slice_receipt(sl: list[dict]) -> tuple[str, str, str, list[int]]:
 def _accepted(evs: list[dict], slices: dict) -> _Verdict:
     if not slices:
         return False, "no slices", []
+    # Every receipt really applied (any attempt, any slice, or the run itself) owns its key and ref,
+    # so another slice can never claim it; spelling variants count as the same receipt
+    # (over-matching only fails closed).
+    owners: dict[tuple[str, str], dict[str, list[int]]] = {}
+    for e in evs:
+        if _gate(e, "apply") and e["p"].get("passed") is True:
+            for label, field in (("receipt", "idempotency_key"), ("receipt ref", "ref")):
+                if type(e["p"].get(field)) is str:
+                    who = owners.setdefault((label, _norm(e["p"][field])), {})
+                    who.setdefault(e["step"], []).append(e["seq"])  # None = the run itself, never a slice name
     ids: list[int] = []
-    owner: dict[tuple[str, str], str] = {}
     for name, sl in sorted(slices.items()):
         key, ref, why, seqs = _slice_receipt(sl)
         if not key:
             return False, f"{name}: {why}", seqs
-        # The driver's key is per run+step+attempt, so a reused receipt shows as a shared ref;
-        # spelling variants count as the same receipt (over-matching only fails closed).
         for label, value in (("receipt", key), ("receipt ref", ref)):
-            norm = (label, _norm(value))
-            if norm in owner:
-                return False, f"{label} shared by {owner[norm]} and {name}", seqs
-            owner[norm] = name
+            others = {k: v for k, v in owners.get((label, _norm(value)), {}).items() if k != name}
+            if others:
+                other = sorted(others, key=str)[0]
+                by = "the run" if other is None else other
+                return False, f"{label} shared by {by} and {name}", sorted(others[other] + seqs)
         ids.extend(seqs)
     return True, "", ids
 
@@ -282,9 +294,12 @@ def _notify(evs: list[dict], slices: dict) -> _Verdict:
 def _no_failed(evs: list[dict], slices: dict) -> _Verdict:
     if not slices:
         return False, "no slices", []
-    runs = [e for e in evs if e["kind"] == "run_state"]
-    # A terminal run state has no way out in the ledger, so a later run_state means a resumed run.
-    ended = {e["seq"] for e in runs[:-1] if e["p"].get("state") in _TERMINAL}
+    runs = [e for e in evs if e["kind"] in ("run_state", EventKind.DONE.value)]
+    # A terminal run state (or a done event) has no way out in the ledger, so a later run event
+    # means a resumed run, and a later step event means work after the end.
+    term = [e["seq"] for e in runs if e["kind"] == EventKind.DONE.value or e["p"].get("state") in _TERMINAL]
+    ended = {s for s in term if s != runs[-1]["seq"]}
+    ended |= {e["seq"] for e in evs if term and e["seq"] > min(term) and e["step"] is not None}
     bad = sorted(ended | {e["seq"] for e in evs if _state(e, "run_state") in ("failed", "cancelled")
                           or _state(e, "step_state") == "failed_after_cap" or e["kind"] == "slice_failed_after_cap"})
     return (False, "failed state", bad) if bad else (True, "", [])

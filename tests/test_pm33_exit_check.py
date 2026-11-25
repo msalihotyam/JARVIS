@@ -220,7 +220,63 @@ MUTATIONS = {
     "worker_fullwidth_claude": (lambda: _edit(lambda k, s, p: ("progress", "s1", {
         "gate": "worker_kind", "worker": "Ｃlaude-opus"}) if p.get("gate") == "no_quota" else (k, s, p)),
                                 "non_claude_or_no_quota"),
+    # PM33EXIT2FIX2 F1: a key/ref any other slice applied in ANY attempt (or the run itself) is owned
+    "shared_ref_earlier_attempt_interrupted": (lambda: _retried("interrupted"), "accepted_with_receipt"),
+    "shared_ref_earlier_attempt_accepted": (lambda: _retried("accepted"), "accepted_with_receipt"),
+    "shared_key_earlier_attempt": (lambda: _retried("interrupted", ref2="ref-s2"), "accepted_with_receipt"),
+    "shared_ref_only_earlier_attempt": (lambda: _retried("interrupted", key2="k-s2"), "accepted_with_receipt"),
+    "shared_ref_earlier_attempt_case": (lambda: _retried("interrupted", key2="k-s2", ref2=" REF-S1"),
+                                        "accepted_with_receipt"),
+    "shared_ref_run_level_apply": (lambda: _insert(18, ("progress", None, {
+        "gate": "apply", "passed": True, "idempotency_key": "k-x", "ref": "ref-s2"})), "accepted_with_receipt"),
+    # F2: a terminal step state of the slice anywhere before its final accept
+    "cancelled_before_running": (lambda: _insert(4, ("step_state", "s1", {"state": "cancelled", "attempt": 1})),
+                                 "accepted_with_receipt"),
+    "accepted_before_running": (lambda: _insert(4, ("step_state", "s1", {"state": "accepted", "attempt": 1})),
+                                "accepted_with_receipt"),
+    "failed_after_cap_before_running": (lambda: _insert(4, ("step_state", "s1", {
+        "state": "failed_after_cap", "attempt": 1})), "accepted_with_receipt"),
+    # F3: Cf dropped before NFKC, so a zero-width char cannot keep a decomposed form apart
+    "shared_ref_decomposed": (lambda: _edit(lambda k, s, p: (k, s, {**p, "ref": {"s1": "é", "s2": "e​́"}[s]})
+                                            if p.get("gate") == "apply" else (k, s, p)), "accepted_with_receipt"),
+    "shared_key_decomposed": (lambda: _edit(lambda k, s, p: (k, s, {**p, "idempotency_key": {
+        "s1": "é", "s2": "e​́"}[s]}) if "idempotency_key" in p else (k, s, p)), "accepted_with_receipt"),
+    # F4: a done-kind event is terminal for no_failed_state too
+    "done_kind_first": (lambda: _mk([("done", None, {})] + _base()), "no_failed_state"),
+    "done_kind_mid": (lambda: _insert(11, ("done", None, {})), "no_failed_state"),
+    # probe: step work after the run ended (run_state done moved early, or a done event with no run_state done)
+    "step_after_run_done": (lambda: _ended_early(_DONE), "no_failed_state"),
+    "step_after_done_kind": (lambda: _ended_early(("done", None, {})), "no_failed_state"),
+    # probe: a run-level apply's ref is the run's, even for a slice literally named "<run>"
+    "shared_ref_run_vs_slice_named_run": (lambda: (lambda b: _mk(b[:18] + [("progress", None, {
+        "gate": "apply", "passed": True, "idempotency_key": "k-x", "ref": "ref-<run>"})] + b[18:]))(
+        _base(("s1", "<run>"))), "accepted_with_receipt"),
+    # F5: seq beyond SQLite's 64-bit INTEGER is malformed
+    "seq_over_int64": (lambda: _raw(_put(-1, "seq", 10**5000)), "log_integrity"),
+    "seq_int64_plus_one": (lambda: _raw(_put(-1, "seq", _HUGE_SEQ + 1)), "log_integrity"),
 }
+
+
+_DONE = ("run_state", None, {"state": "done"})
+
+
+def _ended_early(end):
+    """The run ends (`end`) right after the clarify head, then the slices' step events follow."""
+    b = [e for e in _base() if e != _DONE]
+    return _mk(b[:3] + [end] + b[3:])
+
+
+def _retried(end1, key2="k-s1", ref2="ref-s1"):
+    """s1 attempt 1 applies k-s1/ref-s1 and ends `end1`; attempt 2 (epoch 3) is accepted with k-new/ref-new;
+    s2 uses key2/ref2. With key2="k-s2", ref2="ref-s2" this is a passing log."""
+    b = _base()
+    s1_2 = [("step_state", "s1", {"state": "running", "attempt": 2, "epoch": 3})] + b[5:8] + [
+        ("progress", "s1", {"gate": "apply_intent", "idempotency_key": "k-new"}),
+        ("progress", "s1", {"gate": "apply", "passed": True, "idempotency_key": "k-new", "ref": "ref-new"}),
+        ("step_state", "s1", {"state": "accepted", "attempt": 2})]
+    s2 = [(k, s, {**p, "idempotency_key": key2, **({"ref": ref2} if "ref" in p else {})}
+           if "idempotency_key" in p else p) for k, s, p in b[11:18]]
+    return _mk(b[:10] + [("step_state", "s1", {"state": end1, "attempt": 1})] + s1_2 + s2 + b[18:])
 
 
 def _line(lines, name):
@@ -238,6 +294,10 @@ class EvaluateTests(unittest.TestCase):
         for name in ("log_integrity",) + CRITERIA + ("terminal_done",):
             self.assertRegex(_line(lines, name), r"^\w+: PASS \[[0-9,]*\]$")
         self.assertEqual(_line(lines, "unknown_kinds"), "unknown_kinds: 0 []")
+
+    def test_retry_with_own_receipts_still_passes(self):
+        # control for the F1 mutations: an interrupted attempt and a retry with a new receipt alone pass
+        self.assertEqual(_run(_retried("interrupted", key2="k-s2", ref2="ref-s2"))[-1], "OVERALL: PASS")
 
     def test_not_yet_lines_carry_evidence_ids(self):
         line = _line(_run(MUTATIONS["checks_failed"][0]()), "accepted_with_receipt")
