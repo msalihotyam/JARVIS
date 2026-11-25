@@ -37,7 +37,8 @@ MARKERS = {  # CIDIAG1 D4, plus the platform gate (such a module may skip off Wi
     "winapi": re.compile(r"(?i:\bwindll\b|\boledll\b)|\bwintypes\b|\bWINFUNCTYPE\b|\bWinError\b|\bGetLastError\b"
                          r"|\bFormatError\b|\bwinreg\b|\bmsvcrt\b|\bwin32\w*"
                          r"|\bpywintypes\b|\bcomtypes\b|\buiautomation\b"
-                         r"|(?i:\b(?:kernel|user|advapi|shell|gdi|ole|ws2_)32\b)|\b_winapi\b|\bwinsound\b|\bstartfile\b"),
+                         r"|(?i:\b(?:kernel|user|advapi|shell|gdi|ole|ws2_)32\b)|\b_winapi\b|\bwinsound\b|\bstartfile\b"
+                         r"|\b[gs]et_last_error\b|\bHRESULT\b"),
     "powershell": re.compile(r"powershell|\bpwsh\b|\.ps1\b", re.IGNORECASE),
     "qml_qt": re.compile(r"PySide6|\bQQml|\bQml|\.qml\b|\bjarvis\.ui\b"),
     "platform_gate": re.compile(r"sys\.platform|os\.name\s*[!=]=|platform\.system\(\)"
@@ -48,6 +49,7 @@ _FAILED = re.compile(r"^(?:FAIL|ERROR): (\S+) \(([\w.]+)\)", re.MULTILINE)
 _IN_NAME = re.compile(r"\((tests\.test_\w+)\.")
 SIDES = {"shard-report.json": ("windows", "shard-summary.txt"),
          "os-shadow-report.json": ("linux", "os-shadow-summary.txt")}
+RUN_ID = "run-id.txt"  # .txt, never .json: the gate's aggregate reads every *.json in the shard artifacts
 
 
 class Refused(ValueError):
@@ -116,7 +118,7 @@ def _module_of(test_id: str) -> str:
 def read_report(path: Path) -> dict | None:
     """One report as {dispatched, failing, skipped, seconds, wall, shard}; None when it cannot be accounted
     for (unreadable, a test count that does not add up, a red run whose failures are not all named, or a
-    skip that is not on a tests.* id)."""
+    skip whose id is neither a dispatched id nor a class/module prefix of one)."""
     try:
         report = json.loads(path.read_text(encoding="utf-8-sig", errors="replace"))
         dispatched = list(report["dispatched"])
@@ -135,10 +137,14 @@ def read_report(path: Path) -> dict | None:
         skips = report["skips"]  # [[id, reason]]; a skipped test never ran, so its module is not "pass"
         if not isinstance(skips, list) or len(skips) != int(report["skipped"]):
             return None
+        # a skip id must be a dispatched id or a dot-boundary class/module prefix of one (setUpClass names
+        # its class); any other id hides which dispatched test did not run, so no module can be passing
+        known = {".".join(parts[:i]) for t in dispatched for parts in [str(t).split(".")]
+                 for i in range(2, len(parts) + 1)}
         skipped = set()
         for test, _reason in skips:
-            if not _MODULE.match(str(test)):
-                return None  # a skip that cannot be put on a module: no module can be called passing
+            if not isinstance(test, str) or not _MODULE.match(test) or test not in known:
+                return None
             skipped.add(_module_of(test))
         seconds: dict[str, float] = {}
         for value, name in report["durations"]:
@@ -149,6 +155,21 @@ def read_report(path: Path) -> dict | None:
                 "skipped": skipped, "seconds": seconds, "wall": float(report["wall"]), "shard": report["shard"]}
     except (OSError, ValueError, KeyError, TypeError):
         return None
+
+
+def run_id(run_dir: Path) -> str | None:
+    """The one CI run id written beside every report in run_dir (tests.yml: run-id.txt holds
+    github.run_id); None with no report. Refused when a report has none or the dir mixes two runs."""
+    found = set()
+    for report in (p for name in SIDES for p in sorted(run_dir.rglob(name))):
+        beside = report.with_name(RUN_ID)
+        value = beside.read_text(encoding="utf-8-sig", errors="replace").strip() if beside.is_file() else ""
+        if not value:
+            raise Refused(f"compare: {report} has no {RUN_ID} beside it (its CI run is unknown)")
+        found.add(value)
+    if len(found) > 1:
+        raise Refused(f"compare: {run_dir} mixes the artifacts of CI runs {', '.join(sorted(found))}")
+    return found.pop() if found else None
 
 
 def read_run(run_dir: Path, modules: list[str]) -> dict:
@@ -270,10 +291,12 @@ def main(argv: list[str] | None = None) -> int:
             raise Refused("compare needs existing run dirs and --runs-needed >= 1")
         if len({d.resolve() for d in args.run_dirs}) < len(args.run_dirs):
             raise Refused("compare: a run dir is given twice (one run would count as several)")
-        # shortcut: catches copied reports only; a dir mixing two runs' artifacts needs a run id in them
         copies = [p.read_bytes() for d in args.run_dirs for name in SIDES for p in d.rglob(name)]
         if len(set(copies)) < len(copies):
             raise Refused("compare: the same report is in two places (one run would count as several)")
+        ids = [i for i in (run_id(d) for d in args.run_dirs) if i is not None]
+        if len(set(ids)) < len(ids):
+            raise Refused("compare: two run dirs hold the same CI run (one run would count as several)")
         runs = [read_run(d, modules) for d in args.run_dirs]
         rows = compare(runs, modules, args.runs_needed)
         for module, row in rows.items():
