@@ -2,6 +2,8 @@
 
 import math
 import posixpath
+import re
+import unicodedata
 from types import MappingProxyType
 from typing import NamedTuple
 
@@ -30,11 +32,44 @@ _EXPLICIT = tuple(n for n, w in WORKERS.items() if w.explicit)
 _TRACKED = tuple((n, w.headroom) for n, w in WORKERS.items() if w.headroom)
 (_AUTO,) = (n for n, w in WORKERS.items() if w.auto)  # exactly one, checked at import
 
+# Twins of scripts/conveyor.py ALIAS_DIRS, WIN_DEVICES, _hidden_char, _alias_suspect (PROTALIAS1);
+# tests.test_workers_route pins both sides and checks them over one alias corpus.
+_ALIAS_DIRS = (".claude", ".github", "workflows", "data", ".jarvis")
+_WIN_DEVICES = {"con", "prn", "aux", "nul", "conin$", "conout$",
+                *(f"{d}{i}" for d in ("com", "lpt") for i in range(1, 10))}
+
 
 def _number(value, maximum=None):
     return (type(value) in (int, float) and 0 <= value
             and (maximum is None or value <= maximum)
             and (type(value) is int or math.isfinite(value)))
+
+
+def _hidden_char(ch):
+    """C0/C1 control, format (bidi, zero-width, BOM, tags) or another default-ignorable code point."""
+    o = ord(ch)
+    return (unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp")
+            or o in (0x34F, 0x115F, 0x1160, 0x17B4, 0x17B5, 0x3164, 0xFFA0)
+            or 0x180B <= o <= 0x180F or 0xFE00 <= o <= 0xFE0F or 0xE0000 <= o <= 0xE0FFF)
+
+
+def _alias_suspect(p):
+    """True when p may name something other than it reads (8.3 alias, stream/drive,
+    Win32-trimmed name, device/UNC prefix, hidden char, reserved device, look-alike dir)."""
+    if re.match(r"[\\/]{2}", p):
+        return True
+    for c in re.split(r"[\\/]", p):
+        n = unicodedata.normalize("NFKC", c).casefold()
+        if (re.search(r"~\d", c) or ":" in c or c.endswith(".") or c[-1:].isspace()
+                or any(_hidden_char(ch) for ch in c)
+                or n.split(".")[0].rstrip(" ") in _WIN_DEVICES):
+            return True
+        # NFKC folds fullwidth; a same-length name equal at every ASCII position catches Cyrillic/Greek look-alikes
+        if not c.isascii() and any(n == d or (len(n) == len(d) and all(not a.isascii() or a == b
+                                                                       for a, b in zip(n, d)))
+                                   for d in _ALIAS_DIRS):
+            return True
+    return False
 
 
 def _veto(path):
@@ -44,7 +79,7 @@ def _veto(path):
     """
     q = posixpath.normpath(path.replace("\\", "/").strip()).lower()
     base = q.rsplit("/", 1)[-1]
-    return (q in ("", ".", "..") or any(c in q for c in "*?[~")
+    return (q in ("", ".", "..") or _alias_suspect(q) or any(c in q for c in "*?[~")
             or ":" in q or q.startswith(("/", "../"))
             or any(s.endswith((".", " ")) for s in q.split("/"))
             or (q + "/").startswith(("scripts/", ".claude/", ".github/", "data/"))

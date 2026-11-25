@@ -167,10 +167,10 @@ class TestRouteVetoParity(unittest.TestCase):
                 names |= {n.id for n in ast.walk(f) if isinstance(n, ast.Name)}
                 names |= {"." + n.attr for n in ast.walk(f) if isinstance(n, ast.Attribute)}
         # Non-str constants (bytes, slice/count ints) and methods (.isascii, .casefold) pinned too.
-        self.assertEqual(other, {"1"})  # rsplit("/", 1)
+        self.assertEqual(other, {"1", "True"})  # rsplit("/", 1); PROTALIAS1 "return True"
         # A new constant or helper the rules call (a .kdbx tuple, a regex) fails here too:
         # PROTECTED_DIRS/CODEX_VETO/PROTECTED_FILES are probed by corpus() already.
-        self.assertEqual(names, {"PROTECTED_DIRS", "CODEX_VETO", "any", "isinstance", "str",
+        self.assertEqual(names, {"PROTECTED_DIRS", "CODEX_VETO", "_alias_suspect", "any", "isinstance", "str",
                                  "posixpath", "protected_path", "base", "p", "q", "s", "c",
                                  ".endswith", ".lower", ".replace", ".rsplit", ".split",
                                  ".startswith", ".normpath", ".strip"})
@@ -208,7 +208,8 @@ class TestRouteVetoParity(unittest.TestCase):
         tree = ast.parse(Path(self.conveyor.__file__).read_text(encoding="utf-8"))
         digests = {}
         for f in tree.body:
-            if isinstance(f, ast.FunctionDef) and f.name in ("protected_path", "codex_veto"):
+            if isinstance(f, ast.FunctionDef) and f.name in ("protected_path", "codex_veto",
+                                                             "_alias_suspect", "_hidden_char"):
                 if ast.get_docstring(f):
                     f.body = f.body[1:]  # docstring edits do not change the rule
                 digests[f.name] = hashlib.sha256(repr(norm(f)).encode()).hexdigest()
@@ -216,8 +217,47 @@ class TestRouteVetoParity(unittest.TestCase):
                 self.assertEqual(getattr(self.conveyor, f.name).__code__.co_firstlineno,
                                  f.lineno - len(f.decorator_list), f.name)
         self.assertEqual(digests, {
-            "protected_path": "e0f696cd251aef7e68bec4f41014c476ebf2486e2db6d69bece35552f869c583",
-            "codex_veto": "0847911af6b29661c245fae96ddf01331c752f49176bbfdd0989024f357cee35"})
+            "protected_path": "17a3c85c91b15511d5dcb2ff0896d6cc698d80745cabc992d799624485122b58",
+            "codex_veto": "0847911af6b29661c245fae96ddf01331c752f49176bbfdd0989024f357cee35",
+            # PROTALIAS1FIX: twins in jarvis/workers/route.py; re-check them on any change.
+            "_alias_suspect": "417a3aae0adad76eb41dcca06cd81c9d9c6351fa8528bed87dd3895fc24a40b4",
+            "_hidden_char": "6694798025adebf312cfcd3739937a142d5cbd45faaa4b138fabcf559d8f1d04"})
+
+    def test_alias_corpus_matches_conveyor(self):
+        """PROTALIAS1FIX: route._alias_suspect/_veto and conveyor._alias_suspect/codex_veto
+        agree over one alias corpus (hostile path parts at every depth, PROTALIAS1 classes)."""
+        import importlib
+        import importlib.util
+        r = importlib.import_module("jarvis.workers.route")  # the module, not the route() function
+        c = self.conveyor
+        self.assertEqual(r._ALIAS_DIRS, c.ALIAS_DIRS)
+        self.assertEqual(r._WIN_DEVICES, c.WIN_DEVICES)
+        diff = [hex(o) for o in range(0x110000) if r._hidden_char(chr(o)) != c._hidden_char(chr(o))]
+        self.assertEqual(diff, [])
+        parts = set(_HOSTILE_PARTS)
+        if importlib.util.find_spec("tests.adversarial"):  # ADVCORPUS1 corpus once it is on the base
+            from tests import adversarial
+            parts |= set(adversarial.HOSTILE_PATH_PARTS) | set(getattr(adversarial, "HOSTILE_TEXT", ()))
+        paths = {d + s + t for s in parts for d in ("", "a/", "a\\b\\")
+                 for t in ("", "/x.py", "\\x.py", ".py")}
+        paths |= {p for ps in _PROTALIAS1.values() for p in ps} | set(_PROTALIAS1_SAFE)
+        for path in sorted(paths):
+            for variant in (path, path.upper()):
+                with self.subTest(path=ascii(variant)):
+                    self.assertEqual(r._alias_suspect(variant), bool(c._alias_suspect(variant)))
+                    self.assertEqual(r._veto(variant), c.codex_veto(variant))
+        for cls, ps in _PROTALIAS1.items():
+            for path in ps:
+                with self.subTest(cls=cls, path=ascii(path)):
+                    self.assertTrue(r._alias_suspect(path))
+                    # codex_veto .strip()s first, so a trailing-whitespace name ("x/y\x85") is
+                    # not vetoed on either side; route stays equal to it, never looser.
+                    self.assertEqual(route(facts(files=[path]))[1] == "veto", c.codex_veto(path))
+        for path in _PROTALIAS1_SAFE:
+            with self.subTest(safe=path):
+                self.assertFalse(r._alias_suspect(path))
+        for path in ("jarvis/talk_quote.py", "tests/test_x.py", "docs/data.md", "jarvis/ui/qml/Main.qml"):
+            self.assertFalse(r._veto(path), path)
 
 
 # AUD3TABLE1 oracle: _number() and route() verbatim from base a083d6d, before the table.
@@ -379,3 +419,31 @@ class TestWorkerTable(unittest.TestCase):
                 names.add(node.module or "")
                 names |= {a.name for a in node.names}
         self.assertEqual([n for n in names if "work_review" in n], [], names)
+
+
+# PROTALIAS1 classes and negatives (copy of tests.test_conveyor ProtAlias1Test.CLASSES/SAFE).
+_PROTALIAS1 = {
+    "a 8.3": ("CLAUDE~1/settings.json", "GITHUB~2/workflows/ci.yml", "jarvis/CORE~1.PY"),
+    "b stream": (".github/workflows::$DATA", "data:x/y", "jarvis/core.py:evil", "C:/dev/x.py"),
+    "c trimmed": (".claude./x", ".claude /x", "jarvis/core.py.", "jarvis/core.py ", ".claude\u3000/x", "data /x",
+                  "jarvis/a\u00a0/x.py"),
+    "d unc": ("\\\\?\\C:\\dev\\JARVIS\\.claude\\x", "\\\\.\\pipe\\x", "\\\\server\\share\\x", "//server/share/x"),
+    "e hidden": ("scripts/conve\u200byor.py", "jarvis/a\u202ecod.py", "x/\u2066y.py", "x\x01/y", "x/y\x85",
+                 "\ufeffdata/x", "x/a\u00ady", "x/a\u034fy", "jarvis/a\u2028b.py", "jarvis/a\U000e0041.py"),
+    "f device": ("CON.json", "x/nul", "PRN", "aux.py", "com1.txt", "x/LPT9.log", "COM\u00b9.txt", "con .txt",
+                 "jarvis/conin$.py"),
+    "g lookalike": (".cl\u0430ude/x", "\uff44\uff41\uff54\uff41/x", ".GIT\u0397UB/workflows/x", "x/w\u043erkflows/y",
+                    "\uff0ejarvis/x", ".clau\u0301de/x"),
+}
+_PROTALIAS1_SAFE = ("scripts/conveyor_workers.py", "jarvis/talk_quote.py", "tests/test_x.py",
+                    "jarvis/connectors/base.py", "docs/data.md", "build/reports/X.md", "jarvis/ui/qml/Main.qml")
+# Copy of tests.adversarial HOSTILE_PATH_PARTS (ADVCORPUS1, not yet on this base) plus hidden-char text.
+_HOSTILE_PARTS = (
+    "CLAUDE~1", "GITHUB~1", "PROGRA~1", "x:stream", "x::$DATA", "a.", "a ", "CON", "PRN", "AUX", "NUL",
+    "COM1", "LPT9", "con.txt", "NUL.png", ".Claude", ".GITHUB/workflows", "DATA", ".Jarvis", "..", ".",
+    "//", "\\", "a/b\\c", "C:x", "C:\\x", "/x", "\\\\?\\C:\\x", "\\\\.\\C:\\x", "\\\\host\\share",
+    "\\\\localhost\\C$", "a\uff0fb", "a\u2215b", ".cl\u0430ude", "g\u0435t", "d\u043ecs",
+    "a\u202ab", "a\u202eb", "a\u2066b", "a\u2069b", "a\u200bb", "a\u200db", "\ufeffa", "a\u034fb",
+    "a\u180bb", "a\ufe0fb", "a\u115fb", "a\u3164b", "a\uffa0b", "a\u17b4b", "a\x7fb", "a\x9fb",
+    "w\u043erkflows", "\uff44\uff41\uff54\uff41", ".j\u0430rvis", "\u0441on", "con\u3000", "nul .x",
+)
