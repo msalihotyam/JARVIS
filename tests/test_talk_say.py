@@ -17,6 +17,16 @@ def say(text):
     return result
 
 
+def timed(text, repeats=3):
+    """(result, best of a few perf_counter timings): one loaded-machine stall must not fail a bound."""
+    best = float("inf")
+    for _ in range(repeats):
+        start = time.perf_counter()
+        result = prepare_speech({"text": text})
+        best = min(best, time.perf_counter() - start)
+    return result, best
+
+
 class SpokenTextTests(unittest.TestCase):
     """Acceptance 1, 2, 4, 5."""
 
@@ -209,10 +219,13 @@ class ReviewFixTests(unittest.TestCase):
         n = MAX_INPUT_CHARS - 10
         hostile = [" " * n + "x", " #" * (n // 2) + "x", "a." * (n // 2), "a-." * (n // 3), "a-" * (n // 2),
                    "a/" * (n // 2), "a.py." * (n // 5), "a" + "_" * n + "a", "\t" * n + "x", "|---" * (n // 4) + "x"]
+        hostile += ["C:\\" + "a " * (n // 2), "C:\\a" + " b/" * (n // 3), '"C:\\' + "a" * n, "“C:\\" * (n // 4),
+                    "[" * n, "[[a]" * (n // 4), "<code" * (n // 5), "<code>" * (n // 6), "mailto:" * (n // 7),
+                    "https://x/" + "(" * n, "https://x/" + "((a)" * (n // 4), "`\n" * (n // 2), "a | b\n" * (n // 6)]
         for text in hostile:
-            start = time.perf_counter()
-            self.assertIsInstance(prepare_speech({"text": text}), (Speech, Refusal))
-            self.assertLess(time.perf_counter() - start, 1.0, text[:8])  # was 1.5-5 s when quadratic
+            r, took = timed(text)
+            self.assertIsInstance(r, (Speech, Refusal))
+            self.assertLess(took, 1.0, text[:8])  # was 1.5-5 s when quadratic
 
     def test_kinds_inside_html_tag_reported(self):
         cases = {"x <a href=https://e.com> y": ("x " + CUES["url"] + " y", ("url",)),
@@ -292,9 +305,9 @@ class ReviewFix2Tests(unittest.TestCase):
         n = MAX_INPUT_CHARS - 10
         for text in ("x " + "`" * n, "x" + " `" * (n // 2), "``x`" * (n // 4), "> " * (n // 2) + "x",
                      "- " * (n // 2) + "x", "1. " * (n // 3) + "x", "> " * (n // 2) + "```"):
-            start = time.perf_counter()
-            self.assertIsInstance(prepare_speech({"text": text}), (Speech, Refusal))
-            self.assertLess(time.perf_counter() - start, 1.0, text[:8])  # "x "+"`"*n was 1.18 s
+            r, took = timed(text)
+            self.assertIsInstance(r, (Speech, Refusal))
+            self.assertLess(took, 1.0, text[:8])  # "x "+"`"*n was 1.18 s
 
     def test_url_keeps_balanced_parentheses(self):
         r = say("Bak https://en.wikipedia.org/wiki/Function_(mathematics)#History simdi")
@@ -335,14 +348,85 @@ class ReviewFix2Tests(unittest.TestCase):
                         for _ in range(rng.randint(0, 5))]
             tags = [f"zq{case}t{k}" for k in range(len(tail) + 1)]
             text = "\n".join(head + [fence + " " + tags[0]] + [t + " " + g for t, g in zip(tail, tags[1:])])
-            start = time.perf_counter()
-            r = prepare_speech({"text": text})
-            self.assertLess(time.perf_counter() - start, 0.05, text)
+            r, took = timed(text)
+            self.assertLess(took, 0.05, text)
             self.assertIsInstance(r, Speech, text)
             self.assertTrue(r.rest_in_text, text)
             self.assertEqual(r.spoken.count(CUES["code"]), 1, text)
             self.assertTrue(r.spoken.endswith(CUES["code"]), text)
             self.assertNotIn("zq", r.spoken, text)
+
+
+class ReviewFix3Tests(unittest.TestCase):
+    """TALKSAY1FIX4: CDX-TALKSAY1FIX3 F1-F8; one negative test per variant of %TEMP%/TALKSAY1FIX4-class.md."""
+
+    def assert_said(self, cases, kinds, rest=False):
+        for text, spoken in cases:
+            r = say(text)
+            self.assertEqual((r.spoken, r.text_only, r.rest_in_text), (spoken, kinds, rest), text)
+
+    def test_unquoted_path_with_spaces_speaks_no_tail(self):
+        p = CUES["path"]
+        self.assert_said((("Ayar C:\\Program Files\\JARVIS\\config klasorunde", "Ayar " + p + " klasorunde"),
+                          ("Kur: C:/Program Files/JARVIS/bin ve bitti", "Kur: " + p + " ve bitti"),
+                          ("Yol C:\\Program Files (x86)\\App\\x.exe burada", "Yol " + p + " burada"),
+                          ("Yol C:\\Program Files burada", "Yol " + p + " burada"),
+                          ("Paylasim \\\\srv\\my share\\SECRET tamam", "Paylasim " + p + " tamam"),
+                          ("Bak ~/My Documents/SECRET tamam", "Bak " + p + " tamam"),
+                          ("Bak /Users/My Name/SECRET tamam", "Bak " + p + " tamam"),
+                          ("Bak ./my dir/SECRET tamam", "Bak " + p + " tamam"),
+                          ("Bak C:\\Users\\Salih Dora\\Documents tamam", "Bak " + p + " tamam")), ("path",))
+
+    def test_drive_path_with_many_space_words_speaks_no_tail(self):
+        p = talk_say.CUES["path"]
+        self.assert_said(((r"Dosya C:\Users\Ali\OneDrive - Acme Corp Ltd\Belgeler\Gizli burada.",
+                           "Dosya " + p + " burada."),
+                          (r"Bak: C:\Users\Ali\Klasor A B C D\SECRET tamam.", "Bak: " + p + " tamam."),
+                          (r"Bak \\srv\Ortak Belgeler Arsivi 2026\SECRET tamam", "Bak " + p + " tamam")),
+                         ("path",))
+
+    def test_quoted_path_with_spaces_masked_whole(self):
+        p = CUES["path"]
+        self.assert_said((('"C:\\Program Files\\SECRET"', p), ("'C:\\Program Files\\My App' tamam", p + " tamam"),
+                          ("“C:\\Program Files\\My App” tamam", p + " tamam"),
+                          ("«C:\\Program Files\\My App» tamam", p + " tamam"),
+                          ("C:\\Users'a kopyala", p + " 'a kopyala")), ("path",))
+
+    def test_unquoted_last_folder_word_is_an_open_limit(self):
+        # DECISION NEEDED (report): a space-joined word with no slash after it is prose-shaped ("config klasorunde")
+        self.assertEqual(say("Bak C:\\Program Files\\My App tamam").spoken, "Bak " + CUES["path"] + " App tamam")
+
+    def test_table_inside_quote_or_list_not_spoken(self):
+        self.assert_said((("> a | b\n> --- | ---\n> SECRET | TOKEN", CUES["table"]),
+                          ("> > a | b\n> > --- | ---\n> > SECRET | TOKEN", CUES["table"]),
+                          ("> | a | b |\n> SECRET | x", CUES["table"]),
+                          ("- a | b\n  --- | ---\n  SECRET | TOKEN", CUES["table"])), ("table",))
+
+    def test_indented_code_after_quoted_blank_not_spoken(self):
+        self.assert_said((("> giris\n>\n>     CODE", "giris\n" + CUES["code"]),), ("code",))
+
+    def test_code_span_across_lines_not_spoken(self):
+        self.assert_said((("a `SECRET\nCODE` z", "a " + CUES["code"] + " z"),
+                          ("> a `SECRET\n> CODE` z", "a " + CUES["code"] + " z")), ("code",))
+        self.assert_said((("a `x\n\ny` z", "a x\ny z"),), ())  # a blank line ends the paragraph and the span
+
+    def test_html_code_and_pre_not_spoken(self):
+        self.assert_said((("<code>SECRET</code> son", CUES["code"] + " son"),
+                          ("a <pre class=x>\nSECRET\n</PRE> son", "a " + CUES["code"] + " son")), ("code",))
+        self.assert_said((("a <code>SECRET\nTOKEN", "a " + CUES["code"]),), ("code", talk_say.REST), rest=True)
+
+    def test_nested_link_label_and_url_parens(self):
+        u = CUES["url"]
+        self.assert_said((("[a [b] c](SECRET) son", "a [b] c " + u + " son"),
+                          ("https://x.test/a(b(c)d)SECRET son", u + " son")), ("url",))
+
+    def test_schemes_without_slashes_are_urls(self):
+        self.assert_said((("mailto:alice@example.com yaz", CUES["url"] + " yaz"),
+                          ("Ara TEL:+905551112233 simdi", "Ara " + CUES["url"] + " simdi")), ("url",))
+        self.assert_said((("tel: 555 numara", "tel: 555 numara"),), ())  # a label, not a target
+
+    def test_cap_prefers_sentence_end_over_midword_cut(self):
+        self.assert_said((("A. " + "b" * (SPOKEN_CAP - 2), "A."),), (talk_say.REST,), rest=True)
 
 
 class PurityTests(unittest.TestCase):
