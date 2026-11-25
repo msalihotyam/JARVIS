@@ -1,0 +1,10 @@
+{
+ "version": 1,
+ "classes": {
+  "tests.test_talk_card_source.AllowTests": 0.1,
+  "tests.test_talk_card_source.CheckTapTests": 0.1,
+  "tests.test_talk_card_source.PhoneRefusalLeavesCardOpenTests": 0.1,
+  "tests.test_talk_card_source.HostileTests": 0.2,
+  "tests.test_talk_card_source.SafetyTests": 0.5
+ }
+}
