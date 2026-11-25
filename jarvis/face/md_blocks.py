@@ -9,7 +9,6 @@ Raw HTML is never interpreted: it stays visible text.
 
 from __future__ import annotations
 
-import bisect
 import re
 import string
 import unicodedata
@@ -36,7 +35,7 @@ _DELIM_CELL = re.compile(r":?-+:?")
 class Inline:
     kind: str  # text | bold | italic | code | link | image (a link chip; nothing is loaded)
     text: str
-    href: str = ""  # link/image only: an http(s) URL with bidi/zero-width characters removed
+    href: str = ""  # link/image only: an http(s) URL with invisible (Cf + default-ignorable) characters removed
 
 
 @dataclass(frozen=True)
@@ -89,6 +88,7 @@ class _Parser:
         self.items: list[list] = []  # list: [lines, children, child_ordered]
         self.ordered = False
         self.start = 1
+        self.root = 0  # indent of the latest root-level list marker; nesting is measured from it
         self.stable = 0
         self.trigger = 0  # index of the line whose processing emits the next block
         self.complete = 0  # lines[:complete] end in a newline; only those can close a block for good
@@ -184,14 +184,19 @@ class _Parser:
 
     def item(self, indent: int, ordered: bool, number: int, text: str) -> None:
         last = self.items[-1] if self.open == "list" else None
-        if last and indent >= 2 and len(last[1]) < MAX_ITEMS:  # deeper markers all land on level 2
+        if last and indent >= self.root + 2:  # deeper markers all land on level 2
+            if len(last[1]) >= MAX_ITEMS:
+                self.truncated = True  # drop child overflow; promoting it would invent a root item
+                return
             if not last[1]:
                 last[2] = ordered
             last[1].append([text])
             return
         if self.open != "list" or self.ordered != ordered or len(self.items) >= MAX_ITEMS:
             self.close()  # a full list continues as a new list block: nothing is dropped
-            self.open, self.ordered, self.start, self.items = "list", ordered, number, []
+            self.open, self.ordered, self.start, self.items, self.root = "list", ordered, number, [], indent
+        elif indent < self.root + 2:
+            self.root = indent  # roots may drift (3 -> 0): children nest relative to the latest root
         self.items.append([[text], [], False])
 
     def close(self) -> None:
@@ -216,6 +221,8 @@ _ORDERED = re.compile(r"(\d{1,9})[.)] ")
 _PIPE = re.compile(r"(?<!\\)\|")
 _SPECIAL = re.compile(r"[\\`*_\[!]")
 _ALIGN = {(True, True): "center", (True, False): "left", (False, True): "right", (False, False): ""}
+# Default_Ignorable_Code_Point outside Cf (Cf is stripped by category; the Cn ones make _href refuse the link)
+_IGNORABLE = re.compile("[͏ᅟᅠ឴឵᠋-᠍᠏ㅤ︀-️ﾠ\U000e0100-\U000e01ef]")
 
 
 def _fence(body: str) -> tuple[str, int, str] | None:
@@ -289,10 +296,10 @@ def _table(lines: list[str], p: _Parser) -> Block | None:
 
 
 def _href(raw: str) -> str:
-    """An http(s) link target with bidi/zero-width (Cf) characters removed, or "" (stays text)."""
+    """An http(s) link target with invisible (Cf + default-ignorable) characters removed, or "" (stays text)."""
     if len(raw) > 4 * MAX_HREF_CHARS:
         return ""
-    url = "".join(ch for ch in raw.strip() if unicodedata.category(ch) != "Cf")
+    url = _IGNORABLE.sub("", "".join(ch for ch in raw.strip() if unicodedata.category(ch) != "Cf"))
     if not url.startswith(("http://", "https://")) or len(url) > MAX_HREF_CHARS:
         return ""
     if any(ch == "\\" or ch.isspace() or unicodedata.category(ch) in ("Cc", "Cs", "Co", "Cn") for ch in url):
@@ -304,9 +311,16 @@ def _href(raw: str) -> str:
     return url if netloc and "@" not in netloc else ""
 
 
-def _after(positions: list[int], pos: int) -> int:
-    k = bisect.bisect_left(positions, pos)
-    return positions[k] if k < len(positions) else -1
+class _Cursor:
+    """First position >= pos; queries never go backwards (the scan index only grows), so the total walk is linear."""
+
+    def __init__(self, positions: list[int]) -> None:
+        self.positions, self.k = positions, 0
+
+    def after(self, pos: int) -> int:
+        while self.k < len(self.positions) and self.positions[self.k] < pos:
+            self.k += 1
+        return self.positions[self.k] if self.k < len(self.positions) else -1
 
 
 def _push(out: list[Inline], buf: list[str], inline: Inline | None = None) -> None:
@@ -319,17 +333,18 @@ def _push(out: list[Inline], buf: list[str], inline: Inline | None = None) -> No
 
 
 def _inlines(s: str) -> tuple[Inline, ...]:
-    """One left-to-right scan; every closer lookup is a find/bisect, so time stays linear."""
+    """One left-to-right scan; every closer lookup is a find or a forward-only cursor, so time stays linear."""
     # shortcut: bold/italic/link text is flat (no nested inlines), upgrade if the reading view needs nesting
     out: list[Inline] = []
     buf: list[str] = []
     n = len(s)
-    ticks: dict[int, list[int]] = {}  # backtick run length -> run starts
+    runs: dict[int, list[int]] = {}  # backtick run length -> run starts
     for m in re.finditer(r"`+", s):
-        ticks.setdefault(m.end() - m.start(), []).append(m.start())
-    closes = [m.start() for m in re.finditer(r"\]", s)]
-    opens = [m.start() for m in re.finditer(r"\[", s)]
-    parens = [m.start() for m in re.finditer(r"\)", s)]
+        runs.setdefault(m.end() - m.start(), []).append(m.start())
+    ticks = {k: _Cursor(v) for k, v in runs.items()}
+    closes = _Cursor([m.start() for m in re.finditer(r"\]", s)])
+    opens = _Cursor([m.start() for m in re.finditer(r"\[", s)])
+    parens = _Cursor([m.start() for m in re.finditer(r"\)", s)])
     failed: set[str] = set()  # delimiters with no occurrence left: never search again
     i = 0
     while i < n:
@@ -351,7 +366,7 @@ def _inlines(s: str) -> tuple[Inline, ...]:
                 e += 1
             if c == "`":
                 k = e - i
-                q = _after(ticks.get(k, []), e)
+                q = ticks[k].after(e) if k in ticks else -1
                 if q < 0:
                     buf.append(s[i:e])
                     i = e
@@ -383,9 +398,9 @@ def _inlines(s: str) -> tuple[Inline, ...]:
             i += 1
             continue
         start = i + 2 if image else i + 1
-        r = _after(closes, start)
-        p = _after(parens, r + 2) if r >= 0 and s[r + 1:r + 2] == "(" else -1
-        o = _after(opens, start)
+        r = closes.after(start)
+        p = parens.after(r + 2) if r >= 0 and s[r + 1:r + 2] == "(" else -1
+        o = opens.after(start)
         if p < 0 or 0 <= o < r:
             buf.append(s[i:start])
             i = start
