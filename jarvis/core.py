@@ -1427,6 +1427,16 @@ def _lease_covers(outer: str, inner: str) -> bool:
     return outer == inner or (outer.endswith("/") and inner.startswith(outer))
 
 
+# PM26W1FIX2: how a driven project step's outcome maps onto its chain task.
+# Only these end the task FAILED; the waiting/movable ones leave it resumable.
+_STEP_TERMINAL_FAILED = frozenset({StepState.FAILED_AFTER_CAP, StepState.CANCELLED})
+_RUN_TERMINAL_FAILED = frozenset({RunState.PAUSED, RunState.FAILED, RunState.CANCELLED})
+_RUN_WAITING = frozenset({RunState.BLOCKED_BUDGET, RunState.NEEDS_INPUT})
+# With the run still BUILDING: unbooted (PENDING), mid-acceptance (ACCEPTING), boot-marked (INTERRUPTED).
+# INTERRUPTED is left out: nothing moves it back to PENDING, so waiting on it never ends.
+_STEP_MOVABLE = frozenset({StepState.PENDING, StepState.ACCEPTING})
+
+
 def _plan_targets(plan: WorkPlan) -> tuple[str, ...]:
     """Every target the plan names, deduplicated as the PM10 validator does."""
     return tuple(dict.fromkeys(
@@ -1895,9 +1905,9 @@ class AgentCore:
         piece = plan.slices[step.ordinal - 1]
         ports = work_ports.build_ports(
             store=self.memory, run_id=run_id, boot_id=boot_id, lease=lease,
-            # shortcut: one lease per step on the slice's first target; widen when slices span disjoint trees.
-            lease_target=tuple(_lease_targets(piece.targets))[0],
-            targets={target: "subtree" if target.endswith("/") else "file" for target in targets},
+            # Every permitted target of this slice, all leased or none; the step sees only its own slice.
+            lease_target=tuple(_lease_targets(piece.targets)),
+            targets={target: "subtree" if target.endswith("/") else "file" for target in piece.targets},
             jarvis_repo=first.get("jarvis_repo") is True, plan_hash=first.get("plan_hash"),
             **deps,
         )
@@ -1918,9 +1928,16 @@ class AgentCore:
             # shortcut: direct save_task write; route through the loop's guarded writer when slices join the chain loop.
             self.memory.save_task(session.id, task)
             return AgentRun(RunStatus.COMPLETED, session, task)
-        failed = self._input_failure(
-            task, ErrorCode.VERIFICATION_FAILED, f"step {step.key} ended {after.state.value}", session,
-        )
+        outcome = f"step {step.key} ended {after.state.value} (run {moved.state.value})"
+        terminal = (after.state in _STEP_TERMINAL_FAILED or moved.state in _RUN_TERMINAL_FAILED)
+        if not terminal and (
+            moved.state in _RUN_WAITING or after.state is StepState.NEEDS_INPUT
+            or (moved.state is RunState.BUILDING and after.state in _STEP_MOVABLE)
+        ):
+            # Budget, input and a step that did not finish stay resumable: nothing is saved FAILED.
+            return self._input_failure(task, ErrorCode.INVALID_TASK, f"waiting: {outcome}", session)
+        # Terminal outcomes and anything unmapped fail closed.
+        failed = self._input_failure(task, ErrorCode.VERIFICATION_FAILED, outcome, session)
         task = replace(task, status=TaskStatus.FAILED, result_snapshot=self._result_to_dict(failed.result))
         self.memory.save_task(session.id, task)
         return AgentRun(RunStatus.FAILED, session, task, result=failed.result, error=failed.error)
