@@ -144,7 +144,7 @@ class RouteOnTests(IntentTestCase):
             timings = [self.build_on(model).submit_text(t, conversation_id=conversation.id)
                        .payload["intent"]["usage"]["timing"] for t in ("a", "b", "a", "a")]
         fast, base = f"{conversation.id}:fake-fast:low", f"{conversation.id}:base-model:high"
-        self.assertEqual([("fake-fast", "low", fast, False), ("base-model", "high", base, True),
+        self.assertEqual([("fake-fast", "low", fast, True), ("base-model", "high", base, True),
                           ("fake-fast", "low", fast, True), ("fake-fast", "low", fast, False)], model.seen)
         self.assertEqual([("fake-fast", "low"), ("base-model", "high")] + [("fake-fast", "low")] * 2,
                          [(t["model"], t["effort"]) for t in timings])
@@ -170,7 +170,7 @@ class RouteOnTests(IntentTestCase):
         with patch.object(router_tr, "route", side_effect=RuntimeError("boom")):
             payload = self.build_on(model).submit_text("Selam", conversation_id=conversation.id).payload
         self.assertEqual("conversation", payload["intent"]["status"])
-        self.assertEqual([("base-model", "high", f"{conversation.id}:base-model:high", False)], model.seen)
+        self.assertEqual([("base-model", "high", f"{conversation.id}:base-model:high", True)], model.seen)
 
     def test_off_or_no_model_attrs_is_no_route(self) -> None:
         self.assertIsNone(app_module._route_choice(self.settings, "Selam", RecordingModel()))
@@ -270,19 +270,32 @@ class RouteRollbackTests(IntentTestCase):
                         StructuredError(ErrorCode.EGRESS_REFUSED, "refused before spawn"), "cancel"):
             with self.subTest(outcome=str(outcome)[:40]):
                 resend, last, cid = self.run_turns(("a", "ok"), ("b", "ok"), ("a", outcome), ("a", "ok"), ("a", "ok"))
-                self.assertEqual([False, True, True, True, False], resend)
+                self.assertEqual([True, True, True, True, False], resend)
                 self.assertEqual({cid: f"{cid}:fake-fast:low"}, last)
 
     def test_switching_routing_on_and_off_makes_each_lane_resend_once(self) -> None:
         # The routing-off lane (the conversation id) missed the routed turns, and back.
         resend, last, cid = self.run_turns(("a", "ok", False), ("a", "ok"), ("b", "ok", False), ("b", "ok", False),
                                            ("a", "ok"), ("a", "ok"))
-        self.assertEqual([False, False, True, False, True, False], resend)
+        self.assertEqual([False, True, True, False, True, False], resend)
         self.assertEqual({cid: f"{cid}:fake-fast:low"}, last)
 
     def test_a_failed_first_turn_and_off_only_turns_write_nothing(self) -> None:
-        self.assertEqual(([False], {}), self.run_turns(("a", "raise"))[:2])
+        self.assertEqual(([True], {}), self.run_turns(("a", "raise"))[:2])
         self.assertEqual(([False, False], {}), self.run_turns(("a", "ok", False), ("b", "ok", False))[:2])
+
+    def test_an_unrecorded_first_routed_turn_makes_the_return_to_its_lane_resend(self) -> None:
+        # E1ROUTE1AFIX2 (CDX F1): the first routed turn reached lane fast but was not recorded,
+        # a routing-off turn was answered on the conversation lane, then routing goes back to fast.
+        for outcome in ("cancel", "raise", StructuredError(ErrorCode.VERIFICATION_FAILED, "bad reply after the turn")):
+            with self.subTest(outcome=str(outcome)[:40]):
+                resend, last, cid = self.run_turns(("a", outcome), ("a", "ok", False), ("a", "ok"), ("a", "ok"))
+                self.assertEqual([True, False, True, False], resend)
+                self.assertEqual({cid: f"{cid}:fake-fast:low"}, last)
+                # No routing-off turn between: the unrecorded lane still resends once.
+                resend, last, cid = self.run_turns(("a", outcome), ("a", "ok"), ("a", "ok"))
+                self.assertEqual([True, True, False], resend)
+                self.assertEqual({cid: f"{cid}:fake-fast:low"}, last)
 
 
 class RouteSettingsTests(unittest.TestCase):
