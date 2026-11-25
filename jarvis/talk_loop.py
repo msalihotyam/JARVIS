@@ -15,15 +15,15 @@ in a row while a delivery or poll was due, that due item gets the next step
 (DELIVER outranks POLL there too, so a delivery that stays due every pass can
 hold POLL back; the caller clears or reschedules a delivery once it runs).
 
-Times are seconds on one monotonic scale; a due time of None = nothing
-scheduled. poll_due_at is the due time at the base POLL_INTERVAL; a transport
+Times are seconds on one monotonic scale, int or float in [0, 2**53] (anything
+else is refused, so int and float may be mixed exactly); a due time of None =
+nothing scheduled. poll_due_at is the due time at the base POLL_INTERVAL; a transport
 failure streak of n moves it later so the interval is
 min(POLL_INTERVAL * 2**n, POLL_MAX_INTERVAL). Inbound is never delayed by it.
 """
 
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 
 STOP = "STOP"
@@ -39,12 +39,13 @@ POLL_INTERVAL = 5.0
 POLL_MAX_INTERVAL = 300.0
 FAIRNESS_LIMIT = 8
 MAX_COUNT = 2**31 - 1  # larger counts are corrupt input, refused
+MAX_TIME = 2**53  # every int up to here is an exact float, so mixed int/float times cannot round
 
 REFUSALS = {
     "STATE_INVALID": "state must be a LoopState from this module",
     "FLAG_INVALID": "turn, recover and shutdown flags must be bool",
     "COUNT_INVALID": "inbound count and failure streak must be int in [0, 2**31 - 1]",
-    "TIME_INVALID": "now and due times must be finite numbers >= 0 (due may be None)",
+    "TIME_INVALID": "now and due times must be int or float in [0, 2**53] (due may be None)",
     "INPUT_TOO_DEEP": "input nested too deep",
     "INPUT_INVALID": "input could not be read",
 }
@@ -92,12 +93,8 @@ def _count(value):
 
 
 def _time(value):
-    if type(value) not in (int, float):
-        return False
-    try:
-        return math.isfinite(value) and value >= 0
-    except OverflowError:  # int too large for a float
-        return False
+    # the range check also refuses nan and +-inf; int-float compares are exact in Python
+    return type(value) in (int, float) and 0 <= value <= MAX_TIME
 
 
 @_guarded
@@ -128,14 +125,18 @@ def next_step(state, *, inbound_waiting, turn_in_progress, delivery_due_at,
     if recover_needed and not state.recovered:
         return Step(RECOVER, 0.0, LoopState(True, 0))
 
+    # checked above: every time is <= 2**53, so float() is exact and no int-float mix rounds
+    now = float(now)
+    delivery_due_at = None if delivery_due_at is None else float(delivery_due_at)
+    poll_due_at = None if poll_due_at is None else float(poll_due_at)
     backoff = poll_interval(failure_streak) - POLL_INTERVAL
-    # work in offsets from now: due + backoff rounds the backoff away at huge timestamps
+    # work in offsets from now: due + backoff rounds the backoff away at large timestamps
     deliver_left = None if delivery_due_at is None else delivery_due_at - now
     poll_left = None if poll_due_at is None else poll_due_at - now + backoff
     deliver_due = deliver_left is not None and delivery_due_at <= now
     # no new inbound is fetched during shutdown; the poll time still paces IDLE
     poll_due = (poll_due_at is not None and not shutdown_requested
-                and (poll_due_at <= now if not backoff else poll_due_at - now <= -backoff))
+                and poll_due_at - now <= -backoff)
 
     if inbound_waiting and not turn_in_progress and not shutdown_requested:
         other_due = deliver_due or poll_due
