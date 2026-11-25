@@ -53,21 +53,19 @@ def _parse(index, action):
 
 
 def _prior(was_sent, key):
-    """Return (state, attempts) or raise ValueError(reason)."""
+    """Return (state, attempts, reason); reason is a fixed code, never exception text."""
     try:
         prior = was_sent(*key)
         if prior is None:
-            return None, 0
+            return None, 0, None
         if not isinstance(prior, Mapping):
-            raise ValueError("bad_state")
+            return None, 0, "bad_state"
         state, attempts = prior.get("state"), prior.get("attempts")
-    except ValueError:
-        raise
-    except Exception:
-        raise ValueError("state_unreadable") from None
+    except Exception:  # RecursionError and ValueError subclasses included
+        return None, 0, "state_unreadable"
     if type(state) is not str or state not in _STATES or type(attempts) is not int or attempts < 0:
-        raise ValueError("bad_state")
-    return state, attempts
+        return None, 0, "bad_state"
+    return state, attempts, None
 
 
 def _deliver(item, send, record, was_sent):
@@ -77,10 +75,9 @@ def _deliver(item, send, record, was_sent):
     if not callable(send):
         return _out(item, "refused", "no_sender"), False
     key = item["key"]
-    try:
-        state, attempts = _prior(was_sent, key)
-    except ValueError as exc:
-        return _out(item, "refused", str(exc)), False
+    state, attempts, reason = _prior(was_sent, key)
+    if reason:
+        return _out(item, "refused", reason), False
     if state == "sent":
         return _out(item, "skipped"), False
     if state == "sending":
