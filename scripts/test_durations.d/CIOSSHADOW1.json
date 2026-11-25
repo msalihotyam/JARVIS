@@ -1,0 +1,7 @@
+{
+  "classes": {
+    "tests.test_ci_os_shadow.CompareTests": 0.3,
+    "tests.test_ci_os_shadow.GateIsolationTests": 0.5,
+    "tests.test_ci_os_shadow.StaticCheckTests": 0.3
+  }
+}
