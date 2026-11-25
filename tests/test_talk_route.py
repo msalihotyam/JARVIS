@@ -3,6 +3,7 @@
 import ast
 import itertools
 import unittest
+from collections.abc import Mapping
 from pathlib import Path
 
 from jarvis import talk_route as tr
@@ -136,6 +137,69 @@ class NegativeTests(unittest.TestCase):
                 self.assertIsNone(r.mode)
         self.assertEqual(tr.route(entry(text=LABEL, forwarded=False)).path, tr.MODE)
         self.assertEqual(tr.route(entry("image", LABEL, ATT)).path, tr.TURN)
+
+    def assertForwarded(self, e):
+        r = tr.route(e)
+        self.assertEqual((r.path, r.reason, r.mode, r.note), (tr.TURN, "forwarded", None, None))
+
+    def test_forwarded_get_and_contains_disagree_is_turn(self):
+        class Hides(dict):  # value present, membership denies it (CDX-TALKROUTE1 F1)
+            def __contains__(self, key):
+                return False if key == "forwarded" else super().__contains__(key)
+
+        class Claims(dict):  # membership claims it, get reports the caller default
+            def __contains__(self, key):
+                return key == "forwarded" or super().__contains__(key)
+
+            def get(self, key, default=None):
+                return default if key == "forwarded" else super().get(key, default)
+
+        class View(Mapping):  # non-dict Mapping, membership denies a present value
+            def __init__(self, data):
+                self.data = data
+
+            def __getitem__(self, key):
+                return self.data[key]
+
+            def __iter__(self):
+                return iter(self.data)
+
+            def __len__(self):
+                return len(self.data)
+
+            def __contains__(self, key):
+                return False
+
+        for text in (LABEL, "Yazılı yanıt", "/start"):
+            for fwd in (True, 1, "yes", None, [], 0):
+                with self.subTest(text=text, fwd=repr(fwd)):
+                    self.assertForwarded(Hides(entry(text=text, forwarded=fwd)))
+                    self.assertForwarded(View(entry(text=text, forwarded=fwd)))
+            with self.subTest(text=text, claims=True):
+                self.assertForwarded(Claims(entry(text=text)))
+        # explicit False through get is still honoured even if membership denies it
+        self.assertEqual(tr.route(Hides(entry(text=LABEL, forwarded=False))).path, tr.MODE)
+
+    def test_forwarded_read_once(self):
+        class Flips(dict):  # first get says True, any later get says False
+            calls = 0
+
+            def get(self, key, *default):
+                if key != "forwarded":
+                    return super().get(key, *default)
+                Flips.calls += 1
+                return Flips.calls == 1
+
+        self.assertForwarded(Flips(entry(text=LABEL)))
+        self.assertEqual(Flips.calls, 1)
+
+    def test_forwarded_membership_raises_refused(self):
+        class Raises(dict):
+            def __contains__(self, key):
+                raise RuntimeError("no")
+
+        self.assertRefused(tr.route(Raises(entry(text=LABEL))), "bad_entry")
+        self.assertForwarded(Raises(entry(text=LABEL, forwarded=True)))  # value decides; no membership asked
 
     def test_who_not_salih_refused(self):
         values = ("Salih", "SALIH", "salih ", " salih", "salıh", "jarvis", "system", "", None, 1,
