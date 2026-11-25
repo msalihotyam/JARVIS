@@ -115,6 +115,27 @@ class NegativeTests(unittest.TestCase):
         self.assertIsInstance(step(delivery_due_at=deep), tl.Refusal)
         self.assertIsInstance(tl.next_step(tl.LoopState()), tl.Refusal)  # missing fields
 
+    def test_wrong_arguments_refused_not_raised(self):
+        # every public call is guarded: a bad call shape is a typed Refusal, never an exception
+        calls = [
+            lambda: tl.poll_interval(),
+            lambda: tl.poll_interval(failure_streak=1, x=2),
+            lambda: tl.poll_interval(1, 2),
+            lambda: tl.poll_interval(x=1),
+            lambda: tl.next_step(),
+            lambda: tl.next_step(tl.LoopState(), *QUIET.values()),
+            lambda: tl.next_step(tl.LoopState(), **QUIET, x=2),
+        ]
+        for i, call in enumerate(calls):
+            result = call()
+            self.assertIsInstance(result, tl.Refusal, i)
+            self.assertEqual(result.code, "INPUT_INVALID", i)
+        self.assertEqual(tl.poll_interval(failure_streak=0), tl.POLL_INTERVAL)
+
+    def test_huge_int_poll_due_not_rounded_without_backoff(self):
+        big = 10**308
+        self.assertEqual(step(poll_due_at=big, now=big).kind, tl.POLL)
+
     def test_shutdown_with_turn_never_stops(self):
         for kw in (dict(), dict(inbound_waiting=9), dict(delivery_due_at=0.0),
                    dict(poll_due_at=0.0, failure_streak=3), dict(recover_needed=True)):

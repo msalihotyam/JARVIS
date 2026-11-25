@@ -11,7 +11,9 @@ start and how the inbound fairness run is counted without hidden memory.
 Order: STOP (shutdown, no turn running) > RECOVER (once per start) >
 HANDLE_INBOUND (no turn running, no shutdown) > DELIVER when due > POLL when
 due (not during shutdown) > IDLE(seconds). After FAIRNESS_LIMIT inbound steps
-in a row while a delivery or poll was due, that due item gets the next step.
+in a row while a delivery or poll was due, that due item gets the next step
+(DELIVER outranks POLL there too, so a delivery that stays due every pass can
+hold POLL back; the caller clears or reschedules a delivery once it runs).
 
 Times are seconds on one monotonic scale; a due time of None = nothing
 scheduled. poll_due_at is the due time at the base POLL_INTERVAL; a transport
@@ -98,6 +100,7 @@ def _time(value):
         return False
 
 
+@_guarded
 def poll_interval(failure_streak):
     """Seconds between polls after `failure_streak` transport failures in a row."""
     if not _count(failure_streak):
@@ -125,8 +128,9 @@ def next_step(state, *, inbound_waiting, turn_in_progress, delivery_due_at,
     if recover_needed and not state.recovered:
         return Step(RECOVER, 0.0, LoopState(True, 0))
 
-    if poll_due_at is not None:
-        poll_due_at += poll_interval(failure_streak) - POLL_INTERVAL
+    backoff = poll_interval(failure_streak) - POLL_INTERVAL
+    if poll_due_at is not None and backoff:  # adding 0.0 would round a huge int due time
+        poll_due_at += backoff
     deliver_due = delivery_due_at is not None and delivery_due_at <= now
     # no new inbound is fetched during shutdown; the poll time still paces IDLE
     poll_due = poll_due_at is not None and poll_due_at <= now and not shutdown_requested
