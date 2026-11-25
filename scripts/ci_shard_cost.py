@@ -30,6 +30,7 @@ GAIN = 0.05        # stop when one more step saves under 5% of the gate
 SEARCH_LIMIT = 1024
 MAX_SECONDS = 1e9  # any real time is far below; keeps sums, medians and products finite
 MAX_SHARDS = 1024
+MAX_BYTES = 16 * 1024 * 1024  # real shard reports are KB-sized
 NM = "not measured"
 
 
@@ -93,12 +94,33 @@ def parse(text: str) -> dict:
     return {"shards": shards, "wall": wall, "tests_sum": tests_sum}
 
 
+def _safe(text) -> str:
+    """Untrusted text -> printable ASCII on one table cell: no surrogates, control chars or '|'."""
+    return str(text).encode("unicode_escape").decode("ascii").replace("|", "\\x7c")
+
+
+def _link_dir(path: str) -> bool:
+    # a junction is not a link to islink, and os.walk descends into it
+    return ".." in os.path.basename(path) or os.path.islink(path) or os.path.isjunction(path)
+
+
+def read_capped(path: Path) -> str:
+    """At most MAX_BYTES, read without trusting a size checked earlier (the file may grow)."""
+    with path.open("rb") as fh:
+        data = fh.read(MAX_BYTES + 1)
+    if len(data) > MAX_BYTES:
+        raise Refused(f"over {MAX_BYTES} bytes")
+    return data.decode("utf-8")
+
+
 def collect(root: Path, max_files: int) -> tuple[list[Path], int, int]:
-    """*.json under root, sorted, links and paths leaving root skipped: (files, found, unsafe)."""
+    """*.json under root, sorted, links, junctions and paths leaving root skipped: (files, found, unsafe)."""
     base = os.path.realpath(root)
     found, unsafe = [], 0
     for folder, dirs, names in os.walk(base, followlinks=False):
-        dirs[:] = sorted(d for d in dirs if ".." not in d and not os.path.islink(os.path.join(folder, d)))
+        linked = [d for d in dirs if _link_dir(os.path.join(folder, d))]
+        unsafe += len(linked)
+        dirs[:] = sorted(d for d in dirs if d not in linked)
         for name in names:
             if not name.lower().endswith(".json"):
                 continue
@@ -146,19 +168,20 @@ def build_report(root: Path, max_files: int = MAX_FILES, concurrency: float = 1.
     lines = ["# CISHARDCOST1 shard fixed-cost model", "",
              f"input: {len(files)} of {found} JSON files read (cap --max-files {max_files}"
              + (f"; CAPPED, {found - len(files)} not read)" if found > len(files) else ")"),
-             f"skipped (link, '..' or outside the folder): {unsafe}",
+             f"skipped (link, junction, '..' or outside the folder): {unsafe}",
+             f"file size cap: {MAX_BYTES} bytes",
              f"formula: tests = sum(durations) / P, P = {concurrency:g}; fixed = wall - tests",
              "localci (build/conveyor/localci/*.json): not read, no per-test times", "",
              "| file | shards | wall s | tests s | fixed s | status |", "|---|---|---|---|---|---|"]
     refused = inconsistent = unmeasured = 0
     usable = []
     for path in files:
-        name = path.relative_to(os.path.realpath(root)).as_posix()
+        name = _safe(path.relative_to(os.path.realpath(root)).as_posix())
         try:
-            rec = parse(path.read_text(encoding="utf-8"))
+            rec = parse(read_capped(path))
         except (Refused, OSError, UnicodeDecodeError, OverflowError) as exc:
             refused += 1
-            lines.append(f"| {name} | | | | | refused: {exc} |")
+            lines.append(f"| {name} | | | | | refused: {_safe(exc)} |")
             continue
         tests = None if rec["tests_sum"] is None else rec["tests_sum"] / concurrency
         fixed = None if rec["wall"] is None or tests is None else rec["wall"] - tests
@@ -209,9 +232,10 @@ def main(argv: list[str] | None = None) -> int:
         print("error: DIR must be a folder, --max-files >= 1, --concurrency >= 1", file=sys.stderr)
         return 2
     text = build_report(root, args.max_files, args.concurrency)
+    data = text.encode("utf-8")  # fail before --out is opened, never truncate the previous model
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    out.write_text(text, encoding="utf-8")
+    out.write_bytes(data)
     print(text, end="")
     return 0
 
