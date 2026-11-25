@@ -32,3 +32,4 @@ desktop.ini
 # Claude Code native worktrees (code lanes)
 .claude/worktrees/
 /data-gws-gmail/
+/talk/
