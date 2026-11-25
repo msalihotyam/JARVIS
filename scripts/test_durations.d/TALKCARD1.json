@@ -1,0 +1,10 @@
+{
+ "version": 1,
+ "classes": {
+  "tests.test_talk_card.CreateTests": 0.3,
+  "tests.test_talk_card.ResolveTests": 0.2,
+  "tests.test_talk_card.VerifyTests": 0.1,
+  "tests.test_talk_card.LogTests": 0.1,
+  "tests.test_talk_card.SafetyTests": 0.5
+ }
+}
