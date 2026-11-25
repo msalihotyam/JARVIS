@@ -1,0 +1,1 @@
+{"classes": {"tests.test_brain_tools.ProtocolTests": 0.05, "tests.test_brain_tools.ToolCallTests": 0.05, "tests.test_brain_tools.ProposeTests": 0.1, "tests.test_brain_tools.FramingTests": 0.2, "tests.test_brain_tools.StaticTests": 0.5, "tests.test_brain_tools.WiringTests": 0.05}}
