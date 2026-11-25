@@ -30,6 +30,7 @@ import inspect
 import io
 import json
 import re
+import shutil
 import sqlite3
 import tempfile
 import threading
@@ -1333,6 +1334,37 @@ def declaration_json(count: int, **document: object) -> str:
     return json.dumps(payload)
 
 
+_TEMPLATE_ROOT: tempfile.TemporaryDirectory | None = None
+
+
+def _template_database() -> Path:
+    """One freshly migrated, empty, closed database per process.
+
+    Every BoundaryTestCase gets its own byte copy, so no test ever shares or
+    mutates the template; the copy is then opened through the real
+    SQLiteMemoryStore constructor exactly as before (it only skips re-running
+    migrations v1..current on an empty file, which is what costs the time).
+    """
+    global _TEMPLATE_ROOT
+    if _TEMPLATE_ROOT is None:
+        root = tempfile.TemporaryDirectory()
+        SQLiteMemoryStore(Path(root.name) / "template.db")
+        # The store closed every connection, so the WAL was checkpointed into
+        # the main file; a leftover WAL would make a file copy incomplete.
+        wal = Path(root.name) / "template.db-wal"
+        assert not wal.exists() or wal.stat().st_size == 0, "template WAL not empty"
+        _TEMPLATE_ROOT = root
+        unittest.addModuleCleanup(_drop_template)
+    return Path(_TEMPLATE_ROOT.name) / "template.db"
+
+
+def _drop_template() -> None:
+    global _TEMPLATE_ROOT
+    if _TEMPLATE_ROOT is not None:
+        safe_cleanup(_TEMPLATE_ROOT)
+        _TEMPLATE_ROOT = None
+
+
 class BoundaryTestCase(ChainTestCase):
     """A real SQLite store and a real session; no core, connector or model."""
 
@@ -1340,6 +1372,7 @@ class BoundaryTestCase(ChainTestCase):
         self.root = tempfile.TemporaryDirectory()
         self.addCleanup(safe_cleanup, self.root)
         self.database = Path(self.root.name) / "jarvis.db"
+        shutil.copyfile(_template_database(), self.database)
         self.settings = Settings(memory_database=self.database)
         self.memory = SQLiteMemoryStore(self.database)
         self.session = SessionState(objective="ship it")
