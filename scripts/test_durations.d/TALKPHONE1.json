@@ -1,1 +1,1 @@
-{"version":1,"classes":{"tests.test_talk_phone_send.AcceptanceTests":0.05,"tests.test_talk_phone_send.GuardTests":0.5,"tests.test_talk_phone_send.HardeningTests":0.1,"tests.test_talk_phone_send.NegativeTests":0.2}}
+{"version":1,"classes":{"tests.test_talk_phone_send.AcceptanceTests":0.05,"tests.test_talk_phone_send.GuardTests":0.5,"tests.test_talk_phone_send.HardeningTests":0.1,"tests.test_talk_phone_send.NegativeTests":0.2,"tests.test_talk_phone_send.RecursionLimitTests":0.1}}

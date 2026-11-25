@@ -1,6 +1,8 @@
 """TALKPHONE1: send-to-phone decision (pure; no I/O, no network, no clock)."""
 
 import ast
+import inspect
+import sys
 import unittest
 from collections.abc import Mapping
 from pathlib import Path
@@ -401,6 +403,88 @@ class HardeningTests(_Base):
                     out = self.refused(reasons[name], **kw(value))
                     self.assertEqual((out["note"], out["pointless"]), (None, False))
         self.assertEqual(calls, [])  # neither the metaclass __eq__ nor __iter__ was ever called
+
+
+def _decide_at(depth, call):
+    """call() after depth extra frames: ("out", value) or ("raised", exc); the handler does no work at the limit."""
+    try:
+        return _decide_at(depth - 1, call) if depth else ("out", call())
+    except RecursionError as exc:  # the overflow can hit any of these frames before decide() is reached
+        return "raised", exc
+
+
+def _kind(kind, value):
+    """"escaped" when a frame of the module under test raised, "caller" when the overflow came before it."""
+    if kind == "out":
+        return kind
+    tb, files = value.__traceback__, []
+    while tb is not None:
+        files.append(Path(tb.tb_frame.f_code.co_filename).name)
+        tb = tb.tb_next
+    return "escaped" if MODULE.name in files else "caller"
+
+
+class RecursionLimitTests(unittest.TestCase):
+    """TALKPHONE1FIX3 F1: decide() entered at any depth up to the limit returns, never raises."""
+
+    def sweep(self, call):
+        old = sys.getrecursionlimit()
+        seen = []
+        try:
+            sys.setrecursionlimit(len(inspect.stack(0)) + 80)
+            for depth in range(120):  # past the limit: the last depths overflow before decide() is entered
+                seen.append(_decide_at(depth, call))
+        finally:
+            sys.setrecursionlimit(old)
+        kinds = [_kind(kind, value) for kind, value in seen]
+        self.assertNotIn("escaped", kinds, [d for d, k in enumerate(kinds) if k == "escaped"][:5])
+        self.assertIn("caller", kinds)  # the sweep reached the limit, so the frames right below it were tried
+        outs = [value for kind, value in seen if kind == "out"]
+        self.assertTrue(outs)
+        return outs
+
+    def test_refusal_at_every_depth_below_the_limit(self):
+        outs = self.sweep(lambda: tps.decide(None, None, None))
+        for out in outs:
+            self.assertFalse(out["ok"])
+            self.assertIn(out["reason"], ("bad_config", "internal_error"))
+            self.assertEqual(out["log"]["decision"], "refused")
+        self.assertIn("internal_error", [out["reason"] for out in outs])  # the limit was hit inside decide()
+        self.assertEqual(outs[0]["reason"], "bad_config")
+
+    def test_valid_and_hostile_inputs_never_escape_near_the_limit(self):
+        for call in (run, lambda: run(req=_Hostile(RecursionError())), lambda: run(redact=boom)):
+            for out in self.sweep(call):
+                self.assertIn(out["ok"], (True, False))
+                self.assertTrue(out["ok"] or out["log"]["decision"] == "refused")
+
+    def test_internal_error_constant_is_read_only(self):
+        out = self.sweep(lambda: tps.decide(None, None, None))[-1]
+        self.assertIs(out, tps._INTERNAL_ERROR)
+        with self.assertRaises(TypeError):
+            out["reason"] = "ok"
+        with self.assertRaises(TypeError):
+            out["log"]["reason"] = "ok"
+
+    def test_outermost_handlers_only_reraise_or_return_a_constant(self):
+        tree = ast.parse(MODULE.read_text(encoding="utf-8"))
+        public = [n for n in tree.body if isinstance(n, ast.FunctionDef) and not n.name.startswith("_")]
+        self.assertEqual([n.name for n in public], ["decide"])
+        for func in public:
+            tries = [n for n in func.body if isinstance(n, ast.Try)]
+            self.assertEqual(len(tries), 1, func.name)
+            body = func.body[1:] if ast.get_docstring(func) else func.body
+            self.assertEqual(len(body), 1, func.name)  # nothing outside the try can raise
+            for handler in tries[0].handlers:
+                self.assertIsNone(handler.name, func.name)
+                self.assertEqual(len(handler.body), 1, func.name)
+                stmt = handler.body[0]
+                if isinstance(stmt, ast.Raise):
+                    self.assertIsNone(stmt.exc)
+                else:
+                    self.assertIsInstance(stmt, ast.Return)
+                    self.assertIsInstance(stmt.value, ast.Name)
+                    self.assertTrue(stmt.value.id.isupper(), stmt.value.id)
 
 
 class GuardTests(unittest.TestCase):

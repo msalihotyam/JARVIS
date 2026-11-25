@@ -10,6 +10,7 @@ Every bad input becomes a typed refusal with an ASCII reason code.
 import re
 from collections.abc import Mapping
 from datetime import datetime
+from types import MappingProxyType
 
 OWNER = "salih"
 SOURCE = "pc_view"
@@ -30,6 +31,11 @@ _REASONS = frozenset({
     "bad_time", "one_attachment_only", "bad_attachment_id", "bad_used", "request_used", "not_in_log",
     "bad_attachment", "already_on_phone", "kind_not_allowed", "too_large", "path_outside_root",
     "kind_mismatch", "bad_redact", "internal_error"})
+# Prebuilt so decide()'s outermost handler returns it without a call; read-only because it is shared.
+_INTERNAL_ERROR = MappingProxyType({
+    "ok": False, "reason": "internal_error", "note": None, "pointless": False,
+    "log": MappingProxyType({"event": COMMAND, "by": None, "request_id": None, "attachment_id": None, "at": None,
+                             "decision": "refused", "reason": "internal_error"})})
 
 
 class _Refused(Exception):
@@ -192,7 +198,17 @@ def decide(request, attachment, config, *, redact=None, used=None):
     request: the PC-view command; attachment: the log record for its id (None when absent);
     config: telegram_enabled, chat_id, kinds, max_bytes; redact: TALKREDACT2-shaped callable;
     used: request ids already consumed. Missing redact/used are refused, never defaulted open.
+    The last-resort internal_error refusal is a shared read-only mapping: copy it before changing it.
     """
+    try:
+        return _decide(request, attachment, config, redact, used)
+    except _FATAL:
+        raise
+    except BaseException:  # no call, format or lookup here: near the recursion limit it would raise again
+        return _INTERNAL_ERROR
+
+
+def _decide(request, attachment, config, redact, used):
     log = {"event": COMMAND, "by": None, "request_id": None, "attachment_id": None, "at": None}
     try:
         enabled = _channel(config)
@@ -215,7 +231,7 @@ def decide(request, attachment, config, *, redact=None, used=None):
         file_name, renamed = _file_name(name, kind, redact)
     except _FATAL:
         raise
-    except BaseException as exc:  # hostile Mappings, RecursionError: never escape
+    except BaseException as exc:  # hostile Mappings; anything raised here falls to decide()'s constant
         reason = _reason(exc)
         log.update(decision="refused", reason=reason)
         return {"ok": False, "reason": reason, "note": CHANNEL_OFF_NOTE if reason == "channel_off" else None,
