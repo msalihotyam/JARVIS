@@ -23,6 +23,7 @@ import inspect
 import io
 import json
 import re
+import shutil
 import sqlite3
 import tempfile
 import unittest
@@ -110,12 +111,30 @@ CHAIN_DECLARATION = [
 class VisibilityTestCase(unittest.TestCase):
     """A real SQLite store. No core, registry, connector or model, ever."""
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        # Schema build is the dominant per-test cost; build it once per class
+        # and give every test its own byte copy (tests mutate their copy only).
+        super().setUpClass()
+        cls._template_root = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(safe_cleanup, cls._template_root)
+        cls._template = Path(cls._template_root.name) / "template.db"
+        SQLiteMemoryStore(cls._template)
+
     def setUp(self) -> None:
         self.root = tempfile.TemporaryDirectory()
         self.addCleanup(safe_cleanup, self.root)
         self.database = Path(self.root.name) / "jarvis.db"
         self.settings = Settings(memory_database=self.database)
-        self.memory = SQLiteMemoryStore(self.database)
+        self.memory = self.copied_store(self._template)
+
+    def copied_store(self, template: Path) -> SQLiteMemoryStore:
+        """A fresh store on this test's own copy of a closed template file."""
+        # The store checkpoints (TRUNCATE) after every write and every
+        # connection is closed, so the main file is the whole database.
+        self.assertFalse(template.with_name(template.name + "-wal").exists())
+        shutil.copyfile(template, self.database)
+        return SQLiteMemoryStore(self.database)
 
     # -- fixtures ------------------------------------------------------
 
@@ -1577,11 +1596,27 @@ class AuxiliaryProjectionTests(VisibilityTestCase):
 class StorageHardLimitTests(VisibilityTestCase):
     """F4. The ceiling is the STORE'S, not the caller's."""
 
+    @classmethod
+    def setUpClass(cls) -> None:
+        super().setUpClass()
+        cls._populated: dict[int, tuple[Path, str]] = {}
+
     def populate(self, count: int) -> SessionState:
-        session = self.make_session()
-        for _ in range(count):
-            self.make_session()
-            self.make_task(session.id)
+        # Same rows as building them here; built once per count, then copied,
+        # because the ceiling tests only read them.
+        if count not in self._populated:
+            session = self.make_session()
+            for _ in range(count):
+                self.make_session()
+                self.make_task(session.id)
+            template = Path(self._template_root.name) / f"populated-{count}.db"
+            self.assertFalse(Path(f"{self.database}-wal").exists())
+            shutil.copyfile(self.database, template)
+            self._populated[count] = (template, session.id)
+        template, session_id = self._populated[count]
+        self.memory = self.copied_store(template)
+        session = self.memory.load_session(session_id)
+        assert session is not None
         return session
 
     def test_no_direct_caller_can_exceed_the_ceiling(self) -> None:
