@@ -183,7 +183,10 @@ class SuspiciousFormTests(RootCase):
     def check_part(self, spy, fs, part):
         before = len(spy.calls)  # counted before resolve, so a port call inside it shows
         got = fs.resolve(part)
-        if part in EXPECTED_ALLOWED:
+        if os.name == "nt" and part == ".Claude":
+            # BRAINFS1FIX4 F1: NTFS realpath gives the on-disk .claude; the exact compare refuses it.
+            self.assertRefused(got, "link")
+        elif part in EXPECTED_ALLOWED:
             self.assertIsInstance(got, Resolved)
             real_root = os.path.realpath(self.root)
             self.assertEqual(os.path.commonpath([real_root, got.path]), real_root)
@@ -664,6 +667,79 @@ class CaseExactTests(RootCase):
             with self.subTest(label):
                 fs = BrainFiles(self.root, clock=frozen_clock, final_path=lambda fd, final=final: final)
                 self.assertRefused(fs.read_file("docs/notes.md"), "outside")
+
+
+class LastMinorTests(RootCase):
+    """BRAINFS1FIX4: the three last MINORs (post-realpath compare, \\\\?\\ root, listing parity)."""
+
+    def setUp(self):
+        super().setUp()
+        self.real_root = os.path.realpath(self.root)
+
+    sibling = CaseExactTests.sibling
+    assertNoDocsMatch = CaseExactTests.assertNoDocsMatch
+
+    def test_resolver_into_case_sibling_inside_root_refused(self):
+        # F1: docs swapped for a junction to DOCS after the is_link pass; realpath and the
+        # handle both answer in DOCS, a case-only sibling inside the root.
+        docs = os.path.join(self.real_root, "docs")
+        upper = os.path.join(self.real_root, "DOCS")
+        fs = BrainFiles(self.root, clock=frozen_clock, is_link=lambda p: False,
+                        realpath=lambda p: self.sibling(os.path.realpath(p), docs, upper),
+                        final_path=lambda fd: self.sibling(brain_fs._final_path(fd), docs, upper))
+        self.assertRefused(fs.resolve("docs/notes.md"), "link")
+        self.assertRefused(fs.read_file("docs/notes.md"), "link")
+        self.assertRefused(fs.list_dir("docs"), "link")
+        self.assertNoDocsMatch(fs)
+        self.assertEqual(fs.read_file("jarvis/a.py").text, "print('hello world')\nx = 1\n")
+        if os.name == "nt":  # a request in non-disk case names the same place only by folding
+            self.assertRefused(self.fs.resolve("DOCS/notes.md"), "link")
+
+    def test_long_prefix_stripped_like_final_path(self):
+        # F2: the root keeps its case and loses \\?\ / \\?\UNC\ exactly as handle paths do.
+        strip = brain_fs._strip_long_prefix
+        self.assertEqual(strip("\\\\?\\C:\\Repo\\x"), "C:\\Repo\\x")
+        self.assertEqual(strip("\\\\?\\UNC\\Host\\Share\\x"), "\\\\Host\\Share\\x")
+        self.assertEqual(strip("C:\\Repo"), "C:\\Repo")
+        if os.name != "nt":
+            return
+        fs = BrainFiles("\\\\?\\" + self.real_root, clock=frozen_clock)
+        self.assertIsNone(fs._root_refusal)
+        self.assertEqual(fs._root, self.real_root)
+        self.assertIn("docs", {e.name for e in fs.list_dir("").entries})
+        self.assertEqual(fs.read_file("docs/notes.md").text, "hello docs\n")
+        self.assertIn("docs/notes.md", {m.path for m in fs.search("hello").matches})
+
+    def test_long_prefix_root_naming_another_dir_refused(self):
+        # F2 variant: \\?\...\trail. is a real folder, but without the prefix it names trail.
+        if os.name != "nt":
+            return
+        base = os.path.dirname(self.real_root)
+        os.makedirs(os.path.join(base, "trail"))
+        dotted = "\\\\?\\" + os.path.join(base, "trail.")
+        os.mkdir(dotted)
+        try:
+            fs = BrainFiles(dotted, clock=frozen_clock)
+            self.assertEqual(fs._root_refusal.code, "bad_root")
+            self.assertRefused(fs.list_dir(""), "bad_root")
+        finally:
+            os.rmdir(dotted)
+
+    def test_decomposed_name_hidden_like_read_file(self):
+        # F3: an NFD on-disk name read_file refuses (form) is neither listed nor searched.
+        name = "e\u0301.txt"
+        self.write(name, b"needle\n")
+        self.assertNotIn(name, {e.name for e in self.fs.list_dir("").entries})
+        self.assertEqual(self.fs.search("needle").matches, ())
+        self.assertRefused(self.fs.read_file(name), "form")
+
+    def test_overlong_name_hidden_like_read_file(self):
+        # F3 variant: a path over MAX_PATH_CHARS read_file refuses is neither listed nor searched.
+        self.addCleanup(setattr, brain_fs, "MAX_PATH_CHARS", brain_fs.MAX_PATH_CHARS)
+        brain_fs.MAX_PATH_CHARS = len("docs/notes.md") - 1
+        self.assertNotIn("notes.md", {e.name for e in self.fs.list_dir("docs").entries})
+        self.assertNotIn("docs/notes.md", {m.path for m in self.fs.search("hello").matches})
+        self.assertRefused(self.fs.read_file("docs/notes.md"), "too_long")
 
 
 class HardLinkAndSpecialFileTests(RootCase):

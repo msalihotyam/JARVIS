@@ -155,12 +155,16 @@ def _final_path(fd: int) -> str:
     size = _K32.GetFinalPathNameByHandleW(msvcrt.get_osfhandle(fd), buf, len(buf), 0)
     if size == 0 or size >= len(buf):
         raise ctypes.WinError(ctypes.get_last_error())
-    final = buf.value
-    if final.startswith("\\\\?\\UNC\\"):
-        return "\\\\" + final[8:]
-    if final.startswith("\\\\?\\"):
-        return final[4:]
-    return final
+    return _strip_long_prefix(buf.value)
+
+
+def _strip_long_prefix(path: str) -> str:
+    """\\\\?\\C:\\x -> C:\\x and \\\\?\\UNC\\host\\share -> \\\\host\\share, case kept."""
+    if path.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + path[8:]
+    if path.startswith("\\\\?\\"):
+        return path[4:]
+    return path
 
 
 def _open_dir(path: str) -> int:
@@ -278,12 +282,15 @@ def _check_request(requested) -> list:
     return segs
 
 
-def _name_ok(parent_folded: list, name: str) -> bool:
-    """A directory entry the brain may see: clean form and not a refused name."""
-    fold = _fold(name)
-    if _bad_form(name) or _bad_form(fold):
+def _name_ok(parent: list, name: str) -> bool:
+    """A directory entry the brain may see: exactly what read_file would accept
+    (same _check_request: form, NFC, length, refused names), so listing never shows
+    a path a read of it refuses."""
+    try:
+        _check_request("/".join(parent + [name]))
+    except _Refuse:
         return False
-    return not _refused_name(parent_folded + [fold])
+    return True
 
 
 class BrainFiles:
@@ -303,9 +310,16 @@ class BrainFiles:
             if not os.path.isabs(root):
                 raise _Refuse("bad_root", "root is not absolute")
             real = self._realpath(root)
-            if not isinstance(real, str) or not os.path.isdir(real):
+            if not isinstance(real, str):
                 raise _Refuse("bad_root", "root is not a directory")
-            self._root = real
+            # Handle paths come back stripped (_final_path), so the root is kept stripped too;
+            # \\?\C:\repo. stripped names C:\repo, so the stripped form must resolve to itself.
+            stripped = _strip_long_prefix(real)
+            if stripped != real and self._realpath(stripped) != stripped:
+                raise _Refuse("bad_root", "root names another place without its \\\\?\\ prefix")
+            if not os.path.isdir(stripped):
+                raise _Refuse("bad_root", "root is not a directory")
+            self._root = stripped
         except _Refuse as exc:
             self._root_refusal = exc.refusal
         except Exception:  # noqa: BLE001 - the constructor never raises either
@@ -333,7 +347,9 @@ class BrainFiles:
         if not isinstance(real, str):
             raise _Refuse("internal", "resolver returned no path")
         rel_segs = self._place(real)
-        if os.path.normcase(real) != os.path.normcase(candidate):
+        # Exact, never normcase: a case-only sibling (docs vs DOCS on a case-sensitive
+        # folder) is another directory; samefile/st_ino would follow a swapped-in junction.
+        if real != candidate:
             raise _Refuse("link", "path resolves to another place")
         return Resolved(real, "/".join(rel_segs))
 
@@ -426,7 +442,7 @@ class BrainFiles:
 
     def _list_dir(self, path) -> Listing:
         target = self._resolve(_check_request(path))
-        parent = [_fold(s) for s in target.rel.split("/")] if target.rel else []
+        parent = target.rel.split("/") if target.rel else []
         # Stop at MAX_ENTRIES+1 allowed names (enough for the truncated flag) and at the
         # search clock budget (a flood of skipped links or refused names); only the
         # collected names are sorted, so a huge directory is never held or sorted whole.
@@ -471,7 +487,6 @@ class BrainFiles:
         stack = [start.rel.split("/") if start.rel else []]
         while stack:
             segs = stack.pop()
-            parent = [_fold(s) for s in segs]
             dir_path = os.path.join(self._root, *segs)
             names = []
             try:
@@ -496,7 +511,7 @@ class BrainFiles:
             for name, is_dir in names:
                 if self._clock() > deadline:
                     return SearchResult(tuple(matches), scanned, "time")
-                if not _name_ok(parent, name):
+                if not _name_ok(segs, name):
                     continue
                 if is_dir:
                     if not self._is_link(os.path.join(self._root, *segs, name)):  # junctions too
