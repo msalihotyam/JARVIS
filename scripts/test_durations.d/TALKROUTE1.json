@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "about": "TALKROUTE1: CI duration record for tests.test_talk_route (seconds, same schema as scripts/test_durations.json).",
+  "classes": {
+    "tests.test_talk_route.StaticTests": 1.0,
+    "tests.test_talk_route.AcceptanceTests": 1.0,
+    "tests.test_talk_route.NegativeTests": 1.0
+  },
+  "tests": {}
+}
