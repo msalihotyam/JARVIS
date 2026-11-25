@@ -54,17 +54,25 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
-      # v7.0.0; its own pip cache, keyed on this file (it names the one dependency).
+      # CICOLLECT1: the exact pin list, the one input of the pip cache key and
+      # of the install. build/ is gitignored, so the tested tree is unchanged.
+      # The suite needs exactly PySide6 (same version as the local system Python).
+      - name: Pin the dependencies
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          Set-Content -Encoding utf8 build/ci-pins.txt "PySide6==6.11.2"
+
+      # v7.0.0; its own pip cache, keyed on OS + Python + sha256 of the pins.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.13"
           cache: pip
-          cache-dependency-path: .github/workflows/tests.yml
+          cache-dependency-path: build/ci-pins.txt
 
-      # The suite needs exactly PySide6 (same version as the local system Python).
       - name: Install PySide6
         shell: pwsh
-        run: python -m pip install "PySide6==6.11.2"
+        run: python -m pip install -r build/ci-pins.txt
 
       # This shard of the plan: UI units over K processes, the rest over N
       # workers; it applies the load-sensitive rerun rule (RUNBOOK rule D) and
@@ -97,23 +105,30 @@ jobs:
     env:
       PYTHONUTF8: "1"
     steps:
-      # v7.0.1
+      # v7.0.1. Depth 1: discovery and the shard check read no history.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          fetch-depth: 0
+          fetch-depth: 1
           persist-credentials: false
+
+      # The same pins as the shards (same cache key).
+      - name: Pin the dependencies
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force build | Out-Null
+          Set-Content -Encoding utf8 build/ci-pins.txt "PySide6==6.11.2"
 
       # v7.0.0
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version: "3.13"
           cache: pip
-          cache-dependency-path: .github/workflows/tests.yml
+          cache-dependency-path: build/ci-pins.txt
 
       # Discovery imports every test module.
       - name: Install PySide6
         shell: pwsh
-        run: python -m pip install "PySide6==6.11.2"
+        run: python -m pip install -r build/ci-pins.txt
 
       # v8.0.1
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
