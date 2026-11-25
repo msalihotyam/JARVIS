@@ -1,1 +1,1 @@
-{"classes": {"tests.test_talk_redact.AcceptanceTests": 0.5, "tests.test_talk_redact.NegativeTests": 8.0, "tests.test_talk_redact.PerformanceTests": 5.0, "tests.test_talk_redact.StaticTests": 1.0}}
+{"classes": {"tests.test_talk_redact.AcceptanceTests": 0.5, "tests.test_talk_redact.NegativeTests": 8.0, "tests.test_talk_redact.PerformanceTests": 10.0, "tests.test_talk_redact.StaticTests": 1.0}}

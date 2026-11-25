@@ -305,9 +305,38 @@ class NegativeTests(unittest.TestCase):
                 self.assertIsInstance(result, RedactResult)
 
 
+def _best(fn, text, runs=3):
+    best = float("inf")
+    for _ in range(runs):
+        start = time.perf_counter()
+        fn(text)
+        best = min(best, time.perf_counter() - start)
+    return best
+
+
+def _baseline(n):
+    # Same-length plain ASCII on the same machine, so the budget follows the runner's speed.
+    return _best(redact, ("a b " * (n // 4 + 1))[:n])
+
+
+def _slow_bounds(seconds, baseline):
+    broken = []
+    if seconds >= 10 * baseline + 0.05:
+        broken.append("relative")
+    if seconds >= 2.0:
+        broken.append("absolute")
+    return broken
+
+
+def _quadratic(text):
+    # Deliberately O(n^2): rescans every 8th prefix; the relative bound must catch it.
+    return sum(text.count("a b", 0, i) for i in range(0, len(text), 8))
+
+
 class PerformanceTests(unittest.TestCase):
     def test_pathological_inputs_are_fast(self):
         n = 200_000
+        baseline = _baseline(n)
         units = ("token ", "1 ", "1", "12345678:" + " " * 7, "a", "eyJa.", "-", "\n",
                  "sk-", "bearer ", "\\", '"', "%3a", "password ", "1  ", "ghp_", "AKIA",
                  "\u200b", "\uff10", "{\"a\":", "password\n", "-----", "1:",
@@ -317,18 +346,23 @@ class PerformanceTests(unittest.TestCase):
         for unit in units:
             text = (unit * (n // len(unit) + 1))[:n]
             with self.subTest(unit=ascii(unit)):
-                start = time.perf_counter()
-                redact(text)
-                self.assertLess(time.perf_counter() - start, 0.25)
+                best = _best(redact, text)
+                self.assertEqual(_slow_bounds(best, baseline), [], f"{best:.3f}s vs {baseline:.3f}s")
         for tail in ("12345678:" + " " * n, "eyJaa." + "eyJa" * (n // 4)):
             with self.subTest(tail=ascii(tail[:12])):
-                start = time.perf_counter()
-                redact(tail)
-                self.assertLess(time.perf_counter() - start, 0.25)
+                best = _best(redact, tail)
+                self.assertEqual(_slow_bounds(best, baseline), [], f"{best:.3f}s vs {baseline:.3f}s")
+
+    def test_relative_bound_catches_a_quadratic_scan(self):
+        n = 200_000
+        baseline = _baseline(n)
+        seconds = _best(_quadratic, ("a b " * (n // 4 + 1))[:n], runs=1)
+        self.assertIn("relative", _slow_bounds(seconds, baseline), f"{seconds:.3f}s vs {baseline:.3f}s")
 
     def test_distinct_non_latin_inputs_are_fast(self):
         # CLREV-TALKREDACT2FIX4 F1: per-char unicodedata lookups made these 0.3-0.6 s.
         n = 200_000
+        baseline = _baseline(n)
 
         def cjk(i):
             return chr(0x4E00 + i % 20992)
@@ -344,13 +378,9 @@ class PerformanceTests(unittest.TestCase):
         }
         for name, text in texts.items():
             with self.subTest(input=name):
-                best = 1.0
-                for _ in range(3):
-                    start = time.perf_counter()
-                    result = redact(text)
-                    best = min(best, time.perf_counter() - start)
-                self.assertLess(best, 0.25)
-                self.assertIsInstance(result, RedactResult)
+                best = _best(redact, text)
+                self.assertEqual(_slow_bounds(best, baseline), [], f"{best:.3f}s vs {baseline:.3f}s")
+                self.assertIsInstance(redact(text), RedactResult)
         self.assertEqual(redact(texts["cjk_spaced"]).text, texts["cjk_spaced"])
 
     def test_foreign_word_before_unicode_separator_still_flagged(self):
