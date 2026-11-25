@@ -59,10 +59,13 @@ class SelfDenyProfileTest(unittest.TestCase):
             self.assertTrue(codes(target), target)
 
     def test_benign_targets_stay_allowed(self):
-        for target in ("jarvis/router_tr.py", "README.md", "jarvis/work_classify.py",
+        for target in ("jarvis/talk_log.py", "README.md", "jarvis/work_classify.py",
                        "tests/test_router.py", "jarvis/a.py"):
             self.assertEqual(set(), codes(target), target)
-        self.assertEqual(set(), codes("router_tr.py", "jarvis/"))
+        self.assertEqual(set(), codes("talk_log.py", "jarvis/"))
+        # app.py imports router_tr (E1ROUTE1A), so it joined the authority import closure
+        self.assertEqual({"self_target"}, codes("jarvis/router_tr.py"))
+        self.assertEqual({"self_target"}, codes("router_tr.py", "jarvis/"))
         # outside the JARVIS repo the profile does not apply
         self.assertEqual([], validate(plan("dev/x.py", "uv.lock"), "projects/demo",
                                       jarvis_repo=False))
