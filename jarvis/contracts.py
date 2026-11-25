@@ -23,7 +23,7 @@ if TYPE_CHECKING:
 
     from jarvis.conversation import ConversationRecord, ConversationState
     from jarvis.memory import MemoryRecordView
-    from jarvis.work_ledger import EventKind, WorkEvent, WorkRun
+    from jarvis.work_ledger import EventKind, WorkEvent, WorkRun, WorkStep
 
 # Scheduler phase 1A kernels. Both are PURE - stdlib only, no persistence, no
 # clock, no Core import - so depending on them here creates no cycle, and the
@@ -10141,6 +10141,14 @@ class MemoryStore(Protocol):
         ...
 
     def work_events(self, run_id: str) -> list[WorkEvent]:
+        ...
+
+    def append_work_step(self, step: WorkStep) -> None:
+        """Append-only write of one WorkStep snapshot; history is never updated."""
+        ...
+
+    def work_steps(self, run_id: str) -> list[WorkStep]:
+        """Read the run's steps (latest snapshot per key) in ordinal order."""
         ...
 
     def claim_work_lease(
