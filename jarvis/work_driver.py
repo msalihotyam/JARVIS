@@ -45,6 +45,11 @@ The driver owns no process, database or network. ``ports`` supplies:
   the ledger's PROGRESS gate payloads for the step's current attempt, in
   order. A resumed retry takes its failure text from the last failing one;
   a missing port, an error or no failing payload holds the step.
+- ``lessons()`` -> iterable of PROGRESS payloads (optional; PM36W): the
+  project's stored lesson rows (``gate == "lesson"``). A failed attempt of a
+  checks/regression/review/scope gate is classified (work_lessons.learn);
+  only a class missing from these rows writes one lesson row. Without the
+  port nothing is learned (coverage cannot be judged).
 
 Worker claims are data: only the Core gates accept a slice. Any gate
 error fails closed as a finding, so apply never follows a failed gate.
@@ -85,6 +90,7 @@ from jarvis.work_ledger import (
     run_waits_for_input,
     runnable_steps,
 )
+from jarvis.work_lessons import FailedSlice, FailureClass, FailureKind, FailureSignal, SliceOutcome, learn
 from jarvis.work_regress import RETRY_CAP, retriable, root_cause_ok
 from jarvis.workers.base import WorkerResult
 
@@ -373,6 +379,7 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
         # N6-13: a non-retriable gate error ends the slice; CANCELLED is terminal.
         step = move(StepState.CANCELLED)
         _gate_event(step, "non_retriable", found, ports)
+        _learn(step, found, ports)
         _notify(ports, "slice_failed_after_cap", f"{step.key}:non_retriable", step.key)
         return step, "held"
 
@@ -534,6 +541,7 @@ def _slice_body(track: list[WorkStep], ports: Ports) -> tuple[WorkStep, str]:
                 return hold("refcheck", findings[0]["detail"], n6_gate=True)
             if _fatal(findings):
                 return ended(findings)
+        _learn(step, findings, ports)  # PM36W: a failed attempt, before the cap check
         outcome = capped()
         if outcome is not None:
             return outcome
@@ -752,6 +760,60 @@ def _ledger_findings(step: WorkStep, ports: Ports) -> _Findings | None:
 
 def _finding(gate: str, detail: str) -> _Finding:
     return {"gate": gate, "detail": detail}
+
+
+# PM36W: closed map from a failing gate to a lesson signal; any other gate learns nothing.
+_LESSON_SIGNALS = {
+    "checks": FailureSignal.TEST_FAILURE,
+    "regression": FailureSignal.TEST_FAILURE,
+    "review": FailureSignal.STATIC_DEFECT,
+    "scope": FailureSignal.PLAN_GAP,
+}
+
+
+def lesson_classes(payloads: Iterable[object]) -> tuple[FailureClass, ...]:
+    """PM36W: the failure classes in stored lesson rows, in order, once each.
+    A malformed row is skipped: lesson rows are data, never trusted shape."""
+    out: list[FailureClass] = []
+    for p in payloads:
+        if not isinstance(p, Mapping):
+            continue
+        row = cast("Mapping[str, object]", p)
+        if row.get("gate") != "lesson":
+            continue
+        try:
+            found = FailureClass(FailureKind(row.get("kind")), cast(str, row.get("invariant")))
+        except ValueError:
+            continue
+        if found not in out:
+            out.append(found)
+    return tuple(out)
+
+
+def _learn(step: WorkStep, findings: _Findings | None, ports: Ports) -> None:
+    signal = _LESSON_SIGNALS.get(findings[0]["gate"]) if findings else None
+    if signal is None:
+        return
+    # stable across runs: gate + step slug (the step key carries the run id)
+    invariant = re.sub(r"[^a-z0-9._-]+", "-", f"{findings[0]['gate']}.{step.slug}".lower())[:128]
+    invariant = invariant.strip("._-")
+    port = getattr(ports, "lessons", None)
+    if not callable(port):  # no ledger reader: coverage is unknowable, so write nothing (fail closed)
+        return
+    try:
+        known = lesson_classes(port())
+        lessons = learn((FailedSlice(SliceOutcome.FAILED, signal, invariant),), known=known)
+        for p in lessons.proposals:
+            # no "passed" key: _ledger_findings never reads a lesson row as a gate failure
+            ports.append_event(EventKind.PROGRESS, step.key, {
+                "gate": "lesson", "failure": p.failure.key, "kind": p.failure.kind.value,
+                "invariant": p.failure.invariant,
+                "proposal": {"kind": p.kind.value, "target": p.target, "why": p.why,
+                             "slice_id": p.slice.slice_id, "needs_salih": p.needs_salih},
+            }, idempotency_key=idempotency_key(step.run_id, step.key, step.attempt,
+                                               "lesson:" + p.slice.slice_id))
+    except ValueError:  # an unclassifiable slug or a replayed row: no lesson, the run goes on
+        return
 
 
 def _step_to(step: WorkStep, to: StepState, ports: Ports) -> WorkStep:
