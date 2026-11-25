@@ -1509,6 +1509,9 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         self._warm: dict[str, WarmClaudeSession] = {} if warm_sessions is None else warm_sessions
         #: Task ids whose payload left the conversation out for a live warm process.
         self._warm_dropped: set[str] = set()
+        #: E1ROUTE1A: the caller sets it for one call when this lane missed turns
+        #: another lane answered; the live process is reused, the window is sent.
+        self.warm_resend = False
 
     def complete(self, task: Task, session: SessionState) -> ToolResult:
         return self.execute(task, session)
@@ -1723,7 +1726,8 @@ class ClaudeIntentAdapter(ClaudeCodeConnector):
         # new process, which gets the full window again.
         if self._warm_alive():
             self._warm_dropped.add(task.id)
-            context.pop("conversation", None)
+            if not self.warm_resend:
+                context.pop("conversation", None)
         else:
             self._warm_dropped.discard(task.id)
         payload, redactions = self._redact({"request": task.objective, "context": context})
