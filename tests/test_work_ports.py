@@ -17,7 +17,7 @@ from unittest import mock
 from jarvis import n6_boot, stage_git, work_driver, work_ports
 from jarvis.memory import SQLiteMemoryStore
 from jarvis.work_checks import CheckResult
-from jarvis.work_ledger import EventKind, RunState, StepState, WorkRun, WorkStep, step_key
+from jarvis.work_ledger import EventKind, RunState, StepState, WorkLedgerError, WorkRun, WorkStep, step_key
 from jarvis.work_ports import _changes, build_ports
 from jarvis.work_regress import TestResult
 from jarvis.write_stage import Stage, StageError, StageManager
@@ -96,7 +96,7 @@ class Base(unittest.TestCase):
         data = input.encode() if input is not None else None
         return self.manager._git(cwd, *args, input=data).decode("utf-8", "replace")
 
-    def build(self, targets=None, run_id=RUN):
+    def build(self, targets=None, run_id=RUN, lease_target="project/"):
         def fake_run_check(argv, *, stage, jarvis_repo):
             allowed = stage / "allowed.txt"
             self.exported.append((stage, (stage / ".git").exists(),
@@ -117,7 +117,7 @@ class Base(unittest.TestCase):
 
         return build_ports(
             store=SQLiteMemoryStore(self.db), manager=self.manager, target=self.repo,
-            lease_target="project/", run_id=run_id, boot_id="boot-1", clock=self.clock,
+            lease_target=lease_target, run_id=run_id, boot_id="boot-1", clock=self.clock,
             lease=timedelta(minutes=5), targets=targets or {"allowed.txt": "file"},
             jarvis_repo=False, checks=[("python", "-m", "unittest")],
             base_result=TestResult(3, frozenset()), locked_fixture_hash="a" * 64,
@@ -445,6 +445,32 @@ class WiringTests(Base):
         self.assertTrue(self.ports.lease_claim(self.step))
         self.ports.lease_release(self.step)
         self.assertTrue(self.ports.lease_claim(self.step))
+
+    # PM26W1FIX2 F2: every permitted target is leased per step, all or none.
+    def foreign_claim(self, name):
+        store = SQLiteMemoryStore(self.db)
+        return store.claim_work_lease(name, "other-run", "boot-1", now=self.clock(), lease=timedelta(minutes=5))
+
+    def test_every_lease_target_is_held_and_released(self):
+        ports = self.build(lease_target=("a.txt", "b/"))
+        self.assertEqual(len(ports.lease_claim(self.step)), 2)
+        for name in ("a.txt", "b/"):
+            with self.assertRaises(WorkLedgerError):
+                self.foreign_claim(name)
+        ports.lease_release(self.step)
+        for name in ("a.txt", "b/"):
+            self.assertTrue(self.foreign_claim(name))
+
+    def test_a_refused_target_releases_the_ones_already_taken(self):
+        self.foreign_claim("b/")
+        ports = self.build(lease_target=("a.txt", "b/"))
+        with self.assertRaises(WorkLedgerError):
+            ports.lease_claim(self.step)
+        self.assertTrue(self.foreign_claim("a.txt"))
+
+    def test_no_lease_target_is_refused(self):
+        with self.assertRaises(StageError):
+            self.build(lease_target=())
 
     def test_apply_intent_reports_key_and_receipt(self):
         self.assertIsNone(self.ports.apply_intent(self.step))
