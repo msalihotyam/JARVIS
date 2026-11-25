@@ -15,6 +15,7 @@ and that none of it moved anything that already worked.
 from __future__ import annotations
 
 import os
+import shutil
 import socket
 import subprocess
 import tempfile
@@ -129,6 +130,34 @@ def _forbid(name: str):
     return blocked
 
 
+#: One schema build per module; each test copies the file into its own temp dir
+#: (copied, never shared: every test still writes only its own database).
+_TEMPLATE: dict[str, Any] = {}
+
+
+def _template_database() -> Path:
+    if "path" not in _TEMPLATE:
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        path = Path(temp.name) / "jarvis.db"
+        SQLiteMemoryStore(path)
+        # Fail closed: a copy of the main file alone must carry the whole schema.
+        leftovers = sorted(p.name for p in path.parent.iterdir() if p != path)
+        if leftovers:
+            safe_cleanup(temp)
+            raise AssertionError(f"template database left side files: {leftovers}")
+        _TEMPLATE.update(temp=temp, path=path)
+    return _TEMPLATE["path"]
+
+
+def fresh_memory(test: unittest.TestCase) -> SQLiteMemoryStore:
+    """A test-private store opened (and re-initialized) on a copy of the template."""
+    test.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+    test.addCleanup(safe_cleanup, test.temp)
+    path = Path(test.temp.name) / "jarvis.db"
+    shutil.copyfile(_template_database(), path)
+    return SQLiteMemoryStore(path)
+
+
 def setUpModule() -> None:
     for target, label in (
         ("socket.socket", "a network socket"),
@@ -146,6 +175,9 @@ def setUpModule() -> None:
 def tearDownModule() -> None:
     while _OFFLINE_PATCHES:
         _OFFLINE_PATCHES.pop().stop()
+    if "temp" in _TEMPLATE:
+        safe_cleanup(_TEMPLATE.pop("temp"))
+        _TEMPLATE.clear()
 
 
 # --------------------------------------------------------------------------
@@ -679,9 +711,7 @@ class DestinationPolicyTests(unittest.TestCase):
     """A perfectly valid destination plus a perfect connector is still no."""
 
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(safe_cleanup, self.temp)
-        self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
+        self.memory = fresh_memory(self)
 
     def build(self, connectors, policy) -> AgentCore:
         registry = ToolRegistry()
@@ -1527,9 +1557,7 @@ class CoreDestinationLaunderingTests(unittest.TestCase):
     CAPABILITY = "github_issue_read"
 
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(safe_cleanup, self.temp)
-        self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
+        self.memory = fresh_memory(self)
         #: The build IS authorized for the canonical repository. Every refusal
         #: below is therefore about the spelling and nothing else.
         self.policy = frozenset(
@@ -1776,9 +1804,7 @@ class CoreIdentityOwnershipTests(unittest.TestCase):
     CAPABILITY = "github_issue_read"
 
     def setUp(self) -> None:
-        self.temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
-        self.addCleanup(safe_cleanup, self.temp)
-        self.memory = SQLiteMemoryStore(Path(self.temp.name) / "jarvis.db")
+        self.memory = fresh_memory(self)
         self.policy = frozenset(
             {DestinationGrant(GITHUB_CONNECTOR, self.CAPABILITY, DEST)}
         )
