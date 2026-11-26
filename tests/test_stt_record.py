@@ -1,6 +1,7 @@
 """STTREC1: 30-sentence recorder - session logic, atomic WAV files, path guard, phrases, static rules."""
 
 import ast
+import contextlib
 import builtins
 import json
 import os
@@ -54,6 +55,16 @@ class Base(unittest.TestCase):
             out.setsampwidth(2)
             out.setframerate(16000)
             out.writeframes(frames)
+
+    def denied(self, error=PermissionError(13, "Erişim engellendi")):
+        original = Path.is_file
+
+        def is_file(path):
+            if path.name.endswith(".wav"):
+                raise error
+            return original(path)
+
+        return mock.patch.object(Path, "is_file", autospec=True, side_effect=is_file)
 
     def leftovers(self):
         return [p.name for p in (self.root / "run").glob("*") if not p.name.endswith(".wav")]
@@ -251,6 +262,81 @@ class ResumeAndFinishTest(Base):
         self.assertFalse(s.recording)
 
 
+def corrupt_chunk(path):
+    """CDX-STTREC1FIX F1 class: a chunk header whose size runs past the file -> wave.open raises a bare RuntimeError."""
+    data = bytearray(path.read_bytes())
+    data[12:20] = b"f\0\0\0" + (1000).to_bytes(4, "little")  # unknown chunk; its skip seeks past the chunk end
+    path.write_bytes(bytes(data))
+
+
+class BadStr(Exception):
+    def __str__(self):
+        raise ValueError("str() itself fails")
+
+
+def zero_rate(path):
+    data = bytearray(path.read_bytes())
+    data[24:28] = b"\0\0\0\0"
+    path.write_bytes(bytes(data))
+
+
+class UnreadableTest(Base):
+    """Every refresh read (is_file, wave.open, header fields) turns into state "unreadable", never an exception."""
+
+    def assert_unreadable(self, s, index=0):
+        self.assertEqual(s.status(index), "unreadable")
+        self.assertIn(f"{index + 1:02d}.wav okunamadı", s.unreadable[index])
+        self.assertEqual(s.summary()[0], 0)
+
+    def test_corrupt_chunk_header(self):
+        # CDX F1: Session.summary() raised RuntimeError on cc50017
+        self.write_wav("01.wav")
+        corrupt_chunk(self.root / "run" / "01.wav")
+        with self.assertRaises(RuntimeError):  # the fixture really is the bare-RuntimeError class
+            wave.open(str(self.root / "run" / "01.wav"), "rb").close()
+        s = self.session()
+        self.assertEqual(s.summary(), (0, 0.0))
+        self.assert_unreadable(s)
+        self.assertIn("RuntimeError", s.unreadable[0])
+        self.assertEqual(s.index, 0)  # an unreadable sentence is offered for re-recording
+
+    def test_is_file_permission_denied(self):
+        # CDX F2: Session.status(0) raised PermissionError on cc50017
+        s = self.session()
+        with self.denied():
+            self.assert_unreadable(s)
+            self.assertIn("PermissionError", s.unreadable[0])
+            self.assertEqual(len(s.unreadable), record.COUNT)
+
+    def test_other_read_failures(self):
+        variants = {
+            "oserror": lambda p: mock.patch.object(Path, "is_file", side_effect=OSError(5, "G/Ç hatası")),
+            "not_riff": lambda p: p.write_bytes(b"not a wave file at all, 44 bytes long......"),
+            "empty": lambda p: p.write_bytes(b""),
+            "truncated": lambda p: p.write_bytes(p.read_bytes()[:20]),
+            "zero_rate": zero_rate,
+            "valueerror": lambda p: mock.patch.object(record.wave, "open", side_effect=ValueError("bozuk")),
+            "str_raises": lambda p: mock.patch.object(record.wave, "open", side_effect=BadStr()),
+        }
+        for name, apply in variants.items():
+            with self.subTest(name), tempfile.TemporaryDirectory(dir=FIXTURES) as tmp:
+                self.root = Path(tmp) / "audio"
+                self.write_wav("01.wav")
+                s = self.session()
+                patch = apply(self.root / "run" / "01.wav")
+                with patch if hasattr(patch, "__enter__") else contextlib.nullcontext():
+                    self.assert_unreadable(s)
+
+    def test_unreadable_clears_when_readable_again(self):
+        self.write_wav("01.wav")
+        s = self.session()
+        with self.denied():
+            s.summary()
+        self.assertEqual(s.status(0), "recorded")
+        self.assertEqual(s.summary()[0], 1)
+        self.assertEqual(s.unreadable, {})
+
+
 class PathGuardTest(Base):
     def test_hostile_corpus(self):
         root = self.root.resolve()
@@ -418,6 +504,36 @@ class WindowTest(Base):
         self.assertEqual(buttons["toggle"].text(), "Kaydet")
         self.assertTrue(buttons["done"].isEnabled())
         self.assertIn("beklenmedik", w.findChild(QLabel, "message").text())
+
+    def test_corrupt_file_at_startup(self):
+        # CDX F1: build_window raised RuntimeError on cc50017
+        from PySide6.QtWidgets import QLabel
+
+        self.write_wav("01.wav")
+        corrupt_chunk(self.root / "run" / "01.wav")
+        s = self.session()
+        w = self.enterContext(_closing(record.build_window(s), s))
+        self.assertIn("okunamıyor", w.findChild(QLabel, "position").text())
+        self.assertIn("01.wav okunamadı", w.findChild(QLabel, "message").text())
+        self.assertIn("0/30", w.findChild(QLabel, "progress").text())
+
+    def test_read_denied_folder_failed_save_refreshes(self):
+        # CDX F2: is_file PermissionError + mkstemp PermissionError; on cc50017 the toggle stayed Bitir
+        from PySide6.QtWidgets import QLabel, QPushButton
+
+        s = self.session()
+        w = self.enterContext(_closing(record.build_window(s), s))
+        buttons = {b.objectName(): b for b in w.findChildren(QPushButton)}
+        with self.denied(), mock.patch.object(record.tempfile, "mkstemp", side_effect=PermissionError(13, "yazma engellendi")):
+            buttons["toggle"].click()
+            buttons["toggle"].click()
+        self.assertEqual(buttons["toggle"].text(), "Kaydet")
+        for name in ("previous", "next", "redo", "done"):
+            self.assertTrue(buttons[name].isEnabled(), name)
+        text = w.findChild(QLabel, "message").text()
+        self.assertIn("Kaydedilemedi", text)
+        self.assertIn("01.wav okunamadı", text)
+        self.assertIn("dosya daha okunamadı", text)
 
 
 class _closing:

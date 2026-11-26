@@ -71,14 +71,34 @@ class Session:
         self.recording = False
         self.finished = False
         self.message = ""
-        missing = [i for i in range(COUNT) if self.status(i) == "missing"]
-        self.index = missing[0] if missing else 0
+        self.unreadable = {}  # index -> visible "NN.wav okunamadı: <error>" text from the last probe
+        todo = [i for i in range(COUNT) if self.status(i) != "recorded"]
+        self.index = todo[0] if todo else 0
 
     def path(self, index):
         return self.directory / f"{index + 1:02d}.wav"
 
+    def _probe(self, index):
+        """Return (state, seconds) for one sentence; the only disk read of refresh, it never raises."""
+        path = self.path(index)
+        try:
+            if not path.is_file():
+                state, seconds = "missing", 0.0
+            else:
+                with wave.open(str(path), "rb") as stream:
+                    state, seconds = "recorded", stream.getnframes() / stream.getframerate()
+        except Exception as error:  # is_file re-raises PermissionError; wave.open raises RuntimeError on a bad chunk
+            try:
+                detail = f"{type(error).__name__}: {error}"
+            except Exception:  # an error whose str() raises still gets a visible message
+                detail = type(error).__name__
+            self.unreadable[index] = f"{path.name} okunamadı: {detail}"[:200]
+            return "unreadable", 0.0
+        self.unreadable.pop(index, None)
+        return state, seconds
+
     def status(self, index):
-        return "recorded" if self.path(index).is_file() else "missing"
+        return self._probe(index)[0]
 
     def _move(self, step):
         if self.recording:
@@ -145,17 +165,12 @@ class Session:
         return f"{self.index + 1:02d} kaydedildi."
 
     def summary(self):
-        """Return (recorded count, total seconds) over the files on disk."""
+        """Return (recorded count, total seconds) over the readable files on disk; never raises."""
         recorded, seconds = 0, 0.0
         for index in range(COUNT):
-            if self.status(index) != "recorded":
-                continue
-            recorded += 1
-            try:
-                with wave.open(str(self.path(index)), "rb") as stream:
-                    seconds += stream.getnframes() / stream.getframerate()
-            except (OSError, EOFError, wave.Error, ZeroDivisionError):
-                pass
+            state, length = self._probe(index)
+            recorded += state == "recorded"
+            seconds += length
         return recorded, seconds
 
     def finish(self):
@@ -212,11 +227,13 @@ def build_window(session):
             return
         index = session.index
         sentence.setText(session.sentences[index])
-        state = "kayıtlı" if session.status(index) == "recorded" else "eksik"
+        state = {"recorded": "kayıtlı", "missing": "eksik"}.get(session.status(index), "okunamıyor")
         position.setText(f"Cümle {index + 1:02d} / {COUNT} ({state})")
         recorded, seconds = session.summary()
         progress.setText(f"Kaydedilen {recorded}/{COUNT}, toplam {seconds:.1f} sn")
-        message.setText(session.message)
+        problems = [session.unreadable[i] for i in sorted(session.unreadable)]
+        extra = "\n".join(problems[:3] + ([f"... {len(problems) - 3} dosya daha okunamadı"] if len(problems) > 3 else []))
+        message.setText("\n".join(filter(None, (session.message, extra))))
         buttons["toggle"].setText("Bitir" if session.recording else "Kaydet")
         buttons["previous"].setText("Önceki")
         buttons["next"].setText("Sonraki")
