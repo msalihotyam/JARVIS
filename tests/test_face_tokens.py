@@ -24,7 +24,10 @@ COLORS = {
     "text3": "#8793A1", "accent": "#5BC8F5", "accent_ink": "#06202C",
     "accent_surface": "#0F1C24", "accent_line": "#1D3A4A", "needs_you": "#F2B34A",
     "error": "#F2777F", "ok": "#6FD3A3", "disabled_glyph": "#5E6978",
+    "link": "#7FD4F7", "link_hover": "#B5E6FB", "text_soft": "#C5CED8",
 }
+RADIUS = {"panel": 12, "composer": 16, "control": 12, "code": 8, "pill": 999}
+SPACE = (4, 6, 8, 10, 12, 14, 16, 20, 24)
 SANS = ("Inter-Regular.ttf", "Inter-Medium.ttf", "Inter-SemiBold.ttf")
 MONO = ("JetBrainsMono-Regular.ttf", "JetBrainsMono-Medium.ttf", "JetBrainsMono-SemiBold.ttf")
 ALL_FONTS = [str(FONT_DIR / n) for n in SANS + MONO]
@@ -53,6 +56,12 @@ def translucent(flat):
     return hits
 
 
+def non_numeric(flat):
+    """Keys of a flat QML dict that must be numbers but are not exactly int or float (bool counts as bad)."""
+    text_keys = {k for k in flat if k.startswith("color_") or k.startswith("type_family_")}
+    return sorted(k for k, v in flat.items() if k not in text_keys and type(v) not in (int, float))
+
+
 class AcceptanceTest(unittest.TestCase):
     def test_tokens_are_immutable(self):
         with self.assertRaises(TypeError):
@@ -68,8 +77,11 @@ class AcceptanceTest(unittest.TestCase):
         self.assertEqual(dict(TOKENS["type"]), {
             "body": (17, 28), "h2": (22, 30), "h3": (17, 26), "code": (14.5, 22),
             "small": (13, 20), "label": (12.5, 16),
+            "turn": (16, 26), "cell": (15, 24), "meta": (13, 20), "control": (14, 20),
             "family_sans": "Inter", "family_mono": "JetBrains Mono",
         })
+        self.assertEqual(dict(TOKENS["radius"]), RADIUS)
+        self.assertEqual(dict(TOKENS["space"]), {str(n): n for n in SPACE})
         self.assertEqual(dict(TOKENS["size"]), {
             "ring": 72, "control_min": 44, "reading_col": (640, 660), "reader_width": 880,
             "rail": 320, "pane": 600, "composer_radius": 16, "mini_box": 460,
@@ -91,8 +103,10 @@ class AcceptanceTest(unittest.TestCase):
             self.assertRegex(k, r"^[a-z][a-z0-9_]*$")
             self.assertIn(type(v), (str, int, float), k)
         expected = {f"color_{n}" for n in COLORS}
-        expected |= {f"type_{s}_{p}" for s in ("body", "h2", "h3", "code", "small", "label")
+        expected |= {f"type_{s}_{p}" for s in ("body", "h2", "h3", "code", "small", "label",
+                                               "turn", "cell", "meta", "control")
                      for p in ("size", "line")}
+        expected |= {f"radius_{n}" for n in RADIUS} | {f"space_{n}" for n in SPACE}
         expected |= {"type_family_sans", "type_family_mono", "size_reading_col_min",
                      "size_reading_col_max", "motion_fast", "motion_medium", "motion_slow",
                      "motion_curve_x1", "motion_curve_y1", "motion_curve_x2", "motion_curve_y2"}
@@ -100,6 +114,8 @@ class AcceptanceTest(unittest.TestCase):
                                            "pane", "composer_radius", "mini_box")}
         self.assertEqual(set(flat), expected)
         self.assertEqual((flat["type_code_size"], flat["size_reading_col_max"]), (14.5, 660))
+        self.assertEqual((flat["type_turn_line"], flat["radius_pill"], flat["space_24"],
+                          flat["color_link_hover"]), (26, 999, 24, "#B5E6FB"))
         flat["color_base"] = "#FFFFFF"
         self.assertEqual(as_qml_dict()["color_base"], "#0B0E13")
 
@@ -110,9 +126,13 @@ class ContrastTest(unittest.TestCase):
         self.assertAlmostEqual(contrast("#000000", "#FFFFFF"), 21.0, places=6)
         self.assertAlmostEqual(contrast("#5BC8F5", "#5BC8F5"), 1.0, places=6)
         self.assertAlmostEqual(contrast(COLORS["text3"], COLORS["surface2"]), 5.42, delta=0.01)
+        self.assertAlmostEqual(contrast(COLORS["link"], COLORS["surface2"]), 10.21, delta=0.01)
 
     def test_every_pair_passes_aa(self):
         self.assertGreater(len(PAIRS), 30)
+        surfaces = [k for k, r in ROLES.items() if r == "surface"]
+        for fg in ("link", "link_hover", "text_soft"):  # new text colours: every surface
+            self.assertEqual({bg for f, bg in PAIRS if f == fg}, set(surfaces), fg)
         for fg, bg in PAIRS:
             ratio = contrast(COLORS[fg], COLORS[bg])
             self.assertGreaterEqual(ratio, 4.5, f"{fg} on {bg}: {ratio:.2f}")
@@ -355,6 +375,16 @@ class StaticTest(unittest.TestCase):
         self.assertEqual(bad_hex(TOKENS["color"]), [])
         for value in doctored.values():
             self.assertEqual(tokens.is_hex(value), not bad_hex({"x": value}), repr(value))
+
+    def test_numbers_only_outside_colour_and_family(self):
+        self.assertEqual(non_numeric(as_qml_dict()), [])
+        doctored = {"color_x": "#000000", "type_family_x": "Inter", "radius_a": True,
+                    "space_b": "8", "size_c": None, "type_d_size": (1, 2), "ok": 4, "ok2": 1.5}
+        self.assertEqual(non_numeric(doctored), ["radius_a", "size_c", "space_b", "type_d_size"])
+        for group in ("radius", "space"):
+            for v in TOKENS[group].values():
+                self.assertIs(type(v), int, group)
+                self.assertGreater(v, 0, group)
 
     def test_no_translucent_token(self):
         self.assertEqual(translucent(as_qml_dict()), [])

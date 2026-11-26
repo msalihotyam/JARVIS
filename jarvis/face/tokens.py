@@ -32,6 +32,9 @@ TOKENS = MappingProxyType({
         "error": "#F2777F",
         "ok": "#6FD3A3",
         "disabled_glyph": "#5E6978",
+        "link": "#7FD4F7",
+        "link_hover": "#B5E6FB",
+        "text_soft": "#C5CED8",
     }),
     "type": MappingProxyType({
         # (pixel size, line height)
@@ -41,6 +44,10 @@ TOKENS = MappingProxyType({
         "code": (14.5, 22),
         "small": (13, 20),
         "label": (12.5, 16),
+        "turn": (16, 26),
+        "cell": (15, 24),
+        "meta": (13, 20),
+        "control": (14, 20),
         "family_sans": "Inter",
         "family_mono": "JetBrains Mono",
     }),
@@ -60,6 +67,15 @@ TOKENS = MappingProxyType({
         "slow": 320,
         "curve": (0.2, 0.0, 0.0, 1.0),  # cubic-bezier x1, y1, x2, y2
     }),
+    "radius": MappingProxyType({
+        "panel": 12,
+        "composer": 16,
+        "control": 12,
+        "code": 8,
+        "pill": 999,
+    }),
+    # The spacing scale, keyed by its own value: QML reads ``space_8``.
+    "space": MappingProxyType({str(n): n for n in (4, 6, 8, 10, 12, 14, 16, 20, 24)}),
 })
 
 #: What each colour is for. Lines are borders (never under text); disabled_glyph
@@ -70,11 +86,13 @@ ROLES = MappingProxyType({
     "line1": "line", "line2": "line", "accent_line": "line",
     "text1": "text", "text2": "text", "text3": "text", "accent": "text", "accent_ink": "text",
     "needs_you": "text", "error": "text", "ok": "text",
+    "link": "text", "link_hover": "text", "text_soft": "text",
     "disabled_glyph": "non_text",
 })
 
 _SURFACES = ("base", "surface1", "surface2", "surface3", "accent_surface")
-_ON_SURFACES = ("text1", "text2", "text3", "accent", "needs_you", "error", "ok")
+_ON_SURFACES = ("text1", "text2", "text3", "accent", "needs_you", "error", "ok",
+                "link", "link_hover", "text_soft")
 #: Every (foreground, background) colour-name pair the design puts text on.
 PAIRS = tuple((fg, bg) for fg in _ON_SURFACES for bg in _SURFACES) + (("accent_ink", "accent"),)
 MIN_TEXT_CONTRAST = 4.5
