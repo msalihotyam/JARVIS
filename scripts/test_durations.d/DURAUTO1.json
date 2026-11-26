@@ -1,0 +1,11 @@
+{
+ "version": 1,
+ "classes": {
+  "tests.test_dur_autofill.AdversarialTests": 1.0,
+  "tests.test_dur_autofill.CliTests": 1.0,
+  "tests.test_dur_autofill.OrphanTests": 1.0,
+  "tests.test_dur_autofill.ProposeTests": 1.0,
+  "tests.test_dur_autofill.ScanTests": 1.0,
+  "tests.test_dur_autofill.StaticTests": 1.0
+ }
+}
