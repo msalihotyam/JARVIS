@@ -17,14 +17,15 @@ import time
 import unittest
 from pathlib import Path
 
-os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+os.environ["QT_QPA_PLATFORM"] = "offscreen"                 # an inherited platform must not win
 os.environ.setdefault("QT_QUICK_CONTROLS_STYLE", "Basic")
 if "--shots" in sys.argv:
     os.environ["QT_QUICK_BACKEND"] = "software"           # offscreen grabs need the software scene graph
 
-from PySide6.QtCore import (Property, Q_ARG, QMetaObject, QObject, QPointF, Qt, QtMsgType, QUrl,  # noqa: E402
-                            Signal, Slot, qInstallMessageHandler)
-from PySide6.QtGui import QColor, QGuiApplication, QImage, QPainter  # noqa: E402
+from PySide6.QtCore import (Property, Q_ARG, QEvent, QMetaObject, QObject, QPointF, Qt, QtMsgType,  # noqa: E402
+                            QUrl, Signal, Slot, qInstallMessageHandler)
+from PySide6.QtGui import (QColor, QGuiApplication, QImage, QInputMethodEvent, QKeyEvent,  # noqa: E402
+                           QPainter)
 from PySide6.QtQml import QQmlComponent, QQmlEngine  # noqa: E402
 from PySide6.QtQuick import QQuickItem  # noqa: E402,F401 - items come back as QQuickItem
 from PySide6.QtTest import QTest  # noqa: E402
@@ -55,8 +56,9 @@ def _audit(event: str, args: tuple) -> None:
 sys.addaudithook(_audit)
 
 
-def _message(kind, _context, text) -> None:
-    if kind != QtMsgType.QtDebugMsg and re.search(r"\.qml|QML|Binding loop|Polish loop|Layout", text):
+def _message(kind, context, text) -> None:
+    from_qml = (context.file or "").endswith(".qml") or (context.category or "").startswith("qml")
+    if kind != QtMsgType.QtDebugMsg and (from_qml or re.search(r"\.qml|QML|Binding loop|Polish loop|Layout", text)):
         _MESSAGES.append(text)
 
 
@@ -125,6 +127,7 @@ class FakeFace(QObject):
             self.values[key] = value
             getattr(self, key + "Changed").emit()
 
+    echo = True                                           # False: a model that does not write the edit back
     tokens = Property("QVariantMap", lambda s: s.values["tokens"], notify=tokensChanged)
     composer = Property("QVariantMap", lambda s: s.values["composer"], notify=composerChanged)
     link = Property(str, lambda s: s.values["link"], notify=linkChanged)
@@ -135,8 +138,9 @@ class FakeFace(QObject):
     @Slot(str)
     def textEdited(self, text: str) -> None:
         self.calls.append(("textEdited", text))
-        self.values["composer"] = {**self.values["composer"], "text": text}   # the model echoes the text back
-        self.composerChanged.emit()
+        if self.echo:
+            self.values["composer"] = {**self.values["composer"], "text": text}   # the model echoes the text back
+            self.composerChanged.emit()
 
     @Slot()
     def send(self) -> None:
@@ -531,6 +535,12 @@ class Behaviour(Rig):
     def names(self, rows: list) -> dict:
         return {r["on"]: r["acc"] for r in rows if "on" in r and r["v"]}
 
+    def commit(self, text: str) -> None:
+        ev = QInputMethodEvent()                                            # an input-method commit, not a key
+        ev.setCommitString(text)
+        QGuiApplication.sendEvent(self.win, ev)
+        QTest.qWait(5)
+
     def test_a4_clicks_call_only_face_slots(self) -> None:
         self.open_bar(composer=VIEW["listening"], levels=LEVELS)
         for name in ("talkButton", "cancelTalk", "modeYazili", "modeSesli"):
@@ -689,6 +699,91 @@ class Behaviour(Rig):
         self.set(composer={}, levels=[])
         self.check_frame(WIDTHS["window"], {})
         self.assertEqual(self.face.calls, [])
+
+    def key(self, key, modifier=Qt.NoModifier, repeat=False, kind=QEvent.Type.KeyPress) -> None:
+        QGuiApplication.sendEvent(self.win, QKeyEvent(kind, key.value, modifier, "\r", repeat))
+        QTest.qWait(5)
+
+    def test_n6_hidden_text_takes_no_input(self) -> None:
+        typed = VIEW["typing"]["text"]
+        keys = ((Qt.Key_X, Qt.NoModifier), (Qt.Key_Return, Qt.NoModifier), (Qt.Key_Space, Qt.NoModifier),
+                (Qt.Key_Backspace, Qt.NoModifier), (Qt.Key_Delete, Qt.NoModifier), (Qt.Key_Z, Qt.ControlModifier),
+                (Qt.Key_Return, Qt.ShiftModifier), (Qt.Key_Enter, Qt.KeypadModifier), (Qt.Key_Tab, Qt.NoModifier))
+        for width in WIDTHS:
+            with self.subTest(width=width):
+                self.open_bar(width, composer=VIEW["typing"])
+                edit = self.item("composerText")
+                edit.forceActiveFocus()
+                self.assertTrue(edit.hasActiveFocus())
+                for state in ("listening", "transcribing"):
+                    self.face.calls.clear()
+                    self.set(composer=make_composer(state, typed, True))    # the CDX repro: focused, then hidden
+                    edit.forceActiveFocus()                                 # refused while hidden
+                    for key, mod in keys:
+                        self.press(key, mod)
+                    self.commit("q")
+                    self.click("composerScroll")
+                    self.assertEqual(self.face.calls, [], state)
+                    self.assertEqual((edit.hasActiveFocus(), edit.isEnabled(), edit.property("text")),
+                                     (False, False, typed))
+                    self.set(composer=make_composer("typing", typed, True))
+                    self.assertTrue(edit.hasActiveFocus(), "focus comes back with the field")
+                    self.press(Qt.Key_Return)
+                    self.assertEqual(self.face.calls, [("send",)])
+                self.face.calls.clear()
+                self.item("composerBody").setVisible(False)                 # hidden by an ancestor, not by state
+                QTest.qWait(5)
+                edit.forceActiveFocus()
+                self.press(Qt.Key_X)
+                self.press(Qt.Key_Return)
+                self.commit("q")
+                self.assertEqual((self.face.calls, edit.isEnabled()), ([], False))
+                self.item("composerBody").setVisible(True)
+                self.close_all()
+
+    def test_n7_model_text_and_held_enter(self) -> None:
+        for text in ("a\r\nb", "a\rb", "a b", "a b", "a b"):
+            with self.subTest(text=repr(text)):
+                self.open_bar(composer=make_composer("typing", text, True))
+                self.set(composer=make_composer("typing", text + "c", True))
+                self.assertEqual(self.face.calls, [])                       # Qt's own rewrite is not a user edit
+                self.item("composerText").forceActiveFocus()
+                self.press(Qt.Key_Z)
+                self.assertEqual([c[0] for c in self.face.calls], ["textEdited"])
+                self.close_all()
+        self.open_bar(composer=VIEW["typing"])
+        edit = self.item("composerText")
+        edit.forceActiveFocus()
+        for repeat in (False, True, True):
+            self.key(Qt.Key_Return, repeat=repeat)
+        self.key(Qt.Key_Enter, Qt.KeypadModifier, True)
+        self.key(Qt.Key_Return, repeat=True, kind=QEvent.Type.KeyRelease)
+        self.assertEqual(self.face.calls, [("send",)])                      # a held Enter sends once
+        self.assertEqual(edit.property("text"), VIEW["typing"]["text"])     # and adds no line
+
+    def test_n8_stopped_runner_starts_at_zero(self) -> None:
+        self.open_bar(composer=VIEW["transcribing"])
+        line, runner = self.item("transcribingLine"), self.item("transcribingRunner")
+        QTest.qWait(250)
+        self.assertTrue(line.property("moving"))
+        self.set(tokens=make_tokens(reduced=True))                          # reduced motion switched on mid-run
+        self.assertEqual((line.property("moving"), runner.x(), runner.width()), (False, 0, line.width()))
+        self.close_all()
+        self.open_bar(composer=VIEW["transcribing"])
+        line, runner = self.item("transcribingLine"), self.item("transcribingRunner")
+        QTest.qWait(250)
+        self.set(composer=VIEW["typing"])
+        self.set(tokens=make_tokens(reduced=True))
+        self.set(composer=VIEW["transcribing"])                             # a still transcribe after an animated one
+        self.assertEqual((line.property("moving"), runner.x(), runner.width()), (False, 0, line.width()))
+
+    def test_n9_edit_back_to_model_text_is_reported(self) -> None:
+        self.open_bar(composer=make_composer("typing", "ab", True))
+        self.face.echo = False
+        self.item("composerText").forceActiveFocus()
+        for k in (Qt.Key_End, Qt.Key_C, Qt.Key_Backspace):
+            self.press(k)
+        self.assertEqual(self.face.calls, [("textEdited", "abc"), ("textEdited", "ab")])   # ending on the model text is an edit too
 
 
 def shots() -> None:

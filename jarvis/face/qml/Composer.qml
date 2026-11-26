@@ -18,9 +18,20 @@ Item {
     readonly property bool canSend: c.canSend === true && face.link !== "unreachable"
     readonly property string given: typeof c.text === "string" ? c.text : ""
     readonly property string fixes: summary(c.corrections)
+    property bool syncing: false                                    // true while the model's text is written in
+    property bool ready: false                                      // TextEdit reports its load-time text unguarded
     implicitHeight: col.implicitHeight
-    onGivenChanged: if (edit.text !== given) edit.text = given
-    Component.onCompleted: if (edit.text !== given) edit.text = given
+    onGivenChanged: sync()
+    Component.onCompleted: { ready = true; sync() }
+
+    // Qt may normalise the model text (CRLF, CR), so only edits made outside load and sync() reach textEdited
+    function sync() {
+        if (edit.text === given)
+            return
+        syncing = true
+        edit.text = given
+        syncing = false
+    }
 
     // "raw → fixed, ..." from [raw, fixed] pairs; anything else is skipped, never trusted
     function summary(list) {
@@ -126,6 +137,7 @@ Item {
                         NumberAnimation on x {
                             id: run
                             running: track.visible && !bar.still
+                            onRunningChanged: if (!running) runner.x = 0      // a stopped run leaves x mid-way
                             loops: Animation.Infinite
                             from: -runner.width
                             to: track.width
@@ -187,6 +199,7 @@ Item {
                             objectName: "composerScroll"
                             readonly property real lineH: edit.contentHeight / Math.max(1, edit.lineCount)
                             visible: !bar.listening && !bar.transcribing
+                            enabled: visible                // an invisible item keeps key focus; disabled it gets no input
                             x: bar.t.space_14
                             y: bar.t.space_12
                             width: parent.width - 2 * x
@@ -217,12 +230,12 @@ Item {
                                 Accessible.role: Accessible.EditableText
                                 Accessible.name: "Mesaj"
                                 onCursorRectangleChanged: field.follow(cursorRectangle)
-                                onTextChanged: if (text !== bar.given) face.textEdited(text)
+                                onTextChanged: if (bar.ready && !bar.syncing) face.textEdited(text)
                                 Keys.onPressed: (event) => {
                                     if ((event.key === Qt.Key_Return || event.key === Qt.Key_Enter)
                                             && (event.modifiers & ~Qt.KeypadModifier) === Qt.NoModifier) {
                                         event.accepted = true       // plain Enter never adds a line
-                                        if (bar.canSend)
+                                        if (bar.canSend && !event.isAutoRepeat)   // a held Enter sends once
                                             face.send()
                                     }
                                 }
