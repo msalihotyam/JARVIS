@@ -1,0 +1,7 @@
+{
+  "classes": {
+    "tests.test_face_reading_qml.StaticContractTests": 1,
+    "tests.test_face_reading_qml.ReadingViewTests": 30
+  },
+  "tests": {}
+}
