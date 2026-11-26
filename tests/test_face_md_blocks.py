@@ -30,14 +30,30 @@ def links(doc):
     for b in doc.blocks:
         groups += [b.inlines, *b.header, *(cell for row in b.rows for cell in row)]
         for item in b.items:
-            groups += [item.inlines, *(c.inlines for c in item.children)]
+            groups += [item.inlines, *(c.inlines for c in kids(item))]
     return [i for g in groups for i in g if i.kind in ("link", "image")]
+
+
+def kids(item):
+    """Every child item of a list item, across all its child runs."""
+    return [c for run in item.lists for c in run.items]
+
+
+def flat(inl):
+    return "".join(i.text for i in inl)
 
 
 def shape(doc):
     """List blocks as [(item text, [child texts])] per block, for nesting asserts."""
-    flat = lambda inl: "".join(i.text for i in inl)  # noqa: E731
-    return [[(flat(i.inlines), [flat(c.inlines) for c in i.children]) for i in b.items] for b in doc.blocks]
+    return [[(flat(i.inlines), [flat(c.inlines) for c in kids(i)]) for i in b.items] for b in doc.blocks]
+
+
+def runs(doc):
+    """List blocks as (ordered, start, [(item text, [(ordered, start, [child texts])])]) - every run's type and start."""
+    def run(b):
+        return (b.ordered, b.start, [(flat(i.inlines), [run(r)[:2] + ([flat(c.inlines) for c in r.items],)
+                                                         for r in i.lists]) for i in b.items])
+    return [run(b) for b in doc.blocks]
 
 
 # Default_Ignorable_Code_Point that are not Cf (from Unicode DerivedCoreProperties), one per range end
@@ -77,7 +93,7 @@ class AcceptanceTests(unittest.TestCase):
             Inline("link", "a link", "https://example.com/x"), Inline("text", ".")))
         self.assertFalse(ul.ordered)
         self.assertEqual([i.inlines for i in ul.items], [text("one"), text("two")])
-        self.assertEqual([c.inlines for c in ul.items[1].children], [text("two.a"), text("two.b")])
+        self.assertEqual([c.inlines for c in kids(ul.items[1])], [text("two.a"), text("two.b")])
         self.assertEqual((ol.ordered, ol.start, len(ol.items)), (True, 3, 2))
         self.assertEqual(table.header, (text("L"), text("C"), text("R")))
         self.assertEqual(table.rows, ((text("1"), text("2"), text("3")),))
@@ -90,9 +106,9 @@ class AcceptanceTests(unittest.TestCase):
         self.assertEqual(md.parse("####### x\n").blocks[0].kind, "paragraph")
         doc = md.parse("1. a\n   - b\n      - c\n")
         item = doc.blocks[0].items[0]
-        self.assertEqual([c.inlines for c in item.children], [text("b"), text("c")])  # deeper -> level 2
-        self.assertTrue(all(not c.children for c in item.children))
-        self.assertFalse(item.child_ordered)
+        self.assertEqual([c.inlines for c in kids(item)], [text("b"), text("c")])  # deeper -> level 2
+        self.assertTrue(all(not c.lists for c in kids(item)))
+        self.assertEqual([(r.kind, r.ordered) for r in item.lists], [("list", False)])
 
     def test_1_plain_quote_and_escapes(self):
         doc = md.parse("> just a quote\n\n\\*not italic\\* and \\`no code\\`\n")
@@ -247,6 +263,40 @@ class NegativeTests(unittest.TestCase):
         self.assertEqual([b.kind for b in doc.blocks], ["list", "list"])
         self.assertEqual(shape(doc)[1], [("a", []), ("b", [])])
         source = "  - a\n  - b\n    - b.1\n  - c\n\nend\n"
+        full = md.parse(source)
+        for k in range(len(source) + 1):
+            doc = md.parse(source[:k])
+            with self.subTest(k=k):
+                self.assertEqual(doc.blocks[:doc.stable], full.blocks[:doc.stable])
+
+    def test_11_every_list_run_keeps_its_own_type_and_start(self):
+        ul, ol = False, True
+        cases = {
+            "- p\n  - u\n  1. o\n": [(ul, 1, [("p", [(ul, 1, ["u"]), (ol, 1, ["o"])])])],  # CDX-FACEMD1FIX F1 repro
+            "- p\n  3. x\n  4. y\n": [(ul, 1, [("p", [(ol, 3, ["x", "y"])])])],  # child start kept
+            "- p\n  0. x\n": [(ul, 1, [("p", [(ol, 0, ["x"])])])],
+            "- p\n  999999999. x\n": [(ul, 1, [("p", [(ol, 999999999, ["x"])])])],
+            "1. p\n   2. x\n   - u\n": [(ol, 1, [("p", [(ol, 2, ["x"]), (ul, 1, ["u"])])])],  # ol -> ul
+            "- p\n  1. a\n  - b\n  5. c\n": [(ul, 1, [("p", [(ol, 1, ["a"]), (ul, 1, ["b"]), (ol, 5, ["c"])])])],
+            "- p\n  - u\n      7. deep\n": [(ul, 1, [("p", [(ul, 1, ["u"]), (ol, 7, ["deep"])])])],  # level 3 -> 2
+            "- p\n  - u\n  + v\n  * w\n": [(ul, 1, [("p", [(ul, 1, ["u", "v", "w"])])])],  # bullet char: same run
+            "- p\n  1. a\n  2) b\n": [(ul, 1, [("p", [(ol, 1, ["a", "b"])])])],  # delimiter: same run
+            "- p\n  - u\n  2. o\n  more\n": [(ul, 1, [("p", [(ul, 1, ["u"]), (ol, 2, ["o\nmore"])])])],
+            # mixed nesting at both levels: each root run and each child run has its own type and start
+            "4. a\n   - x\n   2. y\n- b\n  3. z\n  - w\n": [
+                (ol, 4, [("a", [(ul, 1, ["x"]), (ol, 2, ["y"])])]),
+                (ul, 1, [("b", [(ol, 3, ["z"]), (ul, 1, ["w"])])]),
+            ],
+            "- a\n  1. x\n7. b\n   - y\n": [(ul, 1, [("a", [(ol, 1, ["x"])])]), (ol, 7, [("b", [(ul, 1, ["y"])])])],
+        }
+        for source, want in cases.items():
+            with self.subTest(source=source):
+                self.assertEqual(runs(md.parse(source)), want)
+        doc = md.parse("- p\n" + "  - c\n  1. d\n" * md.MAX_ITEMS + "- q\n")  # child cap counts every run
+        self.assertTrue(doc.truncated)
+        self.assertEqual([(t, len(c)) for t, c in shape(doc)[0]], [("p", md.MAX_ITEMS), ("q", 0)])
+        self.assertEqual(len(doc.blocks[0].items[0].lists), md.MAX_ITEMS)
+        source = "3. a\n   - x\n   2. y\n- b\n  4. z\n\nend\n"
         full = md.parse(source)
         for k in range(len(source) + 1):
             doc = md.parse(source[:k])
