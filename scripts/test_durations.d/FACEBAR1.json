@@ -1,0 +1,9 @@
+{
+ "version": 1,
+ "classes": {
+  "tests.test_face_composer_qml.StaticContract": 0.3,
+  "tests.test_face_composer_qml.FrameMatrix": 3.0,
+  "tests.test_face_composer_qml.Look": 1.0,
+  "tests.test_face_composer_qml.Behaviour": 3.0
+ }
+}
