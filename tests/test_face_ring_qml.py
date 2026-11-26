@@ -45,7 +45,7 @@ COLORS = {"base": "#0B0E13", "surface1": "#11161D", "surface2": "#171D26", "surf
 TYPE = {"body": (17, 28), "h2": (22, 30), "h3": (17, 26), "code": (14.5, 22), "small": (13, 20),
         "label": (12.5, 16), "turn": (16, 26), "cell": (15, 24), "meta": (13, 20), "control": (14, 20)}
 RADIUS = {"panel": 12, "composer": 16, "control": 12, "code": 8, "pill": 999}
-SPACE = (4, 8, 12, 16, 20, 24)
+SPACE = (4, 6, 8, 10, 12, 14, 16, 20, 24)
 MOTION = {"fast": 120, "medium": 200, "slow": 320, "curve_x1": 0.2, "curve_y1": 0, "curve_x2": 0, "curve_y2": 1,
           "breathe": 4000, "swell": 700, "arc": 1200, "arc2": 2400, "arc3": 3200, "ripple": 1600, "ask": 1600}
 RING = {"box": 120, "outer_r": 54, "outer_w": 1.5, "dash_r": 46, "dash_w": 2, "dash_on": 2, "dash_off": 6,
@@ -126,6 +126,28 @@ def split_code(text: str) -> tuple[str, list[str]]:
     return re.sub(rx, keep, text, flags=re.S), strings
 
 
+JS_WORDS = {"import", "readonly", "property", "real", "int", "bool", "string", "color", "var", "alias", "signal",
+            "function", "return", "typeof", "if", "else", "true", "false", "null", "undefined", "on", "in"}
+BUILT_INS = {"Math", "String", "isNaN", "isFinite", "qsTr", "Easing", "Animation", "Accessible", "Qt", "parent",
+             "width", "height", "visible", "state", "x", "y", "opacity", "scale", "rotation", "implicitWidth",
+             "implicitHeight", "strokeWidth", "radiusX", "face"}
+
+
+def free_names(code: str) -> set[str]:
+    """Root names split_code() output reads that are not the ring's own, a type it uses, a built-in or face."""
+    # shortcut: regex, not a QML parser: misses multiline ternaries, spreads, non-ASCII names and scope
+    # (an own name counts anywhere in the file); upgrade to qmllint's unqualified-access check when it ships here
+
+    code = re.sub(r"^\s*import\b[^\n]*", "", code, flags=re.M)
+    own = {a or b for a, b in re.findall(r"\b(?:property\s+\w+|function|signal|var)\s+(\w+)|\bid:\s*(\w+)", code)}
+    for params in re.findall(r"\b(?:function|signal)\s+\w+\s*\(([^)]*)\)", code):
+        own |= {p.split()[-1] for p in params.split(",") if p.strip()}
+    types = set(re.findall(r"\b([A-Z]\w*)\s*(?:on\s+\w+\s*)?\{", code))
+    body = re.sub(r"(^|[{;,])(\s*)[A-Za-z_][\w.]*\s*:", r"\1\2", code, flags=re.M)   # a binding's left side
+    body = re.sub(r"\b[A-Z]\w*\s*(?:on\s+\w+\s*)?\{", "{", body)                     # Type { / Type on prop {
+    return set(re.findall(r"(?<![\w.])[A-Za-z_]\w*", body)) - own - types - JS_WORDS - BUILT_INS
+
+
 class StaticContractTests(unittest.TestCase):
     """The QML contract read from the source: imports, tokens only, no state change, plain text."""
 
@@ -147,6 +169,11 @@ class StaticContractTests(unittest.TestCase):
         self.assertNotRegex(self.raw, banned)
         self.assertNotRegex(self.code, r"\bLoader\b|Qt\.include|Qt\.createComponent|Qt\.createQmlObject")
         self.assertEqual({"tokens"}, set(re.findall(r"\bface\s*\.\s*(\w+)", self.code)))
+
+    def test_every_free_name_is_the_rings_own_a_built_in_or_face(self) -> None:
+        self.assertEqual(set(), free_names(self.code))
+        for leak in ("x: otherCtx.x", "y: otherCtx", "z: ring.t(otherCtx)", "z: ring.moving ? otherCtx.y : 0"):
+            self.assertEqual({"otherCtx"}, free_names(self.code + "\nItem { " + leak + " }"), leak)
 
     def test_no_colour_or_size_literal_outside_the_ratio_block(self) -> None:
         self.assertNotIn("#", self.raw)
@@ -260,10 +287,8 @@ class RingStateTests(RingCase):
         breath = self.part(ring, "breathAnim")
         self.assertEqual((0.5, 1.0, 4000), (breath.property("from"), breath.property("to"), breath.property("duration")))
         self.assertEqual(["breathAnim"], [a.objectName() for a in anims(ring) if a.property("running")])
-        core = self.part(ring, "core")
-        first = core.opacity()
-        pump(400)
-        self.assertNotAlmostEqual(first, core.opacity(), places=3)
+        core = self.part(ring, "core")                    # the running breath phase drives the core, no clock read
+        self.assertAlmostEqual(ring.property("breath"), core.opacity(), places=6)
         self.assertTrue(0.5 - 1e-6 <= core.opacity() <= 1 + 1e-6)
 
     def test_listening_is_full_strength_and_swells_with_the_level(self) -> None:
@@ -274,14 +299,35 @@ class RingStateTests(RingCase):
             self.set(level=level)
             self.assertAlmostEqual(want, ring.property("mainScale"), places=6)
             self.assertAlmostEqual(want, main.scale(), places=6)
-        self.set(reducedMotion=False)                     # the Behavior animation is outside the QObject tree,
-        self.set(level=1)                                 # so the swell over motion_swell is checked by timing
-        self.assertLess(main.scale(), 1.07)
-        pump(900)
+        self.set(reducedMotion=False)                     # no in-flight sample: only where the swell
+        self.set(level=1, ms=900)                         # ends is checked, after a wait past motion_swell
         self.assertAlmostEqual(1.07, main.scale(), places=3)
         self.set(state="idle", level=0, ms=900)
         self.assertAlmostEqual(0.6, main.opacity())
         self.assertAlmostEqual(1.0, main.scale())
+
+    def test_a_swell_lands_at_once_when_reduced_motion_turns_on_or_the_ring_hides(self) -> None:
+        self.set(state="listening")
+        rings = [self.ring(size) for size in (72, 28)]
+        for key, stop in (("reducedMotion", True), ("visible", False)):
+            for level, want in ((1, 1.07), (0, 1.0)):     # up to the full swell and back down
+                for ring in rings:
+                    ring.setProperty("level", level)      # the swell is now in flight: no pump, not there yet
+                    self.assertGreater(abs(self.part(ring, "mainRing").scale() - want), 0.01, (key, level))
+                    ring.setProperty(key, stop)
+                for ring in rings:
+                    for lvl in (level, 0.5, level):        # and a level change while stopped lands at once too
+                        ring.setProperty("level", lvl)
+                        at = (key, lvl, ring.objectName())
+                        scale = self.part(ring, "mainRing").scale()
+                        self.assertAlmostEqual(ring.property("mainScale"), scale, places=6, msg=at)
+                        self.assertEqual(0, self.running(ring), at)   # the swell animation itself stopped
+                    self.assertAlmostEqual(want, scale, places=6, msg=at)
+                self.set(**{key: not stop})
+                for ring in rings:                         # back in motion: no stale swell, nothing in flight
+                    at = (key, "resumed", level, ring.objectName())
+                    self.assertAlmostEqual(want, self.part(ring, "mainRing").scale(), places=6, msg=at)
+                    self.assertEqual(0, self.running(ring), at)
 
     def test_understanding_turns_a_quarter_arc_once_per_arc(self) -> None:
         self.set(state="understanding")
@@ -347,11 +393,15 @@ class RingStateTests(RingCase):
         for mood in MOODS:
             self.set(state=mood)
             for size in (72, 28):
-                self.assertEqual((NAMES[mood], NAMES[mood]),
+                want = NAMES[mood] + " (0)" if mood == "needs_you" else NAMES[mood]   # the count, even 0
+                self.assertEqual((want, NAMES[mood]),
                                  (self.ring(size).property("accessibleName"), self.ring(size).property("label")))
-        self.set(state="needs_you", count=4)
-        for size in (72, 28):
-            self.assertEqual("Senden bir şey istiyor (4)", self.ring(size).property("accessibleName"))
+        self.set(state="needs_you", count=0)
+        self.assertFalse(self.part(self.ring(72), "badge").isVisible())   # "(0)" is spoken, the badge stays hidden
+        for count, shown in ((4, "4"), (10, "9+"), (-4, "0"), (math.nan, "0"), (0, "0")):
+            self.set(state="needs_you", count=count)
+            for size in (72, 28):
+                self.assertEqual(f"Senden bir şey istiyor ({shown})", self.ring(size).property("accessibleName"))
         labels = self.ring(72).property("labels").toVariant()
         self.assertEqual(NAMES, {m: labels[m] for m in MOODS})
 
@@ -367,6 +417,27 @@ class RingStateTests(RingCase):
             looks.add((frozenset(self.shown_parts(ring)), round(main.scale(), 4), round(main.opacity(), 4)))
             self.assertAlmostEqual(1.0, self.part(ring, "core").opacity(), msg=mood)
         self.assertEqual(6, len(looks))
+
+    def test_reduced_motion_turned_on_mid_animation_stops_it_in_every_state_at_both_sizes(self) -> None:
+        for mood in MOODS:
+            self.set(state=mood, count=3, level=1)
+            self.set(reducedMotion=False, ms=60)   # level before motion: else the swell's NumberAnimation is still running
+            for size in (72, 28):
+                self.assertEqual(RUNNING[size][mood], self.running(self.ring(size)), (mood, size))
+            for size in (72, 28):
+                self.ring(size).setProperty("reducedMotion", True)    # no wait: it must hold at once
+            for size in (72, 28):
+                ring, at = self.ring(size), (mood, size)
+                self.assertEqual(0, self.running(ring), at)
+                self.assertAlmostEqual(1.0, self.part(ring, "core").opacity(), msg=at)
+                self.assertAlmostEqual(ring.property("mainScale"), self.part(ring, "mainRing").scale(), places=6, msg=at)
+                self.assertEqual((0.0, 0.5), (self.part(ring, "ripple1").property("p"),
+                                              self.part(ring, "ripple2").property("p")), at)
+            self.set(reducedMotion=False, ms=60)
+            for size in (72, 28):                 # hiding stops the loops too (they gate on moving, not animate)
+                self.ring(size).setProperty("visible", False)
+                self.assertEqual(0, self.running(self.ring(size)), (mood, size, "hidden"))
+            self.set(visible=True, reducedMotion=True)
 
     def test_at_28_px_only_the_outer_ring_main_ring_and_core_are_drawn(self) -> None:
         self.set(count=3, elapsed="7 sn", level=1)

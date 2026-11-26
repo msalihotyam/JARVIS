@@ -39,7 +39,7 @@ Item {
     readonly property real lv: isNaN(level) ? 0 : Math.max(0, Math.min(1, level))
     readonly property int asks: isNaN(count) ? 0 : Math.max(0, Math.floor(Math.min(count, badgeCap + 1)))
     readonly property string badgeText: asks > badgeCap ? badgeCap + "+" : String(asks)
-    readonly property string accessibleName: shown === "needs_you" && asks > 0
+    readonly property string accessibleName: shown === "needs_you"
                                              ? qsTr("%1 (%2)").arg(label).arg(badgeText) : label
     onStateChanged: if (moods.indexOf(state) < 0) unknownState(state)
 
@@ -111,9 +111,14 @@ Item {
             width: 2 * ring.u("ring_main_r") + line; height: width; radius: width / 2
             color: "transparent"; border.width: line; border.color: ring.stroke
             opacity: ring.mainStrength
-            scale: ring.mainScale
-            Behavior on scale {
-                enabled: ring.animate && ring.t("motion_swell") > 0
+            // Disabling a Behavior does not stop its running animation, so the swell
+            // animates a side value the ring drops the moment it stops moving; reading
+            // swell.enabled re-writes swollen past the now-disabled Behavior, which stops it.
+            property real swollen: (swell.enabled, ring.mainScale)
+            scale: ring.moving ? swollen : ring.mainScale
+            Behavior on swollen {
+                id: swell
+                enabled: ring.moving && ring.t("motion_swell") > 0
                 NumberAnimation {
                     duration: ring.t("motion_swell"); easing.type: Easing.Bezier
                     easing.bezierCurve: [ring.t("motion_curve_x1"), ring.t("motion_curve_y1"),
