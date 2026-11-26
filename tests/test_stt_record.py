@@ -1,6 +1,7 @@
 """STTREC1: 30-sentence recorder - session logic, atomic WAV files, path guard, phrases, static rules."""
 
 import ast
+import builtins
 import json
 import os
 import tempfile
@@ -160,6 +161,58 @@ class AtomicReplaceTest(Base):
         with mock.patch.object(record.os, "replace", side_effect=OSError("kilitli")):
             self.take(s)
         self.assert_kept(s, old)
+
+    def assert_save_refused(self, s, old):
+        self.assertFalse(s.recording)
+        self.assertIn("Kaydedilemedi", s.message)
+        if old is None:
+            self.assertEqual(s.status(0), "missing")
+        else:
+            self.assert_kept(s, old)
+
+    def test_occupied_target_dir_refused(self):
+        # V1 review repro: the run directory path is a file -> mkdir FileExistsError
+        self.root.mkdir(parents=True)
+        (self.root / "run").write_bytes(b"x")
+        s = self.session(FakeSource(data=PCM))
+        self.take(s)
+        self.assert_save_refused(s, None)
+        self.assertEqual((self.root / "run").read_bytes(), b"x")
+
+    def test_filesystem_step_failures_keep_old(self):
+        # V2 mkdir denied, V3 unwritable dir (mkstemp), V4 write fails, V6 cleanup fails too, V7 non-OSError
+        cases = {
+            "mkdir denied": (Path, "mkdir", PermissionError("erişim yok")),
+            "unwritable dir": (record.tempfile, "mkstemp", PermissionError("erişim yok")),
+            "temp open fails": (builtins, "open", OSError("açılamadı")),  # F2 review P4: no temp, no fd leak
+            "write fails": (record.wave.Wave_write, "writeframes", OSError("disk dolu")),
+            "non-oserror": (record.wave.Wave_write, "writeframes", ValueError("bozuk")),
+        }
+        for label, (owner, name, error) in cases.items():
+            with self.subTest(label):
+                self.write_wav("01.wav")
+                old = (self.root / "run" / "01.wav").read_bytes()
+                s = self.session(FakeSource(data=PCM * 2))
+                s.previous()
+                s.toggle()
+                with mock.patch.object(owner, name, side_effect=error):
+                    s.toggle()
+                self.assert_save_refused(s, old)
+
+    def test_cleanup_failure_does_not_escape(self):
+        # V6: replace fails and unlinking the temp fails as well
+        self.write_wav("01.wav")
+        old = (self.root / "run" / "01.wav").read_bytes()
+        s = self.session(FakeSource(data=PCM * 2))
+        s.previous()
+        s.toggle()
+        with mock.patch.object(record.os, "replace", side_effect=OSError("kilitli")), \
+                mock.patch.object(Path, "unlink", side_effect=PermissionError("açık")):
+            s.toggle()
+        self.assertFalse(s.recording)
+        self.assertIn("Kaydedilemedi", s.message)
+        self.assertIn("geçici dosya kaldı", s.message)  # F2 review P10: a left temp is reported
+        self.assertEqual(s.path(0).read_bytes(), old)
 
     def test_rerecord_replaces(self):
         self.write_wav("01.wav")
@@ -335,6 +388,36 @@ class WindowTest(Base):
         self.assertTrue(w.isVisible())
         buttons["done"].click()
         self.assertFalse(w.isVisible())
+
+    def test_failed_save_refreshes_window(self):
+        # review repro through the window: occupied target -> toggle back to Kaydet, buttons enabled, message shown
+        from PySide6.QtWidgets import QLabel, QPushButton
+
+        self.root.mkdir(parents=True)
+        (self.root / "run").write_bytes(b"x")
+        s = self.session()
+        w = self.enterContext(_closing(record.build_window(s), s))
+        buttons = {b.objectName(): b for b in w.findChildren(QPushButton)}
+        buttons["toggle"].click()
+        buttons["toggle"].click()
+        self.assertEqual(buttons["toggle"].text(), "Kaydet")
+        for name in ("previous", "next", "redo", "done"):
+            self.assertTrue(buttons[name].isEnabled(), name)
+        self.assertIn("Kaydedilemedi", w.findChild(QLabel, "message").text())
+
+    def test_raising_action_still_refreshes(self):
+        # V8: an unexpected exception from an action never skips refresh()
+        from PySide6.QtWidgets import QLabel, QPushButton
+
+        s = self.session()
+        w = self.enterContext(_closing(record.build_window(s), s))
+        buttons = {b.objectName(): b for b in w.findChildren(QPushButton)}
+        buttons["toggle"].click()
+        with mock.patch.object(s, "_save", side_effect=RuntimeError("beklenmedik")):
+            buttons["toggle"].click()
+        self.assertEqual(buttons["toggle"].text(), "Kaydet")
+        self.assertTrue(buttons["done"].isEnabled())
+        self.assertIn("beklenmedik", w.findChild(QLabel, "message").text())
 
 
 class _closing:

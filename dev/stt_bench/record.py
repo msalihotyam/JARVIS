@@ -124,17 +124,23 @@ class Session:
             return "Kayıt çok uzun; cümle değişmedi."
         if len(data) % (CHANNELS * WIDTH):
             return "Bozuk ses verisi; cümle değişmedi."
-        self.directory.mkdir(parents=True, exist_ok=True)
-        handle, temp = tempfile.mkstemp(dir=self.directory, prefix=".rec-", suffix=".tmp")
-        try:
-            with os.fdopen(handle, "wb") as stream, wave.open(stream, "wb") as out:
+        temp = None
+        try:  # every filesystem step: any failure keeps the old file and leaves no temp
+            self.directory.mkdir(parents=True, exist_ok=True)
+            handle, temp = tempfile.mkstemp(dir=self.directory, prefix=".rec-", suffix=".tmp")
+            os.close(handle)  # reopen by name: no raw descriptor can leak and block the cleanup on Windows
+            with open(temp, "wb") as stream, wave.open(stream, "wb") as out:
                 out.setnchannels(CHANNELS)
                 out.setsampwidth(WIDTH)
                 out.setframerate(RATE)
                 out.writeframes(bytes(data))
             os.replace(temp, self.path(self.index))
-        except OSError as error:
-            Path(temp).unlink(missing_ok=True)
+        except Exception as error:
+            if temp is not None:
+                try:
+                    Path(temp).unlink(missing_ok=True)
+                except OSError:
+                    return f"Kaydedilemedi: {error} (geçici dosya kaldı: {Path(temp).name})"
             return f"Kaydedilemedi: {error}"
         return f"{self.index + 1:02d} kaydedildi."
 
@@ -188,9 +194,17 @@ def build_window(session):
                          ("next", session.next), ("done", session.finish)):
         button = QPushButton(objectName=name)
         button.setMinimumSize(120, 56)
-        button.clicked.connect(lambda _=False, act=action: (act(), refresh()))
+        button.clicked.connect(lambda _=False, act=action: click(act))
         row.addWidget(button)
         buttons[name] = button
+
+    def click(act):
+        try:
+            act()
+        except Exception as error:  # the window must never stay stuck on a failed action
+            session.message = f"Hata: {error}"
+        finally:
+            refresh()
 
     def refresh():
         if session.finished:
