@@ -169,7 +169,8 @@ def _accepted_name(item: object) -> str | None:
     path = PureWindowsPath(item)
     if path.parent != _FONT_DIR_W:
         return None
-    return path.name
+    name = path.name
+    return name if type(name) is str else None  # a str subclass's __eq__/__hash__ would run outside the try
 
 
 def font_plan(available_files: object) -> dict:
@@ -183,8 +184,12 @@ def font_plan(available_files: object) -> dict:
     bad_input = not _is_exact(available_files, (list, tuple, set, frozenset))
     if not bad_input:
         try:
-            names = {n for n in map(_accepted_name, available_files) if n is not None}
-        except Exception:  # a hostile item (e.g. a PurePath subclass) must not escape
+            # Called in the body, not via map(): a StopIteration from map() would end the loop silently.
+            names = {_accepted_name(item) for item in available_files}
+            names.discard(None)
+        except (KeyboardInterrupt, SystemExit):  # Ctrl-C / exit still stop the caller
+            raise
+        except BaseException:  # noqa: BLE001 - any other hostile raise (GeneratorExit, custom) -> full fallback
             names, bad_input = set(), True
     plan = {}
     for key, spec in FONT_FAMILIES.items():
