@@ -5,7 +5,8 @@ import ast
 import re
 import sys
 import unittest
-from pathlib import Path, PureWindowsPath
+from types import SimpleNamespace
+from pathlib import Path, PurePosixPath, PureWindowsPath
 from unittest import mock
 
 from jarvis.face import tokens
@@ -272,11 +273,55 @@ class FontPlanTest(unittest.TestCase):
         self.assert_family(plan["sans"], "fallback", "bad_input")
         self.assert_family(plan["mono"], "fallback", "bad_input")
 
-        def interrupt(_item):
-            raise KeyboardInterrupt
+        for fatal in (KeyboardInterrupt, SystemExit):  # Ctrl-C / exit still stop the caller
+            def interrupt(_item, fatal=fatal):
+                raise fatal
 
-        with mock.patch.object(tokens, "_accepted_name", interrupt), self.assertRaises(KeyboardInterrupt):
-            font_plan(ALL_FONTS)  # only Exception is caught; Ctrl-C still stops the caller
+            with mock.patch.object(tokens, "_accepted_name", interrupt), self.assertRaises(fatal):
+                font_plan(ALL_FONTS)
+
+    def test_non_fatal_base_exception_is_full_fallback(self):
+        class Custom(BaseException):
+            pass
+
+        def evil_str(exc):
+            def boom(*_a, **_k):
+                raise exc
+
+            return type("Evil", (str,), {"replace": boom, "split": boom, "__getitem__": boom})
+
+        path_types = (PureWindowsPath, PurePosixPath, Path)
+        for exc in (Custom, GeneratorExit, StopIteration):  # StopIteration must not end the loop silently
+            for kind in path_types:  # exact path types pass the identity check; the str subclass parses lazily
+                for spot in (0, len(ALL_FONTS) - 1):  # hostile item first and last
+                    items = list(ALL_FONTS)
+                    items[spot] = kind(evil_str(exc)("C:/x/" + Path(ALL_FONTS[spot]).name))
+                    with self.subTest(exc=exc.__name__, kind=kind.__name__, spot=spot):
+                        try:
+                            plan = font_plan(items)
+                        except Custom:  # GeneratorExit/Custom are BaseException: catch so a hit fails, not stops
+                            self.fail("Custom escaped")
+                        except GeneratorExit:
+                            self.fail("GeneratorExit escaped")
+                        self.assert_family(plan["sans"], "fallback", "bad_input")
+                        self.assert_family(plan["mono"], "fallback", "bad_input")
+            with mock.patch.object(tokens, "_accepted_name", evil_str(exc)("x").replace):
+                plan = font_plan(ALL_FONTS)
+            self.assert_family(plan["sans"], "fallback", "bad_input")
+            self.assert_family(plan["mono"], "fallback", "bad_input")
+
+    def test_str_subclass_name_never_counts(self):
+        class Name(str):
+            def __eq__(self, _o):
+                raise GeneratorExit
+
+            __hash__ = str.__hash__
+
+        real = PureWindowsPath(FONT_DIR / SANS[0])
+        with mock.patch.object(tokens, "PureWindowsPath", lambda _i: SimpleNamespace(parent=real.parent, name=Name(SANS[0]))):
+            plan = font_plan(ALL_FONTS)  # every name is a subclass: none counts, none of its code runs later
+        self.assert_family(plan["sans"], "fallback", "incomplete_family")
+        self.assert_family(plan["mono"], "fallback", "incomplete_family")
 
     def test_metaclass_eq_does_not_fake_exact_type(self):
         class EqAll(type):  # `type(x) in (...)` would match through this __eq__
