@@ -1,0 +1,10 @@
+{"version": 1, "classes": {
+  "tests.test_talk_tg_in.TakeTest": 1.0,
+  "tests.test_talk_tg_in.OffsetTest": 1.0,
+  "tests.test_talk_tg_in.MergedTest": 1.0,
+  "tests.test_talk_tg_in.DisabledTest": 1.0,
+  "tests.test_talk_tg_in.UpdateMatrixTest": 1.0,
+  "tests.test_talk_tg_in.ClientFailureTest": 1.0,
+  "tests.test_talk_tg_in.StoreFailureTest": 1.0,
+  "tests.test_talk_tg_in.StaticTest": 1.0
+}}
