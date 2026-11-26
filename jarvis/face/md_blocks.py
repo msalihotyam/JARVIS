@@ -41,8 +41,9 @@ class Inline:
 @dataclass(frozen=True)
 class Item:
     inlines: tuple[Inline, ...]
-    children: tuple[Item, ...] = ()  # second (last) nesting level
-    child_ordered: bool = False
+    # second (last) nesting level: one list Block per child run, each with its own ordered/start; a marker type
+    # change starts a new run; child Blocks' items have no lists
+    lists: tuple[Block, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,7 @@ class _Parser:
         self.truncated = False
         self.open = ""  # "" | para | quote | list
         self.lines: list[str] = []  # para / quote content lines
-        self.items: list[list] = []  # list: [lines, children, child_ordered]
+        self.items: list[list] = []  # list: [lines, runs, child count]; run = [ordered, start, [child lines]]
         self.ordered = False
         self.start = 1
         self.root = 0  # indent of the latest root-level list marker; nesting is measured from it
@@ -155,7 +156,7 @@ class _Parser:
                 continue
             if self.open == "list":
                 last = self.items[-1]
-                (last[1][-1] if last[1] else last[0]).append(body.strip())
+                (last[1][-1][2][-1] if last[1] else last[0]).append(body.strip())
                 continue
             if self.open != "para":
                 self.close()
@@ -185,19 +186,20 @@ class _Parser:
     def item(self, indent: int, ordered: bool, number: int, text: str) -> None:
         last = self.items[-1] if self.open == "list" else None
         if last and indent >= self.root + 2:  # deeper markers all land on level 2
-            if len(last[1]) >= MAX_ITEMS:
+            if last[2] >= MAX_ITEMS:
                 self.truncated = True  # drop child overflow; promoting it would invent a root item
                 return
-            if not last[1]:
-                last[2] = ordered
-            last[1].append([text])
+            if not last[1] or last[1][-1][0] != ordered:
+                last[1].append([ordered, number, []])
+            last[1][-1][2].append([text])
+            last[2] += 1
             return
         if self.open != "list" or self.ordered != ordered or len(self.items) >= MAX_ITEMS:
             self.close()  # a full list continues as a new list block: nothing is dropped
             self.open, self.ordered, self.start, self.items, self.root = "list", ordered, number, [], indent
         elif indent < self.root + 2:
             self.root = indent  # roots may drift (3 -> 0): children nest relative to the latest root
-        self.items.append([[text], [], False])
+        self.items.append([[text], [], 0])
 
     def close(self) -> None:
         kind, lines, self.open, self.lines = self.open, self.lines, "", []
@@ -210,8 +212,10 @@ class _Parser:
             self.emit(Block("quote", inlines=self.inl("\n".join(lines)), note=note))
         elif kind == "list":
             items = tuple(
-                Item(self.inl("\n".join(lines)), tuple(Item(self.inl("\n".join(c))) for c in children), child_ordered)
-                for lines, children, child_ordered in self.items
+                Item(self.inl("\n".join(lines)), tuple(
+                    Block("list", ordered=o, start=s, items=tuple(Item(self.inl("\n".join(c))) for c in run))
+                    for o, s, run in runs))
+                for lines, runs, _ in self.items
             )
             self.emit(Block("list", ordered=self.ordered, start=self.start, items=items))
             self.items = []
