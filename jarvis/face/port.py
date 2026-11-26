@@ -8,7 +8,9 @@ from __future__ import annotations
 
 RING_STATES = ("idle", "listening", "understanding", "thinking", "speaking", "needs_you")
 MODES = ("sesli", "yazili")
-WINDOW_ROWS = {"ring": 0, "small": 30, "large": 200}
+WINDOW_ROWS = {"ring": 0, "small": 30, "large": 200, "reader": 30, "full": 200}
+LINK_STATES = ("ok", "unreachable", "unknown")
+ORIGINS = ("local", "remote")
 CHOICES = ("approve", "reject")
 BUTTONS = (("approve", "Onayla"), ("reject", "Reddet"))
 WHO = {"salih": "Salih", "jarvis": "JARVIS", "system": "Sistem"}
@@ -29,6 +31,9 @@ COMMANDS = {
     "set_mode": ("mode",),
     "card_tap": ("card_id", "choice"),
     "resize": ("size",),
+    "talk_cancel": (),
+    "send_to_phone": ("entry_id",),
+    "pair_code": (),
 }
 # same invisible set as the talk card module;category C* covers bidi, zero-width and control chars
 _INVISIBLE = frozenset(
@@ -85,13 +90,13 @@ class Row(_Record):
 
 
 class ViewModel(_Record):
-    __slots__ = ("rows", "ring", "focus_label", "mode", "window", "open_cards")
-    _defaults = {"open_cards": frozenset()}
+    __slots__ = ("rows", "ring", "focus_label", "mode", "window", "open_cards", "link")
+    _defaults = {"open_cards": frozenset(), "link": "unknown"}
 
 
 class Command(_Record):
-    __slots__ = ("name", "text", "path", "mode", "card_id", "choice", "size")
-    _defaults = dict.fromkeys(("text", "path", "mode", "card_id", "choice", "size"))
+    __slots__ = ("name", "text", "path", "mode", "card_id", "choice", "size", "entry_id")
+    _defaults = dict.fromkeys(("text", "path", "mode", "card_id", "choice", "size", "entry_id"))
 
 
 def clean(value, limit=MAX_TEXT_CHARS, newlines=True):
@@ -181,7 +186,7 @@ def _safe_row(entry):
     return Row(None, "unsupported", WHO["system"], "", UNSUPPORTED, "")
 
 
-def present(entries, status, focus, mode, window):
+def present(entries, status, focus, mode, window, link="unknown"):
     """View model of the window's last N entries, or a Refusal. Never raises."""
     try:
         if not (type(entries) is list or type(entries) is tuple):  # identity: `in` uses a metaclass __eq__
@@ -194,28 +199,51 @@ def present(entries, status, focus, mode, window):
             return Refusal("unknown reply mode")
         if type(window) is not str or window not in WINDOW_ROWS:
             return Refusal("unknown window size")
+        if not _known(link, LINK_STATES):
+            return Refusal("link")
         count = WINDOW_ROWS[window]
         rows = tuple(_safe_row(e) for e in entries[-count:]) if count else ()
         open_cards = frozenset(r.card_id for r in rows if r.buttons)
         return ViewModel(
             rows, status["ring"], clean(focus, MAX_LABEL_CHARS, newlines=False), mode, window,
-            open_cards,
+            open_cards, link,
         )
     except Exception:
         return Refusal("view model could not be built")
 
 
-def _command(command, view):
+def _phone_entry(entry_id, view):
+    if type(entry_id) is int:
+        valid = 0 <= entry_id <= MAX_SIZE
+    else:
+        valid = (
+            type(entry_id) is str and 0 < len(entry_id) <= MAX_LABEL_CHARS
+            and not entry_id.startswith("card-") and clean(entry_id, MAX_LABEL_CHARS, newlines=False) == entry_id
+        )
+    return valid and type(view) is ViewModel and type(view.rows) is tuple and any(
+        type(row) is Row and type(row.entry_id) is type(entry_id) and row.entry_id == entry_id
+        and _known(row.who, (WHO["jarvis"],)) and _known(row.kind, KINDS)
+        and row.kind != "approval_card" and row.card_id is None
+        for row in view.rows
+    )
+
+
+def _command(command, view, origin):
     if not _plain(command):  # a subclass or an aliasing key could hide or forge fields
         return Refusal("command must be a mapping")
     name = command.get("name")
     if type(name) is not str or name not in COMMANDS:
         return Refusal("unknown command")
+    if name == "pair_code" and origin == "remote":
+        return Refusal("local_only")
+    if view is not None and name not in ("resize", "pair_code"):
+        if type(view) is not ViewModel or not _known(view.link, ("ok",)):
+            return Refusal("link")
     fields = COMMANDS[name]
     if set(command) != {"name", *fields}:
         return Refusal("unexpected or missing command fields")
     args = {f: command[f] for f in fields}
-    if any(type(v) is not str for v in args.values()):
+    if any(type(value) is not str for field, value in args.items() if field != "entry_id"):
         return Refusal("command fields must be strings")
     if name == "send_text" and not (args["text"].strip() and len(args["text"]) <= MAX_SEND_CHARS):
         return Refusal("text must be non-empty and within the cap")
@@ -225,6 +253,8 @@ def _command(command, view):
         return Refusal("unknown reply mode")
     if name == "resize" and args["size"] not in WINDOW_ROWS:
         return Refusal("unknown window size")
+    if name == "send_to_phone" and not _phone_entry(args["entry_id"], view):
+        return Refusal("entry is not a sendable JARVIS row in the view")
     if name == "card_tap":
         if args["choice"] not in CHOICES:
             return Refusal("unknown card choice")
@@ -235,10 +265,12 @@ def _command(command, view):
     return Command(name, **args)
 
 
-def validate(command, view=None):
+def validate(command, view=None, origin="local"):
     """Typed Command for one window command, or a Refusal. Never raises."""
     try:
-        return _command(command, view)
+        if not _known(origin, ORIGINS):
+            return Refusal("origin")
+        return _command(command, view, origin)
     except Exception:
         return Refusal("command could not be validated")
 

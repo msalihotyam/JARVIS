@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "classes": {
+    "tests.test_face_port.CommandTests": 1.0,
+    "tests.test_face_port.FakeServiceTests": 1.0,
+    "tests.test_face_port.PresentTests": 1.0,
+    "tests.test_face_port.SafetyTests": 1.0,
+    "tests.test_face_port_gap.FacePortGapTests": 1.0,
+    "tests.test_face_shell.ShellWindowTests": 2.5,
+    "tests.test_face_shell.StartTests": 1.0,
+    "tests.test_face_shell.StaticTests": 1.0,
+    "tests.test_talk_boundary.BrainViewTests": 1.0,
+    "tests.test_talk_boundary.ClockTests": 1.0,
+    "tests.test_talk_boundary.ConfigTests": 1.0,
+    "tests.test_talk_boundary.InboxShapeTests": 1.0,
+    "tests.test_talk_boundary.LogShapeTests": 1.0,
+    "tests.test_talk_boundary.RecordTests": 1.0,
+    "tests.test_talk_boundary.TagTests": 1.0,
+    "tests.test_talk_card.CreateTests": 1.0,
+    "tests.test_talk_card.LogTests": 1.0,
+    "tests.test_talk_card.ResolveTests": 1.0,
+    "tests.test_talk_card.SafetyTests": 1.0,
+    "tests.test_talk_card.VerifyTests": 1.0,
+    "tests.test_talk_core.BudgetTests": 1.0,
+    "tests.test_talk_core.FaultMatrixTests": 1.0,
+    "tests.test_talk_core.FlowTests": 1.0,
+    "tests.test_talk_core.PendingAnswerTests": 1.0,
+    "tests.test_talk_core.StaticTests": 1.0,
+    "tests.test_talk_core.UnknownTests": 1.0
+  }
+}

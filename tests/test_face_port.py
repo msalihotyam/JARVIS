@@ -27,7 +27,7 @@ def entry(**fields):
 
 
 def view(entries, window="small", focus="Proje", mode="yazili", status=STATUS):
-    return port.present(entries, status, focus, mode, window)
+    return port.present(entries, status, focus, mode, window, link="ok")
 
 
 class Liar(str):
@@ -94,7 +94,7 @@ class PresentTests(unittest.TestCase):
 
     def test_status_fields_are_taken_not_recomputed(self):
         for ring in port.RING_STATES:
-            vm = port.present([CARD], {"ring": ring}, "Odak", "sesli", "large")
+            vm = port.present([CARD], {"ring": ring}, "Odak", "sesli", "large", link="ok")
             self.assertEqual((vm.ring, vm.focus_label, vm.mode, vm.window), (ring, "Odak", "sesli", "large"))
         self.assertEqual(view([], focus=None).focus_label, "")
 
@@ -141,7 +141,7 @@ class PresentTests(unittest.TestCase):
 
     def test_liar_window_alone_is_refused(self):
         # every other input valid, so only the exact-type guard on window can refuse
-        self.assertIsInstance(port.present([], STATUS, None, "yazili", "small"), port.ViewModel)
+        self.assertIsInstance(port.present([], STATUS, None, "yazili", "small", link="ok"), port.ViewModel)
         self.assertIsInstance(port.present([], STATUS, None, "yazili", Liar("small")), port.Refusal)
 
     def test_records_refuse_delete(self):
@@ -259,7 +259,7 @@ VALID = [
 
 class CommandTests(unittest.TestCase):
     def test_closed_set_each_valid_command_is_typed(self):
-        self.assertEqual({c["name"] for c in VALID}, set(port.COMMANDS))
+        self.assertEqual({c["name"] for c in VALID} | {"talk_cancel", "send_to_phone", "pair_code"}, set(port.COMMANDS))
         vm = view([CARD])
         for command in VALID:
             result = port.validate(command, vm)
@@ -306,14 +306,14 @@ class CommandTests(unittest.TestCase):
             pass
 
         for cards in ["card-abc", {"card-a"}, ["card-a"], frozenset({alias("card-zzz", "card-a")})]:
-            hand = port.ViewModel((), "idle", "", "yazili", "small", cards)
+            hand = port.ViewModel((), "idle", "", "yazili", "small", cards, link="ok")
             self.assertIsInstance(port.validate(tap, hand), port.Refusal, cards)
             fake = port.FakeService([hand])
             fake.view()
             self.assertIsInstance(fake.send(tap), port.Refusal, cards)
-        sub = SubView((), "idle", "", "yazili", "small", frozenset({"card-a"}))
+        sub = SubView((), "idle", "", "yazili", "small", frozenset({"card-a"}), link="ok")
         self.assertIsInstance(port.validate(tap, sub), port.Refusal)
-        plain = port.ViewModel((), "idle", "", "yazili", "small", frozenset({"card-a"}))
+        plain = port.ViewModel((), "idle", "", "yazili", "small", frozenset({"card-a"}), link="ok")
         self.assertIsInstance(port.validate(tap, plain), port.Command)
 
     def test_card_tap_frozenset_subclass_open_cards_refused(self):
@@ -322,7 +322,7 @@ class CommandTests(unittest.TestCase):
                 return True
 
         tap = {"name": "card_tap", "card_id": "card-nope", "choice": "approve"}
-        forged = port.ViewModel((), "idle", "", "yazili", "small", Always({"card-a"}))
+        forged = port.ViewModel((), "idle", "", "yazili", "small", Always({"card-a"}), link="ok")
         self.assertIsInstance(port.validate(tap, forged), port.Refusal)
         fake = port.FakeService([forged])
         fake.view()
