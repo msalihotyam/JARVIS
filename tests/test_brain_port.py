@@ -1,4 +1,5 @@
 import ast
+import math
 import sys
 import unittest
 from decimal import Decimal
@@ -246,7 +247,8 @@ class GuardTests(unittest.TestCase):
         self.assertEqual(port.ask("a").code, "internal")
 
     def test_argv_builder_time_counts_against_limit(self):
-        for spent, want in ((10.0, 20.0), (30.0, None), (31.0, None)):
+        # -0.0005 (a tiny backwards step) is clamped to the limit.
+        for spent, want in ((10.0, 20.0), (30.0, None), (31.0, None), (-0.0005, 30.0)):
             clock = Clock()
             runner = Runner(clock, ok())
 
@@ -262,6 +264,39 @@ class GuardTests(unittest.TestCase):
             else:
                 self.assertIsInstance(result, Reply)
                 self.assertEqual(runner.calls[0][2], want)
+
+    def test_frozen_clock_rounding_never_refuses_a_healthy_call(self):
+        # start + limit - start misses limit by an ulp at these magnitudes; the runner still gets exactly limit.
+        # 5e-4 is under the slack: a valid tiny limit still reaches the runner.
+        for start, limit in ((123456.7, 12.3), (1000.5, 0.1), (100.0, 30.0), (0.0, 5e-4)):
+            clock = Clock()
+            clock.now = start
+            runner = Runner(Clock(), ok())  # advances its own clock: the port's clock stays frozen
+            port = BrainPort(runner, argv_for, TOOLS, {}, clock, limit, 1000)
+            self.assertIsInstance(port.ask("a"), Reply, (start, limit))
+            self.assertEqual(runner.calls[0][2], limit)
+
+    def test_return_within_clock_slack_of_deadline_is_not_a_timeout(self):
+        deadline = 123456.7 + 12.3
+        for end, want in ((math.nextafter(deadline, math.inf), None), (deadline + 0.01, "timeout")):
+            clock = Clock()
+            clock.now = 123456.7
+
+            def step(clock=clock, end=end):
+                clock.now = end
+                return ok()
+
+            port = BrainPort(Runner(Clock(), step), argv_for, TOOLS, {}, clock, 12.3, 1000)
+            result = port.ask("a")
+            self.assertEqual(getattr(result, "code", None), want, end)
+
+    def test_int_clock_past_float_range_is_not_an_internal_failure(self):
+        clock = Clock()
+        clock.now = 10**400  # deadline + slack would raise OverflowError after the runner ran
+        runner = Runner(Clock(), ok())
+        port = BrainPort(runner, argv_for, TOOLS, {}, clock, 5, 1000)
+        self.assertIsInstance(port.ask("a"), Reply)
+        self.assertEqual(runner.calls[0][2], 5)
 
     def test_metered_list_covers_connector_guard(self):
         self.assertLessEqual(set(claude_code.PROHIBITED_BILLING_ENV_VARS), set(brain_port.METERED_ENV))

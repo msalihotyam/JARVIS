@@ -24,6 +24,8 @@ from jarvis import talk_rotate
 
 MAX_OUTPUT_BYTES = 16_000
 MAX_REPLY_CHARS = 4000
+# Clock floats are never compared exactly: start + limit - now can miss limit by an ulp on a frozen clock.
+CLOCK_SLACK_SECONDS = 1e-3
 # ASCII only, no leading "-" so a stored id can never turn into an argv flag.
 SESSION_ID = r"[A-Za-z0-9][A-Za-z0-9-]{0,63}"
 # Same names as the Claude Code connector's billing guard; presence alone refuses.
@@ -153,15 +155,17 @@ class BrainPort:
         argv = self._argv_for(session, self._tool_server)
         # After argv_for, so builder time counts; the bounds refuse a NaN, inf or backwards clock.
         remaining = deadline - self._clock()
-        if not 0 < remaining <= limit:
+        if not 0 < remaining <= limit + CLOCK_SLACK_SECONDS:
             raise _Bad("timeout")
+        remaining = min(remaining, limit)  # the slack never lifts the limit
         try:
             result = self._runner(argv, stdin=stdin, timeout=remaining)
         except TimeoutError:
             raise _Bad("timeout") from None
         except Exception:  # noqa: BLE001 - a broken runner is a typed failure
             raise _Bad("runner_failed") from None
-        if not self._clock() <= deadline:
+        # Subtract, never add: deadline + slack overflows an int clock past float range.
+        if not self._clock() - deadline <= CLOCK_SLACK_SECONDS:
             raise _Bad("timeout")  # nothing partial is returned
         if type(result) is not tuple or len(result) != 4:
             raise _Bad("runner_failed")
