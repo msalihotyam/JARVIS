@@ -5,7 +5,8 @@ import ast
 import re
 import sys
 import unittest
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
+from unittest import mock
 
 from jarvis.face import tokens
 from jarvis.face.tokens import (
@@ -218,6 +219,87 @@ class FontPlanTest(unittest.TestCase):
             self.assert_family(plan["sans"], "fallback", "bad_input")
             self.assert_family(plan["mono"], "fallback", "bad_input")
         each(self, bad, check)
+
+    def test_container_subclass_never_raises(self):
+        def boom(*_a, **_k):
+            raise RuntimeError("boom")
+
+        bad = []
+        for base in (list, tuple, set, frozenset):
+            bad.append(type("Plain", (base,), {})(ALL_FONTS))  # benign subclass: identity, not isinstance
+            for attr in ("__iter__", "__len__", "__contains__", "__getitem__"):
+                bad.append(type("Raising", (base,), {attr: boom})(ALL_FONTS))
+
+        def check(value):
+            plan = font_plan(value)
+            self.assert_family(plan["sans"], "fallback", "bad_input")
+            self.assert_family(plan["mono"], "fallback", "bad_input")
+        each(self, bad, check)
+
+    def test_raising_item_never_escapes(self):
+        def boom(*_a, **_k):
+            raise RuntimeError("boom")
+
+        def hostile(attrs):
+            return type("Hostile", (type(Path(FONT_DIR)),), attrs)(FONT_DIR / SANS[0])
+
+        class Benign(type(Path(FONT_DIR))):
+            pass
+
+        class Text(str):
+            pass
+
+        # PureWindowsPath(item) reads _raw_paths: raising there escaped before the fix.
+        items = [hostile({"_raw_paths": property(boom, lambda _s, _v: None)}), Benign(ALL_FONTS[0]),
+                 Text(ALL_FONTS[0]), PureWindowsPath(ALL_FONTS[0])]
+        items += [hostile({a: property(boom)}) for a in ("_str", "parts", "parent", "name", "drive", "root")]
+        items += [hostile({a: boom}) for a in ("__fspath__", "__str__", "__eq__", "__hash__")]
+
+        def check(i):  # by index: repr() of a hostile item raises
+            item = items[i]
+            plan = font_plan(ALL_FONTS[1:] + [item])  # exact types only: a subclass never counts
+            want = "bundled" if type(item) is PureWindowsPath else "fallback"
+            self.assert_family(plan["sans"], want, "" if want == "bundled" else "incomplete_family")
+            self.assert_family(plan["mono"], "bundled")
+        each(self, range(len(items)), check)
+
+    def test_error_while_iterating_is_full_fallback(self):
+        def boom(_item):
+            raise RuntimeError("boom")
+
+        with mock.patch.object(tokens, "_accepted_name", boom):
+            plan = font_plan(ALL_FONTS)
+        self.assert_family(plan["sans"], "fallback", "bad_input")
+        self.assert_family(plan["mono"], "fallback", "bad_input")
+
+        def interrupt(_item):
+            raise KeyboardInterrupt
+
+        with mock.patch.object(tokens, "_accepted_name", interrupt), self.assertRaises(KeyboardInterrupt):
+            font_plan(ALL_FONTS)  # only Exception is caught; Ctrl-C still stops the caller
+
+    def test_metaclass_eq_does_not_fake_exact_type(self):
+        class EqAll(type):  # `type(x) in (...)` would match through this __eq__
+            __eq__ = lambda cls, other: True  # noqa: E731
+            __hash__ = type.__hash__
+
+        class FakeList(metaclass=EqAll):
+            def __iter__(self):
+                return iter(ALL_FONTS)
+
+        class FakePath(metaclass=EqAll):
+            def __init__(self, path):
+                self.path = path
+
+            def __fspath__(self):
+                return self.path
+
+        plan = font_plan(FakeList())
+        self.assert_family(plan["sans"], "fallback", "bad_input")
+        self.assert_family(plan["mono"], "fallback", "bad_input")
+        plan = font_plan(ALL_FONTS[1:] + [FakePath(ALL_FONTS[0])])
+        self.assert_family(plan["sans"], "fallback", "incomplete_family")
+        self.assertEqual(plan["mono"]["chosen"], "bundled")
 
 
 class StaticTest(unittest.TestCase):
