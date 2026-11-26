@@ -75,11 +75,14 @@ def _imports(source: str):
 
 # FACEKEY1 key store only: the stdlib it uses (DPAPI through plain "import ctypes"); no network, no process.
 KEYSTORE_IMPORTS = {"__future__", "ipaddress", "json", "os", "sys", "tempfile", "dataclasses", "ctypes"}
+BOARD_IMPORTS = {"dataclasses", "datetime", "json", "pathlib", "re", "stat"}
 
 
 def _import_ok(file_name: str, module, names: set) -> bool:
     if file_name == "devices.py":
         return module in DEVICES_IMPORTS
+    if file_name == "board.py":
+        return module in BOARD_IMPORTS
     if file_name == "capture.py" and module == "PySide6.QtCore":  # FACECAP1 grabber's PNG buffer only
         return names == {"QBuffer", "QIODevice"}
     if file_name == "keystore.py":
@@ -123,6 +126,20 @@ class StaticTests(unittest.TestCase):
             for source in (f"import {module}", f"from {module} import x"):
                 with self.subTest(source=source):
                     self.assertFalse(all(_import_ok("devices.py", m, n) for m, n in _imports(source)))
+
+    def test_board_allowance_is_exact_and_keeps_other_files_restricted(self) -> None:
+        imports = dict(_imports((FACE / "board.py").read_text(encoding="utf-8")))
+        self.assertEqual(BOARD_IMPORTS, imports.keys())
+        for file in FACE.glob("*.py"):
+            if file.name == "board.py":
+                continue
+            for module in BOARD_IMPORTS - SHELL_IMPORTS - PURE_IMPORTS:
+                with self.subTest(file=file.name, module=module):
+                    self.assertFalse(_import_ok(file.name, module, imports[module]))
+        for module in ("socket", "http", "http.client", "urllib", "urllib.parse", "urllib.request", "ssl", "subprocess"):
+            for source in (f"import {module}", f"from {module} import x"):
+                with self.subTest(source=source):
+                    self.assertFalse(any(_import_ok("board.py", m, n) for m, n in _imports(source)))
 
     def test_only_urllib_parse_is_allowed_from_the_url_and_network_modules(self) -> None:
         refused = ["import urllib", "import urllib.request", "from urllib import request", "from urllib import parse",
