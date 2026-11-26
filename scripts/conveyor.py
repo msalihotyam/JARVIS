@@ -3349,8 +3349,18 @@ class Conveyor:
         fresh. The winner's source ("ledger" / "live:<family>") goes to self.usage_source.
         A winner RESET_DROP+ above the last accepted value (pager "usage_ok") within
         SPIKE_WINDOW_S is held back (the last accepted value is returned) until another
-        source confirms the rise or the same source reports it again SPIKE_CONFIRM_S later."""
-        cands = []
+        source confirms the rise or the same source reports it again SPIKE_CONFIRM_S later.
+        PACESTALE1: in a readable paced window, a reading older than window_start never counts
+        (event "usage_prewindow_ignored" once per window)."""
+        cands, old, ws, win = [], [], None, None
+        try:
+            p, err = self.load_pace()
+            ws = None if err or p["mode"] != "paced" else p.get("window_start")
+            win = datetime.fromisoformat(ws).timestamp()
+            if win > self.now():
+                win = None  # a future window is a typo or skew, not a reason to drop readings
+        except (OSError, TypeError, ValueError, OverflowError):
+            win = None  # no readable paced window: every fresh reading counts, as before
         f = self.root / "build" / "ledger" / "slices.jsonl"
         try:
             with open(f, "rb") as fh:
@@ -3369,7 +3379,7 @@ class Conveyor:
                 continue
             if isinstance(pct, (int, float)):
                 if self.now() - ts <= USAGE_FRESH_S:
-                    cands.append((ts, pct, "ledger"))
+                    (old if win is not None and ts < win else cands).append((ts, pct, "ledger"))
                 break
         for f in (self.root / "build" / "lanes").glob("*.json"):
             try:
@@ -3379,7 +3389,11 @@ class Conveyor:
                 continue
             if isinstance(pct, (int, float)) and not isinstance(pct, bool) and 0 <= pct <= 100 \
                     and 0 <= self.now() - ts <= USAGE_FRESH_S:
-                cands.append((ts, pct, f"live:{f.stem}"))
+                (old if win is not None and ts < win else cands).append((ts, pct, f"live:{f.stem}"))
+        if old and self.pager_flag("usage_prewindow") != ws:  # one event per pace window
+            o_ts, _, o_src = max(old)
+            self.event("usage_prewindow_ignored", source=o_src, at=iso(o_ts), window_start=ws)
+            self.pager_flag("usage_prewindow", ws)
         ts, pct, src = max(cands, default=(None, None, None))
         ok, spike = self.pager_flag("usage_ok"), self.pager_flag("usage_spike")  # [pct, ts, seen_at, src]
         if not (isinstance(ok, list) and len(ok) == 4):

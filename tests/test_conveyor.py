@@ -2149,6 +2149,67 @@ class TestPaceGovernor(TestUsageGuard):
         self.assertEqual(self.pace_file(), before)
         self.assertEqual(self.resets(), ["quota_reset_refused"])
 
+    # ---- PACESTALE1: a reading from before the paced window never counts in it ----
+    def stale_99(self, window_min_ago):
+        """2026-11-26: 99 % read at 20:31 (ledger) / 20:33 (sonnet), now 22:20."""
+        self.t -= 105 * 60  # 20:35, inside the old window: the 99 holds
+        self.paced(days_ago=7)
+        self.ledger(99, age=4 * 60)
+        self.live("sonnet", {"seven_pct": 99}, age=2 * 60)
+        self.c.pass_once()
+        self.assertTrue(self.status()["usage_hold"])
+        self.t += 105 * 60  # 22:20
+        self.pace(mode="paced", window_start=conveyor.iso(self.t - window_min_ago * 60))
+
+    def prewindow(self):
+        return [e for e in self.events() if e["event"] == "usage_prewindow_ignored"]
+
+    def test_prewindow_reading_ignored_lanes_start(self):
+        self.stale_99(window_min_ago=20)  # window 22:00
+        before = self.pace_file()
+        for n in "AB":
+            self.drop(f"{n}.md", HDR.format(n))
+        self.c.pass_once()
+        self.assertEqual(self.c.usage_pct(), None)
+        self.c.pass_once()
+        st = self.status()
+        self.assertEqual((st["usage_pct"], st["usage_hold"], st["pace"]["band"]), (None, False, "unknown"))
+        self.assertGreater(st["pace"]["max_lanes"], 0)
+        self.assertEqual(self.fake.bg_names(), ["A", "B"])
+        (ev,) = self.prewindow()  # once per window, the newest ignored reading
+        self.assertEqual((ev["source"], ev["at"], ev["window_start"]),
+                         ("live:sonnet", conveyor.iso(self.t - 107 * 60), before["window_start"]))
+        self.t += 60
+        self.ledger(5)  # the first fresh reading rules; young window: refused, nothing else
+        self.c.pass_once()
+        self.assertEqual(self.status()["usage_pct"], 5)
+        self.assertEqual(self.resets(), ["quota_reset_refused"])
+        self.assertEqual(self.pace_file(), before)
+
+    def test_reading_inside_window_still_holds(self):
+        self.stale_99(window_min_ago=140)  # window 20:00
+        self.c.pass_once()
+        self.assertEqual((self.status()["usage_pct"], self.status()["usage_hold"]), (99, True))
+        self.assertEqual(self.prewindow(), [])
+
+    def test_full_burn_keeps_stale_reading(self):
+        self.stale_99(window_min_ago=20)
+        self.pace()  # full_burn
+        self.assertEqual(self.c.usage_pct(), 99)
+        self.assertEqual(self.prewindow(), [])
+
+    def test_unreadable_window_keeps_stale_reading(self):
+        for ws in ("garbage", None, 5, "future"):
+            self.fresh()
+            self.stale_99(window_min_ago=20)
+            if ws == "future":  # skew/typo: a window that has not started yet filters nothing
+                ws = conveyor.iso(self.t + 3600)
+            self.pace(mode="paced", window_start=ws)
+            self.assertEqual(self.c.usage_pct(), 99)
+            self.c.pass_once()
+            self.assertEqual((self.status()["usage_pct"], self.status()["usage_hold"]), (99, True))
+            self.assertEqual(self.prewindow(), [])
+
     def test_spike_confirmed_by_same_source_later(self):
         self.ledger(10)
         self.c.pass_once()
