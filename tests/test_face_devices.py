@@ -16,6 +16,7 @@ from jarvis.face.devices import Device, Paired, Refusal, Registry
 from tests.adversarial import HOSTILE_JSON, HOSTILE_NUMBERS, HOSTILE_TEXT, each
 
 T0 = 1_800_000_000
+PROBE_KEY, PROBE_ID = "A" * 52, "0123456789abcdef"  # present in the shape-matrix fixture
 SOURCE = Path(devices.__file__).read_text(encoding="utf-8")
 
 
@@ -37,11 +38,12 @@ class _Root(unittest.TestCase):
         self.file.write_bytes(raw if isinstance(raw, bytes) else raw.encode("utf-8"))
 
     def assert_refuses_to_load(self) -> None:
-        self.assertIsInstance(self.reg.list(), Refusal)
-        self.assertIsInstance(self.reg.check("A" * 52, T0), Refusal)
-        self.assertIsInstance(self.reg.revoke("0" * 16), Refusal)
+        unreadable = Refusal("registry_unreadable")
+        self.assertEqual(self.reg.list(), unreadable)
+        self.assertEqual(self.reg.check(PROBE_KEY, T0), unreadable)
+        self.assertEqual(self.reg.revoke(PROBE_ID), unreadable)
         before = self.file.read_bytes() if self.file.is_file() else None
-        self.assertIsInstance(self.reg.pair(self.reg.issue_code(T0), "x", T0), Refusal)
+        self.assertEqual(self.reg.pair(self.reg.issue_code(T0), "x", T0), unreadable)
         if before is not None:
             self.assertEqual(self.file.read_bytes(), before)  # a bad file is never overwritten
 
@@ -69,7 +71,7 @@ class RegistryFileTests(_Root):
         self.assertEqual(len(self.reg.list()), 1)
 
     def test_shape_matrix_refuses_to_load(self) -> None:
-        good = {"id": "0123456789abcdef", "name": "a", "key_hash": "0" * 64, "created": 1, "last_seen": 1,
+        good = {"id": PROBE_ID, "name": "a", "key_hash": devices._digest(PROBE_KEY), "created": 1, "last_seen": 1,
                 "revoked": False}
 
         def doc(**over):
@@ -91,6 +93,8 @@ class RegistryFileTests(_Root):
         each(self, bad, lambda raw: (self.write_raw(raw), self.assert_refuses_to_load()))
         self.write_raw(json.dumps({"version": 1, "devices": [good]}))
         self.assertEqual(len(self.reg.list()), 1)
+        self.assertEqual(self.reg.check(PROBE_KEY, T0), PROBE_ID)  # the probes hit a readable file
+        self.assertEqual(self.reg.revoke(PROBE_ID).id, PROBE_ID)
 
     def test_a_50_mb_file_or_a_directory_refuses_to_load(self) -> None:
         self.write_raw(json.dumps({"version": 1, "devices": []}))
@@ -125,6 +129,33 @@ class CodeTests(_Root):
         code = self.reg.issue_code(T0)
         self.assertEqual(self.reg.pair(code, "a", T0 - 1), Refusal("expired"))
         self.assertEqual(self.reg.pair(code, "a", T0), Refusal("no_code"))
+
+    def test_a_clock_that_goes_below_an_earlier_attempt_burns_the_code(self) -> None:
+        code = self.reg.issue_code(T0)
+        wrong = "00000000" if code != "00000000" else "11111111"
+        self.assertEqual(self.reg.pair(wrong, "a", T0 + 100), Refusal("wrong_code"))
+        self.assertEqual(self.reg.pair(code, "a", T0 + 50), Refusal("expired"))
+        self.assertEqual(self.reg.pair(code, "a", T0 + 101), Refusal("no_code"))
+        code = self.reg.issue_code(T0)  # a refused name still records its clock
+        self.assertEqual(self.reg.pair(code, "\x00", T0 + 100), Refusal("bad_name"))
+        self.assertEqual(self.reg.pair(code, "a", T0 + 50), Refusal("expired"))
+        code = self.reg.issue_code(T0)  # a fraction of a second back is back too
+        wrong = "00000000" if code != "00000000" else "11111111"
+        self.assertEqual(self.reg.pair(wrong, "a", T0 + 100.5), Refusal("wrong_code"))
+        self.assertEqual(self.reg.pair(code, "a", T0 + 100), Refusal("expired"))
+        self.assertFalse(self.file.exists())
+
+    def test_the_same_clock_again_keeps_the_code(self) -> None:
+        code = self.reg.issue_code(T0)
+        wrong = "00000000" if code != "00000000" else "11111111"
+        self.assertEqual(self.reg.pair(wrong, "a", T0 + 100), Refusal("wrong_code"))
+        self.assertIsInstance(self.reg.pair(code, "a", T0 + 100), Paired)
+
+    def test_a_try_that_times_out_on_the_lock_still_records_its_clock(self) -> None:
+        code = self.reg.issue_code(T0)
+        with mock.patch.object(self.reg, "_locked", side_effect=TimeoutError("registry busy")):
+            self.assertRaises(TimeoutError, self.reg.pair, code, "a", T0 + 100)
+        self.assertEqual(self.reg.pair(code, "a", T0 + 50), Refusal("expired"))
 
     def test_five_wrong_attempts_burn_the_code(self) -> None:
         code = self.reg.issue_code(T0)
@@ -203,6 +234,29 @@ class CheckTests(_Root):
             self.reg.check(p.key, T0 + 120)
         self.assertTrue(other.list()[0].revoked)
         self.assertEqual(self.reg.check(p.key, T0 + 240), Refusal("revoked"))
+
+    def test_a_racing_last_seen_write_never_moves_it_backwards(self) -> None:
+        other = Registry(self.root)
+        real, real_write = self.reg._load, self.reg._write
+        calls, writes = [], []
+
+        def load_then_check(at):
+            def load():
+                records = real()
+                if not calls:
+                    self.assertEqual(other.check(p.key, at), p.device.id)  # the racer writes first
+                calls.append(1)
+                return records
+            return load
+
+        for racer, mine in ((T0 + 61, T0 + 60), (T0 + 60, T0 + 61)):  # a later or an earlier racer: no second write
+            p = self.paired()
+            calls.clear()
+            with mock.patch.object(self.reg, "_load", load_then_check(racer)), \
+                    mock.patch.object(self.reg, "_write", side_effect=lambda r: (writes.append(1), real_write(r))):
+                self.assertEqual(self.reg.check(p.key, mine), p.device.id)
+            self.assertEqual(writes, [])
+            self.assertEqual({d.id: d.last_seen for d in other.list()}[p.device.id], racer)
 
     def test_writers_take_the_lock_and_a_stale_lock_is_broken(self) -> None:
         p = self.paired()

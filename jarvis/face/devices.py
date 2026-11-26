@@ -68,6 +68,7 @@ class _Code:
     digest: str = field(repr=False)
     issued: float
     attempts: int = 0
+    latest: float = 0.0  # the latest now seen for this code; a smaller one later burns it
 
 
 def _digest(text: str) -> str:
@@ -206,22 +207,24 @@ class Registry:
         now = _now(now)
         code = f"{secrets.randbelow(10**8):08d}"
         with self._mutex:
-            self._code = _Code(_digest(code), now)
+            self._code = _Code(_digest(code), now, latest=now)
         return code
 
     def pair(self, code, name, now):
         """Paired(device, key) once, or Refusal. The attempt is counted before the comparison."""
         now = _now(now)
-        with self._mutex, self._locked():
-            return self._pair(code, name, now)
+        with self._mutex:
+            live = self._code
+            if live is None:
+                return Refusal("no_code")
+            if not live.latest <= now < live.issued + CODE_TTL:  # a clock that went back, even below a later try, expires
+                self._code = None
+                return Refusal("expired")
+            live.latest = now  # every attempt counts, even one that times out on the lock or is refused below
+            with self._locked():
+                return self._pair(live, code, name, now)
 
-    def _pair(self, code, name, now):
-        live = self._code
-        if live is None:
-            return Refusal("no_code")
-        if not live.issued <= now < live.issued + CODE_TTL:  # a clock that went back counts as expired
-            self._code = None
-            return Refusal("expired")
+    def _pair(self, live, code, name, now):
         label = clean_name(name)
         if not label or clean_name(label) != label:  # never write a name the loader would reject
             return Refusal("bad_name")
@@ -269,7 +272,9 @@ class Registry:
                 with self._locked():  # re-read under the lock: only last_seen changes, a fresh revoke stays
                     fresh = self._load() or []
                     for record in fresh:
-                        if record["id"] == found["id"] and not record["revoked"]:
+                        # re-check on the fresh record: a racing check may have written a later now
+                        if record["id"] == found["id"] and not record["revoked"] \
+                                and now - record["last_seen"] >= SEEN_EVERY:
                             record["last_seen"] = int(now)
                             self._write(fresh)
             except OSError:
