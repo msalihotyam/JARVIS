@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "classes": {
+    "tests.test_face_hotkey.BoundaryTests": 1.0,
+    "tests.test_face_hotkey.LifecycleTests": 1.0,
+    "tests.test_face_hotkey.ParseTests": 1.0,
+    "tests.test_face_shell.StaticTests": 1.0
+  }
+}

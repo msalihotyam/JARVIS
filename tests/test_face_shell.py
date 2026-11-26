@@ -83,6 +83,8 @@ def _import_ok(file_name: str, module, names: set) -> bool:
         return module in DEVICES_IMPORTS
     if file_name == "board.py":
         return module in BOARD_IMPORTS
+    if file_name == "hotkey.py":
+        return module in {"__future__", "dataclasses", "sys", "typing"} or (module == "ctypes" and names == {"ctypes"})
     if file_name == "capture.py" and module == "PySide6.QtCore":  # FACECAP1 grabber's PNG buffer only
         return names == {"QBuffer", "QIODevice"}
     if file_name == "keystore.py":
@@ -172,6 +174,28 @@ class StaticTests(unittest.TestCase):
                        "from dataclasses import dataclass", "from __future__ import annotations"):
             with self.subTest(source=source):
                 self.assertTrue(all(_import_ok("keystore.py", m, n) for m, n in _imports(source)))
+
+    def test_the_hotkey_branch_limits_imports_to_its_stdlib(self) -> None:
+        source = (FACE / "hotkey.py").read_text(encoding="utf-8")
+        allowed = {m for m, _ in _imports(source)}
+        self.assertEqual(allowed, {"__future__", "ctypes", "dataclasses", "sys", "typing"})
+        for module in allowed:
+            self.assertTrue(_import_ok("hotkey.py", module, {module}))
+        tree = ast.parse(source)
+        ctypes_imports = {node for node in ast.walk(tree) if isinstance(node, ast.Import)
+                          and any(alias.name == "ctypes" for alias in node.names)}
+        default_os = next(node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "default_os")
+        self.assertEqual(len(ctypes_imports), 1)
+        self.assertTrue(ctypes_imports <= set(ast.walk(default_os)))
+        for path in FACE.rglob("*.py"):
+            if path.name not in {"hotkey.py", "keystore.py"}:  # keystore keeps its existing DPAPI allowance
+                self.assertFalse(_import_ok(path.name, "ctypes", {"ctypes"}), path)
+        for module in ("socket", "http", "http.client", "urllib", "urllib.request", "urllib.parse", "ssl",
+                       "subprocess", "ctypes.wintypes", "os", "math", "pathlib", "jarvis.face.port"):
+            for denied in (f"import {module}", f"from {module} import x"):
+                with self.subTest(source=denied):
+                    self.assertFalse(any(_import_ok("hotkey.py", m, n) for m, n in _imports(denied)))
+        self.assertFalse(_import_ok("hotkey.py", "ctypes", {"wintypes"}))
 
     def test_qml_has_no_file_network_microphone_clipboard_or_screen_access(self) -> None:
         banned = r"Clipboard|clipboard|grabWindow|grabToImage|FileDialog|FolderDialog|XMLHttpRequest|" \
