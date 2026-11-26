@@ -57,7 +57,8 @@ def pump(ms: int = 30) -> None:
 SHELL_IMPORTS = {"__future__", "os", "sys", "pathlib", "PySide6.QtQml", "PySide6.QtGui"}
 # Pure computation only (FACEGEO1 geometry, FACEMD1, FACETOKENS1, FACECOMP1): no file, network, process or thread.
 PURE_IMPORTS = {"math", "fractions", "decimal", "typing", "dataclasses", "enum", "functools", "itertools",
-                "operator", "collections", "collections.abc", "re", "string", "unicodedata", "types", "json"}
+                "operator", "collections", "collections.abc", "re", "string", "unicodedata", "types", "json",
+                "urllib.parse"}  # string parser only; urllib / urllib.request / http / socket stay refused
 
 
 def _imports(source: str):
@@ -72,6 +73,8 @@ def _imports(source: str):
 def _import_ok(file_name: str, module, names: set) -> bool:
     if file_name == "capture.py" and module == "PySide6.QtCore":  # FACECAP1 grabber's PNG buffer only
         return names == {"QBuffer", "QIODevice"}
+    if module == "urllib.parse" and module in names:  # "import urllib.parse" binds urllib, whose .request may be loaded
+        return False
     return module in SHELL_IMPORTS | PURE_IMPORTS \
         and not re.match(r"^jarvis\.(ui|app|core|memory|connectors)", module)
 
@@ -96,6 +99,19 @@ class StaticTests(unittest.TestCase):
         self.assertFalse(all(_import_ok("geometry.py", m, n) for m, n in _imports("from . import shell")))
         for module in sorted(PURE_IMPORTS):
             self.assertTrue(all(_import_ok("geometry.py", m, n) for m, n in _imports(f"from {module} import x")))
+
+    def test_only_urllib_parse_is_allowed_from_the_url_and_network_modules(self) -> None:
+        refused = ["import urllib", "import urllib.request", "from urllib import request", "from urllib import parse",
+                   "from urllib.request import urlopen", "import urllib.error", "from urllib.response import addinfourl",
+                   "import http", "import http.client", "import socket", "import urllib.parse, urllib.request",
+                   "import URLLIB.PARSE", "import urllib.parse.x", "from urllib.parser import x",
+                   "import urllib.parse", "import urllib.parse as p", "import urllib . parse"]
+        for source in refused:
+            with self.subTest(source=source):
+                self.assertFalse(all(_import_ok("md_blocks.py", m, n) for m, n in _imports(source)))
+        for source in ("from urllib.parse import urlsplit", "from urllib.parse import urlsplit as split, quote"):
+            with self.subTest(source=source):
+                self.assertTrue(all(_import_ok("md_blocks.py", m, n) for m, n in _imports(source)))
 
     def test_qml_has_no_file_network_microphone_clipboard_or_screen_access(self) -> None:
         banned = r"Clipboard|clipboard|grabWindow|grabToImage|FileDialog|FolderDialog|XMLHttpRequest|" \
