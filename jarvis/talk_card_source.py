@@ -2,7 +2,7 @@
 
 Where may a card tap come from: plan-class cards from the PC or the phone
 (telegram), security-class cards only from the PC. Checked before a tap
-reaches the card logic (jarvis.talk_card.resolve), so a refused tap leaves
+reaches the card logic (the card module's resolve), so a refused tap leaves
 the card PENDING and it can still be approved on the PC.
 
 The card class is read from the card record made at creation, the view from
