@@ -1,0 +1,10 @@
+{"version": 1, "classes": {
+  "tests.test_stt_record.SessionLogicTest": 0.2,
+  "tests.test_stt_record.WavFileTest": 0.1,
+  "tests.test_stt_record.AtomicReplaceTest": 0.2,
+  "tests.test_stt_record.ResumeAndFinishTest": 0.3,
+  "tests.test_stt_record.PathGuardTest": 0.2,
+  "tests.test_stt_record.PhrasesTest": 0.1,
+  "tests.test_stt_record.StaticTest": 0.1,
+  "tests.test_stt_record.WindowTest": 1.0
+}}
