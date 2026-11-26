@@ -1,0 +1,8 @@
+{
+ "version": 1,
+ "classes": {
+  "tests.test_face_ring_qml.RingNegativeTests": 3.2,
+  "tests.test_face_ring_qml.RingStateTests": 4.7,
+  "tests.test_face_ring_qml.StaticContractTests": 0.01
+ }
+}
