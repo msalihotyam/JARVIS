@@ -270,9 +270,7 @@ def _qt_message(mode, context, message):          # a QML message reaching Qt's 
         _NOISE.append(message)
 
 
-qInstallMessageHandler(_qt_message)
-
-C = {k: v.lower() for k, v in COLORS.items()}
+C ={k: v.lower() for k, v in COLORS.items()}
 TABLE = {"t": "table", "head": ["Ad", "Değer"], "rows": [["bir", "1"], ["iki", "2"]], "align": ["left", "right"]}
 STYLED = {"t": "p", "spans": [{"s": "Kalın", "b": True}, {"s": " ve "}, {"s": "kod", "c": True}, {"s": " ile "},
                               {"s": "buraya", "href": "ornek.test/yol"}, {"s": " git."}]}
@@ -318,6 +316,7 @@ class ReadingViewTests(unittest.TestCase):
         _NOISE.clear()
         _SEEN.clear()
         _RECORD[0] = True
+        self.addCleanup(qInstallMessageHandler, qInstallMessageHandler(_qt_message))   # restored after the test
 
     def tearDown(self):
         _RECORD[0] = False
@@ -532,6 +531,65 @@ class ReadingViewTests(unittest.TestCase):
         self.click(self.one("readAloudButton"))
         self.assertEqual(self.face.calls, [("copyText", "j0"), ("talkToggle", "j0")])
 
+    def answer(self, index):                      # bring row `index` to the top: its button, blocks shown, label
+        self.js(self.flick, f"positionViewAtIndex({index}, 0)")
+        pump()
+        eid = self.rows._rows[index]["entryId"]
+        turns = [t for t in self.items("jarvisTurn") if t.property("entryId") == eid]
+        self.assertEqual(len(turns), 1, eid)
+        button = self.one("collapseButton", under=turns[0])
+        return button, len(self.shown(self.one("answerBlocks", under=turns[0]))), button.childItems()[0].property("text")
+
+    def test_collapse_survives_scrolling_far_away(self):
+        self.load(chat(299) + [jarvis("jz", ALL_BLOCKS[:3])])
+        self.click(self.answer(299)[0])
+        self.assertEqual(self.answer(299)[1:], (1, "Genişlet"))
+        self.js(self.flick, "positionViewAtBeginning()")
+        pump(80)
+        self.assertEqual([t for t in self.items("jarvisTurn") if t.property("entryId") == "jz"], [])
+        self.js(self.root, "toEnd()")
+        pump(80)
+        self.assertEqual(self.answer(299)[1:], (1, "Genişlet"))
+        self.click(self.answer(299)[0])
+        self.assertEqual(self.answer(299)[1:], (3, "Daralt"))
+        self.assertEqual(self.face.calls, [])
+
+    def test_collapse_is_kept_per_entry_id(self):
+        two = [para("bir"), para("iki")]
+        rows = [jarvis(eid, two) for eid in ("__proto__", "constructor", "toString", "a", "A")]
+        self.load(rows)
+
+        def shown():
+            return [self.answer(i)[1] for i in range(len(self.rows._rows))]
+        for index in (0, 1, 3):
+            self.click(self.answer(index)[0])
+        self.assertEqual(shown(), [1, 1, 2, 1, 2])
+        self.rows.append(jarvis("b", two))
+        pump(60)
+        self.click(self.answer(5)[0])
+        self.rows.extend_last(two + [para("üç")])
+        pump(60)
+        self.assertEqual(shown(), [1, 1, 2, 1, 2, 1])
+        self.rows.reset(rows)
+        pump(80)
+        self.assertEqual(shown(), [1, 1, 2, 1, 2])
+        self.assertEqual(self.face.calls, [])
+
+    def test_collapse_without_an_entry_id_does_nothing(self):
+        self.load([jarvis("", ALL_BLOCKS[:3])])
+        button = self.one("collapseButton")
+        self.click(button)
+        self.assertEqual((len(self.shown(self.one("answerBlocks"))), button.childItems()[0].property("text")),
+                         (3, "Daralt"))
+        self.assertEqual((self.js(self.root, "Object.keys(collapsedIds).length"), self.face.calls), (0, []))
+
+    def test_a_queued_follow_yields_to_a_scroll_up(self):
+        self.load(chat(40))
+        self.js(self.root, "arrived(), scrollBy(-1000)")   # a wheel-up lands between the queued follow and its run
+        pump(60)
+        self.assertFalse(self.root.property("following"))
+        self.assertFalse(self.flick.property("atYEnd"))
+
     def test_link_reports_its_address_only(self):
         self.load([jarvis("j0", [STYLED])])
         area = self.one("linkArea")
@@ -629,9 +687,13 @@ class ReadingViewTests(unittest.TestCase):
 
     def test_malformed_blocks_and_rows_draw_nothing_and_throw_nothing(self):
         self.load([jarvis("j0", BAD), jarvis("j1", []), {**jarvis("j2", []), "blocks": {"t": "p"}},
-                   {**jarvis("j3", []), "blocks": "metin"}, jarvis("j4", [para("x")], who="kimse")])
-        self.assertEqual([len(self.shown(b)) for b in self.items("answerBlocks")], [7, 0, 0, 0])
+                   {**jarvis("j3", []), "blocks": "metin"}, jarvis("j4", [para("x")], who="kimse"),
+                   {**jarvis("j5", []), "blocks": {"length": 2}}])
+        self.assertEqual([len(self.shown(b)) for b in self.items("answerBlocks")], [7, 0, 0, 0, 0])
         self.assertEqual([b.property("item") is None for b in self.items("turnBody")].count(True), 1)
+        self.js(self.root, "['j0', 'j1', 'j2', 'j3', 'j5'].forEach(id => toggleCollapsed(id))")   # collapse throws nothing
+        pump()
+        self.assertEqual([len(self.shown(b)) for b in self.items("answerBlocks")], [0, 0, 0, 0, 0])
 
     def test_every_clickable_is_named_and_large_enough(self):
         self.load([salih("s0", "Soru"), jarvis("j0", ALL_BLOCKS), jarvis("j1", [WIDE])], talk=True)

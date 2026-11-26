@@ -10,7 +10,8 @@ Item {
     property string time
     property int readMinutes                    // 0: hide the reading time
     property var blocks: []
-    property bool collapsed: false              // view state only: the answer shows its first block
+    property bool collapsed: false              // set by the view: the answer shows its first block
+    signal collapseToggled()                    // the view keeps the state per entryId; the delegate may be destroyed
     implicitHeight: content.height
 
     Column {
@@ -73,7 +74,7 @@ Item {
                 objectName: "collapseButton"
                 hitMin: turn.hitMin
                 label: turn.collapsed ? qsTr("Genişlet") : qsTr("Daralt")
-                onActivated: turn.collapsed = !turn.collapsed
+                onActivated: turn.collapseToggled()
             }
             TextButton {
                 objectName: "readAloudButton"

@@ -92,7 +92,7 @@ Column {
     FontMetrics { id: cellMetrics; font.pixelSize: root.tk.type_cell_size }
 
     Repeater {
-        model: root.collapsed ? root.arr(root.blocks).slice(0, 1) : root.arr(root.blocks)
+        model: root.collapsed ? Array.prototype.slice.call(root.arr(root.blocks), 0, 1) : root.arr(root.blocks)   // model lists are array-likes, not Arrays
         delegate: Loader {
             required property var modelData
             width: root.width

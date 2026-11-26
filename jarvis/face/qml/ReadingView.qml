@@ -13,7 +13,18 @@ Item {
     property bool following: true               // the view sticks to the bottom while the user is there
     property bool unseen: false                 // something arrived while the user was scrolled up
     property bool settling: false               // true while the view itself moves to the bottom
+    property var collapsedIds: ({})             // Daralt state per entryId: off-screen delegates die, this map does not
 
+    function toggleCollapsed(id) {              // reassigned, never mutated, so the delegates' bindings see it
+        if (typeof id !== "string" || id === "")
+            return                              // no entryId, nothing to keep the state under
+        var next = Object.assign({}, collapsedIds), key = "id:" + id   // prefix: "__proto__" stays a plain key
+        if (next[key] === true)
+            delete next[key]
+        else
+            next[key] = true
+        collapsedIds = next
+    }
     function endY() {                           // the true end, bottom margin included
         return Math.max(list.originY - list.topMargin, list.originY + list.contentHeight + list.bottomMargin - list.height)
     }
@@ -25,9 +36,13 @@ Item {
         following = true
         unseen = false
     }
+    function followEnd() {                      // deferred: a wheel-up between the queue and the run wins
+        if (following)
+            toEnd()
+    }
     function arrived() {
         if (following)
-            Qt.callLater(view.toEnd)
+            Qt.callLater(view.followEnd)
         else
             unseen = true
     }
@@ -59,7 +74,7 @@ Item {
             if (atYEnd)
                 view.unseen = false
         }
-        onContentHeightChanged: if (view.following && !view.settling) Qt.callLater(view.toEnd)
+        onContentHeightChanged: if (view.following && !view.settling) Qt.callLater(view.followEnd)
 
         T.ScrollBar.vertical: T.ScrollBar {
             objectName: "readingScroll"
@@ -117,6 +132,8 @@ Item {
                     time: row.time
                     readMinutes: row.readMinutes
                     blocks: row.blocks
+                    collapsed: view.collapsedIds["id:" + row.entryId] === true
+                    onCollapseToggled: view.toggleCollapsed(row.entryId)
                 }
             }
             Component {
