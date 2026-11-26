@@ -59,6 +59,9 @@ SHELL_IMPORTS = {"__future__", "os", "sys", "pathlib", "PySide6.QtQml", "PySide6
 PURE_IMPORTS = {"math", "fractions", "decimal", "typing", "dataclasses", "enum", "functools", "itertools",
                 "operator", "collections", "collections.abc", "re", "string", "unicodedata", "types", "json",
                 "urllib.parse"}  # string parser only; urllib / urllib.request / http / socket stay refused
+# FACEDEV1 device registry: exactly what devices.py imports (one state file, hashes, codes); no network.
+DEVICES_IMPORTS = {"__future__", "argparse", "base64", "contextlib", "dataclasses", "hashlib", "hmac", "json", "os",
+                   "pathlib", "re", "secrets", "sys", "tempfile", "threading", "time", "unicodedata"}
 
 
 def _imports(source: str):
@@ -71,6 +74,8 @@ def _imports(source: str):
 
 
 def _import_ok(file_name: str, module, names: set) -> bool:
+    if file_name == "devices.py":
+        return module in DEVICES_IMPORTS
     if file_name == "capture.py" and module == "PySide6.QtCore":  # FACECAP1 grabber's PNG buffer only
         return names == {"QBuffer", "QIODevice"}
     if module == "urllib.parse" and module in names:  # "import urllib.parse" binds urllib, whose .request may be loaded
@@ -99,6 +104,19 @@ class StaticTests(unittest.TestCase):
         self.assertFalse(all(_import_ok("geometry.py", m, n) for m, n in _imports("from . import shell")))
         for module in sorted(PURE_IMPORTS):
             self.assertTrue(all(_import_ok("geometry.py", m, n) for m, n in _imports(f"from {module} import x")))
+
+    def test_the_device_registry_allowance_is_for_devices_py_only(self) -> None:
+        for module in sorted(DEVICES_IMPORTS - SHELL_IMPORTS - PURE_IMPORTS):
+            for source in (f"import {module}", f"from {module} import x"):
+                with self.subTest(source=source):
+                    self.assertTrue(all(_import_ok("devices.py", m, n) for m, n in _imports(source)))
+                    self.assertFalse(all(_import_ok("geometry.py", m, n) for m, n in _imports(source)))
+                    self.assertFalse(all(_import_ok("capture.py", m, n) for m, n in _imports(source)))
+        for module in ("socket", "http", "http.client", "urllib", "urllib.parse", "urllib.request", "ssl",
+                       "subprocess", "requests", "asyncio", "sqlite3", "PySide6.QtCore", "jarvis.face.port"):
+            for source in (f"import {module}", f"from {module} import x"):
+                with self.subTest(source=source):
+                    self.assertFalse(all(_import_ok("devices.py", m, n) for m, n in _imports(source)))
 
     def test_only_urllib_parse_is_allowed_from_the_url_and_network_modules(self) -> None:
         refused = ["import urllib", "import urllib.request", "from urllib import request", "from urllib import parse",

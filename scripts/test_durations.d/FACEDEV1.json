@@ -1,0 +1,1 @@
+{"version": 1, "classes": {"tests.test_face_devices.CheckTests": 1.0, "tests.test_face_devices.CliAndStaticTests": 1.0, "tests.test_face_devices.CodeTests": 1.0, "tests.test_face_devices.LeakTests": 1.0, "tests.test_face_devices.RegistryFileTests": 1.0}}
