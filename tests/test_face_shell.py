@@ -73,11 +73,17 @@ def _imports(source: str):
             yield node.module, {a.name for a in node.names}
 
 
+# FACEKEY1 key store only: the stdlib it uses (DPAPI through plain "import ctypes"); no network, no process.
+KEYSTORE_IMPORTS = {"__future__", "ipaddress", "json", "os", "sys", "tempfile", "dataclasses", "ctypes"}
+
+
 def _import_ok(file_name: str, module, names: set) -> bool:
     if file_name == "devices.py":
         return module in DEVICES_IMPORTS
     if file_name == "capture.py" and module == "PySide6.QtCore":  # FACECAP1 grabber's PNG buffer only
         return names == {"QBuffer", "QIODevice"}
+    if file_name == "keystore.py":
+        return module in KEYSTORE_IMPORTS and (module != "ctypes" or names == {"ctypes"})
     if module == "urllib.parse" and module in names:  # "import urllib.parse" binds urllib, whose .request may be loaded
         return False
     return module in SHELL_IMPORTS | PURE_IMPORTS \
@@ -130,6 +136,25 @@ class StaticTests(unittest.TestCase):
         for source in ("from urllib.parse import urlsplit", "from urllib.parse import urlsplit as split, quote"):
             with self.subTest(source=source):
                 self.assertTrue(all(_import_ok("md_blocks.py", m, n) for m, n in _imports(source)))
+
+    def test_the_keystore_branch_allows_exactly_its_own_stdlib_and_nothing_else(self) -> None:
+        used = {m for m, _ in _imports((FACE / "keystore.py").read_text(encoding="utf-8"))}
+        self.assertEqual(used, KEYSTORE_IMPORTS)  # "only what you use"
+        for module in ("ipaddress", "tempfile", "ctypes"):  # the same modules stay refused for other files
+            with self.subTest(module=module):
+                self.assertFalse(_import_ok("geometry.py", module, {module}))
+                self.assertFalse(_import_ok("capture.py", module, {module}))
+        refused = ["import socket", "import ssl", "import http", "import http.client", "import urllib",
+                   "import urllib.request", "from urllib.parse import urlsplit", "import subprocess",
+                   "import ctypes.wintypes", "from ctypes import wintypes", "import shutil", "import threading",
+                   "import jarvis.core", "from PySide6.QtCore import QObject", "import math"]
+        for source in refused:
+            with self.subTest(source=source):
+                self.assertFalse(all(_import_ok("keystore.py", m, n) for m, n in _imports(source)))
+        for source in ("import ctypes", "import os, sys, json, tempfile, ipaddress",
+                       "from dataclasses import dataclass", "from __future__ import annotations"):
+            with self.subTest(source=source):
+                self.assertTrue(all(_import_ok("keystore.py", m, n) for m, n in _imports(source)))
 
     def test_qml_has_no_file_network_microphone_clipboard_or_screen_access(self) -> None:
         banned = r"Clipboard|clipboard|grabWindow|grabToImage|FileDialog|FolderDialog|XMLHttpRequest|" \
