@@ -141,13 +141,20 @@ class KeyStore:
     def _place(self, name: str, create: bool) -> str | Refusal:
         if self._root is None:
             return Refusal("location refused")
-        folder = os.path.join(self._root, *APP_FOLDER)
-        path = os.path.join(folder, name)
-        try:
-            if create:
-                os.makedirs(folder, exist_ok=True)
-        except (OSError, ValueError):
-            return Refusal("folder unavailable")
+        folder = self._root
+        for part in APP_FOLDER if create else ():
+            folder = os.path.join(folder, part)
+            # one level at a time, each proven inside the root before it is made: a junction or
+            # symlink that leads outside never gets a folder created behind it
+            if not self._inside(folder):
+                return Refusal("location refused")
+            try:
+                os.mkdir(folder)
+            except FileExistsError:
+                pass
+            except (OSError, ValueError):
+                return Refusal("folder unavailable")
+        path = os.path.join(self._root, *APP_FOLDER, name)
         return path if self._inside(path) else Refusal("location refused")
 
     def _write(self, name: str, data: bytes) -> Refusal | None:

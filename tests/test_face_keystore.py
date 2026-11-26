@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import pickle  # nosec B403 - only to prove the key wrapper refuses pickling
+import shutil
 import sys
 import tempfile
 import unittest
@@ -122,15 +123,43 @@ class KeyTests(unittest.TestCase):
         self.assertFalse(os.path.exists(folder))
 
     def test_a_50_mb_file_is_refused_by_size_before_it_is_read(self) -> None:
-        calls = []
+        calls, reads = [], []
+        real_open = open
+
+        class ReadSpy:  # the opened file: fstat works, every read() is recorded
+            def __init__(self, f) -> None:
+                self.f = f
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc) -> None:
+                self.f.close()
+
+            def fileno(self) -> int:
+                return self.f.fileno()
+
+            def read(self, n: int = -1) -> bytes:
+                reads.append(n)
+                return self.f.read(n)
+
+        def spy_open(*args, **kwargs):
+            return ReadSpy(real_open(*args, **kwargs))
+
         _, folder, store = store_in(self, unprotect=lambda blob: calls.append(len(blob)) or b"")
-        for name, load in (("device.key", store.load), ("server.json", store.load_address)):
-            path = put(folder, name, b"")
-            os.truncate(path, 50 * 1024 * 1024)  # sparse; nothing is written
-            with mock.patch.object(keystore.os, "fstat", wraps=os.fstat) as fstat:
-                self.assertIsInstance(load(), Refusal)
-            fstat.assert_called()
-            os.unlink(path)
+        with mock.patch.object(keystore, "open", spy_open, create=True):
+            put(folder, "server.json", b'{"ip": "127.0.0.1", "port": 8765}')
+            self.assertEqual(store.load_address(), ("127.0.0.1", 8765))
+            self.assertEqual(reads, [keystore.SERVER_CAP + 1])  # control: the spy sees a real read
+            reads.clear()
+            for name, load in (("device.key", store.load), ("server.json", store.load_address)):
+                path = put(folder, name, b"")
+                os.truncate(path, 50 * 1024 * 1024)  # sparse; nothing is written
+                with mock.patch.object(keystore.os, "fstat", wraps=os.fstat) as fstat:
+                    self.assertIsInstance(load(), Refusal)
+                fstat.assert_called()
+                self.assertEqual(reads, [], name)  # refused on size: not one byte was read
+                os.unlink(path)
         self.assertEqual(calls, [])
 
 
@@ -165,16 +194,29 @@ class PathTests(unittest.TestCase):
         base, elsewhere = os.path.join(tmp, "base"), os.path.join(tmp, "elsewhere")
         os.makedirs(base)
         os.makedirs(elsewhere)
-        link = os.path.join(base, "JARVIS")
-        _winapi.CreateJunction(elsewhere, link)
-        try:
-            store = KeyStore(base, fake_protect, fake_unprotect)
-            put(os.path.join(elsewhere, "face"), "server.json", b'{"ip": "127.0.0.1", "port": 8765}')
-            for result in (store.save(KEY), store.load(), store.load_address(), store.clear()):
-                self.assertIsInstance(result, Refusal)
-            self.assertEqual(os.listdir(os.path.join(elsewhere, "face")), ["server.json"])
-        finally:
-            os.rmdir(link)  # removes the junction only, never its target
+        store = KeyStore(base, fake_protect, fake_unprotect)
+        # the junction at root\JARVIS, then at root\JARVIS\face; each starts with nothing behind it
+        for link in (os.path.join(base, "JARVIS"), os.path.join(base, "JARVIS", "face")):
+            with self.subTest(link=link):
+                os.makedirs(os.path.dirname(link), exist_ok=True)
+                _winapi.CreateJunction(elsewhere, link)
+                try:
+                    self.assertIsInstance(store.save(KEY), Refusal)
+                    self.assertIsInstance(store.save_address("127.0.0.1", 8765), Refusal)
+                    self.assertEqual(os.listdir(elsewhere), [])  # a refused save creates nothing there
+                    target = elsewhere if link.endswith("face") else os.path.join(elsewhere, "face")
+                    put(target, "server.json", b'{"ip": "127.0.0.1", "port": 8765}')
+                    for result in (store.load(), store.load_address(), store.clear()):
+                        self.assertIsInstance(result, Refusal)
+                    self.assertEqual(os.listdir(target), ["server.json"])
+                finally:
+                    os.rmdir(link)  # removes the junction only, never its target
+                    for entry in os.scandir(elsewhere):
+                        shutil.rmtree(entry.path) if entry.is_dir() else os.unlink(entry.path)
+
+    def test_a_missing_root_is_refused_and_never_created(self) -> None:
+        base = temp_root(self)
+        self.assert_refused_everywhere(base, os.path.join(base, "Local"))
 
     def test_default_refuses_a_bad_localappdata_before_touching_it(self) -> None:
         for environ in ({}, {"LOCALAPPDATA": ""}, {"LOCALAPPDATA": "\\\\host\\share"},
