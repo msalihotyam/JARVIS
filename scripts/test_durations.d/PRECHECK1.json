@@ -1,0 +1,1 @@
+{"version": 1, "classes": {"tests.test_slice_precheck.CheckTests": 1.0, "tests.test_slice_precheck.CliTests": 1.0, "tests.test_slice_precheck.FixFixtureTests": 1.0, "tests.test_slice_precheck.HostileTests": 1.0, "tests.test_slice_precheck.NegativeTests": 1.0, "tests.test_slice_precheck.RealGuardTests": 1.0, "tests.test_slice_precheck.StaticTests": 1.0}}
