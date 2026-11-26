@@ -54,21 +54,48 @@ def pump(ms: int = 30) -> None:
     QTest.qWait(ms)
 
 
+SHELL_IMPORTS = {"__future__", "os", "sys", "pathlib", "PySide6.QtQml", "PySide6.QtGui"}
+# Pure computation only (FACEGEO1 geometry, FACEMD1, FACETOKENS1, FACECOMP1): no file, network, process or thread.
+PURE_IMPORTS = {"math", "fractions", "decimal", "typing", "dataclasses", "enum", "functools", "itertools",
+                "operator", "collections", "collections.abc", "re", "string", "unicodedata", "types", "json"}
+
+
+def _imports(source: str):
+    """(module, imported names) for every import statement in the source."""
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            yield from ((a.name, {a.name}) for a in node.names)
+        elif isinstance(node, ast.ImportFrom):
+            yield node.module, {a.name for a in node.names}
+
+
+def _import_ok(file_name: str, module, names: set) -> bool:
+    if file_name == "capture.py" and module == "PySide6.QtCore":  # FACECAP1 grabber's PNG buffer only
+        return names == {"QBuffer", "QIODevice"}
+    return module in SHELL_IMPORTS | PURE_IMPORTS \
+        and not re.match(r"^jarvis\.(ui|app|core|memory|connectors)", module)
+
+
 class StaticTests(unittest.TestCase):
     def test_python_imports_nothing_from_the_old_window_backend_or_io(self) -> None:
-        allowed = {"__future__", "os", "sys", "pathlib", "PySide6.QtQml", "PySide6.QtGui"}
         for path in FACE.glob("*.py"):
-            for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
-                names = [a.name for a in node.names] if isinstance(node, ast.Import) else \
-                    [node.module] if isinstance(node, ast.ImportFrom) else []
-                for name in names:
-                    with self.subTest(file=path.name, module=name):
-                        if path.name == "capture.py" and name == "PySide6.QtCore":  # FACECAP1 grabber's PNG buffer only
-                            self.assertEqual({a.name for a in node.names}, {"QBuffer", "QIODevice"})
-                            continue
-                        self.assertIn(name, allowed)
-                        self.assertNotRegex(name, r"^jarvis\.(ui|app|core|memory|connectors)")
+            for module, names in _imports(path.read_text(encoding="utf-8")):
+                with self.subTest(file=path.name, module=module):
+                    self.assertTrue(_import_ok(path.name, module, names), (module, sorted(names)))
             self.assertNotIn("jarvis.db", path.read_text(encoding="utf-8"))
+
+    def test_the_import_guard_rejects_io_and_the_old_window(self) -> None:
+        banned = ["socket", "subprocess", "urllib", "urllib.request", "http.client", "sqlite3", "winreg", "shutil",
+                  "tempfile", "ctypes", "threading", "asyncio", "io", "requests", "PySide6.QtCore", "PySide6.QtNetwork",
+                  "jarvis.ui.bridge", "jarvis.core", "jarvis.memory", "jarvis.app", "jarvis.connectors.base"]
+        for module in banned:
+            for source in (f"import {module}", f"from {module} import x", f"import math\nimport {module} as m"):
+                with self.subTest(source=source):
+                    self.assertFalse(all(_import_ok("geometry.py", m, n) for m, n in _imports(source)))
+        self.assertFalse(_import_ok("capture.py", "PySide6.QtCore", {"QBuffer", "QIODevice", "QFile"}))
+        self.assertFalse(all(_import_ok("geometry.py", m, n) for m, n in _imports("from . import shell")))
+        for module in sorted(PURE_IMPORTS):
+            self.assertTrue(all(_import_ok("geometry.py", m, n) for m, n in _imports(f"from {module} import x")))
 
     def test_qml_has_no_file_network_microphone_clipboard_or_screen_access(self) -> None:
         banned = r"Clipboard|clipboard|grabWindow|grabToImage|FileDialog|FolderDialog|XMLHttpRequest|" \
