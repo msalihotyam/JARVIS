@@ -90,6 +90,7 @@ class _Parser:
         self.ordered = False
         self.start = 1
         self.root = 0  # indent of the latest root-level list marker; nesting is measured from it
+        self.dropped = False  # the latest child marker was dropped at the cap: its continuation lines go with it
         self.stable = 0
         self.trigger = 0  # index of the line whose processing emits the next block
         self.complete = 0  # lines[:complete] end in a newline; only those can close a block for good
@@ -155,6 +156,8 @@ class _Parser:
                 self.item(indent, *marker)
                 continue
             if self.open == "list":
+                if self.dropped:
+                    continue  # belongs to a child dropped at the cap (truncated is already set)
                 last = self.items[-1]
                 (last[1][-1][2][-1] if last[1] else last[0]).append(body.strip())
                 continue
@@ -187,7 +190,7 @@ class _Parser:
         last = self.items[-1] if self.open == "list" else None
         if last and indent >= self.root + 2:  # deeper markers all land on level 2
             if last[2] >= MAX_ITEMS:
-                self.truncated = True  # drop child overflow; promoting it would invent a root item
+                self.truncated = self.dropped = True  # drop child overflow; promoting it would invent a root item
                 return
             if not last[1] or last[1][-1][0] != ordered:
                 last[1].append([ordered, number, []])
@@ -200,9 +203,10 @@ class _Parser:
         elif indent < self.root + 2:
             self.root = indent  # roots may drift (3 -> 0): children nest relative to the latest root
         self.items.append([[text], [], 0])
+        self.dropped = False
 
     def close(self) -> None:
-        kind, lines, self.open, self.lines = self.open, self.lines, "", []
+        kind, lines, self.open, self.lines, self.dropped = self.open, self.lines, "", [], False
         if kind == "para":
             self.emit(_table(lines, self) or Block("paragraph", inlines=self.inl("\n".join(lines))))
         elif kind == "quote":

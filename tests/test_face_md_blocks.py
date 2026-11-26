@@ -303,6 +303,41 @@ class NegativeTests(unittest.TestCase):
             with self.subTest(k=k):
                 self.assertEqual(doc.blocks[:doc.stable], full.blocks[:doc.stable])
 
+    def test_12_lines_of_a_capped_child_are_dropped_with_it(self):
+        full = "  - c\n" * md.MAX_ITEMS
+        kept = [("p", ["c"] * md.MAX_ITEMS)]
+        cases = {  # CDX-FACEMD1FIX2 F1 repro first; every tail belongs to the dropped child, never to the last kept "c"
+            "  7. dropped\n  tail\n": kept,
+            "  - dropped\ntail\n": kept,  # unindented lazy line
+            "  - dropped\n  tail\n  more\n": kept,
+            "  - dropped\n      - deeper\n  tail\n": kept,  # level 3 under a dropped child: dropped too
+            "  1. dropped\n  - dropped\n  ---\n": kept,  # other-type run and rule-like lazy line
+            "  - dropped\n  tail\n- q\n  more\n  - k\n": kept + [("q\nmore", ["k"])],  # next root item resumes
+            "  - dropped\n\ntail\n": None,  # blank line: tail is a paragraph again
+            "  - dropped\n# h\n": None,
+        }
+        for tail, want in cases.items():
+            with self.subTest(tail=tail):
+                doc = md.parse("- p\n" + full + tail)
+                self.assertTrue(doc.truncated)
+                if want is None:
+                    self.assertEqual(shape(doc)[0], kept)
+                    self.assertEqual([b.kind for b in doc.blocks[1:]], ["paragraph" if "tail" in tail else "heading"])
+                else:
+                    self.assertEqual(shape(doc), [want])
+        # the same at the top-level item cap: the last root item (MAX_ITEMS-th) is full, the next root spills into a new list
+        doc = md.parse("- r\n" * (md.MAX_ITEMS - 1) + "- p\n" + full + "  7. dropped\n  tail\n- q\n  more\n")
+        self.assertTrue(doc.truncated)
+        self.assertEqual([len(b.items) for b in doc.blocks], [md.MAX_ITEMS, 1])
+        self.assertEqual(shape(doc)[0][-1], kept[0])
+        self.assertEqual(shape(doc)[1], [("q\nmore", [])])
+        source = "- p\n" + full + "  - dropped\n  tail\n- q\n  more\n\nend\n"
+        whole = md.parse(source)
+        for k in range(len(source) - 40, len(source) + 1):  # prefixes around the dropped child stay stable
+            doc = md.parse(source[:k])
+            with self.subTest(k=k):
+                self.assertEqual(doc.blocks[:doc.stable], whole.blocks[:doc.stable])
+
     def test_9_default_ignorable_removed_from_targets_kept_in_text(self):
         for ch in IGNORABLE_NOT_CF:
             with self.subTest(ch=hex(ord(ch))):
