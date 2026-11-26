@@ -246,6 +246,79 @@ class GuardTests(unittest.TestCase):
         port = BrainPort(Runner(Clock()), bad_argv, TOOLS, {}, Clock(), 30.0, 1000)
         self.assertEqual(port.ask("a").code, "internal")
 
+    def test_odd_bad_codes_at_every_injected_site_are_one_counted_internal(self):
+        class HashBoom(str):
+            def __hash__(self):
+                raise RuntimeError("hash")
+
+        class SameStr(str):
+            pass
+
+        class LooksLikeTimeout:
+            def __hash__(self):
+                return hash("timeout")
+
+            def __eq__(self, other):
+                return True
+
+        class CodeBoom(brain_port._Bad):
+            def __init__(self):
+                Exception.__init__(self)
+
+            @property
+            def code(self):
+                raise RuntimeError("code")
+
+        def bads():
+            return (brain_port._Bad([]), brain_port._Bad({}), brain_port._Bad(HashBoom("timeout")),
+                    brain_port._Bad(SameStr("timeout")), brain_port._Bad(LooksLikeTimeout()), CodeBoom())
+
+        class RaisingEnv:
+            def __init__(self, bad):
+                self.bad = bad
+
+            def __iter__(self):
+                raise self.bad
+
+        class RaisingClock(Clock):
+            def __init__(self, bad, at):
+                super().__init__()
+                self.bad, self.at, self.reads = bad, at, 0
+
+            def __call__(self):
+                self.reads += 1
+                if self.reads == self.at:
+                    raise self.bad
+                return self.now
+
+        def raising_argv(bad):
+            def build(session, tools):
+                raise bad
+            return build
+
+        sites = {"env": lambda bad: make(ok(), env=RaisingEnv(bad))[0],
+                 "argv_for": lambda bad: BrainPort(Runner(Clock(), ok()), raising_argv(bad), TOOLS, {},
+                                                   Clock(), 30.0, 1000)}
+        for at in (1, 2, 3, 4):  # start, remaining, post-run and finally reads
+            def clock_site(bad, at=at):
+                clock = RaisingClock(bad, at)
+                return BrainPort(Runner(clock, ok()), argv_for, TOOLS, {}, clock, 30.0, 1000)
+            sites[f"clock#{at}"] = clock_site
+        sites["runner"] = lambda bad: make(bad)[0]
+        for site, build in sites.items():
+            for index, bad in enumerate(bads()):
+                with self.subTest(site=site, bad=index):
+                    port = build(bad)
+                    failure = port.ask("a")
+                    want = "runner_failed" if site == "runner" else "internal"
+                    self.assertIsInstance(failure, Failure)
+                    self.assertIs(type(failure.code), str)
+                    self.assertEqual(failure.code, want)
+                    self.assertEqual(failure.text, brain_port.FAILURES[want])
+                    self.assertEqual(port.counters().failures, 1)
+                    # The lock was released; a second ask may even succeed when the runner was never reached.
+                    self.assertNotEqual(getattr(port.ask("a"), "code", None), "busy")
+
     def test_argv_builder_time_counts_against_limit(self):
         # -0.0005 (a tiny backwards step) is clamped to the limit.
         for spent, want in ((10.0, 20.0), (30.0, None), (31.0, None), (-0.0005, 30.0)):

@@ -75,6 +75,16 @@ class _Bad(Exception):
         self.code = code
 
 
+def _failure_code(bad):
+    # Injected code can raise _Bad with any code (unhashable, str subclass, raising property):
+    # exact str type before hashing or membership, so nothing escapes and Failure.code is a plain known str.
+    try:
+        code = bad.code
+    except Exception:  # noqa: BLE001
+        return "internal"
+    return code if type(code) is str and code in FAILURES else "internal"
+
+
 class BrainPort:
     def __init__(self, runner, argv_for, tool_server, env, clock, limit_seconds, context_limit):
         self._runner = runner
@@ -100,8 +110,7 @@ class BrainPort:
             try:
                 return self._ask(packet)
             except _Bad as bad:
-                # An injected callable could raise _Bad with an unknown code: never let KeyError out.
-                code = bad.code if bad.code in FAILURES else "internal"
+                code = _failure_code(bad)
             except Exception:  # noqa: BLE001 - nothing may escape ask()
                 code = "internal"
             self._failures += 1
