@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from pathlib import Path, PurePath, PureWindowsPath
+from pathlib import Path, PosixPath, PurePath, PurePosixPath, PureWindowsPath, WindowsPath
 from types import MappingProxyType
 
 _HEX = re.compile(r"#[0-9A-F]{6}")
@@ -157,9 +157,14 @@ FONT_FAMILIES = MappingProxyType({
 })
 
 
+def _is_exact(value: object, types: tuple) -> bool:
+    return any(type(value) is t for t in types)  # `is`, not `in`: `in` falls back to ==
+
+
 def _accepted_name(item: object) -> str | None:
     """The file name if ``item`` is a path directly in FONT_DIR, else None (exact match only)."""
-    if not (type(item) is str or isinstance(item, PurePath)):
+    # Exact types by identity: a subclass, or a metaclass __eq__, can fake what PureWindowsPath reads.
+    if not _is_exact(item, (str, PurePath, PureWindowsPath, PurePosixPath, Path, WindowsPath, PosixPath)):
         return None
     path = PureWindowsPath(item)
     if path.parent != _FONT_DIR_W:
@@ -174,9 +179,13 @@ def font_plan(available_files: object) -> dict:
     A family is all bundled or all fallback, never partial.
     """
     names: set = set()
-    bad_input = not isinstance(available_files, (list, tuple, set, frozenset))
+    # Exact type: a subclass can override __iter__ and raise.
+    bad_input = not _is_exact(available_files, (list, tuple, set, frozenset))
     if not bad_input:
-        names = {n for n in map(_accepted_name, available_files) if n is not None}
+        try:
+            names = {n for n in map(_accepted_name, available_files) if n is not None}
+        except Exception:  # a hostile item (e.g. a PurePath subclass) must not escape
+            names, bad_input = set(), True
     plan = {}
     for key, spec in FONT_FAMILIES.items():
         if not bad_input and all(f in names for f in spec["files"]):
