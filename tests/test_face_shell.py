@@ -76,6 +76,8 @@ def _imports(source: str):
 # FACEKEY1 key store only: the stdlib it uses (DPAPI through plain "import ctypes"); no network, no process.
 KEYSTORE_IMPORTS = {"__future__", "ipaddress", "json", "os", "sys", "tempfile", "dataclasses", "ctypes"}
 BOARD_IMPORTS = {"dataclasses", "datetime", "json", "pathlib", "re", "stat"}
+# FACECONF1 service settings loader: exactly what service_config.py imports; no network, no process.
+SERVICE_CONFIG_IMPORTS = {"__future__", "ipaddress", "json", "os", "unicodedata", "dataclasses"}
 
 
 def _import_ok(file_name: str, module, names: set) -> bool:
@@ -85,6 +87,8 @@ def _import_ok(file_name: str, module, names: set) -> bool:
         return module in BOARD_IMPORTS
     if file_name == "hotkey.py":
         return module in {"__future__", "dataclasses", "sys", "typing"} or (module == "ctypes" and names == {"ctypes"})
+    if file_name == "service_config.py":
+        return module in SERVICE_CONFIG_IMPORTS
     if file_name == "capture.py" and module == "PySide6.QtCore":  # FACECAP1 grabber's PNG buffer only
         return names == {"QBuffer", "QIODevice"}
     if file_name == "keystore.py":
@@ -196,6 +200,22 @@ class StaticTests(unittest.TestCase):
                 with self.subTest(source=denied):
                     self.assertFalse(any(_import_ok("hotkey.py", m, n) for m, n in _imports(denied)))
         self.assertFalse(_import_ok("hotkey.py", "ctypes", {"wintypes"}))
+
+    def test_the_service_config_branch_allows_exactly_its_own_stdlib_and_nothing_else(self) -> None:
+        used = {m for m, _ in _imports((FACE / "service_config.py").read_text(encoding="utf-8"))}
+        self.assertEqual(used, SERVICE_CONFIG_IMPORTS)
+        extra = SERVICE_CONFIG_IMPORTS - SHELL_IMPORTS - PURE_IMPORTS
+        self.assertEqual(extra, {"ipaddress"})
+        for module in sorted(extra):  # stays refused for every other face file without its own allowance
+            for other in ("geometry.py", "capture.py", "devices.py", "md_blocks.py", "shell.py"):
+                with self.subTest(module=module, file=other):
+                    self.assertFalse(_import_ok(other, module, {module}))
+        for module in ("socket", "http", "http.client", "urllib", "urllib.parse", "urllib.request", "ssl",
+                       "subprocess", "ctypes", "tempfile", "threading", "asyncio", "sqlite3", "shutil", "sys",
+                       "PySide6.QtCore", "jarvis.core"):
+            for source in (f"import {module}", f"from {module} import x"):
+                with self.subTest(source=source):
+                    self.assertFalse(all(_import_ok("service_config.py", m, n) for m, n in _imports(source)))
 
     def test_qml_has_no_file_network_microphone_clipboard_or_screen_access(self) -> None:
         banned = r"Clipboard|clipboard|grabWindow|grabToImage|FileDialog|FolderDialog|XMLHttpRequest|" \
