@@ -14,7 +14,6 @@ logging; counters carry kinds only, never message text. Nothing raises.
 from __future__ import annotations
 
 import json
-import sys
 
 from jarvis import telegram_offset as off
 from jarvis import telegram_wire as wire
@@ -30,14 +29,13 @@ _KINDS = {wire.VoiceNote: "voice", wire.Photo: "photo", wire.Document: "document
           wire.ButtonCallback: "button"}
 
 
-def _client_type(name):
-    # Looked up, not imported: the client module carries the network stack.
-    return getattr(sys.modules.get("jarvis.telegram_client"), name, None)
-
-
 class TgInbox:
-    def __init__(self, client, offset_store, allowed_chat, clock, enabled=False):
+    def __init__(self, client, offset_store, allowed_chat, clock, enabled=False, results=None):
         self._client, self._store, self._chat, self._clock = client, offset_store, allowed_chat, clock
+        # The client's (Ok, Refused, Failed) result types, injected by the wiring: this module neither
+        # imports nor looks up the client module (it carries the network stack). Missing -> client_bad.
+        ok = type(results) is tuple and len(results) == 3 and all(type(t) is type for t in results)
+        self._ok, self._refused, self._failed = results if ok else (None, None, None)
         # A bad allowed_chat would refuse every text and pass it for good: stay off instead.
         self._enabled = enabled is True and type(allowed_chat) is int and allowed_chat > 0
         self._offset = None  # last stored offset; None until loaded
@@ -112,11 +110,11 @@ class TgInbox:
         except Exception:
             self._count("client_raised")
             return None
-        if type(got) is _client_type("Ok") and type(got.value) is list:
+        if self._ok is not None and type(got) is self._ok and type(got.value) is list:
             return got.value
-        if type(got) is _client_type("Refused"):
+        if self._refused is not None and type(got) is self._refused:
             self._count("client_refused")
-        elif type(got) is _client_type("Failed"):
+        elif self._failed is not None and type(got) is self._failed:
             self._count("client_failed")
         else:
             self._count("client_bad")

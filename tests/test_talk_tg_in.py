@@ -15,6 +15,7 @@ from tests.test_talk_core import FakeBrain, FakeClock, FakeLog
 
 ROOT = Path(__file__).resolve().parents[1]
 CHAT = 4242
+RESULTS = (tg.Ok, tg.Refused, tg.Failed)
 
 
 def text(uid, body="selam", chat=CHAT, ctype="private", **extra):
@@ -75,9 +76,9 @@ class Clock:
         return 1700000100
 
 
-def inbox(*answers, repeat=None, store=None, enabled=True):
+def inbox(*answers, repeat=None, store=None, enabled=True, results=RESULTS):
     client, store, clock = Client(*answers, repeat=repeat), store or Store(), Clock()
-    return tti.TgInbox(client, store, CHAT, clock, enabled=enabled), client, store, clock
+    return tti.TgInbox(client, store, CHAT, clock, enabled=enabled, results=results), client, store, clock
 
 
 def batch(*updates):
@@ -320,6 +321,17 @@ class ClientFailureTest(unittest.TestCase):
                 box.take(4)
                 self.assertEqual([c[1]["offset"] for c in client.calls], [0, 0])
 
+    def test_without_injected_result_types_every_answer_is_bad(self):
+        bad = (None, (), list(RESULTS), RESULTS[:2], RESULTS + (tg.Ok,), (tg.Ok, tg.Refused, "Failed"),
+               (tg.Ok(1), tg.Refused, tg.Failed))
+        for results in bad:
+            for answer in (batch(text(3)), tg.Refused("x"), tg.Failed("network")):
+                with self.subTest(results=repr(results)[:60], answer=type(answer).__name__):
+                    box, client, store, _ = inbox(answer, results=results)
+                    self.assertEqual(box.take(4), [])
+                    self.assertEqual(box.counts, {"client_bad": 1})
+                    self.assertEqual((store.saves, len(client.calls)), ([], 1))
+
     def test_an_unreadable_store_makes_no_call(self):
         for store, kind in ((Store(fail="load"), "store_load_failed"), (Store(state="{bad"), "offset_bad")):
             with self.subTest(kind=kind):
@@ -365,6 +377,10 @@ class StaticTest(unittest.TestCase):
         self.assertLessEqual(mods, {"__future__", "json", "sys", "jarvis.telegram_offset",
                                     "jarvis.telegram_wire", "jarvis.talk_boundary"})
         low = self.SOURCE.lower()
-        for word in ("token", "environ", "getenv", "urllib", "socket", "ssl", "requests",
+        # tests.test_telegram_client scans jarvis/ for the client module's name (code, comment, any form)
+        self.assertNotIn("telegram_client", low)
+        self.assertNotIn("sys.modules", low)
+        self.assertNotIn("importlib", low)
+        for word in ("token","environ", "getenv", "urllib", "socket", "ssl", "requests",
                      "import logging", "project_folders", "def " + "heartbeat"):
             self.assertNotIn(word, low)
