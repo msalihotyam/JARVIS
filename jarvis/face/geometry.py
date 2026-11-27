@@ -44,8 +44,9 @@ def rect(state: object, work_area: object, scale: object, saved_ring_pos: object
         return Rect(ring_x, ring_y, RING, RING)
     if state == "full" or width < READER_MIN[0] or height - 2 * MARGIN < READER_MIN[1]:
         return Rect(left, top, width, height)
-    if width >= READER_WIDTH + 2 * MARGIN:
-        return Rect(right - MARGIN - READER_WIDTH, top + MARGIN, READER_WIDTH, height - 2 * MARGIN)
+    if width >= READER_WIDTH:
+        side = min(MARGIN, width - READER_WIDTH)  # right margin shrinks so an 880 reader still fits
+        return Rect(right - side - READER_WIDTH, top + MARGIN, READER_WIDTH, height - 2 * MARGIN)
     return Rect(left, top + MARGIN, width, height - 2 * MARGIN)
 
 

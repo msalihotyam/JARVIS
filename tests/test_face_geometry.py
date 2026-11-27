@@ -31,9 +31,27 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_3_reader_right_aligned_and_narrow_screen(self):
         self.assertEqual(g.rect("reader", HD, 1), (1920 - 24 - 880, 24, 880, 1040 - 48))
-        self.assertEqual(g.rect("reader", (0, 0, 900, 1040), 1), (0, 24, 900, 1040 - 48))
+        self.assertEqual(g.rect("reader", (0, 0, 900, 1040), 1), (900 - 20 - 880, 24, 880, 1040 - 48))
         self.assertEqual(g.rect("reader", HD, 2), (960 - 24 - 880, 24, 880, 520 - 48))
-        self.assertEqual(g.rect("reader", HD, 2.5), (0, 24, 768, 416 - 48))  # 768 < 928: full work width
+        self.assertEqual(g.rect("reader", HD, 2.5), (0, 24, 768, 416 - 48))  # 768 < 880: full work width
+
+    def test_3b_reader_880_wide_from_880_up_margin_shrinks(self):
+        # FACEGEO1FIX: width -> reader x (logical); 880 wide from 880 up, right margin min(24, width - 880)
+        for width, x in ((880, 0), (881, 0), (900, 0), (927, 23), (928, 24), (1000, 96)):
+            with self.subTest(width=width):
+                self.assertEqual(g.rect("reader", (0, 0, width, 1040), 1), (x, 24, 880, 1040 - 48))
+        self.assertEqual(g.rect("reader", (0, 0, 879, 1040), 1), (0, 24, 879, 1040 - 48))  # below 880: full width
+        self.assertEqual(g.rect("reader", (0, 0, 1366, 728), 1.5), (910 - 24 - 880, 24, 880, 485 - 48))  # 910 logical
+        self.assertEqual(g.rect("reader", [HD, (-900, 0, 900, 1040)], 1, (-500, 500)), (-900, 24, 880, 1040 - 48))
+        for width in range(1300, 1420, 3):  # device px; logical band ~743..1136 across scales, origin off-zero
+            for s in (1.25, 1.5, 1.75):
+                area = (-width * 2 + 1, 7, width, 1040)
+                with self.subTest(width=width, s=s):
+                    r, full = g.rect("reader", area, s), g.rect("full", area, s)
+                    self.assertTrue(inside(r, area, s), r)
+                    self.assertEqual(r.width, min(880, full.width))
+                    gap = full.x + full.width - (r.x + r.width)  # right margin
+                    self.assertEqual(gap, min(24, full.width - 880) if full.width >= 880 else 0)
 
     def test_4_full_is_the_work_area(self):
         self.assertEqual(g.rect("full", HD, 1), (0, 0, 1920, 1040))
