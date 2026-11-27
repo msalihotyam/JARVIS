@@ -1,0 +1,12 @@
+{
+  "version": 1,
+  "tests.test_conveyor_api_envelopes.EnvelopeConfigTest": 1.0,
+  "tests.test_conveyor_api_envelopes.SendTest": 1.0,
+  "tests.test_conveyor_api_envelopes.ConcurrencyTest": 1.0,
+  "tests.test_conveyor_api_envelopes.PurposeSpoofTest": 1.0,
+  "tests.test_conveyor_api_envelopes.BatchTest": 1.0,
+  "tests.test_conveyor_api_envelopes.ImageTest": 1.0,
+  "tests.test_conveyor_api_envelopes.ReportTest": 1.0,
+  "tests.test_conveyor_api_envelopes.LedgerScanTest": 1.0,
+  "tests.test_conveyor_api_envelopes.StaticTest": 1.0
+}

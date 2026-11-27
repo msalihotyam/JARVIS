@@ -7,6 +7,7 @@ then the key - read at call time from the Credential Manager generic credential
 "konveyor-bekci" and nowhere else (never an env var, file or argv). The key is never stored,
 logged or put in an exception. Stdlib only.
 """
+import base64
 import contextlib
 import ctypes
 import json
@@ -415,3 +416,439 @@ def call(model, system, messages, max_tokens, purpose, *, root=None, clock=None,
         _append(ledger, {**row, "usd": round((n_in * p_in + n_out * p_out) / 1e6, 6), "release": reserve})
     return "".join(b["text"] for b in content
                    if isinstance(b, dict) and b.get("type") == "text" and isinstance(b.get("text"), str))
+
+
+# --- Per-purpose monthly envelopes, Batch and image input (APIBROKER2). The one ledger, its lock,
+# the hard cap, the daily share and the key reader above are reused unchanged; call() is untouched.
+ENVELOPES_NAME = "api_envelopes.json"  # optional override under ROOT; any fault refuses every call
+ENVELOPE_LIMITS = {"prescreen": 60.0, "night": 60.0, "visual": 10.0, "watch": 10.0}
+# the plan total the envelopes split; overflow gets the rest (0 until the config names a larger total)
+ENVELOPES_DEFAULT = {"monthly_usd": sum(ENVELOPE_LIMITS.values()), **ENVELOPE_LIMITS}
+PURPOSES = (*ENVELOPE_LIMITS, "overflow")
+BATCH_PURPOSES = ("prescreen", "night", "overflow")
+IMAGE_PURPOSES = ("visual",)
+BATCH_RATE = 0.5  # Message Batches bill half the list price
+BATCH_MAX_REQUESTS = 100
+BATCH_MAX_BYTES = 1 << 20
+BATCH_EXPIRE_S = 48 * 3600
+BATCH_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,128}")
+CUSTOM_ID_RE = re.compile(r"[A-Za-z0-9_-]{1,64}")
+REF_RE = re.compile(r"[0-9a-f]{16}")
+IMAGE_MAX_BYTES = 5 << 20
+IMAGE_MAX_COUNT = 4
+IMAGE_ROOT = Path(ROOT).parent  # build/ of the main checkout: the only place an image is read from
+
+
+def _usd(x):
+    """x as a finite float >= 0, or None (bool, str, NaN, inf, negative and 10**400 all refuse)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    try:
+        x = float(x)
+    except OverflowError:
+        return None
+    return x if math.isfinite(x) and x >= 0 else None
+
+
+def envelopes(config=None):
+    """{purpose: monthly USD}; overflow = monthly_usd minus the named envelopes. Any fault refuses."""
+    c = ENVELOPES_DEFAULT if config is None else config
+    if not isinstance(c, dict) or set(c) != set(ENVELOPES_DEFAULT):
+        raise ApiRefused("envelope config: keys must be exactly " + ", ".join(ENVELOPES_DEFAULT))
+    v = {k: _usd(c[k]) for k in ENVELOPES_DEFAULT}
+    if None in v.values():
+        raise ApiRefused("envelope config: every value must be a finite USD number >= 0")
+    rest = round(v.pop("monthly_usd") - sum(v.values()), 6)
+    if rest < 0:
+        raise ApiRefused("envelope config: envelopes sum above the monthly total")
+    return {**v, "overflow": rest}
+
+
+def _envelope_config(root):
+    p = Path(root) / ENVELOPES_NAME
+    if not p.exists():
+        return envelopes()
+    try:
+        cfg = json.loads(p.read_text(encoding="utf-8"), parse_constant=_no_constant)
+    except (OSError, ValueError):
+        raise ApiRefused("envelope config unreadable") from None
+    return envelopes(cfg)
+
+
+def _purpose(purpose, allowed, what):
+    """The exact purpose name: case, padding and prefixes refuse, like an unknown name."""
+    if not isinstance(purpose, str) or purpose not in PURPOSES:
+        raise ApiRefused("unknown purpose: must be exactly one of " + ", ".join(PURPOSES))
+    if purpose not in allowed:
+        raise ApiRefused(f"purpose {purpose} not allowed for {what}")
+    return purpose
+
+
+def _model(model):
+    """(input, output) list price per Mtok; Fable is refused by name, anything unpriced after it."""
+    if not isinstance(model, str) or "fable" in model.casefold():
+        raise ApiRefused("model not allowed (Haiku / Sonnet only): Fable is never used over the API")
+    if model not in PRICES:
+        raise ApiRefused("model not allowed (Haiku / Sonnet only): no price row")
+    return PRICES[model]
+
+
+def _pool_guard(root, now, rows, purpose, need):
+    """The purpose's monthly envelope, then _guard: today's holds, the hard cap and the daily share."""
+    limit = _envelope_config(root)[purpose]
+    t = datetime.fromtimestamp(now, timezone.utc)
+    month0 = t.replace(day=1, hour=0, minute=0, second=0, microsecond=0).timestamp()
+    spent = sum(r["usd"] - r.get("release", 0) for r in rows
+                if r["ts"] >= month0 and "ceiling" not in r and r.get("purpose") == purpose)
+    if spent + need > limit:
+        raise ApiRefused(f"envelope {purpose}: spent {spent:.4f} + est {need:.4f} > {limit:.2f} USD")
+    monthly, daily = caps(root)
+    _guard(now, rows, monthly, daily, math.inf, "", need)  # "" is no caller: the caller caps do not apply
+
+
+def _key(reader):
+    """The key from the same reader as call(), read now; never stored, never in a message."""
+    try:
+        key = (reader or read_credential)()
+    except Exception:
+        key = ""
+    if not isinstance(key, str) or not KEY_RE.fullmatch(key):
+        raise ApiRefused("credential unreadable") from None
+    return key
+
+
+def _exchange(transport, url, key, raw):
+    """(status, body bytes, failed exception type name); never str(e), so no key in any message."""
+    try:
+        status, data = transport(url, {"x-api-key": key, "anthropic-version": API_VERSION,
+                                       "content-type": "application/json"}, raw, TIMEOUT_S)
+        return status, data, ""
+    except Exception as e:
+        return None, b"", type(e).__name__
+
+
+def _ok(status):
+    return isinstance(status, int) and not isinstance(status, bool) and 200 <= status < 300
+
+
+def _json(data):
+    try:
+        return json.loads(data, parse_constant=_no_constant)
+    except (TypeError, ValueError):
+        return None
+
+
+def _usage(msg):
+    """((input tokens, output tokens), text) of one message, or None when either is missing."""
+    usage = msg.get("usage") if isinstance(msg, dict) else None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    n = [usage.get(k) if isinstance(usage, dict) else None for k in ("input_tokens", "output_tokens")]
+    # bounded ints: a 10**400 count would overflow, an inf price would make the ledger unreadable
+    if not (all(isinstance(x, int) and not isinstance(x, bool) and 0 <= x <= 10**12 for x in n)
+            and isinstance(content, list)):
+        return None
+    return tuple(n), "".join(b["text"] for b in content if isinstance(b, dict)
+                             and b.get("type") == "text" and isinstance(b.get("text"), str))
+
+
+def https_get(url, headers, body, timeout):
+    """GET on the same no-redirect, no-proxy opener as https_post; `body` is always None."""
+    opener = urllib.request.build_opener(_NoRedirect, urllib.request.ProxyHandler({}))
+    req = urllib.request.Request(url, headers=headers, method="GET")
+    try:
+        with opener.open(req, timeout=timeout) as r:  # nosec B310 - fixed https URL
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+def _image(path, image_root=None):
+    """(media type, bytes) of a regular PNG / JPEG file under build/; any doubt refuses."""
+    s = os.fspath(path) if isinstance(path, (str, os.PathLike)) else None
+    if not isinstance(s, str) or not s or "\x00" in s or s.startswith(("\\\\", "//")) or ":" in s[2:]:
+        raise ApiRefused("image path refused")  # NUL, UNC / device paths, alternate data streams
+    try:
+        base = Path(IMAGE_ROOT if image_root is None else image_root).resolve(strict=True)
+        p = Path(s).resolve(strict=True)  # a link out of build/ resolves out of it, then refuses
+        inside, regular = p.is_relative_to(base), p.is_file()
+        size = p.stat().st_size
+    except (OSError, ValueError, RuntimeError):
+        raise ApiRefused("image path refused") from None
+    if not inside or not regular:
+        raise ApiRefused("image path must be a file inside build/")
+    if size > IMAGE_MAX_BYTES:
+        raise ApiRefused(f"image over {IMAGE_MAX_BYTES} bytes")
+    try:
+        with open(p, "rb") as f:
+            data = f.read(IMAGE_MAX_BYTES + 1)
+    except OSError:
+        raise ApiRefused("image unreadable") from None
+    if len(data) > IMAGE_MAX_BYTES:
+        raise ApiRefused(f"image over {IMAGE_MAX_BYTES} bytes")
+    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+        return "image/png", data
+    if data.startswith(b"\xff\xd8\xff"):
+        return "image/jpeg", data
+    raise ApiRefused("image must be PNG or JPEG")
+
+
+def _text_args(system, messages, max_tokens):
+    if (not isinstance(system, str) or not _text_messages(messages) or isinstance(max_tokens, bool)
+            or not isinstance(max_tokens, int) or not 0 < max_tokens <= MAX_TOKENS_CAP):
+        raise ApiRefused("arguments must be text only: system str, role/content str messages, max_tokens")
+
+
+def _booked(purpose, model, url, raw, reserve, settle, *, root, clock, reader, post, extra=None):
+    """call()'s shape for an envelope purpose: check + reserve as ONE step under the ledger lock,
+    then send, then the settle row. A transport failure leaves the reserve booked as spent."""
+    root = Path(ROOT if root is None else root)
+    root.mkdir(parents=True, exist_ok=True)
+    ledger = root / LEDGER_NAME
+    with _locked(root / (LEDGER_NAME + ".lock")):
+        now = (clock or time.time)()
+        _pool_guard(root, now, read_ledger(ledger), purpose, reserve)
+        key = _key(reader)
+        row = {"ts": now, "purpose": purpose, "model": model, "in": 0, "out": 0, **(extra or {})}
+        _append(ledger, {**row, "usd": reserve, "status": "sent"})
+        status, data, failed = _exchange(post or https_post, url, key, raw)
+        del key
+        if failed:
+            raise ApiError(f"transport failed: {failed}")
+        resp = _json(data)
+        row["status"] = status if isinstance(status, int) and not isinstance(status, bool) else "?"
+        if not _ok(status):
+            _append(ledger, {**row, "usd": 0.0, "release": reserve})
+            err = resp.get("error") if isinstance(resp, dict) else None
+            kind = err.get("type") if isinstance(err, dict) and isinstance(err.get("type"), str) else ""
+            raise ApiError(f"API status {row['status']} {scrub(kind)[:40]}".strip())
+        fields, result = settle(resp, reserve)
+        _append(ledger, {**row, **fields})
+    if isinstance(result, ApiError):
+        raise result
+    return result
+
+
+def send(purpose, model, system, messages, max_tokens, *, images=(), image_root=None, root=None,
+         clock=None, reader=None, post=None):
+    """Response text of one Messages API call charged to a monthly envelope (`purpose` is exactly
+    one of PURPOSES); `images` (PNG / JPEG paths under build/) only for purpose visual. Refused
+    before sending when the worst case passes the envelope, the daily share or the hard cap."""
+    if cut_set():
+        raise ApiRefused("cut switch set: every API call and new lane dispatch is held")
+    _purpose(purpose, PURPOSES, "calls")
+    p_in, p_out = _model(model)
+    _text_args(system, messages, max_tokens)
+    if not isinstance(images, (list, tuple)):
+        raise ApiRefused("images must be a list of paths")
+    if images:
+        _purpose(purpose, IMAGE_PURPOSES, "images")
+        if len(images) > IMAGE_MAX_COUNT:
+            raise ApiRefused(f"at most {IMAGE_MAX_COUNT} images")
+        if messages[-1]["role"] != "user":
+            raise ApiRefused("images go with the last user message")
+    if sys.platform != "win32":
+        raise ApiRefused("Windows only (Credential Manager)")
+    msgs = list(messages)
+    if images:
+        blocks = []
+        for p in images:
+            kind, data = _image(p, image_root)
+            blocks.append({"type": "image", "source": {"type": "base64", "media_type": kind,
+                                                        "data": base64.b64encode(data).decode("ascii")}})
+        msgs[-1] = {"role": "user", "content": [*blocks, {"type": "text", "text": msgs[-1]["content"]}]}
+    body = {"model": model, "max_tokens": max_tokens, "messages": msgs}
+    if system:
+        body["system"] = system
+    raw = json.dumps(body).encode("utf-8")
+    # worst case at list price: a request byte is never less than a token (base64 images included)
+    reserve = math.ceil((len(raw) * p_in + max_tokens * p_out) / 1e6 * 1e6) / 1e6
+
+    def settle(resp, reserve):
+        got = _usage(resp)
+        if got is None:  # the reserve stays booked as spent
+            return {"usd": 0.0, "release": 0.0}, ApiError("API response without usage/content")
+        (n_in, n_out), text = got
+        return {"in": n_in, "out": n_out, "usd": round((n_in * p_in + n_out * p_out) / 1e6, 6),
+                "release": reserve}, text
+    return _booked(purpose, model, API_URL, raw, reserve, settle,
+                   root=root, clock=clock, reader=reader, post=post)
+
+
+def submit(purpose, requests, *, root=None, clock=None, reader=None, post=None):
+    """Local id of one Message Batch. The worst case at the batch rate is reserved now and
+    settled by collect(id); each request is {custom_id, model, messages, max_tokens[, system]}."""
+    if cut_set():
+        raise ApiRefused("cut switch set: every API call and new lane dispatch is held")
+    _purpose(purpose, BATCH_PURPOSES, "batch")
+    if not isinstance(requests, list) or not 0 < len(requests) <= BATCH_MAX_REQUESTS:
+        raise ApiRefused(f"batch: 1 to {BATCH_MAX_REQUESTS} requests")
+    need = {"custom_id", "model", "messages", "max_tokens"}
+    items, seen, models, worst = [], set(), set(), 0.0
+    for r in requests:
+        if not isinstance(r, dict) or not need <= set(r) <= need | {"system"}:
+            raise ApiRefused("batch request: custom_id, model, messages, max_tokens[, system]")
+        cid, mt, system = r["custom_id"], r["max_tokens"], r.get("system", "")
+        if not isinstance(cid, str) or not CUSTOM_ID_RE.fullmatch(cid) or cid in seen:
+            raise ApiRefused("batch request: custom_id must be unique [A-Za-z0-9_-]{1,64}")
+        p_in, p_out = _model(r["model"])
+        _text_args(system, r["messages"], mt)
+        seen.add(cid)
+        models.add(r["model"])
+        params = {"model": r["model"], "max_tokens": mt, "messages": r["messages"]}
+        if system:
+            params["system"] = system
+        worst += (len(json.dumps(params).encode("utf-8")) * p_in + mt * p_out) * BATCH_RATE / 1e6
+        items.append({"custom_id": cid, "params": params})
+    raw = json.dumps({"requests": items}).encode("utf-8")
+    if len(raw) > BATCH_MAX_BYTES:
+        raise ApiRefused(f"batch over {BATCH_MAX_BYTES} bytes")
+    if sys.platform != "win32":
+        raise ApiRefused("Windows only (Credential Manager)")
+    ref = secrets.token_hex(8)
+
+    def settle(resp, reserve):
+        bid = resp.get("id") if isinstance(resp, dict) else None
+        if isinstance(bid, str) and BATCH_ID_RE.fullmatch(bid):
+            return {"usd": 0.0, "server": bid, "status": "batch submitted"}, ref
+        return ({"usd": 0.0, "status": "batch unaccepted", "final": True},
+                ApiError("API batch response without an id"))
+    return _booked(purpose, ",".join(sorted(models)), API_URL + "/batches", raw,
+                   math.ceil(worst * 1e6) / 1e6, settle, root=root, clock=clock, reader=reader, post=post,
+                   extra={"batch": ref, "n": len(items)})
+
+
+def _batch_results(data):
+    """({custom_id: text, or None when not succeeded}, USD at the batch rate) or None on any fault."""
+    try:
+        text = data.decode("utf-8") if isinstance(data, bytes) else None
+    except UnicodeDecodeError:
+        return None
+    if text is None:
+        return None
+    out, usd = {}, 0.0
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        r = _json(line)
+        cid = r.get("custom_id") if isinstance(r, dict) else None
+        res = r.get("result") if isinstance(r, dict) else None
+        if not isinstance(cid, str) or not CUSTOM_ID_RE.fullmatch(cid) or cid in out or not isinstance(res, dict):
+            return None
+        if res.get("type") != "succeeded":
+            out[cid] = None
+            continue
+        msg = res.get("message")
+        model = msg.get("model") if isinstance(msg, dict) else None
+        got = _usage(msg)
+        if not isinstance(model, str) or model not in PRICES or got is None:
+            return None
+        (n_in, n_out), out[cid] = got
+        p_in, p_out = PRICES[model]
+        usd += (n_in * p_in + n_out * p_out) * BATCH_RATE / 1e6
+    return (out, usd) if out else None
+
+
+def collect(ref, *, root=None, clock=None, reader=None, get=None):
+    """{"status": settled | pending | expired | unpriced | unaccepted | failed[, "results": ...]}.
+    Settles once under the ledger lock; a missing, repeated or malformed answer never raises and
+    leaves the submit reserve booked as spent (after 48 h uncollected: expired at that amount)."""
+    if not isinstance(ref, str) or not REF_RE.fullmatch(ref):
+        raise ApiRefused("unknown batch")
+    root = Path(ROOT if root is None else root)
+    root.mkdir(parents=True, exist_ok=True)
+    ledger = root / LEDGER_NAME
+    with _locked(root / (LEDGER_NAME + ".lock")):
+        rows = [r for r in read_ledger(ledger) if r.get("batch") == ref]
+        if not rows:
+            raise ApiRefused("unknown batch")
+        for r in rows:
+            if r.get("final"):
+                s = r.get("status")
+                return {"status": s[6:] if isinstance(s, str) and s.startswith("batch ") else "failed"}
+        sent = rows[0]
+        server = next((r["server"] for r in rows if isinstance(r.get("server"), str)
+                       and BATCH_ID_RE.fullmatch(r["server"])), None)
+        if server is None:
+            return {"status": "failed"}
+        now = (clock or time.time)()
+
+        def final(status, usd, release, results=None):
+            # ts of the submit: the spend stays on the day (and month) it was reserved
+            _append(ledger, {"ts": sent["ts"], "at": now, "purpose": sent.get("purpose", ""),
+                             "model": sent.get("model", ""), "in": 0, "out": 0, "batch": ref,
+                             "usd": usd, "release": release, "status": "batch " + status, "final": True})
+            return {"status": status, **({} if results is None else {"results": results})}
+        if now - sent["ts"] > BATCH_EXPIRE_S:
+            return final("expired", 0.0, 0.0)
+        if cut_set():
+            return {"status": "pending"}
+        try:
+            key = _key(reader)
+        except ApiRefused:
+            return {"status": "pending"}
+        url = API_URL + "/batches/" + server  # never a URL from the answer
+        status, data, _ = _exchange(get or https_get, url, key, None)
+        info = _json(data) if _ok(status) else None
+        if isinstance(info, dict) and info.get("processing_status") == "ended":
+            status, data, _ = _exchange(get or https_get, url + "/results", key, None)
+        else:
+            status = None
+        del key
+        if not _ok(status):
+            return {"status": "pending"}
+        parsed = _batch_results(data)
+        # a short (truncated) answer must not release the reserve of the missing requests
+        if parsed is None or len(parsed[0]) != sent.get("n"):
+            return final("unpriced", 0.0, 0.0)
+        return final("settled", round(parsed[1], 6), sent["usd"], parsed[0])
+
+
+def report(month, *, root=None):
+    """{"by_purpose": {name: USD}, "by_day": {YYYY-MM-DD: USD}, "total": USD} for one UTC month."""
+    if not isinstance(month, str) or not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
+        raise ApiRefused("month must be YYYY-MM")
+    by_p, by_d = {}, {}
+    for r in read_ledger(Path(ROOT if root is None else root) / LEDGER_NAME):
+        if "ceiling" in r:
+            continue
+        try:
+            t = datetime.fromtimestamp(r["ts"], timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            raise ApiRefused("ledger row invalid") from None
+        if t.strftime("%Y-%m") != month:
+            continue
+        p = r.get("purpose", "")
+        p = p if p in PURPOSES else (caller_of(p) or "other")
+        net = r["usd"] - r.get("release", 0)
+        by_p[p] = by_p.get(p, 0.0) + net
+        by_d[t.strftime("%Y-%m-%d")] = by_d.get(t.strftime("%Y-%m-%d"), 0.0) + net
+    return {"by_purpose": {k: round(v, 6) for k, v in by_p.items()},
+            "by_day": {k: round(by_d[k], 6) for k in sorted(by_d)}, "total": round(sum(by_p.values()), 6)}
+
+
+def main(argv=None):
+    """`conveyor_api.py report YYYY-MM`: the weekly review table (purpose, limit, spent, left; by day)."""
+    a = sys.argv[1:] if argv is None else list(argv)
+    if len(a) != 2 or a[0] != "report":
+        print("usage: conveyor_api.py report YYYY-MM", file=sys.stderr)
+        return 2
+    try:
+        rep = report(a[1])
+        limits = _envelope_config(Path(ROOT))
+        monthly, _ = caps(Path(ROOT))
+    except ApiRefused as e:
+        print(f"refused: {e}", file=sys.stderr)
+        return 1
+    print(f"{'purpose':<10} {'limit':>8} {'spent':>10} {'left':>10}")
+    for p in (*PURPOSES, *sorted(set(rep["by_purpose"]) - set(PURPOSES))):
+        spent, lim = rep["by_purpose"].get(p, 0.0), limits.get(p)
+        left = f"{lim - spent:>10.4f}" if lim is not None else f"{'-':>10}"
+        print(f"{p:<10} {(f'{lim:.2f}' if lim is not None else '-'):>8} {spent:>10.4f} {left}")
+    for d, v in rep["by_day"].items():
+        print(f"{d}  {v:.4f}")
+    print(f"total {rep['total']:.4f} of hard cap {monthly:.2f} USD")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
