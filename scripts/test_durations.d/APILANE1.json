@@ -1,0 +1,1 @@
+{"version": 1, "classes": {"tests.test_api_lane_policy.AcceptanceTests": 1.0, "tests.test_api_lane_policy.UnknownInputTests": 1.0, "tests.test_api_lane_policy.EligibilityTests": 1.0, "tests.test_api_lane_policy.TruthTableTests": 1.0, "tests.test_api_lane_policy.DateTests": 1.0, "tests.test_api_lane_policy.ModelTests": 1.0, "tests.test_api_lane_policy.StaticPurityTests": 1.0}}
