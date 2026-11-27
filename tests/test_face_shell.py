@@ -78,6 +78,8 @@ KEYSTORE_IMPORTS = {"__future__", "ipaddress", "json", "os", "sys", "tempfile", 
 BOARD_IMPORTS = {"dataclasses", "datetime", "json", "pathlib", "re", "stat"}
 # FACECONF1 service settings loader: exactly what service_config.py imports; no network, no process.
 SERVICE_CONFIG_IMPORTS = {"__future__", "ipaddress", "json", "os", "unicodedata", "dataclasses"}
+# FACELOCAL1 local pairing only: pure logic over the injected registry and key store; no network, no ctypes.
+LOCAL_PAIR_IMPORTS = {"__future__", "dataclasses", "jarvis.face.devices", "jarvis.face.keystore"}
 
 
 def _import_ok(file_name: str, module, names: set) -> bool:
@@ -93,6 +95,8 @@ def _import_ok(file_name: str, module, names: set) -> bool:
         return names == {"QBuffer", "QIODevice"}
     if file_name == "keystore.py":
         return module in KEYSTORE_IMPORTS and (module != "ctypes" or names == {"ctypes"})
+    if file_name == "local_pair.py":
+        return module in LOCAL_PAIR_IMPORTS
     if module == "urllib.parse" and module in names:  # "import urllib.parse" binds urllib, whose .request may be loaded
         return False
     return module in SHELL_IMPORTS | PURE_IMPORTS \
@@ -216,6 +220,22 @@ class StaticTests(unittest.TestCase):
             for source in (f"import {module}", f"from {module} import x"):
                 with self.subTest(source=source):
                     self.assertFalse(all(_import_ok("service_config.py", m, n) for m, n in _imports(source)))
+
+    def test_the_local_pair_branch_allows_exactly_its_own_imports_and_nothing_else(self) -> None:
+        used = {m for m, _ in _imports((FACE / "local_pair.py").read_text(encoding="utf-8"))}
+        self.assertEqual(used, LOCAL_PAIR_IMPORTS)  # "only what you use"
+        others = sorted({p.name for p in FACE.glob("*.py")} - {"local_pair.py"} | {"geometry.py"})
+        for module in ("jarvis.face.devices", "jarvis.face.keystore"):  # refused for every other face file
+            for file_name in others:
+                with self.subTest(module=module, file=file_name):
+                    self.assertFalse(_import_ok(file_name, module, {"Refusal"}))
+        refused = ["import socket", "import ssl", "import http", "import http.client", "import urllib",
+                   "import urllib.request", "from urllib.parse import urlsplit", "import subprocess",
+                   "import ctypes", "import os", "import json", "import threading", "import jarvis.core",
+                   "from jarvis.face import shell", "from jarvis.face.port import x", "import math"]
+        for source in refused:
+            with self.subTest(source=source):
+                self.assertFalse(all(_import_ok("local_pair.py", m, n) for m, n in _imports(source)))
 
     def test_qml_has_no_file_network_microphone_clipboard_or_screen_access(self) -> None:
         banned = r"Clipboard|clipboard|grabWindow|grabToImage|FileDialog|FolderDialog|XMLHttpRequest|" \

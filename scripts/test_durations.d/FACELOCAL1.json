@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "classes": {
+    "tests.test_face_local_pair.AcceptanceTests": 1.0,
+    "tests.test_face_local_pair.FaultMatrixTests": 1.0,
+    "tests.test_face_local_pair.NegativeTests": 1.0,
+    "tests.test_face_local_pair.StaticTests": 1.0,
+    "tests.test_face_shell.StaticTests": 1.0
+  }
+}
