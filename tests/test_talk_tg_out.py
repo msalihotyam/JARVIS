@@ -3,6 +3,7 @@
 import ast
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from jarvis import talk_boundary as tb
 from jarvis import talk_tg_out as out
@@ -209,6 +210,112 @@ class NegativeTest(unittest.TestCase):
                                 self.assertEqual(events[i - 1], ("append", "attempt:reply:r1", "ok"))
                         if client.calls:
                             self.assertNotEqual(out.status("reply:r1", log), "none")
+
+    def check_events(self, events):
+        """Every send follows its own attempt record "ok"; no chunk goes twice within one attempt."""
+        current, sent = None, {}
+        for event in events:
+            if event[0] == "call":
+                self.assertIsNotNone(current, "send without an attempt record")
+                self.assertNotIn(event[1], sent[current], "a chunk sent twice for one attempt")
+                sent[current].append(event[1])
+            elif event[0] == "append":
+                is_attempt = event[1].startswith("attempt:")
+                current = event[1] if is_attempt and event[2] == "ok" else None
+                if current is not None:
+                    self.assertNotIn(current, sent, "one attempt record opened twice")
+                    sent[current] = []
+        return sent
+
+    def run_matrix(self, call, where_list, kinds=("ok", "refused", "failed", "hangs", "raises", "junk"),
+                   client_for=hostile_client, setup=None):
+        for where in where_list:
+            for mode in ("ok", "exists", "failed", "unknown", "landed", "raises"):
+                for kind in kinds:
+                    log, client, events = ports(client_for(kind),
+                                                lambda key, w=where, m=mode: m if key.startswith(w) else None)
+                    if setup:
+                        setup(log, client)
+                    with self.subTest(where=where, mode=mode, kind=kind):
+                        for _ in range(3):
+                            call(log, client)  # an exception fails the subtest
+                        yield log, client, self.check_events(events)
+
+    def test_fault_matrix_on_the_notice_and_skipped_appends(self):
+        settings = {"enabled": True, "chat_id": 4242, "cap": 1}
+        lines, text = [reply(n) for n in (1, 2, 3)], "3 cevap PC'de bekliyor"
+
+        def call(log, client):
+            got = step(lines, log, client, settings=settings)
+            self.assertNotEqual(getattr(got, "reason", None), "internal_error")
+            if got.ok:
+                sent_notice = ("notice:reply:r3", "sent") in got.outcomes
+                self.assertEqual(got.notice, text if sent_notice else "")
+
+        wheres = ("attempt:notice:", "sent:notice:", "failed:notice:", "skipped:")
+        for log, client, sent in self.run_matrix(call, wheres):
+            self.assertLessEqual(len(client.calls), 1)
+            self.assertEqual(set(sent) - {"attempt:notice:reply:r3"}, set())
+
+    def test_fault_matrix_on_the_resend_appends(self):
+        def setup(log, client):
+            result, client.result = client.result, lambda: Refused("x")
+            step([reply(1)], log, client)
+            client.result = result
+
+        def call(log, client):
+            got = out.resend("reply:r1", [reply(1)], log, client, Clock(), S, redact=clean)
+            self.assertNotEqual(getattr(got, "reason", None), "internal_error")
+
+        for log, client, sent in self.run_matrix(call, ("attempt:reply:r1#", "sent:reply:r1#", "failed:reply:r1#"),
+                                                 setup=setup):
+            self.assertTrue(all(len(texts) <= 1 for texts in sent.values()))
+            self.assertNotEqual(out.status("reply:r1", log), "none")
+
+    def test_fault_matrix_on_a_later_chunk_of_a_long_reply(self):
+        def chunked(kind):
+            first, later = hostile_client("ok"), hostile_client(kind)
+            calls = []
+
+            def result():
+                calls.append(1)
+                return first() if len(calls) == 1 else later()
+            return result
+
+        def call(log, client):
+            got = step([reply(1, "a" * 8000)], log, client)
+            self.assertNotEqual(getattr(got, "reason", None), "internal_error")
+
+        for log, client, sent in self.run_matrix(call, ("attempt:", "sent:", "failed:"), client_for=chunked):
+            self.assertLessEqual(len(sent), 1)
+            texts = [c[1]["text"] for c in client.calls]
+            self.assertEqual([t[:t.index("/")] for t in texts], [f"({i}" for i in range(1, len(texts) + 1)])
+            if texts:  # chunks go in order, each once, and the reply then has a visible state
+                self.assertNotEqual(out.status("reply:r1", log), "none")
+
+    def test_status_never_raises_on_odd_attempt_suffixes(self):
+        base = "attempt:reply:r1"
+        for suffix, want in (("9" * 5000, "none"), ("1" * 10, "none"), ("", "none"), ("٣", "none"),
+                             ("000000002", "unknown")):
+            log = Log()
+            log.lines = [{"key": base + "#" + suffix}]
+            self.assertEqual(out.status("reply:r1", log), want, suffix[:12])
+            log.lines += [{"key": base}, {"key": "sent:reply:r1"}]
+            self.assertEqual(out.status("reply:r1", log), "unknown" if want == "unknown" else "sent", suffix[:12])
+        with mock.patch.object(out, "_numbers", side_effect=ValueError("odd")):
+            self.assertEqual(out.status("reply:r1", Log()), "unknown")
+
+    def test_resend_ignores_huge_suffixes_and_stops_at_the_attempt_limit(self):
+        log, client, _ = ports(lambda: Refused("x"))
+        step([reply(1)], log, client)
+        log.lines.append({"key": "attempt:reply:r1#" + "9" * 5000})
+        got = out.resend("reply:r1", [reply(1)], log, client, Clock(), S, redact=clean)
+        self.assertIn("attempt:reply:r1#2", log.keys())
+        self.assertEqual(got.outcomes, (("reply:r1", "failed"),))
+        log.lines.append({"key": "attempt:reply:r1#999999999"})
+        calls = len(client.calls)
+        got = out.resend("reply:r1", [reply(1)], log, client, Clock(), S, redact=clean)
+        self.assertEqual((got.ok, got.reason, len(client.calls)), (False, "attempt_limit", calls))
 
     def test_a_log_that_cannot_be_read_stops_before_any_send(self):
         for read in (lambda: 1 / 0, lambda: None, lambda: "x"):

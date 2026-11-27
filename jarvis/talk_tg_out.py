@@ -28,6 +28,7 @@ VIEW_TEXT = {SENT: "telefon kopyası: gönderildi", FAILED: "telefon kopyası: g
 DEFAULT_BUDGET, DEFAULT_CAP = 100, 20
 _FATAL = (KeyboardInterrupt, SystemExit)
 _CHAT_LIMIT = 2**53
+_MAX_DIGITS = 9  # an attempt number suffix "#<n>" has at most this many digits
 _FIXED = {"refused": tb.REFUSED_TEXT, "failed": tb.FAILED_TEXT}
 
 
@@ -168,8 +169,9 @@ def _numbers(key, keys):
     base = "attempt:" + key
     nums = [1] if base in keys else []
     for k in keys:
-        if k.startswith(base + "#") and k[len(base) + 1:].isdigit() and k[len(base) + 1:].isascii():
-            nums.append(int(k[len(base) + 1:]))
+        tail = k[len(base) + 1:]
+        if k.startswith(base + "#") and len(tail) <= _MAX_DIGITS and tail.isdigit() and tail.isascii():
+            nums.append(int(tail))  # longer suffix: not an attempt number (and int() would raise past 4300)
     return nums
 
 
@@ -227,7 +229,7 @@ def _step(reply_lines, delivery_log, client, clock, settings, redact):
             text = f"{len(order)} cevap PC'de bekliyor"
             anchor = max(fresh, key=pos.get)
             result = _attempt(run, "notice:" + anchor, _requests(text, "notice", run.chat_id, run.redact))
-            notice = text if result is not None else ""
+            notice = text if result == SENT else ""
             if result is not None:
                 outcomes.append(("notice:" + anchor, result))
             covered, fresh = covered + fresh, []
@@ -258,6 +260,8 @@ def _resend(key, reply_lines, delivery_log, client, clock, settings, redact):
     if type(key) is not str or key not in replies:
         return Refusal("no_such_reply")
     n = max(_numbers(key, keys), default=0) + 1
+    if len(str(n)) > _MAX_DIGITS:
+        return Refusal("attempt_limit")  # status() could not see a longer attempt number
     try:
         result = _attempt(run, key if n == 1 else f"{key}#{n}", _copy(replies[key], run))
     except _Stop:
@@ -269,6 +273,15 @@ def _resend(key, reply_lines, delivery_log, client, clock, settings, redact):
 
 def status(key, delivery_log):
     """sent | failed | unknown | none for the PC view (VIEW_TEXT); never raises."""
+    try:
+        return _status(key, delivery_log)
+    except _FATAL:
+        raise
+    except BaseException:
+        return UNKNOWN
+
+
+def _status(key, delivery_log):
     got = _call(lambda: delivery_log.read()) if type(key) is str else None
     if type(got) is not list:
         return UNKNOWN
