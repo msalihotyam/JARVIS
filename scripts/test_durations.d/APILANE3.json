@@ -1,0 +1,1 @@
+{"version": 1, "classes": {"tests.test_api_lane_cost.AcceptanceTests": 1.0, "tests.test_api_lane_cost.EventMatrixTests": 1.0, "tests.test_api_lane_cost.LedgerTests": 1.0, "tests.test_api_lane_cost.StaticTests": 1.0}}
