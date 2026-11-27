@@ -1,8 +1,9 @@
 """FACEDEV1: remote-window device registry and one-time pairing codes.
 
 Pure logic over one state file, <root>/talk/state/devices.json; no network. A device pairs
-once with an 8-digit code shown on the local console and gets a 32-byte key back, once.
-Only SHA-256 hashes of keys are stored; the live code's hash is kept in memory only.
+once with an 8-digit code and gets a 32-byte key back, once. The code's hash lives only in
+this Registry's memory, so only the serving process can issue it; the CLI only lists and revokes.
+Only SHA-256 hashes of keys are stored; every check re-reads the file, so a CLI revoke is seen.
 A missing file means no devices; an unreadable or malformed file refuses every call.
 Keys and codes never reach a log, a repr, an exception message or the file.
 """
@@ -298,21 +299,14 @@ class Registry:
         return Refusal("registry_unreadable") if records is None else tuple(_device(r) for r in records)
 
 
-def main(argv=None, clock=time.time) -> int:
+def main(argv=None) -> int:
     parser = argparse.ArgumentParser(prog="python -m jarvis.face.devices")
     parser.add_argument("--root", required=True, help="folder that holds talk/state/devices.json")
     sub = parser.add_subparsers(dest="command", required=True)
-    sub.add_parser("code", help="show a one-time pairing code on this console")
-    sub.add_parser("list")
+    sub.add_parser("list")  # no pairing-code command: a code issued here could never pair with the server
     sub.add_parser("revoke").add_argument("id")
     args = parser.parse_args(argv)
     registry = Registry(args.root)
-    if args.command == "code":
-        if not sys.stdout.isatty():  # the code goes to the local console only, never a pipe or a log file
-            print("refused: the code is shown only on an interactive console", file=sys.stderr)
-            return 2
-        print(registry.issue_code(clock()))
-        return 0
     result = registry.list() if args.command == "list" else registry.revoke(args.id)
     if isinstance(result, Refusal):
         print(f"refused: {result.reason}", file=sys.stderr)

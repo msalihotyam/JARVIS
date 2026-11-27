@@ -322,20 +322,16 @@ class LeakTests(_Root):
 
 
 class CliAndStaticTests(_Root):
-    def run_cli(self, *argv, tty=True):
+    def run_cli(self, *argv):
         out, err = io.StringIO(), io.StringIO()
-        out.isatty = lambda: tty
         with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = devices.main(["--root", str(self.root), *argv], clock=lambda: T0)
+            try:
+                code = devices.main(["--root", str(self.root), *argv])
+            except SystemExit as exc:  # argparse refusals and --help exit
+                code = exc.code
         return code, out.getvalue(), err.getvalue()
 
-    def test_cli_code_list_revoke(self) -> None:
-        rc, out, _ = self.run_cli("code")
-        self.assertEqual(rc, 0)
-        self.assertRegex(out, r"\A[0-9]{8}\n\Z")
-        rc, out, err = self.run_cli("code", tty=False)
-        self.assertEqual((rc, out), (2, ""))
-        self.assertNotRegex(err, "[0-9]{8}")
+    def test_cli_list_revoke(self) -> None:
         p = self.paired("laptop")
         rc, out, _ = self.run_cli("list")
         self.assertEqual(rc, 0)
@@ -345,6 +341,42 @@ class CliAndStaticTests(_Root):
         self.assertEqual(self.run_cli("revoke", p.device.id)[0], 0)
         self.assertIn("revoked", self.run_cli("list")[1])
         self.assertEqual(self.run_cli("revoke", "nope")[0], 1)
+
+    def test_cli_has_no_pairing_code_command(self) -> None:
+        issued = mock.patch.object(Registry, "issue_code", side_effect=AssertionError("issued"))
+        with issued:
+            for argv in (["code"], ["Code"], ["CODE"], ["code", "--help"], ["pair"], ["pair_code"], ["cod"],
+                         ["list", "code"], ["revoke"], [""], ["code", "list"]):
+                with self.subTest(argv=argv):
+                    rc, out, err = self.run_cli(*argv)
+                    self.assertEqual((rc, out), (2, ""))
+                    self.assertNotRegex(err, "[0-9]{8}")
+                    self.assertFalse(self.file.parent.exists())  # nothing written to the registry
+        rc, out, _ = self.run_cli("--help")
+        self.assertEqual(rc, 0)
+        self.assertIn("{list,revoke}", out)
+        self.assertNotIn("code", out)
+
+    def test_parser_registers_only_list_and_revoke(self) -> None:
+        seen = []
+        real = devices.argparse.ArgumentParser.parse_args
+
+        def spy(parser, *a, **k):
+            seen.extend(act.choices for act in parser._actions if isinstance(act, devices.argparse._SubParsersAction))
+            return real(parser, *a, **k)
+        with mock.patch.object(devices.argparse.ArgumentParser, "parse_args", spy):
+            self.run_cli("list")
+        self.assertEqual([set(c) for c in seen], [{"list", "revoke"}])
+        self.assertNotIn("issue_code", SOURCE[SOURCE.index("def main("):])
+
+    def test_a_cli_revoke_from_another_process_reaches_a_running_registry(self) -> None:
+        p = self.paired("phone")  # paired on the serving Registry A
+        self.assertEqual(self.reg.check(p.key, T0), p.device.id)
+        b = Registry(self.root)  # a second instance on the same root, as another process would hold
+        self.assertEqual(b.check(p.key, T0), p.device.id)
+        self.assertEqual(self.run_cli("revoke", p.device.id)[0], 0)  # main() builds its own Registry
+        self.assertEqual(self.reg.check(p.key, T0 + 1), Refusal("revoked"))  # A re-reads the file on every check
+        self.assertEqual(b.check(p.key, T0 + 1), Refusal("revoked"))
 
     def test_list_never_returns_keys_or_hashes(self) -> None:
         self.paired()
