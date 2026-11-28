@@ -23,11 +23,28 @@ COLORS = {
     "line1": "#1B222C", "line2": "#232B36", "text1": "#E7ECF2", "text2": "#AAB4C0",
     "text3": "#8793A1", "accent": "#5BC8F5", "accent_ink": "#06202C",
     "accent_surface": "#0F1C24", "accent_line": "#1D3A4A", "needs_you": "#F2B34A",
-    "error": "#F2777F", "ok": "#6FD3A3", "disabled_glyph": "#5E6978",
+    "needs_you_ink": "#2A1C03", "error": "#F2777F", "ok": "#6FD3A3", "disabled_glyph": "#5E6978",
     "link": "#7FD4F7", "link_hover": "#B5E6FB", "text_soft": "#C5CED8",
 }
 RADIUS = {"panel": 12, "composer": 16, "control": 12, "code": 8, "pill": 999}
 SPACE = (4, 6, 8, 10, 12, 14, 16, 20, 24)
+DURATIONS = {"breathe": 4000, "swell": 700, "arc": 1200, "arc2": 2400, "arc3": 3200,
+             "ripple": 1600, "ask": 1600}
+RING = {"box": 120, "outer_r": 54, "outer_w": 1.5, "dash_r": 46, "dash_w": 2, "dash_on": 2,
+        "dash_off": 6, "main_r": 38, "main_w": 4, "glow_r": 20, "core_r": 12}
+TYPE_EXTRA = {"label_weight": 600, "label_caps": 1, "label_spacing_em": 0.04, "num_weight": 600,
+              "num_unit_weight": 500, "mono_weight": 500}
+SIZE_EXTRA = {"pane_header": 56, "tab": 36, "bar": 8, "tick_w": 2, "tick_h": 16}
+#: EK3 spec names that main already holds under its own name (main's name wins, no duplicate).
+EK3_SAME = {
+    "pane": ("surface3", "#0E1218"), "tile": ("surface1", "#11161D"), "ok": ("ok", "#6FD3A3"),
+    "faint": ("disabled_glyph", "#5E6978"), "chip_now_fill": ("accent_surface", "#0F1C24"),
+    "chip_now_line": ("accent_line", "#1D3A4A"), "line1": ("line1", "#1B222C"),
+    "line2": ("line2", "#232B36"), "surface2": ("surface2", "#171D26"), "text": ("text1", "#E7ECF2"),
+    "text2": ("text2", "#AAB4C0"), "text_soft": ("text_soft", "#C5CED8"),
+    "muted": ("text3", "#8793A1"), "accent": ("accent", "#5BC8F5"),
+    "needs_you": ("needs_you", "#F2B34A"),
+}
 SANS = ("Inter-Regular.ttf", "Inter-Medium.ttf", "Inter-SemiBold.ttf")
 MONO = ("JetBrainsMono-Regular.ttf", "JetBrainsMono-Medium.ttf", "JetBrainsMono-SemiBold.ttf")
 ALL_FONTS = [str(FONT_DIR / n) for n in SANS + MONO]
@@ -79,23 +96,27 @@ class AcceptanceTest(unittest.TestCase):
             "small": (13, 20), "label": (12.5, 16),
             "turn": (16, 26), "cell": (15, 24), "meta": (13, 20), "control": (14, 20),
             "family_sans": "Inter", "family_mono": "JetBrains Mono",
+            "num": (28, 34), "num_unit": (17, 26), "mono": (13, 20), **TYPE_EXTRA,
         })
         self.assertEqual(dict(TOKENS["radius"]), RADIUS)
         self.assertEqual(dict(TOKENS["space"]), {str(n): n for n in SPACE})
         self.assertEqual(dict(TOKENS["size"]), {
             "ring": 72, "control_min": 44, "reading_col": (640, 660), "reader_width": 880,
-            "rail": 320, "pane": 600, "composer_radius": 16, "mini_box": 460,
+            "rail": 320, "pane": 600, "composer_radius": 16, "mini_box": 460, **SIZE_EXTRA,
         })
         self.assertEqual(dict(TOKENS["motion"]), {
-            "fast": 120, "medium": 200, "slow": 320, "curve": (0.2, 0.0, 0.0, 1.0),
+            "fast": 120, "medium": 200, "slow": 320, "curve": (0.2, 0.0, 0.0, 1.0), **DURATIONS,
         })
+        self.assertEqual(dict(TOKENS["ring"]), RING)
 
     def test_motion_reduced_is_zero(self):
         self.assertEqual(motion(), {"fast": 120, "medium": 200, "slow": 320,
-                                    "curve": (0.2, 0.0, 0.0, 1.0)})
+                                    "curve": (0.2, 0.0, 0.0, 1.0), **DURATIONS})
         for reduced in (True, None, 1, "yes", "false", 0):  # anything but False is still
             m = motion(reduced)
             self.assertEqual((m["fast"], m["medium"], m["slow"]), (0, 0, 0), reduced)
+            self.assertEqual({k: m[k] for k in DURATIONS}, dict.fromkeys(DURATIONS, 0), reduced)
+            self.assertEqual(m["curve"], (0.2, 0.0, 0.0, 1.0), reduced)
 
     def test_as_qml_dict_flat_and_stable(self):
         flat = as_qml_dict()
@@ -104,7 +125,8 @@ class AcceptanceTest(unittest.TestCase):
             self.assertIn(type(v), (str, int, float), k)
         expected = {f"color_{n}" for n in COLORS}
         expected |= {f"type_{s}_{p}" for s in ("body", "h2", "h3", "code", "small", "label",
-                                               "turn", "cell", "meta", "control")
+                                               "turn", "cell", "meta", "control",
+                                               "num", "num_unit", "mono")
                      for p in ("size", "line")}
         expected |= {f"radius_{n}" for n in RADIUS} | {f"space_{n}" for n in SPACE}
         expected |= {"type_family_sans", "type_family_mono", "size_reading_col_min",
@@ -112,12 +134,35 @@ class AcceptanceTest(unittest.TestCase):
                      "motion_curve_x1", "motion_curve_y1", "motion_curve_x2", "motion_curve_y2"}
         expected |= {f"size_{n}" for n in ("ring", "control_min", "reader_width", "rail",
                                            "pane", "composer_radius", "mini_box")}
+        expected |= {f"type_{n}" for n in TYPE_EXTRA} | {f"size_{n}" for n in SIZE_EXTRA}
+        expected |= {f"motion_{n}" for n in DURATIONS} | {f"ring_{n}" for n in RING}
         self.assertEqual(set(flat), expected)
         self.assertEqual((flat["type_code_size"], flat["size_reading_col_max"]), (14.5, 660))
         self.assertEqual((flat["type_turn_line"], flat["radius_pill"], flat["space_24"],
                           flat["color_link_hover"]), (26, 999, 24, "#B5E6FB"))
         flat["color_base"] = "#FFFFFF"
         self.assertEqual(as_qml_dict()["color_base"], "#0B0E13")
+
+    def test_ek2_ek3_exact_values(self):
+        flat = as_qml_dict()
+        self.assertEqual(flat["color_needs_you_ink"], "#2A1C03")
+        for spec, (name, value) in EK3_SAME.items():
+            self.assertEqual(flat[f"color_{name}"], value, spec)
+        for n, v in RING.items():
+            self.assertEqual(flat[f"ring_{n}"], v, n)
+        for n, v in DURATIONS.items():
+            self.assertEqual(flat[f"motion_{n}"], v, n)
+        for n, v in TYPE_EXTRA.items():
+            self.assertEqual(flat[f"type_{n}"], v, n)
+        for n, v in SIZE_EXTRA.items():
+            self.assertEqual(flat[f"size_{n}"], v, n)
+        self.assertEqual({k: flat[k] for k in ("type_label_size", "type_label_line", "type_num_size",
+                                               "type_num_line", "type_num_unit_size",
+                                               "type_num_unit_line", "type_mono_size",
+                                               "type_mono_line", "size_pane")},
+                         {"type_label_size": 12.5, "type_label_line": 16, "type_num_size": 28,
+                          "type_num_line": 34, "type_num_unit_size": 17, "type_num_unit_line": 26,
+                          "type_mono_size": 13, "type_mono_line": 20, "size_pane": 600})
 
 
 class ContrastTest(unittest.TestCase):
@@ -136,6 +181,11 @@ class ContrastTest(unittest.TestCase):
         for fg, bg in PAIRS:
             ratio = contrast(COLORS[fg], COLORS[bg])
             self.assertGreaterEqual(ratio, 4.5, f"{fg} on {bg}: {ratio:.2f}")
+
+    def test_needs_you_ink_pair(self):
+        self.assertEqual({p for p in PAIRS if "needs_you_ink" in p}, {("needs_you_ink", "needs_you")})
+        self.assertGreaterEqual(contrast("#2A1C03", "#F2B34A"), 4.5)
+        self.assertFalse({p for p in PAIRS if "disabled_glyph" in p})  # faint: no pair
 
     def test_disabled_glyph_is_non_text_and_exempt(self):
         self.assertEqual(ROLES["disabled_glyph"], "non_text")
