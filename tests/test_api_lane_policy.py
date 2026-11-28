@@ -66,9 +66,17 @@ MODULES = {"math", "posixpath", "re", "unicodedata", "datetime", "typing"}
 FROM_OK = {("datetime", "date"), ("typing", "NamedTuple")}  # CDX F2: (module, name) pairs, never a module
 
 
+MODULE_ATTRS_OK = {"math.isfinite", "math.copysign", "posixpath.normpath", "re.compile", "re.match",
+                   "re.split", "re.search", "re.I", "unicodedata.category", "unicodedata.normalize"}
+
+
 def purity_violations(source):
     out = []
-    for node in ast.walk(ast.parse(source)):
+    tree = ast.parse(source)
+    # CDX-APILANE1FIX F1: a module name is legal only as the direct value of an allowlisted attribute
+    ok_refs = {id(n.value) for n in ast.walk(tree) if isinstance(n, ast.Attribute) and isinstance(n.value, ast.Name)
+               and f"{n.value.id}.{n.attr}" in MODULE_ATTRS_OK}
+    for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             if any(a.name not in MODULES or a.asname for a in node.names):
                 out.append(ast.dump(node))
@@ -79,13 +87,14 @@ def purity_violations(source):
             if node.id.startswith("__") or node.id in {"open", "eval", "exec", "compile", "input", "globals",
                                                        "breakpoint", "getattr", "setattr", "vars", "print"}:
                 out.append(node.id)
+            elif node.id in MODULES and id(node) not in ok_refs:
+                out.append(f"bare {node.id}")  # alias, argument, store or del of a module
         elif isinstance(node, ast.Attribute):
-            if node.attr.startswith("__") or node.attr in {"now", "today", "utcnow", "time", "environ", "system", "popen", "read_text",
+            # F2 probe: frame/traceback introspection (gi_frame.f_globals) reaches module globals and builtins
+            if node.attr.startswith(("__", "gi_", "cr_", "ag_", "f_", "tb_")) or node.attr in {"now", "today", "utcnow", "time", "environ", "system", "popen", "read_text",
                              "write_text", "open"}:
                 out.append(node.attr)
-            elif isinstance(node.value, ast.Name) and node.value.id in MODULES and f"{node.value.id}.{node.attr}" not in {
-                    "math.isfinite", "math.copysign", "posixpath.normpath", "re.compile", "re.match",
-                    "re.split", "re.search", "re.I", "unicodedata.category", "unicodedata.normalize"}:
+            elif isinstance(node.value, ast.Name) and node.value.id in MODULES and f"{node.value.id}.{node.attr}" not in MODULE_ATTRS_OK:
                 out.append(f"{node.value.id}.{node.attr}")  # module attrs: allowlist only
     return out
 
@@ -349,6 +358,21 @@ class StaticPurityTests(unittest.TestCase):  # N6
                     "type.__getattribute__(posixpath, 'os')", "vars(posixpath)['os'].remove('x')", "print(1)"):
             with self.subTest(src=src):
                 self.assertTrue(purity_violations(src))
+
+    def test_guard_rejects_module_aliases(self):  # CDX-APILANE1FIX F1: a module escaping its allowlisted attribute
+        for src in ("import posixpath\np = posixpath\np.os.listdir('.')", "p = posixpath", "f(posixpath)", "[posixpath][0].os",
+                    "(posixpath if 1 else re).os", "lambda: posixpath", "x = {'m': math}", "p, q = posixpath, re",
+                    "posixpath = 1", "del posixpath", "for m in (math,): pass", "def f(m=unicodedata): pass",
+                    "(p := posixpath)", "f(*[re])", "x: int = math", "@posixpath\ndef f(): pass",
+                    # F2 probe: frame introspection hands back module globals and builtins
+                    "(x for x in ()).gi_frame.f_builtins['open']('f')",
+                    "(x for x in ()).gi_frame.f_globals['posixpath'].os.listdir('.')", "c.cr_frame.f_back", "a.ag_frame",
+                    "e.__traceback__.tb_frame"):
+            with self.subTest(src=src):
+                self.assertTrue(purity_violations(src))
+        for src in ("posixpath.normpath('a')", "re.compile('x').match", "math.isfinite(1.0)", "f(re.I)"):
+            with self.subTest(src=src):
+                self.assertEqual(purity_violations(src), [])
 
 
 if __name__ == "__main__":
