@@ -218,7 +218,7 @@ def _duration_error(text):
 
 
 def _scope(spec, changes, texts, old, facts):
-    owned = {_key(p) for p in spec.owned}
+    owned = set(spec.owned)  # exact: jarvis/demo.py does not authorize jarvis/DEMO.py
     tree = _tree((facts.get("sources") or {}).get(CONVEYOR))
     dirs, files = (_literal(tree, n) if tree else None for n in ("PROTECTED_DIRS", "PROTECTED_FILES"))
     if not dirs or not files:
@@ -227,17 +227,18 @@ def _scope(spec, changes, texts, old, facts):
     for status, path, before in changes:
         reason = next((f"{label} path: {why}" for label, p in (("new", path), ("old", before)) if p is not None
                        for why in [_unsafe(p)] if why), None)
-        keys = [k for k in (_key(path), _key(before) if before else None) if k]
+        pairs = [(k, p) for p in (path, before) if p for k in [_key(p)] if k]
+        keys = [k for k, _ in pairs]
         if reason is None:
-            for k in keys:
+            for k, raw in pairs:
                 if _hard_protected(k):
                     reason = f"{k} is protected and is never touched"
                 elif k in files or k.startswith(dirs):
                     reason = f"{k} is in the conveyor protected set"
                 elif status[0] in "DR" and re.fullmatch(r"tests/test_[^/]+\.py", keys[-1]) and k == keys[-1]:
                     reason = f"removes guard test {k}; restore it"
-                elif k not in owned:
-                    reason = f"{k} is not in owned_files" + (" (rename from outside scope)" if k != keys[0] else "")
+                elif raw not in owned:
+                    reason = f"{raw} is not in owned_files" + (" (rename from outside scope)" if raw != path else "")
                 if reason:
                     break
         if reason:
@@ -255,9 +256,16 @@ def _duration(spec, changes, texts, old, facts):
                 out.append(Finding("DURATION", path, 0, f"duration record does not parse: {why}"))
     touched = any(s[0] != "D" and re.fullmatch(r"tests/test_[^/]+\.py", p) for s, p, _ in changes)
     lane_file = f"{DURATION_DIR}{spec.lane}.json"
-    if touched and not records and lane_file not in (facts.get("head_files") or ()):
-        out.append(Finding("DURATION", lane_file, 0, "tests were added or changed but no duration record is in the "
-                           "diff; add it (version 1, every TestCase class, rounded up to 0.1, floor 1.0)"))
+    if touched and lane_file not in records:  # only the lane's own record counts; one kept at HEAD is validated
+        if lane_file not in (facts.get("head_files") or ()):
+            out.append(Finding("DURATION", lane_file, 0, "tests were added or changed but no duration record is in the "
+                               "diff; add it (version 1, every TestCase class, rounded up to 0.1, floor 1.0)"))
+        else:
+            raw = facts.get("lane_record")
+            text = _decode(lane_file, raw)[0] if isinstance(raw, (bytes, bytearray, str)) else None
+            why = "content is not readable text" if text is None else _duration_error(text)
+            if why:
+                out.append(Finding("DURATION", lane_file, 0, f"duration record does not parse: {why}"))
     return out
 
 
@@ -287,7 +295,7 @@ def _report(report, facts):
     if not runs:
         out.append(Finding("REPORT", "report", 0, "RUNS line must give '<n> tests, <n> failures' for the run command"))
     for no, line in runs:
-        counts = re.search(r"(\d+) tests?, (\d+) failures?", line)
+        counts = re.search(r"(?<![\w-])(\d+) tests?, (\d+) failures?", line)
         code = re.search(r"\bexit (?:code )?(-?\d+)", line)
         if not counts:
             out.append(Finding("REPORT", "report", no, "RUNS line must give '<n> tests, <n> failures' for the run command"))
@@ -326,7 +334,7 @@ def _face(spec, changes, texts, old, facts):
     for path in new:
         name = posixpath.basename(path)
         tree = _tree(texts.get(path))
-        if any(re.search(r"(?<![\w.])" + re.escape(name), line) for line in guard_added):
+        if any(re.search(r"(?<![\w.])" + re.escape(name) + r"(?![\w.])", line) for line in guard_added):
             continue
         if tree is None:
             out.append(Finding("FACE_ALLOW", path, 0, "new face module does not parse; fix the syntax"))
@@ -370,6 +378,12 @@ def _base(spec, changes, texts, old, facts):
     if parent not in ok:
         return [Finding("BASE", "HEAD^", 0, f"parent {parent} is neither current main nor the declared base; "
                         "rebase onto main or the stacked base named in the spec")]
+    if "base" in facts:  # the diff base itself: a real ancestor that is HEAD^ or the stacked parent, never HEAD
+        b = facts.get("base")
+        if not (isinstance(b, str) and SHA_RE.fullmatch(b)) or b == facts.get("head") \
+                or facts.get("base_is_ancestor") is not True or b not in {parent, *spec.bases}:
+            return [Finding("BASE", "--base", 0, f"diff base {_clean(b)} is HEAD, not an ancestor, or neither HEAD^ "
+                            "nor the stacked base; pass the slice's real base")]
     return []
 
 
@@ -400,7 +414,12 @@ def _changes(changed_files):
         if isinstance(entry, (list, tuple)) and len(entry) in (2, 3) and isinstance(entry[0], str) and entry[0] \
                 and entry[0][0] in "AMDRCT" and isinstance(entry[1], str) \
                 and (len(entry) == 2 or entry[2] is None or isinstance(entry[2], str)):
-            out.append((entry[0], entry[1], entry[2] if len(entry) == 3 and entry[0][0] == "R" else None))
+            src = entry[2] if len(entry) == 3 else None
+            if entry[0][0] in "RC" and not (isinstance(src, str) and src):
+                bad.append(Finding("SCOPE", f"changed_files[{i}]", 0, "rename/copy entry has no source path; "
+                                   "expected (status, path, old path)"))
+                continue
+            out.append((entry[0], entry[1], src if entry[0][0] == "R" else None))
         else:
             bad.append(Finding("SCOPE", f"changed_files[{i}]", 0, "malformed entry; expected (status, path[, old path])"))
     return out, bad
@@ -415,6 +434,14 @@ def _texts(raw, keep):
             if bad and keep is not None:
                 keep.append(bad)
     return out
+
+
+def _exc(exc):
+    """'Type: message'; the type name alone when formatting the exception itself raises."""
+    try:
+        return f"{type(exc).__name__}: {_clean(exc)}"
+    except Exception:  # a hostile __str__ must not escape the never-raise contract
+        return type(exc).__name__
 
 
 def _check(spec, changed_files, texts, report, facts):
@@ -432,11 +459,13 @@ def _check(spec, changed_files, texts, report, facts):
         else frozenset()
     rep, bad = _decode("report.md", report)
     out += [bad] if bad else _report(rep, facts)
+    out += [Finding("CHECKER_ERROR", p, 0, "changed file cannot be read from git, so it was not scanned; rerun")
+            for p in facts.get("unreadable") or () if isinstance(p, str)]
     for name, fn in CHECKS:
         try:
             out += fn(spec, changes, texts, old, facts)
         except Exception as exc:  # one broken check is a typed CHECKER_ERROR, the others still run
-            out.append(Finding("CHECKER_ERROR", name, 0, f"{type(exc).__name__}: {_clean(exc)}"))
+            out.append(Finding("CHECKER_ERROR", name, 0, _exc(exc)))
     return out
 
 
@@ -445,7 +474,7 @@ def check(spec, changed_files, texts, report, facts):
     try:
         return _check(spec, changed_files, texts, report, facts)
     except Exception as exc:  # the contract is a typed result, never an exception
-        return [Finding("CHECKER_ERROR", "check", 0, f"{type(exc).__name__}: {_clean(exc)}")]
+        return [Finding("CHECKER_ERROR", "check", 0, _exc(exc))]
 
 
 def exit_code(findings):
@@ -494,7 +523,7 @@ def _z(raw):
     return [t.decode("utf-8", "replace") for t in raw.split(b"\0") if t]
 
 
-def collect(runner, base):
+def collect(runner, base, lane=None):
     """(changes, texts, facts) for base..HEAD, read through the injected runner only."""
     def sha(ref):
         rc, out = _git(runner, "rev-parse", "--verify", "-q", ref + "^{commit}")
@@ -505,9 +534,13 @@ def collect(runner, base):
         rc, out = _git(runner, "show", f"{ref}:{path}")
         return None if rc else bytes(out)
 
-    facts = {"head": sha("HEAD"), "parent": sha("HEAD^"), "main": sha("main")}
+    head, base = sha("HEAD"), sha(base)  # resolved once; every read below uses these shas
+    if head is None or base is None:
+        raise RuntimeError("HEAD or --base does not resolve to a commit")
+    facts = {"head": head, "parent": sha("HEAD^"), "main": sha("main"), "base": base,
+             "base_is_ancestor": _git(runner, "merge-base", "--is-ancestor", base, head)[0] == 0}
     tokens, changes, i = _z(_ok(runner, "diff", "--no-ext-diff", "--no-textconv", "--name-status", "-z", "-M",
-                               base, "HEAD")), [], 0
+                               base, head)), [], 0
     while i < len(tokens):
         status = tokens[i]
         if status[:1] in ("R", "C"):
@@ -516,12 +549,16 @@ def collect(runner, base):
         else:
             changes.append((status, tokens[i + 1], None))
             i += 2
-    texts = {p: show("HEAD", p) for s, p, _ in changes if s[0] != "D"}
+    texts = {p: show(head, p) for s, p, _ in changes if s[0] != "D"}
+    facts["unreadable"] = sorted(p for s, p, _ in changes if s[0] in "AMR" and p.endswith(".py") and texts[p] is None)
     facts["old"] = {p: show(base, b or p) for s, p, b in changes if s[0] in "MR"}
-    facts["head_files"] = _z(_ok(runner, "diff", "--no-ext-diff", "--name-only", "-z", EMPTY_TREE, "HEAD", "--",
+    if lane:
+        facts["lane_record"] = show(head, f"{DURATION_DIR}{lane}.json")
+    facts["head_files"] = _z(_ok(runner, "diff", "--no-ext-diff", "--name-only", "-z", EMPTY_TREE, head, "--",
                                  "jarvis", "scripts", "tests"))
     # guard lists come from the base, so a slice cannot loosen the list it is checked against
-    guards = _z(_ok(runner, "diff", "--no-ext-diff", "--name-only", "-z", "-Grglob", EMPTY_TREE, base, "--", "tests"))
+    guards = _z(_ok(runner, "diff", "--no-ext-diff", "--no-textconv", "--name-only", "-z", "-Grglob", EMPTY_TREE, base,
+                    "--", "tests"))
     facts["sources"] = {p: show(base, p) for p in {*guards, FACE_GUARD, PF_GUARD, CONVEYOR}}
     return changes, texts, facts
 
@@ -549,8 +586,12 @@ def main(argv=None, runner=None):
         with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
             args = parser.parse_args(argv)
     except SystemExit as exc:
-        print("\n".join([NOTICE] + [_clean(line) for line in buf.getvalue().splitlines()]))
-        return 0 if exc.code == 0 else 2
+        if exc.code == 0:  # --help
+            print("\n".join([NOTICE] + [_clean(line) for line in buf.getvalue().splitlines()]))
+            return 0
+        usage = [_clean(line) for line in buf.getvalue().splitlines() if line.strip()]
+        print(render([Finding("CHECKER_ERROR", "argv", 0, usage[-1] if usage else "bad arguments")]))
+        return 2
     spec_raw, spec_bad = _read(args.spec, "spec")
     if not (SHA_RE.fullmatch(args.base) or re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_./-]{0,99}", args.base)) \
             or ".." in args.base:
@@ -560,9 +601,10 @@ def main(argv=None, runner=None):
     else:
         report_raw, report_bad = _read(args.report, "report")
         try:
-            changes, texts, facts = collect(runner or _default_runner, args.base)
+            lane = getattr(parse_spec(_decode("spec", spec_raw)[0])[0], "lane", None)
+            changes, texts, facts = collect(runner or _default_runner, args.base, lane)
         except Exception as exc:  # git failure is a checker error, never a traceback
-            findings = [Finding("CHECKER_ERROR", "git", 0, f"{type(exc).__name__}: {_clean(exc)}")]
+            findings = [Finding("CHECKER_ERROR", "git", 0, _exc(exc))]
         else:
             findings = ([report_bad] if report_bad else []) + check(spec_raw, changes, texts, report_raw, facts)
     print(render(findings))

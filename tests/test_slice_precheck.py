@@ -8,6 +8,7 @@ import os
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from scripts import slice_precheck as sp
 from tests.adversarial import HOSTILE_JSON, HOSTILE_NUMBERS, HOSTILE_PATH_PARTS, HOSTILE_TEXT, deep_json, each, \
@@ -69,7 +70,7 @@ def with_text(path, data, status="A"):
 
 
 class CheckTests(unittest.TestCase):
-    def test_clean_historical_slice_has_no_findings(self):
+    def test_clean_synthetic_slice_has_no_findings(self):
         self.assertEqual(run(), [])
 
     def test_finding_is_frozen(self):
@@ -270,29 +271,40 @@ class StaticTests(unittest.TestCase):
             if isinstance(node, ast.Name) and node.id == "subprocess":
                 self.assertIn(id(node), inside)
             if isinstance(node, ast.Call):
-                fn = node.func
-                self.assertFalse(isinstance(fn, ast.Name) and fn.id in ("open", "exec", "eval", "__import__"))
-                self.assertFalse(isinstance(fn, ast.Attribute) and fn.attr in (
-                    "write_text", "write_bytes", "unlink", "rmdir", "mkdir", "touch", "rename", "rmtree", "remove"))
+                self.assertFalse(banned_call(node.func), ast.unparse(node))
             if isinstance(node, ast.FunctionDef):
                 self.assertFalse(any(w in node.name for w in ("write", "review", "queue", "save", "dump", "receipt")))
 
+    def test_attribute_open_is_banned(self):  # F19
+        self.assertTrue(banned_call(ast.parse('Path("queue").open("w")').body[0].value.func))
 
-def fake_runner(case, fail=False):
+
+def banned_call(fn):
+    return (isinstance(fn, ast.Name) and fn.id in ("open", "exec", "eval", "__import__")) or (
+        isinstance(fn, ast.Attribute) and fn.attr in (
+            "open", "write_text", "write_bytes", "unlink", "rmdir", "mkdir", "touch", "rename", "rmtree", "remove"))
+
+
+def fake_runner(case, fail=False, calls=None):
     files = {**{k: v.encode() for k, v in case["facts"]["sources"].items()}, **case["texts"]}
     shas = {"HEAD": case["facts"]["head"], "HEAD^": case["facts"]["parent"], "main": case["facts"]["main"]}
 
     def runner(args):
+        if calls is not None:
+            calls.append(args)
         if fail:
             return "not a tuple"
         if args[0] == "rev-parse":
-            sha = shas.get(args[-1][:-len("^{commit}")])
+            ref = args[-1][:-len("^{commit}")]
+            sha = ref if sp.SHA_RE.fullmatch(ref) else shas.get(ref)
             return (0, sha.encode() + b"\n") if sha else (1, b"")
+        if args[0] == "merge-base":
+            return (1, b"") if case["facts"].get("ancestor") is False else (0, b"")
         if args[0] == "show":
             data = files.get(args[1].split(":", 1)[1])
             return (0, data) if data is not None else (128, b"")
         if "--name-status" in args:
-            return 0, b"".join(f"{s}\0{p}\0".encode() for s, p in case["changed_files"])
+            return 0, b"".join("".join(f"{t}\0" for t in (c[0], *c[2:], c[1])).encode() for c in case["changed_files"])
         if "-Grglob" in args:
             return 0, b"tests/test_iso.py\0"
         return 0, "\0".join(case["facts"]["head_files"]).encode()
@@ -340,3 +352,118 @@ class CliTests(unittest.TestCase):
                 sp._git(ok, *args)
         with self.assertRaises(RuntimeError):
             sp._git(fake_runner(clean(), fail=True), "log")
+
+    def test_guard_discovery_diff_disables_textconv(self):
+        calls = []
+        self.cli(["--spec", "{spec}", "--base", BASE, "--report", "{report}"], fake_runner(clean(), calls=calls))
+        grep = [c for c in calls if "-Grglob" in c]
+        self.assertTrue(grep and all("--no-textconv" in c and "--no-ext-diff" in c for c in grep), calls)
+
+    def test_base_head_or_non_ancestor_is_a_base_finding(self):
+        rc, out = self.cli(["--spec", "{spec}", "--base", "HEAD", "--report", "{report}"], fake_runner(clean()))
+        self.assertEqual((rc, '"BASE"' in out), (1, True))
+        case = clean()
+        case["facts"]["ancestor"] = False
+        rc, out = self.cli(["--spec", "{spec}", "--base", BASE, "--report", "{report}"], fake_runner(case))
+        self.assertEqual((rc, '"BASE"' in out), (1, True))
+
+    def test_unreadable_changed_python_is_a_checker_error(self):
+        case = clean()
+        del case["texts"]["jarvis/demo.py"]
+        rc, out = self.cli(["--spec", "{spec}", "--base", BASE, "--report", "{report}"], fake_runner(case))
+        self.assertEqual((rc, "CHECKER_ERROR" in out), (2, True))
+
+    def test_usage_error_renders_json(self):
+        rc, out = self.cli(["--spec"], fake_runner(clean()))
+        self.assertEqual((rc, "```json" in out, '"CHECKER_ERROR"' in out), (2, True, True))
+        self.assertEqual(self.cli(["--help"], fake_runner(clean()))[0], 0)
+
+
+class FixRoundTests(unittest.TestCase):
+    def base_codes(self, base, ancestor=True):
+        case = clean()
+        case["facts"].update(base=base, base_is_ancestor=ancestor)
+        return codes(case)
+
+    def test_base_must_be_an_ancestor_parent_not_head(self):
+        self.assertEqual(self.base_codes(BASE), [])
+        self.assertEqual(self.base_codes(HEAD), ["BASE"])
+        self.assertEqual(self.base_codes(OTHER), ["BASE"])
+        self.assertEqual(self.base_codes(BASE, ancestor=False), ["BASE"])
+
+    def test_exception_with_raising_str_stays_a_finding(self):
+        class Boom(Exception):
+            def __str__(self):
+                raise ValueError("no str")
+        with mock.patch.object(sp, "_check", side_effect=Boom()):
+            self.assertEqual(codes(), ["CHECKER_ERROR"])
+
+    def test_ownership_is_case_exact(self):
+        case = clean()
+        case["changed_files"].append(("M", "jarvis/DEMO.py"))
+        self.assertEqual(codes(case), ["SCOPE"])
+
+    def test_rename_or_copy_needs_a_source_path(self):
+        for entry in (("R100", "jarvis/demo.py"), ("R100", "jarvis/demo.py", ""), ("C100", "jarvis/demo.py")):
+            with self.subTest(entry=entry):
+                case = clean()
+                case["changed_files"][0] = entry
+                self.assertIn("SCOPE", codes(case))
+
+    def test_only_the_lanes_own_duration_record_counts(self):
+        lane, other = "scripts/test_durations.d/DEMO1.json", "scripts/test_durations.d/OTHER.json"
+        case = clean()
+        case["spec"] = SPEC.replace("DEMO1.json (new)", "DEMO1.json (new), " + other + " (new)")
+        case["changed_files"] = [c for c in case["changed_files"] if c[1] != lane] + [("A", other)]
+        case["texts"][other] = case["texts"].pop(lane)
+        case["facts"]["head_files"] = [p for p in case["facts"]["head_files"] if p != lane] + [other]
+        self.assertEqual(codes(case), ["DURATION"])
+
+    def test_lane_record_at_head_is_validated(self):
+        lane = "scripts/test_durations.d/DEMO1.json"
+        for record, want in ((b'{"version": 1, "classes": [', ["DURATION"]), (b"\xff\xfe", ["DURATION"]),
+                             (b'{"version": 1, "classes": {"tests.test_demo.T": 1.0}}', [])):
+            with self.subTest(record=record):
+                case = clean()
+                case["changed_files"] = [c for c in case["changed_files"] if c[1] != lane]
+                del case["texts"][lane]
+                case["facts"]["lane_record"] = record
+                self.assertEqual(codes(case), want)
+
+    def test_negative_count_is_not_a_count(self):
+        self.assertEqual(codes(report=REPORT.replace("4 tests", "-1 tests")), ["REPORT"])
+
+    def test_allow_list_name_is_bounded(self):
+        case = with_text("jarvis/face/panel.py", b"import os\n")
+        case["spec"] = SPEC.replace("tests/test_demo.py (new)", "tests/test_demo.py (new), " + sp.FACE_GUARD)
+        case["changed_files"].append(("M", sp.FACE_GUARD))
+        case["texts"][sp.FACE_GUARD] = FACE_SRC + 'SHELL_IMPORTS |= {"os"}  # panel.py.tmp\n'
+        self.assertEqual(codes(case), ["FACE_ALLOW"])
+
+
+ADV_HEAD, ADV_BASE = "7b1401c5a3a2faf5b8a7dc396d8cd0e517ecc559", "7fcb07703e9efc530f744ee00371eeb0cb5c9670"
+ADV_FILES = ("tests/adversarial.py", "tests/test_adversarial.py", "scripts/test_durations.d/ADVCORPUS1.json")
+ADV_SPEC = ("@jarvis lane=ADVCORPUS1 model=opus effort=high base=" + ADV_BASE + "\n"
+            "Run: python scripts/test_parallel.py tests.test_adversarial\n"
+            "Owned files: tests/adversarial.py (new), tests/test_adversarial.py (new), "
+            "scripts/test_durations.d/ADVCORPUS1.json (new) [classes map for tests.test_adversarial], "
+            "build/reports/ADVCORPUS1.md (new). Anything else -> STOP (C2). Do NOT edit scripts/test_durations.json.\n")
+ADV_REPORT = ("STATUS: PASS\nBRANCH: worktree-ADVCORPUS1\nCOMMIT: " + ADV_HEAD + "\nPARENT: " + ADV_BASE + "\n"
+              "FILES: tests/adversarial.py, tests/test_adversarial.py, scripts/test_durations.d/ADVCORPUS1.json, "
+              "build/reports/ADVCORPUS1.md\n"
+              "RUNS: python scripts/test_parallel.py tests.test_adversarial -> 10 tests, 0 failures, exit 0; "
+              "ruff clean; git diff --check clean\n"
+              "CHANGED ASSERTS: none\nADJACENT FILES: none\nPRE-EXISTING: none\nGIT STATUS --SHORT: clean\nPUSHED: no\n"
+              "INTEGRATION LANE NEEDS: tests.test_adversarial\n")
+
+
+class RealSliceTests(unittest.TestCase):
+    def test_clean_historical_slice_has_no_findings(self):
+        """ADVCORPUS1 (7b1401c, integrated as f98113f): its spec, report and diff frozen; blobs unchanged at HEAD."""
+        tree = [p.relative_to(ROOT).as_posix() for d in ("jarvis", "scripts", "tests") for p in (ROOT / d).rglob("*.py")]
+        guards = [p for p in tree if p.startswith("tests/test_") and "rglob" in (ROOT / p).read_text(encoding="utf-8")]
+        sources = {p: (ROOT / p).read_text(encoding="utf-8") for p in {sp.FACE_GUARD, sp.PF_GUARD, sp.CONVEYOR, *guards}}
+        facts = {"head": ADV_HEAD, "parent": ADV_BASE, "main": ADV_BASE, "base": ADV_BASE, "base_is_ancestor": True,
+                 "old": {}, "head_files": sorted({*tree, *ADV_FILES}), "sources": sources}
+        texts = {p: (ROOT / p).read_bytes() for p in ADV_FILES}
+        self.assertEqual(sp.check(ADV_SPEC, [("A", p) for p in ADV_FILES], texts, ADV_REPORT, facts), [])
