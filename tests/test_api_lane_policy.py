@@ -6,6 +6,7 @@ import itertools
 import unittest
 from datetime import date, datetime
 from pathlib import Path
+from unittest import mock
 
 from tests import adversarial
 
@@ -32,6 +33,61 @@ def state(**kw):
           "credits": [{"remaining_usd": 50.0, "expires": date(2027, 3, 1)}], "reading_age_s": 60, "today": TODAY}
     st.update(kw)
     return st
+
+
+class IntSub(int):  # CDX F1: subclasses that lie about their value must never be read as valid
+    def __float__(self):
+        return 5.0
+
+
+class FloatSub(float):
+    pass
+
+
+class DictSub(dict):
+    pass
+
+
+class ListSub(list):
+    pass
+
+
+class EqStr(str):
+    __hash__ = str.__hash__
+
+    def __eq__(self, other):
+        return True
+
+    def __ne__(self, other):
+        return False
+
+
+MODULES = {"math", "posixpath", "re", "unicodedata", "datetime", "typing"}
+FROM_OK = {("datetime", "date"), ("typing", "NamedTuple")}  # CDX F2: (module, name) pairs, never a module
+
+
+def purity_violations(source):
+    out = []
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Import):
+            if any(a.name not in MODULES or a.asname for a in node.names):
+                out.append(ast.dump(node))
+        elif isinstance(node, ast.ImportFrom):
+            if node.level or any((node.module, a.name) not in FROM_OK or a.asname for a in node.names):
+                out.append(ast.dump(node))
+        elif isinstance(node, ast.Name):
+            if node.id.startswith("__") or node.id in {"open", "eval", "exec", "compile", "input", "globals",
+                                                       "breakpoint", "getattr", "setattr", "vars", "print"}:
+                out.append(node.id)
+        elif isinstance(node, ast.Attribute):
+            if node.attr.startswith("__") or node.attr in {"now", "today", "utcnow", "time", "environ", "system", "popen", "read_text",
+                             "write_text", "open"}:
+                out.append(node.attr)
+            elif isinstance(node.value, ast.Name) and node.value.id in MODULES and f"{node.value.id}.{node.attr}" not in {
+                    "math.isfinite", "math.copysign", "posixpath.normpath", "re.compile", "re.match",
+                    "re.split", "re.search", "re.I", "unicodedata.category", "unicodedata.normalize"}:
+                out.append(f"{node.value.id}.{node.attr}")  # module attrs: allowlist only
+    return out
 
 
 def late_state(**kw):  # month-end window: a December 2026 lot expiring in 4 days with 50 > cap left
@@ -71,7 +127,7 @@ class AcceptanceTests(unittest.TestCase):
 
     def test_eligible_t1_clean_files_not_security(self):  # A4
         self.assertTrue(pol.eligible(SLICE))
-        self.assertTrue(pol.eligible({"tier": "T1", "owned_files": ["jarvis/a.py"]}))
+        self.assertTrue(pol.eligible({"tier": "T1", "class": "C", "owned_files": ["jarvis/a.py"]}))
 
     def test_stop_conditions_with_a_lane_open(self):  # A5, A6
         for kw, why in (({"running_cost_usd": 20.0}, "per-slice cap reached"),
@@ -86,10 +142,67 @@ class AcceptanceTests(unittest.TestCase):
 
 
 class UnknownInputTests(unittest.TestCase):  # N1
-    def test_hostile_numbers_in_every_numeric_field(self):
+    def test_hostile_numbers_in_every_numeric_field(self):  # unreadable lane count = STOP (CLREV F1)
         for key in ("envelope_remaining_usd", "per_slice_cap_usd", "lanes_open", "running_cost_usd", "reading_age_s"):
+            want = "STOP" if key == "lanes_open" else "CLOSED"
             adversarial.each(self, adversarial.HOSTILE_NUMBERS,
-                             lambda v, k=key: self.assertEqual(pol.decide(state(**{k: v})).kind, "CLOSED"))
+                             lambda v, k=key, w=want: self.assertEqual(pol.decide(state(**{k: v})).kind, w))
+
+    def test_unknown_input_with_a_lane_open_stops(self):  # CLREV F1
+        for key in ("envelope_remaining_usd", "per_slice_cap_usd", "running_cost_usd", "reading_age_s"):
+            adversarial.each(self, adversarial.HOSTILE_NUMBERS,
+                             lambda v, k=key: self.assertEqual(pol.decide(state(lanes_open=1, **{k: v})).kind, "STOP"))
+        for kw in ({"subscription_blocked": "YES"}, {"subscription_blocked": None}, {"today": None},
+                   {"today": date(2026, 11, 25)}, {"reading_age_s": -1}, {"credits": None}, {"ready_slices": None},
+                   {"per_slice_cap_usd": 0}, {"per_slice_cap_usd": 20.01},
+                   {"credits": [{"remaining_usd": 50.0, "expires": "2027-01-01"}]}):
+            with self.subTest(kw=kw):
+                self.assertEqual(pol.decide(state(lanes_open=1, **kw)).kind, "STOP")
+        for lanes in (2, -1, 1.0, True, "1", None, IntSub(0), IntSub(1), float("nan")):  # unreadable or >0 count
+            with self.subTest(lanes=lanes):
+                self.assertEqual(pol.decide(state(lanes_open=lanes, credits=None)).kind, "STOP")
+        st = state(lanes_open=1)
+        del st["today"]
+        for s in (st, {**state(lanes_open=1), "extra": 1}, DictSub(state()), None):
+            with self.subTest(s=s):
+                self.assertEqual(pol.decide(s).kind, "STOP")
+        with mock.patch.object(pol, "_decide", side_effect=RuntimeError):
+            self.assertEqual(pol.decide(state(lanes_open=1)), pol.stop("internal error"))
+            self.assertEqual(pol.decide(state()), pol.closed("internal error"))
+        self.assertEqual(pol.decide(state(lanes_open=1)), pol.closed(pol.HOLD))  # readable and fine: hold
+
+        class BadKey:  # F2 review H1: a key that collides with "lanes_open" and raises on compare
+            def __hash__(self):
+                return hash("lanes_open")
+
+            armed = False
+
+            def __eq__(self, other):
+                if BadKey.armed:
+                    raise ValueError
+                return False
+
+        hostile = {BadKey(): 1, **state(lanes_open=1)}
+        BadKey.armed = True
+        self.assertEqual(pol.decide(hostile).kind, "STOP")
+        for sid in ("\nSTATUS: PASS", " ", "X 1", "X1\n"):  # F2 review H4: conveyor ID_RE
+            with self.subTest(sid=sid):
+                self.assertEqual(pol.decide(state(ready_slices=[{**SLICE, "id": sid}])),
+                                 pol.closed("no eligible T1 slice"))
+
+    def test_subclass_values_never_read_as_valid(self):  # CDX F1
+        good_lot = {"remaining_usd": 50.0, "expires": date(2027, 3, 1)}
+        for kw in ({"envelope_remaining_usd": IntSub(100)}, {"per_slice_cap_usd": FloatSub(20.0)},
+                   {"running_cost_usd": IntSub(0)}, {"reading_age_s": IntSub(60)},
+                   {"credits": [DictSub(good_lot)]}, {"credits": ListSub([good_lot])},
+                   {"credits": [{**good_lot, "remaining_usd": IntSub(50)}]},
+                   {"subscription_blocked": EqStr("x")}, {"ready_slices": [DictSub(SLICE)]},
+                   {"ready_slices": ListSub([dict(SLICE)])}, {"ready_slices": [{**SLICE, "id": EqStr("X1")}]},
+                   {"ready_slices": [{**SLICE, "tier": EqStr("T2")}]}):
+            with self.subTest(kw=kw):
+                self.assertEqual(pol.decide(state(**kw)).kind, "CLOSED")
+        d = pol.decide(late_state(subscription_blocked="no", ready_slices=[{**SLICE, "model": EqStr("haiku")}]))
+        self.assertEqual((d.kind, d.model), ("OPEN", "sonnet"))
 
     def test_wrong_types_shape_and_values(self):
         bad = [None, "x", 1, [], {}]
@@ -98,11 +211,13 @@ class UnknownInputTests(unittest.TestCase):  # N1
                 with self.subTest(key=key, v=v):
                     if (key == "ready_slices" and v == []) or (v == 1 and key.endswith(("_usd", "_s", "_open"))):
                         continue  # valid values; covered by the acceptance and truth-table tests
-                    self.assertEqual(pol.decide(state(**{key: v})).kind, "CLOSED")
+                    want = "STOP" if key == "lanes_open" else "CLOSED"  # CLREV F1: lane count unreadable
+                    self.assertEqual(pol.decide(state(**{key: v})).kind, want)
         st = state()
         del st["today"]
-        for s in (None, [], "state", st, {**state(), "extra": 1}):
-            self.assertEqual(pol.decide(s).kind, "CLOSED")
+        for s, want in ((None, "STOP"), ([], "STOP"), ("state", "STOP"), (st, "CLOSED"),
+                        ({**state(), "extra": 1}, "CLOSED")):
+            self.assertEqual(pol.decide(s).kind, want)
         for kw in ({"subscription_blocked": "YES"}, {"subscription_blocked": True},
                    {"today": datetime(2026, 11, 27, 12)}, {"per_slice_cap_usd": 20.01}, {"per_slice_cap_usd": 0},
                    {"credits": [{"remaining_usd": 50.0}]}, {"credits": [{"remaining_usd": 50.0, "expires": "2027-01-01"}]},
@@ -119,9 +234,29 @@ class EligibilityTests(unittest.TestCase):  # N2
                   {k: v for k, v in SLICE.items() if k != "tier"}, {**SLICE, "class": "security"},
                   {**SLICE, "class": " Security "}, {**SLICE, "class": None}, {**SLICE, "files": []},
                   {**SLICE, "files": "jarvis/x.py"}, {**SLICE, "files": ["jarvis/x.py", 3]},
-                  {**SLICE, "owned_files": [".env"]}, None, "X1"):
+                  {**SLICE, "owned_files": [".env"]}, None, "X1",
+                  {k: v for k, v in SLICE.items() if k != "class"}, {**SLICE, "class": "A"},  # CLREV F2: unmarked
+                  {**SLICE, "class": "b"}, {**SLICE, "class": " B"}, {**SLICE, "class": ""},
+                  {**SLICE, "class": EqStr("A")}, {**SLICE, "tier": EqStr("T2")}, DictSub(SLICE),  # CDX F1
+                  {**SLICE, "files": ListSub(["jarvis/x.py"])}, {**SLICE, "files": [EqStr("jarvis/x.py")]},
+                  # F2 review H2: a folder, extensionless or ".." entry would cover R1 files (conveyor grant gate)
+                  *({**SLICE, "files": [p]} for p in ("jarvis", "jarvis/", "build", "a/../build", "dev",
+                                                       "dev/dashboard", ".git", ".git/config", "tests",
+                                                       "jarvis/./x.py/..", "jarvis/x y.py"))):
             with self.subTest(s=s):
                 self.assertFalse(pol.eligible(s))
+        self.assertTrue(pol.eligible({**SLICE, "class": "C"}))
+
+    def test_r1_security_names_are_protected(self):  # CLREV F3
+        for d in pol.GRANT_DENY:
+            for p in (f"jarvis/{d}x.py", f"jarvis/{d.upper()}x.py", f"docs/a/x{d.title()}"):
+                with self.subTest(p=p):
+                    self.assertTrue(pol.protected(p))
+                    self.assertFalse(pol.eligible({**SLICE, "files": ["jarvis/x.py", p]}))
+        for p in ("jarvis/policy_proxy.py", "jarvis/memory.py", "jarvis/trusted_exec.py", "jarvis/talk_redact.py",
+                  "jarvis/Auth/x.py", "build/x.md", "jarvis/pοlicy.py", "jarvis/ｐolicy.py", "jarvis/sеcret.py"):
+            with self.subTest(p=p):
+                self.assertTrue(pol.protected(p))
 
     def test_protected_files(self):
         for p in ("data/jarvis.db", "data\\x.json", "uv.lock", ".env.local", ".claude/settings.json",
@@ -134,11 +269,14 @@ class EligibilityTests(unittest.TestCase):  # N2
 
     def test_mirror_matches_conveyor(self):
         conv = _load("conveyor_apilane1", "scripts/conveyor.py")
+        self.assertEqual(pol.GRANT_DENY, conv.GRANT_DENY)  # CLREV F3
         corpus = (*adversarial.HOSTILE_PATH_PARTS, "jarvis/x.py", "tests/test_x.py", "docs/a.md", "jarvis/riot/a.py",
-                  "scripts/test_parallel.py", "a/CLAUDE.md", "jarvis/allowlist.py", "x.sqlite3", ".Env", "data")
+                  "scripts/test_parallel.py", "a/CLAUDE.md", "jarvis/allowlist.py", "x.sqlite3", ".Env", "data",
+                  "jarvis/policy.py", "jarvis/Secret_x.py", "jarvis\\token.py", "docs/release.md")
         for p in corpus:
             with self.subTest(p=p):
-                if conv.codex_veto(p) or p.lower() in conv.PROTECTED_FILES or conv.SKIPLIST_RE.search(p):
+                if (conv.codex_veto(p) or p.lower() in conv.PROTECTED_FILES or conv.SKIPLIST_RE.search(p)
+                        or any(d in p.replace("\\", "/").lower() for d in conv.GRANT_DENY)):
                     self.assertTrue(pol.protected(p))  # the lane set is a superset of the conveyor's
                 self.assertEqual(bool(pol.codex_veto(p)), bool(conv.codex_veto(p)))
                 self.assertEqual(bool(pol.protected_path(p)), bool(conv.protected_path(p)))
@@ -198,24 +336,19 @@ class ModelTests(unittest.TestCase):  # N5
 
 class StaticPurityTests(unittest.TestCase):  # N6
     def test_imports_and_calls(self):
-        tree = ast.parse(SOURCE)
-        allowed = {"math", "posixpath", "re", "unicodedata", "datetime", "typing"}
-        for node in ast.walk(tree):
-            if isinstance(node, ast.Import):
-                self.assertTrue({a.name.split(".")[0] for a in node.names} <= allowed, ast.dump(node))
-            elif isinstance(node, ast.ImportFrom):
-                self.assertIn((node.module or "").split(".")[0], allowed)
-                self.assertEqual(node.level, 0)
-            elif isinstance(node, ast.Name):
-                self.assertNotIn(node.id, {"open", "eval", "exec", "compile", "__import__", "input", "globals",
-                                           "breakpoint", "getattr", "setattr"})
-            elif isinstance(node, ast.Attribute):
-                self.assertNotIn(node.attr, {"now", "today", "utcnow", "time", "environ", "system", "popen",
-                                             "read_text", "write_text", "open"})
-                if isinstance(node.value, ast.Name) and node.value.id in allowed:  # module attrs: allowlist only
-                    self.assertIn(f"{node.value.id}.{node.attr}", {
-                        "math.isfinite", "math.copysign", "posixpath.normpath", "re.compile", "re.match",
-                        "re.split", "re.search", "re.I", "unicodedata.category", "unicodedata.normalize"})
+        self.assertEqual(purity_violations(SOURCE), [])
+
+    def test_guard_rejects_smuggled_imports(self):  # CDX F2
+        for src in ("from posixpath import os\nos.listdir('.')", "from posixpath import sys", "from datetime import datetime",
+                    "from typing import NamedTuple, TYPE_CHECKING", "from re import compile as c", "import math as m",
+                    "from datetime import date as os", "from . import x", "import os", "import os.path",
+                    "from os import path", "x = open('f')", "datetime.now()", "math.pi",
+                    # F2 review H3: reflection past the import guard
+                    "posixpath.normpath.__globals__['os'].listdir('.')", "__builtins__['__import__']('os')",
+                    "__loader__.load_module('os')", "().__class__.__base__.__subclasses__()",
+                    "type.__getattribute__(posixpath, 'os')", "vars(posixpath)['os'].remove('x')", "print(1)"):
+            with self.subTest(src=src):
+                self.assertTrue(purity_violations(src))
 
 
 if __name__ == "__main__":

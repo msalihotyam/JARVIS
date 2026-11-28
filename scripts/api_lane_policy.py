@@ -48,7 +48,14 @@ PROTECTED_FILES = {"scripts/test_parallel.py", "scripts/ci.ps1", "scripts/qualit
 ALIAS_DIRS = (".claude", ".github", "workflows", "data", ".jarvis")
 WIN_DEVICES = {"con", "prn", "aux", "nul", "conin$", "conout$", *(f"{d}{i}" for d in ("com", "lpt") for i in range(1, 10))}
 CODEX_VETO = ("scripts/", ".claude/", ".github/", "data/")
+# the conveyor's R1 security list (GRANT_DENY), lowercase substrings
+GRANT_DENY = ("policy", "approv", "authori", "auth", "credential", "secret", "redact", "token",
+              "password", "api_key", "apikey", "memory.py", "schema", "trusted_exec", "conveyor",
+              "push", "release", "uv.lock", ".env", "scripts/", ".github/", ".claude/", "build/",
+              "data/")
 SKIPLIST_RE = re.compile(r"(skip|allow)[_-]?list|load[_-]?sensitive", re.I)
+GRANT_PATH_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_./-]*")  # conveyor grant gate: a file, never a folder
+ID_RE = re.compile(r"[A-Za-z0-9_-]+")  # conveyor slice id
 
 
 def _hidden_char(ch):
@@ -100,26 +107,31 @@ def codex_veto(p):
 def protected(p):
     """The API lane's protected set: the conveyor's codex veto (covers protected_path, PROTECTED_DIRS,
     PROTECTED_FILES via scripts/) plus its skip/allow/load-sensitive list names, and stricter than the
-    conveyor where it normalizes silently: padded names, backslashes and a bare .jarvis segment.
-    Non-str = protected."""
-    if not isinstance(p, str) or p != p.strip() or "\\" in p:
+    conveyor where it normalizes silently: padded names, backslashes and a bare .jarvis segment, plus
+    the R1 security list (GRANT_DENY) and any non-ASCII path (homoglyphs of R1 words).
+    Non-str (exact type) = protected."""
+    if type(p) is not str or p != p.strip() or "\\" in p or not p.isascii():
         return True
-    return codex_veto(p) or bool(SKIPLIST_RE.search(p)) or ".jarvis" in p.casefold().split("/")
+    if not GRANT_PATH_RE.fullmatch(p) or ".." in p.split("/") or "." not in p.rsplit("/", 1)[-1].strip("."):
+        return True  # a folder or extensionless name would cover the R1 files in it (conveyor grant gate)
+    return (codex_veto(p) or bool(SKIPLIST_RE.search(p)) or ".jarvis" in p.casefold().split("/")
+            or any(d in p.lower() for d in GRANT_DENY))
 
 
 def eligible(s):
     """True only for a dict slice with tier exactly T1, a non-empty list of str files (conveyor key
-    "files", plus "owned_files" if given) touching nothing protected, and a class that is not security."""
-    if not isinstance(s, dict) or s.get("tier") != "T1":
+    "files", plus "owned_files" if given) touching nothing protected, and class B or C (the classes
+    Conveyor.route sends off-subscription; absent = unmarked = not eligible). Exact built-in types only."""
+    if type(s) is not dict or type(s.get("tier")) is not str or s["tier"] != "T1":
         return False
     files = []
     for key in ("files", "owned_files"):
         v = s.get(key, [])
-        if not isinstance(v, list):
+        if type(v) is not list:
             return False
         files += v
-    cls = s.get("class", "")
-    if not isinstance(cls, str) or cls.strip().casefold() == "security":
+    cls = s.get("class")
+    if type(cls) is not str or cls not in ("B", "C"):
         return False
     return bool(files) and not any(protected(f) for f in files)
 
@@ -128,8 +140,8 @@ EPOCH = date(2026, 11, 26)  # the rule was approved on this day; an earlier "tod
 
 
 def _num(x):
-    """A finite non-negative number as float, else None (bool, str, None, NaN, inf, -0.0, huge int)."""
-    if isinstance(x, bool) or not isinstance(x, (int, float)):
+    """A finite non-negative number as float, else None (bool, subclass, str, None, NaN, inf, -0.0, huge int)."""
+    if type(x) not in (int, float):
         return None
     try:
         f = float(x)
@@ -139,11 +151,11 @@ def _num(x):
 
 
 def _credits(v):
-    if not isinstance(v, list):
+    if type(v) is not list:
         return None
     out = []
     for c in v:
-        if not isinstance(c, dict) or set(c) != CREDIT_KEYS or type(c["expires"]) is not date:
+        if type(c) is not dict or set(c) != CREDIT_KEYS or type(c["expires"]) is not date:
             return None
         r = _num(c["remaining_usd"])
         if r is None:
@@ -160,25 +172,37 @@ def month_end(credits, today, margin):
         for left, exp in credits)
 
 
+HOLD = "overflow lane already open"
+
+
 def decide(state):
+    """Unknown input = CLOSED while no overflow lane runs; once lanes_open is anything but exact int 0
+    (a lane runs, or the count is unreadable) every unknown/clock-backwards/error result is STOP."""
     try:
-        return _decide(state)
-    except Exception:  # unknown = closed, never raise into the caller
-        return closed("internal error")
+        d = _decide(state)
+    except Exception:  # never raise into the caller
+        d = closed("internal error")
+    try:
+        lanes = state.get("lanes_open") if type(state) is dict else None
+    except Exception:  # a hostile key can raise on lookup: unreadable count
+        lanes = None
+    if d.kind == "CLOSED" and d.reason != HOLD and not (type(lanes) is int and lanes == 0):
+        return stop(d.reason)
+    return d
 
 
 def _decide(st):
-    if not isinstance(st, dict) or set(st) != KEYS:
+    if type(st) is not dict or set(st) != KEYS:
         return closed("unknown state shape")
     quota, today = st["subscription_blocked"], st["today"]
-    if not isinstance(quota, str) or quota not in ("yes", "no", "unknown"):
+    if type(quota) is not str or quota not in ("yes", "no", "unknown"):
         return closed("quota line unreadable")
     if type(today) is not date:
         return closed("today unreadable")
     if today < EPOCH:
         return closed("clock went backwards")
     age = st["reading_age_s"]
-    if not isinstance(age, bool) and isinstance(age, (int, float)) and age < 0:
+    if type(age) in (int, float) and age < 0:
         return closed("clock went backwards")
     age, env, cap, cost = (_num(st[k]) for k in ("reading_age_s", "envelope_remaining_usd", "per_slice_cap_usd",
                                                   "running_cost_usd"))
@@ -191,7 +215,7 @@ def _decide(st):
         return closed("lane count unreadable")
     if not 0 < cap <= PER_SLICE_CAP_MAX_USD:
         return closed("per-slice cap out of range")
-    if not isinstance(slices, list):
+    if type(slices) is not list:
         return closed("ready slices unreadable")
     stale = age > FRESH_S
     usable = sum(left for left, exp in credits if exp >= today)
@@ -206,14 +230,14 @@ def _decide(st):
             return stop("credit exhausted")
         if stale:
             return stop("credit reading stale")
-        return closed("overflow lane already open")
+        return closed(HOLD)
     if stale:
         return closed("credit reading stale")
     if env < cap:
         return closed("envelope below per-slice cap")
     if usable < cap:
         return closed("credit below per-slice cap")
-    ready = [s for s in slices if eligible(s) and isinstance(s.get("id"), str) and s["id"]]
+    ready = [s for s in slices if eligible(s) and type(s.get("id")) is str and ID_RE.fullmatch(s["id"])]
     if not ready:
         return closed("no eligible T1 slice")
     late = month_end(credits, today, cap)
@@ -222,5 +246,5 @@ def _decide(st):
     if quota == "no" and not late:
         return closed("subscription running")
     s = ready[0]
-    model = MODEL_OPUS if late and s.get("model") == MODEL_OPUS else MODEL_SONNET
+    model = MODEL_OPUS if late and type(s.get("model")) is str and s["model"] == MODEL_OPUS else MODEL_SONNET
     return Decision("OPEN", "", model, EFFORT, s["id"])
