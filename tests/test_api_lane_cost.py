@@ -146,6 +146,50 @@ class EventMatrixTests(unittest.TestCase):
         for cap in (float("nan"), -1, True, "5", None, float("inf") * 0):
             self.assertTrue(meter(cap=cap).over_cap(), cap)
 
+    def test_hostile_reported_total_never_raises(self):
+        # APILANE3FIX F1: 10**400 made math.isfinite raise OverflowError
+        def check(v):
+            for via_feed in (False, True):
+                m = meter()
+                m.feed(msg(input_tokens=1_000_000))
+                ev = {"type": "result", "total_cost_usd": v}
+                if via_feed:
+                    m.feed(ev)
+                    c = m.cost
+                else:
+                    c = m.final(ev)
+                self.assertIsNotNone(c)
+                self.assertEqual(c.usd, 2.0)
+                self.assertNotIn("bad_event", c.flags)
+                if v is not None and not (isinstance(v, float) and v == 0):  # only -0.0 is a valid amount
+                    self.assertIn("bad_reported", c.flags)
+                    self.assertIsNone(c.reported_usd)
+                elif v is not None:  # -0.0 is booked as 0.0, never a signed zero
+                    self.assertEqual(math.copysign(1, c.reported_usd), 1)
+        each(self, HOSTILE_NUMBERS + (-10**400,), check)
+
+    def test_hostile_cap_never_raises_and_is_reached(self):
+        def check(v):
+            m = meter(cap=v)
+            self.assertTrue(m.over_cap())
+            if not (isinstance(v, float) and v == 0):  # only -0.0 is a valid cap (0, reached)
+                self.assertIn("bad_cap", m.flags)
+        each(self, HOSTILE_NUMBERS + (-10**400,), check)
+
+    def test_over_cap_honours_final_charge(self):
+        # APILANE3FIX F3: the reported total above the measured one counts against the cap
+        m = meter(cap=1.0)
+        self.assertFalse(m.over_cap())
+        m.final({"type": "result", "total_cost_usd": 2})
+        self.assertTrue(m.over_cap())
+        m2 = meter(cap=3.0)
+        m2.feed(msg(input_tokens=1_000_000))
+        m2.final({"type": "result", "total_cost_usd": 0.5})
+        self.assertFalse(m2.over_cap())
+        m3 = meter(cap=1.0)
+        m3.feed({"type": "result", "total_cost_usd": 1.0})
+        self.assertTrue(m3.over_cap())
+
     def test_events_after_final_and_duplicate_final(self):
         m = meter()
         m.feed(msg(input_tokens=1_000_000))
@@ -190,6 +234,20 @@ class LedgerTests(unittest.TestCase):
             self.assertEqual(len(ledger_rows(p)), 1)
             self.assertTrue(lc.write(p, "S", meter(session="other").final(None), clock=Clock()))
             self.assertEqual(len(ledger_rows(p)), 2)
+
+    def test_direct_final_takes_result_session(self):
+        # APILANE3FIX F2: final(result) without an earlier session event used a random session
+        res = {"type": "result", "session_id": "S1", "total_cost_usd": 1}
+        with tempfile.TemporaryDirectory() as d:
+            p = Path(d) / "api_ledger.jsonl"
+            self.assertTrue(lc.write(p, "S", meter().final(dict(res)), clock=Clock()))
+            self.assertFalse(lc.write(p, "S", meter().final(dict(res)), clock=Clock()))
+            self.assertEqual([r["session"] for r in ledger_rows(p)], ["S1"])
+        self.assertEqual(meter(session="pre").final(res).session, "pre")  # a known session is kept
+        self.assertEqual(meter().final({"session_id": "x" * 500}).session, "x" * lc.SLICE_MAX)
+        for bad in ("", 7, None, ["S1"], True):
+            a, b = meter().final({"session_id": bad}), meter().final({"session_id": bad})
+            self.assertNotEqual(a.session, b.session, bad)  # no usable id: never merged
 
     def test_slice_id_scrubbed_and_bounded(self):
         with tempfile.TemporaryDirectory() as d:

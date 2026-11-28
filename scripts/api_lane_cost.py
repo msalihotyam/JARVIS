@@ -57,14 +57,25 @@ def _count(x, flags):
     return int(math.ceil(x))
 
 
+def _money(x):
+    """A USD amount as a finite non-negative float, else None (bool, non-number, NaN/inf, negative, huge int)."""
+    if isinstance(x, bool) or not isinstance(x, (int, float)):
+        return None
+    try:
+        x = float(x)
+    except OverflowError:  # an int past float range (10**400) cannot be an honest amount
+        return None
+    return x + 0.0 if math.isfinite(x) and x >= 0 else None  # + 0.0: -0.0 becomes 0.0
+
+
 class Meter:
     def __init__(self, prices=None, cap=0.0, *, session=None, clock=time.monotonic):
         self.prices = dict(ca.PRICES if prices is None else prices)
         self.flags = set()
-        ok = not isinstance(cap, bool) and isinstance(cap, (int, float)) and math.isfinite(cap) and cap >= 0
-        if not ok:
+        self.cap = _money(cap)
+        if self.cap is None:
             self.flags.add("bad_cap")
-        self.cap = cap if ok else 0.0  # a bad cap is already reached (fail closed)
+            self.cap = 0.0  # a bad cap is already reached (fail closed)
         self.session = session if isinstance(session, str) and session else None
         self.clock, self.t0 = clock, clock()
         self.msgs = {}  # message id -> (model, {kind: count}, usd)
@@ -86,9 +97,7 @@ class Meter:
         if not isinstance(event, dict):
             self.flags.add("bad_event")
             return
-        sid = event.get("session_id")
-        if self.session is None and isinstance(sid, str) and sid:
-            self.session = sid[:SLICE_MAX]
+        self._take_session(event)
         if event.get("type") == "result":
             self.final(event)
             return
@@ -112,22 +121,29 @@ class Meter:
         self.total += usd - (old[2] if old else 0.0)
         self.msgs[key] = (model, counts, usd)
 
+    def _take_session(self, event):
+        sid = event.get("session_id")
+        if self.session is None and isinstance(sid, str) and sid:
+            self.session = sid[:SLICE_MAX]
+
     def usd(self):
         return max(self.total, 0.0)
 
     def over_cap(self):
-        return self.usd() >= self.cap
+        # after final, the charge (max of measured and reported) is what counts against the cap
+        return max(self.usd(), self.cost.usd if self.cost else 0.0) >= self.cap
 
     def final(self, result=None):
         """The session's Cost; result = its "result" event or None (killed / crashed). Idempotent."""
         if self.cost is not None:
             self.flags.add("duplicate_final")
             return self.cost
-        rep = result.get("total_cost_usd") if isinstance(result, dict) else None
-        if rep is not None and (isinstance(rep, bool) or not isinstance(rep, (int, float))
-                                or not math.isfinite(rep) or rep < 0):
+        if isinstance(result, dict):
+            self._take_session(result)
+        raw = result.get("total_cost_usd") if isinstance(result, dict) else None
+        rep = _money(raw)
+        if raw is not None and rep is None:
             self.flags.add("bad_reported")
-            rep = None
         if result is None:
             self.flags.add("no_final")
         if not self.msgs:
