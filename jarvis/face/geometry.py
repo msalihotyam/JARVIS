@@ -31,8 +31,8 @@ class Rect(NamedTuple):
 
 def rect(state: object, work_area: object, scale: object, saved_ring_pos: object = None) -> Rect:
     """Window rect for state on the screen that holds the ring (primary when none does)."""
-    if not isinstance(state, str) or state not in STATES:
-        raise GeometryRefused(f"unknown state: {state!r:.40}")
+    if type(state) is not str or state not in STATES:  # exact str: a subclass may override __eq__
+        raise GeometryRefused("unknown state")  # fixed text: formatting the input could raise
     s = _number(scale, "scale")
     if not SCALE_RANGE[0] <= s <= SCALE_RANGE[1]:
         raise GeometryRefused("scale outside 1..5")
@@ -42,12 +42,13 @@ def rect(state: object, work_area: object, scale: object, saved_ring_pos: object
     width, height = right - left, bottom - top
     if state == "ring":
         return Rect(ring_x, ring_y, RING, RING)
-    if state == "full" or width < READER_MIN[0] or height - 2 * MARGIN < READER_MIN[1]:
+    if state == "full" or width < READER_MIN[0] or height < READER_MIN[1]:
         return Rect(left, top, width, height)
+    gap = min(MARGIN, (height - READER_MIN[1]) // 2)  # top/bottom margin shrinks so the reader keeps its minimum height
     if width >= READER_WIDTH:
         side = min(MARGIN, width - READER_WIDTH)  # right margin shrinks so an 880 reader still fits
-        return Rect(right - side - READER_WIDTH, top + MARGIN, READER_WIDTH, height - 2 * MARGIN)
-    return Rect(left, top + MARGIN, width, height - 2 * MARGIN)
+        return Rect(right - side - READER_WIDTH, top + gap, READER_WIDTH, height - 2 * gap)
+    return Rect(left, top + gap, width, height - 2 * gap)
 
 
 def _number(value: object, what: str) -> Fraction:

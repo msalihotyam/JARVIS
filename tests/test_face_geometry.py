@@ -53,6 +53,29 @@ class AcceptanceTests(unittest.TestCase):
                     gap = full.x + full.width - (r.x + r.width)  # right margin
                     self.assertEqual(gap, min(24, full.width - 880) if full.width >= 880 else 0)
 
+    def test_3c_reader_880_wide_from_320_high_vertical_margin_shrinks(self):
+        # FACEGEO1FIX2: height -> (top margin, reader height); margin min(24, (height - 320) // 2), full only below 320
+        for height, top, h in ((320, 0, 320), (321, 0, 321), (350, 15, 320), (367, 23, 321), (368, 24, 320), (500, 24, 452)):
+            with self.subTest(height=height):
+                self.assertEqual(g.rect("reader", (0, 0, 900, height), 1), (0, top, 880, h))
+                self.assertEqual(g.rect("reader", (0, 0, 600, height), 1), (0, top, 600, h))  # narrow: full width
+        self.assertEqual(g.rect("reader", (0, 0, 900, 319), 1), (0, 0, 900, 319))  # below 320: full work area
+        self.assertEqual(g.rect("reader", (0, 0, 5120, 1440), 4), (1280 - 24 - 880, 20, 880, 320))  # 32:9 at 400 %: 1280x360
+        self.assertEqual(g.rect("reader", [HD, (-900, 0, 900, 350)], 1, (-500, 100)), (-900, 15, 880, 320))
+        for height in range(400, 560, 7):  # device px; logical ~228..448 across scales, odd origin
+            for s in (1.25, 1.5, 1.75):
+                area = (-2001, -height - 3, 1700, height)
+                with self.subTest(height=height, s=s):
+                    r, full = g.rect("reader", area, s), g.rect("full", area, s)
+                    self.assertTrue(inside(r, area, s), r)
+                    if full.height < 320:
+                        self.assertEqual(r, full)
+                        continue
+                    self.assertEqual(r.width, min(880, full.width))
+                    self.assertGreaterEqual(r.height, 320)
+                    gap = min(24, (full.height - 320) // 2)
+                    self.assertEqual((r.y - full.y, full.y + full.height - r.y - r.height), (gap, gap))
+
     def test_4_full_is_the_work_area(self):
         self.assertEqual(g.rect("full", HD, 1), (0, 0, 1920, 1040))
         self.assertEqual(g.rect("full", (0, 0, 1920, 1040), 1.25), (0, 0, 1536, 832))
@@ -120,6 +143,27 @@ class NegativeTests(unittest.TestCase):
         for state in ("", "Ring", "mini", None, 1, b"ring", ("ring",)):
             with self.subTest(state=state):
                 self.refused(state, HD, 1)
+
+    def test_5b_unknown_state_refused_without_formatting_it(self):
+        # FACEGEO1FIX2: the refusal never builds the input's repr (huge int, raising __repr__/__eq__, str subclass)
+        class Loud:
+            def __repr__(self):
+                raise RuntimeError("repr called")
+
+        class LoudStr(str):
+            def __repr__(self):
+                raise RuntimeError("repr called")
+
+            def __eq__(self, other):
+                raise RuntimeError("eq called")
+
+            __hash__ = str.__hash__
+
+        for state in (10**5000, Loud(), LoudStr("ring"), LoudStr("x"), "x" * 10**6):
+            with self.subTest(state=type(state).__name__):
+                with self.assertRaises(g.GeometryRefused) as caught:
+                    g.rect(state, HD, 1)
+                self.assertEqual(str(caught.exception), "unknown state")
 
     def test_6_huge_and_negative_origins(self):
         far = (2**31 - 4000, -(2**31), 3840, 2160)
