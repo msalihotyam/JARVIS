@@ -29,6 +29,7 @@ TOKENS = MappingProxyType({
         "accent_surface": "#0F1C24",
         "accent_line": "#1D3A4A",
         "needs_you": "#F2B34A",
+        "needs_you_ink": "#2A1C03",
         "error": "#F2777F",
         "ok": "#6FD3A3",
         "disabled_glyph": "#5E6978",
@@ -48,6 +49,15 @@ TOKENS = MappingProxyType({
         "cell": (15, 24),
         "meta": (13, 20),
         "control": (14, 20),
+        "num": (28, 34),
+        "num_unit": (17, 26),
+        "mono": (13, 20),
+        "label_weight": 600,
+        "label_caps": 1,  # Qt Font.AllUppercase
+        "label_spacing_em": 0.04,
+        "num_weight": 600,
+        "num_unit_weight": 500,
+        "mono_weight": 500,
         "family_sans": "Inter",
         "family_mono": "JetBrains Mono",
     }),
@@ -60,12 +70,38 @@ TOKENS = MappingProxyType({
         "pane": 600,
         "composer_radius": 16,
         "mini_box": 460,
+        "pane_header": 56,
+        "tab": 36,
+        "bar": 8,
+        "tick_w": 2,
+        "tick_h": 16,
     }),
     "motion": MappingProxyType({
         "fast": 120,
         "medium": 200,
         "slow": 320,
         "curve": (0.2, 0.0, 0.0, 1.0),  # cubic-bezier x1, y1, x2, y2
+        "breathe": 4000,
+        "swell": 700,
+        "arc": 1200,
+        "arc2": 2400,
+        "arc3": 3200,
+        "ripple": 1600,
+        "ask": 1600,
+    }),
+    # The ring, drawn in a ``box`` x ``box`` area: radii (r) and stroke widths (w).
+    "ring": MappingProxyType({
+        "box": 120,
+        "outer_r": 54,
+        "outer_w": 1.5,
+        "dash_r": 46,
+        "dash_w": 2,
+        "dash_on": 2,
+        "dash_off": 6,
+        "main_r": 38,
+        "main_w": 4,
+        "glow_r": 20,
+        "core_r": 12,
     }),
     "radius": MappingProxyType({
         "panel": 12,
@@ -85,7 +121,7 @@ ROLES = MappingProxyType({
     "accent_surface": "surface",
     "line1": "line", "line2": "line", "accent_line": "line",
     "text1": "text", "text2": "text", "text3": "text", "accent": "text", "accent_ink": "text",
-    "needs_you": "text", "error": "text", "ok": "text",
+    "needs_you": "text", "needs_you_ink": "text", "error": "text", "ok": "text",
     "link": "text", "link_hover": "text", "text_soft": "text",
     "disabled_glyph": "non_text",
 })
@@ -94,7 +130,7 @@ _SURFACES = ("base", "surface1", "surface2", "surface3", "accent_surface")
 _ON_SURFACES = ("text1", "text2", "text3", "accent", "needs_you", "error", "ok",
                 "link", "link_hover", "text_soft")
 #: Every (foreground, background) colour-name pair the design puts text on.
-PAIRS = tuple((fg, bg) for fg in _ON_SURFACES for bg in _SURFACES) + (("accent_ink", "accent"),)
+PAIRS = tuple((fg, bg) for fg in _ON_SURFACES for bg in _SURFACES) + (("accent_ink", "accent"), ("needs_you_ink", "needs_you"))
 MIN_TEXT_CONTRAST = 4.5
 
 
@@ -125,14 +161,8 @@ def contrast(fg: object, bg: object) -> float | Refusal:
 
 def motion(reduced: object = False) -> dict:
     """Durations in ms and the easing curve; anything but ``reduced is False`` means zero motion."""
-    m = TOKENS["motion"]
     still = reduced is not False  # fail-closed: an unclear value gets the reduced-motion answer
-    return {
-        "fast": 0 if still else m["fast"],
-        "medium": 0 if still else m["medium"],
-        "slow": 0 if still else m["slow"],
-        "curve": m["curve"],
-    }
+    return {k: v if k == "curve" else 0 if still else v for k, v in TOKENS["motion"].items()}
 
 
 _TUPLE_KEYS = {
