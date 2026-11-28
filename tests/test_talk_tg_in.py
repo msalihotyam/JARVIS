@@ -219,13 +219,64 @@ class MergedTest(unittest.TestCase):
         self.assertEqual([r["id"] for r in merged.take(4)], ["p1"])
 
     def test_a_pc_item_cannot_take_a_telegram_id(self):
-        pc = PcRaw(pc_item("tg.5"))
-        merged = tti.MergedInbox(pc, inbox()[0])
+        cases = {"tg.5": "tg..5", "tg.0": "tg..0", "tg..5": "tg...5", "tg...07": "tg....07",
+                 "tg.abc": "tg.abc", "tg.": "tg.", "tg..": "tg..", "tg.5a": "tg.5a", "tg.-5": "tg.-5",
+                 "TG.5": "TG.5", "Tg.5": "Tg.5", "xtg.5": "xtg.5", "tg_5": "tg_5", "p1": "p1",
+                 "tg.٥": "tg.٥", "": ""}
+        for enabled in (True, False):  # the same key whether Telegram is on or off
+            for rid, want in cases.items():
+                with self.subTest(rid=rid, enabled=enabled):
+                    pc = PcRaw(pc_item(rid))
+                    merged = tti.MergedInbox(pc, inbox(enabled=enabled)[0])
+                    raw = merged.take(4)[0]
+                    self.assertEqual((raw["id"], raw["text"]), (want, "pc " + rid))
+                    self.assertNotRegex(raw["id"], r"\Atg\.[0-9]+\Z")
+                    self.assertEqual(merged.counts, {"pc_tg_id": 1} if want != rid else {})
+                    merged.ack(raw["id"])
+                    self.assertEqual(pc.acked, [rid])  # the source gets its own id back
+
+    def test_a_pc_retry_keeps_its_log_id_target(self):
+        # retry text names a turn by its view/log id: "tg.5" is Telegram's turn, "tg..5" the PC's
+        pc = PcRaw({"id": "tg.7", "kind": "retry", "text": "tg.5"}, {"id": "p2", "kind": "retry", "text": "tg..5"})
+        got = tti.MergedInbox(pc, inbox()[0]).take(4)
+        self.assertEqual([(r["id"], r["text"]) for r in got], [("tg..7", "tg.5"), ("p2", "tg..5")])
+
+    def test_a_hostile_pc_item_never_raises_out_of_take(self):
+        class Evil:
+            def __eq__(self, other):
+                raise ValueError("eq")
+            __hash__ = object.__hash__
+
+        class Key(str):
+            def __hash__(self):
+                return hash("id")
+
+            def __eq__(self, other):
+                raise ValueError("eq")
+
+        odd = {"id": "tg.5", "kind": Evil(), "text": "x"}
+        clash = {Key("q"): 1}
+        box, _, _, _ = inbox(batch(text(9)))
+        got = tti.MergedInbox(PcRaw(odd, clash), box).take(4)
+        self.assertEqual([r["id"] if r is not clash else r for r in got], ["tg..5", clash, "tg.9"])
+
+    def test_a_128_char_pc_tg_id_is_refused_not_merged(self):
+        rid = "tg." + "1" * 125
+        merged = tti.MergedInbox(PcRaw(pc_item(rid)), inbox()[0])
         raw = merged.take(4)[0]
-        self.assertEqual(raw["id"], "!tg.5")
+        self.assertEqual((len(raw["id"]), merged.counts), (129, {"pc_tg_too_long": 1}))
         self.assertIsNone(tb.ID_RE.fullmatch(raw["id"]))
-        merged.ack(raw["id"])
-        self.assertEqual(pc.acked, ["tg.5"])
+
+    def test_pc_tg5_and_telegram_update_5_get_two_log_keys(self):
+        pc = PcRaw(pc_item("tg.5"))
+        box, _, store, _ = inbox(batch(text(5, "tg metni")))
+        log, brain = FakeLog(), FakeBrain()
+        ports = tb.wrap(tti.MergedInbox(pc, box), log, brain, SimpleNamespace(show=[].append), FakeClock())
+        tc.start(ports, tb.config(4, 40)).step()
+        keys = sorted(x["key"] for x in log.lines if x["key"].startswith("in:"))
+        self.assertEqual(keys, ["in:pc:tg..5", "in:pc:tg.5"])
+        self.assertEqual(sorted(brain.asked), ["pc tg.5", "tg metni"])
+        self.assertEqual((pc.acked, store.offset), (["tg.5"], 6))
 
 
 class DisabledTest(unittest.TestCase):

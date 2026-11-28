@@ -212,14 +212,29 @@ class MergedInbox:
         out = []
         for index, share in zip(order, ((limit + 1) // 2, limit // 2)):
             for raw in self._take(index, share):
-                fwd = key = _ack_value(raw)
-                if index == 0 and type(raw) is dict and type(key) is str and key.startswith("tg."):
-                    raw = dict(raw, id="!" + key)  # a PC id must not take a Telegram log key
-                    key = raw["id"]  # fails ID_RE: the core logs it refused, then acks it
-                    self._count("pc_tg_id")
-                self._routes.append((key, index, fwd))
+                fwd = _ack_value(raw)
+                if index == 0:
+                    raw = self._escape(raw)
+                self._routes.append((_ack_value(raw), index, fwd))
                 out.append(raw)
         return out
+
+    def _escape(self, raw):
+        """A PC id of tg.<dots><digits> gets one more dot: tg.<digits> stays Telegram's.
+
+        Always on, so a PC item keeps one log key whether Telegram is on or off. A 128-char one
+        becomes 129 and fails ID_RE (refused): no one-to-one map exists inside ID_RE. Retry text
+        is left as is: it names a turn by its log id (the view's id), which is already escaped.
+        """
+        try:
+            value = raw.get("id") if type(raw) is dict else None
+        except Exception:  # a key whose __eq__ raises: the boundary refuses the item
+            return raw
+        rest = value[3:].lstrip(".") if type(value) is str and value.startswith("tg.") else ""
+        if not (rest.isascii() and rest.isdigit()):  # Telegram ids are exactly "tg." + ascii digits
+            return raw
+        self._count("pc_tg_id" if len(value) < 128 else "pc_tg_too_long")
+        return dict(raw, id="tg.." + value[3:])
 
     def _take(self, index, share):
         if share < 1:
