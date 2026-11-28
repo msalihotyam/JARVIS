@@ -15,6 +15,7 @@ import math
 import os
 import re
 import secrets
+import stat
 import sys
 import time
 import urllib.error
@@ -437,6 +438,16 @@ REF_RE = re.compile(r"[0-9a-f]{16}")
 IMAGE_MAX_BYTES = 5 << 20
 IMAGE_MAX_COUNT = 4
 IMAGE_ROOT = Path(ROOT).parent  # build/ of the main checkout: the only place an image is read from
+# worst-case input tokens of one image, whatever its byte size: the server downsizes to a long edge
+# of 1568 px (about 1600 tokens, w*h/750) and high-resolution models to 2576 px (about 4800 tokens)
+IMAGE_MAX_TOKENS = 5000
+BATCH_RESULT_TYPES = ("succeeded", "errored", "canceled", "expired")
+_JPEG_SOF = frozenset(range(0xC0, 0xD0)) - {0xC4, 0xC8, 0xCC}  # start-of-frame markers
+
+
+def _up(usd):
+    """usd rounded UP to the ledger's 1e-6: a booked charge is never below the true cost."""
+    return math.ceil(round(usd * 1e6, 6)) / 1e6
 
 
 def _usd(x):
@@ -534,7 +545,7 @@ def _ok(status):
 def _json(data):
     try:
         return json.loads(data, parse_constant=_no_constant)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, RecursionError):  # a deeply nested answer is malformed, not a crash
         return None
 
 
@@ -562,32 +573,73 @@ def https_get(url, headers, body, timeout):
         return e.code, e.read()
 
 
-def _image(path, image_root=None):
-    """(media type, bytes) of a regular PNG / JPEG file under build/; any doubt refuses."""
+def _handle_path(f):
+    """The final path of an open file from its handle (Windows): what was opened, not what was named."""
+    import msvcrt
+    fn = ctypes.WinDLL("kernel32", use_last_error=True).GetFinalPathNameByHandleW
+    fn.argtypes = [ctypes.c_void_p, ctypes.c_wchar_p, ctypes.c_uint32, ctypes.c_uint32]
+    fn.restype = ctypes.c_uint32
+    buf = ctypes.create_unicode_buffer(32768)
+    n = fn(msvcrt.get_osfhandle(f.fileno()), buf, 32768, 0)
+    s = buf.value
+    if not 0 < n < 32768 or not s.startswith("\\\\?\\") or s.startswith("\\\\?\\UNC\\"):
+        raise OSError("final path unavailable")
+    return Path(s[4:])
+
+
+def _jpeg(data):
+    """SOI, then length-carrying marker segments up to a whole start-of-frame segment before any scan."""
+    i = 2
+    while i + 4 <= len(data) and data[i] == 0xFF:
+        m, n = data[i + 1], int.from_bytes(data[i + 2:i + 4], "big")
+        if m == 0xFF:  # fill byte
+            i += 1
+            continue
+        if n < 2 or m == 0x01 or 0xD0 <= m <= 0xDA:  # standalone, SOI, EOI or scan before a frame
+            return False
+        if m in _JPEG_SOF:
+            return n >= 8 and i + 2 + n <= len(data)
+        i += 2 + n
+    return False
+
+
+def _image(path):
+    """(media type, bytes) of a regular PNG / JPEG file under IMAGE_ROOT; any doubt refuses."""
     s = os.fspath(path) if isinstance(path, (str, os.PathLike)) else None
-    if not isinstance(s, str) or not s or "\x00" in s or s.startswith(("\\\\", "//")) or ":" in s[2:]:
+    if not isinstance(s, str) or not s or "\x00" in s or s[:2].replace("/", "\\") == "\\\\" or ":" in s[2:]:
         raise ApiRefused("image path refused")  # NUL, UNC / device paths, alternate data streams
     try:
-        base = Path(IMAGE_ROOT if image_root is None else image_root).resolve(strict=True)
+        base = Path(IMAGE_ROOT).resolve(strict=True)
         p = Path(s).resolve(strict=True)  # a link out of build/ resolves out of it, then refuses
         inside, regular = p.is_relative_to(base), p.is_file()
-        size = p.stat().st_size
     except (OSError, ValueError, RuntimeError):
         raise ApiRefused("image path refused") from None
     if not inside or not regular:
         raise ApiRefused("image path must be a file inside build/")
-    if size > IMAGE_MAX_BYTES:
-        raise ApiRefused(f"image over {IMAGE_MAX_BYTES} bytes")
     try:
-        with open(p, "rb") as f:
-            data = f.read(IMAGE_MAX_BYTES + 1)
+        f = open(p, "rb")
     except OSError:
         raise ApiRefused("image unreadable") from None
+    with f:
+        # confinement again on the opened handle: a swap between the check and open() refuses
+        try:
+            st = os.fstat(f.fileno())
+            ok = stat.S_ISREG(st.st_mode) and _handle_path(f).is_relative_to(base)
+        except (OSError, ValueError, RuntimeError):
+            ok = False
+        if not ok:
+            raise ApiRefused("image path must be a file inside build/")
+        if st.st_size > IMAGE_MAX_BYTES:
+            raise ApiRefused(f"image over {IMAGE_MAX_BYTES} bytes")
+        try:
+            data = f.read(IMAGE_MAX_BYTES + 1)
+        except OSError:
+            raise ApiRefused("image unreadable") from None
     if len(data) > IMAGE_MAX_BYTES:
         raise ApiRefused(f"image over {IMAGE_MAX_BYTES} bytes")
-    if data.startswith(b"\x89PNG\r\n\x1a\n"):
+    if data.startswith(b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR") and len(data) >= 33:  # sig + IHDR + CRC
         return "image/png", data
-    if data.startswith(b"\xff\xd8\xff"):
+    if data.startswith(b"\xff\xd8") and _jpeg(data):
         return "image/jpeg", data
     raise ApiRefused("image must be PNG or JPEG")
 
@@ -628,7 +680,7 @@ def _booked(purpose, model, url, raw, reserve, settle, *, root, clock, reader, p
     return result
 
 
-def send(purpose, model, system, messages, max_tokens, *, images=(), image_root=None, root=None,
+def send(purpose, model, system, messages, max_tokens, *, images=(), root=None,
          clock=None, reader=None, post=None):
     """Response text of one Messages API call charged to a monthly envelope (`purpose` is exactly
     one of PURPOSES); `images` (PNG / JPEG paths under build/) only for purpose visual. Refused
@@ -652,7 +704,7 @@ def send(purpose, model, system, messages, max_tokens, *, images=(), image_root=
     if images:
         blocks = []
         for p in images:
-            kind, data = _image(p, image_root)
+            kind, data = _image(p)
             blocks.append({"type": "image", "source": {"type": "base64", "media_type": kind,
                                                         "data": base64.b64encode(data).decode("ascii")}})
         msgs[-1] = {"role": "user", "content": [*blocks, {"type": "text", "text": msgs[-1]["content"]}]}
@@ -660,15 +712,16 @@ def send(purpose, model, system, messages, max_tokens, *, images=(), image_root=
     if system:
         body["system"] = system
     raw = json.dumps(body).encode("utf-8")
-    # worst case at list price: a request byte is never less than a token (base64 images included)
-    reserve = math.ceil((len(raw) * p_in + max_tokens * p_out) / 1e6 * 1e6) / 1e6
+    # worst case at list price: a request byte is never less than a token, and an image is billed by
+    # its pixels, not its bytes, so each one adds IMAGE_MAX_TOKENS
+    reserve = _up((len(raw) + len(images) * IMAGE_MAX_TOKENS) * p_in / 1e6 + max_tokens * p_out / 1e6)
 
     def settle(resp, reserve):
         got = _usage(resp)
         if got is None:  # the reserve stays booked as spent
             return {"usd": 0.0, "release": 0.0}, ApiError("API response without usage/content")
         (n_in, n_out), text = got
-        return {"in": n_in, "out": n_out, "usd": round((n_in * p_in + n_out * p_out) / 1e6, 6),
+        return {"in": n_in, "out": n_out, "usd": _up((n_in * p_in + n_out * p_out) / 1e6),
                 "release": reserve}, text
     return _booked(purpose, model, API_URL, raw, reserve, settle,
                    root=root, clock=clock, reader=reader, post=post)
@@ -714,11 +767,16 @@ def submit(purpose, requests, *, root=None, clock=None, reader=None, post=None):
                 ApiError("API batch response without an id"))
     return _booked(purpose, ",".join(sorted(models)), API_URL + "/batches", raw,
                    math.ceil(worst * 1e6) / 1e6, settle, root=root, clock=clock, reader=reader, post=post,
-                   extra={"batch": ref, "n": len(items)})
+                   extra={"batch": ref, "n": len(items),
+                          "models": {i["custom_id"]: i["params"]["model"] for i in items}})
 
 
-def _batch_results(data):
-    """({custom_id: text, or None when not succeeded}, USD at the batch rate) or None on any fault."""
+def _batch_results(data, models):
+    """({custom_id: text, or None when not succeeded}, USD at the batch rate) or None on any fault.
+    `models` is {custom_id: model} as submitted: the answer must name exactly those ids, and a
+    succeeded one the submitted model, priced from the submission, never from the answer."""
+    if not isinstance(models, dict) or not models or not all(m in PRICES for m in models.values()):
+        return None
     try:
         text = data.decode("utf-8") if isinstance(data, bytes) else None
     except UnicodeDecodeError:
@@ -726,26 +784,26 @@ def _batch_results(data):
     if text is None:
         return None
     out, usd = {}, 0.0
-    for line in text.splitlines():
+    for line in text.split("\n"):  # not splitlines: U+2028 / U+0085 are legal inside a JSON string
         if not line.strip():
             continue
         r = _json(line)
         cid = r.get("custom_id") if isinstance(r, dict) else None
         res = r.get("result") if isinstance(r, dict) else None
-        if not isinstance(cid, str) or not CUSTOM_ID_RE.fullmatch(cid) or cid in out or not isinstance(res, dict):
+        if (not isinstance(cid, str) or cid not in models or cid in out or not isinstance(res, dict)
+                or res.get("type") not in BATCH_RESULT_TYPES):  # an unknown type may still bill
             return None
         if res.get("type") != "succeeded":
             out[cid] = None
             continue
         msg = res.get("message")
-        model = msg.get("model") if isinstance(msg, dict) else None
         got = _usage(msg)
-        if not isinstance(model, str) or model not in PRICES or got is None:
+        if not isinstance(msg, dict) or msg.get("model") != models[cid] or got is None:
             return None
         (n_in, n_out), out[cid] = got
-        p_in, p_out = PRICES[model]
+        p_in, p_out = PRICES[models[cid]]
         usd += (n_in * p_in + n_out * p_out) * BATCH_RATE / 1e6
-    return (out, usd) if out else None
+    return (out, usd) if set(out) == set(models) else None
 
 
 def collect(ref, *, root=None, clock=None, reader=None, get=None):
@@ -796,11 +854,11 @@ def collect(ref, *, root=None, clock=None, reader=None, get=None):
         del key
         if not _ok(status):
             return {"status": "pending"}
-        parsed = _batch_results(data)
+        parsed = _batch_results(data, sent.get("models"))
         # a short (truncated) answer must not release the reserve of the missing requests
         if parsed is None or len(parsed[0]) != sent.get("n"):
             return final("unpriced", 0.0, 0.0)
-        return final("settled", round(parsed[1], 6), sent["usd"], parsed[0])
+        return final("settled", _up(parsed[1]), sent["usd"], parsed[0])
 
 
 def report(month, *, root=None):

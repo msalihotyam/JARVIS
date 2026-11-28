@@ -1,8 +1,10 @@
 """APIBROKER2: monthly envelopes, Batch and image input on the one ledger. Fake transports + a
 fake credential reader, temp roots, an injected clock; no network, no real ledger, never data/jarvis.db."""
 import base64
+import builtins
 import contextlib
 import importlib.util
+import inspect
 import io
 import json
 import os
@@ -25,8 +27,8 @@ KEY = "sk-ant-api03-TESTONLY_secret-0123456789"
 HAIKU, SONNET = "claude-haiku-5-5", "claude-sonnet-5-5"
 SECRET_TEXT = "REQUEST-TEXT-must-never-reach-the-ledger"
 MSG = [{"role": "user", "content": "hi"}]
-PNG = b"\x89PNG\r\n\x1a\n" + b"\x00" * 32
-JPEG = b"\xff\xd8\xff\xe0" + b"\x00" * 32
+PNG = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR" + b"\x00\x00\x00\x01" * 2 + b"\x08\x02\x00\x00\x00" + b"\x00" * 4
+JPEG = b"\xff\xd8\xff\xc0\x00\x0b\x08\x00\x01\x00\x01\x01\x01\x11\x00\xff\xd9"  # SOI, SOF0 1x1, EOI
 
 
 def ts(day, hour=12):
@@ -172,7 +174,7 @@ class SendTest(Base):
         self.assertEqual((sent["status"], sent["purpose"], self.reads), ("sent", "prescreen", 1))
         self.assertGreater(sent["usd"], 0)
         self.assertEqual(done["release"], sent["usd"])
-        self.assertAlmostEqual(self.net(), round((10 * 0.1 + 5 * 0.5) / 1e6, 6))
+        self.assertAlmostEqual(self.net(), 4e-6)  # 3.5e-6 booked rounded up
 
 
 class ConcurrencyTest(Base):
@@ -353,6 +355,101 @@ class ImageTest(Base):
         self.refused(lambda: self.send(purpose="visual", images=[ok],
                                        messages=MSG + [{"role": "assistant", "content": "x"}]), "images go with")
         self.assertEqual(self.rows(), [])
+
+
+class ReviewFixTest(Base):
+    """APIBROKER2FIX: each test fails on the code before the fix."""
+
+    def reserve(self):
+        return self.rows()[0]["usd"]
+
+    def answered(self, *lines):
+        self.ledger.unlink(missing_ok=True)
+        self.reply = (200, json.dumps({"id": "msgbatch_01"}).encode())
+        ref = self.submit()
+        self.answers = [ENDED, results(*lines) if lines and isinstance(lines[0], dict) else lines[0]]
+        return self.collect(ref)
+
+    def test_neg_f1_image_reserve_covers_pixel_tokens(self):
+        self.assertGreaterEqual(api.IMAGE_MAX_TOKENS, 4784)  # 2576 px long edge, w*h/750
+        p = self.build / "a.png"
+        p.write_bytes(PNG)  # a few bytes on disk, billed by pixels
+        for k in (1, api.IMAGE_MAX_COUNT):
+            with self.subTest(k=k):
+                self.ledger.unlink(missing_ok=True)
+                self.sent.clear()
+                self.send(purpose="visual", images=[str(p)] * k)
+                floor = ((len(self.sent[0][2]) + k * 1600) * 0.1 + 100 * 0.5) / 1e6
+                self.assertGreaterEqual(self.rows()[0]["usd"], floor)
+
+    def test_neg_f2_no_image_root_parameter(self):
+        for fn in (api.send, api._image):
+            self.assertNotIn("image_root", inspect.signature(fn).parameters)
+
+    def test_neg_f3_unknown_result_type_unpriced(self):
+        for res in ({}, {"type": "weird"}, {"type": None}, {"type": ["errored"]}):
+            with self.subTest(res=res):
+                r = self.answered({"custom_id": "a", "result": res}, ok_line("b", SONNET))
+                self.assertEqual(r["status"], "unpriced")
+                self.assertEqual(self.net(), self.reserve())
+
+    def test_neg_f4_ids_and_models_must_match_submission(self):
+        for lines in ((ok_line("x"), ok_line("y", SONNET)), (ok_line("a", SONNET), ok_line("b", SONNET)),
+                      (ok_line(), ok_line("b", HAIKU))):
+            with self.subTest(lines=[(x["custom_id"], x["result"]["message"]["model"]) for x in lines]):
+                self.assertEqual(self.answered(*lines)["status"], "unpriced")
+                self.assertEqual(self.net(), self.reserve())
+        self.ledger.unlink()
+        ref = self.submit()  # a reserve row without the submitted models
+        rows = self.rows()
+        self.assertEqual(rows[0]["models"], {"a": HAIKU, "b": SONNET})
+        del rows[0]["models"]
+        self.ledger.write_text("".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8")
+        self.answers = [ENDED, results(ok_line(), ok_line("b", SONNET))]
+        self.assertEqual(self.collect(ref)["status"], "unpriced")
+
+    def test_neg_f5_charges_round_up(self):
+        self.reply = (200, ok_body(1, 0))  # 1e-7 USD
+        self.send()
+        self.assertEqual(self.rows()[-1]["usd"], 1e-6)
+        r = self.answered(ok_line(n_in=1, n_out=0), {"custom_id": "b", "result": {"type": "expired"}})
+        self.assertEqual((r["status"], self.rows()[-1]["usd"]), ("settled", 1e-6))  # 5e-8 at batch rate
+
+    def test_neg_f6_deep_nesting_unpriced_not_crash(self):
+        r = self.answered((200, ("[" * 100000 + "]" * 100000).encode()))
+        self.assertEqual(r["status"], "unpriced")
+
+    def test_neg_f7_confinement_checked_on_opened_handle(self):
+        outside = self.build.parent / "out.png"
+        outside.write_bytes(PNG)
+        (self.build / "a.png").write_bytes(PNG)
+        swap = lambda p, m="r", *a, **k: builtins.open(outside, m)  # noqa: E731 - swapped after the check
+        with mock.patch.object(api, "open", swap, create=True):
+            self.refused(lambda: self.send(purpose="visual", images=[str(self.build / "a.png")]), "inside build")
+
+    def test_neg_f8_signature_only_files_refused(self):
+        for name, data in (("p.png", b"\x89PNG\r\n\x1a\n" + b"\x00" * 32),  # the old fixtures: signature only
+                           ("j.jpg", b"\xff\xd8\xff\xe0" + b"\x00" * 32),
+                           ("s.jpg", b"\xff\xd8\xff\xda\x00\x08" + b"\x00" * 12),
+                           ("t.jpg", b"\xff\xd8\xff\xc0\x00\x40\x08"), ("q.png", PNG[:20])):
+            with self.subTest(name=name):
+                (self.build / name).write_bytes(data)
+                self.refused(lambda: self.send(purpose="visual", images=[str(self.build / name)]), "PNG or JPEG")
+
+    def test_neg_review_mixed_slash_unc_never_resolved(self):
+        seen, real = [], api.Path.resolve
+        spy = lambda p, *a, **k: seen.append(str(p)) or real(p, *a, **k)  # noqa: E731
+        with mock.patch.object(api.Path, "resolve", spy):
+            for s in ("\\/srv/share/a.png", "/\\srv\\share\\a.png", "\\/./pipe/x"):
+                with self.subTest(s=s):
+                    self.refused(lambda: self.send(purpose="visual", images=[s]), "image path")
+        self.assertFalse([x for x in seen if "srv" in x or "pipe" in x])  # no SMB / device open
+
+    def test_neg_review_line_separator_inside_text_still_settles(self):
+        a = ok_line()
+        a["result"]["message"]["content"][0]["text"] += " \u0085"
+        body = "\n".join(json.dumps(x, ensure_ascii=False) for x in (a, ok_line("b", SONNET))).encode()
+        self.assertEqual(self.answered((200, body))["status"], "settled")
 
 
 class ReportTest(Base):
